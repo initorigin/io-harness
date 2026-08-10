@@ -1,5 +1,11 @@
 //! 0.24.0 — the Windows Job Object backend, live.
 //!
+//! Since 0.47.0 a contained Windows run takes the AppContainer when a profile can
+//! be created, and the Job Object otherwise. The job is created either way — the
+//! container path adopts the suspended process into one before resuming it — so
+//! every cap asserted below is asserted on whichever backend the host gave, and
+//! the tests name the disjunction rather than a single backend.
+//!
 //! Every test here is `cfg(windows)`, so on a macOS or Linux host this file
 //! compiles to nothing and is silent rather than skipped-and-green. It runs on
 //! the Windows CI runner and nowhere else, which is the only place the kernel
@@ -59,12 +65,27 @@ fn limits() -> SandboxLimits {
 
 // --- what the backend says it is --------------------------------------------
 
+/// 0.47.0 changed this test's premise, deliberately: a contained Windows run now
+/// takes the AppContainer where a profile can be created and the Job Object
+/// otherwise, so "the native backend is the Job Object" is no longer a fact about
+/// the platform. What is still exactly assertable — and is the claim this test was
+/// written for in 0.24.0 — is that the native backend is a **real primitive** and
+/// never the floor, and that the floor is still reachable on demand so the
+/// negative controls below have something to run against.
+///
+/// The run's own backend is asserted against the same disjunction rather than
+/// against the probe's answer: `Sandbox::backend` answers before the run and
+/// `SandboxOutcome::backend` is what applied, and on this platform they may
+/// legitimately differ by the container declining a particular run.
 #[tokio::test]
-async fn windows_reports_the_job_object_and_not_the_floor() {
-    assert_eq!(
-        select(&SandboxConfig::new()).backend(),
-        Backend::WindowsJobObject,
-        "the native Windows backend must name the job object it creates"
+async fn windows_reports_a_real_primitive_and_not_the_floor() {
+    let native = select(&SandboxConfig::new()).backend();
+    assert!(
+        matches!(
+            native,
+            Backend::WindowsAppContainer | Backend::WindowsJobObject
+        ),
+        "the native Windows backend must name a primitive it actually creates, got {native:?}"
     );
     // And the floor is still reachable on demand — the negative control below
     // depends on being able to ask for a run with no job at all.
@@ -77,8 +98,37 @@ async fn windows_reports_the_job_object_and_not_the_floor() {
     let script = bat(dir.path(), "ok", "echo hello");
     let out = run_bat(&SandboxConfig::new(), limits(), &script).await;
     assert!(out.success(), "a plain command must still run: {out:?}");
-    assert_eq!(out.backend, Backend::WindowsJobObject);
+    assert!(
+        matches!(
+            out.backend,
+            Backend::WindowsAppContainer | Backend::WindowsJobObject
+        ),
+        "the run must report the primitive that applied to it, got {out:?}"
+    );
     assert!(out.stdout.contains("hello"), "output is still captured");
+}
+
+/// A contained run must not require a multi-threaded runtime, and this is
+/// asserted rather than left to whichever other test happens to be a
+/// `#[tokio::test]`.
+///
+/// `#[tokio::test]` builds a current-thread runtime by default, and so does an
+/// embedder writing `#[tokio::main(flavor = "current_thread")]`. The container
+/// path waited for its process with `tokio::task::block_in_place`, which *panics*
+/// on that flavour. It stayed invisible for as long as the container was declined
+/// on every host; the first CI run that selected it panicked four `verify` tests
+/// that have nothing to do with containment. A backend may not impose a runtime
+/// flavour on the process embedding it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_contained_run_completes_on_a_current_thread_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = bat(dir.path(), "flavour", "echo current-thread");
+    let out = run_bat(&SandboxConfig::new(), limits(), &script).await;
+    assert!(
+        out.success(),
+        "a contained run must complete on a current-thread runtime: {out:?}"
+    );
+    assert!(out.stdout.contains("current-thread"), "{out:?}");
 }
 
 // --- F8: the active-process limit -------------------------------------------

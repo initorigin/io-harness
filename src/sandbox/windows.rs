@@ -478,7 +478,17 @@ pub(crate) mod job {
             }
         };
 
-        let out_path = tmp.join(format!("io-harness-{}.out", std::process::id()));
+        // Unique per *run*, not per process. Two contained commands running at
+        // once in one embedding process — a tree with several children, or a
+        // batch — would otherwise share one capture file and read each other's
+        // output. The process id keeps two processes on the same machine apart;
+        // the counter keeps two runs inside one process apart.
+        static CAPTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let out_path = tmp.join(format!(
+            "io-harness-{}-{}.out",
+            std::process::id(),
+            CAPTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let file = match std::fs::File::create(&out_path) {
             Ok(f) => f,
             Err(e) => {
@@ -523,7 +533,29 @@ pub(crate) mod job {
             .max_wall_secs
             .map(|s| s.saturating_mul(1000).min(u32::MAX as u64) as u32)
             .unwrap_or(u32::MAX);
-        let waited = tokio::task::block_in_place(|| child.wait(wall_ms));
+        // **`spawn_blocking`, not `block_in_place`.** Both keep a blocking Win32
+        // wait off a runtime worker, but `block_in_place` *panics* on a
+        // current-thread runtime — which is what `#[tokio::test]` builds by
+        // default and what an embedder writing
+        // `#[tokio::main(flavor = "current_thread")]` gets. The panic was latent
+        // for as long as the container path was declined on every host; the run
+        // that stopped declining it failed four `verify::tests` at once, none of
+        // which are about containment. A backend may not require a runtime
+        // flavour of the process embedding it.
+        //
+        // `Spawned` is `Send`, so the handles move to a blocking thread and the
+        // answer comes back. It is dropped there, which is the same teardown as
+        // dropping it here: `wait` has already reaped or killed the process on
+        // every path that returns.
+        let waited = match tokio::task::spawn_blocking(move || child.wait(wall_ms)).await {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = std::fs::remove_file(&out_path);
+                return Some(Err(Error::Sandbox {
+                    reason: format!("the thread waiting for the contained process failed: {e}"),
+                }));
+            }
+        };
         let (exit_code, wall) = match waited {
             Ok(Some(code)) => (Some(code), false),
             // `wait` has already terminated it by the time it answers `None`.

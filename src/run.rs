@@ -34,7 +34,7 @@ use crate::provider::{
     CompletionRequest, CompletionResponse, PromptFamily, Provider, ToolCall, ToolSpec,
 };
 use crate::resilience::{Progress, Progressing};
-use crate::sandbox::{Backend, Sandbox, SandboxConfig};
+use crate::sandbox::{Sandbox, SandboxConfig};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{
@@ -11592,15 +11592,18 @@ fn containment_line(config: &SandboxConfig) -> String {
              project's toolchain caches"
         }
     };
-    match backend {
-        Backend::PortableFloor | Backend::WindowsJobObject => format!(
+    // Asked, not enumerated. This site listed the two resource-only backends by
+    // name until 0.47.0, which is the shape that went wrong in four files at once
+    // when the Linux chain added three rungs.
+    match backend.confines_writes() {
+        false => format!(
             "- Commands you run are given resource limits only (mode: {}, backend: {}). This host \
              provides no filesystem confinement and no outbound-network confinement for them, so \
              neither is in force.",
             config.mode.as_str(),
             backend.as_str()
         ),
-        _ => format!(
+        true => format!(
             "- Commands you run are contained (mode: {}, backend: {}): {}, and outbound network \
              is permitted only where this run's policy permits it.",
             config.mode.as_str(),
