@@ -1009,6 +1009,26 @@ pub enum EventKind {
         /// the ones that do not exist on this host were dropped.
         roots: u32,
     },
+    /// A contained command's outbound connection was decided (0.48.0).
+    ///
+    /// One per dial, permitted or refused, from the loopback proxy the run owns.
+    /// This is the event that did not exist before this release and could not
+    /// have: a sandbox denies egress *structurally* — the backend gives the child
+    /// no route out — so until something sat in the route there was no attempt to
+    /// observe and nothing to count.
+    ///
+    /// The decision is the run's own [`Policy`](crate::Policy) applied to
+    /// `host:port`, so a refusal here and a refusal of the crate's own network
+    /// tools are the same rule reaching two different callers.
+    Dialed {
+        /// The host as the command asked for it, never resolved to an address:
+        /// the policy's patterns are written against names.
+        host: String,
+        /// The port it asked for.
+        port: u16,
+        /// Whether the policy permitted it.
+        allowed: bool,
+    },
     /// The run ended. Emitted once, last.
     Finished {
         /// The outcome string as written to `runs.outcome`.
@@ -1073,6 +1093,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "routed",
     "plugin_loaded",
     "plugin_dropped",
+    "dialed",
     "rewound",
     "answered",
     "compacted",
@@ -1687,6 +1708,11 @@ mod tests {
                 text: "the parser is the only caller".into(),
                 tokens: 120,
             },
+            EventKind::Dialed {
+                host: "api.example.com".into(),
+                port: 443,
+                allowed: true,
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
@@ -1727,6 +1753,7 @@ mod tests {
                 | EventKind::PlanProposed { .. }
                 | EventKind::PlanDecided { .. }
                 | EventKind::Reasoning { .. }
+                | EventKind::Dialed { .. }
                 | EventKind::ServerToolUsed { .. }
                 // 0.34.0 — the verdict a review returned, and a run changing which
                 // model it asks.

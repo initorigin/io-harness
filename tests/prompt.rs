@@ -959,12 +959,22 @@ const START_BY_GREPPING: &str = "(nothing yet — start by grepping or finding)"
 const CRITERION_LINE: &str = "Success criterion:";
 
 /// Every request a session turn made, in order.
-async fn turn_requests(contract: &TaskContract, root: &std::path::Path, script: Vec<Vec<ToolCall>>) -> Vec<CompletionRequest> {
+async fn turn_requests(
+    contract: &TaskContract,
+    root: &std::path::Path,
+    script: Vec<Vec<ToolCall>>,
+) -> Vec<CompletionRequest> {
     let provider = Rec::new(script);
     let store = Store::memory().unwrap();
     let mut session = Session::open(&store, root).unwrap();
     let _ = session
-        .turn_bounded(contract, &provider, &store, &Policy::permissive(), &ApproveAll)
+        .turn_bounded(
+            contract,
+            &provider,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+        )
         .await;
     let seen = provider.seen.lock().unwrap().clone();
     seen
@@ -1013,7 +1023,10 @@ async fn a_promoted_turns_later_step_is_asked_as_it_always_was() {
         .with_max_steps(3);
     // The first completion reaches for a tool, which promotes the turn.
     let reqs = turn_requests(&c, dir.path(), vec![write_call(), vec![]]).await;
-    assert!(reqs.len() >= 2, "the turn was promoted and ran a second step");
+    assert!(
+        reqs.len() >= 2,
+        "the turn was promoted and ran a second step"
+    );
 
     let step_two = &reqs[1].user;
     for expected in [CALL_A_TOOL, CRITERION_LINE, "Goal: edit a.txt"] {

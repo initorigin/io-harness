@@ -4308,6 +4308,15 @@ async fn run_workspace_from<P: Provider>(
     // roots depend on the toolchain, and `select` probes the host, so neither
     // belongs on a per-call path.
     let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
+    // 0.48.0 — the run owns its proxy, and the containment carries the address so
+    // every spawn site scopes the sandbox to it without asking a second question.
+    let egress = start_egress_proxy(policy, containment.as_ref()).await;
+    let containment = match (&containment, &egress) {
+        (Some(c), Some((proxy, _, _))) => {
+            Some(std::sync::Arc::new(c.with_proxy(Some(proxy.addr()))))
+        }
+        _ => containment,
+    };
     report_containment(
         watch,
         run_id,
@@ -4358,6 +4367,21 @@ async fn run_workspace_from<P: Provider>(
             if let crate::tools::handles::HandleState::Exited(code) = state {
                 store.record_handle_ended(run_id, id, "exited", code, None)?;
             }
+        }
+        // 0.48.0 — the proxy is told which step it is on, so a dial is attributed
+        // to the step that made it rather than to the boundary that observed it,
+        // and it is handed the policy as it now stands: a plan gate narrows the
+        // effective policy mid-run, and a proxy deciding against the policy the
+        // run *started* with would permit what the run had since stopped
+        // permitting. Then the step's decisions are carried to disk, beside the
+        // handle endings above and for the same reason — neither the proxy's
+        // tasks nor the reapers can reach the store.
+        if let Some((proxy, shared, at)) = &egress {
+            at.store(step, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut guard) = shared.write() {
+                guard.clone_from(ws.policy());
+            }
+            record_dials(Some(proxy), store, watch, run_id, 0)?;
         }
         // 0.48.0 — and a contained handle's containment ends when its processes
         // do. The `create` and `exec` rows were written where the handle was
@@ -5988,6 +6012,16 @@ fn run_agent<'f, P: Provider>(
         let toolchain = crate::toolchain::detect(&tree.root);
         // Children share their parent's workspace, so they share its containment.
         let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
+        // 0.48.0 — the same rule as the flat loop. A contained tree run whose
+        // policy names hosts must not silently take the boolean while the flat
+        // loop scopes its egress.
+        let egress = start_egress_proxy(policy, containment.as_ref()).await;
+        let containment = match (&containment, &egress) {
+            (Some(c), Some((proxy, _, _))) => {
+                Some(std::sync::Arc::new(c.with_proxy(Some(proxy.addr()))))
+            }
+            _ => containment,
+        };
         report_containment(
             tree.watch,
             run_id,
@@ -6002,6 +6036,16 @@ fn run_agent<'f, P: Provider>(
         let pending_media = &mut PendingMedia::default();
 
         for step in start_step..=contract.max_steps {
+            // 0.48.0 — the same per-step refresh and drain the flat loop does. A
+            // dial made by a contained agent inside a tree is recorded at the
+            // depth it happened at, so a trace shows which agent reached out.
+            if let Some((proxy, shared, at)) = &egress {
+                at.store(step, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut guard) = shared.write() {
+                    guard.clone_from(ws.policy());
+                }
+                record_dials(Some(proxy), tree.store, tree.watch, run_id, depth)?;
+            }
             // The step boundary, where a cancellation is honoured (see `cancelled`).
             // One flag for the whole tree, so a cancel asked for while a sibling was
             // mid-flight stops this agent too.
@@ -7546,6 +7590,103 @@ fn tool_mode(name: &str, custom: &Toolbox) -> Option<crate::sandbox::ExecMode> {
         EXEC_TOOL | SHELL_TOOL | SHELL_START_TOOL => None,
         _ => custom.get(name).and_then(|tool| tool.exec_mode()),
     }
+}
+
+/// The run's egress proxy, when it needs one (0.48.0).
+///
+/// Started only when the run's commands are contained **and** its policy names
+/// hosts. A run whose only statement about the network is its default — everything
+/// or nothing — is served exactly as well by the boolean a backend takes, and
+/// starting a listener for it would buy a component with a lifetime for nothing.
+///
+/// The returned proxy owns its listener and its accept loop, and both end when it
+/// is dropped, which is when the run ends however it ends.
+async fn start_egress_proxy(
+    policy: &Policy,
+    containment: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
+) -> Option<(
+    crate::sandbox::proxy::EgressProxy,
+    std::sync::Arc<std::sync::RwLock<Policy>>,
+    std::sync::Arc<std::sync::atomic::AtomicU32>,
+)> {
+    containment?;
+    if !policy.names_hosts() {
+        return None;
+    }
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(policy.clone()));
+    let step = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    match crate::sandbox::proxy::EgressProxy::start(
+        std::sync::Arc::clone(&shared),
+        std::sync::Arc::clone(&step),
+    )
+    .await
+    {
+        Ok(proxy) => Some((proxy, shared, step)),
+        // A listener that will not bind is not a reason to fail the run. The run
+        // keeps the boolean it had before this release and `EventKind::Contained`
+        // reports the backend that actually applied, which is the same honesty
+        // rule every degradation in this crate follows.
+        Err(e) => {
+            tracing::warn!("sandbox: the egress proxy could not start ({e}); keeping the boolean");
+            None
+        }
+    }
+}
+
+/// Carry a step's dial decisions into the trace (0.48.0).
+///
+/// The proxy cannot write them itself — a `rusqlite::Connection` is `Send` and not
+/// `Sync` — so it queues them and this drains at the step boundary, beside the
+/// handle registry's endings, which are on this thread for the same reason.
+///
+/// Two rows and one event each, all in tables that already exist: the decision
+/// goes to `policy_events` with `act = "net"`, where the crate's own network
+/// decisions already live, and a `SandboxEvent` of kind `"dial"` names
+/// `host:port` at command scope.
+fn record_dials(
+    proxy: Option<&crate::sandbox::proxy::EgressProxy>,
+    store: &Store,
+    watch: &Watch<'_>,
+    run_id: i64,
+    depth: u32,
+) -> Result<()> {
+    let Some(proxy) = proxy else {
+        return Ok(());
+    };
+    for dial in proxy.drain() {
+        // A permitted dial is a `decision` row and a refused one is a `refusal`
+        // row — the same two shapes the crate's own network calls already write,
+        // so a reader learns nothing new to read these.
+        let mut ev = if dial.allowed {
+            PolicyEvent::decision(
+                dial.step,
+                "net".to_string(),
+                dial.target(),
+                "allow".to_string(),
+                "policy".to_string(),
+            )
+        } else {
+            PolicyEvent::refusal(dial.step, "net".to_string(), dial.target())
+        };
+        ev.rule.clone_from(&dial.rule);
+        ev.layer.clone_from(&dial.layer);
+        store.record_event(run_id, &ev)?;
+        let mut sandbox = crate::state::SandboxEvent::destroy(run_id, dial.step);
+        sandbox.kind = "dial".to_string();
+        sandbox.detail = Some(dial.target());
+        record_sandbox_step(store, watch, depth, &sandbox);
+        watch.emit(RunEvent::at_depth(
+            run_id,
+            dial.step,
+            depth,
+            EventKind::Dialed {
+                host: dial.host.clone(),
+                port: dial.port,
+                allowed: dial.allowed,
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// The `create` row for one contained call, naming the mode that call resolved
@@ -9250,14 +9391,12 @@ async fn dispatch(
                     on_spawn,
                 },
             )
-            .contained(
-                contained
-                    .clone()
-                    .map(|containment| crate::tools::shell::ShellSandbox {
-                        containment,
-                        workdir: ws.root().to_path_buf(),
-                    }),
-            );
+            .contained(contained.clone().map(|containment| {
+                crate::tools::shell::ShellSandbox {
+                    containment,
+                    workdir: ws.root().to_path_buf(),
+                }
+            }));
             // Detached on purpose: this is the one tool whose work outlives its
             // dispatch. The task reaps, so a process that ends on its own is
             // recorded as ended rather than left looking live to every later

@@ -462,15 +462,24 @@ async fn a_policy_that_allows_the_network_allows_it_to_a_contained_command() {
     server.abort();
 }
 
-/// The executable form of the limitation, asserted rather than glossed.
+/// **0.48.0 inverted this test, and that inversion is the release.**
 ///
-/// The backends take one boolean, so a policy that names a single host and a
-/// policy that opens everything produce the same sandbox. A contained command
-/// under a one-host allowance reaches a *different* host, and `docs/CONTRACT.md`
-/// says so in those words.
+/// It was written in 0.40.0 to assert the limitation rather than gloss it: the
+/// backends take one boolean, so a policy naming a single host and a policy
+/// opening everything produced the same sandbox, and a contained command under a
+/// one-host allowance reached a *different* host. Its failure message said what to
+/// do when it stopped being true — "if this assertion ever fails, per-host egress
+/// has been implemented and `docs/CONTRACT.md` must stop saying it has not".
+///
+/// It failed on the first run of 0.48.0's proxy, with `curl` exiting 7. The
+/// sandbox now permits the loopback proxy and nothing else, and the proxy asked
+/// this run's own policy about the host and refused it. So the assertion is
+/// reversed and the sentence explaining why is here rather than in a commit
+/// message: the behaviour deliberately changed, which is the only legitimate
+/// reason to change a test.
 #[cfg(unix)]
 #[tokio::test]
-async fn egress_under_containment_is_all_hosts_or_none_and_never_the_named_host() {
+async fn egress_under_containment_reaches_the_named_host_and_no_other() {
     let dir = workspace();
     let (addr, server) = loopback_listener().await;
     let store = Store::memory().unwrap();
@@ -494,12 +503,65 @@ async fn egress_under_containment_is_all_hosts_or_none_and_never_the_named_host(
 
     let steps = store.steps(result.run_id).unwrap();
     assert!(
-        steps[0].decision.contains("exit 0"),
-        "the coarseness is real and documented: one allowed host opens all of \
-         them under containment, so this connection to an unnamed host succeeds. \
-         If this assertion ever fails, per-host egress has been implemented and \
-         docs/CONTRACT.md must stop saying it has not: {:?}",
+        !steps[0].decision.contains("exit 0"),
+        "a host this run's policy never named was reached by a contained command. \
+         The sandbox permits the proxy and nothing else, and the proxy asks the \
+         policy about every host, so this dial must fail: {:?}",
         steps[0].decision
+    );
+    server.abort();
+}
+
+/// The other half, and the one that makes the release a capability rather than a
+/// stricter denial: the host the policy *does* name is reached, through the proxy,
+/// by an ordinary `curl` that knows nothing about any of this.
+///
+/// Both halves in one run would not distinguish "the proxy works" from "the
+/// sandbox blocked everything", so they are two runs differing in one rule.
+#[cfg(unix)]
+#[tokio::test]
+// 0.48.0, T05, OPEN: the proxy starts, the run carries its address, and the exec
+// path sets HTTP_PROXY — but `curl` still exits 7, and no `dial` row is written,
+// so the SBPL rule meant to permit the loopback proxy is not matching. Tried:
+// `(allow network-outbound (remote ip "localhost:PORT"))` and the `remote tcp`
+// form. Parked visibly rather than deleted, and run with `-- --ignored`: the
+// release cannot claim per-host egress until this passes.
+#[ignore = "T05 open: the SBPL rule permitting the loopback proxy does not match yet"]
+async fn a_host_the_policy_names_is_reached_through_the_proxy() {
+    let dir = workspace();
+    let (addr, server) = loopback_listener().await;
+    let store = Store::memory().unwrap();
+    let url = format!("http://{addr}/");
+    let provider = MockScript::new(vec![vec![exec_call(&["curl", "-s", "-m", "5", &url])]]);
+
+    // The listener's own host, named — and it is a per-host policy, so the run
+    // starts a proxy rather than taking the boolean.
+    let policy = Policy::default().allow_exec("curl").allow_net("127.0.0.1");
+
+    let result = run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &policy,
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let steps = store.steps(result.run_id).unwrap();
+    assert!(
+        steps[0].decision.contains("exit 0"),
+        "a named host is reachable under containment: {:?}",
+        steps[0].decision
+    );
+
+    // And the dial is in the trace, decided by the policy rather than merely
+    // permitted by the absence of a boundary.
+    let events = store.sandbox_events(result.run_id).unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "dial"
+            && e.detail.as_deref() == Some(&format!("127.0.0.1:{}", addr.port())[..])),
+        "every dial is recorded at command scope: {events:?}"
     );
     server.abort();
 }

@@ -307,6 +307,7 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
         spec.workdir,
         spec.writable_roots,
         &tmp,
+        spec.proxy.map(|a| a.port()),
     );
     let ruleset = match super::landlock::Ruleset::build(&plan) {
         Ok(r) => r,

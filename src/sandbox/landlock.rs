@@ -167,6 +167,17 @@ pub(crate) struct Plan {
     pub(crate) handled_fs: u64,
     pub(crate) handled_net: u64,
     pub(crate) rules: Vec<PathRule>,
+    /// TCP ports this run may `connect` to (0.48.0). Empty is every release
+    /// before it: net access is handled or it is not, and handling it with no
+    /// rule denies every outbound connection.
+    ///
+    /// **Port-scoped and not address-scoped, and that is the honest word for
+    /// it.** Landlock's network rules take a port and no address, so allowing the
+    /// run's loopback proxy through also allows any other host on that same port
+    /// number. The port is ephemeral and chosen per run, which narrows it in
+    /// practice and does not make it a proof — `docs/CONTRACT.md` says so rather
+    /// than letting a reader assume this is per-host enforcement.
+    pub(crate) net_ports: Vec<u16>,
 }
 
 /// Build the rule set for a run.
@@ -182,9 +193,18 @@ pub(crate) fn plan(
     workdir: &Path,
     writable: &[PathBuf],
     tmp: &Path,
+    proxy_port: Option<u16>,
 ) -> Plan {
     let handled_fs = fs_rights_for(abi);
-    let handled_net = net_rights_for(abi, deny_egress);
+    // A proxy means the same thing to this rung as a denial does — take control
+    // of outbound TCP — and then hands one port back. Without the first half the
+    // second would be a rule on an access nothing was restricting.
+    let handled_net = net_rights_for(abi, deny_egress || proxy_port.is_some());
+    let net_ports: Vec<u16> = if handled_net == 0 {
+        Vec::new()
+    } else {
+        proxy_port.into_iter().collect()
+    };
 
     // Read and execute over the whole tree. A unix run has never confined reads,
     // and this is that same claim in this rung's vocabulary.
@@ -217,6 +237,7 @@ pub(crate) fn plan(
         handled_fs,
         handled_net,
         rules,
+        net_ports,
     }
 }
 
@@ -545,6 +566,7 @@ mod tests {
             Path::new("/w"),
             &roots(),
             Path::new("/tmp"),
+            None,
         );
         let full = fs_rights_for(5);
 
@@ -579,6 +601,7 @@ mod tests {
             Path::new("/w"),
             &[],
             Path::new("/tmp"),
+            None,
         );
         let writable: Vec<&Path> = p.rules[1..].iter().map(|r| r.path.as_path()).collect();
         assert_eq!(
@@ -589,6 +612,57 @@ mod tests {
         // And the workspace is still *readable*, through the `/` rule.
         assert_eq!(p.rules[0].path, Path::new("/"));
         assert_ne!(p.rules[0].rights & FS_READ_FILE, 0);
+    }
+
+    /// 0.48.0 — a proxy takes control of outbound TCP and hands exactly one port
+    /// back. Port-scoped, never address-scoped: that is the ceiling of the
+    /// kernel interface and it is asserted here so nobody reads the rung as
+    /// per-host enforcement.
+    #[test]
+    fn a_proxy_handles_the_network_and_allows_only_its_port() {
+        // ABI 4 is where the network rules arrive.
+        let with = plan(
+            4,
+            ExecMode::WorkspaceWrite,
+            false,
+            Path::new("/w"),
+            &[],
+            Path::new("/tmp"),
+            Some(54321),
+        );
+        assert_ne!(
+            with.handled_net, 0,
+            "a proxied run restricts outbound TCP even though its policy permits egress"
+        );
+        assert_eq!(with.net_ports, vec![54321]);
+
+        // Without one, nothing changes from 0.47.0: a run permitting egress
+        // handles no network access at all.
+        let without = plan(
+            4,
+            ExecMode::WorkspaceWrite,
+            false,
+            Path::new("/w"),
+            &[],
+            Path::new("/tmp"),
+            None,
+        );
+        assert_eq!(without.handled_net, 0);
+        assert!(without.net_ports.is_empty());
+
+        // And below the ABI that carries the network rules there is nothing to
+        // hand back, so the port is dropped rather than requested and refused.
+        let old = plan(
+            3,
+            ExecMode::WorkspaceWrite,
+            false,
+            Path::new("/w"),
+            &[],
+            Path::new("/tmp"),
+            Some(54321),
+        );
+        assert_eq!(old.handled_net, 0);
+        assert!(old.net_ports.is_empty());
     }
 
     /// Every right named in a rule must be one the rule set said it handles, or
@@ -604,6 +678,7 @@ mod tests {
                 Path::new("/w"),
                 &roots(),
                 Path::new("/tmp"),
+                None,
             );
             for rule in &p.rules {
                 assert_eq!(

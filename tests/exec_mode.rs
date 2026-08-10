@@ -127,7 +127,9 @@ async fn a_git_write_under_workspace_write_runs_contained() {
     // the mode this call resolved to.
     let events = store.sandbox_events(result.run_id).unwrap();
     assert!(
-        events.iter().any(|e| e.kind == "exec" && e.detail.as_deref() == Some("git_commit")),
+        events
+            .iter()
+            .any(|e| e.kind == "exec" && e.detail.as_deref() == Some("git_commit")),
         "the commit was spawned under containment: {events:?}"
     );
     assert_eq!(
@@ -163,7 +165,8 @@ async fn a_git_write_under_read_only_is_refused_before_anything_spawns() {
     )]]);
 
     let result = run_with(
-        &contract(dir.path()).with_contained_exec(SandboxConfig::new().with_mode(ExecMode::ReadOnly)),
+        &contract(dir.path())
+            .with_contained_exec(SandboxConfig::new().with_mode(ExecMode::ReadOnly)),
         &provider,
         &store,
         &Policy::permissive(),

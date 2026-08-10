@@ -1320,6 +1320,7 @@ impl Shell {
                         sb.containment.config.allow_network,
                         &roots,
                         &stage.argv,
+                        sb.containment.proxy,
                     )
                     .1
                 }
@@ -1354,7 +1355,14 @@ impl Shell {
                     &planned.cwd,
                     sb.containment.config.allow_network,
                     &roots,
+                    sb.containment.proxy,
                 );
+                // 0.48.0 — and the command is told where to send its traffic. The
+                // sandbox permits the proxy and nothing else, so a stage that
+                // ignores these reaches nothing rather than reaching everything.
+                for (k, v) in crate::sandbox::proxy_env(sb.containment.proxy) {
+                    cmd.env(k, v);
+                }
             }
 
             // A detached line's stages go into containment of their own, and a

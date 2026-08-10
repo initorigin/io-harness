@@ -212,7 +212,9 @@ async fn a_contained_handle_cannot_write_outside_the_workspace() {
     // an absent file.
     let events = store.sandbox_events(result.run_id).unwrap();
     assert!(
-        events.iter().any(|e| e.kind == "exec" && e.detail.as_deref() == Some(line.as_str())),
+        events
+            .iter()
+            .any(|e| e.kind == "exec" && e.detail.as_deref() == Some(line.as_str())),
         "the handle's line was recorded as a contained exec: {events:?}"
     );
     assert!(
@@ -441,4 +443,3 @@ async fn a_handle_takes_the_cpu_cap_a_foreground_stage_takes() {
         "the CPU cap reached the handle's stage and ended it: {handle:?}"
     );
 }
-

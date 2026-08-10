@@ -138,11 +138,6 @@ impl EgressProxy {
         self.addr
     }
 
-    /// The proxy URL for `HTTP_PROXY` and its siblings.
-    pub(crate) fn url(&self) -> String {
-        format!("http://{}", self.addr)
-    }
-
     /// Every decision made since the last drain, in the order they were made.
     pub(crate) fn drain(&self) -> Vec<Dial> {
         let mut out = Vec::new();
@@ -166,13 +161,20 @@ async fn serve(
         return Ok(());
     };
     let Some((host, port, connect)) = target_of(&head) else {
-        respond(&mut client, 400, "this proxy speaks CONNECT and absolute-form HTTP").await;
+        respond(
+            &mut client,
+            400,
+            "this proxy speaks CONNECT and absolute-form HTTP",
+        )
+        .await;
         return Ok(());
     };
 
     let target = format!("{host}:{port}");
     let verdict = {
-        let guard = policy.read().map_err(|_| Error::Config("policy lock".into()))?;
+        let guard = policy
+            .read()
+            .map_err(|_| Error::Config("policy lock".into()))?;
         guard.check(Act::Net, &target)
     };
     let allowed = verdict.effect == Effect::Allow;
@@ -219,7 +221,10 @@ async fn serve(
     } else {
         // Absolute-form: the head is the request, and it goes on to the origin as
         // it arrived. Anything already read past it goes with it.
-        upstream.write_all(head.as_bytes()).await.map_err(Error::Io)?;
+        upstream
+            .write_all(head.as_bytes())
+            .await
+            .map_err(Error::Io)?;
         if !rest.is_empty() {
             upstream.write_all(&rest).await.map_err(Error::Io)?;
         }
@@ -315,7 +320,10 @@ mod tests {
     #[test]
     fn absolute_form_defaults_to_port_80_and_is_not_a_connect() {
         let head = "GET http://example.com/index.html HTTP/1.1\r\n\r\n";
-        assert_eq!(target_of(head), Some(("example.com".to_string(), 80, false)));
+        assert_eq!(
+            target_of(head),
+            Some(("example.com".to_string(), 80, false))
+        );
         let ported = "GET http://example.com:8080/x HTTP/1.1\r\n\r\n";
         assert_eq!(
             target_of(ported),
@@ -360,12 +368,9 @@ mod tests {
     }
 
     async fn proxy_for(policy: Policy) -> EgressProxy {
-        EgressProxy::start(
-            Arc::new(RwLock::new(policy)),
-            Arc::new(AtomicU32::new(7)),
-        )
-        .await
-        .unwrap()
+        EgressProxy::start(Arc::new(RwLock::new(policy)), Arc::new(AtomicU32::new(7)))
+            .await
+            .unwrap()
     }
 
     /// Speak CONNECT to the proxy and return its status line.

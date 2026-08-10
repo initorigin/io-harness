@@ -326,7 +326,10 @@ impl GitCmd {
     /// module builds the argv: a reader is what `--no-optional-locks` is for, and
     /// a mode is what it is declared under.
     pub(crate) fn reads_only(&self) -> bool {
-        matches!(self, Self::Status { .. } | Self::Diff { .. } | Self::Log { .. })
+        matches!(
+            self,
+            Self::Status { .. } | Self::Diff { .. } | Self::Log { .. }
+        )
     }
 
     /// The subcommand and its fixed options — everything this module chose, with
@@ -574,6 +577,7 @@ impl<'a> Git<'a> {
                     c.config.allow_network,
                     &roots,
                     &argv,
+                    c.proxy,
                 )
                 .1
             }
@@ -591,6 +595,7 @@ impl<'a> Git<'a> {
                     &self.workdir,
                     c.config.allow_network,
                     &roots,
+                    c.proxy,
                 )
             }
             None => None,
