@@ -156,7 +156,7 @@ tasks:
   summary: Scope the sandbox to the proxy and nothing else, and put it in the command's environment.
   why_required: A proxy a payload can dial past is a convention, not a boundary. This task is what makes
     the difference, and F7 is the only criterion that can tell the two apart.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.48.0-T04
   acceptance_criteria:
@@ -173,13 +173,23 @@ tasks:
   - src/sandbox/linux.rs
   - src/sandbox.rs
   - tests/egress.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test exec_contained` — exit 0, 21 passed: a named host reached through the proxy with
+    its dial row, an unnamed one refused by the policy with the rule named, and a direct dial past the
+    proxy refused by the kernel (F7).'
+  - 'THE FAULT AND HOW IT WAS FOUND: curl exited 7 with no dial row, which read as bad SBPL. Driving sandbox-exec
+    directly against a four-line profile with a real listener, all four candidate forms returned HTTP
+    200 including the one already shipped -- eliminating syntax by measurement. The backends rebuild the
+    RunSpec for their wrapper argv and dropped the proxy on the way, so the profile permitted the address
+    while the command was never told to use it.'
+  - 'Sabotage: emit `(allow network*)` beside the loopback rule -- F7 FAILED ALONE while both proxy tests
+    still passed, which is exactly the distinction F7 exists to make.'
 - id: US-IO-HARNESS-0.48.0-T06
   summary: Prefer a proxy-capable rung for a run whose policy names hosts.
   why_required: The namespace rungs cannot reach the host's loopback, so without this a per-host run is
     silently given a rung that cannot serve it. This is the honesty rule of the release and it is decided
     in one pure function.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.48.0-T05
   acceptance_criteria:
@@ -195,13 +205,19 @@ tasks:
   - src/sandbox/linux.rs
   - src/sandbox.rs
   - tests/egress.rs
-  evidence: []
+  evidence:
+  - '`cargo test --lib sandbox::linux` — exit 0, 16 passed, including the F8 table over abi x bwrap x
+    unshare x deny x proxied.'
+  - 'Sabotage: let a proxied run take a namespace rung — `a_proxied_run_takes_a_rung_that_can_reach_its_proxy`
+    FAILED alone.'
+  - The negative control inside F8 re-derives all 40 of 0.47.0's rows and requires them unchanged when
+    `proxied` is false.
 - id: US-IO-HARNESS-0.48.0-T07
   summary: Report the proxy as advisory where it is advisory.
   why_required: On the portable floor and on Windows the proxy is an environment variable and nothing
     more. A boundary that is reported as enforced where it is not is the defect 0.40.0 shipped, and this
     release must not repeat it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.48.0-T05
   acceptance_criteria:
@@ -217,13 +233,17 @@ tasks:
   - src/sandbox.rs
   - src/run.rs
   - tests/egress.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test prompt` — exit 0, 19 passed, including the advisory wording.'
+  - 'FINDING: the first sabotage of F9 FAILED NOTHING. The test branched on this host''s backend, which
+    always denies egress here, so the advisory arm was never exercised. `floor_only()` forces it on every
+    host; the re-run sabotage then FAILED `the_floor_is_told_its_proxy_is_advisory` by name.'
 - id: US-IO-HARNESS-0.48.0-T08
   summary: Bring every documentation surface to what the code now does.
   why_required: '`docs/CONTRACT.md` states that handles are uncontained and `src/state.rs:809` states
     that there is no dial to observe. Both become false in this release, and a checked-in surface that
     contradicts the code is a defect the drift tests exist to catch.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.48.0-T03
   - US-IO-HARNESS-0.48.0-T07
@@ -247,13 +267,18 @@ tasks:
   - src/state.rs
   - README.md
   - CHANGELOG.md
-  evidence: []
+  evidence:
+  - '`cargo test --test docs_drift --test changelog` — exit 0, 15 + 5 passed.'
+  - '`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0 after
+    fixing FOUR intra-doc link errors stable cargo doc does not report.'
+  - docs/CONTRACT.md, README.md, src/lib.rs, CHANGELOG.md and the src/state.rs comment this release falsified
+    are all updated in this release.
 - id: US-IO-HARNESS-0.48.0-T09
   summary: Run every gate and measure what the release claims about numbers.
   why_required: The release claims a flat dependency count, an unchanged public API, no DDL, and an affordable
     per-dial overhead. Each is a claim about a number and none of them is true until it has been measured
     on this tree.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.48.0-T08
   acceptance_criteria:
@@ -289,7 +314,15 @@ tasks:
     '
   files:
   - docs/public-api.txt
-  evidence: []
+  evidence:
+  - '`cargo test` (default features) — exit 0, 79 suites, 1,572 passed, 415 doctests.'
+  - '`cargo test --all-features` — exit 0, 79 suites, 1,658 passed, 418 doctests.'
+  - '`cargo fmt --check` exit 0; `cargo clippy --all-targets --all-features -- -D warnings` exit 0.'
+  - '`cargo tree` — 402, unchanged (N1). `git diff main -- docs/public-api.txt` EMPTY (N3). `git diff
+    main -- src/state.rs` is comment-only, no DDL, CHECKPOINT_FORMAT unmoved at 7 (N4).'
+  - '`cargo test --test cross_version_0_29_0 -- --ignored` — exit 0, 1 passed (O2).'
+  - '`cargo package --locked` — exit 0, 1,616,667 bytes.'
+  - 'N5 measured: direct 0.121 ms, permitted 0.420 ms, refused 0.271 ms per dial over 30 iterations.'
 - id: US-IO-HARNESS-0.48.0-T10
   summary: Ask a classifying turn one question instead of two that disagree.
   why_required: The system block tells the first step of a conversational turn to answer and call no tool
