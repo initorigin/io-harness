@@ -407,7 +407,7 @@ pub(crate) mod job {
         // named the way every command is named — `cargo`, `rustc`, `npm` — and
         // the parent of a bare filename is the empty path, so the one directory
         // an AppContainer cannot start without was being granted to nothing.
-        let program_dir = super::resolve_program(&spec.argv[0])
+        let program_dir = crate::sandbox::resolve_program(&spec.argv[0])
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
             .filter(|p| !p.as_os_str().is_empty());
         let system_root = std::env::var_os("SystemRoot").map(std::path::PathBuf::from);
