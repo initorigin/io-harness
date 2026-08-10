@@ -204,12 +204,31 @@ pub(crate) enum Grant {
     Full,
 }
 
+/// How far into a directory one grant is meant to reach.
+///
+/// Windows inheritance is static: a child carries the DACL it was created with,
+/// so an inheritable ACE added to a directory reaches what that directory gains
+/// *later* and nothing it already holds. Re-propagating to what is already there
+/// is a second, much more expensive act — it rewrites every object under the
+/// path — and it is not always the right one.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// The directory and everything already inside it. What a path the run
+    /// *names* needs: a workspace whose source files predate the run, a registry
+    /// cache whose crates were downloaded last week.
+    Tree,
+    /// The directory itself, and what it comes to hold afterwards.
+    DirectoryOnly,
+}
+
 /// One granted path.
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GrantedPath {
     pub(crate) path: PathBuf,
     pub(crate) grant: Grant,
+    pub(crate) reach: Reach,
 }
 
 /// The grant set for one run.
@@ -253,6 +272,7 @@ pub(crate) fn grants(
         } else {
             Grant::Full
         },
+        reach: Reach::Tree,
     });
 
     if mode != ExecMode::ReadOnly {
@@ -260,15 +280,28 @@ pub(crate) fn grants(
             out.push(GrantedPath {
                 path: root.clone(),
                 grant: Grant::Full,
+                reach: Reach::Tree,
             });
         }
     }
     // The temporary directory in every mode: a toolchain that cannot open a
     // temporary file cannot run at all. The same allowance every other backend
     // makes.
+    //
+    // **`DirectoryOnly`, and it is a boundary decision before it is a cost.**
+    // What a toolchain needs here is the ability to *create* a temporary file,
+    // and a new file inherits the ACE from the directory. What it does not need
+    // — and what a default-deny container has no business handing over — is
+    // every temporary file every other program on the machine has already
+    // written. `%TEMP%` is shared, it is large, and it is being written to by
+    // other processes while this runs, which made re-propagating it the one
+    // grant in this set that was both expensive and racy: a payload whose ACE
+    // this crate's own test could read a moment earlier was refused, because a
+    // concurrent run's propagation had recomputed that file's DACL in between.
     out.push(GrantedPath {
         path: tmp.to_path_buf(),
         grant: Grant::Full,
+        reach: Reach::DirectoryOnly,
     });
 
     // Read-execute on the toolchain homes this machine names, and the reason is a
@@ -289,6 +322,7 @@ pub(crate) fn grants(
         out.push(GrantedPath {
             path: dir.clone(),
             grant: Grant::ReadExecute,
+            reach: Reach::Tree,
         });
     }
 
@@ -300,6 +334,7 @@ pub(crate) fn grants(
         out.push(GrantedPath {
             path: dir.to_path_buf(),
             grant: Grant::ReadExecute,
+            reach: Reach::Tree,
         });
     }
     out
@@ -458,7 +493,7 @@ pub(crate) mod job {
             }
         };
         for g in &granted {
-            let Err(e) = grant_for(&g.path, profile.sid(), g.grant) else {
+            let Err(e) = grant_for(&g.path, profile.sid(), g.grant, g.reach) else {
                 continue;
             };
             // **A read-execute grant that fails is not fatal, and this is not a
@@ -1093,6 +1128,18 @@ mod tests {
         assert_eq!(find(&g, r"C:\cache\cargo").unwrap().grant, Grant::Full);
         assert_eq!(find(&g, r"C:\cache\npm").unwrap().grant, Grant::Full);
         assert_eq!(find(&g, r"C:\Temp").unwrap().grant, Grant::Full);
+
+        // A path the run named reaches what is already inside it; the shared
+        // temporary directory is granted for what the run will *create* there,
+        // and re-propagating it is the one grant in this set that was both
+        // expensive and racy.
+        assert_eq!(find(&g, r"C:\work").unwrap().reach, Reach::Tree);
+        assert_eq!(find(&g, r"C:\cache\cargo").unwrap().reach, Reach::Tree);
+        assert_eq!(
+            find(&g, r"C:\Users\someone\.rustup").unwrap().reach,
+            Reach::Tree
+        );
+        assert_eq!(find(&g, r"C:\Temp").unwrap().reach, Reach::DirectoryOnly);
         // The two places a process needs in order to start at all, and no more
         // than read-execute on either.
         assert_eq!(find(&g, r"C:\tools\bin").unwrap().grant, Grant::ReadExecute);

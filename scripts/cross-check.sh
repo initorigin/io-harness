@@ -174,6 +174,8 @@ if have_target "$WINDOWS_TARGET"; then
 pub mod shim {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Grant { ReadExecute, Full }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Reach { Tree, DirectoryOnly }
     pub struct TempDir(std::path::PathBuf);
     impl TempDir { pub fn path(&self) -> &std::path::Path { &self.0 } }
     pub fn tempdir() -> std::io::Result<TempDir> { Ok(TempDir(std::path::PathBuf::new())) }
@@ -184,6 +186,7 @@ RS
         # The module's own test block is KEPT: a signature change that only breaks
         # a `cfg(windows)` test is one of the three defects this script exists for.
         sed -e 's|crate::sandbox::windows::Grant|crate::shim::Grant|g' \
+            -e 's|crate::sandbox::windows::Reach|crate::shim::Reach|g' \
             -e 's|tempfile::tempdir()|crate::shim::tempdir()|g' \
             "$ROOT/src/sandbox/appcontainer.rs" >"$WORK/ac_raw.rs"
         elide_tracing "$WORK/ac_raw.rs" "$WORK/appcontainer.rs"

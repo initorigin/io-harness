@@ -83,8 +83,9 @@ pub(crate) mod win {
         DeriveAppContainerSidFromAppContainerName,
     };
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, FreeSid, WinCapabilityInternetClientSid, ACL,
-        DACL_SECURITY_INFORMATION, PSID, SID_AND_ATTRIBUTES, UNPROTECTED_DACL_SECURITY_INFORMATION,
+        CreateWellKnownSid, EqualSid, FreeSid, GetAce, WinCapabilityInternetClientSid,
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, PSID, SID_AND_ATTRIBUTES,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
@@ -125,6 +126,20 @@ pub(crate) mod win {
         }
     }
 
+    /// How far into a directory a grant is meant to reach.
+    ///
+    /// Mirrors `super::super::windows::Reach`, for the same reason `Access`
+    /// mirrors `Grant`: the decision is portable data asserted on the build host
+    /// and this is where it becomes a Win32 flag.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Reach {
+        /// The directory and everything already inside it.
+        Tree,
+        /// The directory itself. What it *later* contains inherits the ACE; what
+        /// it already contains keeps whatever it had.
+        DirectoryOnly,
+    }
+
     /// Apply one entry of the grant set `super::super::windows::grants` derived.
     ///
     /// The bridge exists so the *decision* and the *ACE mask* stay separate
@@ -135,12 +150,17 @@ pub(crate) mod win {
         path: &Path,
         sid: PSID,
         g: crate::sandbox::windows::Grant,
+        r: crate::sandbox::windows::Reach,
     ) -> io::Result<()> {
         let access = match g {
             crate::sandbox::windows::Grant::ReadExecute => Access::ReadExecute,
             crate::sandbox::windows::Grant::Full => Access::Full,
         };
-        grant(path, sid, access)
+        let reach = match r {
+            crate::sandbox::windows::Reach::Tree => Reach::Tree,
+            crate::sandbox::windows::Reach::DirectoryOnly => Reach::DirectoryOnly,
+        };
+        grant(path, sid, access, reach)
     }
 
     /// An AppContainer profile, and the SID it is addressed by.
@@ -301,6 +321,68 @@ pub(crate) mod win {
         }
     }
 
+    /// What `path`'s DACL already allows `sid`, if it names it at all.
+    ///
+    /// `None` is "this SID appears in no allow-ACE on this object", which is the
+    /// only thing that separates a grant that never reached a file from a grant
+    /// that reached it and was not enough. Every Windows failure this release
+    /// has debugged was one of those two, and until this existed the difference
+    /// was inferred from a payload that failed.
+    pub(crate) fn granted_mask(path: &Path, sid: PSID) -> Option<u32> {
+        let wpath = wide(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = std::ptr::null_mut();
+        // SAFETY: `wpath` is a live NUL-terminated path and every out-parameter
+        // is a live local; the owner, group and SACL outs are null, which the
+        // API documents as "do not return this".
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wpath.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return None;
+        }
+        let _sd = LocalGuard(sd);
+
+        if dacl.is_null() {
+            return None;
+        }
+        // SAFETY: `dacl` points into the descriptor `_sd` still owns.
+        let count = unsafe { (*dacl).AceCount };
+        for i in 0..count {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `i` is below the ACE count just read from this ACL.
+            if unsafe { GetAce(dacl, u32::from(i), &mut ace) } == 0 {
+                continue;
+            }
+            let allow = ace.cast::<ACCESS_ALLOWED_ACE>();
+            // Only an allow-ACE (`ACCESS_ALLOWED_ACE_TYPE`, 0) carries a SID at
+            // this offset; reading another type through this layout would be
+            // reading the wrong bytes.
+            // SAFETY: `allow` is the ACE `GetAce` just returned.
+            if unsafe { (*allow).Header.AceType } != 0 {
+                continue;
+            }
+            // SAFETY: `SidStart` is the first word of the ACE's inline SID.
+            let ace_sid = unsafe { std::ptr::addr_of!((*allow).SidStart) } as PSID;
+            // SAFETY: both are live SIDs, one inside the ACL and one the
+            // caller's.
+            if unsafe { EqualSid(ace_sid, sid) } != 0 {
+                // SAFETY: as above.
+                return Some(unsafe { (*allow).Mask });
+            }
+        }
+        None
+    }
+
     /// Grant `sid` `access` to `path`, by adding one ACE to its DACL.
     ///
     /// Adding, never replacing: `GRANT_ACCESS` merges with what is already there,
@@ -316,7 +398,41 @@ pub(crate) mod win {
     /// directory. A missing grant surfaces as a payload that cannot start, which
     /// reads like a broken payload rather than a missing grant — hence the
     /// tracing below.
-    pub(crate) fn grant(path: &Path, sid: PSID, access: Access) -> io::Result<()> {
+    pub(crate) fn grant(path: &Path, sid: PSID, access: Access, reach: Reach) -> io::Result<()> {
+        // **A grant this SID already has is not applied again, and that is a
+        // correctness fix before it is a saving.**
+        //
+        // Re-propagating rewrites the DACL of every object under `path`. Doing
+        // that to a shared tree while another process is reading one of those
+        // DACLs is how a file that demonstrably carries the ACE is refused a
+        // moment later: the rewrite recomputes each child from the parent's
+        // inheritable set, and a reader in the window between sees the object
+        // mid-flight. `windows-latest` runs twenty test processes at once, each
+        // of them granting `%TEMP%` and `CARGO_HOME`, which is exactly that
+        // window twenty times over — and it is what the depth test caught,
+        // reading the ACE off a file that then could not be executed.
+        //
+        // The container SID is derived from a fixed profile name, so it is the
+        // same SID on every run of every process on the machine: the first run
+        // pays for the walk and no later one repeats it.
+        //
+        // The comparison is against the mask this function itself writes, which
+        // is why it can be a plain bit test rather than a generic-rights
+        // mapping: the ACE being looked for is the one a previous run added to
+        // this very path, in the same form. An ACE that says the same thing in
+        // its mapped form is not recognised and costs one more walk, which is
+        // the safe direction to be wrong in.
+        if let Some(have) = granted_mask(path, sid) {
+            let want = access.mask();
+            if have & want == want {
+                tracing::debug!(
+                    path = %path.display(), ?access,
+                    "sandbox: the AppContainer already has this grant"
+                );
+                return Ok(());
+            }
+        }
+
         let wpath = wide(path);
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut sd = std::ptr::null_mut();
@@ -384,17 +500,24 @@ pub(crate) mod win {
         // `windows-latest`, one flag.
         //
         // The cost is real and is not hidden: propagation walks the granted tree,
-        // so granting a large directory is O(entries in it) per run. That is what
-        // N5 measures on this backend.
+        // so the *first* grant of a large directory is O(entries in it). It is
+        // paid once per machine rather than once per run — the check at the head
+        // of this function returns early on every later run — and `Reach` is what
+        // decides whether a path is worth walking at all. That is what N5
+        // measures on this backend.
         //
         // SAFETY: `wpath` is live, `merged` is the ACL just built and still
         // owned by `_merged`, and the owner, group and SACL arguments are null,
         // which with the DACL bits alone means "change only the DACL".
+        let propagate = match reach {
+            Reach::Tree => UNPROTECTED_DACL_SECURITY_INFORMATION,
+            Reach::DirectoryOnly => 0,
+        };
         let rc = unsafe {
             SetNamedSecurityInfoW(
                 wpath.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                DACL_SECURITY_INFORMATION | propagate,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 merged,
@@ -675,7 +798,7 @@ pub(crate) mod win {
 /// quietly recording the denial as evidence.
 #[cfg(all(test, windows))]
 mod tests {
-    use super::win::{grant, Access, Profile, Spawned};
+    use super::win::{grant, granted_mask, Access, Profile, Reach, Spawned};
     use std::io::Read;
     use std::os::windows::process::CommandExt;
 
@@ -694,7 +817,7 @@ mod tests {
                  fallback_scope Trigger A: the release's central mechanism is unavailable here."
             )
         });
-        grant(cwd, profile.sid(), Access::Full)
+        grant(cwd, profile.sid(), Access::Full, Reach::Tree)
             .unwrap_or_else(|e| panic!("could not grant the workspace to the container: {e}"));
 
         let out_path = cwd.join("io-harness-out.txt");
@@ -847,8 +970,9 @@ mod tests {
         let work = tempfile::tempdir().expect("tempdir");
 
         let profile = Profile::create(&name("toolchain"), false).expect("profile");
-        grant(work.path(), profile.sid(), Access::Full).expect("grant the workspace");
-        grant(&bin_dir, profile.sid(), Access::ReadExecute).expect("grant the binary's directory");
+        grant(work.path(), profile.sid(), Access::Full, Reach::Tree).expect("grant the workspace");
+        grant(&bin_dir, profile.sid(), Access::ReadExecute, Reach::Tree)
+            .expect("grant the binary's directory");
 
         let out_path = work.path().join("o.txt");
         let file = std::fs::File::create(&out_path).expect("capture");
@@ -874,89 +998,6 @@ mod tests {
              its own directory granted read-and-execute. This is fallback_scope Trigger B: the \
              grant set is a discovery problem rather than a configuration one. Output: {text:?}"
         );
-    }
-
-    /// What `path`'s DACL says about `sid`, read back rather than assumed.
-    ///
-    /// `None` is "this SID appears in no allow-ACE on this object", which is the
-    /// only thing that distinguishes a grant that did not reach a file from a
-    /// grant that reached it and was not enough. Every Windows failure this
-    /// release has debugged so far has been one of those two and the difference
-    /// was guessed at.
-    fn granted_mask(
-        path: &std::path::Path,
-        sid: windows_sys::Win32::Security::PSID,
-    ) -> Option<u32> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
-        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-        use windows_sys::Win32::Security::{
-            EqualSid, GetAce, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION,
-        };
-
-        let wpath: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut sd = std::ptr::null_mut();
-        // SAFETY: `wpath` is a live NUL-terminated path and every out-parameter
-        // is a live local; the owner, group and SACL outs are null, which the API
-        // documents as "do not return this".
-        let rc = unsafe {
-            GetNamedSecurityInfoW(
-                wpath.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut dacl,
-                std::ptr::null_mut(),
-                &mut sd,
-            )
-        };
-        assert_eq!(
-            rc,
-            ERROR_SUCCESS,
-            "could not read the DACL of {}",
-            path.display()
-        );
-
-        let mut found = None;
-        if !dacl.is_null() {
-            // SAFETY: `dacl` points into the security descriptor `sd` still owns.
-            let count = unsafe { (*dacl).AceCount };
-            for i in 0..count {
-                let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
-                // SAFETY: `i` is below the ACE count just read from this ACL.
-                if unsafe { GetAce(dacl, u32::from(i), &mut ace) } == 0 {
-                    continue;
-                }
-                let allow = ace.cast::<ACCESS_ALLOWED_ACE>();
-                // Only an allow-ACE (`ACCESS_ALLOWED_ACE_TYPE`, 0) has a SID at
-                // this offset; reading any other type through this layout would
-                // be reading the wrong bytes.
-                // SAFETY: `allow` is the ACE `GetAce` just returned.
-                if unsafe { (*allow).Header.AceType } != 0 {
-                    continue;
-                }
-                // SAFETY: `SidStart` is the first word of the ACE's inline SID.
-                let ace_sid = unsafe { std::ptr::addr_of!((*allow).SidStart) }
-                    as windows_sys::Win32::Security::PSID;
-                // SAFETY: both are live SIDs — one inside the ACL, one the
-                // caller's.
-                if unsafe { EqualSid(ace_sid, sid) } != 0 {
-                    // SAFETY: as above.
-                    found = Some(unsafe { (*allow).Mask });
-                    break;
-                }
-            }
-        }
-        // SAFETY: `sd` came from `GetNamedSecurityInfoW`, which documents it as
-        // `LocalAlloc` memory, and is freed once here.
-        unsafe { LocalFree(sd) };
-        found
     }
 
     /// **How deep a grant on a directory actually goes**, read off the ACL.
@@ -990,7 +1031,7 @@ mod tests {
         let at2 = payload(&deep);
 
         let profile = Profile::create(&name("depth"), false).expect("profile");
-        grant(root.path(), profile.sid(), Access::Full).expect("grant the root");
+        grant(root.path(), profile.sid(), Access::Full, Reach::Tree).expect("grant the root");
 
         // The ACL first: a payload that fails cannot say whether the ACE was
         // missing or insufficient, and that is the question.
@@ -1037,7 +1078,7 @@ mod tests {
     fn the_wall_clock_kills_only_what_overruns() {
         let dir = tempfile::tempdir().expect("tempdir");
         let profile = Profile::create(&name("wall"), false).expect("profile");
-        grant(dir.path(), profile.sid(), Access::Full).expect("grant");
+        grant(dir.path(), profile.sid(), Access::Full, Reach::Tree).expect("grant");
         let file = std::fs::File::create(dir.path().join("o.txt")).expect("capture");
 
         // A `cmd` builtin loop, and every obvious alternative is wrong here:

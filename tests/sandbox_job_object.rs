@@ -40,11 +40,25 @@ fn bat(dir: &Path, name: &str, body: &str) -> String {
 }
 
 /// Run one batch file under `limits`, through whichever backend `config` picks.
-async fn run_bat(config: &SandboxConfig, limits: SandboxLimits, script: &str) -> SandboxOutcome {
-    let workdir = tempfile::tempdir().unwrap();
+///
+/// **The payload's own directory is the workdir, and since 0.47.0 that is
+/// load-bearing rather than tidiness.** These tests used to hand the run a fresh
+/// temporary directory and leave the batch file in a different one, which worked
+/// only because a contained Windows run re-propagated a grant across the whole of
+/// `%TEMP%` and so happened to reach a payload nobody had named. That grant is
+/// now the directory alone — the container gets what the run creates there, not
+/// every temporary file already on the machine — so a payload outside the
+/// workspace is outside the boundary, which is the behaviour these tests should
+/// have been written against in the first place.
+async fn run_bat(
+    config: &SandboxConfig,
+    limits: SandboxLimits,
+    workdir: &Path,
+    script: &str,
+) -> SandboxOutcome {
     let argv = vec!["cmd".to_string(), "/c".to_string(), script.to_string()];
     select(config)
-        .run(RunSpec::new(&argv, workdir.path(), &limits).with_network(config.allow_network))
+        .run(RunSpec::new(&argv, workdir, &limits).with_network(config.allow_network))
         .await
         .unwrap()
 }
@@ -96,7 +110,7 @@ async fn windows_reports_a_real_primitive_and_not_the_floor() {
 
     let dir = tempfile::tempdir().unwrap();
     let script = bat(dir.path(), "ok", "echo hello");
-    let out = run_bat(&SandboxConfig::new(), limits(), &script).await;
+    let out = run_bat(&SandboxConfig::new(), limits(), dir.path(), &script).await;
     assert!(out.success(), "a plain command must still run: {out:?}");
     assert!(
         matches!(
@@ -227,7 +241,7 @@ async fn the_crates_own_cargo_gate_runs_contained_and_says_what_it_could_not_rea
 async fn a_contained_run_completes_on_a_current_thread_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let script = bat(dir.path(), "flavour", "echo current-thread");
-    let out = run_bat(&SandboxConfig::new(), limits(), &script).await;
+    let out = run_bat(&SandboxConfig::new(), limits(), dir.path(), &script).await;
     assert!(
         out.success(),
         "a contained run must complete on a current-thread runtime: {out:?}"
@@ -255,6 +269,7 @@ async fn the_process_limit_stops_the_run_and_the_job_is_what_says_so() {
             max_processes: Some(1),
             ..limits()
         },
+        dir.path(),
         &script,
     )
     .await;
@@ -274,7 +289,7 @@ async fn the_process_limit_stops_the_run_and_the_job_is_what_says_so() {
     // The control that makes the assertion above mean something: the identical
     // script with no process limit runs fine, so what failed was the limit and
     // not the script.
-    let free = run_bat(&SandboxConfig::new(), limits(), &script).await;
+    let free = run_bat(&SandboxConfig::new(), limits(), dir.path(), &script).await;
     assert!(
         free.success(),
         "without the limit the same payload must succeed: {free:?}"
@@ -308,6 +323,7 @@ async fn the_memory_limit_is_a_real_bound_and_is_named_as_one() {
             max_memory_bytes: Some(512 * 1024 * 1024),
             ..limits()
         },
+        dir.path(),
         &script,
     )
     .await;
@@ -339,6 +355,7 @@ async fn the_cpu_limit_is_a_real_bound_and_is_named_as_one() {
             max_cpu_secs: Some(2),
             ..limits()
         },
+        dir.path(),
         &script,
     )
     .await;
@@ -387,6 +404,7 @@ async fn closing_the_job_kills_the_grandchild() {
             max_wall_secs: Some(2),
             ..limits()
         },
+        dir.path(),
         &outer,
     )
     .await;
@@ -417,6 +435,7 @@ async fn without_the_job_the_grandchild_survives() {
             max_wall_secs: Some(2),
             ..limits()
         },
+        dir.path(),
         &outer,
     )
     .await;
