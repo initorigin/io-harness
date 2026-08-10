@@ -55,4 +55,13 @@ release_fit:
       The narrower-of-two resolution touches every dispatch site, and 0.42.0's finding was that the
       shared serial phase those sites were assumed to have did not exist. Verify the current shape
       before writing the resolution rather than after.
+    - >
+      **Scope grew once, on 2026-08-10, and it is recorded rather than absorbed**
+      (`US-IO-HARNESS-0.48.0-I03`). A field report showed the classifying turn's system block and
+      user block contradicting each other in the same completion, and the owner ruled the fix into
+      this release: fifteen lines against `extras.classify`, a condition the system half already
+      computes, plus its tests. It is off the containment theme and carried as a stated correction.
+      The other three findings from that report became a new 0.49.0 and are not this release's.
+      The assessment stays `probable`: the addition is small, independent of the proxy, and its
+      negative control — step 2 of a promoted turn byte-identical to today — is cheap to assert.
   recommended_scope_change: null

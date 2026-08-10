@@ -6,7 +6,7 @@ tasks:
   why_required: Every later task runs a command under a mode, and until the declaration and the narrower-of-two
     resolution exist there is nothing for the git built-ins or the handles to be contained under. It is
     also the only task that adds a public trait method, so it settles the break surface first.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F5 — a call runs under the narrower of what it needs and what it was granted.** A git reader dispatched
@@ -33,13 +33,18 @@ tasks:
   - src/tools/mod.rs
   - src/run.rs
   - tests/exec_mode.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test exec_mode` — exit 0, 5 passed. Includes the mode algebra decided without a host.'
+  - 'Sabotage: resolve to the granted mode rather than the narrower one — `a_git_reader_is_narrowed_to_read_only_inside_a_writing_run`
+    FAILED, 4 others passed.'
+  - 'Sabotage: drop the pre-spawn refusal — `a_git_write_under_read_only_is_refused_before_anything_spawns`
+    FAILED, 4 others passed.'
 - id: US-IO-HARNESS-0.48.0-T02
   summary: Contain the six git built-ins under their declared mode.
   why_required: '`Git::run` spawns `git` directly with no rung, so a run''s boundary today depends on
     which tool the model picked. The release''s claim that everything a run starts is inside the boundary
     is false until this spawn site is inside it.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.48.0-T01
   acceptance_criteria:
@@ -56,12 +61,16 @@ tasks:
   - src/tools/git.rs
   - src/run.rs
   - tests/exec_mode.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test exec_mode` — exit 0, 5 passed; a commit lands under containment and the repository
+    is untouched under ReadOnly.'
+  - '`cargo test --test git` — exit 0, 5 passed, after the argv positions were re-asserted for `--no-optional-locks`.'
+  - '`cargo test` (default features) — exit 0, 415 lib tests and every integration suite green.'
 - id: US-IO-HARNESS-0.48.0-T03
   summary: Contain a `shell_start` handle, per stage, with the resource caps and not the wall clock.
   why_required: This is the execution path the release is named for and the one `docs/CONTRACT.md` documents
     as uncontained. Without it an agent contains `exec` and escapes with `shell_start`.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.48.0-T01
   acceptance_criteria:
@@ -95,7 +104,14 @@ tasks:
   - src/tools/shell.rs
   - src/run.rs
   - tests/handles.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test contained_handles` — exit 0, 5 passed.'
+  - 'Sabotage: pass `None` for the handle''s sandbox (0.47.0''s behaviour) — F1, F2 and F3''s caps arm
+    all FAILED by name; both negative controls still passed.'
+  - 'Finding: the first draft of F1 and F2 passed against a handle that had been killed before it could
+    act. `Handles` kills on drop at run end, and a contained stage pays `sandbox-exec`''s startup while
+    an uncontained one does not, so the confinement assertions were satisfied by a dead process. Every
+    confinement assertion is now paired with a write that must land.'
 - id: US-IO-HARNESS-0.48.0-T04
   summary: Build the loopback egress proxy the run owns, and record every dial.
   why_required: Per-host egress has no mechanism at all until a component exists that can be asked about
@@ -265,4 +281,32 @@ tasks:
     '
   files:
   - docs/public-api.txt
+  evidence: []
+- id: US-IO-HARNESS-0.48.0-T10
+  summary: Ask a classifying turn one question instead of two that disagree.
+  why_required: The system block tells the first step of a conversational turn to answer and call no tool
+    while the user block in the same completion tells it to start by grepping and to call a tool. The
+    model resolves the contradiction in its reply, which is what an embedder reported from the field.
+    It is wrong on every conversational turn shipping today (US-IO-HARNESS-0.48.0-I03).
+  status: todo
+  depends_on: []
+  acceptance_criteria:
+  - '**F10 — a classifying turn is asked one question, not two that disagree** (`US-IO-HARNESS-0.48.0-I03`).
+    The first request of a turn whose contract carries `Verification::None` contains no imperative to
+    call a tool and no success-criterion scaffolding: the strings "Call a tool to make progress toward
+    the success criterion", "(nothing yet — start by grepping or finding)" and "Success criterion:" are
+    all absent from its `user` block, while the operator''s own words are present. The negative controls
+    are what make it a change of one thing: **step 2 of a promoted turn is byte-identical to what this
+    build sends today**, and so is step 1 of a turn under any other `Verification`. And 0.44.0''s boundary
+    marks the same prefix on a classifying turn as on a promoted one — asserted rather than assumed, because
+    `cache_boundary_for` is handed this very string and a second user-prompt shape could silently change
+    what is cached while nothing fails. Sabotage: send the workspace user prompt on the classifying step,
+    which is today''s behaviour, under which the imperative reappears and only this fails; and separately,
+    send the conversational prompt on **every** step, under which the promoted turn''s byte-identity control
+    fails and only that fails.
+
+    '
+  files:
+  - src/run.rs
+  - tests/prompt.rs
   evidence: []

@@ -195,6 +195,25 @@ scope:
     attempt, and it is counted. Correcting the sentence that this release falsifies is a scope item
     because 0.45.0 paid for finding one of those at sealing time.
   - >
+    **A correction that is not containment, and is stated as a correction rather than dressed up as
+    one** (`US-IO-HARNESS-0.48.0-I03`). On a classifying turn the system block and the user block
+    contradict each other in the same completion: 0.37.0 gave that step
+    `CONVERSATIONAL_ENDING` — "If a plain answer is the whole of what is wanted, write that answer
+    and call no tool" — while `workspace_user_prompt` (`src/run.rs:11986`) is unconditional at both
+    call sites (`:4450`, `:6064`) and sends "(nothing yet — start by grepping or finding)" and
+    "Call a tool to make progress toward the success criterion." Field evidence from an embedder
+    driving `Session::turn`: the operator typed "Hi", the turn was correctly a
+    `TurnKind::Reply` with zero steps, and the reply text was the model resolving the contradiction
+    out loud — "its a Hi reply to give and no run so just simply answer". 0.37.0 fixed one half of a
+    two-half problem and the other half has shipped ever since. The fix is a conversational
+    counterpart to `workspace_user_prompt`, selected by the condition that already selects the
+    system half — `extras.classify` (`src/session.rs:785`) and `step == start_step` — carrying the
+    operator's words and the conversation seed and nothing else. **Every later step of a promoted
+    turn keeps today's prompt exactly**, on 0.37.0's own reasoning: permitting an answer is a
+    decision about a turn's opening, not a licence to stop at prose on step nine. It rides this
+    release because it is fifteen lines against a condition already computed, and because it is
+    wrong on every conversational turn shipping today.
+  - >
     **The reporting surfaces, updated to describe what now happens.** `docs/CONTRACT.md` (the
     handles paragraph at `:1107`, the platform tables, and a new section on what the proxy does and
     does not prove per rung), the crate-root prose in `src/lib.rs`, the README table, and
@@ -329,6 +348,21 @@ acceptance:
     enforced. A payload that ignores the variables reaches the network, and the test asserts that
     this is what the crate says will happen. Sabotage: report the per-host boundary as enforced on
     the floor, under which the assertion on the reported wording fails and only this fails.
+  - >
+    **F10 — a classifying turn is asked one question, not two that disagree**
+    (`US-IO-HARNESS-0.48.0-I03`). The first request of a turn whose contract carries
+    `Verification::None` contains no imperative to call a tool and no success-criterion
+    scaffolding: the strings "Call a tool to make progress toward the success criterion",
+    "(nothing yet — start by grepping or finding)" and "Success criterion:" are all absent from its
+    `user` block, while the operator's own words are present. The negative controls are what make it
+    a change of one thing: **step 2 of a promoted turn is byte-identical to what this build sends
+    today**, and so is step 1 of a turn under any other `Verification`. And 0.44.0's boundary marks
+    the same prefix on a classifying turn as on a promoted one — asserted rather than assumed,
+    because `cache_boundary_for` is handed this very string and a second user-prompt shape could
+    silently change what is cached while nothing fails. Sabotage: send the workspace user prompt on
+    the classifying step, which is today's behaviour, under which the imperative reappears and only
+    this fails; and separately, send the conversational prompt on **every** step, under which the
+    promoted turn's byte-identity control fails and only that fails.
   non_functional:
   - >
     **N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402**
