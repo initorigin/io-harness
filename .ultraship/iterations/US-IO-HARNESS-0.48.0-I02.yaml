@@ -1,0 +1,68 @@
+id: US-IO-HARNESS-0.48.0-I02
+timestamp: 2026-08-10T15:58:39Z
+category:
+  - implementation-level
+trigger: >
+  F3 measured a handle against a foreground `shell` line being wall-capped and attributed a `Cap`.
+  No `shell` line has ever been either.
+evidence:
+  - >
+    **`max_wall_secs` is enforced in exactly one place, and it is not on the `shell` path.**
+    `src/sandbox.rs:1475` reads the cap inside `run_capped` — the sandbox's own runner — and answers
+    an expiry with `cap_hit: Some(Cap::Wall)`. `exec` reaches that runner. The `shell` tool cannot:
+    it pipes its stages into one another, so it owns every `Child` and spawns them itself, taking
+    only `wrap_argv`, `contain_command` and `apply_rlimits`.
+  - >
+    **`apply_rlimits` applies the CPU and open-file limits and nothing else** (`src/sandbox.rs`,
+    `RLIMIT_CPU` and `RLIMIT_NOFILE`). There is no wall timer and no memory monitor on that path.
+  - >
+    **`docs/CONTRACT.md:1112` already documents this**, in the paragraph on a contained `shell`
+    stage being contained slightly less than an `exec` command: the rlimits apply, the memory
+    monitor does not, and a stage killed by a cap is not attributed to a `Cap`. The contract was
+    written against a behaviour the crate's own documentation contradicts.
+before:
+  scope:
+    - The wall-clock cap is deliberately withheld from a handle
+  assumptions:
+    - >
+      That a foreground `shell` line is killed at `max_wall_secs` and reported as a cap hit, so a
+      handle surviving it would be a visible difference between the two shell paths.
+  implementation: >
+    F3 proven by the contrast between a handle and a foreground `shell` line under the same config.
+change:
+  summary: >
+    F3's control becomes `exec`, which really is killed at `max_wall_secs` and really does report
+    `Cap::Wall`, and F3 gains a second arm asserting that the caps a handle *does* take are applied
+    — an `RLIMIT_CPU` kill on unix. The rule is unchanged and is now stated as what it is: the wall
+    clock reaches neither shell path, so a handle cannot be killed by it, and the caps that do reach
+    a foreground stage reach a handle's stages identically.
+  added:
+    - "F3 arm: an RLIMIT_CPU kill proves a handle takes the caps it is said to take"
+  removed: []
+  deferred: []
+  replaced:
+    - >
+      F3's control arm: a wall-capped foreground `shell` line becomes a wall-capped `exec` command.
+impact:
+  products:
+    - io-harness
+  versions:
+    - 0.48.0
+  tasks:
+    - US-IO-HARNESS-0.48.0-T03
+  dependencies: []
+  resource_effect: >
+    Neutral. One criterion is measured against a control that exists.
+versioning:
+  previous_target: 0.48.0
+  new_target: 0.48.0
+  consequence: no-version-change
+approval:
+  source: user
+  reference: >
+    Owner chose "Control becomes `exec`" over implementing wall-clock enforcement for foreground
+    `shell` stages — which would have been unscoped new behaviour changing every contained shell
+    line — and over dropping the caps arm, in session on 2026-08-10.
+canonical_updates:
+  - products/io-harness/releases/0.48.0.yaml
+  - products/io-harness/execution/tasks.yaml

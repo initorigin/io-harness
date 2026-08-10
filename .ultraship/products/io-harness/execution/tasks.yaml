@@ -80,12 +80,15 @@ tasks:
     second stage''s write lands and only this fails.
 
     '
-  - '**F3 — a handle takes the resource caps and not the wall clock.** Under a `SandboxConfig` whose `max_wall_secs`
-    is short, a handle started before that deadline is still running and still polled after it, while
-    a foreground `shell` line under the same config is killed and reported as a cap hit naming the resource.
-    The memory cap still applies to a handle, asserted by a stage that exceeds it being killed. Sabotage:
-    apply `max_wall_secs` to a handle, under which the handle is dead at the second poll and only this
-    fails.
+  - '**F3 — a handle takes the resource caps a foreground `shell` stage takes, and the wall clock reaches
+    neither.** Under a `SandboxConfig` whose `max_wall_secs` is one second, a handle started and polled
+    well after that deadline is still running, while the same run''s `exec` of a sleeping command is killed
+    and reported as a cap hit naming `Cap::Wall` — the wall clock is enforced by the sandbox''s own runner,
+    which `exec` uses and no `shell` path does. The caps a handle *does* take are asserted to apply: on
+    unix, a stage under `max_cpu_secs = 1` that spins is killed by `RLIMIT_CPU`. Sabotage: drop `apply_rlimits`
+    from the handle''s spawn, under which the spinning stage runs on and only this fails. **`US-IO-HARNESS-0.48.0-I02`**:
+    the control was a wall-capped foreground `shell` line, which no release has ever produced — `max_wall_secs`
+    lives in `run_capped` and the `shell` tool does not reach it.
 
     '
   files:

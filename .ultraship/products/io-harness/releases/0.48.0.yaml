@@ -110,12 +110,14 @@ scope:
     reaper records the handle finished or `shell_kill` ends it, so a handle's containment has a
     beginning and an end in the trace like every other contained command.
   - >
-    **The wall-clock cap is deliberately withheld from a handle, and that is a stated rule rather
-    than an omission.** `SandboxLimits::max_wall_secs` bounds a wedged *call*; a handle exists
-    precisely because its work outlives the call, and a dev server killed at 120 seconds by the
-    sandbox would be a containment feature deleting the tool's purpose. The memory, CPU and
-    open-file caps still apply. `docs/CONTRACT.md` states which caps a handle takes and which it
-    does not.
+    **A handle takes exactly the caps a foreground `shell` stage takes, and the wall clock is on
+    neither path.** `SandboxLimits::max_wall_secs` is enforced inside the sandbox's own runner
+    (`src/sandbox.rs:1475`), which `exec` uses and which no `shell` path reaches, so a handle cannot
+    be killed by it — which is also the right answer: a dev server killed at 120 seconds by the
+    sandbox would be a containment feature deleting the tool's purpose. The CPU and open-file
+    rlimits do apply, through the same `apply_rlimits` a foreground stage takes; the memory monitor
+    applies to neither. `docs/CONTRACT.md` states which caps a handle takes and which it does not
+    (`US-IO-HARNESS-0.48.0-I02`).
   - >
     **The sandbox-lifetime question `docs/CONTRACT.md:1107` names is answered rather than inherited.**
     A handle's containment is applied at each stage's spawn and lives with those processes: on unix
@@ -262,12 +264,16 @@ acceptance:
     one-stage test passes for an implementation that wraps only the head. Sabotage: wrap the first
     stage only, under which the second stage's write lands and only this fails.
   - >
-    **F3 — a handle takes the resource caps and not the wall clock.** Under a `SandboxConfig` whose
-    `max_wall_secs` is short, a handle started before that deadline is still running and still
-    polled after it, while a foreground `shell` line under the same config is killed and reported as
-    a cap hit naming the resource. The memory cap still applies to a handle, asserted by a stage
-    that exceeds it being killed. Sabotage: apply `max_wall_secs` to a handle, under which the
-    handle is dead at the second poll and only this fails.
+    **F3 — a handle takes the resource caps a foreground `shell` stage takes, and the wall clock
+    reaches neither.** Under a `SandboxConfig` whose `max_wall_secs` is one second, a handle started
+    and polled well after that deadline is still running, while the same run's `exec` of a sleeping
+    command is killed and reported as a cap hit naming `Cap::Wall` — the wall clock is enforced by
+    the sandbox's own runner, which `exec` uses and no `shell` path does. The caps a handle *does*
+    take are asserted to apply: on unix, a stage under `max_cpu_secs = 1` that spins is killed by
+    `RLIMIT_CPU`. Sabotage: drop `apply_rlimits` from the handle's spawn, under which the spinning
+    stage runs on and only this fails. **`US-IO-HARNESS-0.48.0-I02`**: the control was a wall-capped
+    foreground `shell` line, which no release has ever produced — `max_wall_secs` lives in
+    `run_capped` and the `shell` tool does not reach it.
   - >
     **F4 — the git built-ins are contained, and `git_commit` under a mode that withholds the
     workspace is refused before it spawns.** Under `ExecMode::WorkspaceWrite` a `git_commit`
