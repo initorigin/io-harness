@@ -117,7 +117,7 @@ tasks:
   why_required: Per-host egress has no mechanism at all until a component exists that can be asked about
     a host. It is also the release's only new long-lived resource, so its lifetime and shutdown are settled
     before anything depends on it.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F6 — a contained command reaches a permitted host and is refused a denied one, through the proxy.**
@@ -143,7 +143,15 @@ tasks:
   - src/state.rs
   - src/run.rs
   - tests/egress.rs
-  evidence: []
+  evidence:
+  - '`cargo test --lib sandbox::proxy` — exit 0, 7 passed: the request forms, a permitted host tunnelled
+    and a denied one refused by name, the decisions drained once, the policy read per dial so a mid-run
+    narrowing reaches it, and the listener ending with the run (O3).'
+  - '`cargo tree` — 402, unchanged: tokio''s net and io-util features were already enabled transitively
+    by reqwest, so N1 holds.'
+  - 'Run-level: 0.40.0''s `egress_under_containment_is_all_hosts_or_none_and_never_the_named_host` FAILED
+    on the proxy''s first run, exactly as its own failure message predicted, and was inverted to assert
+    that a host the policy never named is refused.'
 - id: US-IO-HARNESS-0.48.0-T05
   summary: Scope the sandbox to the proxy and nothing else, and put it in the command's environment.
   why_required: A proxy a payload can dial past is a convention, not a boundary. This task is what makes
