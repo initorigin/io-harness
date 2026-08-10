@@ -154,9 +154,9 @@ The **workspace root** stays the working directory — nothing is copied in and
 nothing is discarded — so an incremental build survives between commands, and the
 toolchain's own cache being writable is what lets a default-contained `cargo` or
 `npm` run at all. What each platform actually enforces differs and the difference
-is not cosmetic: since 0.47.0 all three confine writes and deny egress, Linux
-through a chain whose first rung needs no namespace and Windows through an
-AppContainer alongside the Job Object, and a host that can deliver none of it
+is not cosmetic: macOS and Linux confine writes and deny egress — Linux since
+0.47.0 through a chain whose first rung needs no namespace — while **Windows
+contains resources and not access**, and a host that can deliver none of it
 falls back to the portable floor and **records the floor**, so a run contained
 less than you asked for is legible afterwards — in the trace, in `EventKind::Contained`, and in the agent's own
 prompt. The remaining costs — egress is one boolean per run, and the long-lived
@@ -418,13 +418,13 @@ dependency at all.
 | --- | --- |
 | macOS | Native, `sandbox-exec` |
 | Linux | Native, a chain: Landlock, `bwrap`, namespaces, floor |
-| Windows | Native, AppContainer (files, network) **and** Job Object (memory, CPU, process count, tree kill) |
+| Windows | Native, Job Object (memory, CPU, process count, tree kill) — **resources only, no filesystem or network boundary** |
 
 The full suite runs on all three in CI.
 
-**0.47.0 closed the two holes this table used to carry**, and the Linux one was
-the easiest thing on this page to over-read. The namespace backend needs an
-unprivileged user namespace; Ubuntu 24.04 ships
+**0.47.0 closed the Linux hole in this table**, which was the easiest thing on
+this page to over-read. The namespace backend needs an unprivileged user
+namespace; Ubuntu 24.04 ships
 `kernel.apparmor_restrict_unprivileged_userns=1` and refuses one, so on a stock
 24.04 host — which is what `ubuntu-latest` is — every contained run took the
 portable floor and the filesystem confinement was applied nowhere. Linux is now
@@ -432,11 +432,12 @@ a chain, and its first rung is Landlock, which needs no namespace at all. The
 rung a host takes is the strongest that can enforce what the run asked for, and
 a run denying egress is never given one that cannot deny egress.
 
-Windows had no filesystem or network boundary at all until 0.47.0, because a Job
-Object has neither facility. A contained run now also gets an AppContainer,
-whose grants are derived from what the run already resolved. **If your program
-relied on a command reading outside the workspace on Windows, that read now
-fails** — `TaskContract::with_full_access()` is the escape hatch.
+**The Windows hole is still open, and it is the one to read carefully.** A Job
+Object has no filesystem facility and no network facility, so a contained Windows
+command gets the resource caps and nothing else — `ExecMode` is routed and
+reported there and enforces nothing for the filesystem. The access half was
+planned for 0.47.0 and moved whole to 0.59.0; nothing on Windows changed in this
+release, in either direction.
 
 Both are still reported rather than assumed: `select().backend()` answers before
 the run and the trace records what actually applied.

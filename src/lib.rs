@@ -304,15 +304,18 @@
 //! degrades to [`Backend::PortableFloor`] and **reports the floor**, because the
 //! one thing worse than no boundary is a boundary that is named and absent.
 //!
-//! The access half is `AppContainer`, 0.26.0 built it, and **0.47.0 selects it**.
-//! `sandbox::appcontainer` creates a container, grants paths to its SID and spawns
-//! into it, proven on CI against negative controls for both a refused read and a
-//! refused socket. What kept it unselected was a discovery problem — an
-//! AppContainer is default-deny for reads, and naming everything an arbitrary
-//! toolchain needs is not something a release can guess at. 0.46.0 closed most of
-//! it without meaning to: a run resolves its own writable roots, so the grant set
-//! is now derived from facts the run has. A contained Windows run gets the
-//! container **and** the job object, and reports [`Backend::WindowsAppContainer`].
+//! **Windows has no access half yet, and this paragraph is the honest version of
+//! that.** A contained Windows run gets a Job Object: memory, CPU, active
+//! processes and a tree kill on close, reported as
+//! [`Backend::WindowsJobObject`]. A job object has no filesystem facility and no
+//! network facility, so [`ExecMode`] is routed and reported on this platform and
+//! enforces nothing for the filesystem. `sandbox::appcontainer` holds the
+//! mechanism that would change it — a container created, paths granted to its
+//! SID, a spawn into it, proven on CI against negative controls for both a
+//! refused read and a refused socket — and nothing selects it. 0.47.0 was to be
+//! the release that did; the Windows half was taken out of it whole and is
+//! **0.59.0**, which is recorded rather than implied: see `docs/CONTRACT.md` for
+//! what a Windows run does and does not enforce today.
 //!
 //! Linux likewise stopped being one backend and a fallback. It is a chain —
 //! Landlock, `bwrap`, the namespace backend, the floor — and the rung a host takes

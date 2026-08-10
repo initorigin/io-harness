@@ -56,72 +56,38 @@ notes are produced from it.
   diagnosable. It is a deny-list and not a jail, and it says so; it is written in
   the host architecture's syscall numbers, so a process under a foreign
   personality is allowed through rather than denied by coincidence.
-- **Windows access confinement, selected.** `Backend::WindowsAppContainer`. The
-  AppContainer has been built and proven on the Windows runner since 0.26.0 and
-  was never what `select` returned, because naming every path an arbitrary
-  toolchain needs was a discovery problem that release did not close. 0.46.0
-  closed most of it without meaning to — a run resolves its own writable roots —
-  so the grant set is now derived from facts the run has. A contained Windows run
-  gets the container **and** the Job Object: access and resources together, with
-  the process spawned suspended so it joins the job before it executes an
-  instruction.
-- **The Windows grant set covers the toolchain a launcher stands for.** Read-execute
-  on `RUSTUP_HOME`, `NVM_HOME`, `NVM_DIR`, `VOLTA_HOME`, `PYENV_ROOT`, `GOROOT`,
-  `DOTNET_ROOT`, `JAVA_HOME` and `SDKMAN_DIR` where they exist, and on the
-  directory of the **resolved** program rather than of `argv[0]` — the parent of a
-  bare `rustc` is the empty path, so the one directory a container cannot start
-  without was being granted to nothing. `CARGO_HOME` is deliberately excluded: it
-  holds `credentials.toml` and this set is readable by the payload. A toolchain
-  installed somewhere none of these name fails to start under the container,
-  visibly, as its own error.
-- **The temporary directory is granted for what the run creates there, not for
-  what is already there.** Every path the run names — the workspace, a cache root,
-  a launcher home — is granted across what it already holds, because that content
-  predates the run and is the point. The system temporary directory is granted as
-  a directory: a toolchain can create a temporary file there, and every temporary
-  file already on the machine stays outside the boundary. A payload sitting in the
-  temporary directory rather than in the workspace is unreadable to the run unless
-  it is named as a writable root. A grant the container already holds is not
-  applied again, so the walk of a large tree is paid once per machine rather than
-  once per command.
+- **A note about Windows, because a reader will look for it here.** This release
+  was planned with a Windows half — the AppContainer selected, so a Windows run
+  would enforce files and network rather than resource caps alone — and it is not
+  in it. That work moved whole to **0.59.0** on 2026-08-10; the record is
+  `US-IO-HARNESS-0.47.0-I01`. A Windows run gets exactly what 0.46.0 gave it: a
+  Job Object, which contains resources and not access. `Sandbox::select` returns
+  `WindowsJobObject` as it has since 0.24.0, and `docs/CONTRACT.md` says "native
+  resource containment only" in the platform table because that is what is true.
+  Nothing on Windows is refused today that was permitted yesterday.
 
 ### Changed
 
-- **A contained Windows run now has a filesystem and a network boundary, and this
-  is the release's largest behaviour change.** Up to 0.46.0 a Job Object contained
-  resources and nothing else, so `ExecMode` was routed and reported on Windows and
-  enforced nothing. A program written against 0.46.0 on Windows has therefore
-  never had a filesystem boundary, and may be reading configuration, credentials
-  or a sibling checkout from outside the workspace without anything having refused
-  it. **Those reads now fail.** *Migration:* the grant set is stated in
-  `docs/CONTRACT.md` so a refusal is diagnosable from the documentation rather
-  than from a Win32 error code; `TaskContract::with_full_access()` restores the
-  old behaviour at the construction site, and `SandboxConfig::floor_only()` keeps
-  containment while taking the portable floor. The user's profile directory is
-  deliberately **not** granted.
 - **A contained Linux run on a host with Landlock now confines writes where it
   previously did not**, and on kernel 6.7 or later refuses outbound TCP for an
   egress-denying run. Same remedy if a program was relying on the absent
   boundary. *Migration:* `TaskContract::with_full_access()`, or a mode that says
   what the run actually needs.
-- **On the Windows AppContainer backend, standard error arrives merged into
-  `stdout`.** That backend owns its own spawn — the container SID reaches a child
-  only through a process-thread attribute list, which no stable `Command` can
-  carry — and redirects both streams to one file rather than draining two pipes.
-  Nothing is lost; a caller parsing `stderr` separately on Windows sees it empty.
-- `Backend::as_str` gains `"linux-landlock"`, `"linux-bubblewrap"` and
-  `"windows-appcontainer"`. `EventKind::Contained` and the `SandboxEvent` rows
+- `Backend::as_str` gains `"linux-landlock"` and `"linux-bubblewrap"`.
+  `EventKind::Contained` and the `SandboxEvent` rows
   carry them through their existing fields, so an observer written against 0.46.0
   reads the new backends with no change and a trace written by 0.46.0 stays
   readable.
 
 ### Security
 
-- The two hosts where "contained by default" was true of the API and not of the
-  machine — a stock Ubuntu 24.04 and every Windows host — now enforce it. Both
-  degradations remain *reported* rather than silent: `select().backend()` answers
-  before a run, `EventKind::Contained` records what was applied, and the agent is
-  told its boundary in its own prompt.
+- The host where "contained by default" was true of the API and not of the
+  machine — a stock Ubuntu 24.04, which is what `ubuntu-latest` is — now enforces
+  it. **Windows remains the host where it is not**, and that is stated rather than
+  implied: `select().backend()` answers `WindowsJobObject` before a run,
+  `EventKind::Contained` records what was applied, the agent is told its boundary
+  in its own prompt, and the platform table says resource containment only. The
+  access half is 0.59.0.
 
 ## [0.46.0] - 2026-08-09
 

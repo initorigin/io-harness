@@ -102,17 +102,15 @@ async fn selection_picks_native_on_this_host_and_floor_when_forced() {
     }
 
     // Windows: 0.24.0 made the Job Object the strongest available backend and
-    // this asserted it exactly; 0.47.0 selects the AppContainer alongside it, so
-    // a host that can build a container correctly reports the stronger of the
-    // two. Both are legitimate answers and which one a host gives is the
-    // container probe's business — what must never happen is the floor, which on
-    // Windows would mean the Job Object was not created either.
+    // this asserts it exactly. The access half that would have made a second
+    // answer possible here is 0.59.0's, so on this platform the Job Object is
+    // the native backend and there is nothing else it could legitimately be.
+    // What must never happen is the floor, which on Windows would mean the Job
+    // Object was not created either.
     #[cfg(target_os = "windows")]
-    assert!(
-        matches!(
-            native.backend(),
-            Backend::WindowsAppContainer | Backend::WindowsJobObject
-        ),
+    assert_eq!(
+        native.backend(),
+        Backend::WindowsJobObject,
         "a Windows host must report a native backend, got {:?}",
         native.backend()
     );
@@ -224,12 +222,10 @@ async fn the_selected_backend_denies_outbound_network_by_default() {
 
     // **The outcome's backend, not the selection's.** `Sandbox::backend` answers
     // before the run, from a probe; `SandboxOutcome::backend` is what actually
-    // applied. Those can differ, and on `windows-latest` they do: a profile can
-    // be created — so the probe says `WindowsAppContainer` — while the container
-    // path then declines for this particular run and the Job Object takes it,
-    // which is the designed degradation. Asserting against the probe made this
-    // test demand a network boundary from a run that had honestly reported it
-    // did not get one.
+    // applied. Those can differ — a rung that probes as available can still
+    // decline a particular run and hand it to the one below — and asserting
+    // against the probe makes a test demand a boundary from a run that honestly
+    // reported it did not get one.
     //
     // A run's own report is the only oracle that cannot be wrong about the run.
     if out.backend.denies_egress() {

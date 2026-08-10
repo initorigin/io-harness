@@ -204,8 +204,15 @@ impl Toolchain {
         dirs
     }
 
-    /// The homes a toolchain **launcher** reads to find the binary it stands for
-    /// (0.47.0), independent of any project.
+    /// The homes a toolchain **launcher** reads to find the binary it stands for,
+    /// independent of any project.
+    ///
+    /// **Nothing selects the backend that consumes this**, and that is a
+    /// scheduling fact: the Windows access half was taken out of 0.47.0 whole and
+    /// is 0.59.0's (`US-IO-HARNESS-0.47.0-I01`). The set is kept and tested here
+    /// because it is portable data — which environment variable each ecosystem's
+    /// launcher reads — and because re-deriving it later would mean re-deriving
+    /// the argument below with it.
     ///
     /// A cache directory is where a build writes; this is where a toolchain is
     /// *installed*, and the two are different questions with different answers.
@@ -227,7 +234,7 @@ impl Toolchain {
     /// read access to a payload. What a cargo build needs from it arrives instead
     /// as a writable cache root, which is a fact the run resolved and the caller
     /// asked for.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn launcher_homes() -> Vec<PathBuf> {
         let env = |k: &str| {
             std::env::var_os(k)

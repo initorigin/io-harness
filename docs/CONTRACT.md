@@ -129,7 +129,7 @@ change for every `match` a caller wrote.
 | --- | --- | --- |
 | macOS | Supported, full suite in CI | Native, `sandbox-exec` |
 | Linux | Supported, full suite in CI | Native, a **chain** — Landlock, `bwrap`, namespaces, floor |
-| Windows | Supported, full suite in CI | Native, AppContainer **and** Job Object |
+| Windows | Supported, full suite in CI | Native, Job Object — **resources only** |
 
 Since 0.47.0 Linux is not one backend and a fallback but an ordered chain, and
 the rung a host takes is the strongest one that can enforce what the run asked
@@ -143,11 +143,10 @@ for:
 | `portable-floor` | nothing | No | No |
 
 **A workspace inside the system temporary directory is not confined**, on any
-unix backend and now on Windows too. Every one of them grants the system
+unix backend. Every one of them grants the system
 temporary directory writable — the mount setup binds `${TMPDIR:-/tmp}`, the macOS
-profile allows `/private/var/folders`, the Landlock rung grants it and the
-AppContainer is granted it — because a toolchain that cannot open a temporary
-file cannot run at all. A workspace *located* under that directory therefore sits
+profile allows `/private/var/folders`, and the Landlock rung grants it — because a
+toolchain that cannot open a temporary file cannot run at all. A workspace *located* under that directory therefore sits
 inside a writable grant, and `ExecMode::ReadOnly` does not make it read-only.
 This was found by the CI matrix in 0.47.0, on a test whose own workspace and
 whose "outside" target were both `tempfile::tempdir()`s and so had both been
@@ -187,22 +186,39 @@ network namespaces; Windows does neither. So "sandboxed" on Windows means
 resource-capped and does not mean access-confined, and the two must not be read
 as the same claim.
 
-**The access half is `AppContainer`, and 0.26.0 built it without making it the
-default.** `io_harness::sandbox::appcontainer` creates a container profile,
-derives its SID, grants a path to it with an explicit ACE, and spawns into it
-through `CreateProcessW` with a `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
-attribute list. On the Windows CI runner a payload inside one is refused a read it
-was not granted and has no route off the machine, each against a negative control
-that must succeed outside the container.
+**The access half is `AppContainer`, 0.26.0 built it, and nothing selects it
+yet.** `io_harness::sandbox::appcontainer` creates a container profile, derives
+its SID, grants a path to it with an explicit ACE, and spawns into it through
+`CreateProcessW` with a `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute
+list. On the Windows CI runner a payload inside one is refused a read it was not
+granted and has no route off the machine, each against a negative control that
+must succeed outside the container.
 
-`Sandbox::select` still chooses the Job Object on Windows, so **the table above is
-what a run actually gets** and is unchanged by this release. The obstacle is the
-grant set, not the mechanism: an AppContainer is default-deny for reads, so the
-workspace is the easy part and the executed binary, the toolchain, the redirected
-temporary directory and every language's install tree are the rest. Naming those
-for arbitrary ecosystems is a discovery problem 0.26.0 did not close, and a
-default boundary that cannot run the payload would be worse than one a caller
-reaches for deliberately. Recorded in `US-IO-HARNESS-0.26.0-I02`.
+`Sandbox::select` chooses the Job Object on Windows, so **the table above is what
+a run actually gets**.
+
+**0.47.0 was specified to select the container and does not.** The Windows half
+was taken out of that release whole on 2026-08-10 and rescheduled to **0.59.0**;
+the record is `US-IO-HARNESS-0.47.0-I01`. Three real defects in the module were
+found and fixed on the way and are in the tree: an ACE built from `GENERIC_ALL`
+is stored verbatim by `SetEntriesInAclW` and matches no access check, so every
+grant the module made between 0.26.0 and 0.47.0 was inert while being readable
+back off the DACL; a tree grant must survive a descendant another process holds
+open, because `CARGO_HOME` is being read by the very build that asked for the
+sandbox; and a grant on a directory alone must not enumerate it, because both
+`aclapi` write entry points walk the whole subtree below their target. What
+remains open is why the container declines the `CARGO_HOME` grant on
+`windows-latest`, and whether `cmd.exe` refusing to start a batch file named by an
+absolute path inside an AppContainer is a property of the platform or of this
+spawn.
+
+The original obstacle stands and is the grant set rather than the mechanism: an
+AppContainer is default-deny for reads, so the workspace is the easy part and the
+executed binary, the toolchain, the redirected temporary directory and every
+language's install tree are the rest. Naming those for arbitrary ecosystems is a
+discovery problem 0.26.0 did not close, and a default boundary that cannot run the
+payload would be worse than one a caller reaches for deliberately. Recorded in
+`US-IO-HARNESS-0.26.0-I02`.
 
 Two further differences, stated rather than left to be discovered. The job's CPU
 limit counts user-mode time only, where unix `RLIMIT_CPU` counts kernel time as
@@ -1028,79 +1044,24 @@ cosmetic.**
 | --- | --- | --- | --- |
 | macOS | Yes | Yes, to what the mode grants | Yes |
 | Linux | Yes | Yes, to what the mode grants (0.40.0) | Yes, on every rung but Landlock below ABI 4 |
-| Windows | Yes | Yes, to what the mode grants (0.47.0) | Yes (0.47.0) |
+| Windows | Yes | **No** | **No** |
 
-**Windows changed in 0.47.0 and it is the larger of the release's two surprises.**
-Up to 0.46.0 a Job Object contained resources and nothing else, so a contained
-Windows command got the caps and nothing more — no filesystem boundary and no
-egress boundary, because a job object has neither facility. A contained run now
-also gets an **AppContainer**: a low-box token that answers *no* to every
-securable object it was not granted, with an explicit ACE per granted path, plus
-the job object's limits and kill-on-close. Both halves, one backend,
-`windows-appcontainer`.
+**Windows is the row that is still open, and it did not change in 0.47.0.** A
+Job Object contains resources and nothing else, so a contained Windows command
+gets the caps and nothing more — no filesystem boundary and no egress boundary,
+because a job object has neither facility. `ExecMode` is routed and reported on
+this platform and enforces nothing for the filesystem.
 
-What is granted is derived from what the run already resolved — the workspace
-(read-only under `ExecMode::ReadOnly`), the system temporary directory and the
-detected toolchain's cache directories — plus read-execute on the program's own
-directory, on the system root, and on the toolchain **launcher homes** this
-machine names, all of which a process needs in order to start at all.
-**The user's profile directory is deliberately not granted**: that is where
-credentials live.
+That was to change in 0.47.0. The Windows half of that release — the AppContainer
+selected, a grant set derived from the run's resolved facts, an empty capability
+array as the egress denial — was taken out of it whole on 2026-08-10 and is
+**0.59.0**. The record is `US-IO-HARNESS-0.47.0-I01`, and the reason is that the
+half could not be verified from the development host: ten CI rounds on
+`windows-latest` found three real defects in the module, fixed them, and did not
+converge. What a Windows run gets today is exactly what 0.46.0 gave it, which is
+why there is no migration note for this platform in this release.
 
-The temporary directory is granted **for what the run creates there, not for what
-is already there**. A grant is one inheritable ACE on a directory, and Windows
-inheritance is static: what a directory gains afterwards inherits it, and what it
-already holds is reached only by re-propagating the ACE across every object under
-the path. Every path the run *names* is re-propagated, because a workspace whose
-source files predate the run and a registry cache whose crates were downloaded
-last week are the point of granting them at all. The system temporary directory
-is not, for two reasons that point the same way: a toolchain needs to be able to
-create a temporary file, which inheritance already gives it, and handing a
-default-deny container every temporary file every other program on the machine
-has written is not a boundary. **A payload that lives in the temporary directory
-and is not inside the workspace is therefore unreadable to the run** — name it as
-a writable root, or put it in the workspace.
-
-A grant the container already holds is not applied again. The container SID is
-derived from a fixed profile name, so it is the same SID for every run on the
-machine: the first run pays for the walk of a large tree and no later one repeats
-it.
-
-The program's directory is the directory of the *resolved* program: a command is
-named the way every command is named, and the parent of a bare `rustc` is the
-empty path. The launcher homes are a separate question from the cache
-directories: a cache is where a build writes, a launcher home is where a
-toolchain is installed. `rustc` on `PATH` is a rustup shim that reads
-`RUSTUP_HOME` to find the binary it stands for, and `node` under nvm or volta,
-`python` under pyenv and the JVM launchers all have that shape. A shim that
-cannot see its home does not report a permission error — it concludes the home is
-missing and fails saying so. The set is `RUSTUP_HOME`, `NVM_HOME`, `NVM_DIR`,
-`VOLTA_HOME`, `PYENV_ROOT`, `GOROOT`, `DOTNET_ROOT`, `JAVA_HOME` and
-`SDKMAN_DIR`, read-execute, filtered to those that exist. **`CARGO_HOME` is not
-among them**, deliberately: it holds `credentials.toml`, and this set is readable
-by the payload. A toolchain installed somewhere none of these name will fail to
-start under the container, visibly, as its own error.
-
-A grant reaches what is already inside the directory, not only the directory.
-Windows inheritance is static — a child carries a DACL materialised when it was
-created — so each grant is applied with propagation. The cost is proportional to
-the number of entries under a granted path, which is the figure this release
-measures for this backend. Egress is the capability array: exactly `internetClient` when
-the run's policy permits egress, and empty when it does not, so the denial is
-the token's own.
-
-**A program written against 0.46.0 on Windows has never had a filesystem
-boundary**, and may be reading configuration or a sibling checkout from outside
-the workspace without anything having refused it. Those reads now fail. The
-remedy is `TaskContract::with_full_access()` or a mode that says what the run
-actually needs. A host where the container cannot be built falls back to the Job
-Object alone and reports `windows-job-object`.
-
-One observable difference, stated rather than left to be found: on the
-AppContainer backend **standard error arrives merged into `stdout`**. That
-backend owns its own spawn — the container SID reaches a child only through a
-process-thread attribute list, which no stable `Command` can carry — and
-redirects both streams to one file rather than draining two pipes. **On Windows and on the portable floor
+**On Windows and on the portable floor
 the `ExecMode` is therefore routed and reported and enforces nothing for the
 filesystem** — it is a statement of what the run asked for, not of what the host
 delivered, and `EventKind::Contained`'s `backend` is where the difference shows. On Linux the filesystem half is new in

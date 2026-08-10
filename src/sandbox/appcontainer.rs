@@ -59,10 +59,20 @@
 //! empty, which is stated here because it is a real difference from the other
 //! backends rather than an accident.
 
-// The wiring landed in 0.47.0, so the `allow(dead_code)` this module carried
-// since 0.26.0 has come off: `Profile`, `grant` and `Spawned` are now reached by
-// `super::windows`, which selects this backend rather than only testing it.
+// **`allow(dead_code)`, because nothing selects this backend — and that is a
+// scheduling fact rather than a defect.** The module has been in this state since
+// 0.26.0: built, unit-tested against negative controls on the Windows runner, and
+// reached by no production path. 0.47.0 was to be the release that wired it up;
+// the Windows half was taken out of that release whole on 2026-08-10 and is
+// 0.59.0's, recorded in `US-IO-HARNESS-0.47.0-I01`.
+//
+// What 0.59.0 inherits is better than what 0.47.0 found, and the three fixes are
+// the reason the allowance is worth keeping rather than deleting the module: an
+// ACE must carry specific rights, a tree grant must survive a locked descendant,
+// and a directory-only grant must not enumerate the directory. Each was a real
+// defect, each is fixed here, and each would otherwise have to be re-found.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) mod win {
     use std::io;
     use std::os::windows::ffi::OsStrExt;

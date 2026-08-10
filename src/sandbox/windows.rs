@@ -94,20 +94,11 @@ impl Sandbox for WindowsSandbox {
     async fn run(&self, spec: RunSpec<'_>) -> Result<SandboxOutcome> {
         #[cfg(windows)]
         {
-            // The container first, unless the run asked for the machine. A
-            // `FullAccess` run is asking for the host's own privileges, and
-            // wrapping it in a default-deny token would be answering a different
-            // question than the one the caller asked.
-            //
-            // `None` is the container path declining — a profile that cannot be
-            // created, a grant that cannot be applied — and the answer to that is
-            // the Job Object alone, reporting `WindowsJobObject`, which is
-            // exactly 0.46.0's behaviour. A degradation, never a break.
-            if spec.mode != ExecMode::FullAccess {
-                if let Some(outcome) = job::run_contained(&spec).await {
-                    return outcome;
-                }
-            }
+            // **The Job Object, and only the Job Object.** The AppContainer half
+            // of 0.47.0 was specified here and taken out of the release whole —
+            // see `US-IO-HARNESS-0.47.0-I01` and the 0.59.0 roadmap entry. The
+            // module below is built and unit-tested and reached by nothing on
+            // this path, which is where it has been since 0.26.0.
             job::run(spec).await
         }
         // The type is compiled everywhere so its limit mapping can be unit-tested
@@ -120,27 +111,17 @@ impl Sandbox for WindowsSandbox {
         }
     }
 
-    /// What a run reaching this backend gets: the container when this host can
-    /// build one, the Job Object alone when it cannot.
+    /// The Job Object, which is what a contained Windows run gets.
     ///
-    /// **This method has no run to read, and it does not need one.** The only
-    /// run-dependent input is the mode, and a `FullAccess` run never consults
-    /// `select` at all — 0.46.0 made that its F2, and it is why the mode check
-    /// in [`run`](Sandbox::run) is defence in depth rather than the deciding
-    /// branch. So every run that actually reaches here is a contained one, and
-    /// the container answer is true of all of them.
-    ///
-    /// The probe behind it *attempts* the thing, as every probe in this crate
-    /// does since 0.40.0: it creates a profile and deletes it. A host where that
-    /// fails reports the Job Object, which is what such a host will really get.
+    /// A **resource** boundary: memory, CPU, active processes, and a tree kill
+    /// when the handle closes. Not an access boundary, and this method saying so
+    /// plainly is the point — `ExecMode` is routed and reported on this platform
+    /// and enforces nothing for the filesystem, which `docs/CONTRACT.md` states
+    /// in the same words. The access half is 0.59.0.
     fn backend(&self) -> Backend {
         #[cfg(windows)]
         {
-            if job::container_available() {
-                Backend::WindowsAppContainer
-            } else {
-                Backend::WindowsJobObject
-            }
+            Backend::WindowsJobObject
         }
         #[cfg(not(windows))]
         {
@@ -193,7 +174,7 @@ impl From<&super::SandboxLimits> for JobLimits {
 /// on any host. The two are kept as separate types on purpose: this one is the
 /// *decision* and that one is the ACE mask, and a build host that has no Win32
 /// can still assert the decision.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Grant {
     /// **Pass through this directory, and read nothing in it.** `FILE_TRAVERSE`
@@ -229,7 +210,7 @@ pub(crate) enum Grant {
 /// *later* and nothing it already holds. Re-propagating to what is already there
 /// is a second, much more expensive act — it rewrites every object under the
 /// path — and it is not always the right one.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reach {
     /// The directory and everything already inside it. What a path the run
@@ -241,7 +222,7 @@ pub(crate) enum Reach {
 }
 
 /// One granted path.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GrantedPath {
     pub(crate) path: PathBuf,
@@ -268,7 +249,7 @@ pub(crate) struct GrantedPath {
 /// not a wider default. In particular the user's profile directory is **not**
 /// granted: that is where credentials live, and a default-deny boundary whose
 /// first act is to hand over the home directory is not one.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn grants(
     mode: ExecMode,
     workdir: &Path,
@@ -400,7 +381,7 @@ pub(crate) fn grants(
 /// Out here rather than in the Win32 module so it is asserted on the build host.
 /// A quoting bug is the kind of defect that only shows up on the one argument
 /// containing a space, which is every path on this platform.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn command_line(argv: &[String]) -> String {
     let mut out = String::new();
     for (i, arg) in argv.iter().enumerate() {
@@ -453,7 +434,12 @@ pub(crate) fn command_line(argv: &[String]) -> String {
 /// lives for one call, a handle's lives until the handle is killed. That is a
 /// difference in who owns the handle, not a difference in the mechanism, so the
 /// mechanism is shared rather than written twice.
+// The grant set, the container spawn and everything they reach are unselected
+// with the rest of the Windows access half — see the note above
+// `sandbox::appcontainer::win`. The Job Object below is what a contained Windows
+// run gets and is reached normally.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) mod job {
     use std::io;
 
@@ -726,7 +712,10 @@ pub(crate) mod job {
         }
 
         Some(Ok(SandboxOutcome {
-            backend: Backend::WindowsAppContainer,
+            // The job object is what this outcome can honestly claim: the
+            // container is not a backend this crate selects, so it is not a
+            // backend a caller can be told it got. 0.59.0 is where that changes.
+            backend: Backend::WindowsJobObject,
             argv: spec.argv.to_vec(),
             exit_code,
             cap_hit,

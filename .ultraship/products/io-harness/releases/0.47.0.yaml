@@ -5,9 +5,9 @@ release_type: minor
 
 outcome:
   user_can: >
-    Embed this crate on any of the three platforms it claims and get the containment the API
-    promises — or be told, in the trace and in the agent's own prompt, exactly which weaker thing
-    was applied instead.
+    Embed this crate on a Linux host and get the containment the API promises — including on the
+    distribution that refuses the primitive the backend reaches for first — or be told, in the trace
+    and in the agent's own prompt, exactly which weaker thing was applied instead.
 
     **0.46.0 made containment the default and shipped with two hosts where the default enforces
     nothing.** `docs/CONTRACT.md:983` states it as a table: Linux confines writes and denies egress,
@@ -15,13 +15,19 @@ outcome:
     user namespace, a stock Ubuntu 24.04 ships
     `kernel.apparmor_restrict_unprivileged_userns=1`, `ubuntu-latest` is one, and every contained
     run there takes `Backend::PortableFloor`: resource caps, an ephemeral working directory, and a
-    proxy-environment strip a payload that does not read those variables ignores completely. The
-    Windows row is not a footnote at all. A Job Object is a kernel container for *resources*
-    (`src/sandbox/windows.rs:1`); it has no filesystem facility and no network facility, so a
-    Windows run reporting `WindowsJobObject` is resource-contained and not confined, and nothing
-    about `ExecMode::WorkspaceWrite` is true there. Both are reported rather than hidden, which is
-    the one thing 0.40.0 and 0.46.0 got right and is also the whole of what they got. This release
-    is the other half.
+    proxy-environment strip a payload that does not read those variables ignores completely. Both
+    are reported rather than hidden, which is the one thing 0.40.0 and 0.46.0 got right and is also
+    the whole of what they got. **This release closes the Linux row.**
+
+    **The Windows row stays open, deliberately and with a destination.** Windows access confinement
+    was specified as the other half of this release and was taken out of it whole on 2026-08-10, on
+    the owner's decision, after ten matrix rounds on `windows-latest` failed to converge from a
+    development host that cannot run the platform. It is 0.59.0 now, and the record is
+    `US-IO-HARNESS-0.47.0-I01`. A Windows run keeps exactly what 0.46.0 gave it — a Job Object,
+    which contains resources and not access — `select` returns `WindowsJobObject` as it has since
+    0.24.0, and the platform table says "native resource containment only" because that is what is
+    true. `sandbox::appcontainer` remains in the tree, built and unit-tested and selected by
+    nothing, which is the state it has been in since 0.26.0.
 
     **On Linux the backend becomes a chain, and the first rung needs no namespace at all.**
     Landlock is an unprivileged LSM: a process builds a filesystem ruleset, calls
@@ -41,22 +47,6 @@ outcome:
     by reading a sysctl or a capability list, because 0.40.0's Linux breakage survived three matrix
     runs behind exactly that mistake.
 
-    **On Windows the access half stops being a module nothing selects.** `sandbox::appcontainer`
-    has existed since 0.26.0 — it creates a low-box profile, grants named paths to its container SID
-    with explicit ACEs, and spawns into it through `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`,
-    proven on the Windows runner against negative controls for both a refused read and a refused
-    socket (`src/lib.rs:307`). It is not what `select` returns, and the stated reason is honest:
-    an AppContainer is default-deny for reads, and naming everything an arbitrary toolchain needs
-    was a discovery problem 0.26.0 did not close. **0.46.0 closed most of it without meaning to.**
-    A run now resolves its own writable roots — the workspace, the system temporary directory and
-    the detected toolchain's cache directories, filtered to those that exist
-    (`src/sandbox.rs:939`) — so the grant list is derived from facts the run already has rather than
-    guessed at. This release grants those, adds the small fixed read-execute set a process needs to
-    start at all, spawns into the container, and *also* assigns that process to the Job Object in
-    the same suspended-assign-resume ordering `windows.rs` already argues for. A Windows run then
-    has access confinement and resource containment together, and reports
-    `Backend::WindowsAppContainer`. A grant that fails, or a mode of `FullAccess`, degrades to the
-    Job Object and says so — the same shape Linux has had since 0.9.1.
 
   business_value: >
     **A boundary that is absent on the commonest CI image is worth less than no boundary, because
@@ -69,13 +59,13 @@ outcome:
     the gap between what the default claims and what the commonest host delivers; this is the
     release that closes it rather than documenting it again.
 
-    **Windows is a supported platform in the table and has never had a filesystem boundary.**
-    `docs/CONTRACT.md:132` says "Supported, full suite in CI" and "**Native resource containment
-    only**" in the same row, and 0.26.0 built the mechanism that would fix it and left it unwired.
-    Shipping a security module that nothing selects is a cost already paid with no value taken.
-    The discovery problem that stopped it is smaller now than it was, and the honest answer to
-    what remains of it is the one this crate uses everywhere else: derive what you can, degrade
-    when you cannot, and report which happened.
+    **Shipping the Linux half alone is worth more than holding it for the Windows half.** The
+    boundary that is absent on `ubuntu-latest` is the one most of this crate's users are actually
+    running against; the boundary that is absent on Windows has been absent since the platform was
+    supported, is documented as absent, and nothing regresses by staying that way one release
+    longer. Holding a finished, verified Linux chain hostage to an unfinished Windows one would
+    have shipped neither, and would have left the commonest CI image taking the portable floor for
+    the sake of a claim about a platform this host cannot test.
 
     **The chain is worth more than any one rung, and that is the design argument.** No single Linux
     primitive is available everywhere: user namespaces are restricted on Ubuntu, Landlock is absent
@@ -87,7 +77,7 @@ outcome:
     decides: a run that denies egress may not take a rung that cannot deny egress.
 
     **Zero compile breaks, and that is a deliberate consequence of 0.46.0.** `Backend` is
-    `#[non_exhaustive]` (`src/sandbox.rs:78`), so three new variants are additive; `RunSpec` took
+    `#[non_exhaustive]` (`src/sandbox.rs:78`), so two new variants are additive; `RunSpec` took
     `#[non_exhaustive]` plus a constructor last release specifically so this one and 0.48.0 could
     add to it for free. Nothing here changes a signature, a field type or a schema. The whole
     release is new enforcement behind existing types, which is also what makes it safe to ship into
@@ -122,27 +112,18 @@ outcome:
     with Landlock at an ABI below its network rules, on a run that denies egress, must not take the
     Landlock rung.
 
-    **The Windows half is proven against the negative controls 0.26.0 already wrote and passed.**
-    A refused read of a path outside the grant set and a refused socket are already asserted for
-    the AppContainer module on the Windows runner; this release asserts them for a run driven
-    through `TaskContract` with no direct use of the module, which is the difference between a
-    mechanism that works and a mechanism that is wired. The Job Object's own caps are asserted to
-    still fire on the same run, because a backend that traded resource containment for access
-    containment would be a regression wearing a new name.
-
-    **And the degradation paths are proven to degrade rather than to fail.** A Windows host where
-    a grant cannot be applied, and a Linux host with no rung above the floor, each complete their
-    run and report the weaker backend. That is asserted rather than assumed because the alternative
-    — a hard failure on a host the caller did not choose — is the outcome that would make embedders
-    turn the default off, which is the failure mode 0.46.0's own specification named.
+    **And the degradation path is proven to degrade rather than to fail.** A Linux host with no
+    rung above the floor completes its run and reports the weaker backend. That is asserted rather
+    than assumed because the alternative — a hard failure on a host the caller did not choose — is
+    the outcome that would make embedders turn the default off, which is the failure mode 0.46.0's
+    own specification named.
 
 scope:
   included:
   - >
-    **Three additive `Backend` variants and their stable labels.** `Backend::LinuxLandlock`
-    (`"linux-landlock"`), `Backend::LinuxBubblewrap` (`"linux-bubblewrap"`) and
-    `Backend::WindowsAppContainer` (`"windows-appcontainer"`), each with the doc paragraph the
-    existing four carry saying precisely what it enforces and what it does not. `Backend` is
+    **Two additive `Backend` variants and their stable labels.** `Backend::LinuxLandlock`
+    (`"linux-landlock"`) and `Backend::LinuxBubblewrap` (`"linux-bubblewrap"`), each with the doc
+    paragraph the existing four carry saying precisely what it enforces and what it does not. `Backend` is
     `#[non_exhaustive]` since before this release, so the addition costs no caller a compile.
     `EventKind::Contained` and the `SandboxEvent` rows carry them through the existing fields, so
     there is no new event and no new column.
@@ -194,29 +175,6 @@ scope:
     `/sys/kernel/security/lsm` line or a package's presence — 0.40.0's finding, applied to four
     rungs instead of one.
   - >
-    **Windows access confinement, selected.** `WindowsSandbox::run` attempts the AppContainer path
-    whenever the mode is not `FullAccess`: create or adopt the profile, grant the derived set, spawn
-    into the container `CREATE_SUSPENDED`, assign the process to the Job Object carrying the run's
-    caps, resume it. Both halves in one backend, reported as `WindowsAppContainer`. Any failure in
-    the container path — a profile that cannot be created, a grant that cannot be applied — falls
-    back to the Job Object alone and reports `WindowsJobObject`, which is today's behaviour and
-    therefore a degradation and not a break.
-  - >
-    **The Windows grant set, derived rather than guessed.** `Access::Full` on the workspace root
-    (withheld under `ReadOnly`), the system temporary directory and each existing writable root the
-    run already resolved. `Access::ReadExecute` on the workspace root under `ReadOnly`, on the
-    directory of the resolved program, on `%SystemRoot%` and on the detected toolchain's install
-    directories. Only paths that exist are granted, for the reason 0.46.0 recorded: an absent path
-    in a grant list is not tidiness, it is a failure that unwinds the isolation it was added to
-    preserve.
-  - >
-    **The Windows egress answer, which the empty capability array already gives.** A container with
-    no capabilities has no route off the machine, so an egress-denying run requests none — the
-    denial is the token's own. A run whose policy permits egress requests exactly
-    `internetClient`, so a network-allowing run still works. This makes Windows the third platform
-    where the run's network answer is enforced by the kernel rather than approximated by stripping
-    proxy variables.
-  - >
     **The reporting surfaces, updated to describe what now happens.** The two platform tables in
     `docs/CONTRACT.md` (`:128` and `:983`), the platform prose in `src/lib.rs` (`:295`–`:313`),
     the README's product table, and `CHANGELOG.md`. 0.45.0's boundary section names the backend
@@ -229,6 +187,17 @@ scope:
     existing legs and gains the same guarded leg, because trap 87 is that a guard written for one
     workflow file does not cover its sibling.
   excluded:
+  - >
+    **Windows access confinement, entirely, and it is deferred rather than dropped.** This release
+    was specified with an AppContainer half — `select` returning `WindowsAppContainer`, a derived
+    grant set, an empty capability array as the egress denial — and it is out on the owner's
+    decision of 2026-08-10, recorded as `US-IO-HARNESS-0.47.0-I01` and rescheduled to **0.59.0**.
+    Ten matrix rounds on `windows-latest` found and fixed three real faults in the module and did
+    not converge, and the remaining one needs a machine that can run the platform interactively. A
+    Windows run therefore gets exactly what 0.46.0 gave it: `select` returns `WindowsJobObject`,
+    resources are contained, access is not, and every surface says so. `sandbox::appcontainer` stays
+    compiled and unit-tested and reachable from no production path, which is where it has been since
+    0.26.0 — so this excludes a claim, not a mechanism.
   - >
     **Any change to `RunSpec`, `SandboxConfig`, `ExecMode`, `TaskContract` or `Policy`.** The run's
     mode, its writable roots and its egress answer are already resolved and already reach the
@@ -262,10 +231,6 @@ scope:
     This alone turns `ubuntu-latest` — and every stock Ubuntu 24.04 — from a host that enforces
     nothing into a host that confines writes and refuses `connect`, which is the larger of the two
     holes and the one an embedder is most likely to be standing in.
-  - >
-    **Windows AppContainer selection with the derived grant set**, degrading to the Job Object and
-    reporting it. The second hole, and it needs no new mechanism — the module is built, tested and
-    shipped; what it needs is to be chosen.
   - >
     Dropped under pressure, in this order: the seccomp deny-list first (it is a hardening layer on
     a rung that already confines the filesystem, and the crate's honest position today is that it
@@ -329,36 +294,13 @@ acceptance:
     rung where it cannot recur. Sabotage: wrap the payload in `sh -c` on this rung, under which the
     argv assertion and the missing-program assertion both fail and only this fails.
   - >
-    **F7 — a Windows run is access-confined and resource-contained at the same time.** Driven from
-    `TaskContract::workspace`: a read of a path outside the grant set is refused, a socket to the
-    outside is refused, a write inside the workspace lands, `select(&config).backend()` reports
-    `windows-appcontainer`, and the Job Object's own `max_processes` cap still fires on the same
-    run. The last clause is the control: a backend that traded resource containment for access
-    containment would pass the first four. Sabotage: spawn into the container without assigning the
-    process to the job, under which the cap arm fails and only this fails.
-  - >
-    **F8 — the Windows grant set is derived from the run's resolved facts.** A pure test over the
-    grant-list builder: the workspace root, the temp directory and each existing writable root
-    appear as `Full`; under `ReadOnly` the workspace appears as `ReadExecute` instead; the program's
-    directory and `%SystemRoot%` appear as `ReadExecute`; and a writable root that does not exist
-    appears not at all. Sabotage: grant the workspace `Full` under `ReadOnly`, under which that arm
-    fails and only this fails.
-  - >
-    **F9 — a Windows run whose network is permitted still reaches the network.** The same run with
-    a policy permitting egress requests `internetClient` and connects to the test's own listener;
-    with egress denied it requests nothing and is refused. Both arms in one test so the second is a
-    control rather than a separate claim — an empty capability array that broke every
-    network-permitting run would be a regression this release could otherwise ship green. Sabotage:
-    request the capability unconditionally, under which the denied arm connects and only this fails.
-  - >
-    **F10 — every degradation completes the run and reports the weaker backend.** A Windows host
-    where the container path is made to fail runs to completion and reports `windows-job-object`;
-    a Linux host with no rung above the floor runs to completion and reports `portable-floor`;
-    `EventKind::Contained` carries the backend that was applied in both cases, and `FullAccess`
-    still reports `full-access` with no container and no ruleset. Sabotage: return an error from
+    **F7 — every degradation completes the run and reports the weaker backend.** A Linux host with
+    no rung above the floor runs to completion and reports `portable-floor`, `EventKind::Contained`
+    carries the backend that was applied, and `FullAccess` still reports `full-access` with no
+    ruleset at all. Sabotage: return an error from
     the backend instead of degrading, under which the run fails and only this fails.
   - >
-    **F11 — the seccomp deny-list refuses a named syscall and refuses it with `EPERM`.** On the
+    **F8 — the seccomp deny-list refuses a named syscall and refuses it with `EPERM`.** On the
     Landlock rung, a contained command invoking one of the denied syscalls directly fails with
     `EPERM` and the process is **not** killed — the distinction matters, because a filter that
     killed would be indistinguishable from a crash in the payload and would tell the model nothing.
@@ -371,9 +313,8 @@ acceptance:
   - >
     **N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402**
     crates on macOS and Linux. Landlock and seccomp are `libc::syscall` with hand-written constants
-    against the existing `cfg(unix)` `libc`; the AppContainer path uses the `windows-sys` features
-    already listed in `Cargo.toml` (`Win32_Security_Isolation`, `Win32_Security_Authorization`).
-    No `landlock`, no `seccompiler`, no `libseccomp`, no `nix`.
+    against the existing `cfg(unix)` `libc`. No `landlock`, no `seccompiler`, no `libseccomp`, no
+    `nix`, and no new `windows-sys` feature.
   - >
     **N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
   - >
@@ -392,8 +333,8 @@ acceptance:
   - >
     **N5 — each rung's per-command overhead is measured, not asserted to be small.** The same fixed
     command is timed under `FullAccess`, under the Landlock rung and under the existing namespace
-    rung on a Linux host, and under the Job Object and the AppContainer on a Windows runner, over
-    the same 30-iteration shape 0.46.0 used to record ~6.25 ms for `sandbox-exec`. Every figure goes
+    rung on a Linux host, over the same 30-iteration shape 0.46.0 used to record ~6.25 ms for
+    `sandbox-exec`. Every figure goes
     into the release record. The Landlock rung's claim is that it avoids a wrapper spawn entirely,
     which is a claim about a number and is therefore measured rather than argued.
   - >
@@ -420,9 +361,10 @@ acceptance:
   - >
     **O4 — the documentation surfaces agree with the code, in the same release.** Both
     `docs/CONTRACT.md` platform tables, the `src/lib.rs` platform prose, the README's table and
-    `CHANGELOG.md` describe the chain, the Windows backend and what each rung does and does not
-    enforce. `tests/docs_drift.rs` and `tests/changelog.rs` pass. No surface still says Windows
-    confines nothing.
+    `CHANGELOG.md` describe the chain and what each rung does and does not enforce.
+    `tests/docs_drift.rs` and `tests/changelog.rs` pass. **No surface claims a Windows filesystem or
+    network boundary**, and the Windows row still reads "native resource containment only" — the
+    deferral is a documentation criterion of this release, not an omission from it.
 
 delivery:
   target_mode: published
@@ -445,32 +387,27 @@ delivery:
     `CHECKPOINT_FORMAT` is unmoved at 7, and a 0.46.0 store and a 0.47.0 store are the same store in
     both directions.
   - >
-    **No compile break.** Three additive variants on an enum that is already `#[non_exhaustive]`,
+    **No compile break.** Two additive variants on an enum that is already `#[non_exhaustive]`,
     which is the attribute's whole purpose: a caller matching on `Backend` already carries a
     wildcard arm and keeps compiling. No signature, field type or trait method changes.
   - >
     **A behaviour change with no compile consequence, and it is the release.** On a Linux host with
     Landlock — every kernel 5.13 and later, which includes every currently supported Ubuntu, Debian
     and Fedora — a contained command's writes are now confined where before they were not, and on a
-    kernel 6.7 or later an egress-denying run's outbound TCP is now refused. On Windows a contained
-    command's reads are now default-deny outside the granted set, and an egress-denying run has no
-    socket. A program that was relying on a command writing or reading outside the workspace on
-    those hosts — and getting away with it because the boundary was absent, not because it was
+    kernel 6.7 or later an egress-denying run's outbound TCP is now refused. A program that was
+    relying on a command writing outside the workspace on those hosts — and getting away with it because the boundary was absent, not because it was
     permitted — sees those operations refused. The remedy is the one 0.46.0 named:
     `TaskContract::with_full_access()`, or a `SandboxConfig` whose mode says what the run actually
     needs. The changelog carries this as a migration note rather than a line item.
   - >
-    **The Windows change is the larger surprise of the two and the changelog says so first.**
-    0.46.0's default was a no-op on Windows; a program written against 0.46.0 on Windows has never
-    had a filesystem boundary and may be reading configuration, credentials or a sibling checkout
-    from outside the workspace without anything having refused it. Those reads now fail. The
-    grant set is stated in `docs/CONTRACT.md` so the failure is diagnosable from the documentation
-    rather than from a Win32 error code.
+    **Windows changes in no way at all, and the changelog says so where a reader will look.** The
+    platform's containment is what 0.46.0 shipped: a Job Object, resources and not access. Nothing
+    on Windows is refused today that was permitted yesterday, and no migration note is owed there.
   observability:
   - >
     `EventKind::Contained { mode, backend, roots }` is unchanged and now carries the new labels —
-    `"linux-landlock"`, `"linux-bubblewrap"`, `"windows-appcontainer"` — so an existing observer
-    reads the new backends with no code change and a trace written by 0.46.0 stays readable.
+    `"linux-landlock"` and `"linux-bubblewrap"` — so an existing observer reads the new backends
+    with no code change and a trace written by 0.46.0 stays readable.
   - >
     The `SandboxEvent` create/exec/destroy rows keep naming the backend per command, so a run that
     degrades mid-flight is visible at command scope and not only at run scope.
@@ -498,9 +435,9 @@ dependencies:
     rung, from a loopback listener the test itself starts, or from a pure decision or grant-list
     function.
   - >
-    **The Linux and Windows CI runners are load-bearing for this release in a way they have not
-    been before.** F1, F2, F4, F7 and F9 cannot be evaluated on the macOS development host at all:
-    Landlock, bubblewrap and AppContainer do not exist there. This release is therefore
+    **The Linux CI runner is load-bearing for this release in a way it has not been before.** F1,
+    F2 and F4 cannot be evaluated on the macOS development host at all: Landlock and bubblewrap do
+    not exist there. This release is therefore
     CI-discovered by construction, which is the same position 0.40.0 and 0.46.0 were in — and in
     both, the defect that mattered was found by the matrix and not locally. Budget for that
     rather than being surprised by it.
@@ -536,28 +473,16 @@ resource_profile:
     mitigation is the one this crate already uses: probe by attempting the restriction, and assert
     enforcement by a refused write rather than by a successful setup call.
   - >
-    **Nothing on the Linux or Windows halves can be tested on the development host.** Every
-    iteration of F1, F2, F4, F7 and F9 costs a CI round. Expect the debugging loop to be measured
-    in matrix runs, and prefer pure decision and argv/grant-list tests wherever a claim can be
-    split into a host-free half — F3, F6 and F8 exist partly for that reason.
-  - >
-    **The AppContainer path owns its own spawn, and joining it to the Job Object is where the
-    ordering argument has to hold twice.** `windows.rs` spawns `CREATE_SUSPENDED` and assigns
-    before resuming precisely so no instruction executes outside the job; the container path must
-    do the same, in its own `CreateProcessW`, with the attribute list carrying the security
-    capabilities. A process that runs briefly outside the job leaves a hole that nothing reports.
-  - >
-    **The Windows default-deny read set is the risk 0.26.0 named and did not close.** The grant
-    list is derived, but "derived" is not "complete": a toolchain reading a machine-wide
-    configuration file, a certificate store or an environment-directed cache outside the derived
-    set will now be refused. Expect the first Windows CI run to surface at least one such path and
-    to require a decision about whether it belongs in the fixed read-execute set or whether the
-    degradation is the correct answer for that run.
+    **Nothing on the Linux half can be tested on the development host.** Every iteration of F1, F2
+    and F4 costs a CI round. Expect the debugging loop to be measured in matrix runs, and prefer
+    pure decision and argv tests wherever a claim can be split into a host-free half — F3 and F6
+    exist partly for that reason. **This is the cost driver that took the Windows half out of the
+    release**: it was CI-discovered by construction on a platform the host cannot run at all, and
+    ten matrix rounds did not converge.
   - >
     **The existing suite runs commands everywhere, and the enforcement is new on two platforms.**
     0.46.0 flipped the default and had to read failures that were the release working correctly.
-    This release does it again for Windows reads and for Linux writes on hosts that never enforced
-    them. Each failure is a decision, not a sweep: a test relying on a read outside the workspace
+    This release does it again for Linux writes on hosts that never enforced them. Each failure is a decision, not a sweep: a test relying on a read outside the workspace
     either says so or should not have been doing it.
   preferred_tools:
   - >
@@ -601,14 +526,14 @@ risks:
   process, none of which a build performs; the filter returns `EPERM` rather than killing the
   process, so the failure is diagnosable; and it is the first thing the fallback scope drops.
 - >
-  **The Windows grant set is incomplete and refuses a read a toolchain needs.** This is the
-  discovery problem 0.26.0 declined to close, and deriving from the run's resolved roots reduces it
-  without eliminating it. Mitigations: the fixed read-execute set covers the program's own
-  directory and the system root; failures degrade to the Job Object rather than to a failed run
-  when the container cannot be built at all; `with_full_access()` is a one-call escape; and the
-  grant set is documented in `docs/CONTRACT.md` so a refusal is diagnosable. **This is the risk
-  most likely to produce an iteration record**, and the honest form of that record is a named path
-  added to the fixed set with the reason.
+  **The Windows grant set is incomplete and refuses a read a toolchain needs.** Recorded here
+  because it is what happened: this was named at specification time as "the risk most likely to
+  produce an iteration record", and it produced `US-IO-HARNESS-0.47.0-I01` — not as a named path
+  added to the fixed set, but as the whole half moving to 0.59.0. The mitigation that mattered was
+  the one this crate uses everywhere: the container degrades to the Job Object rather than failing
+  the run, so a host that cannot be granted still works and still says what it got. The risk is
+  0.59.0's now, and its roadmap entry carries the three faults this release found and fixed so the
+  next attempt does not re-find them.
 - >
   **Landlock's forward-compatible ABI handling is got wrong and the rung fails on older kernels.**
   Requesting an access flag the kernel does not know fails the whole ruleset creation. Mitigation:
@@ -624,9 +549,12 @@ risks:
   is choosing rather than guessing.
 - >
   **CI-only discoverability makes the loop slow enough to encourage shortcuts.** The temptation is
-  a blanket skip or a test that asserts the label instead of the behaviour. Mitigation: F3, F6 and
-  F8 are deliberately host-free so the decision logic, the argv and the grant list are settled
-  locally, leaving the matrix to answer only what only it can.
+  a blanket skip or a test that asserts the label instead of the behaviour. Mitigation: F3 and F6
+  are deliberately host-free so the decision logic and the argv are settled locally, leaving the
+  matrix to answer only what only it can. **The Windows half is the case where this risk was
+  realised** — a test that asserted success without asserting the backend passed while the run was
+  not contained at all, twice — and the answer was an assertion on the backend and a capability
+  table that prints what answered. Both stay in the tree for 0.59.0.
 
 open_questions:
 - >
@@ -646,11 +574,13 @@ open_questions:
   application that wants to refuse can read `select(&config).backend()` before it starts, which
   the type's own doc example shows. If an embedder asks for it, it is additive on `SandboxConfig`.
 - >
-  Whether the Windows fixed read-execute set should include the user's profile directory. It does
-  not: that is where credentials live, and a default-deny boundary whose first act is to grant the
-  home directory is not one. The consequence is that a toolchain reading a per-user configuration
-  file from outside the derived cache roots is refused, and the answer for now is the escape hatch
-  rather than a wider default.
+  Whether the Windows fixed read-execute set should include the user's profile directory. Carried
+  to 0.59.0 unanswered, and the position this release took stands as the starting one: it does not,
+  because that is where credentials live and a default-deny boundary whose first act is to grant
+  the home directory is not one. 0.59.0 inherits two further questions of its own, both recorded in
+  its roadmap entry — why the container declines the `CARGO_HOME` grant on `windows-latest`, and
+  whether `cmd.exe` refusing to start a batch file named absolutely inside an AppContainer is a
+  property of the platform or of this spawn.
 - >
   Whether `shell_start`'s backgrounded handles should have been contained here rather than in
   0.48.0. They are the one execution path still running at full privilege after this release, and

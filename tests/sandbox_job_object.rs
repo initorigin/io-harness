@@ -1,10 +1,10 @@
 //! 0.24.0 — the Windows Job Object backend, live.
 //!
-//! Since 0.47.0 a contained Windows run takes the AppContainer when a profile can
-//! be created, and the Job Object otherwise. The job is created either way — the
-//! container path adopts the suspended process into one before resuming it — so
-//! every cap asserted below is asserted on whichever backend the host gave, and
-//! the tests name the disjunction rather than a single backend.
+//! A contained Windows run takes the Job Object, and that is the whole of what
+//! this platform enforces: resources, not access. 0.47.0 was to add the
+//! AppContainer beside it and the Windows half of that release moved whole to
+//! 0.59.0, so every cap below is asserted on the one backend this platform
+//! selects.
 //!
 //! Every test here is `cfg(windows)`, so on a macOS or Linux host this file
 //! compiles to nothing and is silent rather than skipped-and-green. It runs on
@@ -130,11 +130,9 @@ fn limits() -> SandboxLimits {
 #[tokio::test]
 async fn windows_reports_a_real_primitive_and_not_the_floor() {
     let native = select(&SandboxConfig::new()).backend();
-    assert!(
-        matches!(
-            native,
-            Backend::WindowsAppContainer | Backend::WindowsJobObject
-        ),
+    assert_eq!(
+        native,
+        Backend::WindowsJobObject,
         "the native Windows backend must name a primitive it actually creates, got {native:?}"
     );
     // And the floor is still reachable on demand — the negative control below
@@ -148,11 +146,9 @@ async fn windows_reports_a_real_primitive_and_not_the_floor() {
     let script = bat(dir.path(), "ok", "echo hello");
     let out = run_bat(&SandboxConfig::new(), limits(), dir.path(), &script).await;
     assert!(out.success(), "a plain command must still run: {out:?}");
-    assert!(
-        matches!(
-            out.backend,
-            Backend::WindowsAppContainer | Backend::WindowsJobObject
-        ),
+    assert_eq!(
+        out.backend,
+        Backend::WindowsJobObject,
         "the run must report the primitive that applied to it, got {out:?}"
     );
     assert!(out.stdout.contains("hello"), "output is still captured");
@@ -194,87 +190,6 @@ async fn a_contained_run_can_execute_a_program_from_the_path() {
     assert!(
         out.stdout.contains("rustc"),
         "the payload's own output must come back: {out:?}"
-    );
-}
-
-/// The crate's **own** verification gate, contained, with its own output.
-///
-/// `cargo test --offline` is what `tests/policy.rs`, `tests/sandbox.rs` and four
-/// `verify` unit tests all use as their criterion, and every one of them fails on
-/// `windows-latest` under the container while a `rustc` gate in the same shape
-/// passes. Those tests assert a boolean, so the run's own account of what it could
-/// not reach is discarded exactly where it is needed.
-///
-/// This runs the same command through the same backend and puts the merged output
-/// in the failure message. It is not a diagnostic bolted on beside the release:
-/// "the crate's own gate runs contained on this platform" is the release's claim,
-/// and until now nothing asserted it with the evidence attached.
-#[tokio::test]
-async fn the_crates_own_cargo_gate_runs_contained_and_says_what_it_could_not_reach() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    std::fs::create_dir(root.join("src")).unwrap();
-    std::fs::write(
-        root.join("Cargo.toml"),
-        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("src/lib.rs"),
-        "pub fn hello() -> u32 { 42 }\n#[test] fn t() { assert_eq!(hello(), 42); }\n",
-    )
-    .unwrap();
-
-    // The roots the run's own gate resolves, so this is the gate's real
-    // configuration rather than a stricter one invented here.
-    let roots: Vec<std::path::PathBuf> = io_harness::toolchain::detect(root)
-        .map(|tc| tc.cache_dirs())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| p.is_dir())
-        .collect();
-    let limits = SandboxLimits {
-        max_wall_secs: Some(600),
-        ..limits()
-    };
-    let argv = vec![
-        "cargo".to_string(),
-        "test".to_string(),
-        "--offline".to_string(),
-    ];
-    let out = select(&SandboxConfig::new())
-        .run(
-            RunSpec::new(&argv, root, &limits)
-                .with_network(false)
-                .with_writable_roots(&roots),
-        )
-        .await
-        .unwrap();
-
-    // **The backend first, and this assertion is the one that was missing.**
-    // `run_contained` declines when a grant it must have cannot be applied, and
-    // the Job Object then runs the command with no access boundary — so a bare
-    // `success()` here passed while proving nothing about containment, which is
-    // exactly how this release mis-read its own evidence for a round. The probe
-    // says this host can build a container; a run that did not get one is a
-    // failure, not a degradation to accept quietly.
-    assert_eq!(
-        out.backend,
-        Backend::WindowsAppContainer,
-        "the gate ran, but not inside a container — the container declined this run and the \
-         job object executed it, so nothing here is evidence about access. Exit {:?}, merged \
-         output:\n{}",
-        out.exit_code,
-        out.stdout
-    );
-    assert!(
-        out.success(),
-        "the crate's own gate could not run contained — backend {:?}, exit {:?}, \
-         writable roots {:?}, merged output:\n{}",
-        out.backend,
-        out.exit_code,
-        roots,
-        out.stdout
     );
 }
 

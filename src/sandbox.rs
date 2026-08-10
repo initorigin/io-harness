@@ -109,17 +109,6 @@ pub enum Backend {
     /// seccomp filter; only the kernel's own defaults for an unprivileged user
     /// namespace apply on top.
     LinuxNamespaces,
-    /// Windows AppContainer **and** Job Object together: a low-box token that
-    /// answers *no* to every securable object it was not granted, with an
-    /// explicit ACE per granted path and a capability array that is empty unless
-    /// the run's policy permits egress — plus the Job Object's memory, CPU and
-    /// active-process limits and its kill-on-close.
-    ///
-    /// This is the only Windows backend that confines **access**. A run
-    /// reporting it is both access-confined and resource-contained; a run
-    /// reporting [`WindowsJobObject`](Backend::WindowsJobObject) is the second
-    /// only. See [`appcontainer`].
-    WindowsAppContainer,
     /// Windows Job Object: memory, CPU and active-process limits, and a
     /// tree kill on close. A **resource** boundary and nothing else — a Job
     /// Object has no filesystem facility and no network facility, so a run
@@ -158,8 +147,7 @@ impl Backend {
             Backend::MacosSandboxExec
             | Backend::LinuxLandlock
             | Backend::LinuxBubblewrap
-            | Backend::LinuxNamespaces
-            | Backend::WindowsAppContainer => true,
+            | Backend::LinuxNamespaces => true,
             // A Job Object is a resource container: there is no path rule to set
             // on one. The floor is an ephemeral working directory and nothing.
             Backend::WindowsJobObject | Backend::PortableFloor => false,
@@ -188,8 +176,7 @@ impl Backend {
             Backend::MacosSandboxExec
             | Backend::LinuxLandlock
             | Backend::LinuxBubblewrap
-            | Backend::LinuxNamespaces
-            | Backend::WindowsAppContainer => true,
+            | Backend::LinuxNamespaces => true,
             Backend::WindowsJobObject | Backend::PortableFloor => false,
         }
     }
@@ -201,7 +188,6 @@ impl Backend {
             Backend::LinuxLandlock => "linux-landlock",
             Backend::LinuxBubblewrap => "linux-bubblewrap",
             Backend::LinuxNamespaces => "linux-namespaces",
-            Backend::WindowsAppContainer => "windows-appcontainer",
             Backend::WindowsJobObject => "windows-job-object",
             Backend::PortableFloor => "portable-floor",
         }

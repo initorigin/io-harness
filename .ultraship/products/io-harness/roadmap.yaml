@@ -1128,14 +1128,18 @@ versions:
     status: released
   - version: 0.47.0
     outcome: >
-      Containment holds on every platform the crate claims, including the hosts that refuse the
-      primitive it reaches for first. The Linux backend needs an unprivileged user namespace and a
-      stock modern distribution refuses one, so a run there takes the portable floor: caps only, no
-      filesystem confinement, no egress denial. It is reported rather than hidden, and it is still
-      the weaker guarantee. This release makes Linux a chain — a namespace-free filesystem and
-      syscall restriction first, a mount-namespacing helper where the host has one, the existing
-      backend after that, the floor last — and finishes Windows access confinement so a Windows run
-      enforces files and network rather than resource caps alone.
+      Containment holds on the Linux hosts that refuse the primitive it reaches for first. The
+      backend needs an unprivileged user namespace and a stock modern distribution refuses one, so a
+      run there takes the portable floor: caps only, no filesystem confinement, no egress denial. It
+      is reported rather than hidden, and it is still the weaker guarantee. This release makes Linux
+      a chain — a namespace-free filesystem and syscall restriction first, a mount-namespacing
+      helper where the host has one, the existing backend after that, the floor last — so the
+      commonest CI image in the world stops silently taking the floor.
+
+      **Windows access confinement was specified here and is not in it.** It moved whole to 0.59.0
+      by owner decision on 2026-08-10; see `US-IO-HARNESS-0.47.0-I01`. A Windows run keeps exactly
+      the containment 0.46.0 gave it — a Job Object, which contains resources and not access — and
+      the platform table says so rather than implying otherwise.
     detail: specified
     status: planned
   - version: 0.48.0
@@ -1362,5 +1366,47 @@ versions:
       undo depends on goes when the run does — a restore point without its run is a promise the
       store can no longer keep, and it says so at the time rather than at the moment somebody
       reaches for it.
+    detail: outline
+    status: planned
+  - version: 0.59.0
+    outcome: >
+      A Windows run is access-confined, not merely resource-contained.
+
+      This was specified as half of 0.47.0 and taken out of it whole on 2026-08-10, on the owner's
+      decision, after ten matrix rounds on `windows-latest` failed to converge from a development
+      host that cannot run the platform. The record is `US-IO-HARNESS-0.47.0-I01`. Nothing about the
+      goal changed: `docs/CONTRACT.md` still says "Supported, full suite in CI" and "native resource
+      containment only" in the same row, and `sandbox::appcontainer` still holds a mechanism nothing
+      selects — a low-box profile, named paths granted to its container SID with explicit ACEs, and
+      a spawn through `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, proven against negative
+      controls for a refused read and a refused socket. A Job Object is a kernel container for
+      resources; it has no filesystem facility and no network facility. This release is the other
+      half, and it selects it.
+
+      **It starts from evidence 0.47.0 paid for rather than from where 0.26.0 left it**, and the
+      three faults it already fixed are in the tree: an ACE must carry specific rights, because
+      `SetEntriesInAclW` stores a `GENERIC_ALL` mask verbatim and an access check for
+      `FILE_READ_DATA` never matches one — every grant this module made between 0.26.0 and 0.47.0
+      was inert and readable back off the DACL, which is the worst shape a security defect can take.
+      A tree grant must continue past a descendant something else has open, because `CARGO_HOME` is
+      being read by the very build that asked for the sandbox. And a grant on a directory alone must
+      not enumerate it, because both `aclapi` write entry points walk the whole subtree below their
+      target and one grant on an ancestor of `%TEMP%` enumerated the user profile.
+
+      **Two questions are open and are what the first day is for.** Why the container declines the
+      `CARGO_HOME` grant on `windows-latest` — the decline reason is recorded and printed by the
+      capability table, and it needs a machine where that can be read in seconds rather than in a
+      matrix round. And whether `cmd.exe` refusing to start a batch file named by an absolute path
+      inside an AppContainer is a property of the platform or of this spawn: the same file is read
+      by absolute path with `type` and runs when named relative to the working directory, on a
+      workspace nowhere near the user profile, so it is not the grant set and not the path's
+      ancestors.
+
+      **The instrument to keep.** `what_the_container_actually_permits_on_this_host` asks each
+      capability separately — a builtin, a read, a script, a write, a program on `PATH` — through
+      the container path itself, and prints the backend that answered each with its output. A test
+      that asserts only success cannot tell a container that permitted the operation from a
+      container that declined and let the Job Object run it unconfined, and this release began by
+      making that mistake twice.
     detail: outline
     status: planned
