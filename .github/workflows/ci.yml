@@ -237,7 +237,14 @@ jobs:
       - name: permit unprivileged user namespaces so the Linux backend is real
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-      - run: cargo nextest run ${{ matrix.flags }} --lib --tests
+      # `--no-fail-fast`, added in 0.47.0 and it is a lesson about round trips
+      # rather than about testing. nextest stops the run on the first failures,
+      # and on a platform the development host cannot run at all that turns one
+      # defect into one matrix round: four `verify` tests failed here and 698
+      # tests — including the ones written to say *why* — never ran. A leg that
+      # is going to be red anyway costs nothing extra by finishing, and it
+      # answers the next question in the same round.
+      - run: cargo nextest run ${{ matrix.flags }} --lib --tests --no-fail-fast
       # 0.47.0 — N5. The Windows backends' per-command cost, printed rather than
       # asserted: the measurement tests carry no threshold, because a wall-clock
       # number on a shared runner is not something a merge should turn on. The
@@ -245,8 +252,13 @@ jobs:
       #
       # `--success-output immediate` because nextest captures the output of a
       # passing test, and the whole point of these is what they print.
+      # Not macOS: 0.46.0 measured `sandbox-exec` and the figure is in its record.
+      # The Linux leg here is the one that *restores* unprivileged user
+      # namespaces, so it is where the namespace rung can be timed at all — the
+      # `contained-linux` leg leaves the restriction in place by design and
+      # reports that rung as not measurable.
       - name: measure the per-command containment overhead (N5)
-        if: runner.os == 'Windows' && matrix.flags == ''
+        if: matrix.flags == '' && runner.os != 'macOS'
         run: >
           cargo nextest run --lib
           --run-ignored ignored-only
@@ -309,7 +321,7 @@ jobs:
           --example orphan
           --example plan_gate_fixture
           --example tick
-      - run: cargo nextest run --lib --tests
+      - run: cargo nextest run --lib --tests --no-fail-fast
         env:
           IO_HARNESS_EXPECT_BACKEND: linux-landlock
       # 0.47.0 — N5, on the leg where the rung under measurement is the one a

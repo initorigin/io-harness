@@ -27,12 +27,30 @@
 # caller uses, because the one defect this script originally missed was a
 # function that compiled fine and was private to its module.
 #
-# WHAT IT DOES NOT COVER
+# THE WINDOWS HALF IS NO LONGER A SHIM, WHERE THE TOOLCHAIN IS INSTALLED
 #
-# The `cfg`-gated code in `src/sandbox/linux.rs` and `src/sandbox/windows.rs`,
-# which depends on the whole crate and cannot be extracted this cheaply. Those
-# still need the matrix. Run this first anyway: it is seconds against minutes,
-# and it catches the leaf modules where most of the unsafe code lives.
+# This script originally said `src/sandbox/windows.rs` could not be covered:
+# it depends on the whole crate, and cross-compiling the crate needs a cross C
+# toolchain for rusqlite's bundled SQLite. That was a missing package, not a law.
+# With mingw-w64 present the whole crate — lib and every test target — type-checks
+# for `x86_64-pc-windows-gnu` in about a minute, and it catches exactly what three
+# matrix rounds of 0.47.0 were spent on: a type not imported into `mod job`, a
+# function reached through the wrong `super::`, a signature that only a
+# `cfg(windows)` caller uses.
+#
+#     brew install mingw-w64    # or your platform's equivalent
+#     rustup target add x86_64-pc-windows-gnu
+#
+# CI builds for `-msvc` and this checks `-gnu`. They differ in the linker and the
+# C runtime, neither of which type-checking reaches; what is being checked here is
+# the crate's own `cfg(windows)` code, which is identical under both.
+#
+# WHAT IT STILL DOES NOT COVER
+#
+# The `cfg`-gated code in `src/sandbox/linux.rs`, which needs a cross C toolchain
+# of its own — and, on every platform, whether any of this *behaves*. A Windows
+# runner is the only machine that can answer whether an AppContainer can execute
+# a given program. Run this first anyway: it is a minute against a matrix round.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -178,6 +196,22 @@ RS
     fi
 else
     echo "skip $WINDOWS_TARGET (rustup target add $WINDOWS_TARGET)"
+fi
+
+# --- Windows: the whole crate, lib and tests -------------------------------
+#
+# The real check, where the cross C toolchain exists. Everything above is a shim
+# against a hand-written stub; this is the crate.
+WINDOWS_GNU=x86_64-pc-windows-gnu
+if have_target "$WINDOWS_GNU" && command -v x86_64-w64-mingw32-gcc >/dev/null; then
+    note "cargo check $WINDOWS_GNU (whole crate, lib and tests)"
+    CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
+        AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar \
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+        CARGO_PROFILE_DEV_DEBUG=0 \
+        cargo check --target "$WINDOWS_GNU" --all-features --lib --tests || fail=1
+else
+    echo "skip $WINDOWS_GNU whole-crate check (needs: rustup target add $WINDOWS_GNU, and mingw-w64)"
 fi
 
 if [ "$fail" -ne 0 ]; then
