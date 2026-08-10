@@ -1094,7 +1094,12 @@ pub(crate) fn wrap_argv(
             linux::bwrap_argv(argv, workdir, allow_network, config.mode, writable_roots),
         );
     }
-    let _ = writable_roots;
+    // On a platform with no argv-wrapping branch above — Windows, and any host
+    // that took the floor — none of these is read. Named rather than
+    // underscore-prefixed because every other platform does use them, and a
+    // parameter called `_workdir` in a signature this shared would read as if the
+    // working directory were ignored everywhere.
+    let _ = (workdir, allow_network, writable_roots);
     (backend, argv.to_vec())
 }
 

@@ -366,7 +366,7 @@ pub(crate) mod job {
         OpenThread, ResumeThread, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
     };
 
-    use super::JobLimits;
+    use super::{Grant, JobLimits};
     use crate::error::{Error, Result};
     use crate::sandbox::{run_capped, run_capped_hooked, Backend, Cap, RunSpec, SandboxOutcome};
 
