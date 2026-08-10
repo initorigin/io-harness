@@ -1,6 +1,5 @@
 product: io-harness
 version: 0.47.0
-status: planned
 release_type: minor
 
 outcome:
@@ -587,3 +586,89 @@ open_questions:
   a reader could reasonably expect "containment holds on every platform" to include them. The
   roadmap places them in 0.48.0 with the per-tool modes they need, and the limitation stays
   stated in `docs/CONTRACT.md` until then.
+
+status: released
+released_at: 2026-08-10T14:45:00Z
+mode: published
+delivered: >
+  A contained run on a stock Ubuntu 24.04 host — which is what `ubuntu-latest` is — now confines
+  writes and refuses outbound TCP, where every release from 0.40.0 to 0.46.0 applied neither and
+  reported the portable floor while every interface said "contained". Linux is an ordered chain:
+  Landlock first because it needs no namespace at all, `bwrap` where the host has a working one,
+  the existing `unshare` backend after that, the floor last — and the rung a host takes is the
+  strongest one that can enforce what the run asked for, with one rule that can send it lower: a
+  run that denies egress is never given a rung that cannot deny egress.
+
+  **Windows is not in this release and that is the release's other fact.** The AppContainer half
+  was specified here and taken out whole on the owner's decision of 2026-08-10, rescheduled to
+  0.59.0, recorded as `US-IO-HARNESS-0.47.0-I01`. A Windows run gets exactly what 0.46.0 gave it —
+  a Job Object, resources and not access — and every documentation surface says so.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — exit 0, **77 test binaries, 1,540 passed, 0 failed**,
+    including **412** doctests. Run with `XDG_CONFIG_HOME` redirected to a scratch directory,
+    which is this machine's standing environment fix for `tests/plugin.rs` and unrelated to the
+    release.
+  - >
+    `cargo test --all-features` — exit 0, **77 test binaries, 1,626 passed, 0 failed**, including
+    **415** doctests, as a separate invocation after `rm -rf target`.
+  - >
+    `cargo test --test cross_version_0_29_0 -- --ignored --exact
+    a_current_store_is_read_by_a_0_29_0_binary` — exit 0, 1 passed. The pinned 0.29.0 generator
+    built first (exit 0); a 0.29.0 binary still reads a store this tree wrote.
+  - >
+    CI run **31395244227** on `bc18f86` — **16 of 16 jobs green**, including
+    `contained (ubuntu, userns restricted)`, which is the leg that does **not** relax
+    `kernel.apparmor_restrict_unprivileged_userns` and is therefore the one that proves the
+    release rather than the fallback.
+  builds:
+  - '`cargo fmt --check` — exit 0.'
+  - '`cargo clippy --all-targets --all-features -- -D warnings` — exit 0.'
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0.
+    Run before the release PR, because stable `cargo doc` does not see what this gate sees; it
+    found nothing this release, which is worth stating since it found something in five of the
+    last seven.
+  - >
+    `cargo package --locked` — exit 0, **1,582,269 bytes**. Run on a tree with no uncommitted
+    source changes.
+  - >
+    `cargo tree` — **402** crates, unchanged. `CHECKPOINT_FORMAT` unmoved at **7**.
+    `git diff main -- src/state.rs` is **empty**: no table, column or index, the fourth such
+    release running. `git diff main -- docs/public-api.txt` is **empty** — two `Backend` variants
+    were added and one removed, and the checker enumerates crate-root items rather than variants.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **The record is sealed before the crates.io upload**, which follows the `develop` → `main` merge
+  and the GitHub Release. `mode: published` states the authorized target; the flow makes it true.
+- >
+  **Windows enforces no filesystem or network boundary**, and this release does not change that in
+  either direction. `ExecMode` is routed and reported on that platform and enforces nothing for the
+  filesystem, exactly as in 0.46.0. The access half is 0.59.0
+  (`US-IO-HARNESS-0.47.0-I01`), and `docs/CONTRACT.md`, the README, `src/lib.rs` and the changelog
+  all say resource containment only.
+- >
+  **Three acceptance criteria were removed rather than met**: F7, F8 and F9 were the Windows arms
+  and went with the deferral. F10 and F11 were renumbered F7 and F8, and F7 lost its Windows arm
+  and kept its Linux one. Stated here rather than left for a reader to notice the criteria list
+  and the roadmap disagreeing.
+- >
+  **`sandbox::appcontainer` ships compiled, unit-tested and selected by nothing**, carrying
+  `allow(dead_code)` as it did from 0.26.0 until this release. It keeps three corrections this
+  release paid for — an ACE must carry specific rights rather than generic ones, a tree grant must
+  survive a descendant another process holds open, and a directory-only grant must not enumerate
+  the directory — so 0.59.0 starts from them rather than re-finding them.
+- >
+  **`shell_start`'s backgrounded handles are still uncontained**, which is 0.48.0's, and the
+  limitation stays stated in `docs/CONTRACT.md` until then.
+- >
+  **A workspace located inside the system temporary directory is not confined** on any unix
+  backend, because every one of them grants that directory writable so a toolchain can open a
+  temporary file. Found by the CI matrix in this release and documented rather than worked around.
+supersedes: 0.46.0
+next_recommended_version: 0.48.0
+immutable: true

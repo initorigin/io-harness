@@ -1141,7 +1141,7 @@ versions:
       the containment 0.46.0 gave it — a Job Object, which contains resources and not access — and
       the platform table says so rather than implying otherwise.
     detail: specified
-    status: planned
+    status: released
   - version: 0.48.0
     outcome: >
       Everything a run starts is inside the boundary, and the boundary is the one the policy already
