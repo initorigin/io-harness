@@ -943,3 +943,150 @@ async fn the_prompt_is_composed_once_and_does_not_move() {
         "the prompt followed a file the run rewrote under it"
     );
 }
+
+// ------------------------------------------------------------------------ F10
+//
+// 0.48.0 (`US-IO-HARNESS-0.48.0-I03`) — 0.37.0 gave a classifying turn its own
+// *system* prompt and left the *user* block unconditional, so one completion
+// carried "write that answer and call no tool" beside "start by grepping" and
+// "Call a tool to make progress toward the success criterion." An embedder
+// reported the consequence verbatim: the operator typed "Hi" and the reply began
+// by narrating the classification decision.
+
+/// The imperative and the scaffolding a classifying turn must not be sent.
+const CALL_A_TOOL: &str = "Call a tool to make progress toward the success criterion.";
+const START_BY_GREPPING: &str = "(nothing yet — start by grepping or finding)";
+const CRITERION_LINE: &str = "Success criterion:";
+
+/// Every request a session turn made, in order.
+async fn turn_requests(contract: &TaskContract, root: &std::path::Path, script: Vec<Vec<ToolCall>>) -> Vec<CompletionRequest> {
+    let provider = Rec::new(script);
+    let store = Store::memory().unwrap();
+    let mut session = Session::open(&store, root).unwrap();
+    let _ = session
+        .turn_bounded(contract, &provider, &store, &Policy::permissive(), &ApproveAll)
+        .await;
+    let seen = provider.seen.lock().unwrap().clone();
+    seen
+}
+
+#[tokio::test]
+async fn a_classifying_turn_is_not_told_to_call_a_tool() {
+    let dir = workspace();
+    // `Verification::None` is what makes a turn classifying — the same condition
+    // `extras.classify` is set from.
+    let c = TaskContract::workspace("Hi", dir.path())
+        .with_verification(Verification::None)
+        .with_max_steps(2);
+    let reqs = turn_requests(&c, dir.path(), vec![vec![]]).await;
+
+    let user = &reqs[0].user;
+    for forbidden in [CALL_A_TOOL, START_BY_GREPPING, CRITERION_LINE] {
+        assert!(
+            !user.contains(forbidden),
+            "a classifying turn was told {forbidden:?} in the same completion that told it to \
+             answer and call no tool.\n--- user ---\n{user}"
+        );
+    }
+    // And it is asked what the operator actually said.
+    assert!(
+        user.contains("Hi"),
+        "the operator's own words reach the model.\n--- user ---\n{user}"
+    );
+    // The system half is 0.37.0's, unchanged — this release fixed the other half.
+    assert!(
+        reqs[0].system.ends_with(CONVERSATIONAL_ENDING),
+        "the classifying system prompt is untouched"
+    );
+}
+
+/// The negative control that keeps this a change of one thing: the moment a turn
+/// is promoted to a run, every later step is asked exactly as it was before.
+///
+/// 0.37.0's reasoning, applied to the user block: permitting an answer is a
+/// decision about a turn's *opening*, not a licence to stop at prose on step nine.
+#[tokio::test]
+async fn a_promoted_turns_later_step_is_asked_as_it_always_was() {
+    let dir = workspace();
+    let c = TaskContract::workspace("edit a.txt", dir.path())
+        .with_verification(Verification::None)
+        .with_max_steps(3);
+    // The first completion reaches for a tool, which promotes the turn.
+    let reqs = turn_requests(&c, dir.path(), vec![write_call(), vec![]]).await;
+    assert!(reqs.len() >= 2, "the turn was promoted and ran a second step");
+
+    let step_two = &reqs[1].user;
+    for expected in [CALL_A_TOOL, CRITERION_LINE, "Goal: edit a.txt"] {
+        assert!(
+            step_two.contains(expected),
+            "step 2 of a promoted turn is the workspace prompt, unchanged: {expected:?} missing.\
+             \n--- user ---\n{step_two}"
+        );
+    }
+    // ...and step 1 was not.
+    assert!(
+        !reqs[0].user.contains(CALL_A_TOOL),
+        "the opening is the only step this release changes"
+    );
+}
+
+/// The other negative control: a turn that is not classifying is asked the way it
+/// always was on its first step too. Only `Verification::None` selects the new
+/// shape, which is the same condition that selects the new system prompt.
+#[tokio::test]
+async fn a_verified_turns_first_step_is_the_workspace_prompt() {
+    let dir = workspace();
+    let c = TaskContract::workspace("do the thing", dir.path())
+        .with_verification(Verification::FileContains("ok".into()))
+        .with_max_steps(1);
+    let reqs = turn_requests(&c, dir.path(), vec![write_call()]).await;
+    assert!(
+        reqs[0].user.contains(CALL_A_TOOL) && reqs[0].user.contains(CRITERION_LINE),
+        "a verified turn's opening is untouched.\n--- user ---\n{}",
+        reqs[0].user
+    );
+}
+
+/// The order 0.44.0's cache boundary depends on.
+///
+/// `cache_boundary_for` is handed this very string and locates the fold's summary
+/// inside it, so the operator's words must stay *ahead* of the conversation the
+/// way the goal stays ahead of the observations in the workspace prompt. A shape
+/// that reordered them would change what a classifying turn caches while nothing
+/// failed — which is why this is asserted rather than assumed.
+#[tokio::test]
+async fn a_classifying_turn_keeps_the_order_the_cache_boundary_reads() {
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let mut session = Session::open(&store, dir.path()).unwrap();
+
+    // Turn one, so turn two has a conversation to carry.
+    let first = TaskContract::workspace("Hi", dir.path())
+        .with_verification(Verification::None)
+        .with_max_steps(1);
+    let p1 = Rec::new(vec![vec![]]);
+    let _ = session
+        .turn_bounded(&first, &p1, &store, &Policy::permissive(), &ApproveAll)
+        .await;
+
+    let second = TaskContract::workspace("and what can you do", dir.path())
+        .with_verification(Verification::None)
+        .with_max_steps(1);
+    let p2 = Rec::new(vec![vec![]]);
+    let _ = session
+        .turn_bounded(&second, &p2, &store, &Policy::permissive(), &ApproveAll)
+        .await;
+
+    let user = p2.seen.lock().unwrap()[0].user.clone();
+    let words = user
+        .find("and what can you do")
+        .expect("the operator's words are in the request");
+    let seed = user
+        .find("[earlier turn]")
+        .expect("the conversation so far is in the request");
+    assert!(
+        words < seed,
+        "the operator's words precede the conversation, as the goal precedes the observations in \
+         the workspace prompt.\n--- user ---\n{user}"
+    );
+}

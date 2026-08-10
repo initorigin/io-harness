@@ -4447,7 +4447,14 @@ async fn run_workspace_from<P: Provider>(
                 },
             )
             .await?;
-            let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
+            // 0.48.0 — asked by the same condition that already chooses the system
+            // half below, so the two halves of one completion cannot disagree.
+            let user = match &conversational {
+                Some(_) if step == start_step => {
+                    conversational_user_prompt(&contract.goal, &assembled.text)
+                }
+                _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
+            };
             // 0.44.0 — the second cache breakpoint, at the end of what compaction
             // froze, and only once that prefix has already gone out once.
             let cache_boundary =
@@ -6061,7 +6068,14 @@ fn run_agent<'f, P: Provider>(
                     },
                 )
                 .await?;
-                let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
+                // 0.48.0 — the same rule as the flat loop, and for the same reason
+                // the system half is chosen this way here too.
+                let user = match &conversational {
+                    Some(_) if step == start_step => {
+                        conversational_user_prompt(&contract.goal, &assembled.text)
+                    }
+                    _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
+                };
                 // 0.44.0 — the same rule as the flat loop, through the same helper.
                 // A boundary computed in one loop and not the other would make a
                 // contained run and a flat one cache differently while nothing failed.
@@ -12014,6 +12028,39 @@ fn workspace_user_prompt(
         goal = contract.goal,
         criterion = contract.verify.describe(),
     )
+}
+
+/// The user block for a turn's classifying step (0.48.0).
+///
+/// **The half 0.37.0 did not write.** That release gave a classifying turn its own
+/// *system* prompt, ending "If a plain answer is the whole of what is wanted,
+/// write that answer and call no tool" — and left [`workspace_user_prompt`]
+/// unconditional, so the same completion also carried "(nothing yet — start by
+/// grepping or finding)" and "Call a tool to make progress toward the success
+/// criterion." A model handed both resolves the contradiction in its reply, which
+/// is exactly what an embedder driving `Session::turn` reported: the operator
+/// typed "Hi" and the answer began "its a Hi reply to give and no run so just
+/// simply answer". The turn machinery was right; what the model was asked was not.
+///
+/// So this carries the operator's words and the conversation so far, and nothing
+/// else: no goal/constraints/criterion scaffolding, because a greeting has no
+/// success criterion; no "start by grepping", because starting is the question
+/// being asked rather than the instruction being given; and no closing imperative,
+/// because the system block already says what to do in both readings.
+///
+/// **The operator's words come first and the conversation follows**, which is the
+/// order [`workspace_user_prompt`] already uses for the goal and the observations.
+/// That is deliberate rather than incidental: 0.44.0's `cache_boundary_for` is
+/// handed this string and locates the fold's summary inside it, so keeping the
+/// relative order keeps a classifying turn marking the same prefix a promoted one
+/// marks. A second user-prompt shape that reordered them would change what is
+/// cached while nothing failed.
+fn conversational_user_prompt(goal: &str, observations: &str) -> String {
+    if observations.is_empty() {
+        goal.to_string()
+    } else {
+        format!("{goal}\n\n{observations}")
+    }
 }
 
 /// What an agent inside a tree is and what its tools are, without the sentence

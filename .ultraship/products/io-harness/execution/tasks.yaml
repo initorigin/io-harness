@@ -288,7 +288,7 @@ tasks:
     while the user block in the same completion tells it to start by grepping and to call a tool. The
     model resolves the contradiction in its reply, which is what an embedder reported from the field.
     It is wrong on every conversational turn shipping today (US-IO-HARNESS-0.48.0-I03).
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F10 — a classifying turn is asked one question, not two that disagree** (`US-IO-HARNESS-0.48.0-I03`).
@@ -309,4 +309,14 @@ tasks:
   files:
   - src/run.rs
   - tests/prompt.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test prompt` — exit 0, 16 passed, including the four new arms.'
+  - 'Sabotage: send the workspace user prompt on the classifying step (0.47.0''s behaviour) — `a_classifying_turn_is_not_told_to_call_a_tool`
+    and `a_promoted_turns_later_step_is_asked_as_it_always_was` both FAILED by name.'
+  - 'Sabotage: send the conversational prompt on every step — `a_promoted_turns_later_step_is_asked_as_it_always_was`
+    FAILED alone; the two openings still passed.'
+  - '`cargo test --test session --test context --test cache_boundary` — exit 0, 7 + 16 + 5 passed.'
+  - 'The cache-boundary arm is met as an ORDER INVARIANT, not a fold: with no compaction in a two-turn
+    session there is no boundary to compare, so the test asserts the property the boundary rests on —
+    the operator''s words precede the conversation, as the goal precedes the observations. Stated rather
+    than glossed.'
