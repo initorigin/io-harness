@@ -632,4 +632,105 @@ open_questions:
   `SandboxLimits` field that says "and handles too". Excluded here as a knob for a case nobody has
   asked for; the rule is stated and the caller can `shell_kill`.
 
-status: planned
+status: released
+released_at: 2026-08-11T05:40:00Z
+mode: published
+delivered: >
+  Everything a run starts is inside the boundary, and the boundary is the one the policy already
+  describes. A backgrounded `shell_start` handle and the six git built-ins are contained like every
+  other spawn, so which tool the model picks no longer decides whether the boundary applies. Each
+  spawning tool declares the mode it needs and a call runs under the narrower of that and what the
+  contract granted, with an unsatisfiable need refused before any process starts. And a run whose
+  policy names hosts reaches those hosts and no others: its contained commands go through a loopback
+  proxy the run owns, which asks the run's own `Policy` about every `host:port` and records the
+  answer.
+
+  **The release's own proof was written two releases ago.** 0.40.0 added a test asserting the
+  coarseness it could not fix — one allowed host opened all of them — whose failure message said
+  "if this assertion ever fails, per-host egress has been implemented and `docs/CONTRACT.md` must
+  stop saying it has not". It failed on the proxy's first run and was inverted.
+
+  Plus one correction that is not containment: a classifying turn is asked one question instead of
+  two that disagree (`US-IO-HARNESS-0.48.0-I03`).
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — exit 0, **79 test binaries, 1,572 passed, 0 failed**,
+    including **415** doctests. Run with `XDG_CONFIG_HOME` redirected to a scratch directory, this
+    machine's standing environment fix for `tests/plugin.rs` and unrelated to the release.
+  - >
+    `cargo test --all-features` — exit 0, **79 test binaries, 1,658 passed, 0 failed**, including
+    **418** doctests.
+  - >
+    `cargo test --test cross_version_0_29_0 -- --ignored --exact
+    a_current_store_is_read_by_a_0_29_0_binary` — exit 0, 1 passed. No DDL, so a 0.29.0 binary still
+    reads a store this tree wrote.
+  - >
+    **Sabotages, each failing a NAMED test.** Handle containment removed → F1, F2 and F3's caps arm
+    failed while both negative controls passed. Resolve to the granted mode rather than the narrower
+    → F5 alone. Drop the pre-spawn refusal → F4 alone. A blanket `(allow network*)` beside the
+    loopback rule → **F7 alone, while both proxy tests still passed**, which is the distinction F7
+    exists to make. A proxied run allowed a namespace rung → F8 alone. The workspace user prompt on
+    the classifying step → F10's two arms. The conversational prompt on every step → the promoted
+    turn's byte-identity control alone.
+  - >
+    **A sabotage that failed nothing, reported as a finding.** F9's first form branched on this
+    host's backend, which always denies egress here, so reporting the advisory case as enforced broke
+    nothing. `floor_only()` forces the weak arm on every host; the re-run then failed
+    `the_floor_is_told_its_proxy_is_advisory` by name.
+  builds:
+  - '`cargo fmt --check` — exit 0.'
+  - '`cargo clippy --all-targets --all-features -- -D warnings` — exit 0.'
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0,
+    after it caught **four** intra-doc link errors stable `cargo doc` does not report. Sixth time in
+    eight releases.
+  - >
+    `cargo package --locked` — exit 0, **1,616,667 bytes**.
+  - >
+    `cargo tree` — **402** crates, unchanged (N1): tokio's `net` and `io-util` features were already
+    enabled transitively by reqwest. `git diff main -- docs/public-api.txt` is **empty** (N3).
+    `git diff main -- src/state.rs` is **comment-only** — no table, column or index — and
+    `CHECKPOINT_FORMAT` is unmoved at **7** (N4).
+  - >
+    **N5, measured over 30 iterations:** direct **0.121 ms**, permitted through the proxy
+    **0.420 ms**, refused **0.271 ms** per dial. The hop costs ~0.30 ms and a refusal is cheaper than
+    a permission because it never dials upstream.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **The record is sealed before the crates.io upload**, which follows the `develop` → `main` merge
+  and the GitHub Release. `mode: published` states the authorized target; the flow makes it true.
+- >
+  **Per-host egress is proven on macOS and unproven on Linux.** Every F6/F7 assertion ran against
+  `macos-sandbox-exec`, where SBPL names the loopback address exactly. The Landlock rung's port rule
+  is written and its **plan** is unit-tested (`a_proxy_handles_the_network_and_allows_only_its_port`),
+  but no Linux host has executed it in this session — that is CI's to answer, as the contract's cost
+  drivers said it would be.
+- >
+  **Under Landlock the scoping is port-scoped, not address-scoped.** Another host on the proxy's port
+  number is reachable. The port is ephemeral and per-run, which narrows it in practice and is not a
+  proof; `docs/CONTRACT.md` carries this per backend rather than as a footnote.
+- >
+  **On the portable floor and on Windows the proxy is advisory** — the variables are set and a command
+  that ignores them reaches the network. Reported in the agent's own boundary section in that word.
+- >
+  **A handle still live when the run ends writes no `destroy` row.** The registry kills it on drop and
+  there is no step left to record on, which is the position `record_handle_ended` was already in.
+- >
+  **The harness's own `git worktree add`** — the one that roots a spawned child's worktree — is not
+  contained. It is a fixed argv the crate builds, on a path already checked against the parent's
+  policy, and is not a model-initiated command; the six git *built-ins* the model calls are contained.
+- >
+  **A registered `Tool`'s declared mode is a refusal mechanism, not a confinement one.** The crate does
+  not see that tool's own spawn and makes no claim to govern it.
+- >
+  **Debug prints from the proxy diagnosis reached three commits** before being removed in `1aa86f5`.
+  `cargo fmt` reformatted them between writing and removing them, so the removal did not match. They
+  are absent from the shipped tree; noted because a released tree's history should not be read as
+  clean when it was not.
+supersedes: 0.47.0
+next_recommended_version: 0.49.0
+immutable: true

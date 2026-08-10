@@ -1154,7 +1154,7 @@ versions:
       loopback proxy the run owns, which enforces the host rules the policy already states and
       records every dial.
     detail: specified
-    status: planned
+    status: released
   - version: 0.49.0
     outcome: >
       The model is asked a question it was trained to answer. Three faults share one cause and are
