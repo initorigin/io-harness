@@ -1103,6 +1103,88 @@ mod tests {
         }
     }
 
+    /// **What the container permits on this host, one capability per line.**
+    ///
+    /// Every Windows failure in this release was read wrongly at least once,
+    /// because two very different outcomes look identical from outside a test
+    /// that only asserts success: a container that permitted the operation, and a
+    /// container that **declined** — `run_contained` answers `None` when a grant
+    /// it must have cannot be applied, and the Job Object then runs the command
+    /// with no access boundary at all and every assertion passes. A gate test
+    /// written that way proved nothing about containment and read as if it had.
+    ///
+    /// So this asks each capability separately, through `run_contained` itself so
+    /// there is no doubt which backend answered, and prints all of them before
+    /// asserting. A failure here is a table, not a boolean.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn what_the_container_actually_permits_on_this_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("probe.txt"), "io-harness-probe\r\n").expect("probe file");
+        std::fs::write(
+            dir.path().join("probe.bat"),
+            "@echo off\r\necho io-harness-probe\r\n",
+        )
+        .expect("probe batch");
+
+        let limits = SandboxLimits::none();
+        let cases: [(&str, &[&str]); 5] = [
+            // The control: a shell builtin needs nothing but `%SystemRoot%`,
+            // which carries an ALL APPLICATION PACKAGES ACE of its own. If this
+            // fails the container is not usable on this host at all.
+            ("a shell builtin", &["cmd", "/c", "echo io-harness-probe"]),
+            // Reading a file the workspace grant covers. This is the claim the
+            // whole grant set rests on and nothing asserted it directly.
+            ("reading a granted file", &["cmd", "/c", "type probe.txt"]),
+            // Executing one. `cmd` opens a batch file itself, so this separates
+            // "the payload cannot be read" from "the payload cannot be started".
+            ("running a granted batch file", &["cmd", "/c", "probe.bat"]),
+            // Writing into the workspace, which `Full` is entirely about.
+            (
+                "writing into the workspace",
+                &["cmd", "/c", "echo written> written.txt"],
+            ),
+            // A program on PATH, through its launcher and toolchain home.
+            ("a program on PATH", &["rustc", "--version"]),
+        ];
+
+        let mut report = String::new();
+        let mut failed = 0;
+        for (what, args) in cases {
+            let argv: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            let spec = RunSpec::new(&argv, dir.path(), &limits)
+                .with_mode(ExecMode::WorkspaceWrite)
+                .with_network(false);
+            match job::run_contained(&spec).await {
+                None => {
+                    failed += 1;
+                    report.push_str(&format!(
+                        "\n  {what}: THE CONTAINER DECLINED — a grant it must have could not be \
+                         applied, so this command would run under the job object with no access \
+                         boundary"
+                    ));
+                }
+                Some(Err(e)) => {
+                    failed += 1;
+                    report.push_str(&format!("\n  {what}: the backend errored: {e}"));
+                }
+                Some(Ok(o)) => {
+                    if !o.success() {
+                        failed += 1;
+                    }
+                    report.push_str(&format!(
+                        "\n  {what}: backend {:?}, exit {:?}, output {:?}",
+                        o.backend, o.exit_code, o.stdout
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            failed, 0,
+            "the AppContainer did not permit what the grant set says it grants:{report}"
+        );
+    }
+
     fn find<'a>(g: &'a [GrantedPath], p: &str) -> Option<&'a GrantedPath> {
         g.iter().find(|x| x.path == Path::new(p))
     }

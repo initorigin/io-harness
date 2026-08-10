@@ -70,8 +70,8 @@ pub(crate) mod win {
     use std::path::Path;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS,
-        GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+        CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
+        HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
         GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
@@ -118,10 +118,44 @@ pub(crate) mod win {
     }
 
     impl Access {
+        /// **Specific rights, never generic ones, and this is the whole of why
+        /// the grants were inert.**
+        ///
+        /// `GENERIC_READ`, `GENERIC_EXECUTE` and `GENERIC_ALL` are a calling
+        /// convention for *requesting* access, not a way of describing it. The
+        /// SDK is explicit that generic rights must be mapped to specific ones
+        /// before an ACE is created, and `SetEntriesInAclW` stores the mask it is
+        /// handed rather than mapping it — so an ACE built from `GENERIC_ALL`
+        /// carries `0x1000_0000`, an access check for `FILE_READ_DATA` asks for
+        /// `0x1`, and the two share no bit. The ACE is present, it names the
+        /// container SID, it can be read back off the DACL — and it grants
+        /// nothing.
+        ///
+        /// That is what made this release's Windows failures so hard to read.
+        /// Every case that worked worked for another reason: `cmd.exe` and the
+        /// system libraries live under `%SystemRoot%`, and the runner's workspace
+        /// volume, which already carry an `ALL APPLICATION PACKAGES` ACE; and a
+        /// run whose `Full` grant *failed* was declined by `run_contained` and
+        /// executed by the Job Object with no container at all. Both look like a
+        /// working container from the outside, which is why the test below asks
+        /// each capability separately and prints the backend that answered.
+        ///
+        /// The values are the SDK's own, written out rather than imported: three
+        /// constants do not justify compiling the whole
+        /// `Win32_Storage_FileSystem` binding module into every Windows build,
+        /// and they are ABI-stable.
         fn mask(self) -> u32 {
+            // STANDARD_RIGHTS_READ | FILE_READ_DATA | FILE_READ_EA
+            // | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+            const FILE_GENERIC_READ: u32 = 0x0012_0089;
+            // STANDARD_RIGHTS_EXECUTE | FILE_EXECUTE | FILE_READ_ATTRIBUTES
+            // | SYNCHRONIZE
+            const FILE_GENERIC_EXECUTE: u32 = 0x0012_00A0;
+            // STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | every file-specific right
+            const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
             match self {
-                Access::ReadExecute => GENERIC_READ | GENERIC_EXECUTE,
-                Access::Full => GENERIC_ALL,
+                Access::ReadExecute => FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+                Access::Full => FILE_ALL_ACCESS,
             }
         }
     }

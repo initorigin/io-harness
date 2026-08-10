@@ -215,6 +215,22 @@ async fn the_crates_own_cargo_gate_runs_contained_and_says_what_it_could_not_rea
         .await
         .unwrap();
 
+    // **The backend first, and this assertion is the one that was missing.**
+    // `run_contained` declines when a grant it must have cannot be applied, and
+    // the Job Object then runs the command with no access boundary — so a bare
+    // `success()` here passed while proving nothing about containment, which is
+    // exactly how this release mis-read its own evidence for a round. The probe
+    // says this host can build a container; a run that did not get one is a
+    // failure, not a degradation to accept quietly.
+    assert_eq!(
+        out.backend,
+        Backend::WindowsAppContainer,
+        "the gate ran, but not inside a container — the container declined this run and the \
+         job object executed it, so nothing here is evidence about access. Exit {:?}, merged \
+         output:\n{}",
+        out.exit_code,
+        out.stdout
+    );
     assert!(
         out.success(),
         "the crate's own gate could not run contained — backend {:?}, exit {:?}, \
