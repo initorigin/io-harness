@@ -250,8 +250,8 @@ pub trait Tool: Send + Sync {
     ///
     /// Defaulted to `None`, which means *whatever this run was granted* — so a
     /// tool written against any earlier release compiles unchanged and is treated
-    /// exactly as it was. Return [`ExecMode::ReadOnly`] to say this tool never
-    /// needs to write, or [`ExecMode::WorkspaceWrite`] to say it does.
+    /// exactly as it was. Return [`ExecMode::ReadOnly`](crate::ExecMode::ReadOnly) to say this tool never
+    /// needs to write, or [`ExecMode::WorkspaceWrite`](crate::ExecMode::WorkspaceWrite) to say it does.
     ///
     /// **This is a refusal mechanism and not a confinement one, and the
     /// difference matters.** A registered tool spawns its own processes; the

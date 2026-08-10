@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.47"
+io-harness = "0.48"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -159,8 +159,10 @@ is not cosmetic: macOS and Linux confine writes and deny egress — Linux since
 contains resources and not access**, and a host that can deliver none of it
 falls back to the portable floor and **records the floor**, so a run contained
 less than you asked for is legible afterwards — in the trace, in `EventKind::Contained`, and in the agent's own
-prompt. The remaining costs — egress is one boolean per run, and the long-lived
-`shell_start` handles are not contained — are stated in
+prompt. **0.48.0 closed the last two gaps**: a backgrounded `shell_start` handle
+and the git built-ins are contained like everything else, and a run whose policy
+names hosts reaches those hosts and no others — through a proxy the run owns,
+whose guarantee differs per backend and is stated per backend in
 [docs/CONTRACT.md](docs/CONTRACT.md) rather than discovered.
 
 **Verification in any language, or none — or a second model.** A
@@ -438,6 +440,15 @@ command gets the resource caps and nothing else — `ExecMode` is routed and
 reported there and enforces nothing for the filesystem. The access half was
 planned for 0.47.0 and moved whole to 0.59.0; nothing on Windows changed in this
 release, in either direction.
+
+**0.48.0 made egress per-host, and what that is worth also differs by row.** A run
+whose policy names hosts routes its contained commands through a loopback proxy it
+owns. macOS scopes the route to that address exactly; Linux's Landlock rung scopes
+it to a **port**, so another host on that port number is reachable and the contract
+says so; the namespace rungs cannot reach the host's loopback at all and are not
+given such a run; and on Windows and the portable floor the proxy is **advisory** —
+a command that ignores it reaches the network, and the agent's own prompt uses that
+word.
 
 Both are still reported rather than assumed: `select().backend()` answers before
 the run and the trace records what actually applied.

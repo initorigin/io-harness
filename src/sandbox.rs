@@ -744,7 +744,7 @@ impl<'a> RunSpec<'a> {
     /// Route this command's egress through a loopback proxy at `addr` (0.48.0).
     ///
     /// When set, the backend permits that address and **nothing else**: the
-    /// proxy is the only route out, and it asks the run's own [`Policy`] about
+    /// proxy is the only route out, and it asks the run's own [`Policy`](crate::Policy) about
     /// every host before it connects. That is what turns per-host rules from a
     /// statement of intent into the thing enforced — see `docs/CONTRACT.md` for
     /// what each backend can and cannot scope, because the answer differs and the
