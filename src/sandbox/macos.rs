@@ -17,10 +17,6 @@ pub struct MacosSandbox;
 
 impl Sandbox for MacosSandbox {
     async fn run(&self, spec: RunSpec<'_>) -> Result<SandboxOutcome> {
-        eprintln!(
-            "ZZ macos spec.proxy={:?} allow_net={}",
-            spec.proxy, spec.allow_network
-        );
         let profile = profile_for(
             spec.workdir,
             spec.allow_network,
