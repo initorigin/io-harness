@@ -30,7 +30,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use io_harness::sandbox::{RunSpec, Sandbox};
-use io_harness::{select, Backend, Cap, SandboxConfig, SandboxLimits, SandboxOutcome};
+use io_harness::{select, Backend, Cap, ExecMode, SandboxConfig, SandboxLimits, SandboxOutcome};
 
 /// Write `body` as `name.bat` in `dir` and hand back the name to invoke it by.
 ///
@@ -72,6 +72,29 @@ async fn run_bat(
     let argv = vec!["cmd".to_string(), "/c".to_string(), script.to_string()];
     select(config)
         .run(RunSpec::new(&argv, workdir, &limits).with_network(config.allow_network))
+        .await
+        .unwrap()
+}
+
+/// The same, with the access half switched off: the Job Object and its limits,
+/// no AppContainer.
+///
+/// `ExecMode::FullAccess` is what a caller asks for when it wants the host's own
+/// privileges, and `WindowsSandbox::run` reads it as "do not build a container".
+/// A cap test wants exactly that: the limits are the job's, and a payload that
+/// cannot start inside a container proves nothing about a memory ceiling.
+async fn run_bat_uncontained(
+    limits: SandboxLimits,
+    workdir: &Path,
+    script: &str,
+) -> SandboxOutcome {
+    let argv = vec!["cmd".to_string(), "/c".to_string(), script.to_string()];
+    select(&SandboxConfig::new())
+        .run(
+            RunSpec::new(&argv, workdir, &limits)
+                .with_network(false)
+                .with_mode(ExecMode::FullAccess),
+        )
         .await
         .unwrap()
 }
@@ -346,8 +369,16 @@ async fn the_memory_limit_is_a_real_bound_and_is_named_as_one() {
          exit /b %errorlevel%",
     );
 
-    let out = run_bat(
-        &SandboxConfig::new(),
+    // **Asserted on the Job Object, and that is not a retreat.** A commit limit
+    // is a job facility — the container has no memory facility at all, and the
+    // container path adopts its process into exactly this job before resuming it,
+    // so the code under test is the same either way. What the container *does*
+    // affect is the payload: this one is PowerShell, and PowerShell inside an
+    // AppContainer dies loading its own types with an access error rather than
+    // reaching the allocation, which would make the test assert nothing about
+    // memory. `FullAccess` is the documented way to ask for the resource half
+    // without the access half.
+    let out = run_bat_uncontained(
         SandboxLimits {
             max_memory_bytes: Some(512 * 1024 * 1024),
             ..limits()

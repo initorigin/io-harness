@@ -629,8 +629,30 @@ pub(crate) mod win {
                         std::ptr::null_mut(),
                     )
                 };
+                // **A descendant that refused is not a failed grant, and the
+                // difference decides whether the run is contained at all.**
+                // The tree walk crosses a directory that other processes are
+                // using — `CARGO_HOME` is being read by the very build that
+                // asked for the sandbox — so a locked object is ordinary. The
+                // call reports it and the whole grant used to be discarded,
+                // which made `run_contained` decline and handed the command to
+                // the Job Object with no access boundary: the crate's own gate
+                // ran, passed, and was not in a container.
+                //
+                // So the *root* is what decides. If it carries the ACE the grant
+                // stands, with the failure logged; if it does not, nothing under
+                // it can have been set either and the error is real.
                 if rc != ERROR_SUCCESS {
-                    return Err(io::Error::from_raw_os_error(rc as i32));
+                    let want = access.mask();
+                    let root_has = granted_mask(path, sid).is_some_and(|have| have & want == want);
+                    if !root_has {
+                        return Err(io::Error::from_raw_os_error(rc as i32));
+                    }
+                    tracing::warn!(
+                        path = %path.display(),
+                        "sandbox: the container's grant reached this directory but not every \
+                         object under it (os error {rc}); something else holds one of them"
+                    );
                 }
             }
             Reach::DirectoryOnly => set_dacl_on_this_object_alone(path, merged)?,
