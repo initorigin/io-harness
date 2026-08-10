@@ -173,7 +173,7 @@ if have_target "$WINDOWS_TARGET"; then
         cat >"$WORK/win_shim.rs" <<'RS'
 pub mod shim {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Grant { ReadExecute, Full }
+    pub enum Grant { Traverse, ReadExecute, Full }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Reach { Tree, DirectoryOnly }
     pub struct TempDir(std::path::PathBuf);

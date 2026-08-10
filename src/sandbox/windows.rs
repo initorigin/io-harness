@@ -196,6 +196,24 @@ impl From<&super::SandboxLimits> for JobLimits {
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Grant {
+    /// **Pass through this directory, and read nothing in it.** `FILE_TRAVERSE`
+    /// and `FILE_READ_ATTRIBUTES`, with no `FILE_LIST_DIRECTORY`: a name may be
+    /// resolved *through* the directory, and the directory itself cannot be
+    /// enumerated and its files cannot be opened.
+    ///
+    /// **Why a granted path is not reachable without this.** Opening a file by a
+    /// relative name resolves it against the working-directory handle the process
+    /// was created with, and no component is re-checked. Opening the *same file*
+    /// by absolute path walks every component from the volume root, and each one
+    /// is an access check the container has to pass. So a payload the run granted
+    /// in full was refused whenever it was named absolutely and permitted
+    /// whenever it was named relative to the working directory — the same bytes,
+    /// the same ACE, two different questions asked of the kernel.
+    ///
+    /// This is the weakest right that answers it. The crate still refuses to
+    /// grant the user's profile directory, and traverse is not a retreat from
+    /// that: it permits reaching `%TEMP%`, not reading what is beside it.
+    Traverse,
     /// Read and execute. What a binary, a toolchain or a read-only input tree
     /// needs, and the most that should ever be given to one.
     ReadExecute,
@@ -336,6 +354,31 @@ pub(crate) fn grants(
             grant: Grant::ReadExecute,
             reach: Reach::Tree,
         });
+    }
+
+    // **Every ancestor of every granted path, traverse-only.** A grant that
+    // cannot be reached by name is not a grant, and an absolute path is checked
+    // component by component — see `Grant::Traverse`. Added last and deduplicated
+    // against the set above, so a directory that is already granted something
+    // stronger is never weakened to a traverse: `retain` keeps the first entry
+    // for a path and these are the last ones added.
+    let named: Vec<PathBuf> = out.iter().map(|g| g.path.clone()).collect();
+    let mut seen: Vec<PathBuf> = named.clone();
+    for path in named {
+        for ancestor in path.ancestors().skip(1) {
+            // A bare prefix (`C:`) is not a directory and cannot carry an ACE;
+            // the volume root (`C:\`) can, and its grant is expected to fail on a
+            // machine this process does not own, which is not fatal.
+            if ancestor.as_os_str().is_empty() || seen.iter().any(|p| p == ancestor) {
+                continue;
+            }
+            seen.push(ancestor.to_path_buf());
+            out.push(GrantedPath {
+                path: ancestor.to_path_buf(),
+                grant: Grant::Traverse,
+                reach: Reach::DirectoryOnly,
+            });
+        }
     }
     out
 }
@@ -516,12 +559,16 @@ pub(crate) mod job {
             // mechanism: without it the payload cannot write to the workspace at
             // all, and a container that silently could not is worse than the Job
             // Object, which at least says what it is.
-            if g.grant == Grant::ReadExecute {
+            if g.grant == Grant::ReadExecute || g.grant == Grant::Traverse {
                 tracing::debug!(
                     "sandbox: no DACL write on {} ({e}); relying on its ALL APPLICATION \
                      PACKAGES access",
                     g.path.display()
                 );
+                // A traverse grant fails on exactly the directories nobody owns —
+                // the volume root, `C:\Users` — and those already permit an
+                // AppContainer to pass through, which is why a path under the
+                // profile could be reached at all before this existed.
                 continue;
             }
             tracing::warn!(
@@ -1306,6 +1353,36 @@ mod tests {
             Reach::Tree
         );
         assert_eq!(find(&g, r"C:\Temp").unwrap().reach, Reach::DirectoryOnly);
+
+        // Every ancestor of a granted path is reachable by name, traverse-only.
+        // A granted directory that cannot be walked to is refused the moment the
+        // payload is named absolutely rather than relative to the working
+        // directory, which is the same file and a different question.
+        //
+        // **Windows only, and not because the code is.** `grants` is portable and
+        // is asserted on the build host precisely so it does not need a Windows
+        // runner — but `Path::ancestors` splits on the *host's* separator, and a
+        // backslash is an ordinary character in a unix path, so on the build host
+        // `C:\cache\cargo` is a single component with no ancestors to find. The
+        // decision is the same on both; only this half of the assertion needs the
+        // platform that can see it.
+        #[cfg(not(windows))]
+        let _ = &g;
+        #[cfg(windows)]
+        {
+            let cache = find(&g, r"C:\cache").expect("the parent of a granted cache root");
+            assert_eq!(cache.grant, Grant::Traverse);
+            assert_eq!(cache.reach, Reach::DirectoryOnly);
+            assert_eq!(find(&g, r"C:\Users").unwrap().grant, Grant::Traverse);
+            assert_eq!(
+                find(&g, r"C:\Users\someone").unwrap().grant,
+                Grant::Traverse
+            );
+
+            // And a path that is already granted something stronger is never
+            // weakened to a traverse by being some other path's ancestor.
+            assert_eq!(find(&g, r"C:\Windows").unwrap().grant, Grant::ReadExecute);
+        }
         // The two places a process needs in order to start at all, and no more
         // than read-execute on either.
         assert_eq!(find(&g, r"C:\tools\bin").unwrap().grant, Grant::ReadExecute);

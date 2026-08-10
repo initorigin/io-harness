@@ -109,6 +109,9 @@ pub(crate) mod win {
     /// What a grant lets the container do with a path.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub(crate) enum Access {
+        /// Pass through a directory and read nothing in it — see
+        /// `super::super::windows::Grant::Traverse`, which carries the argument.
+        Traverse,
         /// Read and execute. What a binary, a toolchain or a read-only input
         /// tree needs, and the most that should ever be given to one.
         ReadExecute,
@@ -153,7 +156,14 @@ pub(crate) mod win {
             const FILE_GENERIC_EXECUTE: u32 = 0x0012_00A0;
             // STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | every file-specific right
             const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+            // FILE_TRAVERSE alone, plus the attribute read a stat of the
+            // component needs. Deliberately without FILE_LIST_DIRECTORY: a name
+            // may be resolved through the directory and the directory may not be
+            // enumerated.
+            const FILE_TRAVERSE: u32 = 0x0000_0020;
+            const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
             match self {
+                Access::Traverse => FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
                 Access::ReadExecute => FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
                 Access::Full => FILE_ALL_ACCESS,
             }
@@ -187,6 +197,7 @@ pub(crate) mod win {
         r: crate::sandbox::windows::Reach,
     ) -> io::Result<()> {
         let access = match g {
+            crate::sandbox::windows::Grant::Traverse => Access::Traverse,
             crate::sandbox::windows::Grant::ReadExecute => Access::ReadExecute,
             crate::sandbox::windows::Grant::Full => Access::Full,
         };
