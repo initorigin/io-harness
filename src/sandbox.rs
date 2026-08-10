@@ -1303,7 +1303,12 @@ pub(crate) fn wrap_argv(
     // underscore-prefixed because every other platform does use them, and a
     // parameter called `_workdir` in a signature this shared would read as if the
     // working directory were ignored everywhere.
-    let _ = (workdir, allow_network, writable_roots);
+    // `proxy` is consumed only by the macOS profile: the Landlock rung installs
+    // its port rule through `contain_command` rather than through an argv
+    // wrapper, and the namespace rungs cannot reach a loopback proxy at all — a
+    // proxied run is never given one. So on every other platform it is
+    // deliberately unused here.
+    let _ = (workdir, allow_network, writable_roots, proxy);
     (backend, argv.to_vec())
 }
 
