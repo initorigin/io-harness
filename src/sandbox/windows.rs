@@ -236,6 +236,7 @@ pub(crate) fn grants(
     mode: ExecMode,
     workdir: &Path,
     writable_roots: &[PathBuf],
+    toolchain_roots: &[PathBuf],
     program_dir: Option<&Path>,
     system_root: Option<&Path>,
     tmp: &Path,
@@ -269,6 +270,27 @@ pub(crate) fn grants(
         path: tmp.to_path_buf(),
         grant: Grant::Full,
     });
+
+    // Read-execute on the toolchain homes this machine names, and the reason is a
+    // launcher rather than a compiler. `rustc` on `PATH` is a rustup **shim**: it
+    // reads `RUSTUP_HOME` to find out which toolchain it stands for and then
+    // starts a second binary inside it. Granting the shim's own directory is not
+    // enough, and the failure is not a permission message — the shim cannot see
+    // its home, concludes it must create one, and reports
+    // "could not create home directory ... Cannot create a file when that file
+    // already exists". nvm, volta, pyenv and the JVM launchers all have the same
+    // shape.
+    //
+    // `CARGO_HOME` is deliberately **not** in this set even though it is the same
+    // kind of directory: it holds `credentials.toml`, and this set is read-execute
+    // for a payload. What a cargo build needs out of it arrives as a writable
+    // cache root, which is the run's own resolved fact and the caller's decision.
+    for dir in toolchain_roots {
+        out.push(GrantedPath {
+            path: dir.clone(),
+            grant: Grant::ReadExecute,
+        });
+    }
 
     // Read-execute on the two places a process needs to start: its own program's
     // directory and the system root. Without these an AppContainer cannot load
@@ -411,10 +433,12 @@ pub(crate) mod job {
             .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
             .filter(|p| !p.as_os_str().is_empty());
         let system_root = std::env::var_os("SystemRoot").map(std::path::PathBuf::from);
+        let toolchain_roots = crate::toolchain::Toolchain::launcher_homes();
         let granted = super::grants(
             spec.mode,
             spec.workdir,
             spec.writable_roots,
+            &toolchain_roots,
             program_dir.as_deref(),
             system_root.as_deref(),
             &tmp,
@@ -1059,6 +1083,7 @@ mod tests {
             ExecMode::WorkspaceWrite,
             Path::new(r"C:\work"),
             &roots,
+            &[PathBuf::from(r"C:\Users\someone\.rustup")],
             Some(Path::new(r"C:\tools\bin")),
             Some(Path::new(r"C:\Windows")),
             Path::new(r"C:\Temp"),
@@ -1072,7 +1097,14 @@ mod tests {
         // than read-execute on either.
         assert_eq!(find(&g, r"C:\tools\bin").unwrap().grant, Grant::ReadExecute);
         assert_eq!(find(&g, r"C:\Windows").unwrap().grant, Grant::ReadExecute);
-        assert_eq!(g.len(), 6, "nothing is granted that was not named");
+        // A toolchain launcher's home: read-execute, never writable. This is what
+        // a rustup shim reads to find the binary it stands for, and a shim that
+        // cannot see its home does not report a permission error.
+        assert_eq!(
+            find(&g, r"C:\Users\someone\.rustup").unwrap().grant,
+            Grant::ReadExecute
+        );
+        assert_eq!(g.len(), 7, "nothing is granted that was not named");
     }
 
     /// F8's mode arm — `ReadOnly` downgrades the workspace to read-execute and
@@ -1084,6 +1116,7 @@ mod tests {
             ExecMode::ReadOnly,
             Path::new(r"C:\work"),
             &roots,
+            &[PathBuf::from(r"C:\Users\someone\.rustup")],
             None,
             None,
             Path::new(r"C:\Temp"),
@@ -1094,6 +1127,12 @@ mod tests {
             "a read-only run has nothing to build and no cache to populate"
         );
         assert_eq!(find(&g, r"C:\Temp").unwrap().grant, Grant::Full);
+        // The launcher home survives `ReadOnly` — it is already read-execute, and
+        // a read-only run still has to be able to start the program it was given.
+        assert_eq!(
+            find(&g, r"C:\Users\someone\.rustup").unwrap().grant,
+            Grant::ReadExecute
+        );
     }
 
     /// The user's profile directory is deliberately **not** in the set. It is
@@ -1106,6 +1145,7 @@ mod tests {
         let g = grants(
             ExecMode::WorkspaceWrite,
             Path::new(r"C:\work"),
+            &[],
             &[],
             Some(Path::new(r"C:\tools\bin")),
             Some(Path::new(r"C:\Windows")),
@@ -1125,6 +1165,7 @@ mod tests {
         let g = grants(
             ExecMode::WorkspaceWrite,
             Path::new(r"C:\work"),
+            &[],
             &[],
             None,
             None,

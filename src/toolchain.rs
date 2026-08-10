@@ -204,6 +204,60 @@ impl Toolchain {
         dirs
     }
 
+    /// The homes a toolchain **launcher** reads to find the binary it stands for
+    /// (0.47.0), independent of any project.
+    ///
+    /// A cache directory is where a build writes; this is where a toolchain is
+    /// *installed*, and the two are different questions with different answers.
+    /// `rustc` on `PATH` is a rustup shim that reads `RUSTUP_HOME` and then starts
+    /// a second binary inside it; `node` under nvm or volta, `python` under pyenv
+    /// and every JVM launcher have the same shape. A boundary that grants the
+    /// shim's own directory and not its home does not fail with a permission
+    /// message — the launcher decides its home is missing and reports something
+    /// else entirely.
+    ///
+    /// Not a method on a detected `Toolchain`: the program a caller runs need not
+    /// belong to the project's ecosystem, and a run in a directory with no project
+    /// at all still executes something. Every ecosystem's conventional home is
+    /// offered, its own environment variable first, and the caller filters —
+    /// which here means the ones that exist on this machine.
+    ///
+    /// **`CARGO_HOME` is deliberately absent** even though it is the same kind of
+    /// directory. It holds `credentials.toml`, and the one caller of this grants
+    /// read access to a payload. What a cargo build needs from it arrives instead
+    /// as a writable cache root, which is a fact the run resolved and the caller
+    /// asked for.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn launcher_homes() -> Vec<PathBuf> {
+        let env = |k: &str| {
+            std::env::var_os(k)
+                .map(PathBuf::from)
+                .filter(|p| !p.as_os_str().is_empty())
+        };
+        let home = || {
+            env("HOME")
+                .or_else(|| env("USERPROFILE"))
+                .unwrap_or_else(|| PathBuf::from("/"))
+        };
+        let mut dirs = vec![env("RUSTUP_HOME").unwrap_or_else(|| home().join(".rustup"))];
+        for key in [
+            "NVM_HOME",
+            "NVM_DIR",
+            "VOLTA_HOME",
+            "PYENV_ROOT",
+            "GOROOT",
+            "DOTNET_ROOT",
+            "JAVA_HOME",
+            "SDKMAN_DIR",
+        ] {
+            dirs.extend(env(key));
+        }
+        dirs.retain(|p| p.is_absolute() && p.is_dir());
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+
     /// The detection, as the sentence the model is shown.
     ///
     /// Prose rather than JSON: this lands in a prompt, and a model reads a
@@ -568,6 +622,27 @@ pub fn detect(root: &Path) -> Option<Toolchain> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The launcher homes are read-execute grants for a payload, so the one
+    /// property worth a test is what is **not** in them: `CARGO_HOME` holds
+    /// `credentials.toml`, and this list must never be the thing that hands a
+    /// registry token to a contained command. Asserted so that adding it for
+    /// convenience has to argue with a test.
+    ///
+    /// Everything returned must also be an absolute directory that exists — the
+    /// filter is here rather than at the one caller, which would otherwise have
+    /// to know which of these are conventions and which are environment.
+    #[test]
+    fn the_launcher_homes_exclude_cargo_home_and_are_all_real_directories() {
+        let homes = Toolchain::launcher_homes();
+        for p in &homes {
+            assert!(p.is_absolute() && p.is_dir(), "{p:?}");
+            assert!(
+                !p.ends_with(".cargo"),
+                "CARGO_HOME holds credentials.toml and is read-execute here: {p:?}"
+            );
+        }
+    }
 
     /// A directory holding exactly the named files, all empty.
     fn project(files: &[&str]) -> tempfile::TempDir {

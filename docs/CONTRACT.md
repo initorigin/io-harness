@@ -1042,9 +1042,31 @@ the job object's limits and kill-on-close. Both halves, one backend,
 What is granted is derived from what the run already resolved — the workspace
 (read-only under `ExecMode::ReadOnly`), the system temporary directory and the
 detected toolchain's cache directories — plus read-execute on the program's own
-directory and the system root, which a process needs in order to start at all.
+directory, on the system root, and on the toolchain **launcher homes** this
+machine names, all of which a process needs in order to start at all.
 **The user's profile directory is deliberately not granted**: that is where
-credentials live. Egress is the capability array: exactly `internetClient` when
+credentials live.
+
+The program's directory is the directory of the *resolved* program: a command is
+named the way every command is named, and the parent of a bare `rustc` is the
+empty path. The launcher homes are a separate question from the cache
+directories: a cache is where a build writes, a launcher home is where a
+toolchain is installed. `rustc` on `PATH` is a rustup shim that reads
+`RUSTUP_HOME` to find the binary it stands for, and `node` under nvm or volta,
+`python` under pyenv and the JVM launchers all have that shape. A shim that
+cannot see its home does not report a permission error — it concludes the home is
+missing and fails saying so. The set is `RUSTUP_HOME`, `NVM_HOME`, `NVM_DIR`,
+`VOLTA_HOME`, `PYENV_ROOT`, `GOROOT`, `DOTNET_ROOT`, `JAVA_HOME` and
+`SDKMAN_DIR`, read-execute, filtered to those that exist. **`CARGO_HOME` is not
+among them**, deliberately: it holds `credentials.toml`, and this set is readable
+by the payload. A toolchain installed somewhere none of these name will fail to
+start under the container, visibly, as its own error.
+
+A grant reaches what is already inside the directory, not only the directory.
+Windows inheritance is static — a child carries a DACL materialised when it was
+created — so each grant is applied with propagation. The cost is proportional to
+the number of entries under a granted path, which is the figure this release
+measures for this backend. Egress is the capability array: exactly `internetClient` when
 the run's policy permits egress, and empty when it does not, so the denial is
 the token's own.
 

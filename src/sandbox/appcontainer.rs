@@ -84,7 +84,7 @@ pub(crate) mod win {
     };
     use windows_sys::Win32::Security::{
         CreateWellKnownSid, FreeSid, WinCapabilityInternetClientSid, ACL,
-        DACL_SECURITY_INFORMATION, PSID, SID_AND_ATTRIBUTES,
+        DACL_SECURITY_INFORMATION, PSID, SID_AND_ATTRIBUTES, UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
@@ -367,15 +367,34 @@ pub(crate) mod win {
         }
         let _merged = LocalGuard(merged.cast());
 
+        // **`UNPROTECTED_DACL_SECURITY_INFORMATION`, and it is the whole grant.**
+        //
+        // Windows inheritance is *static*: a child object carries its own
+        // materialised DACL, copied from its parent's inheritable ACEs at the
+        // moment it was created. Adding an inheritable ACE to a directory
+        // therefore reaches the directory and **nothing already inside it** — the
+        // system re-propagates to existing children only when the change is made
+        // with this flag.
+        //
+        // Without it every grant here looked applied and did almost nothing, which
+        // is the exact failure mode the comment above `grant` warns about. The
+        // workspace was granted and the source file already in it was not, so
+        // `rustc a.rs` came back "Access is denied"; `%TEMP%` was granted and the
+        // temporary directory created before the run was not. Thirty-one tests on
+        // `windows-latest`, one flag.
+        //
+        // The cost is real and is not hidden: propagation walks the granted tree,
+        // so granting a large directory is O(entries in it) per run. That is what
+        // N5 measures on this backend.
+        //
         // SAFETY: `wpath` is live, `merged` is the ACL just built and still
         // owned by `_merged`, and the owner, group and SACL arguments are null,
-        // which with `DACL_SECURITY_INFORMATION` alone means "change only the
-        // DACL".
+        // which with the DACL bits alone means "change only the DACL".
         let rc = unsafe {
             SetNamedSecurityInfoW(
                 wpath.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 merged,

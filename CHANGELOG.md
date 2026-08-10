@@ -65,6 +65,15 @@ notes are produced from it.
   gets the container **and** the Job Object: access and resources together, with
   the process spawned suspended so it joins the job before it executes an
   instruction.
+- **The Windows grant set covers the toolchain a launcher stands for.** Read-execute
+  on `RUSTUP_HOME`, `NVM_HOME`, `NVM_DIR`, `VOLTA_HOME`, `PYENV_ROOT`, `GOROOT`,
+  `DOTNET_ROOT`, `JAVA_HOME` and `SDKMAN_DIR` where they exist, and on the
+  directory of the **resolved** program rather than of `argv[0]` — the parent of a
+  bare `rustc` is the empty path, so the one directory a container cannot start
+  without was being granted to nothing. `CARGO_HOME` is deliberately excluded: it
+  holds `credentials.toml` and this set is readable by the payload. A toolchain
+  installed somewhere none of these name fails to start under the container,
+  visibly, as its own error.
 
 ### Changed
 
