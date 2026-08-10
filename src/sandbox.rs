@@ -1052,6 +1052,53 @@ pub(crate) fn writable_cache_roots(
     roots
 }
 
+/// Where on this machine `program` actually is, by the shell's own rule (0.47.0).
+///
+/// A program with a separator in it is a path and is answered as one; anything
+/// else is looked for in each `PATH` entry, and on Windows under each `PATHEXT`
+/// extension as well. It is not asked to decide *executability* — a file that
+/// exists and cannot be executed is a real failure with a real message, and
+/// reporting it as "not installed" would be a worse answer than the operating
+/// system's own.
+///
+/// Two callers need this and they need different halves of it. `exec` asks
+/// whether a contained spawn would find the payload at all, because a contained
+/// spawn is of a wrapper that exists and would otherwise report a missing program
+/// as its own failure (0.46.0). The Windows container asks *where* it is, because
+/// an AppContainer must be granted read-execute on the program's own directory or
+/// it cannot load the binary — and until 0.47.0 that grant was derived from
+/// `argv[0]` verbatim, so a command named the way every command is named
+/// (`cargo`, `rustc`, `npm`) yielded the parent of a bare filename, which is the
+/// empty path, and the directory the run needed most was granted to nothing.
+pub(crate) fn resolve_program(program: &str) -> Option<PathBuf> {
+    let looks_like_a_path = program.contains('/') || (cfg!(windows) && program.contains('\\'));
+    if looks_like_a_path {
+        let p = Path::new(program);
+        return p.is_file().then(|| p.to_path_buf());
+    }
+    let path = std::env::var_os("PATH")?;
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(|e| e.to_ascii_lowercase())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    std::env::split_paths(&path).find_map(|dir| {
+        let direct = dir.join(program);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        exts.iter().find_map(|ext| {
+            let candidate = dir.join(format!("{program}{ext}"));
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
+
 /// The argv this host's backend would run, and the backend it chose.
 ///
 /// The native backends confine a command by *wrapping its argv* — macOS prepends

@@ -333,31 +333,13 @@ impl Exec {
 /// executed is a real failure with a real message, and reporting it as "not
 /// installed" would be a worse answer than the operating system's own.
 fn on_path(program: &str) -> bool {
-    let looks_like_a_path = program.contains('/') || (cfg!(windows) && program.contains('\\'));
-    if looks_like_a_path {
-        return Path::new(program).is_file();
-    }
-    let Some(path) = std::env::var_os("PATH") else {
-        // No `PATH` at all is not a claim that the program is missing.
+    // No `PATH` at all is not a claim that the program is missing, and that is a
+    // distinction only this caller makes: the resolver answers "where is it",
+    // which on a machine with no `PATH` is honestly nowhere.
+    if std::env::var_os("PATH").is_none() {
         return true;
-    };
-    let exts: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
-            .split(';')
-            .filter(|e| !e.is_empty())
-            .map(|e| e.to_ascii_lowercase())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    std::env::split_paths(&path).any(|dir| {
-        if dir.join(program).is_file() {
-            return true;
-        }
-        exts.iter()
-            .any(|ext| dir.join(format!("{program}{ext}")).is_file())
-    })
+    }
+    crate::sandbox::resolve_program(program).is_some()
 }
 
 fn command(program: &str, args: &[String], workdir: &Path) -> Command {

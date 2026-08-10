@@ -108,6 +108,45 @@ async fn windows_reports_a_real_primitive_and_not_the_floor() {
     assert!(out.stdout.contains("hello"), "output is still captured");
 }
 
+/// A contained run must be able to execute a program resolved from `PATH`.
+///
+/// This is the whole of the Windows half seen from the outside: an AppContainer
+/// denies everything not granted, so a payload it cannot load or whose own
+/// toolchain it cannot reach fails in a way that looks like the payload being
+/// broken. The crate's four `verify` gates found it first — they run `rustc`
+/// against a scratch file and every one of them failed on `windows-latest` the
+/// moment the container was actually selected.
+///
+/// `rustc` is the program deliberately: it is on `PATH` rather than beside the
+/// test, it is what the crate's own verification gate runs, and on a rustup
+/// installation it is a shim that starts a second binary somewhere else — which
+/// is exactly the case a grant set derived from one directory has to answer.
+///
+/// The failure message carries the whole outcome, because on this backend the
+/// payload's stderr arrives merged into `stdout` and it is the only thing that
+/// says *which* access was refused.
+#[tokio::test]
+async fn a_contained_run_can_execute_a_program_from_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let argv = vec!["rustc".to_string(), "--version".to_string()];
+    let out = select(&SandboxConfig::new())
+        .run(RunSpec::new(&argv, dir.path(), &limits()).with_network(false))
+        .await
+        .unwrap();
+    assert!(
+        out.success(),
+        "a contained run must be able to start a program on PATH — backend {:?}, \
+         exit {:?}, merged output {:?}",
+        out.backend,
+        out.exit_code,
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("rustc"),
+        "the payload's own output must come back: {out:?}"
+    );
+}
+
 /// A contained run must not require a multi-threaded runtime, and this is
 /// asserted rather than left to whichever other test happens to be a
 /// `#[tokio::test]`.

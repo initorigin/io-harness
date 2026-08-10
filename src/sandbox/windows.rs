@@ -403,9 +403,13 @@ pub(crate) mod job {
         use crate::sandbox::appcontainer::win::{grant_for, Profile, Spawned};
 
         let tmp = std::env::temp_dir();
-        let program_dir = std::path::Path::new(&spec.argv[0])
-            .parent()
-            .map(|p| p.to_path_buf());
+        // The **resolved** program's directory, not `argv[0]`'s. A command is
+        // named the way every command is named — `cargo`, `rustc`, `npm` — and
+        // the parent of a bare filename is the empty path, so the one directory
+        // an AppContainer cannot start without was being granted to nothing.
+        let program_dir = super::resolve_program(&spec.argv[0])
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .filter(|p| !p.as_os_str().is_empty());
         let system_root = std::env::var_os("SystemRoot").map(std::path::PathBuf::from);
         let granted = super::grants(
             spec.mode,
