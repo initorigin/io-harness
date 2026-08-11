@@ -7,6 +7,7 @@
 //! instead of restarting.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -22,16 +23,18 @@ use crate::approve::{Plan, PlanGate, PlanStep, PlanVerdict};
 use crate::approve::{Question, Responder, ResponderNone};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::context::{
-    assemble, bound, entry_cap_chars, Assembly, Ledger as ContextLedger, ObsKind, Observation,
+    assemble, bound, entry_cap_chars, Assembled, Assembly, Ledger as ContextLedger, ObsKind,
+    Observation, Piece,
 };
-use crate::contract::{SystemPrompt, TaskContract};
+use crate::contract::{Preset, SystemPrompt, TaskContract};
 use crate::error::{Error, Result};
 use crate::mcp::McpSession;
 use crate::net::{self, NetGuard};
 use crate::observe::{EventKind, Ignore, Observer, RunEvent};
 use crate::policy::{Act, Effect, Policy, Rule};
 use crate::provider::{
-    CompletionRequest, CompletionResponse, PromptFamily, Provider, ToolCall, ToolSpec,
+    CompletionRequest, CompletionResponse, Message, PromptFamily, Provider, ToolCall, ToolResult,
+    ToolSpec,
 };
 use crate::resilience::{Progress, Progressing};
 use crate::sandbox::{Sandbox, SandboxConfig};
@@ -975,7 +978,7 @@ pub(crate) struct TurnExtras<'a> {
     /// the path from the tree's root to the head. Seeded into the observation
     /// ledger before the first step, so it is compacted by the assembler that
     /// already compacts a long run rather than by a second rule of its own.
-    pub seed: &'a [String],
+    pub seed: &'a [(&'static str, String)],
     /// Where an operator's mid-turn messages and an interrupt arrive. Drained at
     /// the step boundary and nowhere else.
     pub steer: Option<&'a crate::session::SteerInbox>,
@@ -3757,8 +3760,15 @@ fn seed_conversation(ledger: &mut ContextLedger, extras: &TurnExtras<'_>) {
     if !ledger.is_empty() {
         return;
     }
-    for entry in extras.seed {
-        ledger.push(Observation::new(0, ObsKind::Message, None, entry.clone()));
+    for (speaker, entry) in extras.seed {
+        // 0.49.0 — tagged with who was speaking, so the transcript can send it as
+        // that speaker's own turn rather than as narration inside another.
+        ledger.push(Observation::new(
+            0,
+            ObsKind::Message,
+            Some((*speaker).to_string()),
+            entry.clone(),
+        ));
     }
 }
 
@@ -4228,7 +4238,9 @@ async fn run_workspace_from<P: Provider>(
     // permitting an answer is a decision about the turn's opening, not a licence
     // to stop at a plan in prose on step nine.
     let conversational = conversational_opening(
-        WORKSPACE_PROMPT,
+        // 0.49.0 — a turn that has not been decided to be work is not told it has a
+        // specification to meet. Every later step is `system` above, unchanged.
+        CONVERSATION_PROMPT,
         contract,
         extras,
         &extra,
@@ -4285,6 +4297,11 @@ async fn run_workspace_from<P: Provider>(
     // whose summary assembly stubbed, and on a resume — a resumed run has sent this
     // prefix zero times from where it now stands, so it earns the marker again.
     let mut marked_prefix = PrefixGuard::default();
+    // 0.49.0 — what each step of THIS run asked for, so the next step can send it
+    // back as an assistant turn. In memory and never stored: a vendor correlates a
+    // call with its result inside one request, and this loop rebuilds the whole
+    // request every step, so nothing here needs to outlive the run.
+    let mut turns: BTreeMap<u32, StepTurn> = BTreeMap::new();
     // The run's live process handles, created before the first turn and killed
     // when the run ends however it ends. `Arc` because the reaping task for each
     // handle outlives the dispatch that started it and has to be able to record
@@ -4489,6 +4506,7 @@ async fn run_workspace_from<P: Provider>(
             // froze, and only once that prefix has already gone out once.
             let cache_boundary =
                 cache_boundary_for(&user, &ledger, &mut marked_prefix, watch, run_id, step, 0);
+            let messages = transcript(&user, &assembled, &turns);
             #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
                 // 0.37.0 — the conversational prompt is this turn's opening only. Every
@@ -4500,12 +4518,19 @@ async fn run_workspace_from<P: Provider>(
                     _ => system.clone(),
                 },
                 user: user.clone(),
+                // 0.49.0 — the same emission as a conversation. Empty until this run
+                // has driven a step of its own, which is what keeps a first step and a
+                // resumed run byte-identical on the wire to what 0.48.0 sent.
+                messages: messages.clone(),
                 tools: tools.clone(),
                 // 0.22.0 — the run's web declaration, unchanged per step.
                 web: contract.web.clone(),
                 // 0.31.0 — the root's tier, unchanged per step.
                 effort: contract.effort,
                 cache_boundary,
+                // 0.49.0 — the same breakpoint the line above names, counted in
+                // messages because that is what this request sends.
+                cache_through: cache_through_for(cache_boundary, &messages),
                 #[cfg(feature = "media")]
                 media: attach_media(contract, pending_media)?,
                 ..Default::default()
@@ -4601,6 +4626,17 @@ async fn run_workspace_from<P: Provider>(
                 },
             ));
         }
+
+        // 0.49.0 — record what this step asked for before anything is dispatched,
+        // so the next step sends the model its own turn back instead of a
+        // third-person account of it.
+        turns.insert(
+            step,
+            StepTurn {
+                text: response.text.clone(),
+                calls: response.tool_calls.clone(),
+            },
+        );
 
         // Dispatch every tool call the model made this step, in order, folding
         // each result into the observation log the next turn will see.
@@ -5969,7 +6005,8 @@ fn run_agent<'f, P: Provider>(
         // agent that is not a classifying turn's root, which is every child and
         // every agent of every `run_tree`.
         let conversational = conversational_opening(
-            TREE_PROMPT,
+            // 0.49.0 — as the flat loop, over the tree agent's own description.
+            CONVERSATION_TREE_PROMPT,
             contract,
             extras,
             &extra,
@@ -5992,6 +6029,9 @@ fn run_agent<'f, P: Provider>(
         // prompt from its own ledger, so one agent's frozen prefix says nothing about
         // another's, and a shared one would mark a prefix this agent has never sent.
         let mut marked_prefix = PrefixGuard::default();
+        // 0.49.0 — per agent in the tree, for the reason the flat loop keeps one per
+        // run: a child's turns are its own and must never reach its parent's request.
+        let mut turns: BTreeMap<u32, StepTurn> = BTreeMap::new();
         // Same ledger and same per-turn assembly as the workspace loop: a tree of
         // 100 children each re-sending its own unbounded log is the multiplied
         // version of the problem 0.10.0 exists to fix — and, since 0.13.0, the
@@ -6143,6 +6183,7 @@ fn run_agent<'f, P: Provider>(
                     step,
                     depth,
                 );
+                let messages = transcript(&user, &assembled, &turns);
                 #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
                 let request = CompletionRequest {
                     // 0.39.0 — a contained turn's opening is its first completion
@@ -6153,6 +6194,11 @@ fn run_agent<'f, P: Provider>(
                         _ => system.clone(),
                     },
                     user: user.clone(),
+                    // 0.49.0 — the same conversation the flat loop sends, built by the
+                    // same helper: a transcript assembled in one loop and not the other
+                    // would make a contained run and a flat one talk to the model
+                    // differently while nothing failed.
+                    messages: messages.clone(),
                     tools: tools.clone(),
                     // 0.21.0 — a named agent's model. `None` for the root and for any
                     // child spawned without a definition, which is what every provider
@@ -6168,6 +6214,8 @@ fn run_agent<'f, P: Provider>(
                     // root's own, and a child spawned without a definition inherits it.
                     effort: identity.and_then(|d| d.effort).or(contract.effort),
                     cache_boundary,
+                    // 0.49.0 — as the flat loop, through the same helper.
+                    cache_through: cache_through_for(cache_boundary, &messages),
                     #[cfg(feature = "media")]
                     media: attach_media(contract, pending_media)?,
                     ..Default::default()
@@ -6242,6 +6290,15 @@ fn run_agent<'f, P: Provider>(
                     },
                 ));
             }
+
+            // 0.49.0 — recorded before dispatch, as the flat loop does.
+            turns.insert(
+                step,
+                StepTurn {
+                    text: response.text.clone(),
+                    calls: response.tool_calls.clone(),
+                },
+            );
 
             let mut decisions: Vec<String> = Vec::new();
             let mut calls_json: Vec<String> = Vec::new();
@@ -11091,6 +11148,40 @@ fn cache_boundary_for(
     Some(at)
 }
 
+/// The transcript half of 0.44.0's second breakpoint (0.49.0).
+///
+/// The byte offset [`cache_boundary_for`] computed is an offset into `user`, and a
+/// request carrying a transcript does not send `user` — so the same decision is
+/// re-expressed as a count of leading messages. It is a translation and never a
+/// second decision: the guard has already ruled on whether this prefix has been
+/// sent before, and this only asks how many whole messages fit inside it.
+///
+/// Exact, because the conversation's text *is* `user`: every message's own text is
+/// a slice of it in order, which is what
+/// `the_derived_user_is_the_flat_prompt_the_transcript_was_built_from` asserts. An
+/// assistant turn consumes none of it — its calls are not in the flat prompt at
+/// all — so it is carried along with the results message that follows it rather
+/// than splitting the count.
+fn cache_through_for(boundary: Option<usize>, messages: &[Message]) -> Option<usize> {
+    let at = boundary?;
+    let mut consumed = 0usize;
+    let mut through = 0usize;
+    for (i, message) in messages.iter().enumerate() {
+        consumed += match message {
+            Message::User(text) => text.len(),
+            Message::Assistant { .. } => 0,
+            Message::Results(results) => results.iter().map(|r| r.content.len()).sum(),
+        };
+        if consumed > at {
+            break;
+        }
+        through = i + 1;
+    }
+    // The whole transcript is never marked: the last message is the turn being
+    // asked about, and marking it would write a prefix that changes every step.
+    (through > 0 && through < messages.len()).then_some(through)
+}
+
 /// One definition, and every loop calls it — the flat workspace loop and the tree
 /// loop each immediately before [`assemble`], and the overflow recovery with
 /// `forced`. A rule that lived in one loop would lapse in the other, which is the
@@ -11722,6 +11813,9 @@ struct PromptSpec<'a> {
 fn compose(spec: PromptSpec<'_>) -> String {
     let description = match spec.prompt {
         SystemPrompt::Replace(text) => text.clone(),
+        // 0.49.0 — a preset sits exactly where a replacement sits, so everything
+        // the crate has to say about the request is still composed around it.
+        SystemPrompt::Preset(preset) => preset.describe().to_string(),
         _ => spec.base.to_string(),
     };
     let mut out = with_skill_catalog(with_extra_tools(description, spec.extra), spec.skills);
@@ -11758,6 +11852,14 @@ fn prompt_source(prompt: &SystemPrompt) -> &'static str {
         SystemPrompt::Builtin => "builtin",
         SystemPrompt::Append(_) => "appended",
         SystemPrompt::Replace(_) => "replaced",
+        // 0.49.0 — the trace names the preset, not just that one was used: which
+        // description a run was given is the fact a reader is after.
+        //
+        // No catch-all arm: `#[non_exhaustive]` binds outside this crate and not
+        // inside it, so one here is unreachable — and a variant added later should
+        // fail this match rather than be traced as an unnamed "preset".
+        SystemPrompt::Preset(Preset::Concise) => "preset:concise",
+        SystemPrompt::Preset(Preset::Careful) => "preset:careful",
     }
 }
 
@@ -12089,6 +12191,39 @@ const WORKSPACE_PROMPT: &str = "You are an agent working across a repository to 
      full new contents to edit it. You may edit several files. Work in small steps; after each of \
      your steps the whole set is checked against the success criterion.";
 
+/// What the agent is on a turn that has not yet been decided to be work (0.49.0).
+///
+/// The same agent as [`WORKSPACE_PROMPT`] and the same tools, described without the
+/// two things that are not true of a conversational turn: that there is a *stated
+/// specification* to meet, and that the whole set is checked against a *success
+/// criterion* after every step. A session turn carries `Verification::None`, so
+/// nothing is checked — and an operator who typed "hi" was structurally being told
+/// they had written a specification.
+///
+/// That is the same mismatch 0.48.0's `I03` fixed one block lower down. The user
+/// block stopped saying "Call a tool to make progress toward the success criterion"
+/// on a classifying turn; this stops the system block above it saying there is one.
+///
+/// The two prompts must not drift into describing two different worlds — the rule
+/// [`WORKSPACE_PROMPT`] and [`TREE_PROMPT`] already hold each other to. What differs
+/// here is the framing of the turn, never the tools or the workspace.
+const CONVERSATION_PROMPT: &str = "You are an agent working in a repository, in conversation with \
+     an operator. Use `grep` to search file contents and `find` to locate files by name, then \
+     `read_file` to inspect a file before changing it, and `write_file` with the file's path and \
+     full new contents to edit it. You may edit several files. Work in small steps.";
+
+/// [`CONVERSATION_PROMPT`] for a turn that may also fan out (0.49.0).
+///
+/// The tree's own description with the same two claims removed, for the reason
+/// [`TREE_PROMPT`] exists at all: a contained turn must be described the world it is
+/// actually in, one where it may spawn.
+const CONVERSATION_TREE_PROMPT: &str = "You are an agent working in a repository, in conversation \
+     with an operator. Use `grep`, `find`, `read_file`, and `write_file` as in a normal run. You \
+     may also decompose the work: call `spawn_agent` to launch a sub-agent that pursues a smaller \
+     goal over the same workspace, and its result is reported back to you. A sub-agent inherits \
+     your permissions and can only be more restricted, never less. Prefer spawning when parts of \
+     the task are independent. Work in small steps.";
+
 /// The prompt a conversational turn's **first** completion is made with (0.37.0).
 ///
 /// The one sentence that differs is the one about the ending, and it is the whole
@@ -12172,6 +12307,123 @@ fn with_skill_catalog(base: String, skills: &Skills) -> String {
          skill's full text when its description matches what you are doing.\n{}",
         skills.catalog()
     )
+}
+
+/// What one step of this run asked for, kept so the next step can send it back as
+/// an assistant turn (0.49.0).
+///
+/// In memory and for this run only. A resumed run has none of these for the steps
+/// it did not itself drive, and that is the whole of why its earlier history stays
+/// prose — see [`transcript`].
+#[derive(Debug, Clone)]
+struct StepTurn {
+    /// What the model wrote, when it wrote anything beside its calls.
+    text: Option<String>,
+    /// The calls it made, in the order it made them.
+    calls: Vec<ToolCall>,
+}
+
+/// The role-tagged conversation this step's request carries (0.49.0).
+///
+/// Built from the **same emission** the flat `user` string is built from, so the
+/// two cannot describe the run differently: [`Assembled::emitted`] concatenates to
+/// [`Assembled::text`] byte for byte, and `user` is that text inside the prompt's
+/// own framing. What this function does is cut the framing off the front and back
+/// and interleave the steps' assistant turns into the middle.
+///
+/// A step whose results do not line up with the calls it made is emitted as prose
+/// instead — the shape every release through 0.48.0 sent. Two ways to reach that:
+///
+/// - **a resumed run.** Its earlier steps were driven by a process that is gone,
+///   the ledger it restored holds text and not tool-call structure, and nothing is
+///   stored that would rebuild them. Everything from the resume point on is
+///   role-tagged.
+/// - **a count that disagrees.** If a step ever produced more results than it made
+///   calls, correlating them positionally would answer the wrong call. Falling
+///   back costs that step its block shape and loses nothing, where guessing would
+///   send a transcript that reads as confident and is wrong.
+fn transcript(user: &str, assembled: &Assembled, turns: &BTreeMap<u32, StepTurn>) -> Vec<Message> {
+    // The prompt's own framing, split off the observation section it wraps. The
+    // section is embedded verbatim, which is what makes this exact rather than a
+    // reconstruction — the same property `frozen_prefix` relies on.
+    let (head, tail) = match assembled.text.is_empty() {
+        false => user
+            .split_once(assembled.text.as_str())
+            .unwrap_or((user, "")),
+        true => (user, ""),
+    };
+    let mut out: Vec<Message> = Vec::new();
+    let mut pending = head.to_string();
+    let mut i = 0;
+    while i < assembled.emitted.len() {
+        let at = &assembled.emitted[i];
+        match at.piece {
+            Piece::Prose => {
+                pending.push_str(&at.text);
+                i += 1;
+                continue;
+            }
+            // An earlier turn of this conversation is that speaker's own message,
+            // which is the whole of what the seed change bought.
+            Piece::Operator | Piece::Agent => {
+                if !pending.is_empty() {
+                    out.push(Message::User(std::mem::take(&mut pending)));
+                }
+                out.push(match at.piece {
+                    Piece::Agent => Message::Assistant {
+                        text: Some(at.text.clone()),
+                        calls: Vec::new(),
+                    },
+                    _ => Message::User(at.text.clone()),
+                });
+                i += 1;
+                continue;
+            }
+            Piece::Result => {}
+        }
+        // One run of results, all from the same step.
+        let step = at.step;
+        let mut results = Vec::new();
+        while let Some(e) = assembled
+            .emitted
+            .get(i)
+            .filter(|e| e.piece == Piece::Result && e.step == step)
+        {
+            results.push(ToolResult {
+                call: e.ordinal,
+                content: e.text.clone(),
+            });
+            i += 1;
+        }
+        let known = turns
+            .get(&step)
+            .filter(|turn| results.iter().all(|r| r.call < turn.calls.len()));
+        let Some(turn) = known else {
+            for result in &results {
+                pending.push_str(&result.content);
+            }
+            continue;
+        };
+        if !pending.is_empty() {
+            out.push(Message::User(std::mem::take(&mut pending)));
+        }
+        out.push(Message::Assistant {
+            text: turn.text.clone(),
+            calls: turn.calls.clone(),
+        });
+        out.push(Message::Results(results));
+    }
+    pending.push_str(tail);
+    if !pending.is_empty() {
+        out.push(Message::User(pending));
+    }
+    // A transcript of one user message is the flat request said twice. Sending
+    // nothing is what keeps a first step, a single-file run and a resumed run
+    // byte-identical on the wire to what 0.48.0 sent.
+    match out.as_slice() {
+        [Message::User(_)] | [] => Vec::new(),
+        _ => out,
+    }
 }
 
 fn workspace_user_prompt(
