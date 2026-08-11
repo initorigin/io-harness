@@ -744,7 +744,13 @@ async fn an_earlier_turn_arrives_as_that_speakers_own_message() {
     ]);
     let mut session = Session::open(&store, ws.path()).unwrap();
     session
-        .turn("what can you do?", &provider, &store, &policy(), &ApproveAll)
+        .turn(
+            "what can you do?",
+            &provider,
+            &store,
+            &policy(),
+            &ApproveAll,
+        )
         .await
         .unwrap();
     session
@@ -758,9 +764,9 @@ async fn an_earlier_turn_arrives_as_that_speakers_own_message() {
         "the second turn must carry a conversation, or this asserts nothing"
     );
 
-    let asked = messages.iter().any(|m| {
-        matches!(m, Message::User(text) if text.contains("what can you do?"))
-    });
+    let asked = messages
+        .iter()
+        .any(|m| matches!(m, Message::User(text) if text.contains("what can you do?")));
     let answered = messages.iter().any(|m| {
         matches!(
             m,
@@ -768,7 +774,10 @@ async fn an_earlier_turn_arrives_as_that_speakers_own_message() {
                 if text.contains("I read repositories and change them.") && calls.is_empty()
         )
     });
-    assert!(asked, "the operator's earlier turn is a user message: {messages:#?}");
+    assert!(
+        asked,
+        "the operator's earlier turn is a user message: {messages:#?}"
+    );
     assert!(
         answered,
         "and the agent's own answer is an assistant message, not something it is \

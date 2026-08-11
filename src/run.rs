@@ -11854,9 +11854,12 @@ fn prompt_source(prompt: &SystemPrompt) -> &'static str {
         SystemPrompt::Replace(_) => "replaced",
         // 0.49.0 — the trace names the preset, not just that one was used: which
         // description a run was given is the fact a reader is after.
+        //
+        // No catch-all arm: `#[non_exhaustive]` binds outside this crate and not
+        // inside it, so one here is unreachable — and a variant added later should
+        // fail this match rather than be traced as an unnamed "preset".
         SystemPrompt::Preset(Preset::Concise) => "preset:concise",
         SystemPrompt::Preset(Preset::Careful) => "preset:careful",
-        SystemPrompt::Preset(_) => "preset",
     }
 }
 
@@ -12344,7 +12347,9 @@ fn transcript(user: &str, assembled: &Assembled, turns: &BTreeMap<u32, StepTurn>
     // section is embedded verbatim, which is what makes this exact rather than a
     // reconstruction — the same property `frozen_prefix` relies on.
     let (head, tail) = match assembled.text.is_empty() {
-        false => user.split_once(assembled.text.as_str()).unwrap_or((user, "")),
+        false => user
+            .split_once(assembled.text.as_str())
+            .unwrap_or((user, "")),
         true => (user, ""),
     };
     let mut out: Vec<Message> = Vec::new();

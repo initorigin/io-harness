@@ -1245,8 +1245,10 @@ async fn a_classifying_turn_is_not_told_it_has_a_specification() {
     // Negative control 1: a run the caller declared as work is unchanged.
     let work = workspace_system(&contract(dir.path())).await;
     assert!(
-        work.starts_with("You are an agent working across a repository to meet a stated \
-                          specification."),
+        work.starts_with(
+            "You are an agent working across a repository to meet a stated \
+                          specification."
+        ),
         "a workspace run's framing must not move:\n{work}"
     );
     assert!(work.contains("checked against the success criterion"));
@@ -1254,8 +1256,10 @@ async fn a_classifying_turn_is_not_told_it_has_a_specification() {
     // Negative control 2: so is the tree's.
     let tree = tree_system(&contract(dir.path())).await;
     assert!(
-        tree.starts_with("You are an agent working across a repository to meet a stated \
-                          specification."),
+        tree.starts_with(
+            "You are an agent working across a repository to meet a stated \
+                          specification."
+        ),
         "a tree run's framing must not move:\n{tree}"
     );
 }
@@ -1278,7 +1282,10 @@ async fn a_preset_is_opt_in_and_the_builtin_does_not_move() {
 
     for (preset, marker) in [
         (Preset::Concise, "Act before you explain"),
-        (Preset::Careful, "Before you report a change as done, check it"),
+        (
+            Preset::Careful,
+            "Before you report a change as done, check it",
+        ),
     ] {
         let shaped = workspace_system(
             &contract(dir.path()).with_system_prompt(SystemPrompt::Preset(preset)),

@@ -999,7 +999,10 @@ mod transcript_body {
             WebFlavor::OpenRouter,
         );
         assert!(b["messages"][2]["content"].is_null(), "{b}");
-        assert_eq!(b["messages"][2]["tool_calls"][0]["function"]["name"], "find");
+        assert_eq!(
+            b["messages"][2]["tool_calls"][0]["function"]["name"],
+            "find"
+        );
         assert_eq!(b["messages"][3]["role"], "tool");
     }
 

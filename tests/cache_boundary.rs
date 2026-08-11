@@ -555,9 +555,7 @@ fn marked_messages(req: &CompletionRequest) -> Option<String> {
             .map(|m| match m {
                 Message::User(text) => text.clone(),
                 Message::Assistant { .. } => String::new(),
-                Message::Results(results) => {
-                    results.iter().map(|r| r.content.as_str()).collect()
-                }
+                Message::Results(results) => results.iter().map(|r| r.content.as_str()).collect(),
             })
             .collect(),
     )

@@ -1247,7 +1247,12 @@ fn observed(step: u32, kind: ObsKind, target: &str, text: &str) -> Observation {
 async fn the_emitted_pieces_reconstruct_the_assembled_text_exactly() {
     let mut ledger = Ledger::new();
     ledger.push(observed(1, ObsKind::Read, "a.txt", "\n[read a.txt]\nAAA\n"));
-    ledger.push(observed(1, ObsKind::Grep, "todo", "\n[grep todo]\nno hits\n"));
+    ledger.push(observed(
+        1,
+        ObsKind::Grep,
+        "todo",
+        "\n[grep todo]\nno hits\n",
+    ));
     ledger.push(Observation::new(
         1,
         ObsKind::Message,
@@ -1270,7 +1275,12 @@ async fn the_emitted_pieces_reconstruct_the_assembled_text_exactly() {
 async fn a_results_ordinal_is_the_index_of_the_call_it_answers() {
     let mut ledger = Ledger::new();
     ledger.push(observed(1, ObsKind::Read, "a.txt", "\n[read a.txt]\nAAA\n"));
-    ledger.push(observed(1, ObsKind::Grep, "todo", "\n[grep todo]\nno hits\n"));
+    ledger.push(observed(
+        1,
+        ObsKind::Grep,
+        "todo",
+        "\n[grep todo]\nno hits\n",
+    ));
     ledger.push(Observation::new(
         1,
         ObsKind::Message,
@@ -1435,9 +1445,7 @@ async fn the_derived_user_is_the_flat_prompt_the_transcript_was_built_from() {
             .map(|m| match m {
                 Message::User(text) => text.clone(),
                 Message::Assistant { .. } => String::new(),
-                Message::Results(results) => {
-                    results.iter().map(|r| r.content.as_str()).collect()
-                }
+                Message::Results(results) => results.iter().map(|r| r.content.as_str()).collect(),
             })
             .collect();
         assert_eq!(
@@ -1487,7 +1495,8 @@ async fn parallel_calls_are_one_turn_and_one_batch_in_call_order() {
     else {
         unreachable!()
     };
-    let Some(Message::Results(results)) = m.iter().find(|x| matches!(x, Message::Results(_))) else {
+    let Some(Message::Results(results)) = m.iter().find(|x| matches!(x, Message::Results(_)))
+    else {
         unreachable!()
     };
     assert_eq!(calls.len(), 3);

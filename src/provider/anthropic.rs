@@ -1256,7 +1256,8 @@ mod transcript_body {
         for (i, result) in results.iter().enumerate() {
             assert_eq!(result["type"], "tool_result");
             assert_eq!(
-                result["tool_use_id"], assistant[i + 1]["id"],
+                result["tool_use_id"],
+                assistant[i + 1]["id"],
                 "result {i} must correlate with the call it answers"
             );
         }
