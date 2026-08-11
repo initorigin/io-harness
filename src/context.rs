@@ -536,6 +536,41 @@ pub struct Assembled {
     pub collapsed: bool,
     /// Estimated tokens for `text` — see [`estimate_tokens`].
     pub est_tokens: u64,
+    /// (0.49.0) The same emission, piece by piece, so the run loop can build a
+    /// role-tagged transcript from it.
+    ///
+    /// Every byte of [`text`](Assembled::text) is in here in the same order and
+    /// nothing else is, which is what lets the loop send a real conversation and
+    /// still fill the derived `user` with the string it filled before 0.49.0 —
+    /// two renderings of one emission rather than two emissions.
+    pub emitted: Vec<Emitted>,
+}
+
+/// (0.49.0) One piece of the observation section, as the transcript sees it.
+///
+/// The run loop turns a run of these into a
+/// [`Message::Results`](crate::Message::Results) batch and the rest into user
+/// text. It is emitted here rather than reconstructed there because only this
+/// function knows what was carried, what was elided, and in what order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Emitted {
+    /// The step the observation happened on.
+    pub step: u32,
+    /// Its position among that step's tool results, counted over **every** result
+    /// of the step including the ones elided this turn.
+    ///
+    /// That is the index of the call it answers: 0.41.0 folds a step's results
+    /// back in the model's own call order, never in completion order. Counting
+    /// the elided ones is what keeps the correlation exact when a result is
+    /// stubbed or the stubs are collapsed — dropping them would slide every later
+    /// result up by one and quietly answer the wrong call.
+    pub ordinal: usize,
+    /// Whether this answers a tool call. False for the memory block, a folded
+    /// summary, operator steering, a collapse line, and anything else the model
+    /// said rather than a tool produced.
+    pub result: bool,
+    /// The text, exactly as it appears in [`Assembled::text`].
+    pub text: String,
 }
 
 /// How one entry is going to appear this turn.
@@ -678,6 +713,18 @@ pub async fn assemble(
     // a long run instead of merely holding on a short one.
     let stub_ceiling = (budget_tokens / 8).max(64);
     let mut pieces: Vec<(bool, String)> = Vec::with_capacity(n);
+    // (0.49.0) The ordinal each entry answers on, counted over every result of its
+    // step whether or not this turn carries it. Computed in one pass ahead of the
+    // emission because a stub still occupies its call's position.
+    let mut ordinals = vec![0usize; n];
+    let mut counted: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for i in 0..n {
+        if entries[i].kind != ObsKind::Message {
+            let next = counted.entry(entries[i].step).or_default();
+            ordinals[i] = *next;
+            *next += 1;
+        }
+    }
     for i in 0..n {
         let e = &entries[i];
         if whole[i] {
@@ -711,23 +758,47 @@ pub async fn assemble(
         .map(|(_, t)| estimate_tokens(t))
         .sum();
     out.text.push_str(&notes_text);
+    // (0.49.0) The transcript's own view of the same emission. Prose first — the
+    // memory block renders ahead of everything and belongs to no call.
+    let prose = |step: u32, text: &str| Emitted {
+        step,
+        ordinal: 0,
+        result: false,
+        text: text.to_string(),
+    };
+    if !notes_text.is_empty() {
+        out.emitted.push(prose(0, &notes_text));
+    }
+    let piece = |i: usize, text: &str| Emitted {
+        step: entries[i].step,
+        ordinal: ordinals[i],
+        result: entries[i].kind != ObsKind::Message,
+        text: text.to_string(),
+    };
     if stub_tokens <= stub_ceiling {
-        for (_, t) in &pieces {
+        for (i, (_, t)) in pieces.iter().enumerate() {
             out.text.push_str(t);
+            out.emitted.push(piece(i, t));
         }
     } else {
         // One line for all of them, where the oldest of them sat. Naming each
         // elision is worth more than the space it takes right up to the point it
         // costs more than the observations themselves.
         out.collapsed = true;
-        out.text.push_str(&format!(
+        let collapse = format!(
             "\n[{} earlier observation(s) elided: superseded, or older than this \
              turn's context window — re-read or re-run what you need]\n",
             out.stubbed
-        ));
-        for (whole, t) in &pieces {
+        );
+        out.text.push_str(&collapse);
+        // The collapse line answers no call, so it is prose — and the pieces that
+        // survive it keep the ordinals they were counted with, which is why a
+        // collapsed turn still correlates every result it does carry.
+        out.emitted.push(prose(0, &collapse));
+        for (i, (whole, t)) in pieces.iter().enumerate() {
             if *whole {
                 out.text.push_str(t);
+                out.emitted.push(piece(i, t));
             }
         }
     }

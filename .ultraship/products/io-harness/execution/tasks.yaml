@@ -124,7 +124,7 @@ tasks:
   summary: Emit a message sequence from the assembler beside the flat text it already emits.
   why_required: The transcript is built from the ledger, and the ledger is only read here; without it
     the loop has no messages to send.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.49.0-T01
   acceptance_criteria:
@@ -147,7 +147,18 @@ tasks:
     '
   files:
   - src/context.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test context` — 19 passed, 0 failed, the 16 pre-existing assembler tests among them.'
+  - '`the_emitted_pieces_reconstruct_the_assembled_text_exactly` — the pieces concatenate to `Assembled::text`
+    byte for byte. This is what makes F5 assertable at all: the conversation and the derived `user` are
+    two renderings of ONE emission, not two emissions that have to be kept in step.'
+  - '`a_results_ordinal_is_the_index_of_the_call_it_answers` — the emitted shape is exactly `[(1,0,true),(1,1,true),(1,0,false),(2,0,true)]`:
+    a step''s results count from zero, prose answers no call, and the next step starts again.'
+  - '`an_elided_result_keeps_its_calls_position` — with a superseded read elided between two carried results
+    the ordinals are `[0 (elided), 1, 2]`. Counting only the surviving results would have slid the grep
+    up to call 0 and answered the read with it — a misalignment nothing in the assembled text would show.'
+  - 'No change to `assemble`''s signature and none to `Assembly`, so the break stays the two the contract
+    named: `Assembled` gains `emitted`, and that is all.'
 - id: US-IO-HARNESS-0.49.0-T05
   summary: Build the request's transcript in the run loop with minted tool-call ids, and derive `user`
     unchanged.

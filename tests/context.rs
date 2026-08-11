@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use io_harness::context::{
-    assemble, entry_cap_chars, estimate_tokens, Assembly, Compaction, ContextBudget, Ledger,
-    ObsKind, Observation,
+    assemble, entry_cap_chars, estimate_tokens, Assembled, Assembly, Compaction, ContextBudget,
+    Ledger, ObsKind, Observation,
 };
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::{Tool, ToolFuture, Toolbox, Workspace};
@@ -1207,5 +1207,121 @@ async fn what_the_run_observed_before_the_interruption_is_in_the_prompt_after_it
             .contains("the-observation-from-step-one"),
         "the resumed run carried its earlier observation into the prompt, got: {}",
         after.observations(0)
+    );
+}
+
+// ------------------------------------------------- 0.49.0: the emitted pieces
+
+/// Assemble a ledger with an open policy and no notes, at `step`.
+async fn emitted_for(ledger: &Ledger, budget: u64) -> Assembled {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("s.db")).unwrap();
+    let policy = open_policy();
+    let ws = Workspace::with_policy(dir.path(), policy.clone());
+    assemble(
+        ledger,
+        budget,
+        &[],
+        Assembly {
+            ws: Some(&ws),
+            policy: &policy,
+            store: &store,
+            run_id: 1,
+            step: 9,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+fn observed(step: u32, kind: ObsKind, target: &str, text: &str) -> Observation {
+    Observation::new(step, kind, Some(target.to_string()), text)
+}
+
+/// The transcript and the flat string are two renderings of ONE emission.
+///
+/// This is what makes the derived `user` assertable at all: if the pieces did not
+/// concatenate to exactly the text, the conversation the model receives and the
+/// shim a provider reads would be two different accounts of the same run.
+#[tokio::test]
+async fn the_emitted_pieces_reconstruct_the_assembled_text_exactly() {
+    let mut ledger = Ledger::new();
+    ledger.push(observed(1, ObsKind::Read, "a.txt", "\n[read a.txt]\nAAA\n"));
+    ledger.push(observed(1, ObsKind::Grep, "todo", "\n[grep todo]\nno hits\n"));
+    ledger.push(Observation::new(
+        1,
+        ObsKind::Message,
+        None,
+        "\n[note] the model said something\n",
+    ));
+    ledger.push(observed(2, ObsKind::Read, "b.txt", "\n[read b.txt]\nBBB\n"));
+
+    let out = emitted_for(&ledger, 24_000).await;
+    let rebuilt: String = out.emitted.iter().map(|e| e.text.as_str()).collect();
+    assert_eq!(
+        rebuilt, out.text,
+        "the pieces must concatenate to the assembled text byte for byte"
+    );
+}
+
+/// A result's ordinal is the index of the call it answers, counted over every
+/// result of its step — and prose is not a result.
+#[tokio::test]
+async fn a_results_ordinal_is_the_index_of_the_call_it_answers() {
+    let mut ledger = Ledger::new();
+    ledger.push(observed(1, ObsKind::Read, "a.txt", "\n[read a.txt]\nAAA\n"));
+    ledger.push(observed(1, ObsKind::Grep, "todo", "\n[grep todo]\nno hits\n"));
+    ledger.push(Observation::new(
+        1,
+        ObsKind::Message,
+        None,
+        "\n[note] prose\n",
+    ));
+    ledger.push(observed(2, ObsKind::Read, "b.txt", "\n[read b.txt]\nBBB\n"));
+
+    let out = emitted_for(&ledger, 24_000).await;
+    let shape: Vec<(u32, usize, bool)> = out
+        .emitted
+        .iter()
+        .map(|e| (e.step, e.ordinal, e.result))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![(1, 0, true), (1, 1, true), (1, 0, false), (2, 0, true)],
+        "step 1's two results are calls 0 and 1, the note answers no call, and \
+         step 2 starts counting again"
+    );
+}
+
+/// **The elision case, and it is the one that matters.** A stubbed result still
+/// occupies its call's position, so the results that survive still answer the
+/// calls they actually answered.
+///
+/// Dropping the elided ones from the count would slide every later result up by
+/// one — a transcript in which the model reads the grep's output as the answer to
+/// its read. Nothing about that failure is visible in the assembled text, which is
+/// why it is asserted here rather than left to a body test.
+#[tokio::test]
+async fn an_elided_result_keeps_its_calls_position() {
+    let mut ledger = Ledger::new();
+    // Two reads of the same path: the first is superseded by the second and is
+    // elided, while the grep between them is carried.
+    ledger.push(observed(1, ObsKind::Read, "a.txt", "\n[read a.txt]\nOLD\n"));
+    ledger.push(observed(1, ObsKind::Grep, "todo", "\n[grep todo]\nhit\n"));
+    ledger.push(observed(1, ObsKind::Read, "a.txt", "\n[read a.txt]\nNEW\n"));
+
+    let out = emitted_for(&ledger, 24_000).await;
+    let results: Vec<(usize, bool)> = out
+        .emitted
+        .iter()
+        .filter(|e| e.result)
+        .map(|e| (e.ordinal, e.text.contains("elided")))
+        .collect();
+    assert_eq!(
+        results,
+        vec![(0, true), (1, false), (2, false)],
+        "the superseded read is elided IN PLACE at call 0, and the grep stays at \
+         call 1 rather than sliding up: {:#?}",
+        out.emitted
     );
 }
