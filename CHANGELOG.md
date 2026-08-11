@@ -26,7 +26,7 @@ notes are produced from it.
 
 ### Security
 
-## [0.48.0] - 2026-08-10
+## [0.48.0] - 2026-08-11
 
 ### Added
 
