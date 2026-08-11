@@ -1153,16 +1153,45 @@ versions:
       command permitted one host can reach all of them. Sandboxed egress is routed through a
       loopback proxy the run owns, which enforces the host rules the policy already states and
       records every dial.
-    detail: outline
-    status: planned
+    detail: specified
+    status: released
   - version: 0.49.0
     outcome: >
-      Agents in one tree can talk. A tree can nest, share one ledger, queue past its concurrency cap
-      and hand results up, but a child cannot tell a sibling what it found, and a coordinator cannot
-      wait on a named child — it can only spawn and read what comes back. This release adds a
-      durable mailbox: send, read, and wait on an agent by name, ordered, checkpointed and replayed
-      like every other row. Addressing stays inside the tree, in the same spirit as
-      inherit-and-narrow.
+      The model is asked a question it was trained to answer. Three faults share one cause and are
+      fixed together. **The request cannot express a conversation**: `CompletionRequest` carries one
+      `system` string and one `user` string (`src/provider/mod.rs:467`), and both wires emit exactly
+      one user message and no assistant turn — so the crate parses `tool_calls` off a response and
+      then discards the protocol on the way back in. Prior turns are flattened to prose by
+      `Session::seed`, tool results become bracketed text inside the same blob, and no `tool_use` or
+      `tool_result` block with a correlated id is ever sent. Every model this crate targets is
+      post-trained on the role-tagged transcript with native tool blocks; a single user message
+      narrating the assistant's own past actions in the third person is off that distribution, and
+      the failure is not an error but degraded instruction following — restating plans, narrating
+      intent instead of acting, losing that a tool has already been called. This release makes a
+      turn a turn: an ordered `Vec<Turn>` the assembler emits and each wire maps onto its own block
+      types one to one, with `user: String` kept for one release as a derived shim that collapses to
+      today's body exactly.
+
+      **Task framing stops being the only framing.** `Session::default_contract` is
+      `TaskContract::workspace`, so a greeting is structurally a task with a goal and a success
+      criterion, and the built-in prompt opens "You are an agent working across a repository to meet
+      a stated specification" whatever was typed. It is the same mismatch 0.48.0 fixed in the user
+      block, in the system block, and it largely resolves once a turn is a turn rather than a goal.
+
+      **And `SystemPrompt::Builtin` gains the half 0.45.0 planned and did not ship.** The enum
+      landed as `Builtin | Append | Replace`, so an embedder who wants a shaped agent has two
+      options: write a full agent prompt from scratch, or take three sentences naming four tools
+      with no tone, no output format, no length rule. `Preset` is opt-in by name and `Builtin` stays
+      the default — 0.45.0's argument that a library must not install opinions into someone else's
+      product is not being reopened, and an opt-in preset is the opposite of installing one.
+
+      **Why it is here and not later.** It is the upstream cause of three limits the entries after
+      it plan around rather than remove: 0.44.0's second breakpoint sits inside a user message the
+      assembler rewrites every step, where real turns make everything before a boundary immutable by
+      construction; summarising compaction has no message boundaries to summarise between; and
+      reasoning-content replay is inexpressible, so a provider that rejects a request carrying tools
+      unless prior reasoning is replayed cannot be supported at all in this shape. Breaking, and the
+      break is the point.
     detail: outline
     status: planned
   - version: 0.50.0
@@ -1408,5 +1437,22 @@ versions:
       that asserts only success cannot tell a container that permitted the operation from a
       container that declined and let the Job Object run it unconfined, and this release began by
       making that mistake twice.
+    detail: outline
+    status: planned
+  - version: 0.60.0
+    outcome: >
+      Agents in one tree can talk. A tree can nest, share one ledger, queue past its concurrency cap
+      and hand results up, but a child cannot tell a sibling what it found, and a coordinator cannot
+      wait on a named child — it can only spawn and read what comes back. This release adds a
+      durable mailbox: send, read, and wait on an agent by name, ordered, checkpointed and replayed
+      like every other row. Addressing stays inside the tree, in the same spirit as
+      inherit-and-narrow.
+
+      **Moved here from 0.49.0 on 2026-08-10** (`US-IO-HARNESS-0.48.0-I03`) to make room for the
+      provider-request reshape, which the entries between here and there are all built on. Nothing
+      depended on this entry and it is unchanged apart from its number. It moved rather than every
+      entry after it, because 0.47.0's released record is immutable and names **0.59.0** as the
+      Windows access half — a renumber would have left a published claim pointing at the wrong
+      version.
     detail: outline
     status: planned

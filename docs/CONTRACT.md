@@ -983,6 +983,13 @@ contained turn is a tree like any other in this respect.
 | `WorkspaceWrite` *(the default)* | the workspace root, the system temporary directory, and the detected toolchain's own cache directories |
 | `FullAccess` | anywhere this program's user can write |
 
+**Every mode may also write `/dev/null`**, on every backend. The bit bucket is
+where a toolchain's own scripts send output they mean to discard, and a write to
+it changes nothing an observer can see — the confinement is about what a run can
+*keep*. The macOS profile has allowed the device since 0.6.0 and the namespace
+rung populates `/dev`; the Landlock rung grants it as of 0.48.0, having been the
+one rung where a read grant alone made every git built-in fail.
+
 `FullAccess` is what every release up to 0.45.0 did by default, and it is still
 available — as a sentence rather than as an omission:
 `TaskContract::with_full_access()`. The method is named the way it is so the
@@ -1085,15 +1092,35 @@ says. An operator who wants the real backend sets
 distributions already ship; this repository's own CI does exactly that so its
 Linux legs exercise the backend rather than the fallback.
 
-**Egress under containment is all hosts or none.** The backends take one boolean:
-a network namespace either exists or it does not. So the run's `Policy` decides
-whether a contained command has a route out — `true` when the policy would permit
-any `Act::Net`, `false` otherwise — and a policy that allows exactly one host
-gives a contained command a route to **every** host. Per-host filtering is
-unchanged for the crate's own tools and is not, and cannot cheaply be, applied at
-the sandbox wall. `Effect::Ask` counts as *not* permitted: an approver answers
-about one action at the moment it is attempted, and a namespace is built before
-the command starts and cannot be renegotiated afterwards.
+**Egress under containment follows the policy's own host rules (0.48.0).** Up to
+0.47.0 this was all hosts or none: the backends take one boolean, so a policy
+allowing exactly one host gave a contained command a route to **every** host.
+A run whose policy carries any `Act::Net` rule now routes its contained commands
+through a loopback proxy the run owns. The sandbox permits that address and
+nothing else; the proxy asks the run's own `Policy` about every `host:port` before
+it connects, tunnels what is permitted, and answers what is not with `403` naming
+the rule and the layer that refused it. Every dial is recorded — a `policy_events`
+row with `act = "net"` and a `sandbox_events` row of kind `"dial"`.
+
+A run whose policy names **no** host starts no proxy and is on the pre-0.48.0
+path: the single boolean, unchanged. `Effect::Ask` still counts as *not*
+permitted.
+
+**What the proxy proves differs per backend, and the weaker answer is reported
+rather than implied.**
+
+| Backend | What scopes the route to the proxy | What that proves |
+| --- | --- | --- |
+| `macos-sandbox-exec` | SBPL names the loopback address and port exactly | Per-host. A direct dial past the proxy is refused by the kernel. |
+| `linux-landlock` (ABI 4+) | `LANDLOCK_ACCESS_NET_CONNECT_TCP` permits one **port** | Port-scoped, **not** address-scoped: another host on that same port number is reachable. The port is ephemeral and chosen per run, which narrows it in practice and is not a proof. |
+| `linux-namespaces`, `linux-bubblewrap` | nothing — an empty network namespace cannot reach the host's loopback | Not selected for a run that names hosts. Such a run takes the boolean and reports the backend that applied. |
+| `windows-job-object`, `portable-floor` | nothing | The proxy is **advisory**: the variables are set and a command that ignores them reaches the network. The agent's own boundary section says the word "advisory". |
+
+The proxy terminates no TLS and inspects no payload: a `CONNECT` names its host in
+cleartext, which is the whole of what the decision needs. It is a boundary for the
+agent's own commands and **not** a security barrier against another process on the
+same machine — the listener is on loopback with an ephemeral port, and anything on
+the host may talk to it.
 
 **A contained command may write only under what its mode grants.** Up to 0.45.0
 that was the workspace and the system temporary directory alone, and the concrete
@@ -1104,10 +1131,39 @@ removes that cost for a project whose ecosystem this crate can name. For one it
 cannot — or for a build that writes to a path the *caller* configured outside the
 workspace — the answer is `with_full_access()`, said once at the call site.
 
-**The `shell_start` / `shell_poll` / `shell_kill` handles are not contained.** A
-handle outlives the call that made it, and what a resumed run should do with a
-handle whose sandbox no longer exists is a design question rather than an
-extension of this one. Only the foreground `shell` line and `exec` are contained.
+**Everything a run starts is contained (0.48.0).** Up to 0.47.0 this paragraph
+said the `shell_start` / `shell_poll` / `shell_kill` handles were not, and it did
+not mention that the git built-ins were not either — so which tool the model
+happened to pick decided whether the boundary applied. Both now take the same
+containment every other spawn takes, per stage.
+
+The design question that paragraph deferred — what a resumed run does with a
+handle whose sandbox no longer exists — is answered by construction rather than
+by a mechanism: a handle's restriction lives **with its processes**, as a
+`pre_exec` rule set or a wrapper argv on unix and as the Job Object the handle
+already owns on Windows. There is nothing to tear down and nothing to re-enter,
+so a resumed run finds the previous run's handle rows and orphans them exactly as
+it did before.
+
+**A handle takes the caps a foreground `shell` stage takes, and the wall clock
+reaches neither.** `SandboxLimits::max_wall_secs` is enforced inside the sandbox's
+own runner, which `exec` uses and no `shell` path reaches — so a handle cannot be
+killed by it, which is also the right answer: a dev server killed at the sandbox's
+ceiling would be a containment feature deleting the tool's purpose. The CPU and
+open-file rlimits do apply. A handle still live when the run ends is killed by the
+registry on drop, and that ending is not recorded — there is no step left to
+record it on.
+
+**Each spawning tool declares the mode it needs, and the run resolves it before
+the spawn.** A call runs under the *narrower* of what it declares and what the
+contract granted — the three git readers declare `read-only`, the four that write
+`.git` declare `workspace-write`, and `exec` / `shell` / `shell_start` declare
+nothing because they are the tools the grant was written for. A need the grant
+cannot satisfy is refused with **no process started**, so the model reads a reason
+naming both modes instead of decoding an errno. A registered `Tool` may declare
+one too, and there the declaration is a **refusal** mechanism and not a
+confinement one: the crate does not see that tool's own spawn and does not claim
+to govern it.
 
 **A contained `shell` stage is contained slightly less than an `exec` command.**
 `shell` pipes its stages into one another, so it owns every child process and

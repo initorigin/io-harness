@@ -340,6 +340,74 @@ impl ExecMode {
     pub fn is_contained(&self) -> bool {
         !matches!(self, ExecMode::FullAccess)
     }
+
+    /// How much this mode grants, as a number, so two of them can be compared
+    /// (0.48.0).
+    ///
+    /// Private because the ordering is the only thing callers need and
+    /// [`ExecMode::narrower`] is that. Publishing a rank would invite arithmetic
+    /// on it, and the moment a fourth mode exists the arithmetic is wrong while
+    /// the comparison still holds.
+    fn rank(&self) -> u8 {
+        match self {
+            ExecMode::ReadOnly => 0,
+            ExecMode::WorkspaceWrite => 1,
+            ExecMode::FullAccess => 2,
+        }
+    }
+
+    /// The lesser of two grants (0.48.0).
+    ///
+    /// A tool declares the mode it needs and a contract grants one; a call runs
+    /// under whichever of the two permits less. That is least privilege stated as
+    /// a function: a reader dispatched inside a run that may write is still only
+    /// a reader, and a run that may only read never becomes one that may write
+    /// because a tool asked.
+    ///
+    /// ```
+    /// use io_harness::ExecMode;
+    ///
+    /// // A git reader inside a run that may write the workspace.
+    /// assert_eq!(
+    ///     ExecMode::WorkspaceWrite.narrower(ExecMode::ReadOnly),
+    ///     ExecMode::ReadOnly
+    /// );
+    /// // A tool asking for more than the run was given gets the run's answer —
+    /// // the refusal that goes with it is the dispatcher's, not this function's.
+    /// assert_eq!(
+    ///     ExecMode::ReadOnly.narrower(ExecMode::WorkspaceWrite),
+    ///     ExecMode::ReadOnly
+    /// );
+    /// // Commutative, and equal modes are their own answer.
+    /// assert_eq!(
+    ///     ExecMode::FullAccess.narrower(ExecMode::FullAccess),
+    ///     ExecMode::FullAccess
+    /// );
+    /// ```
+    pub fn narrower(self, other: ExecMode) -> ExecMode {
+        if other.rank() < self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// Whether a call needing `self` can run under a contract granting `grant`
+    /// (0.48.0).
+    ///
+    /// The question the dispatcher asks *before* it spawns anything. A need the
+    /// grant cannot satisfy is a refusal the model reads, not an errno it has to
+    /// decode out of a failed command.
+    ///
+    /// ```
+    /// use io_harness::ExecMode;
+    ///
+    /// assert!(ExecMode::ReadOnly.satisfied_by(ExecMode::WorkspaceWrite));
+    /// assert!(!ExecMode::WorkspaceWrite.satisfied_by(ExecMode::ReadOnly));
+    /// ```
+    pub fn satisfied_by(self, grant: ExecMode) -> bool {
+        self.rank() <= grant.rank()
+    }
 }
 
 /// Resource caps applied to a sandboxed run. Serde-serializable like
@@ -521,6 +589,16 @@ pub struct SandboxConfig {
     /// Allow outbound network. Default `false` — network is denied by default.
     #[serde(default)]
     pub allow_network: bool,
+    /// The loopback proxy this command's egress must go through, if the run has
+    /// one (0.48.0). `None` is every release before it: egress is the boolean
+    /// `allow_network` and nothing scopes it by host.
+    ///
+    /// It lives here and not on [`SandboxConfig`] deliberately: `RunSpec` is
+    /// `#[non_exhaustive]` and gained a constructor in 0.46.0 precisely so a
+    /// later release could add to it for free, while a public field on
+    /// `SandboxConfig` would be a compile break for every caller with an
+    /// exhaustive literal and a new key every `io.toml` reader had to ignore.
+    pub proxy: Option<std::net::SocketAddr>,
     /// Disable the native backend and force the portable floor. Off by default;
     /// used to prove the selection ladder and to run the floor everywhere.
     #[serde(default)]
@@ -598,6 +676,21 @@ pub struct RunSpec<'a> {
     pub limits: &'a SandboxLimits,
     /// Whether outbound network is permitted (default-deny lives in the caller).
     pub allow_network: bool,
+    /// The loopback proxy this command's egress must go through, if the run has
+    /// one (0.48.0).
+    ///
+    /// `None` is every release before it: egress is the boolean
+    /// [`RunSpec::allow_network`] and nothing scopes it by host. When it is set,
+    /// the backend permits that address and nothing else, and the proxy asks the
+    /// run's own [`Policy`](crate::Policy) about every host before it connects.
+    ///
+    /// It lives here and not on [`SandboxConfig`] deliberately: `RunSpec` is
+    /// `#[non_exhaustive]` and gained a constructor in 0.46.0 precisely so a later
+    /// release could add to it for free, while a public field on `SandboxConfig`
+    /// would be a compile break for every caller holding an exhaustive literal —
+    /// and a new key every `io.toml` reader would have to know about, for a value
+    /// no operator can write down because it is chosen at run start.
+    pub proxy: Option<std::net::SocketAddr>,
     /// Where this command may write (0.46.0).
     ///
     /// [`ExecMode::FullAccess`] never reaches a backend — a command under it is
@@ -628,6 +721,7 @@ impl<'a> RunSpec<'a> {
             workdir,
             limits,
             allow_network: false,
+            proxy: None,
             mode: ExecMode::WorkspaceWrite,
             writable_roots: &[],
         }
@@ -647,6 +741,19 @@ impl<'a> RunSpec<'a> {
 
     /// Grant write access to these directories besides the workdir. They must be
     /// absolute and must exist — see [`RunSpec::writable_roots`].
+    /// Route this command's egress through a loopback proxy at `addr` (0.48.0).
+    ///
+    /// When set, the backend permits that address and **nothing else**: the
+    /// proxy is the only route out, and it asks the run's own [`Policy`](crate::Policy) about
+    /// every host before it connects. That is what turns per-host rules from a
+    /// statement of intent into the thing enforced — see `docs/CONTRACT.md` for
+    /// what each backend can and cannot scope, because the answer differs and the
+    /// weaker one is reported rather than implied.
+    pub fn with_proxy(mut self, addr: Option<std::net::SocketAddr>) -> Self {
+        self.proxy = addr;
+        self
+    }
+
     pub fn with_writable_roots(mut self, roots: &'a [PathBuf]) -> Self {
         self.writable_roots = roots;
         self
@@ -951,6 +1058,7 @@ pub(crate) fn apply_rlimits(cmd: &mut tokio::process::Command, limits: &SandboxL
 /// on a hot path and, worse, letting two call sites disagree about what a mode
 /// means. The two loops build one of these and hand it to `dispatch`; the exec
 /// tool, the shell tool and the verification gate all read it.
+#[derive(Clone)]
 pub(crate) struct ExecContainment {
     /// What the contract asked for, with egress already resolved from the run's
     /// own policy.
@@ -959,6 +1067,10 @@ pub(crate) struct ExecContainment {
     /// existing, deduplicated — see [`RunSpec::writable_roots`] for why each of
     /// those three matters.
     pub(crate) roots: Vec<PathBuf>,
+    /// The run's loopback proxy, when it has one (0.48.0). Resolved once with the
+    /// containment, because a run has at most one proxy and every command it
+    /// contains goes through the same one.
+    pub(crate) proxy: Option<std::net::SocketAddr>,
 }
 
 impl ExecContainment {
@@ -980,6 +1092,15 @@ impl ExecContainment {
         Self {
             config: config.clone(),
             roots,
+            proxy: None,
+        }
+    }
+
+    /// The same containment, routing egress through `addr` (0.48.0).
+    pub(crate) fn with_proxy(&self, addr: Option<std::net::SocketAddr>) -> Self {
+        Self {
+            proxy: addr,
+            ..self.clone()
         }
     }
 
@@ -996,6 +1117,31 @@ impl ExecContainment {
                 ..self.config.clone()
             },
             roots: self.roots.clone(),
+            proxy: self.proxy,
+        }
+    }
+
+    /// The same containment under a narrower mode, for one call (0.48.0).
+    ///
+    /// **The roots are recomputed rather than carried**, and that is the whole
+    /// reason this is a method instead of a struct update: `resolve` grants the
+    /// toolchain's cache directories only under
+    /// [`WorkspaceWrite`](ExecMode::WorkspaceWrite), so a containment narrowed to
+    /// [`ReadOnly`](ExecMode::ReadOnly) that kept them would be a read-only mode
+    /// with a list of writable directories attached — which is not read-only, and
+    /// would have been invisible in every test that only asserts the mode.
+    pub(crate) fn with_mode(&self, mode: ExecMode) -> Self {
+        Self {
+            config: SandboxConfig {
+                mode,
+                ..self.config.clone()
+            },
+            roots: if mode == ExecMode::WorkspaceWrite {
+                self.roots.clone()
+            } else {
+                Vec::new()
+            },
+            proxy: self.proxy,
         }
     }
 
@@ -1004,12 +1150,35 @@ impl ExecContainment {
         select(&self.config).backend()
     }
 
+    /// The writable roots for a command whose workspace root is `workspace_root`
+    /// (0.48.0).
+    ///
+    /// One definition of "the root is writable unless the mode says otherwise",
+    /// shared by every caller that spawns a child itself instead of delegating to
+    /// [`Sandbox::run`] — the `shell` tool's stages, a `shell_start` handle's
+    /// stages, and the git built-ins. It was written out twice inside one function
+    /// before this release; a third copy in another file is how a mode ends up
+    /// meaning two things.
+    ///
+    /// Under [`ReadOnly`](ExecMode::ReadOnly) the root is **not** named, because
+    /// the workspace is exactly what that mode withholds and naming it here would
+    /// hand it back through the side door.
+    pub(crate) fn roots_for(&self, workspace_root: &Path) -> Vec<PathBuf> {
+        let mut roots = Vec::with_capacity(self.roots.len() + 1);
+        if self.config.mode != ExecMode::ReadOnly {
+            roots.push(workspace_root.to_path_buf());
+        }
+        roots.extend(self.roots.iter().cloned());
+        roots
+    }
+
     /// A [`RunSpec`] for one command under this containment.
     pub(crate) fn spec<'a>(&'a self, argv: &'a [String], workdir: &'a Path) -> RunSpec<'a> {
         RunSpec::new(argv, workdir, &self.config.limits)
             .with_network(self.config.allow_network)
             .with_mode(self.config.mode)
             .with_writable_roots(&self.roots)
+            .with_proxy(self.proxy)
     }
 }
 
@@ -1104,11 +1273,13 @@ pub(crate) fn wrap_argv(
     allow_network: bool,
     writable_roots: &[PathBuf],
     argv: &[String],
+    proxy: Option<std::net::SocketAddr>,
 ) -> (Backend, Vec<String>) {
     let backend = select(config).backend();
     #[cfg(target_os = "macos")]
     if backend == Backend::MacosSandboxExec {
-        let profile = macos::profile_for(workdir, allow_network, config.mode, writable_roots);
+        let profile =
+            macos::profile_for(workdir, allow_network, config.mode, writable_roots, proxy);
         let mut wrapped = vec!["sandbox-exec".to_string(), "-p".to_string(), profile];
         wrapped.extend(argv.iter().cloned());
         return (backend, wrapped);
@@ -1132,7 +1303,12 @@ pub(crate) fn wrap_argv(
     // underscore-prefixed because every other platform does use them, and a
     // parameter called `_workdir` in a signature this shared would read as if the
     // working directory were ignored everywhere.
-    let _ = (workdir, allow_network, writable_roots);
+    // `proxy` is consumed only by the macOS profile: the Landlock rung installs
+    // its port rule through `contain_command` rather than through an argv
+    // wrapper, and the namespace rungs cannot reach a loopback proxy at all — a
+    // proxied run is never given one. So on every other platform it is
+    // deliberately unused here.
+    let _ = (workdir, allow_network, writable_roots, proxy);
     (backend, argv.to_vec())
 }
 
@@ -1158,6 +1334,7 @@ pub(crate) fn contain_command(
     workdir: &Path,
     allow_network: bool,
     writable_roots: &[PathBuf],
+    proxy: Option<std::net::SocketAddr>,
 ) -> Option<Contained> {
     #[cfg(target_os = "linux")]
     {
@@ -1173,6 +1350,7 @@ pub(crate) fn contain_command(
             workdir,
             writable_roots,
             &tmp,
+            proxy.map(|a| a.port()),
         );
         let ruleset = landlock::Ruleset::build(&plan).ok()?;
         let fd = ruleset.raw();
@@ -1245,7 +1423,7 @@ async fn run_capped_hooked(
 
     // Deny network on the floor best-effort by stripping proxy configuration.
     // A real kernel boundary comes from the native backends; documented as such.
-    if !spec.allow_network {
+    if !spec.allow_network && spec.proxy.is_none() {
         for k in [
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -1256,6 +1434,14 @@ async fn run_capped_hooked(
         ] {
             cmd.env_remove(k);
         }
+    }
+    // 0.48.0 — and where the run has a proxy, the command is told to use it. This
+    // is the one place every backend's spawn converges, so setting it here is what
+    // stops `exec` and a `shell` stage from disagreeing about whether a command
+    // can find its way out. The sandbox permits the proxy and nothing else, so a
+    // command that ignores these reaches nothing rather than reaching everything.
+    for (k, v) in proxy_env(spec.proxy) {
+        cmd.env(k, v);
     }
 
     // Unix: apply rlimits in the child before exec. CPU is the reliable kill.
@@ -1714,6 +1900,7 @@ pub async fn copy_back(
 // cross-check, which is an environment limit, not a limit of this code).
 pub mod linux;
 pub mod macos;
+pub(crate) mod proxy;
 pub mod windows;
 
 // The Landlock rung follows the same split: its rule *plan* — which paths, which
@@ -1737,6 +1924,40 @@ pub(crate) mod seccomp;
 // `cfg(windows)` body rather than a portable type with a gated implementation,
 // and it is proven on the Windows runner or nowhere.
 pub mod appcontainer;
+
+/// The proxy variables a contained command is given (0.48.0).
+///
+/// Empty when the run has no proxy, so a command in a run that never named a host
+/// sees exactly the environment it saw in 0.47.0.
+///
+/// `NO_PROXY` is set **empty** on purpose. A value inherited from the caller's own
+/// environment would punch a hole in the boundary from outside it — the operator
+/// who wrote the policy is not the operator who exported `NO_PROXY=*` — and the
+/// cost is stated in the release's open questions rather than discovered: a run
+/// that legitimately needs a direct connection to something else has no way to say
+/// so.
+///
+/// Both cases are given, because there is no agreement between clients about
+/// which they read: `curl` prefers the lowercase form, most Go and Rust clients
+/// read either, and several toolchains read only the uppercase one.
+pub(crate) fn proxy_env(proxy: Option<std::net::SocketAddr>) -> Vec<(&'static str, String)> {
+    let Some(addr) = proxy else {
+        return Vec::new();
+    };
+    let url = format!("http://{addr}");
+    [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .into_iter()
+    .map(|k| (k, url.clone()))
+    .chain([("NO_PROXY", String::new()), ("no_proxy", String::new())])
+    .collect()
+}
 
 #[cfg(test)]
 mod tests {

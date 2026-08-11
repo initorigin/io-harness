@@ -802,16 +802,23 @@ pub struct SandboxEvent {
     pub run_id: i64,
     /// The step it occurred on.
     pub step: u32,
-    /// `"create"`, `"exec"`, `"cap_hit"`, `"destroy"`, `"gate_phase_failed"`
-    /// (whose `detail` names the phase), or `"gate_output"` (whose `detail` is
-    /// what a failing gate command printed).
+    /// `"create"` (whose `detail` names the [`ExecMode`](crate::ExecMode) that
+    /// call resolved to, since 0.48.0), `"exec"`, `"cap_hit"`, `"destroy"`,
+    /// `"dial"` (0.48.0, whose `detail` is the `host:port` a contained command
+    /// asked for), `"gate_phase_failed"` (whose `detail` names the phase), or
+    /// `"gate_output"` (whose `detail` is what a failing gate command printed).
     ///
-    /// A `"net_deny"` kind was documented here from 0.6.0 to 0.11.0 and never
-    /// existed: nothing constructed it and nothing emitted it. It was removed in
-    /// 0.12.0 rather than implemented, because a sandbox denies egress
-    /// *structurally* — the backend gives the child no route out, so there is no
-    /// attempt to observe and nothing to count. Network decisions the harness
-    /// actually makes are in `policy_events` with `act = "net"`.
+    /// **0.48.0 made an old sentence here false, and this is the corrected one.**
+    /// A `"net_deny"` kind was documented from 0.6.0 to 0.11.0 and never existed;
+    /// it was removed in 0.12.0 rather than implemented, on the reasoning that a
+    /// sandbox denies egress *structurally* — the backend gives the child no route
+    /// out, so there is no attempt to observe and nothing to count. That was true
+    /// of every release up to 0.47.0. Since 0.48.0 a run whose policy names hosts
+    /// routes its contained commands through a proxy it owns, so there **is** an
+    /// attempt and it **is** counted: one `"dial"` row per outbound connection,
+    /// permitted or refused, beside the decision itself in `policy_events` with
+    /// `act = "net"` — which is still where the harness's own network decisions
+    /// live, and now where its commands' decisions live too.
     pub kind: String,
     /// The backend that isolated the run (e.g. `"macos-sandbox-exec"`).
     pub backend: Option<String>,

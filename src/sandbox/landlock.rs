@@ -95,6 +95,9 @@ pub(crate) const NET_CONNECT_TCP: u64 = 1 << 1;
 /// What a *read-only* hierarchy is allowed: look at it and run what is in it.
 pub(crate) const READ_SET: u64 = FS_EXECUTE | FS_READ_FILE | FS_READ_DIR;
 
+/// The bit bucket, which every mode may write to. See [`plan`].
+pub(crate) const DEV_NULL: &str = "/dev/null";
+
 /// Every filesystem right this module ever asks the kernel to handle, before
 /// masking to the host's ABI.
 const ALL_FS: u64 = FS_EXECUTE
@@ -167,6 +170,17 @@ pub(crate) struct Plan {
     pub(crate) handled_fs: u64,
     pub(crate) handled_net: u64,
     pub(crate) rules: Vec<PathRule>,
+    /// TCP ports this run may `connect` to (0.48.0). Empty is every release
+    /// before it: net access is handled or it is not, and handling it with no
+    /// rule denies every outbound connection.
+    ///
+    /// **Port-scoped and not address-scoped, and that is the honest word for
+    /// it.** Landlock's network rules take a port and no address, so allowing the
+    /// run's loopback proxy through also allows any other host on that same port
+    /// number. The port is ephemeral and chosen per run, which narrows it in
+    /// practice and does not make it a proof — `docs/CONTRACT.md` says so rather
+    /// than letting a reader assume this is per-host enforcement.
+    pub(crate) net_ports: Vec<u16>,
 }
 
 /// Build the rule set for a run.
@@ -182,9 +196,18 @@ pub(crate) fn plan(
     workdir: &Path,
     writable: &[PathBuf],
     tmp: &Path,
+    proxy_port: Option<u16>,
 ) -> Plan {
     let handled_fs = fs_rights_for(abi);
-    let handled_net = net_rights_for(abi, deny_egress);
+    // A proxy means the same thing to this rung as a denial does — take control
+    // of outbound TCP — and then hands one port back. Without the first half the
+    // second would be a rule on an access nothing was restricting.
+    let handled_net = net_rights_for(abi, deny_egress || proxy_port.is_some());
+    let net_ports: Vec<u16> = if handled_net == 0 {
+        Vec::new()
+    } else {
+        proxy_port.into_iter().collect()
+    };
 
     // Read and execute over the whole tree. A unix run has never confined reads,
     // and this is that same claim in this rung's vocabulary.
@@ -213,10 +236,39 @@ pub(crate) fn plan(
             rights: handled_fs,
         });
     }
+
+    // `/dev/null` is writable under every mode, and this rule is not a
+    // convenience either.
+    //
+    // The `/` rule above covers opening the bit bucket to *read*; it does not
+    // cover opening it to *write*, and that is how it is nearly always opened —
+    // every `2>/dev/null` a toolchain's own scripts contain, and this crate's git
+    // built-ins, which point `GIT_CONFIG_GLOBAL` at it and which git opens "for
+    // reading and writing" even when all it means to do is parse it. Without this
+    // rule every git built-in fails on Linux with `fatal: could not open
+    // '/dev/null' for reading and writing: Permission denied`, which is what the
+    // matrix caught and no macOS host could: the SBPL profile and the mount setup
+    // have always allowed the device. This is that same allowance in this rung's
+    // vocabulary, and a write to the bit bucket changes nothing an observer can
+    // see — the confinement this rung exists for is about what a run can *keep*.
+    //
+    // File rights only. Landlock refuses a rule asking for a directory right on
+    // something that is not a directory, so `READ_SET`'s `FS_READ_DIR` and every
+    // `FS_MAKE_*` are deliberately absent — and a rule the kernel refuses would
+    // fail the whole rule set, which is the same reason this is exists-filtered
+    // like every writable root has been since 0.46.0.
+    if Path::new(DEV_NULL).exists() {
+        rules.push(PathRule {
+            path: PathBuf::from(DEV_NULL),
+            rights: (FS_READ_FILE | FS_WRITE_FILE) & handled_fs,
+        });
+    }
+
     Plan {
         handled_fs,
         handled_net,
         rules,
+        net_ports,
     }
 }
 
@@ -239,9 +291,20 @@ mod imp {
     /// returns the ABI the running kernel supports.
     const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
 
-    /// `LANDLOCK_RULE_PATH_BENEATH`. It is the only rule type this module adds:
+    /// `LANDLOCK_RULE_NET_PORT` (0.48.0). Added only for the loopback proxy's
+    /// port, and only where the negotiated ABI carries the network rules.
+    ///
+    /// **Port-scoped, not address-scoped**, because that is the whole of what the
+    /// kernel interface offers: the rule names a port and no address, so another
+    /// host on that port number is reachable. The port is ephemeral and chosen
+    /// per run, which narrows it in practice and is not a proof —
+    /// `docs/CONTRACT.md` says so per backend rather than letting a reader assume
+    /// this is per-host enforcement.
+    const RULE_NET_PORT: i32 = 2;
+
+    /// `LANDLOCK_RULE_PATH_BENEATH`. It is the first rule type this module adds:
     /// the network half is expressed by *handling* the network rights and
-    /// granting no port, so there is no `LANDLOCK_RULE_NET_PORT` here.
+    /// granting no port when nothing is proxied.
     const RULE_PATH_BENEATH: i32 = 1;
 
     /// The ABI 4 layout: filesystem rights, then network rights.
@@ -270,6 +333,15 @@ mod imp {
     struct PathBeneathAttr {
         allowed_access: u64,
         parent_fd: RawFd,
+    }
+
+    /// `struct landlock_net_port_attr` (0.48.0): two `__u64` fields and no
+    /// padding question, unlike its path sibling — the kernel takes the port as a
+    /// 64-bit value in host byte order rather than as a `__u16`.
+    #[repr(C)]
+    struct NetPortAttr {
+        allowed_access: u64,
+        port: u64,
     }
 
     /// The kernel's Landlock ABI, or `None` when this host has no usable
@@ -372,12 +444,44 @@ mod imp {
             for rule in &plan.rules {
                 ruleset.add_path(&rule.path, rule.rights & plan.handled_fs)?;
             }
-            // No network rule is ever added. Handling `CONNECT_TCP` and
-            // `BIND_TCP` while permitting no port is precisely how Landlock
-            // spells "no route out" — the denial is the absence of a permission,
-            // the same shape as an empty network namespace and as the Windows
-            // container's empty capability array.
+            // Handling `CONNECT_TCP` and `BIND_TCP` while permitting no port is
+            // precisely how Landlock spells "no route out" — the denial is the
+            // absence of a permission, the same shape as an empty network
+            // namespace and as the Windows container's empty capability array.
+            //
+            // 0.48.0 hands exactly one port back: the run's loopback proxy, which
+            // is the only route out a proxied run has. Nothing else is ever added.
+            for port in &plan.net_ports {
+                ruleset.add_net_port(*port, plan.handled_net & NET_CONNECT_TCP)?;
+            }
             Ok(ruleset)
+        }
+
+        /// Permit `connect` to one TCP port.
+        fn add_net_port(&self, port: u16, rights: u64) -> io::Result<()> {
+            if rights == 0 {
+                return Ok(());
+            }
+            let attr = NetPortAttr {
+                allowed_access: rights,
+                // The kernel takes the port as a 64-bit value in host byte order.
+                port: u64::from(port),
+            };
+            // SAFETY: `attr` is live and fully initialised for the whole call and
+            // the size passed is its own.
+            let rc = unsafe {
+                libc::syscall(
+                    SYS_LANDLOCK_ADD_RULE,
+                    self.fd.as_raw_fd(),
+                    RULE_NET_PORT,
+                    &attr as *const NetPortAttr,
+                    0u32,
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
 
         fn add_path(&self, path: &Path, rights: u64) -> io::Result<()> {
@@ -545,6 +649,7 @@ mod tests {
             Path::new("/w"),
             &roots(),
             Path::new("/tmp"),
+            None,
         );
         let full = fs_rights_for(5);
 
@@ -555,7 +660,13 @@ mod tests {
         );
         assert_eq!(p.rules[0].rights & FS_WRITE_FILE, 0);
 
-        let writable: Vec<&Path> = p.rules[1..].iter().map(|r| r.path.as_path()).collect();
+        // The hierarchies, in order, with the bit bucket's file rule excluded —
+        // it is a device and not a hierarchy, and it has its own test below.
+        let writable: Vec<&Path> = p.rules[1..]
+            .iter()
+            .filter(|r| r.path != Path::new(DEV_NULL))
+            .map(|r| r.path.as_path())
+            .collect();
         assert_eq!(
             writable,
             [
@@ -565,7 +676,10 @@ mod tests {
                 Path::new("/tmp"),
             ]
         );
-        assert!(p.rules[1..].iter().all(|r| r.rights == full));
+        assert!(p.rules[1..]
+            .iter()
+            .filter(|r| r.path != Path::new(DEV_NULL))
+            .all(|r| r.rights == full));
     }
 
     /// F5 — `ReadOnly` withholds the workspace and keeps the temp directory,
@@ -579,8 +693,13 @@ mod tests {
             Path::new("/w"),
             &[],
             Path::new("/tmp"),
+            None,
         );
-        let writable: Vec<&Path> = p.rules[1..].iter().map(|r| r.path.as_path()).collect();
+        let writable: Vec<&Path> = p.rules[1..]
+            .iter()
+            .filter(|r| r.path != Path::new(DEV_NULL))
+            .map(|r| r.path.as_path())
+            .collect();
         assert_eq!(
             writable,
             [Path::new("/tmp")],
@@ -589,6 +708,105 @@ mod tests {
         // And the workspace is still *readable*, through the `/` rule.
         assert_eq!(p.rules[0].path, Path::new("/"));
         assert_ne!(p.rules[0].rights & FS_READ_FILE, 0);
+    }
+
+    /// 0.48.0 — the bit bucket is writable under **every** mode, and the rule
+    /// asks for file rights only.
+    ///
+    /// Both halves are the defect the matrix found. A read-only grant is not
+    /// enough, because git opens `GIT_CONFIG_GLOBAL` for reading *and writing*
+    /// and every git built-in therefore failed on Linux; and a rule carrying a
+    /// directory right on a device is refused by the kernel, which would fail the
+    /// whole rule set and hand back an unconfined run.
+    #[test]
+    fn the_bit_bucket_is_writable_under_every_mode_and_asks_for_file_rights_only() {
+        // The rule is exists-filtered, and this test asserts a grant. Every host
+        // this crate builds on has the device; if one does not, there is nothing
+        // to assert about.
+        if !Path::new(DEV_NULL).exists() {
+            return;
+        }
+        for mode in [
+            ExecMode::ReadOnly,
+            ExecMode::WorkspaceWrite,
+            ExecMode::FullAccess,
+        ] {
+            let p = plan(
+                5,
+                mode,
+                false,
+                Path::new("/w"),
+                &[],
+                Path::new("/tmp"),
+                None,
+            );
+            let rule = p
+                .rules
+                .iter()
+                .find(|r| r.path == Path::new(DEV_NULL))
+                .unwrap_or_else(|| panic!("{mode:?} grants the bit bucket: {:?}", p.rules));
+            assert_ne!(
+                rule.rights & FS_WRITE_FILE,
+                0,
+                "{mode:?} may write it — a read grant is what broke every git built-in"
+            );
+            assert_eq!(
+                rule.rights & (FS_READ_DIR | FS_MAKE_REG | FS_MAKE_DIR | FS_REFER),
+                0,
+                "{mode:?} asks for no directory right on a device"
+            );
+        }
+    }
+
+    /// 0.48.0 — a proxy takes control of outbound TCP and hands exactly one port
+    /// back. Port-scoped, never address-scoped: that is the ceiling of the
+    /// kernel interface and it is asserted here so nobody reads the rung as
+    /// per-host enforcement.
+    #[test]
+    fn a_proxy_handles_the_network_and_allows_only_its_port() {
+        // ABI 4 is where the network rules arrive.
+        let with = plan(
+            4,
+            ExecMode::WorkspaceWrite,
+            false,
+            Path::new("/w"),
+            &[],
+            Path::new("/tmp"),
+            Some(54321),
+        );
+        assert_ne!(
+            with.handled_net, 0,
+            "a proxied run restricts outbound TCP even though its policy permits egress"
+        );
+        assert_eq!(with.net_ports, vec![54321]);
+
+        // Without one, nothing changes from 0.47.0: a run permitting egress
+        // handles no network access at all.
+        let without = plan(
+            4,
+            ExecMode::WorkspaceWrite,
+            false,
+            Path::new("/w"),
+            &[],
+            Path::new("/tmp"),
+            None,
+        );
+        assert_eq!(without.handled_net, 0);
+        assert!(without.net_ports.is_empty());
+
+        // And below the ABI that carries the network rules there is nothing to
+        // hand back, so the port is dropped rather than requested and refused.
+        let old = plan(
+            3,
+            ExecMode::WorkspaceWrite,
+            false,
+            Path::new("/w"),
+            &[],
+            Path::new("/tmp"),
+            Some(54321),
+        );
+        assert_eq!(old.handled_net, 0);
+        assert!(old.net_ports.is_empty());
     }
 
     /// Every right named in a rule must be one the rule set said it handles, or
@@ -604,6 +822,7 @@ mod tests {
                 Path::new("/w"),
                 &roots(),
                 Path::new("/tmp"),
+                None,
             );
             for rule in &p.rules {
                 assert_eq!(

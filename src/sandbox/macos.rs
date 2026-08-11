@@ -22,6 +22,7 @@ impl Sandbox for MacosSandbox {
             spec.allow_network,
             spec.mode,
             spec.writable_roots,
+            spec.proxy,
         );
         // Wrap the command in sandbox-exec with an inline profile.
         let mut wrapped: Vec<String> = vec!["sandbox-exec".into(), "-p".into(), profile];
@@ -31,7 +32,8 @@ impl Sandbox for MacosSandbox {
         let wspec = RunSpec::new(&wrapped, spec.workdir, spec.limits)
             .with_network(spec.allow_network)
             .with_mode(spec.mode)
-            .with_writable_roots(spec.writable_roots);
+            .with_writable_roots(spec.writable_roots)
+            .with_proxy(spec.proxy);
         run_capped(Backend::MacosSandboxExec, wspec, move |cmd| {
             // Keep rustc's temp writes inside the confined workdir — except under
             // `ReadOnly`, where the workdir is exactly what may not be written to
@@ -61,11 +63,20 @@ pub(crate) fn profile_for(
     allow_network: bool,
     mode: ExecMode,
     writable_roots: &[PathBuf],
+    proxy: Option<std::net::SocketAddr>,
 ) -> String {
-    let net = if allow_network {
-        "(allow network*)"
-    } else {
-        "(deny network*)"
+    // 0.48.0 — when the run owns a proxy, everything is denied and that one
+    // loopback address is allowed back. SBPL can name an address and a port
+    // exactly, so on this platform "the proxy is the only route out" is a kernel
+    // decision rather than a convention a payload could ignore. The deny comes
+    // first because the last matching rule wins.
+    let net = match (proxy, allow_network) {
+        (Some(addr), _) => format!(
+            "(deny network*)\n(allow network-outbound (remote ip \"localhost:{}\"))",
+            addr.port()
+        ),
+        (None, true) => "(allow network*)".to_string(),
+        (None, false) => "(deny network*)".to_string(),
     };
     // - allow default: let rustc read/exec/fork freely
     // - deny writes under / then re-allow what the mode grants and the tty/dev
@@ -100,7 +111,7 @@ mod tests {
     use super::*;
 
     fn profile(mode: ExecMode, roots: &[PathBuf]) -> String {
-        profile_for(Path::new("/tmp/sbx"), false, mode, roots)
+        profile_for(Path::new("/tmp/sbx"), false, mode, roots, None)
     }
 
     #[test]
@@ -112,8 +123,37 @@ mod tests {
     }
 
     #[test]
+    fn a_proxy_denies_everything_and_allows_the_loopback_port_back() {
+        let addr: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let p = profile_for(
+            Path::new("/tmp/sbx"),
+            true,
+            ExecMode::WorkspaceWrite,
+            &[],
+            Some(addr),
+        );
+        assert!(p.contains("(deny network*)"), "everything is denied first");
+        assert!(
+            p.contains("(allow network-outbound (remote ip \"localhost:54321\"))"),
+            "and exactly the proxy is allowed back: {p}"
+        );
+        // Even though the run permits egress: with a proxy, permission is the
+        // proxy's decision to make per host, not the profile's to grant wholesale.
+        assert!(
+            !p.contains("(allow network*)"),
+            "no blanket allow survives: {p}"
+        );
+    }
+
+    #[test]
     fn profile_allows_network_when_asked() {
-        let p = profile_for(Path::new("/tmp/sbx"), true, ExecMode::WorkspaceWrite, &[]);
+        let p = profile_for(
+            Path::new("/tmp/sbx"),
+            true,
+            ExecMode::WorkspaceWrite,
+            &[],
+            None,
+        );
         assert!(p.contains("(allow network*)"));
     }
 

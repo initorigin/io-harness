@@ -1,0 +1,77 @@
+id: US-IO-HARNESS-0.48.0-I01
+timestamp: 2026-08-10T15:49:13Z
+category:
+  - implementation-level
+trigger: >
+  F5's proof arm could not be satisfied by any read-declared built-in, and the only way to make its
+  sentence literally true was to ship a regression to `git status`.
+evidence:
+  - >
+    **No read-declared built-in attempts a write.** F5 asserted that a read-only built-in under a
+    `WorkspaceWrite` grant has "a write it attempts inside the workspace refused". The three
+    `ToolEffect::ReadOnly` built-ins — `grep`, `find`, `read_file` — never spawn a process at all,
+    so no mode applies to them and there is nothing for a sandbox to refuse.
+  - >
+    **The only spawning read-declared tools are the three git readers, and they do not write
+    either.** The crate already classifies them: `src/run.rs:9809` maps `git_log`, `git_status` and
+    `git_diff` to `Act::Read` on `.git` and the other three to `Act::Write`, which is the table the
+    declared modes are derived from. A `git log` writes nothing.
+  - >
+    **The one case where a git reader does write is an index refresh, and refusing it is a
+    regression, not a criterion.** `git status` may take `.git/index.lock` to refresh a stale index.
+    Satisfying F5 as written would mean allowing that write to be attempted and refused under an
+    ordinary `WorkspaceWrite` run — turning a working `git_status` into a failure so that a test
+    could observe a refusal. `git`'s own `--no-optional-locks` is the answer, and it is being added
+    to the readers' fixed argv.
+before:
+  scope:
+    - Each spawning tool declares the mode it needs
+    - A call runs under the narrower of declared and granted
+    - A need the grant cannot satisfy is refused before the spawn
+  assumptions:
+    - >
+      That some read-declared built-in would attempt a write, so the narrowing could be proven by a
+      refusal on the same surface F1 and F4 use.
+  implementation: >
+    The git readers' fixed argv unchanged, and F5 proven by a refused write from a read-declared
+    tool.
+change:
+  summary: >
+    Reword F5's proof arm. The narrower-of-two rule is unchanged and stays in scope; what changes is
+    what proves it — the mode resolved and recorded per call, plus a spawn pinned to the resolved
+    mode being refused a write, rather than a refusal from a tool that never attempts one. Adds
+    `--no-optional-locks` to the git readers' fixed argv so `ReadOnly` is correct for them rather
+    than merely survivable.
+  added:
+    - "`--no-optional-locks` on the git readers' fixed argv"
+  removed: []
+  deferred: []
+  replaced:
+    - >
+      F5's proof arm: "a write it attempts inside the workspace is refused" becomes the recorded
+      mode on `SandboxEvent` and `EventKind::Contained` plus a pinned-mode spawn refused a write.
+impact:
+  products:
+    - io-harness
+  versions:
+    - 0.48.0
+  tasks:
+    - US-IO-HARNESS-0.48.0-T01
+    - US-IO-HARNESS-0.48.0-T02
+  dependencies: []
+  resource_effect: >
+    Neutral. One criterion is proven on a surface that exists instead of one that does not, and one
+    flag is added to a fixed argv this crate already builds.
+versioning:
+  previous_target: 0.48.0
+  new_target: 0.48.0
+  consequence: no-version-change
+approval:
+  source: user
+  reference: >
+    Owner chose "Reword F5's proof arm" over dropping the narrowing and over keeping F5 literally,
+    in session on 2026-08-10, having been shown that the third option ships a `git status`
+    regression to satisfy a test.
+canonical_updates:
+  - products/io-harness/releases/0.48.0.yaml
+  - products/io-harness/execution/tasks.yaml
