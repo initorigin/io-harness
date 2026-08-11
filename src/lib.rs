@@ -129,6 +129,16 @@
 //! against a missing or newer-format checkpoint is a typed [`Error::Resume`],
 //! never a panic or a half-resume.
 //!
+//! **A request that can express a conversation.** [`CompletionRequest`] carries
+//! [`messages`](CompletionRequest::messages) — an ordered transcript of user
+//! turns, assistant turns holding the calls the model made, and batches of
+//! results answering them — and each built-in wire maps it onto that vendor's own
+//! block types one to one. Before 0.49.0 a run's own history reached the model as
+//! prose describing it, which is off the distribution these models are trained
+//! on. [`CompletionRequest::user`] is still filled, derived and byte-identical to
+//! what it was, so a [`Provider`] that reads it keeps working; it is retained for
+//! one release.
+//!
 //! **Providers, with fallback.** [`OpenRouter`], [`Anthropic`] and [`OpenAi`]
 //! behind one [`Provider`] trait, over the crate's own HTTP+SSE client.
 //! [`provider::Fallback`] moves to the next configured provider when one is down

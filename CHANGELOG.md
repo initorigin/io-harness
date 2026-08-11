@@ -26,6 +26,88 @@ notes are produced from it.
 
 ### Security
 
+## [0.49.0] - 2026-08-11
+
+### Added
+
+- **A request can carry a conversation.** `CompletionRequest` gains
+  `messages: Vec<Message>`: an ordered transcript of user turns, assistant turns
+  carrying the calls the model made, and batches of results answering them. Each
+  built-in wire maps it onto that vendor's own block types one to one — `tool_use`
+  and `tool_result` on Anthropic, `tool_calls` and `role: "tool"` messages on the
+  OpenAI wire — so a run's own history reaches the model in the shape every model
+  this crate targets was post-trained on. Through 0.48.0 the request held one
+  `system` string and one `user` string, and a step's results were re-rendered as
+  bracketed prose inside the next user message: the crate parsed the protocol off
+  a response and then discarded it on the way back in, leaving the model to read a
+  third-person account of its own past actions. The failure that produced was not
+  an error and left nothing in a log — restating plans, narrating intent instead
+  of acting, losing that a tool had already been called.
+- **`CompletionRequest::cache_through`**, the transcript half of 0.44.0's second
+  cache breakpoint: how many leading messages the caller states are byte-stable.
+  It marks the same content the byte offset marked, expressed where a real
+  transcript has boundaries.
+- **`SystemPrompt::Preset`**, opt-in **by name**. `Preset::Concise` acts first and
+  reports briefly; `Preset::Careful` verifies its own work before reporting it and
+  says what it checked. `SystemPrompt::Builtin` is still the default and is
+  byte-identical to 0.48.0's. 0.45.0 declined to ship a preset catalogue on the
+  grounds that a library must not install opinions into someone else's product;
+  a preset nobody can reach without naming it installs nothing, and the builtin is
+  asserted unchanged after one exists.
+- **`Message`, `ToolResult` and `Preset`** are new public types.
+  `context::Assembled` gains `emitted`, the piece-by-piece view of the same
+  emission its flat `text` is built from.
+
+### Changed
+
+- **BREAKING: `CompletionRequest` gains two fields and `context::Assembled` gains
+  one.** An exhaustive struct literal of either stops compiling.
+  *Migration:* use `..Default::default()`, which is what this type's own
+  documentation has advised since 0.15.0 and what every construction site in this
+  repository already used. The same break `media` (0.15.0), `model` (0.21.0),
+  `web` (0.22.0), `effort` (0.31.0) and `cache_boundary` (0.44.0) each were.
+- **BREAKING (behaviour): what the crate's own loop sends changed.** A request
+  built by this crate now carries a role-tagged conversation where it carried one
+  user message of prose. A model's answers will differ — that is the release, not
+  a side effect — and an embedder asserting on exact model output will see it.
+  *Migration:* none is available or wanted; the previous shape is what the release
+  exists to remove. A caller building its own `CompletionRequest` and leaving
+  `messages` empty gets 0.48.0's body from every built-in wire, byte for byte.
+- **`CompletionRequest::user` is derived and retained for one release.** The loop
+  fills it with exactly the string it filled before, so a `Provider` that reads it
+  keeps working unchanged and is honestly non-conversational. A built-in wire
+  ignores it whenever `messages` is non-empty. It will be removed in a later
+  version; read `messages` in new code.
+- **`CompletionRequest::cache_boundary` applies to the derived `user` path only.**
+  A request carrying a transcript marks it with `cache_through` instead.
+- **A classifying session turn is no longer framed as a task.** Its system block
+  opened "You are an agent working across a repository to meet a stated
+  specification" and promised the whole set is checked against the success
+  criterion after every step — of a turn carrying `Verification::None`, where
+  nothing is checked. An operator who typed a greeting was being told they had
+  written a specification. The tools, the workspace and 0.37.0's sentence about
+  how a turn may end are unchanged. This is the same mismatch 0.48.0 fixed in the
+  user block, one block higher.
+- **A session's earlier turns arrive as their own messages.** The seed narrated
+  them — "the operator asked: …", "you answered: …" — inside the one user message
+  a request could carry. The attribution moved to the message's role, and the
+  ledger entries read `[operator] …` and `[agent] …`. A program parsing the old
+  wording out of a prompt will not find it.
+- **A `Replay` cassette key no longer includes the transcript.** It is a rendering
+  of content the key already covers, and including it would make every recording
+  miss the moment the loop started sending one — and would break replay after a
+  resume, since a resumed run rebuilds its ledger from stored text and carries no
+  transcript. No recording needs re-recording. The two cache markers stay in the
+  key, as 0.44.0 decided.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.48.0] - 2026-08-11
 
 ### Added

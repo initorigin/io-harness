@@ -400,7 +400,7 @@ tasks:
   summary: Bring `docs/CONTRACT.md`, the crate-root prose, the README and the changelog to 0.49.0.
   why_required: These are checked-in surfaces with their own drift tests, and the contract requires them
     to change in this release rather than the next one.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.49.0-T05
   acceptance_criteria:
@@ -415,7 +415,21 @@ tasks:
   - src/lib.rs
   - README.md
   - CHANGELOG.md
-  evidence: []
+  evidence:
+  - '`cargo test --test docs_drift` — 15 passed; `cargo test --test changelog` — 5 passed; `cargo test
+    --doc` — 418 passed.'
+  - O4 — `docs/CONTRACT.md` gains a section saying what a message is, why the ids are minted rather than
+    remembered, what `user` is still for and when it goes, and the two cases still sent as prose (a resumed
+    run's pre-resume history, and a step whose results do not line up with its calls). The caching section
+    says which marker applies on which path and why the OpenAI wire marks only a user message. The 0.24.0
+    note that these two structs 'may gain fields in a later minor' now records that 0.49.0 is that minor.
+  - '`CHANGELOG.md` carries both breaks with `*Migration:*` notes — the struct-literal break and the behaviour
+    break — plus the derived `user`, the reframed classifying turn, the reworded seed, and the `Replay`
+    key change. `every_breaking_entry_carries_a_migration_note` passes.'
+  - The crate-root prose in `src/lib.rs` and the README both lead with what the release is for, and both
+    state that a provider reading `user` keeps working.
+  - '`Cargo.toml` 0.48.0 → 0.49.0 and the README''s install snippet 0.48 → 0.49, which `readme_dependency_version_matches_cargo_toml`
+    checks.'
 - id: US-IO-HARNESS-0.49.0-T12
   summary: Run the release gates and measure the live caching figure.
   why_required: Every non-functional claim in the contract is a number or an exit code, and none of them
