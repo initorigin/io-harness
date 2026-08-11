@@ -5,7 +5,7 @@ tasks:
   summary: Add `Message`, `CompletionRequest::messages` and `cache_through`, with `user` derived and documented.
   why_required: Nothing else in the release can be written until a request can express a conversation;
     every other task reads or writes these types.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**N3 — the break is exactly what is named, and nothing more.** The compile breaks are: an exhaustive
@@ -22,7 +22,19 @@ tasks:
   files:
   - src/provider/mod.rs
   - src/lib.rs
-  evidence: []
+  evidence:
+  - '`cargo test --lib provider::transcript_tests` — 5 passed. The types are `Message` (`User` / `Assistant
+    { text, calls }` / `Results`), `ToolResult { call, content }`, and `CompletionRequest::{messages,
+    cache_through}`.'
+  - '`a_request_with_no_transcript_serialises_as_it_did_before_0_49_0` — a flat request carries neither
+    new key, so a `Replay` cassette recorded before this release still matches a flat request made after
+    it.'
+  - 'The first run of `an_unusable_cache_marker_is_ignored` FAILED with `attempt to subtract with overflow`:
+    `then_some(through - 1)` evaluates eagerly and underflowed on the very `Some(0)` case the guard exists
+    to reject. Fixed to `then(|| ...)`.'
+  - '`cargo test --test public_api` — 9 passed after `docs/public-api.txt` gained exactly the two enumerated
+    additions, `enum Message` and `struct ToolResult`, which is the number N3 stated at plan time. `every_public_item_has_a_worked_example`
+    required a doctest on `ToolResult` and now passes over 211 items.'
 - id: US-IO-HARNESS-0.49.0-T02
   summary: Map a message sequence onto the Anthropic body as native `tool_use` and `tool_result` blocks.
   why_required: The release's outcome is what reaches the wire; a neutral request the wire flattens again

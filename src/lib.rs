@@ -439,8 +439,9 @@ pub use observe::{Broadcast, EventKind, Flow, Ignore, Observer, RunEvent};
 pub use plugin::{Dropped, Plugin, Plugins, MAX_ID, NAMESPACE, PLUGIN_FILE};
 pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{
-    Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, Effort, ModelInfo, OpenAi,
-    OpenRouter, PriceSource, PromptFamily, Provider, Reference, ToolCall, ToolSpec, Usage,
+    Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, Effort, Message, ModelInfo,
+    OpenAi, OpenRouter, PriceSource, PromptFamily, Provider, Reference, ToolCall, ToolResult,
+    ToolSpec, Usage,
 };
 #[cfg(feature = "media")]
 pub use provider::{Media, IMAGE_MEDIA_TYPES};

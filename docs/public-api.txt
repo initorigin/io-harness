@@ -79,6 +79,7 @@ enum Flow src/observe.rs
 enum GateOutcome src/state.rs
 enum McpTransport src/mcp.rs
 enum MemoryKind src/state.rs
+enum Message src/provider/mod.rs
 enum PlanVerdict src/approve.rs
 enum PriceSource src/provider/mod.rs
 enum Progressing src/resilience.rs
@@ -200,6 +201,7 @@ struct TodoItem src/state.rs
 struct Transcript src/session.rs
 struct TranscriptTurn src/session.rs
 struct ToolCall src/provider/mod.rs
+struct ToolResult src/provider/mod.rs
 struct ToolSpec src/provider/mod.rs
 struct Toolbox src/tools/custom.rs
 struct Turn src/state.rs
