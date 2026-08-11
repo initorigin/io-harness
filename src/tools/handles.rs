@@ -178,6 +178,9 @@ struct Record {
     /// thing a running process produces and pretending otherwise loses it.
     cursor: u64,
     state: HandleState,
+    /// Whether this handle's ending has already been reported to the trace
+    /// (0.48.0). See [`Handles::take_unreported_endings`].
+    end_reported: bool,
     /// The containment this handle's processes are in. See [`Containment`].
     ///
     /// On Windows, dropping this is the kill — so it is taken out of the record
@@ -264,6 +267,7 @@ impl Handles {
                 capture: capture.clone(),
                 cursor: 0,
                 state: HandleState::Running,
+                end_reported: false,
                 contained,
             },
         );
@@ -366,6 +370,29 @@ impl Handles {
     /// What a handle is doing.
     pub(crate) fn state(&self, id: u64) -> Option<HandleState> {
         self.lock().get(&id).map(|r| r.state.clone())
+    }
+
+    /// The handles that have ended and whose ending has not been reported to the
+    /// trace yet, marking each as reported (0.48.0).
+    ///
+    /// A contained handle's containment ends when its processes do, and the
+    /// `destroy` row that says so must be written **once**. The natural place to
+    /// write it is the run loop's per-step sweep, which is also where an ending is
+    /// carried to the store — but that sweep sees an ended handle on every
+    /// subsequent step, and `record_handle_ended` can be replayed harmlessly while
+    /// a trace row cannot. So the once-ness lives here, next to the state it is
+    /// about, rather than as a set the loop has to remember to keep.
+    pub(crate) fn take_unreported_endings(&self) -> Vec<u64> {
+        let mut guard = self.lock();
+        let mut ended = Vec::new();
+        for (id, r) in guard.iter_mut() {
+            if r.state.is_over() && !r.end_reported {
+                r.end_reported = true;
+                ended.push(*id);
+            }
+        }
+        ended.sort_unstable();
+        ended
     }
 
     /// Record that a handle ended on its own.
@@ -507,6 +534,10 @@ impl Handles {
                 capture: PathBuf::new(),
                 cursor: 0,
                 state: HandleState::Orphaned(ORPHAN_REASON.to_string()),
+                // Already reported, because there is nothing to report: this
+                // handle's containment belonged to the process that started it,
+                // and this run never created one to destroy.
+                end_reported: true,
                 // An orphan has no containment and must never acquire one: the
                 // job that held its processes died with the process that made
                 // it, and there is nothing here to close.

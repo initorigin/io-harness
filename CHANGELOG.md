@@ -26,6 +26,78 @@ notes are produced from it.
 
 ### Security
 
+## [0.48.0] - 2026-08-11
+
+### Added
+
+- **A `shell_start` handle runs inside the boundary.** A backgrounded handle was
+  the one execution path left at full privilege: an agent that could not write
+  outside the workspace with `shell` could start the same line with `shell_start`
+  and write wherever it liked, so the boundary depended on which tool the model
+  picked. A handle now takes the same containment the foreground line takes, per
+  stage, and its create / exec / destroy rows name the backend that applied.
+- **The six git built-ins run contained**, under the mode they declare, and they
+  write the same sandbox rows every other spawn writes. The three readers gain
+  `--no-optional-locks`, which is git's own way of not taking an index lock it did
+  not have to.
+- **Each spawning tool declares the mode it needs, resolved before the spawn.** A
+  call runs under the narrower of what it declares and what
+  `TaskContract::exec_sandbox` granted — least privilege per call rather than per
+  run — and a need the grant cannot satisfy is refused with **no process started**,
+  naming both modes so the model reads a reason instead of decoding an errno.
+  `Tool::exec_mode` is a new defaulted trait method; a toolbox written against any
+  earlier release compiles unchanged. For a registered tool the declaration is a
+  refusal mechanism and not a confinement one, and the crate says so: it does not
+  see that tool's own spawn and does not claim to govern it.
+- **Per-host egress under containment.** `Policy` has carried per-host `Act::Net`
+  rules since 0.8.0 and a contained command could never be held to them, because a
+  backend takes one boolean. A run whose policy names any host now routes its
+  contained commands through a loopback proxy the run owns: the sandbox permits
+  that address and nothing else, and the proxy asks the run's own policy about
+  every `host:port` before it connects, refusing with the rule and layer named.
+  What that proves differs per backend and `docs/CONTRACT.md` carries the table —
+  address-scoped on macOS, **port-scoped** under Landlock, and **advisory** on the
+  portable floor and on Windows, in that word.
+- **`EventKind::Dialed { host, port, allowed }`**, one per outbound connection,
+  with `dialed` joining the names an operator may filter on in a `[[hook]]`.
+- `ExecMode::narrower` and `ExecMode::satisfied_by`; `RunSpec::proxy` and
+  `RunSpec::with_proxy`.
+
+### Changed
+
+- **A run whose policy names hosts reaches those hosts and no others.** Before
+  this release such a run's contained commands could reach everything. A command
+  that ignores `HTTP_PROXY` now reaches nothing rather than everything, which is
+  stricter in the direction the policy already asked for. A run with no `Act::Net`
+  rules, or one whose default permits the network, is unaffected and starts no
+  proxy.
+- **A backgrounded handle and a git built-in are now confined.** A program relying
+  on either writing outside the workspace — and getting away with it because the
+  boundary did not apply, not because it was permitted — sees that refused.
+  *Migration:* `TaskContract::with_full_access()` restores an uncontained run at
+  the construction site, and `SandboxConfig::floor_only()` keeps containment while
+  taking the portable floor, which for the newly contained paths is 0.47.0's
+  behaviour exactly.
+- **A Linux run whose policy names hosts prefers a rung that can reach its proxy.**
+  The namespace rungs put the child in an empty network namespace where the host's
+  loopback is unreachable, so they cannot serve such a run at all; where no rung
+  can, the run takes the boolean and reports the backend that applied.
+- `sandbox_events` rows of kind `create` now carry the mode that call resolved to
+  in `detail`, because the mode is a per-call fact once a reader declares less than
+  the run grants. No schema change: `kind` and `detail` are text columns.
+
+### Fixed
+
+- **A classifying turn is asked one question instead of two that disagree.**
+  0.37.0 gave a conversational turn its own system prompt — "if a plain answer is
+  the whole of what is wanted, write that answer and call no tool" — and left the
+  user block unconditional, so the same completion also carried "(nothing yet —
+  start by grepping or finding)" and "Call a tool to make progress toward the
+  success criterion." A model handed both resolved the contradiction in its reply.
+  The user block is now chosen by the condition that already chooses the system
+  half and carries the operator's words and the conversation and nothing else.
+  Every later step of a promoted turn is byte-for-byte what it was.
+
 ## [0.47.0] - 2026-08-09
 
 ### Added

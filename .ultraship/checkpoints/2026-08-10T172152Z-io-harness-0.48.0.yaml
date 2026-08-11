@@ -1,0 +1,87 @@
+product: io-harness
+version: 0.48.0
+timestamp: 2026-08-10T17:21:52Z
+reason: capacity
+repository_state: passing
+completed_acceptance:
+  - >
+    **F1 — a `shell_start` handle cannot write outside its granted roots.** Proven with the
+    positive control that the first draft lacked.
+  - >
+    **F2 — every stage of a handle is contained, not only the first.**
+  - >
+    **F3 — a handle takes the resource caps a foreground `shell` stage takes, and the wall clock
+    reaches neither** (`US-IO-HARNESS-0.48.0-I02`).
+  - >
+    **F4 — the git built-ins are contained, and a need the grant cannot satisfy is refused before
+    anything is spawned**, asserted by the absence of the row a spawn would have written.
+  - >
+    **F5 — a call runs under the narrower of what it needs and what it was granted**
+    (`US-IO-HARNESS-0.48.0-I01`).
+  - >
+    **F10 — a classifying turn is asked one question, not two that disagree**
+    (`US-IO-HARNESS-0.48.0-I03`).
+  - >
+    **F6, in part** — the proxy decides every dial, permitted and refused, with the rule and layer
+    named; the decisions reach `policy_events`, a `"dial"` `SandboxEvent` and `EventKind::Dialed`.
+    Proven at component level (7 tests in `src/sandbox/proxy.rs`) and at run level by the
+    **inversion of 0.40.0's coarseness test**: a host the policy never named is now refused to a
+    contained command, which is the assertion that release wrote to detect exactly this release.
+  - >
+    **O3 — the proxy ends with the run that owns it**, asserted by the port ceasing to answer.
+remaining_acceptance:
+  - >
+    **F6's remaining half and F7 — a host the policy *names* must be REACHED through the proxy, and
+    a direct dial must be refused.** This is the open work; see below.
+  - >
+    **F8 — the rung preference is a table, decided without a host.**
+  - >
+    **F9 — on the floor and on Windows the proxy is reported as advisory.**
+  - >
+    **N1–N6, O1, O2, O4** — the gates and the documentation surfaces (T08, T09).
+active_hypotheses:
+  - >
+    **The SBPL rule permitting the loopback proxy is not matching, and that is the one thing
+    blocking the release's central claim.** Everything either side of it is proven: the proxy binds
+    and decides (its own tests pass), the run starts one when the policy names hosts, the address
+    reaches `RunSpec` and the macOS profile, and `run_capped` sets `HTTP_PROXY` for every backend.
+    But `curl` exits 7 and **no `dial` row is written at all**, so the connection is being refused
+    before it reaches the proxy — which points at the profile rather than at the proxy or the
+    environment.
+
+    **The SBPL syntax has been eliminated as the cause, by measurement.** Driving `sandbox-exec`
+    directly against a four-line profile — `(version 1)` / `(allow default)` / `(deny network*)` /
+    one allow — with a real loopback listener, **all four candidate forms returned HTTP 200**:
+    `(remote ip "localhost:*")`, `(remote ip "localhost:PORT")`, `(remote tcp "localhost:PORT")` and
+    `(remote ip "*:*")`. The original form was correct. So the composed profile the run builds does
+    not contain the allow line at all, which means `spec.proxy` is `None` by the time it reaches
+    `profile_for` — a wiring fault, not a syntax one.
+
+    **Start the next session there, not at the profile.** The chain to walk, in order, printing the
+    value at each hop: the run loop rebinds `containment` with `with_proxy` *after* `start_egress_proxy`
+    — confirm the rebound value is what reaches `dispatch`'s `exec_sandbox` parameter rather than an
+    earlier binding; `resolve_call_mode` clones it; `with_egress` and `with_mode` must both carry
+    `proxy` through (both were written to, and both are worth asserting rather than reading);
+    `ExecContainment::spec` sets `.with_proxy`. A unit test asserting `spec.proxy.is_some()` for a
+    containment built through `with_egress(true)` would have caught this and does not exist yet. The
+    absence of a `dial` row is the corroborating signal: nothing ever reached the proxy, so the
+    refusal happened at the kernel with a profile that never named it.
+  - >
+    **The Linux half has not been exercised at all.** `landlock::plan` gains `net_ports` and its
+    pure test passes, but no Linux host has run it. F8's decision table does not exist yet, and the
+    rung preference — a per-host run must not be given a namespace rung that cannot reach the
+    host's loopback — is specified and unimplemented. Expect this to be CI-discovered, as the
+    contract's cost drivers say.
+  - >
+    **A handle live when the run ends writes no `destroy` row.** The registry kills it on drop and
+    there is no step left to record on, which is the position `record_handle_ended` is already in.
+    Stated in the code and owed a `known_limitations` line at completion.
+next_task: US-IO-HARNESS-0.48.0-T05
+required_context:
+  - src/sandbox/proxy.rs
+  - src/sandbox/macos.rs
+  - src/sandbox/landlock.rs
+  - src/sandbox.rs
+  - src/run.rs
+  - tests/exec_contained.rs
+  - .ultraship/products/io-harness/releases/0.48.0.yaml

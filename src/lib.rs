@@ -324,6 +324,20 @@
 //! egress. The Landlock rung needs no namespace, which is the whole point, because
 //! a stock Ubuntu 24.04 refuses the one the older rung needs.
 //!
+//! **0.48.0 finished the sentence "everything a run starts is contained", and made
+//! egress mean what the policy says.** A backgrounded `shell_start` handle and
+//! the git built-ins now take the same containment every other spawn takes, so the
+//! boundary no longer depends on which tool the model picked; each spawning tool
+//! declares the mode it needs and a call runs under the narrower of that and what
+//! the contract granted, with an unsatisfiable need refused before anything is
+//! started. And a run whose [`Policy`] names hosts routes its contained commands
+//! through a loopback proxy the run owns, which asks that policy about every
+//! `host:port`. What the proxy proves differs per backend and the weaker answer is
+//! reported: address-scoped on macOS, **port-scoped** under Landlock, and
+//! **advisory** on the portable floor and on Windows — where the agent's own
+//! boundary section uses that word rather than implying a boundary it does not
+//! have.
+//!
 //! Two smaller differences worth knowing rather than discovering: the job's CPU
 //! limit counts user-mode time only, where unix `RLIMIT_CPU` counts kernel time
 //! too, so the cap is genuinely weaker there; and the memory limit makes an

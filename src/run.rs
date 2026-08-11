@@ -4176,7 +4176,8 @@ async fn run_workspace_from<P: Provider>(
     // the prompt the loop falls back to when it ends is a different string already.
     // An approver's remembered rule is not reflected: it widens the boundary mid-run,
     // and a prompt composed once cannot follow it (`docs/CONTRACT.md`).
-    let after_planning = boundary_section(policy, &contract.exec_sandbox);
+    let after_planning =
+        boundary_section(policy, &contract.exec_sandbox, will_proxy(policy, contract));
     let base_system = compose(PromptSpec {
         base: WORKSPACE_PROMPT,
         prompt: &contract.prompt,
@@ -4196,7 +4197,12 @@ async fn run_workspace_from<P: Provider>(
             skills,
             directive: Some(planning_directive(&contract.agents)),
             instructions: &contract.instructions,
-            boundary: boundary_section(&effective, &contract.exec_sandbox).as_deref(),
+            boundary: boundary_section(
+                &effective,
+                &contract.exec_sandbox,
+                will_proxy(&effective, contract),
+            )
+            .as_deref(),
             family: provider.prompt_family(),
             ending: CALL_TOOLS_ENDING,
         }),
@@ -4308,6 +4314,15 @@ async fn run_workspace_from<P: Provider>(
     // roots depend on the toolchain, and `select` probes the host, so neither
     // belongs on a per-call path.
     let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
+    // 0.48.0 — the run owns its proxy, and the containment carries the address so
+    // every spawn site scopes the sandbox to it without asking a second question.
+    let egress = start_egress_proxy(policy, containment.as_ref()).await;
+    let containment = match (&containment, &egress) {
+        (Some(c), Some((proxy, _, _))) => {
+            Some(std::sync::Arc::new(c.with_proxy(Some(proxy.addr()))))
+        }
+        _ => containment,
+    };
     report_containment(
         watch,
         run_id,
@@ -4357,6 +4372,39 @@ async fn run_workspace_from<P: Provider>(
         for (id, state) in handles.states() {
             if let crate::tools::handles::HandleState::Exited(code) = state {
                 store.record_handle_ended(run_id, id, "exited", code, None)?;
+            }
+        }
+        // 0.48.0 — the proxy is told which step it is on, so a dial is attributed
+        // to the step that made it rather than to the boundary that observed it,
+        // and it is handed the policy as it now stands: a plan gate narrows the
+        // effective policy mid-run, and a proxy deciding against the policy the
+        // run *started* with would permit what the run had since stopped
+        // permitting. Then the step's decisions are carried to disk, beside the
+        // handle endings above and for the same reason — neither the proxy's
+        // tasks nor the reapers can reach the store.
+        if let Some((proxy, shared, at)) = &egress {
+            at.store(step, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut guard) = shared.write() {
+                guard.clone_from(ws.policy());
+            }
+            record_dials(Some(proxy), store, watch, run_id, 0)?;
+        }
+        // 0.48.0 — and a contained handle's containment ends when its processes
+        // do. The `create` and `exec` rows were written where the handle was
+        // started; this is the only thread that can write the `destroy` one,
+        // because the reaping task cannot reach the store. Once per handle rather
+        // than once per step: the sweep above may be replayed harmlessly and a
+        // trace row may not, so the once-ness lives in the registry.
+        //
+        // A run that ends while a handle is still live writes no destroy row —
+        // the registry kills it on drop and there is no step left to record on,
+        // which is the same position `record_handle_ended` is in and is stated in
+        // the release record rather than papered over.
+        if containment.is_some() {
+            for id in handles.take_unreported_endings() {
+                let mut ended = crate::state::SandboxEvent::destroy(run_id, step);
+                ended.detail = Some(format!("shell_start handle {id}"));
+                record_sandbox_step(store, watch, 0, &ended);
             }
         }
 
@@ -4429,7 +4477,14 @@ async fn run_workspace_from<P: Provider>(
                 },
             )
             .await?;
-            let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
+            // 0.48.0 — asked by the same condition that already chooses the system
+            // half below, so the two halves of one completion cannot disagree.
+            let user = match &conversational {
+                Some(_) if step == start_step => {
+                    conversational_user_prompt(&contract.goal, &assembled.text)
+                }
+                _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
+            };
             // 0.44.0 — the second cache breakpoint, at the end of what compaction
             // froze, and only once that prefix has already gone out once.
             let cache_boundary =
@@ -5854,8 +5909,13 @@ fn run_agent<'f, P: Provider>(
         // while the phase is on. `policy` here is this agent's own — a child's is its
         // parent's narrowed by `Policy::contain` — so a child is told its boundary and
         // not the root's.
-        let after_planning = boundary_section(policy, &contract.exec_sandbox);
-        let while_planning = boundary_section(&effective, &contract.exec_sandbox);
+        let after_planning =
+            boundary_section(policy, &contract.exec_sandbox, will_proxy(policy, contract));
+        let while_planning = boundary_section(
+            &effective,
+            &contract.exec_sandbox,
+            will_proxy(&effective, contract),
+        );
         let agent_root = contract.root.as_deref().unwrap_or(&tree.root);
         let mut ws = Workspace::with_policy(agent_root, effective);
         // The tree shares one MCP session, so every agent in it — root or child —
@@ -5963,6 +6023,16 @@ fn run_agent<'f, P: Provider>(
         let toolchain = crate::toolchain::detect(&tree.root);
         // Children share their parent's workspace, so they share its containment.
         let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
+        // 0.48.0 — the same rule as the flat loop. A contained tree run whose
+        // policy names hosts must not silently take the boolean while the flat
+        // loop scopes its egress.
+        let egress = start_egress_proxy(policy, containment.as_ref()).await;
+        let containment = match (&containment, &egress) {
+            (Some(c), Some((proxy, _, _))) => {
+                Some(std::sync::Arc::new(c.with_proxy(Some(proxy.addr()))))
+            }
+            _ => containment,
+        };
         report_containment(
             tree.watch,
             run_id,
@@ -5977,6 +6047,16 @@ fn run_agent<'f, P: Provider>(
         let pending_media = &mut PendingMedia::default();
 
         for step in start_step..=contract.max_steps {
+            // 0.48.0 — the same per-step refresh and drain the flat loop does. A
+            // dial made by a contained agent inside a tree is recorded at the
+            // depth it happened at, so a trace shows which agent reached out.
+            if let Some((proxy, shared, at)) = &egress {
+                at.store(step, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut guard) = shared.write() {
+                    guard.clone_from(ws.policy());
+                }
+                record_dials(Some(proxy), tree.store, tree.watch, run_id, depth)?;
+            }
             // The step boundary, where a cancellation is honoured (see `cancelled`).
             // One flag for the whole tree, so a cancel asked for while a sibling was
             // mid-flight stops this agent too.
@@ -6043,7 +6123,14 @@ fn run_agent<'f, P: Provider>(
                     },
                 )
                 .await?;
-                let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
+                // 0.48.0 — the same rule as the flat loop, and for the same reason
+                // the system half is chosen this way here too.
+                let user = match &conversational {
+                    Some(_) if step == start_step => {
+                        conversational_user_prompt(&contract.goal, &assembled.text)
+                    }
+                    _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
+                };
                 // 0.44.0 — the same rule as the flat loop, through the same helper.
                 // A boundary computed in one loop and not the other would make a
                 // contained run and a flat one cache differently while nothing failed.
@@ -7480,6 +7567,216 @@ fn tool_effect(name: &str, custom: &Toolbox) -> ToolEffect {
     }
 }
 
+/// The mode a call needs, before anything is spawned for it (0.48.0).
+///
+/// `None` means *whatever this run was granted*, which is the answer for `exec`,
+/// `shell` and `shell_start`: they are the tools
+/// [`TaskContract::exec_sandbox`](crate::TaskContract::exec_sandbox) was written
+/// for, and narrowing them would be the contract disagreeing with itself.
+///
+/// **The git built-ins are classified the way this crate already classifies
+/// them.** `dispatch` decides a git call's `Act` on `.git` at one place — writers
+/// are `git_add`, `git_commit`, `git_branch` and `git_worktree`, readers are
+/// `git_log`, `git_status` and `git_diff` — and a second, hand-maintained opinion
+/// about which of them writes is a fact in two files waiting to disagree. The
+/// modes here are that table read as grants.
+///
+/// The three read-only built-ins declare `ReadOnly` and it is **inert**: they
+/// spawn nothing, so no backend ever wraps them and no mode is ever applied. It
+/// is written down anyway because the alternative is a reader of this function
+/// wondering whether their absence meant "needs everything".
+///
+/// A registered tool answers for itself through
+/// [`Tool::exec_mode`](crate::tools::Tool), defaulted to `None`, so a toolbox
+/// assembled before 0.48.0 keeps running exactly as it did. An MCP tool declares
+/// nothing: the server owns that process and this crate does not model it.
+fn tool_mode(name: &str, custom: &Toolbox) -> Option<crate::sandbox::ExecMode> {
+    use crate::sandbox::ExecMode;
+    match name {
+        GREP_TOOL | FIND_TOOL | READ_FILE_TOOL => Some(ExecMode::ReadOnly),
+        GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL => Some(ExecMode::ReadOnly),
+        GIT_ADD_TOOL | GIT_COMMIT_TOOL | GIT_BRANCH_TOOL | GIT_WORKTREE_TOOL => {
+            Some(ExecMode::WorkspaceWrite)
+        }
+        EXEC_TOOL | SHELL_TOOL | SHELL_START_TOOL => None,
+        _ => custom.get(name).and_then(|tool| tool.exec_mode()),
+    }
+}
+
+/// Whether this run will route its contained commands through a proxy (0.48.0).
+///
+/// The same two questions [`start_egress_proxy`] asks, as a pure predicate, so the
+/// prompt's boundary section can say what the run is about to do without the
+/// listener having been started yet — and so the two can never disagree about
+/// whether a run is proxied.
+fn will_proxy(policy: &Policy, contract: &TaskContract) -> bool {
+    contract.exec_sandbox.mode.is_contained() && policy.names_hosts()
+}
+
+/// The run's egress proxy, when it needs one (0.48.0).
+///
+/// Started only when the run's commands are contained **and** its policy names
+/// hosts. A run whose only statement about the network is its default — everything
+/// or nothing — is served exactly as well by the boolean a backend takes, and
+/// starting a listener for it would buy a component with a lifetime for nothing.
+///
+/// The returned proxy owns its listener and its accept loop, and both end when it
+/// is dropped, which is when the run ends however it ends.
+async fn start_egress_proxy(
+    policy: &Policy,
+    containment: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
+) -> Option<(
+    crate::sandbox::proxy::EgressProxy,
+    std::sync::Arc<std::sync::RwLock<Policy>>,
+    std::sync::Arc<std::sync::atomic::AtomicU32>,
+)> {
+    containment?;
+    if !policy.names_hosts() {
+        return None;
+    }
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(policy.clone()));
+    let step = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    match crate::sandbox::proxy::EgressProxy::start(
+        std::sync::Arc::clone(&shared),
+        std::sync::Arc::clone(&step),
+    )
+    .await
+    {
+        Ok(proxy) => Some((proxy, shared, step)),
+        // A listener that will not bind is not a reason to fail the run. The run
+        // keeps the boolean it had before this release and `EventKind::Contained`
+        // reports the backend that actually applied, which is the same honesty
+        // rule every degradation in this crate follows.
+        Err(e) => {
+            tracing::warn!("sandbox: the egress proxy could not start ({e}); keeping the boolean");
+            None
+        }
+    }
+}
+
+/// Carry a step's dial decisions into the trace (0.48.0).
+///
+/// The proxy cannot write them itself — a `rusqlite::Connection` is `Send` and not
+/// `Sync` — so it queues them and this drains at the step boundary, beside the
+/// handle registry's endings, which are on this thread for the same reason.
+///
+/// Two rows and one event each, all in tables that already exist: the decision
+/// goes to `policy_events` with `act = "net"`, where the crate's own network
+/// decisions already live, and a `SandboxEvent` of kind `"dial"` names
+/// `host:port` at command scope.
+fn record_dials(
+    proxy: Option<&crate::sandbox::proxy::EgressProxy>,
+    store: &Store,
+    watch: &Watch<'_>,
+    run_id: i64,
+    depth: u32,
+) -> Result<()> {
+    let Some(proxy) = proxy else {
+        return Ok(());
+    };
+    for dial in proxy.drain() {
+        // A permitted dial is a `decision` row and a refused one is a `refusal`
+        // row — the same two shapes the crate's own network calls already write,
+        // so a reader learns nothing new to read these.
+        let mut ev = if dial.allowed {
+            PolicyEvent::decision(
+                dial.step,
+                "net".to_string(),
+                dial.target(),
+                "allow".to_string(),
+                "policy".to_string(),
+            )
+        } else {
+            PolicyEvent::refusal(dial.step, "net".to_string(), dial.target())
+        };
+        ev.rule.clone_from(&dial.rule);
+        ev.layer.clone_from(&dial.layer);
+        store.record_event(run_id, &ev)?;
+        let mut sandbox = crate::state::SandboxEvent::destroy(run_id, dial.step);
+        sandbox.kind = "dial".to_string();
+        sandbox.detail = Some(dial.target());
+        record_sandbox_step(store, watch, depth, &sandbox);
+        watch.emit(RunEvent::at_depth(
+            run_id,
+            dial.step,
+            depth,
+            EventKind::Dialed {
+                host: dial.host.clone(),
+                port: dial.port,
+                allowed: dial.allowed,
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// The `create` row for one contained call, naming the mode that call resolved
+/// to (0.48.0).
+///
+/// The mode goes in `detail`, which was unused on a `create` row, because the
+/// mode is now a **per-call** fact and not a per-run one: a git reader declares
+/// `read-only` inside a run granting `workspace-write`, and a trace that recorded
+/// only the run's grant would say the opposite of what was enforced. `detail` is
+/// a text column, so this costs no schema change — and `SandboxEvent::create` is
+/// public, so its signature is left exactly as it is.
+fn sandbox_create(
+    run_id: i64,
+    step: u32,
+    containment: &crate::sandbox::ExecContainment,
+) -> crate::state::SandboxEvent {
+    let mut created =
+        crate::state::SandboxEvent::create(run_id, step, containment.backend().as_str());
+    created.detail = Some(containment.config.mode.as_str().to_string());
+    created
+}
+
+/// What this call is contained under, decided before it is dispatched (0.48.0).
+///
+/// Three outcomes, and the order they are decided in is the release's own claim
+/// that a requirement is *resolved* rather than discovered:
+///
+/// 1. The tool needs more than the contract granted — refused here, with nothing
+///    spawned and nothing to attribute a permission error to.
+/// 2. The tool needs less — the call is contained under the narrower of the two,
+///    with the writable roots recomputed for it.
+/// 3. The tool declares nothing, or exactly what it was granted — the run's own
+///    containment, unchanged, which is every call made before this release.
+///
+/// A run that granted [`ExecMode::FullAccess`](crate::ExecMode::FullAccess) has
+/// no containment at all, and nothing here invents one: `exec_sandbox` is `None`,
+/// so there is nothing to narrow and nothing a declaration could be refused
+/// against. That is the documented escape hatch and it stays absolute.
+enum CallMode {
+    /// Run under this containment. `None` is uncontained, as before.
+    Contained(Option<std::sync::Arc<crate::sandbox::ExecContainment>>),
+    /// Refuse the call. The tool needs more than this run was granted.
+    Refused { needed: crate::sandbox::ExecMode },
+}
+
+fn resolve_call_mode(
+    name: &str,
+    custom: &Toolbox,
+    exec_sandbox: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
+) -> CallMode {
+    let Some(containment) = exec_sandbox else {
+        // FullAccess: no backend, no roots, nothing to narrow or refuse against.
+        return CallMode::Contained(None);
+    };
+    let granted = containment.config.mode;
+    let Some(needed) = tool_mode(name, custom) else {
+        return CallMode::Contained(Some(std::sync::Arc::clone(containment)));
+    };
+    if !needed.satisfied_by(granted) {
+        return CallMode::Refused { needed };
+    }
+    let resolved = granted.narrower(needed);
+    if resolved == granted {
+        CallMode::Contained(Some(std::sync::Arc::clone(containment)))
+    } else {
+        CallMode::Contained(Some(std::sync::Arc::new(containment.with_mode(resolved))))
+    }
+}
+
 /// The part of a read-only call that can run at the same time as another one.
 ///
 /// Everything a call needs from the run has already been decided by the time one
@@ -8061,6 +8358,52 @@ async fn dispatch(
         return Ok(refused);
     }
     let name = call.name.as_str();
+    // 0.48.0 — what this call may do is decided here, before the arm that would
+    // spawn for it. A tool needing more than this run grants leaves with nothing
+    // started, which is what "resolved before execution rather than discovered by
+    // a failure" means: no process, and therefore no permission error for the
+    // model to interpret.
+    let narrowed;
+    let exec_sandbox = match resolve_call_mode(name, custom, exec_sandbox) {
+        CallMode::Refused { needed } => {
+            let granted = exec_sandbox
+                .map(|c| c.config.mode)
+                .unwrap_or(crate::sandbox::ExecMode::FullAccess);
+            return Ok(Dispatched::go(
+                format!("{name} refused: needs {}", needed.as_str()),
+                format!(
+                    "\n[{name} refused] this tool needs the `{}` containment mode and this run \
+                     grants `{}`. Nothing was started. Do this another way, or ask for a run that \
+                     grants it.\n",
+                    needed.as_str(),
+                    granted.as_str()
+                ),
+            ));
+        }
+        CallMode::Contained(resolved) => {
+            // Reported when it differs from the run's own answer, in the shape
+            // 0.44.0 used for `CacheMarked`: an event on the transition rather
+            // than one per call, so an observer sees the calls that were held to
+            // less than the run was granted and is not handed a copy of the run's
+            // own containment on every dispatch.
+            if let (Some(call_c), Some(run_c)) = (resolved.as_ref(), exec_sandbox) {
+                if call_c.config.mode != run_c.config.mode {
+                    watch.emit(RunEvent::at_depth(
+                        run_id,
+                        step,
+                        depth,
+                        EventKind::Contained {
+                            mode: call_c.config.mode.as_str().to_string(),
+                            backend: call_c.backend().as_str().to_string(),
+                            roots: call_c.roots.len() as u32,
+                        },
+                    ));
+                }
+            }
+            narrowed = resolved;
+            narrowed.as_ref()
+        }
+    };
     Ok(match name {
         // 0.41.0 — the three read-only built-ins go through the same two halves a
         // batched read does: the policy on this thread, then the read itself. One
@@ -8826,7 +9169,7 @@ async fn dispatch(
             if let Some(containment) = &contained {
                 let backend = containment.backend();
                 for event in [
-                    crate::state::SandboxEvent::create(run_id, step, backend.as_str()),
+                    sandbox_create(run_id, step, containment),
                     crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), line_src),
                 ] {
                     record_sandbox_step(store, watch, depth, &event);
@@ -9039,13 +9382,42 @@ async fn dispatch(
                         dyn Fn(&tokio::process::Child) -> crate::error::Result<()> + Send + Sync,
                     >
             };
+            // 0.48.0 — the same containment the foreground line gets, per stage,
+            // through the same shared runner. Until this release a handle was the
+            // one execution path left at full privilege, so an agent that could
+            // not write outside the workspace with `shell` could start the same
+            // line with `shell_start` and write wherever it liked.
+            //
+            // There is no cross-run lifetime to manage and that is the answer to
+            // the question `docs/CONTRACT.md` left open: the restriction lives
+            // with the processes — a `pre_exec` rule set or a wrapper argv on
+            // unix, the Job Object this handle already owns on Windows — so
+            // nothing is torn down and nothing is re-entered. A resumed run finds
+            // the previous run's handle rows and orphans them, exactly as before.
+            let contained = exec_sandbox
+                .map(|c| std::sync::Arc::new(c.with_egress(ws.policy().permits_any_egress())));
+            if let Some(containment) = &contained {
+                let backend = containment.backend();
+                for event in [
+                    sandbox_create(run_id, step, containment),
+                    crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), line_src),
+                ] {
+                    record_sandbox_step(store, watch, depth, &event);
+                }
+            }
             let runner = Shell::detached(
                 cap,
                 crate::tools::shell::Capture {
                     path: capture,
                     on_spawn,
                 },
-            );
+            )
+            .contained(contained.clone().map(|containment| {
+                crate::tools::shell::ShellSandbox {
+                    containment,
+                    workdir: ws.root().to_path_buf(),
+                }
+            }));
             // Detached on purpose: this is the one tool whose work outlives its
             // dispatch. The task reaps, so a process that ends on its own is
             // recorded as ended rather than left looking live to every later
@@ -9335,7 +9707,7 @@ async fn dispatch(
             if let Some(containment) = &contained {
                 let backend = containment.backend();
                 for event in [
-                    crate::state::SandboxEvent::create(run_id, step, backend.as_str()),
+                    sandbox_create(run_id, step, containment),
                     crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), &joined),
                 ] {
                     record_sandbox_step(store, watch, depth, &event);
@@ -9910,7 +10282,27 @@ async fn dispatch(
                 }
             };
 
-            let git = Git::new(ws.policy(), ws.root(), cap);
+            // 0.48.0 — `exec_sandbox` here is this call's own containment, already
+            // narrowed to what the tool declared: `read-only` for the three
+            // readers, `workspace-write` for the four that touch `.git`. A run
+            // granting `FullAccess` hands `None` and this spawn is what it always
+            // was.
+            let contained = exec_sandbox
+                .map(|c| std::sync::Arc::new(c.with_egress(ws.policy().permits_any_egress())));
+            if let Some(containment) = &contained {
+                for event in [
+                    sandbox_create(run_id, step, containment),
+                    crate::state::SandboxEvent::exec(
+                        run_id,
+                        step,
+                        containment.backend().as_str(),
+                        name,
+                    ),
+                ] {
+                    record_sandbox_step(store, watch, depth, &event);
+                }
+            }
+            let git = Git::new(ws.policy(), ws.root(), cap).contained(contained.clone());
             // 0.21.0 — a refused git built-in costs a step, not the run.
             //
             // Until here, `Git::run`'s refusal left the loop as `Error::Refused`, so
@@ -9953,6 +10345,14 @@ async fn dispatch(
                 }
                 Err(e) => return Err(e),
             };
+            if contained.is_some() {
+                record_sandbox_step(
+                    store,
+                    watch,
+                    depth,
+                    &crate::state::SandboxEvent::destroy(run_id, step),
+                );
+            }
             match outcome {
                 GitOutcome::Unavailable { reason } => Dispatched::go(
                     "git unavailable",
@@ -11481,7 +11881,7 @@ fn report_containment(
     ));
 }
 
-fn boundary_section(policy: &Policy, sandbox: &SandboxConfig) -> Option<String> {
+fn boundary_section(policy: &Policy, sandbox: &SandboxConfig, proxied: bool) -> Option<String> {
     let permissive = policy.is_permissive();
     if permissive && !sandbox.mode.is_contained() {
         return None;
@@ -11497,7 +11897,7 @@ fn boundary_section(policy: &Policy, sandbox: &SandboxConfig) -> Option<String> 
             lines.push(boundary_line(policy, act, label, defaults));
         }
     }
-    lines.push(containment_line(sandbox));
+    lines.push(containment_line(sandbox, proxied));
     Some(format!(
         "Your boundary. These are enforced before a call runs, so a call outside them is refused \
          rather than attempted — plan around them rather than finding them one refusal at a \
@@ -11575,7 +11975,7 @@ fn effect_label(effect: Effect) -> &'static str {
 /// the caller asked for: on a stock Ubuntu 24.04 the namespace backend is refused
 /// and the floor applies, and an agent told it is confined when it is not is worse
 /// informed than one told nothing (0.40.0).
-fn containment_line(config: &SandboxConfig) -> String {
+fn containment_line(config: &SandboxConfig, proxied: bool) -> String {
     if !config.mode.is_contained() {
         return "- Commands you run are not contained (mode: full-access): they run at this \
                 program's own privileges and may write anywhere this machine's user can write."
@@ -11595,20 +11995,37 @@ fn containment_line(config: &SandboxConfig) -> String {
     // Asked, not enumerated. This site listed the two resource-only backends by
     // name until 0.47.0, which is the shape that went wrong in four files at once
     // when the Linux chain added three rungs.
+    // 0.48.0 — what the egress half of this line may claim depends on whether the
+    // backend can scope the route out. Where it cannot, the proxy is an
+    // environment variable a command may ignore, and the word for that is
+    // *advisory*: saying anything stronger would be the defect 0.40.0 shipped,
+    // where every interface said contained and no machine enforced it.
+    let egress = match (proxied, backend.denies_egress()) {
+        (true, true) => {
+            " Outbound network goes through a proxy this run owns, which permits only the hosts \
+             this run's policy names."
+        }
+        (true, false) => {
+            " Outbound network is offered a proxy this run owns, but this backend cannot confine \
+             the route to it, so that boundary is advisory: a command that ignores the proxy \
+             settings reaches the network."
+        }
+        (false, _) => " Outbound network is permitted only where this run's policy permits it.",
+    };
     match backend.confines_writes() {
         false => format!(
             "- Commands you run are given resource limits only (mode: {}, backend: {}). This host \
-             provides no filesystem confinement and no outbound-network confinement for them, so \
-             neither is in force.",
-            config.mode.as_str(),
-            backend.as_str()
-        ),
-        true => format!(
-            "- Commands you run are contained (mode: {}, backend: {}): {}, and outbound network \
-             is permitted only where this run's policy permits it.",
+             provides no filesystem confinement for them, so that is not in force.{}",
             config.mode.as_str(),
             backend.as_str(),
-            where_writes_go
+            egress
+        ),
+        true => format!(
+            "- Commands you run are contained (mode: {}, backend: {}): {}.{}",
+            config.mode.as_str(),
+            backend.as_str(),
+            where_writes_go,
+            egress
         ),
     }
 }
@@ -11788,6 +12205,39 @@ fn workspace_user_prompt(
         goal = contract.goal,
         criterion = contract.verify.describe(),
     )
+}
+
+/// The user block for a turn's classifying step (0.48.0).
+///
+/// **The half 0.37.0 did not write.** That release gave a classifying turn its own
+/// *system* prompt, ending "If a plain answer is the whole of what is wanted,
+/// write that answer and call no tool" — and left [`workspace_user_prompt`]
+/// unconditional, so the same completion also carried "(nothing yet — start by
+/// grepping or finding)" and "Call a tool to make progress toward the success
+/// criterion." A model handed both resolves the contradiction in its reply, which
+/// is exactly what an embedder driving `Session::turn` reported: the operator
+/// typed "Hi" and the answer began "its a Hi reply to give and no run so just
+/// simply answer". The turn machinery was right; what the model was asked was not.
+///
+/// So this carries the operator's words and the conversation so far, and nothing
+/// else: no goal/constraints/criterion scaffolding, because a greeting has no
+/// success criterion; no "start by grepping", because starting is the question
+/// being asked rather than the instruction being given; and no closing imperative,
+/// because the system block already says what to do in both readings.
+///
+/// **The operator's words come first and the conversation follows**, which is the
+/// order [`workspace_user_prompt`] already uses for the goal and the observations.
+/// That is deliberate rather than incidental: 0.44.0's `cache_boundary_for` is
+/// handed this string and locates the fold's summary inside it, so keeping the
+/// relative order keeps a classifying turn marking the same prefix a promoted one
+/// marks. A second user-prompt shape that reordered them would change what is
+/// cached while nothing failed.
+fn conversational_user_prompt(goal: &str, observations: &str) -> String {
+    if observations.is_empty() {
+        goal.to_string()
+    } else {
+        format!("{goal}\n\n{observations}")
+    }
 }
 
 /// What an agent inside a tree is and what its tools are, without the sentence

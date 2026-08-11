@@ -623,6 +623,24 @@ impl Policy {
             .any(|rule| rule.act == Act::Net && rule.effect == Effect::Allow)
     }
 
+    /// Does this policy have anything to say about *which* hosts (0.48.0)?
+    ///
+    /// The question [`Policy::permits_any_egress`] cannot answer and that decides
+    /// whether a run needs a proxy at all. A run whose only statement about the
+    /// network is its default — everything or nothing — is served exactly as well
+    /// by the boolean a backend takes, and starting a listener for it would be a
+    /// component with a lifetime bought for nothing.
+    ///
+    /// **A deny counts as much as an allow.** A policy whose default permits the
+    /// network and which denies one host has named a host, and the only thing that
+    /// can enforce that denial on a contained command is the proxy.
+    pub(crate) fn names_hosts(&self) -> bool {
+        self.layers
+            .iter()
+            .flat_map(|layer| &layer.rules)
+            .any(|rule| rule.act == Act::Net)
+    }
+
     pub fn check(&self, act: Act, target: &str) -> Verdict {
         self.explain(act, target)
     }
