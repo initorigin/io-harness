@@ -434,7 +434,7 @@ tasks:
   summary: Run the release gates and measure the live caching figure.
   why_required: Every non-functional claim in the contract is a number or an exit code, and none of them
     is true until it has been seen.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.49.0-T11
   acceptance_criteria:
@@ -475,4 +475,37 @@ tasks:
     '
   files:
   - docs/public-api.txt
-  evidence: []
+  evidence:
+  - '`cargo fmt --check` — exit 0. `cargo clippy --all-targets --all-features -- -D warnings` — exit 0,
+    after it caught an unreachable `SystemPrompt::Preset(_)` catch-all: `#[non_exhaustive]` binds outside
+    the defining crate and not inside it, so the arm was dead. Removed rather than allowed, so a variant
+    added later fails this match instead of being traced as an unnamed "preset".'
+  - '`cargo test` (default) — exit 0, **79 test binaries, 1,601 passed, 0 failed**, including **418**
+    doctests.'
+  - '`cargo test --all-features` — exit 0, **79 test binaries, 1,687 passed, 0 failed**, including **421**
+    doctests. A separate invocation after `rm -rf target`; the count was read only after the process exited,
+    never out of a live log.'
+  - 'N1 — `cargo tree` **402** crates, unchanged. No new dependency: the transcript is `serde_json` values
+    built by hand, as both wire bodies already were.'
+  - N2 — MSRV unmoved at 1.95; `msrv_is_stated_and_matches_cargo_toml` passes.
+  - 'N3 — `git diff main -- docs/public-api.txt` is **+3 lines, -0**: `enum Message`, `struct ToolResult`,
+    `enum Preset`. Exactly the enumerated additions the criterion named at plan time, and nothing else.
+    The compile breaks are the two the contract listed: an exhaustive literal of `CompletionRequest` (two
+    new fields) and of `context::Assembled` (one). No trait method was added or changed, so every `impl
+    Provider` in the repository and out of it compiles unchanged.'
+  - N4 — `git diff main -- src/state.rs` is **EMPTY**. No table, column or index; `CHECKPOINT_FORMAT`
+    unmoved at **7**. This falls out of minting ids rather than storing them.
+  - 'N5 — MEASURED LIVE against OpenRouter, `anthropic/claude-haiku-4.5` pinned and read back off `CompletionResponse::model`.
+    A request carrying a transcript, marked `cache_through = 1`: **cache_read 13,093 of a 13,182-token
+    prompt**, against **7,408** for the same transcript unmarked — a **5,685**-token saving, the same
+    figure 0.44.0 measured on the flat path. The reshape did not lose the saving. 0.38.0''s and 0.44.0''s
+    own arms still PASS in the same run (7,408 marked vs 0 on the no-marker control; 13,093 vs 7,408).'
+  - N6 — every prior release's suite passes unchanged, which the two full runs above are.
+  - O1 — the full suite passes on this host; the three-platform matrix is the release PR's own gate.
+  - O2 — `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0
+    -- --ignored` — 1 passed. No DDL, so a 0.29.0 binary still reads a store this tree writes.
+  - '`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0, after
+    it caught **two** errors stable `cargo doc` does not report: a public item''s doc linking to the private
+    `mint_call_id`, and a redundant explicit link target. Seventh release in nine where this gate has
+    found something.'
+  - '`cargo package --locked` — exit 0, 234 files, **1,646,671 bytes**.'
