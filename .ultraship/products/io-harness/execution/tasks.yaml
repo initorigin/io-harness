@@ -224,7 +224,7 @@ tasks:
   summary: Re-express the transcript cache marker as a message index and keep `PrefixGuard`'s rule.
   why_required: 0.44.0's measured saving is billed money; a reshape that silently stops marking would
     cost more than the release saves and fail no existing test.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.49.0-T05
   acceptance_criteria:
@@ -240,7 +240,19 @@ tasks:
   files:
   - src/run.rs
   - src/provider/mod.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test cache_boundary` — 9 passed, 0 failed, the seven 0.44.0 tests among them unchanged.'
+  - 'F7 — `the_transcript_marker_covers_the_span_the_byte_offset_names`: the messages through `cache_through`
+    concatenate to EXACTLY the span `cache_boundary` names, asserted against each other rather than each
+    against a literal, and that span still ends at the folded summary''s own sentence. The fold''s own
+    step carries neither marker, so `PrefixGuard`''s see-it-twice rule survives the translation.'
+  - 'The whole transcript is never marked: `cache_through < messages.len()` is asserted, because the last
+    message is the turn being asked about and marking it would write a prefix that moves every step.'
+  - 'SABOTAGE (F7): marking one message past the boundary failed exactly `the_transcript_marker_covers_the_span_the_byte_offset_names`
+    and nothing else — the seven 0.44.0 tests still passed, which is what makes the new assertion the
+    one holding this claim.'
+  - '`a_run_that_never_folds_marks_no_messages` — 0.44.0''s no-fold control asserted again for the field
+    this release added.'
 - id: US-IO-HARNESS-0.49.0-T07
   summary: Seed a session's prior turns as real user and assistant messages.
   why_required: A conversation whose own history is bracketed prose is the same off-distribution shape

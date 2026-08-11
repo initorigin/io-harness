@@ -4497,6 +4497,7 @@ async fn run_workspace_from<P: Provider>(
             // froze, and only once that prefix has already gone out once.
             let cache_boundary =
                 cache_boundary_for(&user, &ledger, &mut marked_prefix, watch, run_id, step, 0);
+            let messages = transcript(&user, &assembled, &turns);
             #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
                 // 0.37.0 — the conversational prompt is this turn's opening only. Every
@@ -4511,13 +4512,16 @@ async fn run_workspace_from<P: Provider>(
                 // 0.49.0 — the same emission as a conversation. Empty until this run
                 // has driven a step of its own, which is what keeps a first step and a
                 // resumed run byte-identical on the wire to what 0.48.0 sent.
-                messages: transcript(&user, &assembled, &turns),
+                messages: messages.clone(),
                 tools: tools.clone(),
                 // 0.22.0 — the run's web declaration, unchanged per step.
                 web: contract.web.clone(),
                 // 0.31.0 — the root's tier, unchanged per step.
                 effort: contract.effort,
                 cache_boundary,
+                // 0.49.0 — the same breakpoint the line above names, counted in
+                // messages because that is what this request sends.
+                cache_through: cache_through_for(cache_boundary, &messages),
                 #[cfg(feature = "media")]
                 media: attach_media(contract, pending_media)?,
                 ..Default::default()
@@ -6169,6 +6173,7 @@ fn run_agent<'f, P: Provider>(
                     step,
                     depth,
                 );
+                let messages = transcript(&user, &assembled, &turns);
                 #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
                 let request = CompletionRequest {
                     // 0.39.0 — a contained turn's opening is its first completion
@@ -6183,7 +6188,7 @@ fn run_agent<'f, P: Provider>(
                     // same helper: a transcript assembled in one loop and not the other
                     // would make a contained run and a flat one talk to the model
                     // differently while nothing failed.
-                    messages: transcript(&user, &assembled, &turns),
+                    messages: messages.clone(),
                     tools: tools.clone(),
                     // 0.21.0 — a named agent's model. `None` for the root and for any
                     // child spawned without a definition, which is what every provider
@@ -6199,6 +6204,8 @@ fn run_agent<'f, P: Provider>(
                     // root's own, and a child spawned without a definition inherits it.
                     effort: identity.and_then(|d| d.effort).or(contract.effort),
                     cache_boundary,
+                    // 0.49.0 — as the flat loop, through the same helper.
+                    cache_through: cache_through_for(cache_boundary, &messages),
                     #[cfg(feature = "media")]
                     media: attach_media(contract, pending_media)?,
                     ..Default::default()
@@ -11129,6 +11136,40 @@ fn cache_boundary_for(
         ));
     }
     Some(at)
+}
+
+/// The transcript half of 0.44.0's second breakpoint (0.49.0).
+///
+/// The byte offset [`cache_boundary_for`] computed is an offset into `user`, and a
+/// request carrying a transcript does not send `user` — so the same decision is
+/// re-expressed as a count of leading messages. It is a translation and never a
+/// second decision: the guard has already ruled on whether this prefix has been
+/// sent before, and this only asks how many whole messages fit inside it.
+///
+/// Exact, because the conversation's text *is* `user`: every message's own text is
+/// a slice of it in order, which is what
+/// `the_derived_user_is_the_flat_prompt_the_transcript_was_built_from` asserts. An
+/// assistant turn consumes none of it — its calls are not in the flat prompt at
+/// all — so it is carried along with the results message that follows it rather
+/// than splitting the count.
+fn cache_through_for(boundary: Option<usize>, messages: &[Message]) -> Option<usize> {
+    let at = boundary?;
+    let mut consumed = 0usize;
+    let mut through = 0usize;
+    for (i, message) in messages.iter().enumerate() {
+        consumed += match message {
+            Message::User(text) => text.len(),
+            Message::Assistant { .. } => 0,
+            Message::Results(results) => results.iter().map(|r| r.content.len()).sum(),
+        };
+        if consumed > at {
+            break;
+        }
+        through = i + 1;
+    }
+    // The whole transcript is never marked: the last message is the turn being
+    // asked about, and marking it would write a prefix that changes every step.
+    (through > 0 && through < messages.len()).then_some(through)
 }
 
 /// One definition, and every loop calls it — the flat workspace loop and the tree
