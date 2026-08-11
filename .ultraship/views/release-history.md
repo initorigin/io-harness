@@ -66,7 +66,7 @@ Run `ultraship views` to regenerate.
 
 - **The record is sealed before the crates.io upload**, which follows the `develop` → `main` merge and the GitHub Release. `mode: published` states the authorized target; the flow makes it true.
 
-- **Per-host egress is proven on macOS and unproven on Linux.** Every F6/F7 assertion ran against `macos-sandbox-exec`, where SBPL names the loopback address exactly. The Landlock rung's port rule is written and its **plan** is unit-tested (`a_proxy_handles_the_network_and_allows_only_its_port`), but no Linux host has executed it in this session — that is CI's to answer, as the contract's cost drivers said it would be.
+- **Per-host egress was sealed as proven on macOS and unproven on Linux; CI answered it, and it holds.** Every F6/F7 assertion had run against `macos-sandbox-exec`, where SBPL names the loopback address exactly, and no Linux host had executed the Landlock rung's port rule. On the `contained (ubuntu, userns restricted)` leg — the leg that does **not** relax `kernel.apparmor_restrict_unprivileged_userns`, and therefore takes the Landlock rung rather than a namespace one — `a_direct_dial_past_the_proxy_is_refused_by_the_sandbox`, `a_host_the_policy_names_is_reached_through_the_proxy` and `egress_under_containment_reaches_the_named_host_and_no_other` all pass. The limitation is left here rather than deleted because it is the honest history of what the seal knew.
 
 - **Under Landlock the scoping is port-scoped, not address-scoped.** Another host on the proxy's port number is reachable. The port is ephemeral and per-run, which narrows it in practice and is not a proof; `docs/CONTRACT.md` carries this per backend rather than as a footnote.
 
@@ -77,6 +77,8 @@ Run `ultraship views` to regenerate.
 - **The harness's own `git worktree add`** — the one that roots a spawned child's worktree — is not contained. It is a fixed argv the crate builds, on a path already checked against the parent's policy, and is not a model-initiated command; the six git *built-ins* the model calls are contained.
 
 - **A registered `Tool`'s declared mode is a refusal mechanism, not a confinement one.** The crate does not see that tool's own spawn and makes no claim to govern it.
+
+- **The record was sealed, and then corrected twice before the merge into `main`** — which is the only window that permits it. `2a6a680` installs the Landlock net-port rule the plan carried and `Ruleset::build` never read, and `b8caa3c` grants `/dev/null`. Every gate quoted above was re-run in full against the corrected tree and this record re-pinned; the CI run it cites is on `b8caa3c`, which does not contain this record, for the structural reason a release record can never cite CI on the commit that carries it.
 
 - **Debug prints from the proxy diagnosis reached three commits** before being removed in `1aa86f5`. `cargo fmt` reformatted them between writing and removing them, so the removal did not match. They are absent from the shipped tree; noted because a released tree's history should not be read as clean when it was not.
 

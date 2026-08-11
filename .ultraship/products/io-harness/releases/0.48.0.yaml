@@ -655,12 +655,30 @@ delivered: >
 evidence:
   tests:
   - >
-    `cargo test` (default features) — exit 0, **79 test binaries, 1,572 passed, 0 failed**,
+    `cargo test` (default features) — exit 0, **79 test binaries, 1,573 passed, 0 failed**,
     including **415** doctests. Run with `XDG_CONFIG_HOME` redirected to a scratch directory, this
-    machine's standing environment fix for `tests/plugin.rs` and unrelated to the release.
+    machine's standing environment fix for `tests/plugin.rs` and unrelated to the release. Re-run in
+    full on the corrected tree; the count is one above the first seal because the correction below
+    brought its own test.
   - >
-    `cargo test --all-features` — exit 0, **79 test binaries, 1,658 passed, 0 failed**, including
-    **418** doctests.
+    `cargo test --all-features` — exit 0, **79 test binaries, 1,659 passed, 0 failed**, including
+    **418** doctests. Also re-run in full on the corrected tree.
+  - >
+    **THE MATRIX FOUND A DEFECT AFTER THE SEAL, AND IT IS THE RELEASE'S SECOND FINDING.** Every one
+    of the six git built-ins failed on Linux — **nine tests across all three ubuntu legs**, exit 128,
+    `fatal: could not open '/dev/null' for reading and writing: Permission denied` — while every
+    macOS and Windows leg passed. The Landlock rung grants read-and-execute over `/` and the write
+    set over the run's roots; `/dev/null` is under `/`, so it was readable and not writable, and this
+    crate's git built-ins point `GIT_CONFIG_GLOBAL` at it — which git opens **for reading and
+    writing** even when all it means to do is parse it. No macOS host could see it: the SBPL profile
+    has carried `(allow file-write* (literal "/dev/null"))` since 0.6.0 and the namespace rung
+    populates `/dev`, so Landlock was the one rung of the three that did not grant the device.
+    Diagnosed from the child's own stderr on a throwaway `diag/**` branch rather than by reasoning
+    (run 31453709671), fixed by one more path rule carrying **file rights only** — a directory right
+    on a device is refused by the kernel, and a refused rule fails the whole rule set and would hand
+    back an unconfined run reporting a confining backend. The same Linux job then reported
+    `code=Some(0)` and both commits landing (run 31454080240), and the full matrix went **19 of 19
+    green** on `b8caa3c`.
   - >
     `cargo test --test cross_version_0_29_0 -- --ignored --exact
     a_current_store_is_read_by_a_0_29_0_binary` — exit 0, 1 passed. No DDL, so a 0.29.0 binary still
@@ -686,7 +704,7 @@ evidence:
     after it caught **four** intra-doc link errors stable `cargo doc` does not report. Sixth time in
     eight releases.
   - >
-    `cargo package --locked` — exit 0, **1,616,667 bytes**.
+    `cargo package --locked` — exit 0, **1,618,342 bytes** on the corrected tree.
   - >
     `cargo tree` — **402** crates, unchanged (N1): tokio's `net` and `io-util` features were already
     enabled transitively by reqwest. `git diff main -- docs/public-api.txt` is **empty** (N3).
@@ -704,11 +722,15 @@ known_limitations:
   **The record is sealed before the crates.io upload**, which follows the `develop` → `main` merge
   and the GitHub Release. `mode: published` states the authorized target; the flow makes it true.
 - >
-  **Per-host egress is proven on macOS and unproven on Linux.** Every F6/F7 assertion ran against
-  `macos-sandbox-exec`, where SBPL names the loopback address exactly. The Landlock rung's port rule
-  is written and its **plan** is unit-tested (`a_proxy_handles_the_network_and_allows_only_its_port`),
-  but no Linux host has executed it in this session — that is CI's to answer, as the contract's cost
-  drivers said it would be.
+  **Per-host egress was sealed as proven on macOS and unproven on Linux; CI answered it, and it
+  holds.** Every F6/F7 assertion had run against `macos-sandbox-exec`, where SBPL names the loopback
+  address exactly, and no Linux host had executed the Landlock rung's port rule. On the
+  `contained (ubuntu, userns restricted)` leg — the leg that does **not** relax
+  `kernel.apparmor_restrict_unprivileged_userns`, and therefore takes the Landlock rung rather than a
+  namespace one — `a_direct_dial_past_the_proxy_is_refused_by_the_sandbox`,
+  `a_host_the_policy_names_is_reached_through_the_proxy` and
+  `egress_under_containment_reaches_the_named_host_and_no_other` all pass. The limitation is left
+  here rather than deleted because it is the honest history of what the seal knew.
 - >
   **Under Landlock the scoping is port-scoped, not address-scoped.** Another host on the proxy's port
   number is reachable. The port is ephemeral and per-run, which narrows it in practice and is not a
@@ -726,6 +748,13 @@ known_limitations:
 - >
   **A registered `Tool`'s declared mode is a refusal mechanism, not a confinement one.** The crate does
   not see that tool's own spawn and makes no claim to govern it.
+- >
+  **The record was sealed, and then corrected twice before the merge into `main`** — which is the
+  only window that permits it. `2a6a680` installs the Landlock net-port rule the plan carried and
+  `Ruleset::build` never read, and `b8caa3c` grants `/dev/null`. Every gate quoted above was re-run
+  in full against the corrected tree and this record re-pinned; the CI run it cites is on `b8caa3c`,
+  which does not contain this record, for the structural reason a release record can never cite CI
+  on the commit that carries it.
 - >
   **Debug prints from the proxy diagnosis reached three commits** before being removed in `1aa86f5`.
   `cargo fmt` reformatted them between writing and removing them, so the removal did not match. They
