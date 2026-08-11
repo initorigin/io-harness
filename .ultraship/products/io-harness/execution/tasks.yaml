@@ -39,7 +39,7 @@ tasks:
   summary: Map a message sequence onto the Anthropic body as native `tool_use` and `tool_result` blocks.
   why_required: The release's outcome is what reaches the wire; a neutral request the wire flattens again
     delivers nothing.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.49.0-T01
   acceptance_criteria:
@@ -61,7 +61,21 @@ tasks:
     '
   files:
   - src/provider/anthropic.rs
-  evidence: []
+  evidence:
+  - '`cargo test --lib anthropic` — 26 passed, 0 failed. That includes every pre-existing body test (`body_maps_tools_to_input_schema_and_system_top_level`,
+    `body_marks_one_cache_breakpoint_at_the_end_of_system`, `body_splits_the_user_turn_at_the_boundary_and_marks_only_the_first_half`,
+    `an_unusable_boundary_sends_the_body_that_has_always_been_sent`, `no_effort_leaves_the_anthropic_body_exactly_as_it_was`),
+    which is F4 asserted by the suite that was already there.'
+  - 'F2 — `the_body_carries_native_blocks_whose_ids_correlate`: the assistant turn carries a text block
+    and two `tool_use` blocks, the results turn is `role: "user"` and carries two `tool_result` blocks,
+    and each `tool_use_id` is asserted equal to the `id` of the call it answers rather than to a literal.'
+  - 'F4 — `an_empty_transcript_sends_the_0_48_0_body`: the whole `messages` array is asserted equal to
+    `[{role: user, content: <the flat string>}]`.'
+  - 'SABOTAGE (F2): appending one character to the result''s `tool_use_id` failed exactly one named test
+    — `the_body_carries_native_blocks_whose_ids_correlate` — with the other 25 passing, so the correlation
+    assertion is what is holding it and not the block shape.'
+  - A result correlating with nothing is dropped and a message left with no blocks is dropped whole (`a_result_correlating_with_nothing_is_dropped`),
+    because an empty `content` array is a 400.
 - id: US-IO-HARNESS-0.49.0-T03
   summary: 'Map a message sequence onto the OpenAI/OpenRouter body as `tool_calls` and `role: "tool"`
     messages.'

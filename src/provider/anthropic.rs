@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::{read_sse, CompletionRequest, CompletionResponse, Provider, ToolCall, Usage};
+use super::{read_sse, CompletionRequest, CompletionResponse, Message, Provider, ToolCall, Usage};
 use crate::error::{Error, Result};
 
 /// The request deadline this provider uses unless [`Anthropic::with_timeout`]
@@ -163,9 +163,7 @@ impl Anthropic {
                 "text": request.system,
                 "cache_control": { "type": "ephemeral" },
             }],
-            "messages": [
-                { "role": "user", "content": Self::user_content(request) },
-            ],
+            "messages": Self::messages(request),
             "tools": tools,
         });
         // 0.31.0 — Anthropic is the vendor with no tiers: extended thinking is a
@@ -185,6 +183,107 @@ impl Anthropic {
         }
         body
     }
+
+    /// The `messages` array.
+    ///
+    /// (0.49.0) A request carrying no transcript produces the single `role: "user"`
+    /// entry every release through 0.48.0 sent, byte for byte — that is the whole
+    /// compatibility claim and `an_empty_transcript_sends_the_0_48_0_body` holds it.
+    /// A request carrying one is mapped onto Anthropic's own block types: a
+    /// `tool_use` block per call the assistant made, and a `tool_result` block per
+    /// result, correlated by the id [`mint_call_id`](super::mint_call_id) derives
+    /// from the two positions.
+    ///
+    /// Tool results are user-role content on this wire, so a results batch becomes
+    /// one `role: "user"` message — which is also why the batch exists as a message
+    /// kind rather than one message per result.
+    ///
+    /// A message that would carry no blocks at all is **dropped**: an empty
+    /// `content` array is a `400`, and the two ways to produce one — an assistant
+    /// turn with neither text nor calls, and a results batch whose every result
+    /// correlated with nothing — are both better answered by sending less than by
+    /// sending something the vendor refuses.
+    fn messages(request: &CompletionRequest) -> serde_json::Value {
+        if request.messages.is_empty() {
+            return json!([{ "role": "user", "content": Self::user_content(request) }]);
+        }
+        let marked = super::marked_message(request);
+        let last = request.messages.len() - 1;
+        let mut out: Vec<serde_json::Value> = Vec::with_capacity(request.messages.len());
+        for (m, message) in request.messages.iter().enumerate() {
+            let (role, mut blocks) = match message {
+                Message::User(text) => ("user", vec![json!({ "type": "text", "text": text })]),
+                Message::Assistant { text, calls } => {
+                    let mut blocks = Vec::new();
+                    if let Some(text) = text.as_deref().filter(|t| !t.is_empty()) {
+                        blocks.push(json!({ "type": "text", "text": text }));
+                    }
+                    for (i, call) in calls.iter().enumerate() {
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": super::mint_call_id(m, i),
+                            "name": call.name,
+                            "input": call.arguments,
+                        }));
+                    }
+                    ("assistant", blocks)
+                }
+                Message::Results(results) => {
+                    let blocks = results
+                        .iter()
+                        .filter_map(|r| {
+                            let id = super::result_call_id(&request.messages, m, r)?;
+                            Some(json!({
+                                "type": "tool_result",
+                                "tool_use_id": id,
+                                "content": r.content,
+                            }))
+                        })
+                        .collect();
+                    ("user", blocks)
+                }
+            };
+            if m == last && role == "user" {
+                Self::prepend_media(&mut blocks, request);
+            }
+            if blocks.is_empty() {
+                continue;
+            }
+            if marked == Some(m) {
+                let end = blocks.len() - 1;
+                blocks[end]["cache_control"] = json!({ "type": "ephemeral" });
+            }
+            out.push(json!({ "role": role, "content": blocks }));
+        }
+        json!(out)
+    }
+
+    /// Put this turn's images ahead of its text, which is what Anthropic's own
+    /// guidance recommends for a prompt asking about an image.
+    ///
+    /// (0.49.0) They go on the transcript's last user-role message because that is
+    /// the turn being asked about — `Session::attach` stages images for one turn and
+    /// the loop sends them on that turn's opening step, where the transcript ends in
+    /// the operator's own message.
+    #[cfg(feature = "media")]
+    fn prepend_media(blocks: &mut Vec<serde_json::Value>, request: &CompletionRequest) {
+        for (i, m) in request.media.iter().enumerate() {
+            blocks.insert(
+                i,
+                json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": m.media_type,
+                        "data": m.base64,
+                    },
+                }),
+            );
+        }
+    }
+
+    #[cfg(not(feature = "media"))]
+    fn prepend_media(_blocks: &mut [serde_json::Value], _request: &CompletionRequest) {}
 
     /// The server-tool entries a [`WebAccess`](crate::WebAccess) declaration adds
     /// to the `tools` array, in Anthropic's shape.
@@ -1071,6 +1170,167 @@ mod tests {
         let out = acc.finish();
         assert_eq!(out.text.as_deref(), Some("hello world"));
         assert!(out.tool_calls.is_empty());
+    }
+}
+
+/// 0.49.0 — a transcript on the wire: native blocks, correlated ids, and the
+/// byte-identity that lets a request without one keep working.
+#[cfg(test)]
+mod transcript_body {
+    use super::*;
+    use crate::provider::{Message, ToolResult};
+
+    fn provider() -> Anthropic {
+        Anthropic::new("k", "claude-x")
+    }
+
+    fn conversation() -> Vec<Message> {
+        vec![
+            Message::User("tidy the README".into()),
+            Message::Assistant {
+                text: Some("Reading it first.".into()),
+                calls: vec![
+                    ToolCall {
+                        name: "read_file".into(),
+                        arguments: json!({ "path": "README.md" }),
+                    },
+                    ToolCall {
+                        name: "grep".into(),
+                        arguments: json!({ "pattern": "TODO" }),
+                    },
+                ],
+            },
+            Message::Results(vec![
+                ToolResult {
+                    call: 0,
+                    content: "# Project".into(),
+                },
+                ToolResult {
+                    call: 1,
+                    content: "no matches".into(),
+                },
+            ]),
+        ]
+    }
+
+    fn with(messages: Vec<Message>) -> CompletionRequest {
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+        CompletionRequest {
+            system: "sys".into(),
+            user: "derived shim".into(),
+            messages,
+            ..Default::default()
+        }
+    }
+
+    /// **F2** — the assistant turn carries `tool_use` blocks and the results turn
+    /// carries `tool_result` blocks whose `tool_use_id` is *the same string*.
+    ///
+    /// The correlation is asserted between the two extracted values rather than
+    /// against a literal, because a body where every block carries a plausible id
+    /// that correlates with nothing is exactly what a vendor answers with a 400 and
+    /// a reader cannot see.
+    #[test]
+    fn the_body_carries_native_blocks_whose_ids_correlate() {
+        let b = provider().body(&with(conversation()));
+        let messages = b["messages"].as_array().expect("a messages array");
+        assert_eq!(messages.len(), 3);
+
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "tidy the README");
+
+        assert_eq!(messages[1]["role"], "assistant");
+        let assistant = messages[1]["content"].as_array().expect("blocks");
+        assert_eq!(assistant[0]["type"], "text");
+        assert_eq!(assistant[0]["text"], "Reading it first.");
+        assert_eq!(assistant[1]["type"], "tool_use");
+        assert_eq!(assistant[1]["name"], "read_file");
+        assert_eq!(assistant[1]["input"], json!({ "path": "README.md" }));
+        assert_eq!(assistant[2]["type"], "tool_use");
+        assert_eq!(assistant[2]["name"], "grep");
+
+        // Tool results are user-role content on this wire.
+        assert_eq!(messages[2]["role"], "user");
+        let results = messages[2]["content"].as_array().expect("blocks");
+        assert_eq!(results.len(), 2);
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(result["type"], "tool_result");
+            assert_eq!(
+                result["tool_use_id"], assistant[i + 1]["id"],
+                "result {i} must correlate with the call it answers"
+            );
+        }
+        assert_eq!(results[0]["content"], "# Project");
+        assert_eq!(results[1]["content"], "no matches");
+    }
+
+    /// **F4** — a request with no transcript sends the body 0.48.0 sent.
+    ///
+    /// The negative control the whole compatibility claim rests on: this is the
+    /// assertion an implementation that always builds a transcript fails.
+    #[test]
+    fn an_empty_transcript_sends_the_0_48_0_body() {
+        let b = provider().body(&with(Vec::new()));
+        assert_eq!(
+            b["messages"],
+            json!([{ "role": "user", "content": "derived shim" }])
+        );
+    }
+
+    /// A result naming a call its turn did not make is dropped rather than sent
+    /// with an invented id, and a message left with no blocks is dropped whole —
+    /// an empty `content` array is a 400.
+    #[test]
+    fn a_result_correlating_with_nothing_is_dropped() {
+        let mut messages = conversation();
+        messages[2] = Message::Results(vec![ToolResult {
+            call: 7,
+            content: "from nowhere".into(),
+        }]);
+        let b = provider().body(&with(messages));
+        let sent = b["messages"].as_array().expect("a messages array");
+        assert_eq!(sent.len(), 2, "the empty results message is dropped: {b}");
+        assert!(!b.to_string().contains("from nowhere"));
+
+        // The same rule seen from the assistant side.
+        let b = provider().body(&with(vec![
+            Message::User("hi".into()),
+            Message::Assistant {
+                text: None,
+                calls: Vec::new(),
+            },
+        ]));
+        assert_eq!(b["messages"].as_array().expect("array").len(), 1);
+    }
+
+    /// **F7's wire half** — the marker lands on the last block of the message the
+    /// request names, and nowhere else. The system marker is the only other one.
+    #[test]
+    fn the_transcript_marker_lands_on_the_message_the_request_names() {
+        let mut request = with(conversation());
+        request.cache_through = Some(2);
+        let b = provider().body(&request);
+        let messages = b["messages"].as_array().expect("array");
+        let assistant = messages[1]["content"].as_array().expect("blocks");
+        assert_eq!(
+            assistant.last().expect("a block")["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(
+            messages[0]["content"][0].get("cache_control").is_none(),
+            "an earlier message must not carry its own marker"
+        );
+        assert!(
+            messages[2]["content"][0].get("cache_control").is_none(),
+            "nothing after the boundary is marked"
+        );
+        // Two in the whole body: the system breakpoint and this one.
+        assert_eq!(b.to_string().matches("cache_control").count(), 2, "{b}");
+
+        // And an unusable count marks nothing, which leaves 0.38.0's one marker.
+        request.cache_through = Some(0);
+        let b = provider().body(&request);
+        assert_eq!(b.to_string().matches("cache_control").count(), 1, "{b}");
     }
 }
 
