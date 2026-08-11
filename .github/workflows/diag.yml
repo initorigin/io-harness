@@ -1,0 +1,33 @@
+name: diag
+
+# Temporary. Lives only on a `diag/**` branch and is never merged: it exists to
+# get one Linux host to say why a contained `git` write does not land.
+
+on:
+  push:
+    branches: ["diag/**"]
+
+jobs:
+  git-under-landlock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: diag
+      - name: host facts
+        run: |
+          uname -a
+          git --version
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          ls /sys/kernel/security/ || true
+      - name: the failing git test, with the child's own stderr
+        env:
+          IO_HARNESS_DIAG: "1"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          cargo test --test git an_agent_stages_its_edits_and_commits_them -- --nocapture 2>&1 | tail -80
+          cargo test --test exec_mode a_git_write_under_workspace_write_runs_contained -- --nocapture 2>&1 | tail -80

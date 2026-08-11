@@ -601,11 +601,28 @@ impl<'a> Git<'a> {
             None => None,
         };
         match child.output().await {
-            Ok(out) => Ok(GitOutcome::Ran {
-                code: out.status.code(),
-                stdout: cap_result(String::from_utf8_lossy(&out.stdout).into_owned(), self.cap).0,
-                stderr: cap_result(String::from_utf8_lossy(&out.stderr).into_owned(), self.cap).0,
-            }),
+            Ok(out) => {
+                if std::env::var_os("IO_HARNESS_DIAG").is_some() {
+                    eprintln!(
+                        "DIAG git: backend={:?} mode={:?} workdir={} roots={:?} code={:?}\n  argv={:?}\n  stdout={}\n  stderr={}",
+                        self.sandbox.as_ref().map(|c| c.backend()),
+                        self.sandbox.as_ref().map(|c| c.config.mode),
+                        self.workdir.display(),
+                        roots,
+                        out.status.code(),
+                        spawn_argv,
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr),
+                    );
+                }
+                Ok(GitOutcome::Ran {
+                    code: out.status.code(),
+                    stdout: cap_result(String::from_utf8_lossy(&out.stdout).into_owned(), self.cap)
+                        .0,
+                    stderr: cap_result(String::from_utf8_lossy(&out.stderr).into_owned(), self.cap)
+                        .0,
+                })
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(GitOutcome::Unavailable {
                 reason: format!("no `{}` on PATH", self.program),
             }),
