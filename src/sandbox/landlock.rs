@@ -95,6 +95,9 @@ pub(crate) const NET_CONNECT_TCP: u64 = 1 << 1;
 /// What a *read-only* hierarchy is allowed: look at it and run what is in it.
 pub(crate) const READ_SET: u64 = FS_EXECUTE | FS_READ_FILE | FS_READ_DIR;
 
+/// The bit bucket, which every mode may write to. See [`plan`].
+pub(crate) const DEV_NULL: &str = "/dev/null";
+
 /// Every filesystem right this module ever asks the kernel to handle, before
 /// masking to the host's ABI.
 const ALL_FS: u64 = FS_EXECUTE
@@ -233,6 +236,34 @@ pub(crate) fn plan(
             rights: handled_fs,
         });
     }
+
+    // `/dev/null` is writable under every mode, and this rule is not a
+    // convenience either.
+    //
+    // The `/` rule above covers opening the bit bucket to *read*; it does not
+    // cover opening it to *write*, and that is how it is nearly always opened —
+    // every `2>/dev/null` a toolchain's own scripts contain, and this crate's git
+    // built-ins, which point `GIT_CONFIG_GLOBAL` at it and which git opens "for
+    // reading and writing" even when all it means to do is parse it. Without this
+    // rule every git built-in fails on Linux with `fatal: could not open
+    // '/dev/null' for reading and writing: Permission denied`, which is what the
+    // matrix caught and no macOS host could: the SBPL profile and the mount setup
+    // have always allowed the device. This is that same allowance in this rung's
+    // vocabulary, and a write to the bit bucket changes nothing an observer can
+    // see — the confinement this rung exists for is about what a run can *keep*.
+    //
+    // File rights only. Landlock refuses a rule asking for a directory right on
+    // something that is not a directory, so `READ_SET`'s `FS_READ_DIR` and every
+    // `FS_MAKE_*` are deliberately absent — and a rule the kernel refuses would
+    // fail the whole rule set, which is the same reason this is exists-filtered
+    // like every writable root has been since 0.46.0.
+    if Path::new(DEV_NULL).exists() {
+        rules.push(PathRule {
+            path: PathBuf::from(DEV_NULL),
+            rights: (FS_READ_FILE | FS_WRITE_FILE) & handled_fs,
+        });
+    }
+
     Plan {
         handled_fs,
         handled_net,
@@ -629,7 +660,13 @@ mod tests {
         );
         assert_eq!(p.rules[0].rights & FS_WRITE_FILE, 0);
 
-        let writable: Vec<&Path> = p.rules[1..].iter().map(|r| r.path.as_path()).collect();
+        // The hierarchies, in order, with the bit bucket's file rule excluded —
+        // it is a device and not a hierarchy, and it has its own test below.
+        let writable: Vec<&Path> = p.rules[1..]
+            .iter()
+            .filter(|r| r.path != Path::new(DEV_NULL))
+            .map(|r| r.path.as_path())
+            .collect();
         assert_eq!(
             writable,
             [
@@ -639,7 +676,10 @@ mod tests {
                 Path::new("/tmp"),
             ]
         );
-        assert!(p.rules[1..].iter().all(|r| r.rights == full));
+        assert!(p.rules[1..]
+            .iter()
+            .filter(|r| r.path != Path::new(DEV_NULL))
+            .all(|r| r.rights == full));
     }
 
     /// F5 — `ReadOnly` withholds the workspace and keeps the temp directory,
@@ -655,7 +695,11 @@ mod tests {
             Path::new("/tmp"),
             None,
         );
-        let writable: Vec<&Path> = p.rules[1..].iter().map(|r| r.path.as_path()).collect();
+        let writable: Vec<&Path> = p.rules[1..]
+            .iter()
+            .filter(|r| r.path != Path::new(DEV_NULL))
+            .map(|r| r.path.as_path())
+            .collect();
         assert_eq!(
             writable,
             [Path::new("/tmp")],
@@ -664,6 +708,54 @@ mod tests {
         // And the workspace is still *readable*, through the `/` rule.
         assert_eq!(p.rules[0].path, Path::new("/"));
         assert_ne!(p.rules[0].rights & FS_READ_FILE, 0);
+    }
+
+    /// 0.48.0 — the bit bucket is writable under **every** mode, and the rule
+    /// asks for file rights only.
+    ///
+    /// Both halves are the defect the matrix found. A read-only grant is not
+    /// enough, because git opens `GIT_CONFIG_GLOBAL` for reading *and writing*
+    /// and every git built-in therefore failed on Linux; and a rule carrying a
+    /// directory right on a device is refused by the kernel, which would fail the
+    /// whole rule set and hand back an unconfined run.
+    #[test]
+    fn the_bit_bucket_is_writable_under_every_mode_and_asks_for_file_rights_only() {
+        // The rule is exists-filtered, and this test asserts a grant. Every host
+        // this crate builds on has the device; if one does not, there is nothing
+        // to assert about.
+        if !Path::new(DEV_NULL).exists() {
+            return;
+        }
+        for mode in [
+            ExecMode::ReadOnly,
+            ExecMode::WorkspaceWrite,
+            ExecMode::FullAccess,
+        ] {
+            let p = plan(
+                5,
+                mode,
+                false,
+                Path::new("/w"),
+                &[],
+                Path::new("/tmp"),
+                None,
+            );
+            let rule = p
+                .rules
+                .iter()
+                .find(|r| r.path == Path::new(DEV_NULL))
+                .unwrap_or_else(|| panic!("{mode:?} grants the bit bucket: {:?}", p.rules));
+            assert_ne!(
+                rule.rights & FS_WRITE_FILE,
+                0,
+                "{mode:?} may write it — a read grant is what broke every git built-in"
+            );
+            assert_eq!(
+                rule.rights & (FS_READ_DIR | FS_MAKE_REG | FS_MAKE_DIR | FS_REFER),
+                0,
+                "{mode:?} asks for no directory right on a device"
+            );
+        }
     }
 
     /// 0.48.0 — a proxy takes control of outbound TCP and hands exactly one port
