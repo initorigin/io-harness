@@ -42,8 +42,7 @@
 //! the cache entry still being alive, which is the vendor's clock and not ours.
 
 use io_harness::{
-    Auth, Compatible, CompletionRequest, Message, OpenRouter, Provider, ToolCall, ToolResult,
-    Usage,
+    Auth, Compatible, CompletionRequest, Message, OpenRouter, Provider, ToolCall, ToolResult, Usage,
 };
 
 /// An Anthropic slug, because Anthropic is the vendor whose caching is
