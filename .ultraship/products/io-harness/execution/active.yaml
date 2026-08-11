@@ -1,0 +1,48 @@
+product: io-harness
+version: 0.49.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      **No constraints are recorded for this workspace.** `ultraship constraints` reports none —
+      there is no active release to hold them — so this assessment is grounded in the repository's
+      own condition and in the eighteen releases of measured history behind it, never in a capacity
+      figure, which UltraShip has no telemetry to supply and which would be fiction with a decimal
+      point.
+    - >
+      **The reshape is additive at the type level and the compatibility story is already decided.**
+      `CompletionRequest` is deliberately not `#[non_exhaustive]` and its documented ergonomic is
+      `..Default::default()`, so two new fields cost only the exhaustive literals. `user` is kept
+      and derived, which is what keeps 54 read sites, 20 test files and 77 `impl Provider for`
+      blocks compiling untouched — the release does not have to rewrite the test suite to ship.
+    - >
+      **The one decision that could have made this large removes the schema change instead.** Ids
+      are minted rather than stored, because a vendor correlates a tool-use id with a tool-result id
+      inside a single request and this crate rebuilds the whole request every step. That leaves
+      `ToolCall` untouched — 199 literals across 73 files — and leaves `src/state.rs` with no DDL.
+    - >
+      **`probable` and not `high`, and the reason is the two wire bodies.** Both address
+      `messages[0]` and `messages[1]` by literal index, and four features write into those positions
+      (`web_key`, `effort_key`, `cached_system`, `cached_user`). Rebuilding the array while every
+      existing body test stays byte-identical is the largest single piece of work here, and a
+      byte-identity control is unforgiving by design.
+    - >
+      **The fallback scope is drawn along a line the release can be cut on.** The request reshape
+      and the two wire mappings are the outcome; the preset, the conversational framing and the
+      session seed each sit behind it and can be shed in order without a rewrite. Recorded at
+      specification time for exactly that reason.
+  major_cost_drivers:
+    - >
+      Rebuilding both wire bodies from a sequence while `web_key`, `effort_key`, `cached_system` and
+      `cached_user` keep writing into the right places and every locked body test stays
+      byte-identical.
+    - >
+      Emitting a message sequence from the assembler beside the flat string it already emits,
+      without changing one byte of that string — which is what makes the derived `user` assertable.
+    - >
+      A live caching measurement for N5, which costs a real provider call and can mislead if the
+      answering model is read from the environment rather than from the response.
+  recommended_scope_change: null
