@@ -129,6 +129,16 @@
 //! against a missing or newer-format checkpoint is a typed [`Error::Resume`],
 //! never a panic or a half-resume.
 //!
+//! **A request that can express a conversation.** [`CompletionRequest`] carries
+//! [`messages`](CompletionRequest::messages) — an ordered transcript of user
+//! turns, assistant turns holding the calls the model made, and batches of
+//! results answering them — and each built-in wire maps it onto that vendor's own
+//! block types one to one. Before 0.49.0 a run's own history reached the model as
+//! prose describing it, which is off the distribution these models are trained
+//! on. [`CompletionRequest::user`] is still filled, derived and byte-identical to
+//! what it was, so a [`Provider`] that reads it keeps working; it is retained for
+//! one release.
+//!
 //! **Providers, with fallback.** [`OpenRouter`], [`Anthropic`] and [`OpenAi`]
 //! behind one [`Provider`] trait, over the crate's own HTTP+SSE client.
 //! [`provider::Fallback`] moves to the next configured provider when one is down
@@ -425,7 +435,7 @@ pub use approve::{
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
 pub use context::{Compaction, ContextBudget};
-pub use contract::{Routing, SystemPrompt, TaskContract};
+pub use contract::{Preset, Routing, SystemPrompt, TaskContract};
 pub use error::{Error, ProviderErrorKind, Result};
 pub use hooks::Hooks;
 pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
@@ -439,8 +449,9 @@ pub use observe::{Broadcast, EventKind, Flow, Ignore, Observer, RunEvent};
 pub use plugin::{Dropped, Plugin, Plugins, MAX_ID, NAMESPACE, PLUGIN_FILE};
 pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{
-    Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, Effort, ModelInfo, OpenAi,
-    OpenRouter, PriceSource, PromptFamily, Provider, Reference, ToolCall, ToolSpec, Usage,
+    Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, Effort, Message, ModelInfo,
+    OpenAi, OpenRouter, PriceSource, PromptFamily, Provider, Reference, ToolCall, ToolResult,
+    ToolSpec, Usage,
 };
 #[cfg(feature = "media")]
 pub use provider::{Media, IMAGE_MEDIA_TYPES};

@@ -12,7 +12,7 @@ use io_harness::provider::{CompletionRequest, CompletionResponse, PromptFamily, 
 use io_harness::sandbox::{select, Sandbox, SandboxConfig};
 use io_harness::{
     run_tree, run_with, run_with_observed, Act, ApproveAll, Containment, ContextBudget, Effect,
-    EventKind, Flow, Observer, Policy, Provider, RunEvent, Session, Store, SystemPrompt,
+    EventKind, Flow, Observer, Policy, Preset, Provider, RunEvent, Session, Store, SystemPrompt,
     TaskContract, Verification,
 };
 use serde_json::json;
@@ -26,7 +26,15 @@ const V0440_WORKSPACE: &str = "You are an agent working across a repository to m
 
 const V0440_SINGLE: &str = "You are an agent that edits exactly one file to meet a stated specification. Call the `write_file` tool with the file's full new contents. Do not explain; make the edit. The file will be checked against the success criterion after each write.";
 
-const V0440_CONVERSATIONAL: &str = "You are an agent working across a repository to meet a stated specification. Use `grep` to search file contents and `find` to locate files by name, then `read_file` to inspect a file before changing it, and `write_file` with the file's path and full new contents to edit it. You may edit several files. Work in small steps; after each of your steps the whole set is checked against the success criterion. What the operator has said may not be work at all — it may be a greeting, a question about you or what you can do, or a remark that wants nothing done. If a plain answer is the whole of what is wanted, write that answer and call no tool. If any part of it needs the repository read or changed, call a tool and start: do not describe what you are about to do instead of doing it, and do not promise to act in prose. When the two readings are both possible, act.";
+/// **0.49.0 rebased this one, and only this one.** A classifying turn's system block
+/// no longer opens by telling an operator who typed "hi" that they wrote a
+/// specification, and no longer says the whole set is checked against a success
+/// criterion — a session turn carries `Verification::None`, so nothing is. That is
+/// the same mismatch 0.48.0's `I03` fixed one block lower down, and this release
+/// fixes it in the block above. The workspace, tree and single-file baselines below
+/// are 0.44.0's still, untouched, which is what says the change is confined to the
+/// turn that has not yet been decided to be work.
+const V0490_CONVERSATIONAL: &str = "You are an agent working in a repository, in conversation with an operator. Use `grep` to search file contents and `find` to locate files by name, then `read_file` to inspect a file before changing it, and `write_file` with the file's path and full new contents to edit it. You may edit several files. Work in small steps. What the operator has said may not be work at all — it may be a greeting, a question about you or what you can do, or a remark that wants nothing done. If a plain answer is the whole of what is wanted, write that answer and call no tool. If any part of it needs the repository read or changed, call a tool and start: do not describe what you are about to do instead of doing it, and do not promise to act in prose. When the two readings are both possible, act.";
 
 const V0440_TREE: &str = "You are an agent working across a repository to meet a stated specification. Use `grep`, `find`, `read_file`, and `write_file` as in a normal run. You may also decompose the work: call `spawn_agent` to launch a sub-agent that pursues a smaller goal over the same workspace, and its result is reported back to you. A sub-agent inherits your permissions and can only be more restricted, never less. Prefer spawning when parts of the task are independent. Work in small steps; the whole set is checked against the success criterion after each. Do not explain; call tools.";
 
@@ -197,7 +205,7 @@ async fn a_default_run_is_0_44_0_with_the_ending_moved_to_the_end() {
 
     relocated(
         &conversational_system(&contract(dir.path()), dir.path()).await,
-        V0440_CONVERSATIONAL,
+        V0490_CONVERSATIONAL,
         CONVERSATIONAL_ENDING,
     );
 
@@ -280,9 +288,12 @@ async fn no_caller_prompt_can_get_past_the_ending() {
     const HOUSE: &str = "ACME-HOUSE-STYLE prefer the smallest diff that works.";
     const INSTEAD: &str = "ACME-REPLACED you are Acme's release bot.";
 
-    // Builtin: the crate's description, and its ending last.
+    // Builtin: the crate's description, and its ending last. 0.49.0 — a classifying
+    // turn opens "in conversation with an operator" rather than "to meet a stated
+    // specification"; what this test is about is where the CALLER's text may sit,
+    // which is unchanged.
     let builtin = conversational_system(&contract(dir.path()), dir.path()).await;
-    assert!(builtin.starts_with("You are an agent working across a repository"));
+    assert!(builtin.starts_with("You are an agent working in a repository"));
     assert!(builtin.ends_with(CONVERSATIONAL_ENDING));
 
     // Append: after the crate's description, before the crate's ending.
@@ -291,7 +302,7 @@ async fn no_caller_prompt_can_get_past_the_ending() {
         dir.path(),
     )
     .await;
-    assert!(appended.starts_with("You are an agent working across a repository"));
+    assert!(appended.starts_with("You are an agent working in a repository"));
     assert!(appended.ends_with(CONVERSATIONAL_ENDING));
     let at = appended.find(HOUSE).expect("the appended text is carried");
     assert!(
@@ -1094,8 +1105,12 @@ async fn a_classifying_turn_keeps_the_order_the_cache_boundary_reads() {
     let words = user
         .find("and what can you do")
         .expect("the operator's words are in the request");
+    // 0.49.0 — the marker changed with the seed's own shape. The attribution moved
+    // from third-person prose ("the operator asked: …") to the message's role, so
+    // the entry is now `[operator]`; what this test asserts is the ORDER, which is
+    // unchanged and is what `cache_boundary_for` depends on.
     let seed = user
-        .find("[earlier turn]")
+        .find("[operator]")
         .expect("the conversation so far is in the request");
     assert!(
         words < seed,
@@ -1191,5 +1206,118 @@ async fn a_run_that_names_no_host_is_not_told_about_a_proxy() {
     assert!(
         line.contains("only where this run's policy permits it"),
         "0.47.0's wording survives for an unproxied run: {line}"
+    );
+}
+
+// ------------------------------------- 0.49.0: a conversation is not a specification
+
+/// **F8** — a turn that has not been decided to be work is not framed as a task,
+/// and every other shape is untouched.
+///
+/// The negative controls are what make this a change of one thing. A run under an
+/// explicit `TaskContract::workspace` still gets 0.44.0's opening byte for byte,
+/// and so does the tree — asserted here beside the change rather than trusted to
+/// the baselines above, because the two prompts share a composer and a change to
+/// it would move both.
+#[tokio::test]
+async fn a_classifying_turn_is_not_told_it_has_a_specification() {
+    let dir = workspace();
+
+    let classifying = conversational_system(&contract(dir.path()), dir.path()).await;
+    assert!(
+        !classifying.contains("to meet a stated specification"),
+        "an operator who typed a greeting was told they wrote a specification:\n{classifying}"
+    );
+    assert!(
+        !classifying.contains("checked against the success criterion"),
+        "a session turn carries Verification::None, so nothing is checked:\n{classifying}"
+    );
+    // Still the same agent with the same tools — the framing changed, not the world.
+    for tool in ["`grep`", "`find`", "`read_file`", "`write_file`"] {
+        assert!(
+            classifying.contains(tool),
+            "the conversational prompt must describe the same tools, missing {tool}"
+        );
+    }
+    // And 0.37.0's sentence about how a turn may end is still last.
+    assert!(classifying.ends_with(CONVERSATIONAL_ENDING));
+
+    // Negative control 1: a run the caller declared as work is unchanged.
+    let work = workspace_system(&contract(dir.path())).await;
+    assert!(
+        work.starts_with(
+            "You are an agent working across a repository to meet a stated \
+                          specification."
+        ),
+        "a workspace run's framing must not move:\n{work}"
+    );
+    assert!(work.contains("checked against the success criterion"));
+
+    // Negative control 2: so is the tree's.
+    let tree = tree_system(&contract(dir.path())).await;
+    assert!(
+        tree.starts_with(
+            "You are an agent working across a repository to meet a stated \
+                          specification."
+        ),
+        "a tree run's framing must not move:\n{tree}"
+    );
+}
+
+// -------------------------------------------------- 0.49.0: a preset, opt-in by name
+
+/// **F9** — a preset is reached by name and never by default, and `Builtin` does
+/// not move.
+///
+/// The byte-identity control is the load-bearing half: a preset that shipped as
+/// the default would be the thing 0.45.0 declined to ship, and it would pass every
+/// assertion about the preset's own text.
+#[tokio::test]
+async fn a_preset_is_opt_in_and_the_builtin_does_not_move() {
+    let dir = workspace();
+
+    // Nobody asked: 0.44.0's description, exactly as the baseline above.
+    let untouched = workspace_system(&contract(dir.path())).await;
+    relocated(&untouched, V0440_WORKSPACE, CALL_TOOLS_ENDING);
+
+    for (preset, marker) in [
+        (Preset::Concise, "Act before you explain"),
+        (
+            Preset::Careful,
+            "Before you report a change as done, check it",
+        ),
+    ] {
+        let shaped = workspace_system(
+            &contract(dir.path()).with_system_prompt(SystemPrompt::Preset(preset)),
+        )
+        .await;
+        assert!(
+            shaped.contains(marker),
+            "{preset:?} must carry its own working style, got:\n{shaped}"
+        );
+        // The same agent in the same workspace: a preset shapes how the work is
+        // done and reported, never what the agent can reach.
+        for tool in ["`grep`", "`find`", "`read_file`", "`write_file`"] {
+            assert!(shaped.contains(tool), "{preset:?} dropped {tool}");
+        }
+        // And everything the crate composes around a description still applies,
+        // in the order `Replace` already fixed — the ending last of all.
+        assert!(
+            shaped.ends_with(CALL_TOOLS_ENDING),
+            "{preset:?} got past the crate's ending:\n{shaped}"
+        );
+        assert_ne!(
+            shaped, untouched,
+            "{preset:?} composed to the builtin, so nothing was chosen"
+        );
+        // One preset is not the other.
+        assert!(!shaped.contains("port the parser"));
+    }
+
+    // Choosing one does not change what anyone else gets.
+    let after = workspace_system(&contract(dir.path())).await;
+    assert_eq!(
+        after, untouched,
+        "the builtin moved once a preset existed, which is exactly what must not happen"
     );
 }

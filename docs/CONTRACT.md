@@ -840,6 +840,20 @@ changing, and that is what this marker covers. 0.38.0 deliberately left the
 transcript unmarked because assembly rewrote earlier observations every turn;
 compaction is what removed the objection.
 
+**(0.49.0) The second marker is a count of messages on a request that carries a
+transcript**, and a byte offset only on one that does not. `cache_boundary` is an
+offset into `user`, which a conversational request does not send;
+`cache_through` names how many leading messages the caller states are stable, and
+the wire marks the last content block of the message before that count. It is a
+translation of the same decision, not a second one: the same guard rules on
+whether the prefix has already gone out once, and the marked span is asserted to
+cover exactly what the offset covered. On the OpenAI wire the marker only ever
+lands on a `role: "user"` message — an assistant message's content is `null`
+whenever the turn was a bare tool call, and whether that wire carries a marker on
+a `role: "tool"` message through to the vendor behind it is not something this
+crate can assert. Marking less costs a smaller hit; marking something the vendor
+drops costs a cache write on every step.
+
 | provider | what is sent | why |
 | --- | --- | --- |
 | `Anthropic` | `system` as a content-block array whose one block carries `cache_control: {"type":"ephemeral"}`; the user turn split into two text blocks with the same object on the first | that vendor's caching is request-side |
@@ -1619,6 +1633,59 @@ that will break struct literals of them.** It is written here rather than left t
 be discovered, and 0.22.0 is the precedent — it added three fields and broke
 exactly that. If you construct either in a mock provider or a test, prefer
 `..Default::default()` so that a new field costs you nothing.
+
+**0.49.0 is that minor, and it added two: `messages` and `cache_through`.**
+
+## What a message is, and what `user` is still for (0.49.0)
+
+`CompletionRequest::messages` is the conversation the request carries, in order:
+a user turn, an assistant turn holding the calls that step made, and one batch of
+results answering it. Each built-in wire maps it onto that vendor's own block
+types one to one. Empty — the default, and every caller before 0.49.0 — means
+every built-in wire sends the body it sent in 0.48.0, byte for byte.
+
+Before this release a request could not express a conversation at all. It held
+one `system` string and one `user` string, both wires emitted a single
+`role: "user"` message, and a step's results were re-rendered as bracketed prose
+inside the next one. So the crate parsed `tool_calls` off a response and then
+discarded the protocol on the way back in, and the model read a third-person
+account of its own past actions. That is off the distribution every model this
+crate targets was post-trained on, and what it produces is not an error but
+degraded instruction following: restating plans, narrating intent instead of
+acting, losing that a tool has already been called.
+
+**The ids are minted, not remembered.** A vendor correlates a `tool_use` id with
+the `tool_result` id answering it *within one request*, and this crate rebuilds
+the whole request on every step — so the id the vendor originally issued is never
+needed again, `ToolCall` gained no field for it, and nothing is stored. They are
+derived from the message's position and the call's, so the same transcript
+assembles to the same bytes, which is what a cache prefix requires. Nine
+characters and alphanumeric, the strictest id rule any vendor this crate plans to
+reach states.
+
+**A result names its call by position in the turn before it**, and a result that
+names a call that turn did not make is dropped from the body rather than sent
+with an invented id — a `tool_result` correlating with nothing is a 400 on at
+least one vendor. A message that would carry no blocks at all is dropped whole,
+for the same reason.
+
+**`user` is derived and kept for one release.** The loop fills it with exactly the
+string it filled before 0.49.0, so a `Provider` that reads it receives what it
+always received and is honestly non-conversational; a built-in wire ignores it
+whenever `messages` is non-empty. It will be removed in a later version. The two
+are not built separately: the assembler emits one sequence of pieces, the flat
+string is those pieces concatenated, and the conversation is those same pieces
+interleaved with the assistant turns — which is why they cannot drift into two
+accounts of one run.
+
+**Two cases are sent as prose, and both are prose today.** A resumed run rebuilds
+its ledger from stored observation text, which holds no tool-call structure, so
+its **pre-resume** history stays in the first user message and everything from
+the resume point on is role-tagged. And a step whose results do not line up with
+the calls it made falls back the same way, because correlating them positionally
+would answer the wrong call. Neither is a regression — both are exactly what
+0.48.0 sent — and neither is silent: `messages` is empty or short, and a reader
+can see it.
 
 **`rusqlite::Error` is in the public API, and the intent is to take it out
 (0.23.0).** `Error::State(#[from] rusqlite::Error)` carries the storage

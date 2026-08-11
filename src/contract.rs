@@ -11,11 +11,20 @@ use crate::verify::Verification;
 ///
 /// Until 0.45.0 the system prompt was three private `const`s an embedder could
 /// neither read nor change, so a program built on this crate could not give its
-/// agent its own voice without forking. This is the whole of the answer, and it
-/// is deliberately three states rather than a catalogue: a preset shipped by a
-/// library is an opinion about model behaviour that library cannot test and can
-/// never withdraw, and a preset written by the embedder is a `const` in the
-/// embedder's own crate.
+/// agent its own voice without forking.
+///
+/// **0.45.0 shipped three states and argued against a catalogue**, on the grounds
+/// that a preset shipped by a library is an opinion about model behaviour the
+/// library cannot test and can never withdraw. 0.49.0 adds a fourth, and the
+/// argument is answered rather than dropped: [`SystemPrompt::Preset`] is reached
+/// **by name and never by default**, so nothing is installed into anyone's product
+/// — `Builtin` is still what a caller who says nothing gets, byte for byte. The
+/// testability half is answered by the preset's text being asserted like any other
+/// prompt this crate emits. What remains true is that a preset's wording is public
+/// behaviour: changing one is a documented behaviour change, not an internal edit.
+///
+/// What 0.45.0 was actually objecting to — a library deciding an embedder's tone
+/// for them — is what a default preset would have been and what this is not.
 ///
 /// What no variant can reach is the crate's own ending — the sentence that
 /// decides what a turn is. It is emitted **last**, after everything here, because
@@ -52,6 +61,67 @@ pub enum SystemPrompt {
     /// does not replace what the crate has to say about the request it is
     /// building.
     Replace(String),
+    /// (0.49.0) One of the crate's own shaped descriptions, chosen **by name**.
+    ///
+    /// Composed exactly where [`SystemPrompt::Replace`]'s text is, so everything
+    /// the crate has to say about the request is still built around it.
+    Preset(Preset),
+}
+
+/// (0.49.0) A shaped agent description this crate ships, for an embedder who wants
+/// more than four tool names and less than a whole prompt of their own.
+///
+/// [`SystemPrompt::Builtin`] says what the tools are and nothing about how to use
+/// them: no tone, no output format, no rule about length. The two options before
+/// this were to accept that or to write an agent prompt from scratch. A preset is
+/// the third, and it is **opt-in by name** — see [`SystemPrompt`] for why that is
+/// not the thing 0.45.0 declined to ship.
+///
+/// Deliberately small. Each variant states the working style it is for, and a
+/// variant that is merely a tone would be the catalogue this is not.
+///
+/// ```
+/// use io_harness::{Preset, SystemPrompt, TaskContract};
+///
+/// let contract = TaskContract::workspace("port the parser", "/tmp/repo")
+///     .with_system_prompt(SystemPrompt::Preset(Preset::Concise));
+///
+/// // A preset is chosen, never inherited: the default is still the builtin.
+/// assert!(matches!(contract.prompt, SystemPrompt::Preset(Preset::Concise)));
+/// let plain = TaskContract::workspace("port the parser", "/tmp/repo");
+/// assert!(matches!(plain.prompt, SystemPrompt::Builtin));
+/// ```
+///
+/// `#[non_exhaustive]` from birth, for the reason [`SystemPrompt`] is: another
+/// working style is a thing a minor may add.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Preset {
+    /// Acts first and reports briefly. For an agent whose output a program reads,
+    /// or an operator who wants the change rather than an account of it.
+    Concise,
+    /// Verifies its own work before reporting it, and says what it checked. For a
+    /// run nobody is watching, where a confident wrong answer costs more than the
+    /// extra steps.
+    Careful,
+}
+
+impl Preset {
+    /// The description this preset composes in place of the builtin one.
+    ///
+    /// It names the same tools as [`SystemPrompt::Builtin`] because it describes the
+    /// same agent in the same workspace — a preset shapes how the work is done and
+    /// reported, never what the agent can reach.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Preset::Concise => {
+                "You are an agent working across a repository to meet a stated specification. Use `grep` to search file contents and `find` to locate files by name, then `read_file` to inspect a file before changing it, and `write_file` with the file's path and full new contents to edit it. Work in small steps; after each of your steps the whole set is checked against the success criterion. Act before you explain: make the change, then report what you changed in one or two sentences. Do not restate the request, do not narrate what you are about to do, and do not summarise work the operator can see in the diff."
+            }
+            Preset::Careful => {
+                "You are an agent working across a repository to meet a stated specification. Use `grep` to search file contents and `find` to locate files by name, then `read_file` to inspect a file before changing it, and `write_file` with the file's path and full new contents to edit it. Work in small steps; after each of your steps the whole set is checked against the success criterion. Before you report a change as done, check it: read back what you wrote, or run the project's own check where one exists. Say what you verified and how. If you could not verify something, say that instead of implying you did."
+            }
+        }
+    }
 }
 
 /// A single unit of work handed to the harness.

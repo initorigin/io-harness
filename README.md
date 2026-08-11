@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.48"
+io-harness = "0.49"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -270,6 +270,18 @@ from a terminal one.
 your program already does, or point the harness at MCP servers over stdio or
 streamable HTTP. Skills are markdown instruction files that shape how the agent
 approaches a class of task, with no Rust at all.
+
+**The model is asked a question it was trained to answer.** A request carries an
+ordered transcript — user turns, assistant turns holding the calls the model made,
+and the results answering them — and each wire maps it onto that vendor's own
+block types, `tool_use`/`tool_result` on Anthropic and `tool_calls` plus
+`role: "tool"` messages on the OpenAI wire. Through 0.48.0 a request held one
+system string and one user string, so the crate parsed the tool protocol off a
+response and discarded it on the way back in: a step's results were re-rendered as
+bracketed prose narrating the assistant's own past actions in the third person.
+That produced no error and nothing in a log, only degraded instruction following.
+`CompletionRequest::user` is still filled and byte-identical to what it was, so a
+provider written against an earlier release keeps working.
 
 **Provider-executed web search and fetch.** `TaskContract::with_web` declares what
 the provider may look up on the agent's behalf — search, optionally fetch, a cap on

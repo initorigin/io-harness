@@ -1,363 +1,511 @@
 product: io-harness
-version: 0.48.0
+version: 0.49.0
 tasks:
-- id: US-IO-HARNESS-0.48.0-T01
-  summary: Declare the mode each spawning tool needs and resolve it before the spawn.
-  why_required: Every later task runs a command under a mode, and until the declaration and the narrower-of-two
-    resolution exist there is nothing for the git built-ins or the handles to be contained under. It is
-    also the only task that adds a public trait method, so it settles the break surface first.
+- id: US-IO-HARNESS-0.49.0-T01
+  summary: Add `Message`, `CompletionRequest::messages` and `cache_through`, with `user` derived and documented.
+  why_required: Nothing else in the release can be written until a request can express a conversation;
+    every other task reads or writes these types.
   status: done
   depends_on: []
   acceptance_criteria:
-  - '**F5 — a call runs under the narrower of what it needs and what it was granted.** A git reader dispatched
-    under a run granting `WorkspaceWrite` is spawned under `ReadOnly`: the mode on its `SandboxEvent`
-    and `EventKind::Contained` reads `"read-only"` while the same run''s `exec`, in the same step, reads
-    `"workspace-write"` and writes into the workspace successfully. A spawn pinned to the resolved `ReadOnly`
-    mode is refused a write inside the workspace, which is what makes the resolution an enforcement and
-    not a label. Under a `FullAccess` grant nothing is narrowed and nothing is wrapped. Sabotage: resolve
-    to the granted mode rather than the narrower one, under which the git reader records `workspace-write`
-    and only this fails. **`US-IO-HARNESS-0.48.0-I01`**: this arm replaced one asserting a refused write
-    from a read-declared built-in, because no such built-in attempts a write and making one do so would
-    have regressed `git_status`.
-
-    '
-  - '**N3 — zero compile breaks, and `docs/public-api.txt` is unchanged.** The public additions are a
-    defaulted trait method, one `EventKind` variant, and one `RunSpec` builder — and the checker (`tests/docs_drift.rs`)
-    enumerates crate-root items rather than methods or variants, so the file is byte-identical. **The
-    number is stated at plan time as "unchanged"**, because a criterion promising a line count has been
-    met in a different form in four of the last ten releases and byte-identical is the stronger claim.
+  - '**N3 — the break is exactly what is named, and nothing more.** The compile breaks are: an exhaustive
+    struct literal of `CompletionRequest` outside this crate (two new fields, the documented cost of the
+    type not being `#[non_exhaustive]`) and an exhaustive literal of `Assembled`. `SystemPrompt` is already
+    `#[non_exhaustive]`, so its new variant is free; no trait method is added or changed, so every `impl
+    Provider` compiles unchanged; `ToolCall`, `CompletionResponse`, `ToolSpec` and `Usage` are untouched.
+    `docs/public-api.txt` gains the new crate-root items and **the count is stated at plan time as "the
+    enumerated additions only"**, because the checker enumerates crate-root re-exports rather than fields
+    or variants and a criterion promising a line count has been met in a different form in four of the
+    last ten releases.
 
     '
   files:
-  - src/tools/custom.rs
-  - src/tools/mod.rs
+  - src/provider/mod.rs
+  - src/lib.rs
+  evidence:
+  - '`cargo test --lib provider::transcript_tests` — 5 passed. The types are `Message` (`User` / `Assistant
+    { text, calls }` / `Results`), `ToolResult { call, content }`, and `CompletionRequest::{messages,
+    cache_through}`.'
+  - '`a_request_with_no_transcript_serialises_as_it_did_before_0_49_0` — a flat request carries neither
+    new key, so a `Replay` cassette recorded before this release still matches a flat request made after
+    it.'
+  - 'The first run of `an_unusable_cache_marker_is_ignored` FAILED with `attempt to subtract with overflow`:
+    `then_some(through - 1)` evaluates eagerly and underflowed on the very `Some(0)` case the guard exists
+    to reject. Fixed to `then(|| ...)`.'
+  - '`cargo test --test public_api` — 9 passed after `docs/public-api.txt` gained exactly the two enumerated
+    additions, `enum Message` and `struct ToolResult`, which is the number N3 stated at plan time. `every_public_item_has_a_worked_example`
+    required a doctest on `ToolResult` and now passes over 211 items.'
+- id: US-IO-HARNESS-0.49.0-T02
+  summary: Map a message sequence onto the Anthropic body as native `tool_use` and `tool_result` blocks.
+  why_required: The release's outcome is what reaches the wire; a neutral request the wire flattens again
+    delivers nothing.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.49.0-T01
+  acceptance_criteria:
+  - '**F2 — the Anthropic body carries native blocks with correlated ids.** The assistant message''s `content[]`
+    holds one `tool_use` entry per call with `id`, `name` and `input`; the next user message holds one
+    `tool_result` entry per result whose `tool_use_id` **equals** the id on the call it answers, asserted
+    as string equality between the two extracted values rather than against a literal. Sabotage: mint
+    the result''s id independently of the call''s, under which the two stop matching and only this fails.
+
+    '
+  - '**F4 — an empty `messages` sends the body that has always been sent.** For all four flavours — `Anthropic`,
+    `OpenRouter`, `OpenAi`, `Compatible` — a request with no messages produces a body byte-identical to
+    the one 0.48.0 produced, asserted against the locked expected bodies the wire test modules already
+    carry (`anthropic.rs:740`, `:771`, `:849`, `:895`; `openai_wire.rs:689`, `:733`, `:753`, `:806`, `:846`,
+    `:868`). This is the negative control the whole compatibility claim rests on. Sabotage: emit a one-element
+    `messages` array whenever `user` is non-empty, under which every one of those tests fails and nothing
+    else does.
+
+    '
+  files:
+  - src/provider/anthropic.rs
+  evidence:
+  - '`cargo test --lib anthropic` — 26 passed, 0 failed. That includes every pre-existing body test (`body_maps_tools_to_input_schema_and_system_top_level`,
+    `body_marks_one_cache_breakpoint_at_the_end_of_system`, `body_splits_the_user_turn_at_the_boundary_and_marks_only_the_first_half`,
+    `an_unusable_boundary_sends_the_body_that_has_always_been_sent`, `no_effort_leaves_the_anthropic_body_exactly_as_it_was`),
+    which is F4 asserted by the suite that was already there.'
+  - 'F2 — `the_body_carries_native_blocks_whose_ids_correlate`: the assistant turn carries a text block
+    and two `tool_use` blocks, the results turn is `role: "user"` and carries two `tool_result` blocks,
+    and each `tool_use_id` is asserted equal to the `id` of the call it answers rather than to a literal.'
+  - 'F4 — `an_empty_transcript_sends_the_0_48_0_body`: the whole `messages` array is asserted equal to
+    `[{role: user, content: <the flat string>}]`.'
+  - 'SABOTAGE (F2): appending one character to the result''s `tool_use_id` failed exactly one named test
+    — `the_body_carries_native_blocks_whose_ids_correlate` — with the other 25 passing, so the correlation
+    assertion is what is holding it and not the block shape.'
+  - A result correlating with nothing is dropped and a message left with no blocks is dropped whole (`a_result_correlating_with_nothing_is_dropped`),
+    because an empty `content` array is a 400.
+- id: US-IO-HARNESS-0.49.0-T03
+  summary: 'Map a message sequence onto the OpenAI/OpenRouter body as `tool_calls` and `role: "tool"`
+    messages.'
+  why_required: Three of the four flavours this crate ships go out over this wire; without it the reshape
+    reaches one vendor.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.49.0-T01
+  acceptance_criteria:
+  - '**F3 — the OpenAI body carries native blocks with correlated ids.** The assistant message carries
+    `tool_calls[]` with `id`, `type: "function"` and `function.name`/`function.arguments`, and one `role:
+    "tool"` message per result whose `tool_call_id` equals it. The same string- equality assertion as
+    F2. Sabotage: emit the results as a plain user message, which is what the wire does today, under which
+    the `role: "tool"` assertion fails and only this fails.
+
+    '
+  - '**F4 — an empty `messages` sends the body that has always been sent.** For all four flavours — `Anthropic`,
+    `OpenRouter`, `OpenAi`, `Compatible` — a request with no messages produces a body byte-identical to
+    the one 0.48.0 produced, asserted against the locked expected bodies the wire test modules already
+    carry (`anthropic.rs:740`, `:771`, `:849`, `:895`; `openai_wire.rs:689`, `:733`, `:753`, `:806`, `:846`,
+    `:868`). This is the negative control the whole compatibility claim rests on. Sabotage: emit a one-element
+    `messages` array whenever `user` is non-empty, under which every one of those tests fails and nothing
+    else does.
+
+    '
+  files:
+  - src/provider/openai_wire.rs
+  evidence:
+  - '`cargo test --lib openai_wire` — 25 passed, 0 failed, including every pre-existing body test: `body_maps_tools_to_function_schema`,
+    `the_openai_body_carries_no_breakpoint_and_keeps_its_bare_system_string`, `the_openrouter_body_carries_one_breakpoint_on_its_system_part`,
+    `the_openrouter_body_splits_the_user_turn_at_the_boundary`, `the_openai_body_ignores_a_boundary_entirely`,
+    `no_effort_leaves_both_bodies_exactly_as_they_were`, `no_declaration_adds_no_key_to_either_body`.'
+  - 'F3 — `the_body_carries_native_blocks_whose_ids_correlate`: five emitted messages (system, user, assistant,
+    two tool), `tool_calls[].function.arguments` a JSON string as this wire spells it, and each `tool_call_id`
+    asserted equal to the `id` of the call it answers.'
+  - 'F4 — `an_empty_transcript_sends_the_0_48_0_body` over BOTH flavours: two messages, the second equal
+    to `{role: user, content: <the flat string>}`.'
+  - 'SABOTAGE (F3): emitting the results as plain user messages failed exactly the two named tests that
+    assert the `role: "tool"` mapping and nothing else.'
+  - 'The marker index is recomputed rather than reused, because a results batch emits one message per
+    result and the emitted array is therefore longer than the caller''s list (`the_transcript_marker_lands_on_a_user_message`).
+    Only a user message is marked: an assistant `content` is null on a bare tool call, and whether this
+    wire carries a marker on a tool message through to the vendor behind it is not something the crate
+    can assert.'
+- id: US-IO-HARNESS-0.49.0-T04
+  summary: Emit a message sequence from the assembler beside the flat text it already emits.
+  why_required: The transcript is built from the ledger, and the ledger is only read here; without it
+    the loop has no messages to send.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.49.0-T01
+  acceptance_criteria:
+  - '**F1 — a multi-step run sends a role-tagged transcript.** A run driven to three steps produces a
+    request whose `messages` are, in order: a user turn, an assistant turn carrying the calls it made,
+    a results batch, an assistant turn, a results batch. Asserted on the captured `CompletionRequest`
+    **and** on the body each wire builds from it, because the first alone would pass for a wire that flattens
+    them again. Sabotage: have the loop send an empty `messages` and fill only `user`, which is today''s
+    behaviour, under which this fails and every negative control still passes.
+
+    '
+  - '**F10 — parallel calls in one step are one assistant turn and one results batch, in call order.**
+    A step whose completion carries four read-only calls — 0.41.0''s batch path — produces exactly one
+    assistant message with four `tool_use` blocks and exactly one results message with four `tool_result`
+    blocks, correlated pairwise, **in the model''s call order and not in completion order**, which is
+    the ordering 0.41.0 already guarantees for the folded text. Sabotage: emit one results message per
+    call, under which the count assertion fails and only this fails; and separately, fold in completion
+    order, under which the ordering assertion fails.
+
+    '
+  files:
+  - src/context.rs
+  evidence:
+  - '`cargo test --test context` — 19 passed, 0 failed, the 16 pre-existing assembler tests among them.'
+  - '`the_emitted_pieces_reconstruct_the_assembled_text_exactly` — the pieces concatenate to `Assembled::text`
+    byte for byte. This is what makes F5 assertable at all: the conversation and the derived `user` are
+    two renderings of ONE emission, not two emissions that have to be kept in step.'
+  - '`a_results_ordinal_is_the_index_of_the_call_it_answers` — the emitted shape is exactly `[(1,0,true),(1,1,true),(1,0,false),(2,0,true)]`:
+    a step''s results count from zero, prose answers no call, and the next step starts again.'
+  - '`an_elided_result_keeps_its_calls_position` — with a superseded read elided between two carried results
+    the ordinals are `[0 (elided), 1, 2]`. Counting only the surviving results would have slid the grep
+    up to call 0 and answered the read with it — a misalignment nothing in the assembled text would show.'
+  - 'No change to `assemble`''s signature and none to `Assembly`, so the break stays the two the contract
+    named: `Assembled` gains `emitted`, and that is all.'
+- id: US-IO-HARNESS-0.49.0-T05
+  summary: Build the request's transcript in the run loop with minted tool-call ids, and derive `user`
+    unchanged.
+  why_required: This is where a run stops narrating its own history in prose, and where the shim's byte-identity
+    is either kept or lost.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.49.0-T04
+  acceptance_criteria:
+  - '**F1 — a multi-step run sends a role-tagged transcript.** A run driven to three steps produces a
+    request whose `messages` are, in order: a user turn, an assistant turn carrying the calls it made,
+    a results batch, an assistant turn, a results batch. Asserted on the captured `CompletionRequest`
+    **and** on the body each wire builds from it, because the first alone would pass for a wire that flattens
+    them again. Sabotage: have the loop send an empty `messages` and fill only `user`, which is today''s
+    behaviour, under which this fails and every negative control still passes.
+
+    '
+  - '**F5 — the derived `user` is byte-identical to what 0.48.0 assembled.** Locked as a byte-exact constant
+    in the shape `tests/prompt.rs` already uses (`V0440_SINGLE`, `prompt.rs:234`): the same run under
+    the same fixture produces the same `user` string it produced before this release, character for character,
+    while `messages` is populated beside it. Sabotage: derive `user` by joining the messages with a separator
+    instead of reusing the assembled text, under which the locked string fails and only this fails.
+
+    '
+  - '**F10 — parallel calls in one step are one assistant turn and one results batch, in call order.**
+    A step whose completion carries four read-only calls — 0.41.0''s batch path — produces exactly one
+    assistant message with four `tool_use` blocks and exactly one results message with four `tool_result`
+    blocks, correlated pairwise, **in the model''s call order and not in completion order**, which is
+    the ordering 0.41.0 already guarantees for the folded text. Sabotage: emit one results message per
+    call, under which the count assertion fails and only this fails; and separately, fold in completion
+    order, under which the ordering assertion fails.
+
+    '
+  files:
   - src/run.rs
-  - tests/exec_mode.rs
   evidence:
-  - '`cargo test --test exec_mode` — exit 0, 5 passed. Includes the mode algebra decided without a host.'
-  - 'Sabotage: resolve to the granted mode rather than the narrower one — `a_git_reader_is_narrowed_to_read_only_inside_a_writing_run`
-    FAILED, 4 others passed.'
-  - 'Sabotage: drop the pre-spawn refusal — `a_git_write_under_read_only_is_refused_before_anything_spawns`
-    FAILED, 4 others passed.'
-- id: US-IO-HARNESS-0.48.0-T02
-  summary: Contain the six git built-ins under their declared mode.
-  why_required: '`Git::run` spawns `git` directly with no rung, so a run''s boundary today depends on
-    which tool the model picked. The release''s claim that everything a run starts is inside the boundary
-    is false until this spawn site is inside it.'
+  - '`cargo test` (default features) — exit 0, **79 test binaries, 1,594 passed, 0 failed**, including
+    **417** doctests. Run with `XDG_CONFIG_HOME` redirected, this machine''s standing environment fix
+    for `tests/plugin.rs`.'
+  - 'F1 — `a_multi_step_run_sends_a_role_tagged_transcript`: the opening step carries no transcript at
+    all (a one-message conversation is the flat request said twice), step 2 carries user / assistant-with-its-call
+    / results-batch, and by step 3 both steps are present in order.'
+  - 'F5 — `the_derived_user_is_the_flat_prompt_the_transcript_was_built_from`: the conversation''s own
+    text concatenates to `request.user` byte for byte, on every request that carries a transcript, and
+    that string is still the whole workspace prompt.'
+  - 'F10 — `parallel_calls_are_one_turn_and_one_batch_in_call_order`: three parallel reads become exactly
+    one assistant turn and one results batch, and result i is asserted to contain the content of call
+    i''s file.'
+  - 'SABOTAGE (F1): returning an empty transcript from `transcript` — 0.48.0''s behaviour — failed exactly
+    the three named tests above and nothing else.'
+  - THE SABOTAGE FOUND A WEAK TEST, and it is worth recording. F5's first form iterated `requests().filter(|r|
+    !r.messages.is_empty())` and would have passed VACUOUSLY under that sabotage, since the filter matched
+    nothing. It now asserts the count is non-zero first. The sabotage is what surfaced it; reading the
+    test did not.
+  - 'THE RESUME CASE WAS FOUND BY THE SUITE, not by reasoning. `a_workspace_replay_survives_being_interrupted_and_resumed`
+    (tests/determinism.rs) failed with `no recorded response for this request`: a resumed run rebuilds
+    its ledger from text and carries no transcript, so keying a cassette on `messages` made every post-resume
+    step a miss. Fixed by excluding `messages` from `Replay`''s key — it is a rendering of content the
+    key already covers, which is exactly what F5 proves. The two cache markers stay in the key, because
+    0.44.0 decided they are part of the question and `a_boundary_is_absent_from_an_unmarked_key_and_present_in_a_marked_one`
+    holds that decision; a first attempt that dropped them too failed that test by name.'
+- id: US-IO-HARNESS-0.49.0-T06
+  summary: Re-express the transcript cache marker as a message index and keep `PrefixGuard`'s rule.
+  why_required: 0.44.0's measured saving is billed money; a reshape that silently stops marking would
+    cost more than the release saves and fail no existing test.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.48.0-T01
+  - US-IO-HARNESS-0.49.0-T05
   acceptance_criteria:
-  - '**F4 — the git built-ins are contained, and `git_commit` under a mode that withholds the workspace
-    is refused before it spawns.** Under `ExecMode::WorkspaceWrite` a `git_commit` succeeds and its `SandboxEvent`
-    rows name the backend that applied; under `ExecMode::ReadOnly` the call is refused with an observation
-    naming the tool, the mode it needs and the mode the run grants, **and no `git` process is spawned**
-    — asserted by the absence of an `"exec"` sandbox row for it, not by the refusal text alone. Sabotage:
-    resolve the declared mode after the spawn rather than before, under which the row exists and the refusal
-    arrives as an errno, and only this fails.
+  - '**F7 — the transcript cache marker still lands, on the same content.** A run that has compacted marks
+    the message carrying the folded summary and nothing after it: `cache_through` names that index, the
+    wire marks the last content block of that message, exactly one such marker exists besides the system
+    one, and `EventKind::CacheMarked` fires on the transition and not per step. `PrefixGuard`''s rule
+    is asserted intact — a prefix seen once is **not** marked. Sabotage: mark on first sight, under which
+    the guard test fails and only that fails; and separately, mark the message after the summary, under
+    which the marked content assertion fails and only that fails.
 
     '
   files:
-  - src/tools/git.rs
   - src/run.rs
-  - tests/exec_mode.rs
+  - src/provider/mod.rs
   evidence:
-  - '`cargo test --test exec_mode` — exit 0, 5 passed; a commit lands under containment and the repository
-    is untouched under ReadOnly.'
-  - '`cargo test --test git` — exit 0, 5 passed, after the argv positions were re-asserted for `--no-optional-locks`.'
-  - '`cargo test` (default features) — exit 0, 415 lib tests and every integration suite green.'
-- id: US-IO-HARNESS-0.48.0-T03
-  summary: Contain a `shell_start` handle, per stage, with the resource caps and not the wall clock.
-  why_required: This is the execution path the release is named for and the one `docs/CONTRACT.md` documents
-    as uncontained. Without it an agent contains `exec` and escapes with `shell_start`.
+  - '`cargo test --test cache_boundary` — 9 passed, 0 failed, the seven 0.44.0 tests among them unchanged.'
+  - 'F7 — `the_transcript_marker_covers_the_span_the_byte_offset_names`: the messages through `cache_through`
+    concatenate to EXACTLY the span `cache_boundary` names, asserted against each other rather than each
+    against a literal, and that span still ends at the folded summary''s own sentence. The fold''s own
+    step carries neither marker, so `PrefixGuard`''s see-it-twice rule survives the translation.'
+  - 'The whole transcript is never marked: `cache_through < messages.len()` is asserted, because the last
+    message is the turn being asked about and marking it would write a prefix that moves every step.'
+  - 'SABOTAGE (F7): marking one message past the boundary failed exactly `the_transcript_marker_covers_the_span_the_byte_offset_names`
+    and nothing else — the seven 0.44.0 tests still passed, which is what makes the new assertion the
+    one holding this claim.'
+  - '`a_run_that_never_folds_marks_no_messages` — 0.44.0''s no-fold control asserted again for the field
+    this release added.'
+- id: US-IO-HARNESS-0.49.0-T07
+  summary: Seed a session's prior turns as real user and assistant messages.
+  why_required: A conversation whose own history is bracketed prose is the same off-distribution shape
+    the release exists to remove, one level up.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.48.0-T01
+  - US-IO-HARNESS-0.49.0-T05
   acceptance_criteria:
-  - '**F1 — a `shell_start` handle cannot write outside its granted roots.** Driven end to end from `TaskContract::workspace(goal,
-    root)` with no builder call: a line started through `shell_start` that writes to an absolute path
-    outside the workspace leaves no file, `shell_poll` shows the failure, and the same line started under
-    `with_full_access()` writes it. Asserted on the filesystem, never on the presence of a `ShellSandbox`.
-    Sabotage: pass `None` for the handle''s sandbox, which is today''s behaviour, under which the outside
-    file appears and only this fails.
-
-    '
-  - '**F2 — every stage of a handle is contained, not only the first.** A two-stage line whose *second*
-    stage writes outside the granted roots leaves no file, and the same line''s first stage still reaches
-    the second — the pipe is intact. This is asserted separately from F1 because a one-stage test passes
-    for an implementation that wraps only the head. Sabotage: wrap the first stage only, under which the
-    second stage''s write lands and only this fails.
-
-    '
-  - '**F3 — a handle takes the resource caps a foreground `shell` stage takes, and the wall clock reaches
-    neither.** Under a `SandboxConfig` whose `max_wall_secs` is one second, a handle started and polled
-    well after that deadline is still running, while the same run''s `exec` of a sleeping command is killed
-    and reported as a cap hit naming `Cap::Wall` — the wall clock is enforced by the sandbox''s own runner,
-    which `exec` uses and no `shell` path does. The caps a handle *does* take are asserted to apply: on
-    unix, a stage under `max_cpu_secs = 1` that spins is killed by `RLIMIT_CPU`. Sabotage: drop `apply_rlimits`
-    from the handle''s spawn, under which the spinning stage runs on and only this fails. **`US-IO-HARNESS-0.48.0-I02`**:
-    the control was a wall-capped foreground `shell` line, which no release has ever produced — `max_wall_secs`
-    lives in `run_capped` and the `shell` tool does not reach it.
+  - '**F6 — a session''s prior turns are turns.** A second turn in a session sends the first turn''s prompt
+    as a user message and its reply as an assistant message; the strings `[earlier turn] the operator
+    asked:` and `[earlier turn] you answered:` appear **nowhere** in the request. Asserted as an absence
+    and a presence together, because either alone passes for a build that sends both. Sabotage: restore
+    `Session::seed`''s bracketed strings, under which the absence assertion fails and only this fails.
 
     '
   files:
-  - src/tools/shell.rs
+  - src/session.rs
+  evidence:
+  - '`cargo test --test session_reply` — 9 passed, 0 failed.'
+  - 'F6 — `an_earlier_turn_arrives_as_that_speakers_own_message`: the operator''s earlier turn is a `Message::User`
+    carrying their words, the agent''s own answer is a `Message::Assistant` with no calls, and the strings
+    `the operator asked:` and `you answered:` are absent from the whole request including `user`. Presence
+    and absence are asserted together: presence alone passes for a build that sends the turns AND keeps
+    narrating them, absence alone passes for one that dropped them.'
+  - 'SABOTAGE (F6): untagging the seed entries — 0.48.0''s behaviour, where a prior turn is prose inside
+    somebody else''s message — failed exactly that one test.'
+  - 'THE SEED''S PROSE CHANGED, and two existing tests changed with it, each with the sentence saying
+    why. `tests/session_reply.rs`''s `a_reply_is_read_by_the_turn_that_follows_it` asserted the literal
+    `you answered: ` and now asserts `[agent] `; `tests/prompt.rs` looked for `[earlier turn]` to check
+    the ORDER of the operator''s words against the conversation, which is unchanged, and now looks for
+    `[operator]`. The attribution moved out of third-person prose and into the message''s role, which
+    is the release''s own argument applied to the seed.'
+  - '`cargo test` (default features) — exit 0 with the whole suite green after the change.'
+- id: US-IO-HARNESS-0.49.0-T08
+  summary: Frame a conversational turn as a conversation rather than as a task with a goal.
+  why_required: '`Session::default_contract` turns a greeting into a specification, which is the second
+    of the three faults the contract names.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.49.0-T07
+  acceptance_criteria:
+  - '**F8 — a conversational turn is not framed as a task, and 0.48.0''s `I03` fix is untouched.** A turn
+    under `Session::turn` sends a system block that does not contain "working across a repository to meet
+    a stated specification" and a first user message that is the operator''s words — while the negative
+    controls hold: a turn under an explicit `TaskContract::workspace` sends the workspace prompt byte-identically,
+    and step 2 of a promoted turn is byte-identical to what this build sends today, which is 0.48.0''s
+    own F10 control asserted again here because this release touches those call sites. Sabotage: route
+    the conversational turn back through `TaskContract::workspace`, under which the framing assertion
+    fails and only this fails.
+
+    '
+  files:
+  - src/session.rs
+  - src/contract.rs
   - src/run.rs
-  - tests/handles.rs
   evidence:
-  - '`cargo test --test contained_handles` — exit 0, 5 passed.'
-  - 'Sabotage: pass `None` for the handle''s sandbox (0.47.0''s behaviour) — F1, F2 and F3''s caps arm
-    all FAILED by name; both negative controls still passed.'
-  - 'Finding: the first draft of F1 and F2 passed against a handle that had been killed before it could
-    act. `Handles` kills on drop at run end, and a contained stage pays `sandbox-exec`''s startup while
-    an uncontained one does not, so the confinement assertions were satisfied by a dead process. Every
-    confinement assertion is now paired with a write that must land.'
-- id: US-IO-HARNESS-0.48.0-T04
-  summary: Build the loopback egress proxy the run owns, and record every dial.
-  why_required: Per-host egress has no mechanism at all until a component exists that can be asked about
-    a host. It is also the release's only new long-lived resource, so its lifetime and shutdown are settled
-    before anything depends on it.
+  - '`cargo test --test prompt` — 20 passed, 0 failed.'
+  - 'F8 — `a_classifying_turn_is_not_told_it_has_a_specification`: the classifying turn''s system block
+    contains neither `to meet a stated specification` nor `checked against the success criterion` — a
+    session turn carries `Verification::None`, so nothing IS checked — while still describing the same
+    four tools, and 0.37.0''s sentence about how a turn may end is still last.'
+  - 'The negative controls are in the same test and are what make it a change of one thing: a run under
+    an explicit `TaskContract::workspace` and a tree run both still open with 0.44.0''s sentence byte
+    for byte. The two byte-exact baselines in `tests/prompt.rs` say the same thing — `V0440_WORKSPACE`,
+    `V0440_TREE` and `V0440_SINGLE` are untouched and only the conversational one was rebased, as `V0490_CONVERSATIONAL`.'
+  - 'SABOTAGE (F8): composing the classifying turn from `WORKSPACE_PROMPT` again — 0.48.0''s behaviour
+    — failed three named tests, all three of them the ones that lock a classifying turn''s opening, and
+    no others.'
+  - 'DEVIATION, stated rather than glossed: the scope named a `TaskContract::conversation` constructor
+    beside `TaskContract::workspace`. It was NOT added, because it would have been byte-identical to `workspace`
+    — that constructor already defaults to `Verification::None` (`src/contract.rs:470`), and the operator''s
+    words already reach the model as the first user text through `conversational_user_prompt`. A public
+    constructor that differs from an existing one in nothing is a synonym, not an affordance. The substance
+    of the scope item — a conversation is not framed as a specification — landed where it is actually
+    read, in the system block.'
+- id: US-IO-HARNESS-0.49.0-T09
+  summary: Add `SystemPrompt::Preset`, opt-in by name, with `Builtin` byte-identical.
+  why_required: 'The third fault the contract names: an embedder''s only shaped-agent option today is
+    to write a whole prompt from scratch.'
   status: done
-  depends_on: []
+  depends_on:
+  - US-IO-HARNESS-0.49.0-T01
   acceptance_criteria:
-  - '**F6 — a contained command reaches a permitted host and is refused a denied one, through the proxy.**
-    Two loopback listeners the test starts, a policy permitting one and not the other, and one contained
-    command dialling both: the first returns the listener''s bytes, the second is refused, `policy_events`
-    carries a `net` row per dial with the effect and the deciding layer, and a `SandboxEvent` of kind
-    `"dial"` names each `host:port`. On a host with no proxy-capable rung the test asserts instead that
-    the run took the boolean and that `EventKind::Contained` reported the backend that applied — the honesty
-    rule asserted rather than skipped, which is 0.40.0''s lesson about a test that steps over a fallback.
-    Sabotage: answer every `CONNECT` with `200` without consulting the policy, under which the denied
-    host is reached and only this fails.
-
-    '
-  - '**O3 — no test leaves a handle, a listener or a proxy running.** The proxy''s task ends with the
-    run that owns it, asserted by a test that starts a run with a proxy, ends it, and finds the port closed.
-    This is the same class of leak the handle registry exists to prevent and it gets the same treatment.
+  - '**F9 — a preset is opt-in and `Builtin` does not move.** With no `with_system_prompt` call the composed
+    system block is byte-identical to this build''s; with `SystemPrompt::Preset(p)` the base description
+    is that preset''s text and everything `compose` appends after it — the skill catalogue, the appended
+    text, the framed sections, the ending — is in the same order and the same bytes as under `Replace`.
+    Sabotage: make a preset the default, under which the byte- identity control fails and only this fails.
 
     '
   files:
-  - src/sandbox/proxy.rs
-  - src/sandbox.rs
-  - src/observe.rs
-  - src/state.rs
+  - src/contract.rs
   - src/run.rs
-  - tests/egress.rs
   evidence:
-  - '`cargo test --lib sandbox::proxy` — exit 0, 7 passed: the request forms, a permitted host tunnelled
-    and a denied one refused by name, the decisions drained once, the policy read per dial so a mid-run
-    narrowing reaches it, and the listener ending with the run (O3).'
-  - '`cargo tree` — 402, unchanged: tokio''s net and io-util features were already enabled transitively
-    by reqwest, so N1 holds.'
-  - 'Run-level: 0.40.0''s `egress_under_containment_is_all_hosts_or_none_and_never_the_named_host` FAILED
-    on the proxy''s first run, exactly as its own failure message predicted, and was inverted to assert
-    that a host the policy never named is refused.'
-- id: US-IO-HARNESS-0.48.0-T05
-  summary: Scope the sandbox to the proxy and nothing else, and put it in the command's environment.
-  why_required: A proxy a payload can dial past is a convention, not a boundary. This task is what makes
-    the difference, and F7 is the only criterion that can tell the two apart.
+  - '`cargo test --test prompt` — 21 passed, 0 failed.'
+  - 'F9 — `a_preset_is_opt_in_and_the_builtin_does_not_move`: with nothing asked for, the composed prompt
+    is still 0.44.0''s `V0440_WORKSPACE` baseline; each of the two presets carries its own working style,
+    still names all four tools, still ends with the crate''s own ending, and differs from the builtin;
+    and the builtin is re-read afterwards and asserted unchanged.'
+  - 'SABOTAGE (F9): making `Preset::Concise` the description `Builtin` composes — a preset shipped as
+    the default, which is precisely what 0.45.0 declined — failed five named tests including the byte-exact
+    0.44.0 baselines, and F9''s own control among them.'
+  - '`SystemPrompt` is `#[non_exhaustive]` since 0.45.0, so the new variant costs no caller a recompile.
+    `docs/public-api.txt` gains one line, `enum Preset`, with a worked example (`cargo test --test public_api`
+    — 9 passed).'
+  - '0.45.0''s doc comment argued AGAINST a preset catalogue in terms this release had to answer rather
+    than delete: a preset is reached by name and never by default, so nothing is installed into anyone''s
+    product; its text is asserted like any other prompt the crate emits; and what remains true — that
+    a preset''s wording is public behaviour and changing one is a documented behaviour change — is now
+    written where the old argument was.'
+- id: US-IO-HARNESS-0.49.0-T10
+  summary: Report a `Replay` miss from the message sequence, and re-record the repository's cassettes.
+  why_required: A cassette recorded before this release misses silently against a request that now carries
+    messages, and a miss reported as "no recorded response" is unreadable.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.48.0-T04
+  - US-IO-HARNESS-0.49.0-T05
   acceptance_criteria:
-  - '**F7 — the proxy is the only route out.** Under a run whose policy names hosts, a contained command
-    dialling a permitted host **directly**, with the proxy environment stripped from its own environment,
-    is refused by the sandbox rather than connecting — on a rung that can be address-scoped or port-scoped.
-    This is the criterion that separates a boundary from a convention, and on a rung that can enforce
-    neither it asserts the run did not take that rung for a per-host policy. Sabotage: emit `(allow network*)`
-    alongside the loopback rule, under which the direct dial succeeds and only this fails.
+  - '**O3 — recorded cassettes are handled explicitly, not discovered.** `Replay` keys on the serialized
+    request (`src/provider/replay.rs:68-69`), so a cassette recorded before this release misses against
+    a request that now carries messages. Every cassette in the repository is re-recorded or its fixture
+    is shown to send no messages, and the changelog tells an embedder that their own recordings need the
+    same. A silent miss reported as "no recorded response" is the failure this criterion exists to prevent.
 
     '
   files:
-  - src/sandbox/macos.rs
-  - src/sandbox/linux.rs
-  - src/sandbox.rs
-  - tests/egress.rs
+  - src/provider/replay.rs
   evidence:
-  - '`cargo test --test exec_contained` — exit 0, 21 passed: a named host reached through the proxy with
-    its dial row, an unnamed one refused by the policy with the rule named, and a direct dial past the
-    proxy refused by the kernel (F7).'
-  - 'THE FAULT AND HOW IT WAS FOUND: curl exited 7 with no dial row, which read as bad SBPL. Driving sandbox-exec
-    directly against a four-line profile with a real listener, all four candidate forms returned HTTP
-    200 including the one already shipped -- eliminating syntax by measurement. The backends rebuild the
-    RunSpec for their wrapper argv and dropped the proxy on the way, so the profile permitted the address
-    while the command was never told to use it.'
-  - 'Sabotage: emit `(allow network*)` beside the loopback rule -- F7 FAILED ALONE while both proxy tests
-    still passed, which is exactly the distinction F7 exists to make.'
-- id: US-IO-HARNESS-0.48.0-T06
-  summary: Prefer a proxy-capable rung for a run whose policy names hosts.
-  why_required: The namespace rungs cannot reach the host's loopback, so without this a per-host run is
-    silently given a rung that cannot serve it. This is the honesty rule of the release and it is decided
-    in one pure function.
+  - '`cargo test --test replay` — 10 passed; `cargo test --test determinism` — 8 passed.'
+  - 'O3 — `a_recording_answers_the_same_request_with_or_without_a_transcript` asserts BOTH directions:
+    a recording made flat (as every release through 0.48.0 made them) answers a request carrying a transcript,
+    and a recording made carrying one answers a request with none, which is the post-resume case.'
+  - 'SABOTAGE: putting `messages` back into the key failed exactly two named tests — the O3 test above
+    and `a_workspace_replay_survives_being_interrupted_and_resumed` — which is the pair that says the
+    exclusion is load-bearing rather than tidy.'
+  - 'THE CONTRACT''S O3 IS MET IN A DIFFERENT FORM, and this is the honest version: it required every
+    cassette in the repository to be re-recorded. **No cassette needed re-recording, and none exists to
+    re-record** — `find . -name ''*.json'' -path ''*fixture*''` returns store databases and cargo build
+    artifacts, not provider recordings; every recording in the suite is made in-test. The substance of
+    the criterion — that a stale recording must not silently miss — is delivered by the key excluding
+    the transcript, and is asserted rather than assumed.'
+  - The miss message now reports the message count beside the system length and the first 120 characters
+    of `user`, so a genuine divergence names what shape the request was.
+- id: US-IO-HARNESS-0.49.0-T11
+  summary: Bring `docs/CONTRACT.md`, the crate-root prose, the README and the changelog to 0.49.0.
+  why_required: These are checked-in surfaces with their own drift tests, and the contract requires them
+    to change in this release rather than the next one.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.48.0-T05
-  acceptance_criteria:
-  - '**F8 — the rung preference is a table, decided without a host.** A pure test over the decision function
-    for every combination of probe answers, mode, egress answer and *whether the policy names hosts*:
-    a per-host run returns a proxy-capable rung where one exists, returns the boolean rung with the flattened
-    answer where none does, and a run with no per-host rules returns exactly what 0.47.0''s table returned
-    — the negative control that must not move. Sabotage: prefer the namespace rung for a per-host run,
-    under which the per-host rows return a rung that cannot reach the proxy and only this fails.
-
-    '
-  files:
-  - src/sandbox/linux.rs
-  - src/sandbox.rs
-  - tests/egress.rs
-  evidence:
-  - '`cargo test --lib sandbox::linux` — exit 0, 16 passed, including the F8 table over abi x bwrap x
-    unshare x deny x proxied.'
-  - 'Sabotage: let a proxied run take a namespace rung — `a_proxied_run_takes_a_rung_that_can_reach_its_proxy`
-    FAILED alone.'
-  - The negative control inside F8 re-derives all 40 of 0.47.0's rows and requires them unchanged when
-    `proxied` is false.
-- id: US-IO-HARNESS-0.48.0-T07
-  summary: Report the proxy as advisory where it is advisory.
-  why_required: On the portable floor and on Windows the proxy is an environment variable and nothing
-    more. A boundary that is reported as enforced where it is not is the defect 0.40.0 shipped, and this
-    release must not repeat it.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.48.0-T05
-  acceptance_criteria:
-  - '**F9 — on the floor and on Windows the proxy is reported as advisory.** The run completes, the environment
-    carries the proxy variables, `EventKind::Contained` names the backend that applied, and the crate''s
-    own report says the egress boundary is advisory on that backend rather than enforced. A payload that
-    ignores the variables reaches the network, and the test asserts that this is what the crate says will
-    happen. Sabotage: report the per-host boundary as enforced on the floor, under which the assertion
-    on the reported wording fails and only this fails.
-
-    '
-  files:
-  - src/sandbox.rs
-  - src/run.rs
-  - tests/egress.rs
-  evidence:
-  - '`cargo test --test prompt` — exit 0, 19 passed, including the advisory wording.'
-  - 'FINDING: the first sabotage of F9 FAILED NOTHING. The test branched on this host''s backend, which
-    always denies egress here, so the advisory arm was never exercised. `floor_only()` forces it on every
-    host; the re-run sabotage then FAILED `the_floor_is_told_its_proxy_is_advisory` by name.'
-- id: US-IO-HARNESS-0.48.0-T08
-  summary: Bring every documentation surface to what the code now does.
-  why_required: '`docs/CONTRACT.md` states that handles are uncontained and `src/state.rs:809` states
-    that there is no dial to observe. Both become false in this release, and a checked-in surface that
-    contradicts the code is a defect the drift tests exist to catch.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.48.0-T03
-  - US-IO-HARNESS-0.48.0-T07
+  - US-IO-HARNESS-0.49.0-T05
   acceptance_criteria:
   - '**O4 — the documentation surfaces agree with the code, in the same release.** `docs/CONTRACT.md`
-    no longer states that handles are uncontained, states what a handle''s caps are and are not, states
-    per rung what the proxy proves and what it does not, and uses the word "advisory" where it is advisory.
-    `src/lib.rs`, the README table and `CHANGELOG.md` agree, and `tests/docs_drift.rs` and `tests/changelog.rs`
-    pass.
-
-    '
-  - '**N4 — no durable state moves.** `git diff main -- src/state.rs` shows **no DDL**: no table, column
-    or index, and `CHECKPOINT_FORMAT` unmoved at 7. The only change to that file is the corrected `kind`
-    documentation and the new value it now describes. Every other release since 0.44.0 has produced an
-    empty diff there and this one states the exception rather than letting a reader find it.
+    describes what a message is, what the derived `user` is for and when it goes, which marker applies
+    on which path, and the corrected per-vendor-difference count. `src/lib.rs`, the README and `CHANGELOG.md`
+    agree, and `tests/docs_drift.rs` and `tests/changelog.rs` pass.
 
     '
   files:
   - docs/CONTRACT.md
   - src/lib.rs
-  - src/state.rs
   - README.md
   - CHANGELOG.md
   evidence:
-  - '`cargo test --test docs_drift --test changelog` — exit 0, 15 + 5 passed.'
-  - '`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0 after
-    fixing FOUR intra-doc link errors stable cargo doc does not report.'
-  - docs/CONTRACT.md, README.md, src/lib.rs, CHANGELOG.md and the src/state.rs comment this release falsified
-    are all updated in this release.
-- id: US-IO-HARNESS-0.48.0-T09
-  summary: Run every gate and measure what the release claims about numbers.
-  why_required: The release claims a flat dependency count, an unchanged public API, no DDL, and an affordable
-    per-dial overhead. Each is a claim about a number and none of them is true until it has been measured
-    on this tree.
+  - '`cargo test --test docs_drift` — 15 passed; `cargo test --test changelog` — 5 passed; `cargo test
+    --doc` — 418 passed.'
+  - O4 — `docs/CONTRACT.md` gains a section saying what a message is, why the ids are minted rather than
+    remembered, what `user` is still for and when it goes, and the two cases still sent as prose (a resumed
+    run's pre-resume history, and a step whose results do not line up with its calls). The caching section
+    says which marker applies on which path and why the OpenAI wire marks only a user message. The 0.24.0
+    note that these two structs 'may gain fields in a later minor' now records that 0.49.0 is that minor.
+  - '`CHANGELOG.md` carries both breaks with `*Migration:*` notes — the struct-literal break and the behaviour
+    break — plus the derived `user`, the reframed classifying turn, the reworded seed, and the `Replay`
+    key change. `every_breaking_entry_carries_a_migration_note` passes.'
+  - The crate-root prose in `src/lib.rs` and the README both lead with what the release is for, and both
+    state that a provider reading `user` keeps working.
+  - '`Cargo.toml` 0.48.0 → 0.49.0 and the README''s install snippet 0.48 → 0.49, which `readme_dependency_version_matches_cargo_toml`
+    checks.'
+- id: US-IO-HARNESS-0.49.0-T12
+  summary: Run the release gates and measure the live caching figure.
+  why_required: Every non-functional claim in the contract is a number or an exit code, and none of them
+    is true until it has been seen.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.48.0-T08
+  - US-IO-HARNESS-0.49.0-T11
   acceptance_criteria:
   - '**N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402** crates
-    on macOS and Linux. The proxy is `tokio::net::TcpListener` plus a hand-parsed request line; no `hyper`,
-    no `http`, no `tower`, no TLS crate.
+    on macOS and Linux. Messages are `serde_json` values built by hand, exactly as both wire bodies are
+    built today.
 
     '
   - '**N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
 
     '
-  - '**N5 — the proxy''s per-dial overhead is measured, not asserted to be small.** The same fixed request
-    is timed direct, through the proxy on a permitted host, and refused on a denied one, over the 30-iteration
-    shape 0.46.0 used to record ~6.25 ms of containment overhead. Every figure goes into the release record.
-    A proxy is a hop and the claim that the hop is affordable is a claim about a number.
+  - '**N4 — no durable state moves.** `git diff main -- src/state.rs` shows **no DDL**: no table, column
+    or index, and `CHECKPOINT_FORMAT` unmoved at 7. This is a consequence of minting ids rather than storing
+    them, and it is asserted rather than assumed.
+
+    '
+  - '**N5 — prompt caching does not regress, and the number is re-measured.** A live run through OpenRouter
+    against a pinned model repeats 0.44.0''s measurement — system breakpoint alone, then system plus transcript
+    — and the cache-read figure is recorded in the release record beside 0.44.0''s 13,093 of 13,113. A
+    reshape that quietly stops caching would cost money and fail no test, which is why this is a criterion
+    and not a hope.
 
     '
   - '**N6 — 0.41.0''s batch, 0.42.0''s gate, 0.43.0''s fold, 0.44.0''s boundary, 0.45.0''s prompt, 0.46.0''s
-    default and 0.47.0''s chain are unaffected.** Their suites pass unchanged. Specifically: the composed
-    system prompt is still byte-identical across the steps of a run and still composed once — the proxy
-    is started once per run and the boundary section names the backend `select` returned, and a per-step
-    re-resolution would turn 0.38.0''s cache read into a cache write on every step and fail no other test.
+    default, 0.47.0''s chain and 0.48.0''s containment are unaffected.** Their suites pass unchanged.
+    Specifically: the composed system prompt is still byte-identical across the steps of a run and still
+    composed once, and 0.43.0''s context-overflow retry still folds and re-asks once per step with the
+    messages rebuilt from the folded ledger.
 
     '
   - '**O1 — the full suite passes on all three platforms**, on the standing CI matrix including 0.47.0''s
-    `contained (ubuntu, userns restricted)` leg, which is the leg where the Landlock rung and therefore
-    the Linux proxy path is the one actually taken.
+    `contained (ubuntu, userns restricted)` leg.
 
     '
-  - '**O2 — cross-version is unaffected and proven so.** No DDL, so a 0.47.0 store and a 0.48.0 store
+  - '**O2 — cross-version is unaffected and proven so.** No DDL, so a 0.48.0 store and a 0.49.0 store
     are the same store in both directions, asserted by the existing cross-version suites.
 
     '
   files:
   - docs/public-api.txt
   evidence:
-  - '`cargo test` (default features) — exit 0, 79 suites, 1,572 passed, 415 doctests.'
-  - '`cargo test --all-features` — exit 0, 79 suites, 1,658 passed, 418 doctests.'
-  - '`cargo fmt --check` exit 0; `cargo clippy --all-targets --all-features -- -D warnings` exit 0.'
-  - '`cargo tree` — 402, unchanged (N1). `git diff main -- docs/public-api.txt` EMPTY (N3). `git diff
-    main -- src/state.rs` is comment-only, no DDL, CHECKPOINT_FORMAT unmoved at 7 (N4).'
-  - '`cargo test --test cross_version_0_29_0 -- --ignored` — exit 0, 1 passed (O2).'
-  - '`cargo package --locked` — exit 0, 1,616,667 bytes.'
-  - 'N5 measured: direct 0.121 ms, permitted 0.420 ms, refused 0.271 ms per dial over 30 iterations.'
-- id: US-IO-HARNESS-0.48.0-T10
-  summary: Ask a classifying turn one question instead of two that disagree.
-  why_required: The system block tells the first step of a conversational turn to answer and call no tool
-    while the user block in the same completion tells it to start by grepping and to call a tool. The
-    model resolves the contradiction in its reply, which is what an embedder reported from the field.
-    It is wrong on every conversational turn shipping today (US-IO-HARNESS-0.48.0-I03).
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - '**F10 — a classifying turn is asked one question, not two that disagree** (`US-IO-HARNESS-0.48.0-I03`).
-    The first request of a turn whose contract carries `Verification::None` contains no imperative to
-    call a tool and no success-criterion scaffolding: the strings "Call a tool to make progress toward
-    the success criterion", "(nothing yet — start by grepping or finding)" and "Success criterion:" are
-    all absent from its `user` block, while the operator''s own words are present. The negative controls
-    are what make it a change of one thing: **step 2 of a promoted turn is byte-identical to what this
-    build sends today**, and so is step 1 of a turn under any other `Verification`. And 0.44.0''s boundary
-    marks the same prefix on a classifying turn as on a promoted one — asserted rather than assumed, because
-    `cache_boundary_for` is handed this very string and a second user-prompt shape could silently change
-    what is cached while nothing fails. Sabotage: send the workspace user prompt on the classifying step,
-    which is today''s behaviour, under which the imperative reappears and only this fails; and separately,
-    send the conversational prompt on **every** step, under which the promoted turn''s byte-identity control
-    fails and only that fails.
-
-    '
-  files:
-  - src/run.rs
-  - tests/prompt.rs
-  evidence:
-  - '`cargo test --test prompt` — exit 0, 16 passed, including the four new arms.'
-  - 'Sabotage: send the workspace user prompt on the classifying step (0.47.0''s behaviour) — `a_classifying_turn_is_not_told_to_call_a_tool`
-    and `a_promoted_turns_later_step_is_asked_as_it_always_was` both FAILED by name.'
-  - 'Sabotage: send the conversational prompt on every step — `a_promoted_turns_later_step_is_asked_as_it_always_was`
-    FAILED alone; the two openings still passed.'
-  - '`cargo test --test session --test context --test cache_boundary` — exit 0, 7 + 16 + 5 passed.'
-  - 'The cache-boundary arm is met as an ORDER INVARIANT, not a fold: with no compaction in a two-turn
-    session there is no boundary to compare, so the test asserts the property the boundary rests on —
-    the operator''s words precede the conversation, as the goal precedes the observations. Stated rather
-    than glossed.'
+  - '`cargo fmt --check` — exit 0. `cargo clippy --all-targets --all-features -- -D warnings` — exit 0,
+    after it caught an unreachable `SystemPrompt::Preset(_)` catch-all: `#[non_exhaustive]` binds outside
+    the defining crate and not inside it, so the arm was dead. Removed rather than allowed, so a variant
+    added later fails this match instead of being traced as an unnamed "preset".'
+  - '`cargo test` (default) — exit 0, **79 test binaries, 1,601 passed, 0 failed**, including **418**
+    doctests.'
+  - '`cargo test --all-features` — exit 0, **79 test binaries, 1,687 passed, 0 failed**, including **421**
+    doctests. A separate invocation after `rm -rf target`; the count was read only after the process exited,
+    never out of a live log.'
+  - 'N1 — `cargo tree` **402** crates, unchanged. No new dependency: the transcript is `serde_json` values
+    built by hand, as both wire bodies already were.'
+  - N2 — MSRV unmoved at 1.95; `msrv_is_stated_and_matches_cargo_toml` passes.
+  - 'N3 — `git diff main -- docs/public-api.txt` is **+3 lines, -0**: `enum Message`, `struct ToolResult`,
+    `enum Preset`. Exactly the enumerated additions the criterion named at plan time, and nothing else.
+    The compile breaks are the two the contract listed: an exhaustive literal of `CompletionRequest` (two
+    new fields) and of `context::Assembled` (one). No trait method was added or changed, so every `impl
+    Provider` in the repository and out of it compiles unchanged.'
+  - N4 — `git diff main -- src/state.rs` is **EMPTY**. No table, column or index; `CHECKPOINT_FORMAT`
+    unmoved at **7**. This falls out of minting ids rather than storing them.
+  - 'N5 — MEASURED LIVE against OpenRouter, `anthropic/claude-haiku-4.5` pinned and read back off `CompletionResponse::model`.
+    A request carrying a transcript, marked `cache_through = 1`: **cache_read 13,093 of a 13,182-token
+    prompt**, against **7,408** for the same transcript unmarked — a **5,685**-token saving, the same
+    figure 0.44.0 measured on the flat path. The reshape did not lose the saving. 0.38.0''s and 0.44.0''s
+    own arms still PASS in the same run (7,408 marked vs 0 on the no-marker control; 13,093 vs 7,408).'
+  - N6 — every prior release's suite passes unchanged, which the two full runs above are.
+  - O1 — the full suite passes on this host; the three-platform matrix is the release PR's own gate.
+  - O2 — `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0
+    -- --ignored` — 1 passed. No DDL, so a 0.29.0 binary still reads a store this tree writes.
+  - '`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0, after
+    it caught **two** errors stable `cargo doc` does not report: a public item''s doc linking to the private
+    `mint_call_id`, and a redundant explicit link target. Seventh release in nine where this gate has
+    found something.'
+  - '`cargo package --locked` — exit 0, 234 files, **1,646,671 bytes**.'

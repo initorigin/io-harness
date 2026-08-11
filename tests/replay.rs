@@ -23,7 +23,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use io_harness::provider::{
-    CompletionRequest, CompletionResponse, Record, Replay, ToolCall, ToolSpec, Usage,
+    CompletionRequest, CompletionResponse, Message, Record, Replay, ToolCall, ToolResult, ToolSpec,
+    Usage,
 };
 use io_harness::{
     run, Error, Provider, ProviderErrorKind, RunOutcome, Store, TaskContract, Verification,
@@ -564,5 +565,68 @@ async fn a_real_run_replays_from_its_recording_without_a_provider() {
     assert_eq!(
         std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
         "DONE\n"
+    );
+}
+
+// ------------------------------------------- 0.49.0: a transcript is not a new key
+
+/// **O3** — a recording made before this release still answers a request that
+/// carries a transcript.
+///
+/// This is what makes "no cassette has to be re-recorded" a fact rather than a
+/// hope. The transcript is a rendering of content the key already covers — the run
+/// loop derives `user` from the same emission it builds the conversation from — so
+/// keying on it would have made every recorded case a miss the moment the loop
+/// started sending one.
+///
+/// The second half is the one that found this: a resumed run rebuilds its ledger
+/// from stored text and carries **no** transcript where the recorded run did, so a
+/// transcript-sensitive key breaks replay-after-resume, a guarantee older than
+/// this release. Both directions are asserted here.
+#[tokio::test]
+async fn a_recording_answers_the_same_request_with_or_without_a_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = recording_path(&dir);
+
+    // Recorded flat, exactly as every release through 0.48.0 recorded.
+    let recorder = Record::new(Canned::new(vec![text("the recorded answer")]));
+    recorder.complete(req("what is the answer")).await.unwrap();
+    recorder.save(&path).unwrap();
+    let replay = Replay::load(&path).unwrap();
+
+    let with_transcript = CompletionRequest {
+        messages: vec![
+            Message::User("what is the answer".into()),
+            Message::Assistant {
+                text: None,
+                calls: vec![ToolCall {
+                    name: "read_file".into(),
+                    arguments: json!({ "path": "a" }),
+                }],
+            },
+            Message::Results(vec![ToolResult {
+                call: 0,
+                content: "contents".into(),
+            }]),
+        ],
+        ..req("what is the answer")
+    };
+
+    assert_eq!(
+        replay.complete(with_transcript.clone()).await.unwrap(),
+        text("the recorded answer"),
+        "a 0.48.0 recording must still answer a 0.49.0 request whose `user` it recorded"
+    );
+    // And the other direction: a recording made carrying one answers a request
+    // that carries none, which is the post-resume case.
+    let recorder = Record::new(Canned::new(vec![text("recorded with a transcript")]));
+    recorder.complete(with_transcript).await.unwrap();
+    let path2 = dir.path().join("second.json");
+    recorder.save(&path2).unwrap();
+    let replay = Replay::load(&path2).unwrap();
+    assert_eq!(
+        replay.complete(req("what is the answer")).await.unwrap(),
+        text("recorded with a transcript"),
+        "a resumed run carries no transcript, and must still find its recording"
     );
 }

@@ -1192,8 +1192,8 @@ versions:
       reasoning-content replay is inexpressible, so a provider that rejects a request carrying tools
       unless prior reasoning is replayed cannot be supported at all in this shape. Breaking, and the
       break is the point.
-    detail: outline
-    status: planned
+    detail: specified
+    status: released
   - version: 0.50.0
     outcome: >
       A parent chooses how a child returns. A child today blocks its parent and pours its whole tool

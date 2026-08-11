@@ -41,7 +41,9 @@
 //! says nothing about any other vendor, and the second call's saving depends on
 //! the cache entry still being alive, which is the vendor's clock and not ours.
 
-use io_harness::{Auth, Compatible, CompletionRequest, OpenRouter, Provider, Usage};
+use io_harness::{
+    Auth, Compatible, CompletionRequest, Message, OpenRouter, Provider, ToolCall, ToolResult, Usage,
+};
 
 /// An Anthropic slug, because Anthropic is the vendor whose caching is
 /// request-side. Override with `CACHE_LIVE_MODEL` to measure another one.
@@ -238,6 +240,59 @@ async fn main() -> io_harness::Result<()> {
              Check that the frozen prefix clears the vendor's minimum cacheable length."
         );
     }
+    // ---- 0.49.0: the same breakpoint, on a request that carries a transcript ----
+    //
+    // The reshape moved the marker from a byte offset into `user` to a count of
+    // messages, and a wire that quietly stopped marking would fail no test and cost
+    // money on every step. So the arm is measured, not reasoned about — and against
+    // the same-shaped baseline the 0.44.0 half uses: an identical transcript sent
+    // with no `cache_through`, so the difference is the one field.
+    let transcript = vec![
+        Message::User(frozen.clone()),
+        Message::Assistant {
+            text: None,
+            calls: vec![ToolCall {
+                name: "read_file".into(),
+                arguments: serde_json::json!({ "path": "src/parse.rs" }),
+            }],
+        },
+        Message::Results(vec![ToolResult {
+            call: 0,
+            content: "[read src/parse.rs] the volatile tail, different each turn.\n".into(),
+        }]),
+    ];
+    let conversational = |through: Option<usize>| CompletionRequest {
+        messages: transcript.clone(),
+        cache_through: through,
+        ..request(&system, &user)
+    };
+
+    println!("\ntranscript, unmarked (system breakpoint only):");
+    let t0 = marked.complete(conversational(None)).await?;
+    let e1 = report("call 1", &t0.model, t0.usage);
+
+    println!("\ntranscript, cache_through = 1 (the frozen user turn):");
+    let t1 = marked.complete(conversational(Some(1))).await?;
+    let f1 = report("call 1 (writes)", &t1.model, t1.usage);
+    let t2 = marked.complete(conversational(Some(1))).await?;
+    let f2 = report("call 2 (should read)", &t2.model, t2.usage);
+
+    println!("\n--- verdict: the transcript breakpoint (0.49.0) ---");
+    println!("transcript unmarked: cache_read={e1}");
+    println!("transcript marked:   call 1 cache_read={f1}, call 2 cache_read={f2}");
+    if f2 > e1 {
+        println!(
+            "PASS — marking a message boundary reads {} tokens beyond the system block alone, \
+             so the reshape did not lose 0.44.0's saving.",
+            f2 - e1
+        );
+    } else {
+        println!(
+            "FAIL — a request carrying a transcript cached no more than its system block. The \
+             marker is not reaching the vendor."
+        );
+    }
+
     println!(
         "\nNote: OpenRouter reports no cache-write counter, so every `cache_write` above is \
          zero by construction on this wire and the writing call's cost is unreported rather \

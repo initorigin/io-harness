@@ -467,8 +467,30 @@ impl std::fmt::Display for Effort {
 pub struct CompletionRequest {
     /// System instructions.
     pub system: String,
-    /// The user turn.
+    /// The user turn, as one flat string.
+    ///
+    /// **(0.49.0) Derived from [`messages`](CompletionRequest::messages) and kept
+    /// for one release.** When this crate's own loop builds a request it fills
+    /// this with exactly the string it filled before 0.49.0, byte for byte, so a
+    /// [`Provider`] that reads it — and this repository reads it in 54 places —
+    /// keeps receiving what it always received and is honestly
+    /// non-conversational. A built-in wire ignores it whenever `messages` is
+    /// non-empty. It will be removed in a later version; read `messages` in new
+    /// code.
     pub user: String,
+    /// (0.49.0) The conversation this request carries, in order.
+    ///
+    /// Empty — the default, and every caller before 0.49.0 — means the request is
+    /// a flat one and every built-in wire sends the body it sent in 0.48.0, byte
+    /// for byte. Non-empty means the wire builds a role-tagged transcript from
+    /// it, with native tool blocks, and ignores [`user`](CompletionRequest::user).
+    ///
+    /// The sequence a run produces alternates: a user turn, then an assistant
+    /// turn carrying the calls that step made, then one
+    /// [`Message::Results`] batch answering it. An
+    /// out-of-tree [`Provider`] that ignores this field keeps working.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<Message>,
     /// Tools the model may call.
     pub tools: Vec<ToolSpec>,
     /// (0.21.0) Override the model for this one request, or `None` to use the
@@ -560,8 +582,37 @@ pub struct CompletionRequest {
     /// // 21 bytes of goal line, plus the blank line that ends it.
     /// assert_eq!(request.cache_boundary, Some(23));
     /// ```
+    ///
+    /// **(0.49.0) This applies to the flat [`user`](CompletionRequest::user) path
+    /// only.** A request carrying [`messages`](CompletionRequest::messages) marks
+    /// its transcript with [`cache_through`](CompletionRequest::cache_through)
+    /// instead, and this field is ignored — one field carrying two meanings
+    /// depending on another field is the kind of cleverness that is read wrong
+    /// once and then billed for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_boundary: Option<usize>,
+    /// (0.49.0) How many leading [`messages`](CompletionRequest::messages) the
+    /// caller states are byte-stable across requests, or `None` for a transcript
+    /// with no such prefix.
+    ///
+    /// A provider that takes a request-side cache marker marks the last content
+    /// block of message `cache_through - 1`, so the vendor serves everything
+    /// through that turn from its cache on the next request that repeats it. It
+    /// is the transcript half of what
+    /// [`cache_boundary`](CompletionRequest::cache_boundary) did for the flat
+    /// path, expressed where a real transcript has boundaries: message
+    /// boundaries.
+    ///
+    /// A count of `0`, and one past the end of `messages`, are both **ignored**
+    /// rather than refused, for the reason `cache_boundary` gives: a boundary is
+    /// an optimisation, and an optimisation that turns a working run into an
+    /// `Err` costs more than it can save.
+    ///
+    /// The crate's own run loop never marks a prefix it has not already sent at
+    /// least once. A caller building a request by hand owns that judgement
+    /// itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_through: Option<usize>,
     /// Images the model should see alongside `user`.
     ///
     /// A provider that does not accept images refuses a request carrying any,
@@ -654,6 +705,143 @@ pub struct ToolCall {
     pub name: String,
     /// Parsed arguments object.
     pub arguments: serde_json::Value,
+}
+
+/// (0.49.0) One turn of the conversation a request carries.
+///
+/// Before 0.49.0 a request held one `system` string and one `user` string, so a
+/// run's own history reached the model as prose *describing* what the assistant
+/// had done — and every model this crate targets is post-trained on a
+/// role-tagged transcript with native tool blocks instead. A sequence of these
+/// is what [`CompletionRequest::messages`] carries, and each built-in wire maps
+/// it onto that vendor's own block types one to one.
+///
+/// ```
+/// use io_harness::{Message, ToolCall, ToolResult};
+///
+/// let transcript = vec![
+///     Message::User("Tidy the README.".into()),
+///     Message::Assistant {
+///         text: None,
+///         calls: vec![ToolCall {
+///             name: "read_file".into(),
+///             arguments: serde_json::json!({ "path": "README.md" }),
+///         }],
+///     },
+///     // One results message answers the assistant turn before it, and each
+///     // result names the call it answers by position in that turn.
+///     Message::Results(vec![ToolResult { call: 0, content: "# Project".into() }]),
+/// ];
+/// assert_eq!(transcript.len(), 3);
+/// ```
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Message {
+    /// What the operator, or this crate on their behalf, said.
+    User(String),
+    /// What the model said, and the calls it made. `text` is `None` for a
+    /// completion that stopped on a tool call without writing anything first.
+    Assistant {
+        /// The prose the model wrote, when it wrote any.
+        text: Option<String>,
+        /// The calls it made, in the order it made them.
+        calls: Vec<ToolCall>,
+    },
+    /// The results of the calls in the [`Message::Assistant`] turn immediately
+    /// before this one. A *batch* rather than one message per result, because the
+    /// Anthropic wire requires every result answering one assistant turn to
+    /// arrive in a single user message, and because 0.41.0 dispatches a run of
+    /// read-only calls together.
+    Results(Vec<ToolResult>),
+}
+
+/// (0.49.0) One tool result inside a [`Message::Results`] batch.
+///
+/// It names the call it answers by **position** in the assistant turn before it,
+/// rather than carrying an id of its own. The id a vendor correlates on is
+/// minted from those two positions when the body is built, so
+/// the two halves of a correlation can never be derived from different places
+/// and drift apart.
+///
+/// ```
+/// use io_harness::{Message, ToolCall, ToolResult};
+///
+/// let assistant = Message::Assistant {
+///     text: Some("Reading both files.".into()),
+///     calls: vec![
+///         ToolCall { name: "read_file".into(), arguments: serde_json::json!({ "path": "a" }) },
+///         ToolCall { name: "read_file".into(), arguments: serde_json::json!({ "path": "b" }) },
+///     ],
+/// };
+///
+/// // One batch answers that whole turn, and each result says which call it is
+/// // answering — so a step whose second call was refused still correlates the
+/// // first, instead of the results sliding up by one.
+/// let results = Message::Results(vec![ToolResult { call: 0, content: "# A".into() }]);
+///
+/// let Message::Assistant { calls, .. } = &assistant else { unreachable!() };
+/// let Message::Results(answered) = &results else { unreachable!() };
+/// assert_eq!(calls.len(), 2);
+/// assert_eq!(answered[0].call, 0);
+/// ```
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolResult {
+    /// Index of the call this answers, in the assistant message immediately
+    /// before. A result naming a call that turn did not make is dropped by the
+    /// wire rather than sent, because a `tool_result` correlating with nothing
+    /// is a `400` on at least one vendor.
+    pub call: usize,
+    /// What the tool produced, as the model will read it.
+    pub content: String,
+}
+
+/// (0.49.0) The id a `tool_use` block and the `tool_result` answering it share.
+///
+/// Minted rather than remembered. A vendor correlates the two **within one
+/// request**, and this crate rebuilds the whole request on every step, so the id
+/// the vendor originally issued is never needed again — which is why
+/// [`ToolCall`] gained no field for it and no id is ever stored.
+///
+/// Deterministic in the two positions, so the same transcript assembles to the
+/// same bytes on every step, which is what a cache prefix requires. Nine
+/// characters and alphanumeric, because that is the strictest id rule any vendor
+/// this crate plans to reach states, and a format that satisfies all of them
+/// costs nothing to choose.
+pub(crate) fn mint_call_id(message: usize, call: usize) -> String {
+    format!("t{:04x}{:04x}", message & 0xffff, call & 0xffff)
+}
+
+/// The id a result at `messages[at]` correlates on, or `None` when it answers a
+/// call that turn did not make.
+///
+/// One helper rather than one rule per wire, for the reason [`split_at_boundary`]
+/// is one function: both vendors reject a `tool_result` that correlates with
+/// nothing, and a validity rule written twice is a validity rule that drifts
+/// once. A result the helper rejects is **dropped from the body**, never sent
+/// with an invented id.
+pub(crate) fn result_call_id(
+    messages: &[Message],
+    at: usize,
+    result: &ToolResult,
+) -> Option<String> {
+    let before = at.checked_sub(1)?;
+    let Message::Assistant { calls, .. } = messages.get(before)? else {
+        return None;
+    };
+    (result.call < calls.len()).then(|| mint_call_id(before, result.call))
+}
+
+/// The index of the last message a cache marker covers, or `None` when the
+/// request states no stable prefix or states one that cannot be honoured.
+///
+/// `Some(0)` marks an empty prefix and a count past the end would mark the whole
+/// transcript including the turn that changes every step; both are ignored
+/// rather than refused, exactly as [`split_at_boundary`] ignores an unusable byte
+/// offset.
+pub(crate) fn marked_message(request: &CompletionRequest) -> Option<usize> {
+    let through = request.cache_through?;
+    // `then`, not `then_some`: the latter evaluates its argument eagerly and
+    // `through - 1` underflows on the `0` case this very guard exists to reject.
+    (through > 0 && through <= request.messages.len()).then(|| through - 1)
 }
 
 /// Token usage for one completion, in a vendor-neutral shape. Used to enforce
@@ -1712,6 +1900,143 @@ mod catalogue_default {
         // against an implementation whose `models()` is empty for everyone.
         let models = WrittenBefore0_29_0.models().await.unwrap();
         assert!(models.is_empty());
+    }
+}
+
+/// The 0.49.0 transcript types, and the compatibility the whole release rests on.
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+
+    fn transcript() -> Vec<Message> {
+        vec![
+            Message::User("go".into()),
+            Message::Assistant {
+                text: None,
+                calls: vec![
+                    ToolCall {
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({ "path": "a" }),
+                    },
+                    ToolCall {
+                        name: "grep".into(),
+                        arguments: serde_json::json!({ "pattern": "x" }),
+                    },
+                ],
+            },
+            Message::Results(vec![
+                ToolResult {
+                    call: 0,
+                    content: "contents of a".into(),
+                },
+                ToolResult {
+                    call: 1,
+                    content: "no matches".into(),
+                },
+            ]),
+        ]
+    }
+
+    /// A request with no transcript serialises to exactly the bytes it did in
+    /// 0.48.0. `Replay` keys a cassette on this string
+    /// (`src/provider/replay.rs`), so a recording made before this release must
+    /// still match a flat request made after it — the whole "an empty
+    /// `messages` is a 0.48.0 request" claim, asserted at the layer that would
+    /// silently break it.
+    #[test]
+    fn a_request_with_no_transcript_serialises_as_it_did_before_0_49_0() {
+        let flat = CompletionRequest {
+            system: "S".into(),
+            user: "U".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&flat).unwrap();
+        assert!(
+            !json.contains("messages") && !json.contains("cache_through"),
+            "a flat request must not carry either new key: {json}"
+        );
+    }
+
+    /// Ids correlate the two halves of one call, and both halves are derived
+    /// from the same function rather than minted independently.
+    #[test]
+    fn a_result_correlates_with_the_call_it_names() {
+        let messages = transcript();
+        let Message::Assistant { calls, .. } = &messages[1] else {
+            unreachable!()
+        };
+        let Message::Results(results) = &messages[2] else {
+            unreachable!()
+        };
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(
+                result_call_id(&messages, 2, result).as_deref(),
+                Some(mint_call_id(1, i).as_str()),
+                "result {i} must carry the id its call carries"
+            );
+        }
+        assert_eq!(calls.len(), results.len());
+    }
+
+    /// A minted id is nine characters and alphanumeric — the strictest rule any
+    /// vendor this crate plans to reach states.
+    #[test]
+    fn a_minted_id_satisfies_the_strictest_vendor_rule() {
+        for (m, c) in [(0, 0), (7, 3), (0xffff, 0xffff)] {
+            let id = mint_call_id(m, c);
+            assert_eq!(id.len(), 9, "{id}");
+            assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "{id}");
+        }
+        // Deterministic in the two positions, which is what lets the same
+        // transcript re-assemble to the same bytes on the next step.
+        assert_eq!(mint_call_id(1, 0), mint_call_id(1, 0));
+        assert_ne!(mint_call_id(1, 0), mint_call_id(0, 1));
+    }
+
+    /// A result naming a call its turn did not make correlates with nothing, and
+    /// is reported as such so the wire can drop it rather than invent an id.
+    #[test]
+    fn a_result_naming_no_call_correlates_with_nothing() {
+        let messages = transcript();
+        let stray = ToolResult {
+            call: 9,
+            content: "from nowhere".into(),
+        };
+        assert_eq!(result_call_id(&messages, 2, &stray), None);
+        // A results batch that does not follow an assistant turn is the same
+        // failure seen from the other side.
+        let orphan = vec![Message::Results(vec![ToolResult {
+            call: 0,
+            content: "x".into(),
+        }])];
+        assert_eq!(result_call_id(&orphan, 0, &orphan_result()), None);
+    }
+
+    fn orphan_result() -> ToolResult {
+        ToolResult {
+            call: 0,
+            content: "x".into(),
+        }
+    }
+
+    /// An unusable marker is ignored rather than refused, exactly as an unusable
+    /// byte offset is.
+    #[test]
+    fn an_unusable_cache_marker_is_ignored() {
+        let mut request = CompletionRequest {
+            messages: transcript(),
+            ..Default::default()
+        };
+        request.cache_through = None;
+        assert_eq!(marked_message(&request), None);
+        request.cache_through = Some(0);
+        assert_eq!(marked_message(&request), None, "an empty prefix");
+        request.cache_through = Some(4);
+        assert_eq!(marked_message(&request), None, "past the end");
+        request.cache_through = Some(2);
+        assert_eq!(marked_message(&request), Some(1));
+        request.cache_through = Some(3);
+        assert_eq!(marked_message(&request), Some(2), "the whole transcript");
     }
 }
 

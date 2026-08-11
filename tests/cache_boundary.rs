@@ -20,7 +20,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
+use io_harness::provider::{CompletionRequest, CompletionResponse, Message, ToolCall, Usage};
 use io_harness::{
     run_with, ApproveAll, Compaction, ContextBudget, EventKind, Flow, Observer, Policy, Provider,
     RunEvent, Store, TaskContract, Verification,
@@ -541,5 +541,106 @@ async fn a_run_that_never_folds_marks_nothing() {
             !req.user.contains(SUMMARY_SENTENCE),
             "request {i} carries a summary in a run that cannot fold"
         );
+    }
+}
+
+// ------------------------------------------- 0.49.0: the same boundary, in messages
+
+/// The transcript's own text through `cache_through`, or `None` when unmarked.
+fn marked_messages(req: &CompletionRequest) -> Option<String> {
+    let through = req.cache_through?;
+    Some(
+        req.messages[..through]
+            .iter()
+            .map(|m| match m {
+                Message::User(text) => text.clone(),
+                Message::Assistant { .. } => String::new(),
+                Message::Results(results) => results.iter().map(|r| r.content.as_str()).collect(),
+            })
+            .collect(),
+    )
+}
+
+/// **F7** — a request carrying a transcript marks the same content the byte offset
+/// marks, expressed as a count of messages.
+///
+/// The two markers are asserted against each other rather than each against a
+/// literal: `cache_through`'s messages must concatenate to exactly the span
+/// `cache_boundary` names. That is what fails an implementation that marks a
+/// plausible-looking message boundary somewhere else — which would cost a cache
+/// write on every step while every other test in this file still passed.
+///
+/// And the guard's rule is asserted to survive the translation: the fold's own step
+/// carries neither marker, because that prefix has been sent zero times.
+#[tokio::test]
+async fn the_transcript_marker_covers_the_span_the_byte_offset_names() {
+    let dir = workspace();
+    let provider = Recorder::new(NAMES.iter().map(|n| vec![read(n)]).collect());
+    let store = Store::memory().unwrap();
+
+    run_with(
+        &contract(dir.path(), NAMES.len() as u32),
+        &provider,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let working = provider.working();
+    let folded = working
+        .iter()
+        .position(|r| r.user.contains(SUMMARY_SENTENCE))
+        .expect("the run never folded; nothing below is meaningful");
+
+    assert_eq!(
+        working[folded].cache_through, None,
+        "the step the fold happened on must not be marked, in either expression"
+    );
+
+    let after = &working[folded + 1];
+    assert!(
+        !after.messages.is_empty(),
+        "the step after the fold sends a transcript, or this asserts nothing"
+    );
+    let by_offset = marked(after).expect("the byte offset is still computed");
+    let by_messages = marked_messages(after).expect("and the message count with it");
+    assert_eq!(
+        by_messages, by_offset,
+        "the marked messages must cover exactly the span the offset names"
+    );
+    assert!(
+        by_messages.trim_end().ends_with(SUMMARY_SENTENCE),
+        "and that span still ends at the folded summary, got: …{}",
+        &by_messages[by_messages.len().saturating_sub(120)..]
+    );
+    // Never the whole conversation: the last message is the turn being asked
+    // about, and marking it would write a prefix that moves on every step.
+    assert!(
+        after.cache_through.expect("marked") < after.messages.len(),
+        "the turn being asked about must stay outside the marked prefix"
+    );
+}
+
+/// A run that never folds marks nothing, in the message expression as in the byte
+/// one — 0.44.0's `a_run_that_never_folds_marks_nothing`, asserted again for the
+/// field this release added.
+#[tokio::test]
+async fn a_run_that_never_folds_marks_no_messages() {
+    let dir = workspace();
+    let provider = Recorder::new(NAMES.iter().take(2).map(|n| vec![read(n)]).collect());
+    let store = Store::memory().unwrap();
+    let never = contract(dir.path(), 2).with_compaction(Compaction {
+        at_share: 1.0,
+        ..Compaction::default()
+    });
+
+    run_with(&never, &provider, &store, &open_policy(), &ApproveAll)
+        .await
+        .unwrap();
+
+    for (i, req) in provider.working().iter().enumerate() {
+        assert_eq!(req.cache_through, None, "request {i} was marked");
     }
 }
