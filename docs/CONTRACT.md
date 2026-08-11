@@ -983,6 +983,13 @@ contained turn is a tree like any other in this respect.
 | `WorkspaceWrite` *(the default)* | the workspace root, the system temporary directory, and the detected toolchain's own cache directories |
 | `FullAccess` | anywhere this program's user can write |
 
+**Every mode may also write `/dev/null`**, on every backend. The bit bucket is
+where a toolchain's own scripts send output they mean to discard, and a write to
+it changes nothing an observer can see — the confinement is about what a run can
+*keep*. The macOS profile has allowed the device since 0.6.0 and the namespace
+rung populates `/dev`; the Landlock rung grants it as of 0.48.0, having been the
+one rung where a read grant alone made every git built-in fail.
+
 `FullAccess` is what every release up to 0.45.0 did by default, and it is still
 available — as a sentence rather than as an omission:
 `TaskContract::with_full_access()`. The method is named the way it is so the
