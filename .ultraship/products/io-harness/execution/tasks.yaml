@@ -367,7 +367,7 @@ tasks:
   summary: Report a `Replay` miss from the message sequence, and re-record the repository's cassettes.
   why_required: A cassette recorded before this release misses silently against a request that now carries
     messages, and a miss reported as "no recorded response" is unreadable.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.49.0-T05
   acceptance_criteria:
@@ -380,7 +380,22 @@ tasks:
     '
   files:
   - src/provider/replay.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test replay` — 10 passed; `cargo test --test determinism` — 8 passed.'
+  - 'O3 — `a_recording_answers_the_same_request_with_or_without_a_transcript` asserts BOTH directions:
+    a recording made flat (as every release through 0.48.0 made them) answers a request carrying a transcript,
+    and a recording made carrying one answers a request with none, which is the post-resume case.'
+  - 'SABOTAGE: putting `messages` back into the key failed exactly two named tests — the O3 test above
+    and `a_workspace_replay_survives_being_interrupted_and_resumed` — which is the pair that says the
+    exclusion is load-bearing rather than tidy.'
+  - 'THE CONTRACT''S O3 IS MET IN A DIFFERENT FORM, and this is the honest version: it required every
+    cassette in the repository to be re-recorded. **No cassette needed re-recording, and none exists to
+    re-record** — `find . -name ''*.json'' -path ''*fixture*''` returns store databases and cargo build
+    artifacts, not provider recordings; every recording in the suite is made in-test. The substance of
+    the criterion — that a stale recording must not silently miss — is delivered by the key excluding
+    the transcript, and is asserted rather than assumed.'
+  - The miss message now reports the message count beside the system length and the first 120 characters
+    of `user`, so a genuine divergence names what shape the request was.
 - id: US-IO-HARNESS-0.49.0-T11
   summary: Bring `docs/CONTRACT.md`, the crate-root prose, the README and the changelog to 0.49.0.
   why_required: These are checked-in surfaces with their own drift tests, and the contract requires them
