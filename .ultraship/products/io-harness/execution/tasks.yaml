@@ -290,7 +290,7 @@ tasks:
   summary: Frame a conversational turn as a conversation rather than as a task with a goal.
   why_required: '`Session::default_contract` turns a greeting into a specification, which is the second
     of the three faults the contract names.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.49.0-T07
   acceptance_criteria:
@@ -308,7 +308,26 @@ tasks:
   - src/session.rs
   - src/contract.rs
   - src/run.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test prompt` — 20 passed, 0 failed.'
+  - 'F8 — `a_classifying_turn_is_not_told_it_has_a_specification`: the classifying turn''s system block
+    contains neither `to meet a stated specification` nor `checked against the success criterion` — a
+    session turn carries `Verification::None`, so nothing IS checked — while still describing the same
+    four tools, and 0.37.0''s sentence about how a turn may end is still last.'
+  - 'The negative controls are in the same test and are what make it a change of one thing: a run under
+    an explicit `TaskContract::workspace` and a tree run both still open with 0.44.0''s sentence byte
+    for byte. The two byte-exact baselines in `tests/prompt.rs` say the same thing — `V0440_WORKSPACE`,
+    `V0440_TREE` and `V0440_SINGLE` are untouched and only the conversational one was rebased, as `V0490_CONVERSATIONAL`.'
+  - 'SABOTAGE (F8): composing the classifying turn from `WORKSPACE_PROMPT` again — 0.48.0''s behaviour
+    — failed three named tests, all three of them the ones that lock a classifying turn''s opening, and
+    no others.'
+  - 'DEVIATION, stated rather than glossed: the scope named a `TaskContract::conversation` constructor
+    beside `TaskContract::workspace`. It was NOT added, because it would have been byte-identical to `workspace`
+    — that constructor already defaults to `Verification::None` (`src/contract.rs:470`), and the operator''s
+    words already reach the model as the first user text through `conversational_user_prompt`. A public
+    constructor that differs from an existing one in nothing is a synonym, not an affordance. The substance
+    of the scope item — a conversation is not framed as a specification — landed where it is actually
+    read, in the system block.'
 - id: US-IO-HARNESS-0.49.0-T09
   summary: Add `SystemPrompt::Preset`, opt-in by name, with `Builtin` byte-identical.
   why_required: 'The third fault the contract names: an embedder''s only shaped-agent option today is

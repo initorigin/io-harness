@@ -4238,7 +4238,9 @@ async fn run_workspace_from<P: Provider>(
     // permitting an answer is a decision about the turn's opening, not a licence
     // to stop at a plan in prose on step nine.
     let conversational = conversational_opening(
-        WORKSPACE_PROMPT,
+        // 0.49.0 — a turn that has not been decided to be work is not told it has a
+        // specification to meet. Every later step is `system` above, unchanged.
+        CONVERSATION_PROMPT,
         contract,
         extras,
         &extra,
@@ -6003,7 +6005,8 @@ fn run_agent<'f, P: Provider>(
         // agent that is not a classifying turn's root, which is every child and
         // every agent of every `run_tree`.
         let conversational = conversational_opening(
-            TREE_PROMPT,
+            // 0.49.0 — as the flat loop, over the tree agent's own description.
+            CONVERSATION_TREE_PROMPT,
             contract,
             extras,
             &extra,
@@ -12176,6 +12179,39 @@ const WORKSPACE_PROMPT: &str = "You are an agent working across a repository to 
      `read_file` to inspect a file before changing it, and `write_file` with the file's path and \
      full new contents to edit it. You may edit several files. Work in small steps; after each of \
      your steps the whole set is checked against the success criterion.";
+
+/// What the agent is on a turn that has not yet been decided to be work (0.49.0).
+///
+/// The same agent as [`WORKSPACE_PROMPT`] and the same tools, described without the
+/// two things that are not true of a conversational turn: that there is a *stated
+/// specification* to meet, and that the whole set is checked against a *success
+/// criterion* after every step. A session turn carries `Verification::None`, so
+/// nothing is checked — and an operator who typed "hi" was structurally being told
+/// they had written a specification.
+///
+/// That is the same mismatch 0.48.0's `I03` fixed one block lower down. The user
+/// block stopped saying "Call a tool to make progress toward the success criterion"
+/// on a classifying turn; this stops the system block above it saying there is one.
+///
+/// The two prompts must not drift into describing two different worlds — the rule
+/// [`WORKSPACE_PROMPT`] and [`TREE_PROMPT`] already hold each other to. What differs
+/// here is the framing of the turn, never the tools or the workspace.
+const CONVERSATION_PROMPT: &str = "You are an agent working in a repository, in conversation with \
+     an operator. Use `grep` to search file contents and `find` to locate files by name, then \
+     `read_file` to inspect a file before changing it, and `write_file` with the file's path and \
+     full new contents to edit it. You may edit several files. Work in small steps.";
+
+/// [`CONVERSATION_PROMPT`] for a turn that may also fan out (0.49.0).
+///
+/// The tree's own description with the same two claims removed, for the reason
+/// [`TREE_PROMPT`] exists at all: a contained turn must be described the world it is
+/// actually in, one where it may spawn.
+const CONVERSATION_TREE_PROMPT: &str = "You are an agent working in a repository, in conversation \
+     with an operator. Use `grep`, `find`, `read_file`, and `write_file` as in a normal run. You \
+     may also decompose the work: call `spawn_agent` to launch a sub-agent that pursues a smaller \
+     goal over the same workspace, and its result is reported back to you. A sub-agent inherits \
+     your permissions and can only be more restricted, never less. Prefer spawning when parts of \
+     the task are independent. Work in small steps.";
 
 /// The prompt a conversational turn's **first** completion is made with (0.37.0).
 ///
