@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.49.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -570,3 +570,150 @@ open_questions:
   defaulted trait method rather than a field. Not attempted: adding a method to an externally
   implementable trait is a break for the one extension point this crate has, and a field an
   implementor may ignore is the shape every other request-side capability here already uses.
+released_at: 2026-08-11T18:20:00Z
+mode: published
+delivered: >
+  A turn is a turn. `CompletionRequest` carries an ordered `messages` transcript — user turns,
+  assistant turns holding the calls the model made, and batches of results answering them — and each
+  built-in wire maps it onto that vendor's own block types one to one: `tool_use` and `tool_result`
+  on Anthropic, `tool_calls` and `role: "tool"` messages on the OpenAI wire. Through 0.48.0 the
+  crate parsed the tool protocol off a response and then discarded it on the way back in, so a run's
+  own history reached the model as prose narrating the assistant's past actions in the third person
+  — off the distribution every model this crate targets was post-trained on, producing no error and
+  nothing in a log, only degraded instruction following.
+
+  Two consequences ship with it. A session's earlier turns arrive as their own user and assistant
+  messages instead of `[earlier turn] you answered: …` inside somebody else's, and a classifying
+  turn is no longer told it has a specification to meet and a success criterion to satisfy when it
+  carries `Verification::None` — the same mismatch 0.48.0's `I03` fixed one block lower down. Plus
+  `SystemPrompt::Preset`, opt-in by name, for an embedder who wants a shaped agent without writing a
+  whole prompt.
+
+  **The decision that kept the release small is that the ids are minted rather than remembered.** A
+  vendor correlates a `tool_use` id with the `tool_result` answering it inside one request, and this
+  crate rebuilds the whole request every step, so the id the vendor issued is never needed again.
+  `ToolCall` gained no field — 199 literals across 73 files untouched — and `src/state.rs` has no
+  DDL at all.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — exit 0, **79 test binaries, 1,601 passed, 0 failed**,
+    including **418** doctests. Run with `XDG_CONFIG_HOME` redirected to a scratch directory, this
+    machine's standing environment fix for `tests/plugin.rs` and unrelated to the release.
+  - >
+    `cargo test --all-features` — exit 0, **79 test binaries, 1,687 passed, 0 failed**, including
+    **421** doctests. A separate invocation after `rm -rf target`. The count was read only after the
+    process exited: a first read taken while it was still running showed 12 binaries and 679 passed,
+    with every line present reading `ok`, which is 0.47.0's trap seen again.
+  - >
+    `cargo test --test cross_version_0_29_0 -- --ignored` — exit 0, 1 passed, after building the
+    0.29.0 generator. No DDL, so a 0.29.0 binary still reads a store this tree writes (O2).
+  - >
+    **SABOTAGES, each failing NAMED tests.** F1: returning an empty transcript from `transcript` —
+    0.48.0's behaviour — failed exactly `a_multi_step_run_sends_a_role_tagged_transcript`,
+    `the_derived_user_is_the_flat_prompt_the_transcript_was_built_from` and
+    `parallel_calls_are_one_turn_and_one_batch_in_call_order`. F2: appending one character to the
+    Anthropic result's `tool_use_id` failed `the_body_carries_native_blocks_whose_ids_correlate`
+    alone, with the other 25 passing. F3: emitting the results as plain user messages failed the two
+    tests asserting the `role: "tool"` mapping. F4: building a transcript when the caller sent none
+    failed **nine** tests across both wires — the two new byte-identity tests and seven pre-existing
+    body tests from 0.14.0, 0.22.0, 0.31.0, 0.38.0 and 0.44.0, which is what says the compatibility
+    claim is held by the suite that was already there. F6: untagging the seed entries failed
+    `an_earlier_turn_arrives_as_that_speakers_own_message` alone. F7: marking one message past the
+    boundary failed `the_transcript_marker_covers_the_span_the_byte_offset_names` alone while the
+    seven 0.44.0 tests passed. F8: composing the classifying turn from `WORKSPACE_PROMPT` again
+    failed the three tests that lock a classifying turn's opening. F9: making `Preset::Concise` the
+    description `Builtin` composes failed five named tests including 0.44.0's byte-exact baselines.
+    O3: putting `messages` back into the `Replay` key failed
+    `a_recording_answers_the_same_request_with_or_without_a_transcript` and
+    `a_workspace_replay_survives_being_interrupted_and_resumed`.
+  - >
+    **A SABOTAGE FOUND A WEAK TEST, and that is worth more than the sabotage.** F5's first form
+    iterated `requests().filter(|r| !r.messages.is_empty())` and would have passed **vacuously**
+    under F1's sabotage, because the filter matched nothing. It now asserts the count is non-zero
+    before iterating. Reading the test did not surface this; running the sabotage did.
+  builds:
+  - '`cargo fmt --check` — exit 0.'
+  - >
+    `cargo clippy --all-targets --all-features -- -D warnings` — exit 0, after it caught an
+    unreachable `SystemPrompt::Preset(_)` catch-all arm: `#[non_exhaustive]` binds outside the
+    defining crate and not inside it. Removed rather than allowed, so a variant added later fails
+    this match instead of being traced as an unnamed "preset".
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0,
+    after it caught **two** errors stable `cargo doc` does not report: a public item's doc linking
+    to the private `mint_call_id`, and a redundant explicit link target. Seventh release in nine.
+  - '`cargo package --locked` — exit 0, 234 files, **1,646,671 bytes**.'
+  - >
+    `cargo tree` — **402** crates, unchanged (N1). `git diff main -- docs/public-api.txt` is **+3
+    lines, −0** — `enum Message`, `struct ToolResult`, `enum Preset`, exactly the enumerated
+    additions N3 named at plan time (N3). `git diff main -- src/state.rs` is **EMPTY** and
+    `CHECKPOINT_FORMAT` is unmoved at **7** (N4).
+  - >
+    **N5, MEASURED LIVE** against OpenRouter with `anthropic/claude-haiku-4.5` pinned and read back
+    off `CompletionResponse::model` rather than off the environment. A request carrying a transcript
+    and marked `cache_through = 1` read **13,093 of a 13,182-token prompt**, against **7,408** for
+    the same transcript unmarked — a **5,685**-token saving, the same figure 0.44.0 recorded on the
+    flat path. 0.38.0's and 0.44.0's own arms passed in the same run (7,408 marked against **0** on
+    the no-marker `Compatible` control, and 13,093 against 7,408). The reshape did not quietly stop
+    caching, which is a claim about a number and is now a number.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **The record is sealed before the crates.io upload**, which follows the `develop` → `main` merge
+  and the GitHub Release. `mode: published` states the authorized target; the flow makes it true.
+- >
+  **A resumed run's pre-resume history is prose, exactly as it was in 0.48.0.** The ledger a resume
+  restores holds observation text and no tool-call structure, and nothing durable was added, so the
+  steps a resumed run did not itself drive stay in the first user message. Everything from the
+  resume point on is role-tagged. Reconstructing them structurally needs the calls to be durable and
+  is a schema change this release excluded.
+- >
+  **A step whose results do not line up with the calls it made is sent as prose too.** Correlating
+  them positionally would answer the wrong call, so the loop falls back rather than guessing. It is
+  not silent — `messages` is empty or short and a reader can see it.
+- >
+  **`CompletionRequest::user` is retained for one release and is derived.** It will be removed in a
+  later version. Until then a request has two renderings of one emission, and only the fact that
+  both come from the same pass keeps them from disagreeing.
+- >
+  **On the OpenAI wire only a `role: "user"` message is ever marked.** An assistant message's
+  content is `null` whenever the turn was a bare tool call, and whether that wire carries a
+  `cache_control` on a `role: "tool"` message through to the vendor behind it is not something this
+  crate can assert. Marking less costs a smaller cache hit; marking something the vendor drops would
+  cost a cache write on every step. So a boundary falling on a results batch marks the user message
+  before it, and the transcript's marked span is asserted against the byte offset rather than
+  assumed.
+- >
+  **A CRITERION MET IN A DIFFERENT FORM, stated rather than glossed.** The scope named a
+  `TaskContract::conversation(root)` constructor beside `TaskContract::workspace`. It was **not
+  added**: that constructor already defaults to `Verification::None` (`src/contract.rs:470`) and the
+  operator's words already reach the model as the first user text through
+  `conversational_user_prompt`, so the new one would have been byte-identical to the old — a synonym
+  rather than an affordance. The substance of the item, that a conversation is not framed as a
+  specification, landed where it is actually read: the classifying turn's system block.
+- >
+  **A SECOND CRITERION MET IN A DIFFERENT FORM.** O3 required every cassette in the repository to be
+  re-recorded. None needed it and none exists to re-record — the checked-in fixtures are store
+  databases, and every recording in the suite is made in-test. What the criterion was for, that a
+  stale recording must not silently miss, is delivered by `Replay`'s key excluding the transcript
+  and is asserted in both directions.
+- >
+  **A session turn's flat prompt changed wording.** The seed's `[earlier turn] the operator asked:`
+  and `[earlier turn] you answered:` became `[operator]` and `[agent]`, because the attribution
+  moved into the message's role. A program parsing the old wording out of a prompt will not find it.
+  Two existing tests changed with it, each carrying the sentence saying why.
+- >
+  **The single-file loop sends no transcript.** It drives one tool over one file and has no
+  observation ledger to build one from, so it is byte-identical to 0.48.0 on the wire. Not a
+  regression and not a gap this release set out to close.
+- >
+  **Reasoning replay is expressible now and is still not shipped.** An assistant message is a place
+  to put `CompletionResponse::reasoning`, which remains never persisted and never re-sent. The
+  vendor that requires it belongs to a later release, and shipping the carrier and the payload
+  together would have put two unrelated breaks in one version.
+supersedes: 0.48.0
+next_recommended_version: 0.50.0
+immutable: true
