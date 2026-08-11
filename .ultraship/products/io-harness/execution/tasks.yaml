@@ -81,7 +81,7 @@ tasks:
     messages.'
   why_required: Three of the four flavours this crate ships go out over this wire; without it the reshape
     reaches one vendor.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.49.0-T01
   acceptance_criteria:
@@ -103,7 +103,23 @@ tasks:
     '
   files:
   - src/provider/openai_wire.rs
-  evidence: []
+  evidence:
+  - '`cargo test --lib openai_wire` — 25 passed, 0 failed, including every pre-existing body test: `body_maps_tools_to_function_schema`,
+    `the_openai_body_carries_no_breakpoint_and_keeps_its_bare_system_string`, `the_openrouter_body_carries_one_breakpoint_on_its_system_part`,
+    `the_openrouter_body_splits_the_user_turn_at_the_boundary`, `the_openai_body_ignores_a_boundary_entirely`,
+    `no_effort_leaves_both_bodies_exactly_as_they_were`, `no_declaration_adds_no_key_to_either_body`.'
+  - 'F3 — `the_body_carries_native_blocks_whose_ids_correlate`: five emitted messages (system, user, assistant,
+    two tool), `tool_calls[].function.arguments` a JSON string as this wire spells it, and each `tool_call_id`
+    asserted equal to the `id` of the call it answers.'
+  - 'F4 — `an_empty_transcript_sends_the_0_48_0_body` over BOTH flavours: two messages, the second equal
+    to `{role: user, content: <the flat string>}`.'
+  - 'SABOTAGE (F3): emitting the results as plain user messages failed exactly the two named tests that
+    assert the `role: "tool"` mapping and nothing else.'
+  - 'The marker index is recomputed rather than reused, because a results batch emits one message per
+    result and the emitted array is therefore longer than the caller''s list (`the_transcript_marker_lands_on_a_user_message`).
+    Only a user message is marked: an assistant `content` is null on a bare tool call, and whether this
+    wire carries a marker on a tool message through to the vendor behind it is not something the crate
+    can assert.'
 - id: US-IO-HARNESS-0.49.0-T04
   summary: Emit a message sequence from the assembler beside the flat text it already emits.
   why_required: The transcript is built from the ledger, and the ledger is only read here; without it

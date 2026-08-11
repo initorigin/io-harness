@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
-use super::{ensure_parsed, read_sse, CompletionRequest, CompletionResponse, ToolCall, Usage};
+use super::{
+    ensure_parsed, read_sse, CompletionRequest, CompletionResponse, Message, ToolCall, Usage,
+};
 use crate::error::Result;
 
 /// Build the chat/completions request body for `model` from a neutral request.
@@ -43,10 +45,7 @@ pub(crate) fn body(
         "model": model,
         "stream": true,
         "stream_options": { "include_usage": true },
-        "messages": [
-            { "role": "system", "content": request.system },
-            { "role": "user", "content": user_content(request) },
-        ],
+        "messages": messages(request),
         "tools": tools,
     });
     // 0.22.0 — the one key the two vendors spell differently. Added here rather
@@ -71,10 +70,183 @@ pub(crate) fn body(
     // 0.44.0 — the second breakpoint, added the fourth time in the shape the three
     // above established, and absent entirely for a wire that does not take one and for
     // a request whose caller named no stable prefix.
-    if let Some(content) = cached_user(flavor, request) {
-        body["messages"][1]["content"] = content;
+    //
+    // 0.49.0 — on the flat path only. A request carrying a transcript marks a message
+    // boundary instead, below, because a byte offset into a string that is no longer
+    // sent cannot mean anything.
+    if request.messages.is_empty() {
+        if let Some(content) = cached_user(flavor, request) {
+            body["messages"][1]["content"] = content;
+        }
+    } else if let Some(at) = cached_transcript_at(flavor, request) {
+        let slot = &mut body["messages"][at]["content"];
+        match slot.as_array_mut() {
+            // Already a parts array, because this turn carries images. Mark the
+            // last *text* part: the images follow it and marking one of those
+            // would write a single turn's attachment into the cache entry.
+            Some(parts) => {
+                if let Some(text) = parts.iter_mut().rev().find(|p| p["type"] == "text") {
+                    text["cache_control"] = json!({ "type": "ephemeral" });
+                }
+            }
+            None => {
+                let text = slot.take();
+                *slot = json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": { "type": "ephemeral" },
+                }]);
+            }
+        }
     }
     body
+}
+
+/// The `messages` array.
+///
+/// (0.49.0) A request carrying no transcript produces the two-element system-then-user
+/// array every release through 0.48.0 sent, byte for byte — the compatibility claim the
+/// whole release rests on, and what `an_empty_transcript_sends_the_0_48_0_body` holds.
+///
+/// A request carrying one is mapped onto this wire's own shapes: an assistant turn
+/// becomes one message with `tool_calls`, and a results batch becomes **one
+/// `role: "tool"` message per result**, because that is how this wire spells a tool
+/// result. So the emitted array is longer than `request.messages` — which is why the
+/// cache marker is located by [`cached_transcript_at`] rather than by reusing the
+/// caller's index.
+///
+/// `function.arguments` is a JSON **string** here, not an object: that is the shape the
+/// vendor sends and the shape [`Accumulator`] parses back.
+fn messages(request: &CompletionRequest) -> serde_json::Value {
+    let system = json!({ "role": "system", "content": request.system });
+    if request.messages.is_empty() {
+        return json!([system, { "role": "user", "content": user_content(request) }]);
+    }
+    let mut out = vec![system];
+    let last = request.messages.len() - 1;
+    for (m, message) in request.messages.iter().enumerate() {
+        match message {
+            Message::User(text) => {
+                let content = if m == last {
+                    user_parts(text, request)
+                } else {
+                    json!(text)
+                };
+                out.push(json!({ "role": "user", "content": content }));
+            }
+            Message::Assistant { text, calls } => {
+                let calls: Vec<serde_json::Value> = calls
+                    .iter()
+                    .enumerate()
+                    .map(|(i, call)| {
+                        json!({
+                            "id": crate::provider::mint_call_id(m, i),
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": call.arguments.to_string(),
+                            },
+                        })
+                    })
+                    .collect();
+                let text = text.as_deref().filter(|t| !t.is_empty());
+                if text.is_none() && calls.is_empty() {
+                    // Neither content nor a call is a message with nothing in it,
+                    // which at least one vendor answers with a 400.
+                    continue;
+                }
+                let mut entry = json!({ "role": "assistant", "content": text });
+                if !calls.is_empty() {
+                    entry["tool_calls"] = json!(calls);
+                }
+                out.push(entry);
+            }
+            Message::Results(results) => {
+                for result in results {
+                    // A result correlating with nothing is dropped rather than sent
+                    // with an invented id — the same rule the Anthropic wire follows.
+                    let Some(id) = crate::provider::result_call_id(&request.messages, m, result)
+                    else {
+                        continue;
+                    };
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": result.content,
+                    }));
+                }
+            }
+        }
+    }
+    json!(out)
+}
+
+/// This turn's text with its images after it, or the bare string when there are none.
+///
+/// Text first, then images: the order OpenAI's own examples use, and the reason this
+/// wire can mark a message carrying media where the Anthropic one cannot.
+#[cfg(feature = "media")]
+fn user_parts(text: &str, request: &CompletionRequest) -> serde_json::Value {
+    if request.media.is_empty() {
+        return json!(text);
+    }
+    let mut parts = vec![json!({ "type": "text", "text": text })];
+    parts.extend(request.media.iter().map(image_part));
+    json!(parts)
+}
+
+#[cfg(not(feature = "media"))]
+fn user_parts(text: &str, _request: &CompletionRequest) -> serde_json::Value {
+    json!(text)
+}
+
+/// The index **in the emitted array** of the message a transcript's cache marker
+/// should sit on, or `None` when there is nothing to mark.
+///
+/// The caller names a boundary in its own message list and this wire emits a longer
+/// one, so the index is recomputed rather than reused. Two rules keep it honest:
+///
+/// - **only a `role: "user"` message is marked.** A `role: "tool"` message is not,
+///   because whether this wire's translation carries a marker on one through to the
+///   vendor behind it is not something this crate can assert; and an assistant message
+///   is not, because its `content` is `null` whenever the turn was a bare tool call and
+///   a marker needs text to sit on. Marking *less* costs a smaller cache hit, where
+///   marking something the vendor drops costs a cache write on every step.
+/// - a request whose marked prefix contains no user message is not marked at all.
+fn cached_transcript_at(flavor: WebFlavor, request: &CompletionRequest) -> Option<usize> {
+    if flavor == WebFlavor::OpenAi {
+        // Nothing to ask for, and 21 `Compatible` endpoints behind this flavour that
+        // would answer an unknown key with a 400 — `cached_system`'s rule.
+        return None;
+    }
+    let through = crate::provider::marked_message(request)?;
+    // The emitted array is the system message plus one entry per message, except that
+    // a results batch emits one entry per correlated result.
+    let mut emitted = 1;
+    let mut mark = None;
+    for (m, message) in request.messages.iter().enumerate() {
+        if m > through {
+            break;
+        }
+        match message {
+            Message::User(_) => {
+                mark = Some(emitted);
+                emitted += 1;
+            }
+            Message::Assistant { text, calls } => {
+                if text.as_deref().is_some_and(|t| !t.is_empty()) || !calls.is_empty() {
+                    emitted += 1;
+                }
+            }
+            Message::Results(results) => {
+                emitted += results
+                    .iter()
+                    .filter(|r| crate::provider::result_call_id(&request.messages, m, r).is_some())
+                    .count();
+            }
+        }
+    }
+    mark
 }
 
 /// The system message's `content` for a wire that takes a request-side cache
@@ -709,6 +881,158 @@ mod tests {
 
 /// 0.38.0 — the cache breakpoint reaches one of the two wire vendors and not the
 /// other, and the pair of tests here is what keeps it that way.
+/// 0.49.0 — a transcript on this wire: `tool_calls` on an assistant message,
+/// `role: "tool"` messages answering them, and the byte-identity that lets a
+/// request without one keep working.
+#[cfg(test)]
+mod transcript_body {
+    use super::*;
+    use crate::provider::ToolResult;
+
+    fn conversation() -> Vec<Message> {
+        vec![
+            Message::User("tidy the README".into()),
+            Message::Assistant {
+                text: Some("Reading it first.".into()),
+                calls: vec![
+                    ToolCall {
+                        name: "read_file".into(),
+                        arguments: json!({ "path": "README.md" }),
+                    },
+                    ToolCall {
+                        name: "grep".into(),
+                        arguments: json!({ "pattern": "TODO" }),
+                    },
+                ],
+            },
+            Message::Results(vec![
+                ToolResult {
+                    call: 0,
+                    content: "# Project".into(),
+                },
+                ToolResult {
+                    call: 1,
+                    content: "no matches".into(),
+                },
+            ]),
+        ]
+    }
+
+    fn with(messages: Vec<Message>) -> CompletionRequest {
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+        CompletionRequest {
+            system: "sys".into(),
+            user: "derived shim".into(),
+            messages,
+            ..Default::default()
+        }
+    }
+
+    /// **F3** — the assistant message carries `tool_calls` and each result arrives as
+    /// its own `role: "tool"` message whose `tool_call_id` is *the same string*.
+    #[test]
+    fn the_body_carries_native_blocks_whose_ids_correlate() {
+        let b = body("gpt-x", &with(conversation()), WebFlavor::OpenRouter);
+        let m = b["messages"].as_array().expect("a messages array");
+        // system, user, assistant, and one tool message per result.
+        assert_eq!(m.len(), 5, "{b}");
+        assert_eq!(m[0]["role"], "system");
+        assert_eq!(m[1]["role"], "user");
+        assert_eq!(m[1]["content"], "tidy the README");
+
+        assert_eq!(m[2]["role"], "assistant");
+        assert_eq!(m[2]["content"], "Reading it first.");
+        let calls = m[2]["tool_calls"].as_array().expect("tool_calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "read_file");
+        // `arguments` is a JSON string on this wire, which is also what the
+        // accumulator parses back out of a response.
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            json!(r#"{"path":"README.md"}"#)
+        );
+
+        for (i, tool) in m[3..].iter().enumerate() {
+            assert_eq!(tool["role"], "tool");
+            assert_eq!(
+                tool["tool_call_id"], calls[i]["id"],
+                "tool message {i} must correlate with the call it answers"
+            );
+        }
+        assert_eq!(m[3]["content"], "# Project");
+        assert_eq!(m[4]["content"], "no matches");
+    }
+
+    /// **F4** — a request with no transcript sends the body 0.48.0 sent, on the
+    /// flavour that adds the most and on the one that adds nothing.
+    #[test]
+    fn an_empty_transcript_sends_the_0_48_0_body() {
+        for flavor in [WebFlavor::OpenAi, WebFlavor::OpenRouter] {
+            let b = body("gpt-x", &with(Vec::new()), flavor);
+            let m = b["messages"].as_array().expect("a messages array");
+            assert_eq!(m.len(), 2, "{b}");
+            assert_eq!(m[1], json!({ "role": "user", "content": "derived shim" }));
+        }
+    }
+
+    /// A call with no text is `content: null` plus its calls, which is the shape a
+    /// completion that stopped straight on a tool call has to send.
+    #[test]
+    fn an_assistant_turn_with_no_text_sends_null_content() {
+        let b = body(
+            "gpt-x",
+            &with(vec![
+                Message::User("go".into()),
+                Message::Assistant {
+                    text: None,
+                    calls: vec![ToolCall {
+                        name: "find".into(),
+                        arguments: json!({}),
+                    }],
+                },
+                Message::Results(vec![ToolResult {
+                    call: 0,
+                    content: "one hit".into(),
+                }]),
+            ]),
+            WebFlavor::OpenRouter,
+        );
+        assert!(b["messages"][2]["content"].is_null(), "{b}");
+        assert_eq!(b["messages"][2]["tool_calls"][0]["function"]["name"], "find");
+        assert_eq!(b["messages"][3]["role"], "tool");
+    }
+
+    /// **F7's wire half** — the marker lands on a user message and never on a tool
+    /// message, and the index is recomputed because this wire emits a longer array
+    /// than the caller's own list.
+    #[test]
+    fn the_transcript_marker_lands_on_a_user_message() {
+        let mut request = with(conversation());
+        request.cache_through = Some(3);
+        let b = body("gpt-x", &request, WebFlavor::OpenRouter);
+        // Message 3 of the caller's list is the results batch; the marker walks back
+        // to the user message, which is index 1 of the emitted array.
+        assert_eq!(b["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(
+            b["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        for i in [2, 3, 4] {
+            assert!(
+                !b["messages"][i].to_string().contains("cache_control"),
+                "message {i} must not be marked: {b}"
+            );
+        }
+        // Two in the whole body: the system breakpoint and this one.
+        assert_eq!(b.to_string().matches("cache_control").count(), 2, "{b}");
+
+        // The OpenAI flavour asks for nothing, on this path as on the flat one.
+        let b = body("gpt-x", &request, WebFlavor::OpenAi);
+        assert_eq!(b.to_string().matches("cache_control").count(), 0, "{b}");
+    }
+}
+
 #[cfg(test)]
 mod cache_wire {
     use super::*;
