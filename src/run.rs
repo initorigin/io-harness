@@ -7,6 +7,7 @@
 //! instead of restarting.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -22,7 +23,8 @@ use crate::approve::{Plan, PlanGate, PlanStep, PlanVerdict};
 use crate::approve::{Question, Responder, ResponderNone};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::context::{
-    assemble, bound, entry_cap_chars, Assembly, Ledger as ContextLedger, ObsKind, Observation,
+    assemble, bound, entry_cap_chars, Assembled, Assembly, Ledger as ContextLedger, ObsKind,
+    Observation,
 };
 use crate::contract::{SystemPrompt, TaskContract};
 use crate::error::{Error, Result};
@@ -31,7 +33,8 @@ use crate::net::{self, NetGuard};
 use crate::observe::{EventKind, Ignore, Observer, RunEvent};
 use crate::policy::{Act, Effect, Policy, Rule};
 use crate::provider::{
-    CompletionRequest, CompletionResponse, PromptFamily, Provider, ToolCall, ToolSpec,
+    CompletionRequest, CompletionResponse, Message, PromptFamily, Provider, ToolCall, ToolResult,
+    ToolSpec,
 };
 use crate::resilience::{Progress, Progressing};
 use crate::sandbox::{Sandbox, SandboxConfig};
@@ -4285,6 +4288,11 @@ async fn run_workspace_from<P: Provider>(
     // whose summary assembly stubbed, and on a resume — a resumed run has sent this
     // prefix zero times from where it now stands, so it earns the marker again.
     let mut marked_prefix = PrefixGuard::default();
+    // 0.49.0 — what each step of THIS run asked for, so the next step can send it
+    // back as an assistant turn. In memory and never stored: a vendor correlates a
+    // call with its result inside one request, and this loop rebuilds the whole
+    // request every step, so nothing here needs to outlive the run.
+    let mut turns: BTreeMap<u32, StepTurn> = BTreeMap::new();
     // The run's live process handles, created before the first turn and killed
     // when the run ends however it ends. `Arc` because the reaping task for each
     // handle outlives the dispatch that started it and has to be able to record
@@ -4500,6 +4508,10 @@ async fn run_workspace_from<P: Provider>(
                     _ => system.clone(),
                 },
                 user: user.clone(),
+                // 0.49.0 — the same emission as a conversation. Empty until this run
+                // has driven a step of its own, which is what keeps a first step and a
+                // resumed run byte-identical on the wire to what 0.48.0 sent.
+                messages: transcript(&user, &assembled, &turns),
                 tools: tools.clone(),
                 // 0.22.0 — the run's web declaration, unchanged per step.
                 web: contract.web.clone(),
@@ -4601,6 +4613,17 @@ async fn run_workspace_from<P: Provider>(
                 },
             ));
         }
+
+        // 0.49.0 — record what this step asked for before anything is dispatched,
+        // so the next step sends the model its own turn back instead of a
+        // third-person account of it.
+        turns.insert(
+            step,
+            StepTurn {
+                text: response.text.clone(),
+                calls: response.tool_calls.clone(),
+            },
+        );
 
         // Dispatch every tool call the model made this step, in order, folding
         // each result into the observation log the next turn will see.
@@ -5992,6 +6015,9 @@ fn run_agent<'f, P: Provider>(
         // prompt from its own ledger, so one agent's frozen prefix says nothing about
         // another's, and a shared one would mark a prefix this agent has never sent.
         let mut marked_prefix = PrefixGuard::default();
+        // 0.49.0 — per agent in the tree, for the reason the flat loop keeps one per
+        // run: a child's turns are its own and must never reach its parent's request.
+        let mut turns: BTreeMap<u32, StepTurn> = BTreeMap::new();
         // Same ledger and same per-turn assembly as the workspace loop: a tree of
         // 100 children each re-sending its own unbounded log is the multiplied
         // version of the problem 0.10.0 exists to fix — and, since 0.13.0, the
@@ -6153,6 +6179,11 @@ fn run_agent<'f, P: Provider>(
                         _ => system.clone(),
                     },
                     user: user.clone(),
+                    // 0.49.0 — the same conversation the flat loop sends, built by the
+                    // same helper: a transcript assembled in one loop and not the other
+                    // would make a contained run and a flat one talk to the model
+                    // differently while nothing failed.
+                    messages: transcript(&user, &assembled, &turns),
                     tools: tools.clone(),
                     // 0.21.0 — a named agent's model. `None` for the root and for any
                     // child spawned without a definition, which is what every provider
@@ -6242,6 +6273,15 @@ fn run_agent<'f, P: Provider>(
                     },
                 ));
             }
+
+            // 0.49.0 — recorded before dispatch, as the flat loop does.
+            turns.insert(
+                step,
+                StepTurn {
+                    text: response.text.clone(),
+                    calls: response.tool_calls.clone(),
+                },
+            );
 
             let mut decisions: Vec<String> = Vec::new();
             let mut calls_json: Vec<String> = Vec::new();
@@ -12172,6 +12212,97 @@ fn with_skill_catalog(base: String, skills: &Skills) -> String {
          skill's full text when its description matches what you are doing.\n{}",
         skills.catalog()
     )
+}
+
+/// What one step of this run asked for, kept so the next step can send it back as
+/// an assistant turn (0.49.0).
+///
+/// In memory and for this run only. A resumed run has none of these for the steps
+/// it did not itself drive, and that is the whole of why its earlier history stays
+/// prose — see [`transcript`].
+#[derive(Debug, Clone)]
+struct StepTurn {
+    /// What the model wrote, when it wrote anything beside its calls.
+    text: Option<String>,
+    /// The calls it made, in the order it made them.
+    calls: Vec<ToolCall>,
+}
+
+/// The role-tagged conversation this step's request carries (0.49.0).
+///
+/// Built from the **same emission** the flat `user` string is built from, so the
+/// two cannot describe the run differently: [`Assembled::emitted`] concatenates to
+/// [`Assembled::text`] byte for byte, and `user` is that text inside the prompt's
+/// own framing. What this function does is cut the framing off the front and back
+/// and interleave the steps' assistant turns into the middle.
+///
+/// A step whose results do not line up with the calls it made is emitted as prose
+/// instead — the shape every release through 0.48.0 sent. Two ways to reach that:
+///
+/// - **a resumed run.** Its earlier steps were driven by a process that is gone,
+///   the ledger it restored holds text and not tool-call structure, and nothing is
+///   stored that would rebuild them. Everything from the resume point on is
+///   role-tagged.
+/// - **a count that disagrees.** If a step ever produced more results than it made
+///   calls, correlating them positionally would answer the wrong call. Falling
+///   back costs that step its block shape and loses nothing, where guessing would
+///   send a transcript that reads as confident and is wrong.
+fn transcript(user: &str, assembled: &Assembled, turns: &BTreeMap<u32, StepTurn>) -> Vec<Message> {
+    // The prompt's own framing, split off the observation section it wraps. The
+    // section is embedded verbatim, which is what makes this exact rather than a
+    // reconstruction — the same property `frozen_prefix` relies on.
+    let (head, tail) = match assembled.text.is_empty() {
+        false => user.split_once(assembled.text.as_str()).unwrap_or((user, "")),
+        true => (user, ""),
+    };
+    let mut out: Vec<Message> = Vec::new();
+    let mut pending = head.to_string();
+    let mut i = 0;
+    while i < assembled.emitted.len() {
+        if !assembled.emitted[i].result {
+            pending.push_str(&assembled.emitted[i].text);
+            i += 1;
+            continue;
+        }
+        // One run of results, all from the same step.
+        let step = assembled.emitted[i].step;
+        let mut results = Vec::new();
+        while let Some(e) = assembled.emitted.get(i).filter(|e| e.result && e.step == step) {
+            results.push(ToolResult {
+                call: e.ordinal,
+                content: e.text.clone(),
+            });
+            i += 1;
+        }
+        let known = turns
+            .get(&step)
+            .filter(|turn| results.iter().all(|r| r.call < turn.calls.len()));
+        let Some(turn) = known else {
+            for result in &results {
+                pending.push_str(&result.content);
+            }
+            continue;
+        };
+        if !pending.is_empty() {
+            out.push(Message::User(std::mem::take(&mut pending)));
+        }
+        out.push(Message::Assistant {
+            text: turn.text.clone(),
+            calls: turn.calls.clone(),
+        });
+        out.push(Message::Results(results));
+    }
+    pending.push_str(tail);
+    if !pending.is_empty() {
+        out.push(Message::User(pending));
+    }
+    // A transcript of one user message is the flat request said twice. Sending
+    // nothing is what keeps a first step, a single-file run and a resumed run
+    // byte-identical on the wire to what 0.48.0 sent.
+    match out.as_slice() {
+        [Message::User(_)] | [] => Vec::new(),
+        _ => out,
+    }
 }
 
 fn workspace_user_prompt(

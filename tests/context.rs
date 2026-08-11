@@ -20,7 +20,7 @@ use io_harness::context::{
     assemble, entry_cap_chars, estimate_tokens, Assembled, Assembly, Compaction, ContextBudget,
     Ledger, ObsKind, Observation,
 };
-use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
+use io_harness::provider::{CompletionRequest, CompletionResponse, Message, ToolCall};
 use io_harness::tools::{Tool, ToolFuture, Toolbox, Workspace};
 use io_harness::{
     run_with, ApproveAll, McpServer, MemoryEntry, MemoryKind, Policy, Provider, Store,
@@ -1324,4 +1324,182 @@ async fn an_elided_result_keeps_its_calls_position() {
          call 1 rather than sliding up: {:#?}",
         out.emitted
     );
+}
+
+// ------------------------------------------ 0.49.0: the transcript on the wire
+
+/// Every request the mock was sent, whole.
+fn requests(mock: &MockScript) -> Vec<CompletionRequest> {
+    mock.seen.lock().unwrap().clone()
+}
+
+/// **F1** — a multi-step run sends a role-tagged transcript, and the shim beside it
+/// is the string 0.48.0 sent.
+///
+/// The first request carries no transcript at all: there is nothing to tell the
+/// model about yet, and sending a one-message conversation would be the flat
+/// request said twice.
+#[tokio::test]
+async fn a_multi_step_run_sends_a_role_tagged_transcript() {
+    let dir = ws();
+    std::fs::write(dir.path().join("a.txt"), "AAA\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "BBB\n").unwrap();
+    let contract = never_passes(dir.path(), 3);
+    let provider = MockScript::new(vec![
+        vec![call("read_file", json!({ "path": "a.txt" }))],
+        vec![call("read_file", json!({ "path": "b.txt" }))],
+    ]);
+    let store = Store::memory().unwrap();
+    run_with(&contract, &provider, &store, &open_policy(), &ApproveAll)
+        .await
+        .unwrap();
+
+    let seen = requests(&provider);
+    assert!(seen.len() >= 3, "the loop ran {} steps", seen.len());
+    assert!(
+        seen[0].messages.is_empty(),
+        "the opening step has nothing to say back: {:#?}",
+        seen[0].messages
+    );
+
+    // Step 2 knows about step 1: one assistant turn carrying the call it made, and
+    // one results batch answering it.
+    let m = &seen[1].messages;
+    assert!(m.len() >= 3, "expected a conversation, got {m:#?}");
+    assert!(matches!(m[0], Message::User(_)));
+    match &m[1] {
+        Message::Assistant { calls, .. } => {
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "read_file");
+            assert_eq!(calls[0].arguments["path"], "a.txt");
+        }
+        other => panic!("expected the assistant's own turn, got {other:?}"),
+    }
+    match &m[2] {
+        Message::Results(results) => {
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].call, 0);
+            assert!(
+                results[0].content.contains("AAA"),
+                "the result is the file it read: {}",
+                results[0].content
+            );
+        }
+        other => panic!("expected the results of that turn, got {other:?}"),
+    }
+
+    // And by step 3 both steps are there, in order.
+    let calls: Vec<String> = seen[2]
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::Assistant { calls, .. } => {
+                Some(calls[0].arguments["path"].as_str().unwrap().to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls, vec!["a.txt", "b.txt"]);
+}
+
+/// **F5** — the derived `user` is the string this build would have sent before the
+/// transcript existed, and the transcript is that same string's own pieces.
+///
+/// Asserted as a reconstruction rather than against a frozen literal, which is the
+/// stronger claim: every byte of the flat prompt is somewhere in the conversation,
+/// in the same order, and nothing was invented to put there.
+#[tokio::test]
+async fn the_derived_user_is_the_flat_prompt_the_transcript_was_built_from() {
+    let dir = ws();
+    std::fs::write(dir.path().join("a.txt"), "AAA\n").unwrap();
+    let contract = never_passes(dir.path(), 3);
+    let provider = MockScript::new(vec![
+        vec![call("read_file", json!({ "path": "a.txt" }))],
+        vec![call("read_file", json!({ "path": "a.txt" }))],
+    ]);
+    let store = Store::memory().unwrap();
+    run_with(&contract, &provider, &store, &open_policy(), &ApproveAll)
+        .await
+        .unwrap();
+
+    let seen = requests(&provider);
+    let conversations = seen.iter().filter(|r| !r.messages.is_empty()).count();
+    assert!(
+        conversations > 0,
+        "at least one request must carry a transcript, or this test passes vacuously"
+    );
+    for req in seen.iter().filter(|r| !r.messages.is_empty()) {
+        let rebuilt: String = req
+            .messages
+            .iter()
+            .map(|m| match m {
+                Message::User(text) => text.clone(),
+                Message::Assistant { .. } => String::new(),
+                Message::Results(results) => {
+                    results.iter().map(|r| r.content.as_str()).collect()
+                }
+            })
+            .collect();
+        assert_eq!(
+            rebuilt, req.user,
+            "the conversation's text must be the derived `user`, byte for byte"
+        );
+        assert!(
+            req.user.contains("Call a tool to make progress"),
+            "and the derived `user` is still the whole workspace prompt"
+        );
+    }
+}
+
+/// **F10** — a step whose completion carried several calls becomes ONE assistant
+/// turn and ONE results batch, correlated pairwise in the model's call order.
+#[tokio::test]
+async fn parallel_calls_are_one_turn_and_one_batch_in_call_order() {
+    let dir = ws();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(dir.path().join(name), format!("CONTENT-{name}\n")).unwrap();
+    }
+    let contract = never_passes(dir.path(), 3);
+    let provider = MockScript::new(vec![vec![
+        call("read_file", json!({ "path": "a.txt" })),
+        call("read_file", json!({ "path": "b.txt" })),
+        call("read_file", json!({ "path": "c.txt" })),
+    ]]);
+    let store = Store::memory().unwrap();
+    run_with(&contract, &provider, &store, &open_policy(), &ApproveAll)
+        .await
+        .unwrap();
+
+    let seen = requests(&provider);
+    let m = &seen[1].messages;
+    let assistants = m
+        .iter()
+        .filter(|x| matches!(x, Message::Assistant { .. }))
+        .count();
+    let batches = m
+        .iter()
+        .filter(|x| matches!(x, Message::Results(_)))
+        .count();
+    assert_eq!((assistants, batches), (1, 1), "one turn, one batch: {m:#?}");
+
+    let Some(Message::Assistant { calls, .. }) =
+        m.iter().find(|x| matches!(x, Message::Assistant { .. }))
+    else {
+        unreachable!()
+    };
+    let Some(Message::Results(results)) = m.iter().find(|x| matches!(x, Message::Results(_))) else {
+        unreachable!()
+    };
+    assert_eq!(calls.len(), 3);
+    assert_eq!(results.len(), 3);
+    for (i, result) in results.iter().enumerate() {
+        assert_eq!(result.call, i, "results are in the model's call order");
+        let path = calls[i].arguments["path"].as_str().unwrap();
+        let name = path.trim_end_matches(".txt");
+        assert!(
+            result.content.contains(&format!("CONTENT-{name}")),
+            "result {i} must answer call {i} ({path}), got: {}",
+            result.content
+        );
+    }
 }

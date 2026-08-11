@@ -65,8 +65,40 @@ use crate::provider::{CompletionRequest, CompletionResponse, Provider};
 /// no separator can be forged by a prompt containing it. Serialising a
 /// `CompletionRequest` cannot fail: every field is a `String`, a `Vec`, or a
 /// `serde_json::Value`, none of which has a failing `Serialize`.
+///
+/// **(0.49.0) `messages` is excluded, and the two cache markers are not.**
+///
+/// The transcript is a *rendering* of content the key already covers: the run loop
+/// derives `user` from the same emission it builds the transcript from, byte for
+/// byte, which `the_derived_user_is_the_flat_prompt_the_transcript_was_built_from`
+/// holds. A key over `user` therefore asks the same question, in a form that does
+/// not move when the rendering does. That buys two things a stricter key loses:
+///
+/// - **a recording made before 0.49.0 still replays.** The key is byte-identical
+///   to the one that release computed, so nothing has to be re-recorded.
+/// - **an interrupted run still replays.** A resumed run rebuilds its ledger from
+///   the store, which holds observation text and not tool-call structure, so its
+///   requests carry no transcript where the recorded ones did. Keying on the
+///   transcript makes every post-resume step a miss — which is how this was found:
+///   `a_workspace_replay_survives_being_interrupted_and_resumed` failed, and the
+///   guarantee it asserts is older than this release.
+///
+/// The cache markers stay in the key, because 0.44.0 decided they are part of the
+/// question and `a_boundary_is_absent_from_an_unmarked_key_and_present_in_a_marked_one`
+/// holds that decision. The two rulings are not in tension: a marker changes what
+/// is asked of the vendor, where the transcript changes only how content already
+/// in the key is spelt.
+///
+/// The limit, stated rather than left to be discovered: two requests whose
+/// transcripts differ while their `user` strings do not would share a key. This
+/// loop cannot produce such a pair, since both are built from one emission — but a
+/// caller hand-building requests could.
 fn key(request: &CompletionRequest) -> String {
-    serde_json::to_string(request).expect("a CompletionRequest is always serialisable")
+    let stable = CompletionRequest {
+        messages: Vec::new(),
+        ..request.clone()
+    };
+    serde_json::to_string(&stable).expect("a CompletionRequest is always serialisable")
 }
 
 /// Which answer each key is currently on, and which key was asked last.
@@ -140,10 +172,12 @@ impl Provider for Replay {
             return Err(Error::provider(
                 ProviderErrorKind::Request,
                 format!(
-                    "no recorded response for this request (system {} chars, {} tools, user \
-                     begins {:?}): the replay has diverged from what was recorded",
+                    "no recorded response for this request (system {} chars, {} tools, {} \
+                     message(s), user begins {:?}): the replay has diverged from what was \
+                     recorded",
                     request.system.len(),
                     request.tools.len(),
+                    request.messages.len(),
                     request.user.chars().take(120).collect::<String>(),
                 ),
             ));
