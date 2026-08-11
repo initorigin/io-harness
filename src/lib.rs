@@ -425,7 +425,7 @@ pub use approve::{
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
 pub use context::{Compaction, ContextBudget};
-pub use contract::{Routing, SystemPrompt, TaskContract};
+pub use contract::{Preset, Routing, SystemPrompt, TaskContract};
 pub use error::{Error, ProviderErrorKind, Result};
 pub use hooks::Hooks;
 pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};

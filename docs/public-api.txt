@@ -83,6 +83,7 @@ enum Message src/provider/mod.rs
 enum PlanVerdict src/approve.rs
 enum PriceSource src/provider/mod.rs
 enum Progressing src/resilience.rs
+enum Preset src/contract.rs
 enum PromptFamily src/provider/mod.rs
 enum ProviderErrorKind src/error.rs
 enum ProviderSpec src/config.rs

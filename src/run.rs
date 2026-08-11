@@ -26,7 +26,7 @@ use crate::context::{
     assemble, bound, entry_cap_chars, Assembled, Assembly, Ledger as ContextLedger, ObsKind,
     Observation, Piece,
 };
-use crate::contract::{SystemPrompt, TaskContract};
+use crate::contract::{Preset, SystemPrompt, TaskContract};
 use crate::error::{Error, Result};
 use crate::mcp::McpSession;
 use crate::net::{self, NetGuard};
@@ -11813,6 +11813,9 @@ struct PromptSpec<'a> {
 fn compose(spec: PromptSpec<'_>) -> String {
     let description = match spec.prompt {
         SystemPrompt::Replace(text) => text.clone(),
+        // 0.49.0 — a preset sits exactly where a replacement sits, so everything
+        // the crate has to say about the request is still composed around it.
+        SystemPrompt::Preset(preset) => preset.describe().to_string(),
         _ => spec.base.to_string(),
     };
     let mut out = with_skill_catalog(with_extra_tools(description, spec.extra), spec.skills);
@@ -11849,6 +11852,11 @@ fn prompt_source(prompt: &SystemPrompt) -> &'static str {
         SystemPrompt::Builtin => "builtin",
         SystemPrompt::Append(_) => "appended",
         SystemPrompt::Replace(_) => "replaced",
+        // 0.49.0 — the trace names the preset, not just that one was used: which
+        // description a run was given is the fact a reader is after.
+        SystemPrompt::Preset(Preset::Concise) => "preset:concise",
+        SystemPrompt::Preset(Preset::Careful) => "preset:careful",
+        SystemPrompt::Preset(_) => "preset",
     }
 }
 

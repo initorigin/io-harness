@@ -12,7 +12,7 @@ use io_harness::provider::{CompletionRequest, CompletionResponse, PromptFamily, 
 use io_harness::sandbox::{select, Sandbox, SandboxConfig};
 use io_harness::{
     run_tree, run_with, run_with_observed, Act, ApproveAll, Containment, ContextBudget, Effect,
-    EventKind, Flow, Observer, Policy, Provider, RunEvent, Session, Store, SystemPrompt,
+    EventKind, Flow, Observer, Policy, Preset, Provider, RunEvent, Session, Store, SystemPrompt,
     TaskContract, Verification,
 };
 use serde_json::json;
@@ -1257,5 +1257,60 @@ async fn a_classifying_turn_is_not_told_it_has_a_specification() {
         tree.starts_with("You are an agent working across a repository to meet a stated \
                           specification."),
         "a tree run's framing must not move:\n{tree}"
+    );
+}
+
+// -------------------------------------------------- 0.49.0: a preset, opt-in by name
+
+/// **F9** — a preset is reached by name and never by default, and `Builtin` does
+/// not move.
+///
+/// The byte-identity control is the load-bearing half: a preset that shipped as
+/// the default would be the thing 0.45.0 declined to ship, and it would pass every
+/// assertion about the preset's own text.
+#[tokio::test]
+async fn a_preset_is_opt_in_and_the_builtin_does_not_move() {
+    let dir = workspace();
+
+    // Nobody asked: 0.44.0's description, exactly as the baseline above.
+    let untouched = workspace_system(&contract(dir.path())).await;
+    relocated(&untouched, V0440_WORKSPACE, CALL_TOOLS_ENDING);
+
+    for (preset, marker) in [
+        (Preset::Concise, "Act before you explain"),
+        (Preset::Careful, "Before you report a change as done, check it"),
+    ] {
+        let shaped = workspace_system(
+            &contract(dir.path()).with_system_prompt(SystemPrompt::Preset(preset)),
+        )
+        .await;
+        assert!(
+            shaped.contains(marker),
+            "{preset:?} must carry its own working style, got:\n{shaped}"
+        );
+        // The same agent in the same workspace: a preset shapes how the work is
+        // done and reported, never what the agent can reach.
+        for tool in ["`grep`", "`find`", "`read_file`", "`write_file`"] {
+            assert!(shaped.contains(tool), "{preset:?} dropped {tool}");
+        }
+        // And everything the crate composes around a description still applies,
+        // in the order `Replace` already fixed — the ending last of all.
+        assert!(
+            shaped.ends_with(CALL_TOOLS_ENDING),
+            "{preset:?} got past the crate's ending:\n{shaped}"
+        );
+        assert_ne!(
+            shaped, untouched,
+            "{preset:?} composed to the builtin, so nothing was chosen"
+        );
+        // One preset is not the other.
+        assert!(!shaped.contains("port the parser"));
+    }
+
+    // Choosing one does not change what anyone else gets.
+    let after = workspace_system(&contract(dir.path())).await;
+    assert_eq!(
+        after, untouched,
+        "the builtin moved once a preset existed, which is exactly what must not happen"
     );
 }
