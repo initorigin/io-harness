@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use io_harness::approve::DecisionFuture;
-use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
+use io_harness::provider::{CompletionRequest, CompletionResponse, Message, ToolCall, Usage};
 use io_harness::tools::Workspace;
 use io_harness::{
     rewind_run, ApproveAll, Approver, EventKind, Flow, Observer, Policy, Provider, Request,
@@ -73,6 +73,11 @@ impl Mock {
     /// The user prompt of the nth completion it served.
     fn user(&self, n: usize) -> String {
         self.seen.lock().unwrap()[n].user.clone()
+    }
+
+    /// The transcript of the `n`th request (0.49.0).
+    fn messages(&self, n: usize) -> Vec<Message> {
+        self.seen.lock().unwrap()[n].messages.clone()
     }
 }
 
@@ -455,8 +460,14 @@ async fn a_reply_is_read_by_the_turn_that_follows_it() {
         second.contains("what can you do?"),
         "the second turn did not read the first turn's prompt:\n{second}"
     );
+    // 0.49.0 — the wording changed because the release changed it. The seed used to
+    // narrate the agent's own past turn in the third person ("you answered: …")
+    // inside the one user message a request could carry; the attribution now lives
+    // in the message's role, and the entry is `[agent]`. What this test is about —
+    // that a reply is part of the conversation the next turn reads — is unchanged,
+    // and F6 asserts the role-tagged half.
     assert!(
-        second.contains("you answered: I read repositories and change them."),
+        second.contains("[agent] I read repositories and change them."),
         "the second turn did not read the first turn's answer, so a reply is not \
          part of the conversation:\n{second}"
     );
@@ -713,4 +724,62 @@ fn body_of(src: &str, name: &str) -> String {
 /// is, so naming it is the whole test.
 fn mentions_classification(body: &str) -> bool {
     body.contains("classify:") || body.contains("classify =")
+}
+
+// ------------------------------------------------- 0.49.0: a prior turn is a turn
+
+/// **F6** — a session's earlier turns reach the model as real user and assistant
+/// messages, and the third-person narration is gone.
+///
+/// Both halves are asserted together on purpose. The presence assertion alone
+/// passes for a build that sends the turns as messages *and* keeps narrating them;
+/// the absence assertion alone passes for a build that simply dropped them.
+#[tokio::test]
+async fn an_earlier_turn_arrives_as_that_speakers_own_message() {
+    let ws = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let provider = Mock::new(vec![
+        Say::Text("I read repositories and change them."),
+        Say::Text("still here"),
+    ]);
+    let mut session = Session::open(&store, ws.path()).unwrap();
+    session
+        .turn("what can you do?", &provider, &store, &policy(), &ApproveAll)
+        .await
+        .unwrap();
+    session
+        .turn("and now?", &provider, &store, &policy(), &ApproveAll)
+        .await
+        .unwrap();
+
+    let messages = provider.messages(1);
+    assert!(
+        !messages.is_empty(),
+        "the second turn must carry a conversation, or this asserts nothing"
+    );
+
+    let asked = messages.iter().any(|m| {
+        matches!(m, Message::User(text) if text.contains("what can you do?"))
+    });
+    let answered = messages.iter().any(|m| {
+        matches!(
+            m,
+            Message::Assistant { text: Some(text), calls }
+                if text.contains("I read repositories and change them.") && calls.is_empty()
+        )
+    });
+    assert!(asked, "the operator's earlier turn is a user message: {messages:#?}");
+    assert!(
+        answered,
+        "and the agent's own answer is an assistant message, not something it is \
+         told about: {messages:#?}"
+    );
+
+    // The narration is gone from the whole request, `user` included — the
+    // attribution lives in the role now.
+    let user = provider.user(1);
+    assert!(
+        !user.contains("the operator asked:") && !user.contains("you answered:"),
+        "the third-person narration must be gone:\n{user}"
+    );
 }

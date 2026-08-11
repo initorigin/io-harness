@@ -257,7 +257,7 @@ tasks:
   summary: Seed a session's prior turns as real user and assistant messages.
   why_required: A conversation whose own history is bracketed prose is the same off-distribution shape
     the release exists to remove, one level up.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.49.0-T05
   acceptance_criteria:
@@ -270,7 +270,22 @@ tasks:
     '
   files:
   - src/session.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test session_reply` — 9 passed, 0 failed.'
+  - 'F6 — `an_earlier_turn_arrives_as_that_speakers_own_message`: the operator''s earlier turn is a `Message::User`
+    carrying their words, the agent''s own answer is a `Message::Assistant` with no calls, and the strings
+    `the operator asked:` and `you answered:` are absent from the whole request including `user`. Presence
+    and absence are asserted together: presence alone passes for a build that sends the turns AND keeps
+    narrating them, absence alone passes for one that dropped them.'
+  - 'SABOTAGE (F6): untagging the seed entries — 0.48.0''s behaviour, where a prior turn is prose inside
+    somebody else''s message — failed exactly that one test.'
+  - 'THE SEED''S PROSE CHANGED, and two existing tests changed with it, each with the sentence saying
+    why. `tests/session_reply.rs`''s `a_reply_is_read_by_the_turn_that_follows_it` asserted the literal
+    `you answered: ` and now asserts `[agent] `; `tests/prompt.rs` looked for `[earlier turn]` to check
+    the ORDER of the operator''s words against the conversation, which is unchanged, and now looks for
+    `[operator]`. The attribution moved out of third-person prose and into the message''s role, which
+    is the release''s own argument applied to the seed.'
+  - '`cargo test` (default features) — exit 0 with the whole suite green after the change.'
 - id: US-IO-HARNESS-0.49.0-T08
   summary: Frame a conversational turn as a conversation rather than as a task with a goal.
   why_required: '`Session::default_contract` turns a greeting into a specification, which is the second

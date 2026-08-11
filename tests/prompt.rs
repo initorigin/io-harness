@@ -1094,8 +1094,12 @@ async fn a_classifying_turn_keeps_the_order_the_cache_boundary_reads() {
     let words = user
         .find("and what can you do")
         .expect("the operator's words are in the request");
+    // 0.49.0 — the marker changed with the seed's own shape. The attribution moved
+    // from third-person prose ("the operator asked: …") to the message's role, so
+    // the entry is now `[operator]`; what this test asserts is the ORDER, which is
+    // unchanged and is what `cache_boundary_for` depends on.
     let seed = user
-        .find("[earlier turn]")
+        .find("[operator]")
         .expect("the conversation so far is in the request");
     assert!(
         words < seed,

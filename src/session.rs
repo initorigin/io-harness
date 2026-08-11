@@ -871,20 +871,29 @@ impl Session {
     /// One entry per prior turn on the path, each bounded by the same per-entry cap
     /// the loop bounds a tool result by, so a long conversation is compacted by the
     /// assembler rather than by a rule of this module's own.
-    fn seed(&self, store: &Store, contract: &TaskContract) -> Result<Vec<String>> {
+    ///
+    /// **(0.49.0) Each entry says who was speaking**, and the run loop turns that
+    /// into a real user or assistant message. Through 0.48.0 they were narration —
+    /// "the operator asked: …" and "you answered: …" — inside the single user
+    /// message the request could carry, which told the model about its own past
+    /// turn in the third person. The attribution moved from the prose to the role,
+    /// which is where the model was trained to read it.
+    fn seed(&self, store: &Store, contract: &TaskContract) -> Result<Vec<(&'static str, String)>> {
         let cap = entry_cap_chars(contract.context.effective_tokens(contract.max_tokens));
         let mut out = Vec::new();
         for turn in self.history(store)? {
-            out.push(bound(
-                &format!("\n[earlier turn] the operator asked: {}\n", turn.prompt),
-                cap,
-                ObsKind::Message,
-            ));
-            if let Some(reply) = turn.reply.as_deref().filter(|r| !r.is_empty()) {
-                out.push(bound(
-                    &format!("\n[earlier turn] you answered: {reply}\n"),
+            out.push((
+                crate::context::SEED_OPERATOR,
+                bound(
+                    &format!("\n[operator] {}\n", turn.prompt),
                     cap,
                     ObsKind::Message,
+                ),
+            ));
+            if let Some(reply) = turn.reply.as_deref().filter(|r| !r.is_empty()) {
+                out.push((
+                    crate::context::SEED_AGENT,
+                    bound(&format!("\n[agent] {reply}\n"), cap, ObsKind::Message),
                 ));
             }
         }

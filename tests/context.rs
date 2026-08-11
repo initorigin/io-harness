@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use io_harness::context::{
     assemble, entry_cap_chars, estimate_tokens, Assembled, Assembly, Compaction, ContextBudget,
-    Ledger, ObsKind, Observation,
+    Ledger, ObsKind, Observation, Piece,
 };
 use io_harness::provider::{CompletionRequest, CompletionResponse, Message, ToolCall};
 use io_harness::tools::{Tool, ToolFuture, Toolbox, Workspace};
@@ -1283,7 +1283,7 @@ async fn a_results_ordinal_is_the_index_of_the_call_it_answers() {
     let shape: Vec<(u32, usize, bool)> = out
         .emitted
         .iter()
-        .map(|e| (e.step, e.ordinal, e.result))
+        .map(|e| (e.step, e.ordinal, e.piece == Piece::Result))
         .collect();
     assert_eq!(
         shape,
@@ -1314,7 +1314,7 @@ async fn an_elided_result_keeps_its_calls_position() {
     let results: Vec<(usize, bool)> = out
         .emitted
         .iter()
-        .filter(|e| e.result)
+        .filter(|e| e.piece == Piece::Result)
         .map(|e| (e.ordinal, e.text.contains("elided")))
         .collect();
     assert_eq!(

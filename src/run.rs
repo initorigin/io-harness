@@ -24,7 +24,7 @@ use crate::approve::{Question, Responder, ResponderNone};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::context::{
     assemble, bound, entry_cap_chars, Assembled, Assembly, Ledger as ContextLedger, ObsKind,
-    Observation,
+    Observation, Piece,
 };
 use crate::contract::{SystemPrompt, TaskContract};
 use crate::error::{Error, Result};
@@ -978,7 +978,7 @@ pub(crate) struct TurnExtras<'a> {
     /// the path from the tree's root to the head. Seeded into the observation
     /// ledger before the first step, so it is compacted by the assembler that
     /// already compacts a long run rather than by a second rule of its own.
-    pub seed: &'a [String],
+    pub seed: &'a [(&'static str, String)],
     /// Where an operator's mid-turn messages and an interrupt arrive. Drained at
     /// the step boundary and nowhere else.
     pub steer: Option<&'a crate::session::SteerInbox>,
@@ -3760,8 +3760,15 @@ fn seed_conversation(ledger: &mut ContextLedger, extras: &TurnExtras<'_>) {
     if !ledger.is_empty() {
         return;
     }
-    for entry in extras.seed {
-        ledger.push(Observation::new(0, ObsKind::Message, None, entry.clone()));
+    for (speaker, entry) in extras.seed {
+        // 0.49.0 — tagged with who was speaking, so the transcript can send it as
+        // that speaker's own turn rather than as narration inside another.
+        ledger.push(Observation::new(
+            0,
+            ObsKind::Message,
+            Some((*speaker).to_string()),
+            entry.clone(),
+        ));
     }
 }
 
@@ -12300,15 +12307,39 @@ fn transcript(user: &str, assembled: &Assembled, turns: &BTreeMap<u32, StepTurn>
     let mut pending = head.to_string();
     let mut i = 0;
     while i < assembled.emitted.len() {
-        if !assembled.emitted[i].result {
-            pending.push_str(&assembled.emitted[i].text);
-            i += 1;
-            continue;
+        let at = &assembled.emitted[i];
+        match at.piece {
+            Piece::Prose => {
+                pending.push_str(&at.text);
+                i += 1;
+                continue;
+            }
+            // An earlier turn of this conversation is that speaker's own message,
+            // which is the whole of what the seed change bought.
+            Piece::Operator | Piece::Agent => {
+                if !pending.is_empty() {
+                    out.push(Message::User(std::mem::take(&mut pending)));
+                }
+                out.push(match at.piece {
+                    Piece::Agent => Message::Assistant {
+                        text: Some(at.text.clone()),
+                        calls: Vec::new(),
+                    },
+                    _ => Message::User(at.text.clone()),
+                });
+                i += 1;
+                continue;
+            }
+            Piece::Result => {}
         }
         // One run of results, all from the same step.
-        let step = assembled.emitted[i].step;
+        let step = at.step;
         let mut results = Vec::new();
-        while let Some(e) = assembled.emitted.get(i).filter(|e| e.result && e.step == step) {
+        while let Some(e) = assembled
+            .emitted
+            .get(i)
+            .filter(|e| e.piece == Piece::Result && e.step == step)
+        {
             results.push(ToolResult {
                 call: e.ordinal,
                 content: e.text.clone(),

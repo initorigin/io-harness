@@ -546,6 +546,42 @@ pub struct Assembled {
     pub emitted: Vec<Emitted>,
 }
 
+/// (0.49.0) The `target` an [`Observation`] carries to say an earlier turn of this
+/// conversation was the operator speaking, and the one that says it was the agent.
+///
+/// The seed writes them (`Session::seed`) and [`assemble`] reads them back into
+/// [`Piece`], which is how the run loop knows to send a prior turn as a real user
+/// or assistant message instead of as narration inside somebody else's.
+pub const SEED_OPERATOR: &str = "operator";
+/// See [`SEED_OPERATOR`].
+pub const SEED_AGENT: &str = "agent";
+
+/// (0.49.0) What one [`Emitted`] piece is, for a loop building a transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Piece {
+    /// Framing, the memory block, a folded summary, a collapse line — user text
+    /// that belongs to no turn of its own.
+    Prose,
+    /// The result of a tool call, named by [`Emitted::ordinal`].
+    Result,
+    /// What the operator said on an earlier turn of this conversation.
+    Operator,
+    /// What the agent answered on an earlier turn of this conversation.
+    Agent,
+}
+
+impl Piece {
+    /// What an observation is, for the transcript.
+    fn of(observation: &Observation) -> Self {
+        match (observation.kind, observation.target.as_deref()) {
+            (ObsKind::Message, Some(SEED_OPERATOR)) => Piece::Operator,
+            (ObsKind::Message, Some(SEED_AGENT)) => Piece::Agent,
+            (ObsKind::Message, _) => Piece::Prose,
+            _ => Piece::Result,
+        }
+    }
+}
+
 /// (0.49.0) One piece of the observation section, as the transcript sees it.
 ///
 /// The run loop turns a run of these into a
@@ -565,10 +601,9 @@ pub struct Emitted {
     /// stubbed or the stubs are collapsed — dropping them would slide every later
     /// result up by one and quietly answer the wrong call.
     pub ordinal: usize,
-    /// Whether this answers a tool call. False for the memory block, a folded
-    /// summary, operator steering, a collapse line, and anything else the model
-    /// said rather than a tool produced.
-    pub result: bool,
+    /// What this piece is: a tool result, an earlier turn of the conversation, or
+    /// prose belonging to no turn of its own.
+    pub piece: Piece,
     /// The text, exactly as it appears in [`Assembled::text`].
     pub text: String,
 }
@@ -719,7 +754,7 @@ pub async fn assemble(
     let mut ordinals = vec![0usize; n];
     let mut counted: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
     for i in 0..n {
-        if entries[i].kind != ObsKind::Message {
+        if Piece::of(&entries[i]) == Piece::Result {
             let next = counted.entry(entries[i].step).or_default();
             ordinals[i] = *next;
             *next += 1;
@@ -763,7 +798,7 @@ pub async fn assemble(
     let prose = |step: u32, text: &str| Emitted {
         step,
         ordinal: 0,
-        result: false,
+        piece: Piece::Prose,
         text: text.to_string(),
     };
     if !notes_text.is_empty() {
@@ -772,7 +807,7 @@ pub async fn assemble(
     let piece = |i: usize, text: &str| Emitted {
         step: entries[i].step,
         ordinal: ordinals[i],
-        result: entries[i].kind != ObsKind::Message,
+        piece: Piece::of(&entries[i]),
         text: text.to_string(),
     };
     if stub_tokens <= stub_ceiling {
