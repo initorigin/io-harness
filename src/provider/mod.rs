@@ -487,7 +487,7 @@ pub struct CompletionRequest {
     ///
     /// The sequence a run produces alternates: a user turn, then an assistant
     /// turn carrying the calls that step made, then one
-    /// [`Message::Results`](crate::Message::Results) batch answering it. An
+    /// [`Message::Results`] batch answering it. An
     /// out-of-tree [`Provider`] that ignores this field keeps working.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<Message>,
@@ -758,7 +758,7 @@ pub enum Message {
 ///
 /// It names the call it answers by **position** in the assistant turn before it,
 /// rather than carrying an id of its own. The id a vendor correlates on is
-/// minted from those two positions when the body is built ([`mint_call_id`]), so
+/// minted from those two positions when the body is built, so
 /// the two halves of a correlation can never be derived from different places
 /// and drift apart.
 ///
