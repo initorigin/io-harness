@@ -1192,7 +1192,7 @@ versions:
       reasoning-content replay is inexpressible, so a provider that rejects a request carrying tools
       unless prior reasoning is replayed cannot be supported at all in this shape. Breaking, and the
       break is the point.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.50.0
     outcome: >
