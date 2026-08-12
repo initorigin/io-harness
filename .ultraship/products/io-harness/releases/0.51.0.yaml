@@ -751,7 +751,9 @@ evidence:
     `[Snapshot]`, a private item, refused by `rustdoc::private_intra_doc_links`. Sixth release running
     that this gate has found something.
   - >
-    `cargo package --locked` — exit 0, **1,699,907 bytes**.
+    `cargo package --locked` — exit 0, **1,699,911 bytes** on the tree that ships. It was
+    1,699,907 on the pre-merge tree; the four bytes are the Dependabot lock bump plus the settled
+    gzip drift. See the re-gate note in `known_limitations`.
   - >
     **N1** — `cargo tree` is **402** lines, unchanged since 0.23.0. The differ, the unified-diff
     parser and the applier are ~450 lines in a new crate-internal `src/diff.rs`; no crate was added.
@@ -863,12 +865,34 @@ known_limitations:
   explicitly and why the criterion says outright that a green macOS gate is not evidence here. The
   matrix runs on the release PR.
 - >
-  **One flake on the first `--all-features` run, and it is the ninth of a family already recorded.**
+  **The same flake TWICE, on both `--all-features` runs, and it is a family already recorded.**
   `a_handle_takes_the_cpu_cap_a_foreground_stage_takes` — a 0.48.0 containment test — reported a
-  spinning `awk` still `running` after the CPU cap should have ended it, on a machine that had just
-  built the whole all-features tree. It passed alone (5 of 5) and in the default suite. Nothing in
-  this release touches the handle or sandbox path. The suite was re-run with `--no-fail-fast` and was
-  green.
+  spinning `awk` still `running` after the CPU cap should have ended it, both times on a machine that
+  had just built the whole all-features tree from clean. It passed standalone 5 of 5 on both
+  occasions and in every default-suite run. Nothing in this release touches the handle or sandbox
+  path. Twice is no longer a coincidence: the test is load-dependent, and the honest reading is that
+  it asserts a wall clock it does not own.
+- >
+  **DEPENDABOT MERGED INTO `develop` WHILE THIS RELEASE WAS IN FLIGHT — 0.37.0's trap, second
+  occurrence — AND THE WHOLE GATE SET RE-RAN BECAUSE OF IT.** PR #149 landed five patch bumps above
+  the feature merge, including **`rusqlite` 0.40.1 → 0.40.2 and `libsqlite3-sys`**, this crate's
+  storage dependency. `git diff --quiet feat/0.51.0 develop` was therefore NOT quiet: `Cargo.lock`,
+  28 lines. The extra commits ship, so every gate was re-run against the merged tree before the
+  release PR was opened, which is the only window in which a sealed record may be corrected.
+  **Re-gate results, all on the merged tree:** `cargo fmt --check` exit 0; `cargo clippy
+  --all-targets --all-features -- -D warnings` exit 0; `cargo test` exit 0, 81 binaries, **1,656
+  passed**, 425 doctests — identical to the pre-merge run; `cargo test --all-features
+  --no-fail-fast` on a cleared target, 81 binaries, **1,742** (one being the flake above),
+  428 doctests; `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features
+  --no-deps` exit 0; `cargo package --locked` exit 0 at 1,699,911 bytes; `cargo tree` still **402**;
+  and the cross-version generator gate green, `a_current_store_is_read_by_a_0_29_0_binary` ok —
+  which is the one that matters most here, since a real 0.29.0 binary reading a store written by
+  this build is what a `rusqlite` patch bump could have broken.
+- >
+  **This record was amended after it was sealed, and that is legal only before the merge into
+  `main`.** The amendment carries the re-gate above, the corrected package size, and the second
+  occurrence of the flake. Nothing it claimed became false; the tree it describes moved, and the
+  record moved with it rather than being left describing a tree that no longer existed.
 - >
   **One ordering to state rather than gloss.** The nightly rustdoc gate's fix — a doc-comment link in
   `src/state.rs` — landed after the two suites had run. It cannot change behaviour, but rather than
