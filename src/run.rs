@@ -9615,6 +9615,10 @@ async fn dispatch(
                     // point; this is measurement, and the content never reaches
                     // the model.
                     let (before, kept) = read_before(ws, &target);
+                    // A `Kept::Unkept` before text is `""` and is not what was
+                    // there, so it is not something to diff against. Read here
+                    // rather than from `kept`, which is moved below.
+                    let diffable = !matches!(kept, Kept::Unkept(_));
                     match ws.write_file(&target, &body) {
                         Ok(wrote) => {
                             record_edit(
@@ -9625,6 +9629,10 @@ async fn dispatch(
                                 &target,
                                 &before,
                                 &body,
+                                // A whole-file write measures the whole file
+                                // either way, so the hunk's texts and the
+                                // counts' texts happen to be the same pair here.
+                                diffable.then(|| (before.as_str(), body.as_str())),
                             );
                             record_snapshot(store, run_id, step, &target, kept);
                             // The same check `edit_file` runs, for the same
@@ -9705,17 +9713,25 @@ async fn dispatch(
                     remember,
                 } => {
                     let replacement = content.unwrap_or_default();
-                    // The restore point, read here because nothing else on this
-                    // path reads the file: `record_edit` below compares `search`
-                    // against `replacement`, and `Workspace::edit_file` does its
-                    // own read internally and does not hand back what it found.
-                    // The measurement half is discarded for exactly that reason —
-                    // taking `before` here instead would change the line counts
-                    // this arm has reported since 0.18.0 from "the size of the
-                    // replacement" to "the size of the file".
-                    let (_, kept) = read_before(ws, &target);
+                    // The restore point, and — since 0.51.0 — the hunk's "before".
+                    // `Workspace::edit_file` does its own read internally and does
+                    // not hand back what it found, so this is the only place the
+                    // file's previous text exists on this path.
+                    //
+                    // It is still NOT what the counts are measured from. Those
+                    // compare `search` against `replacement`, which is what has
+                    // made them "the size of the replacement" rather than "the
+                    // size of the file" since 0.18.0; folding the two together is
+                    // the tidy-up that would silently renumber every trace.
+                    let (before, kept) = read_before(ws, &target);
+                    let diffable = !matches!(kept, Kept::Unkept(_));
                     match ws.edit_file(&target, search, &replacement) {
                         Ok(wrote) => {
+                            // The file as it now stands, through the same reader,
+                            // so the after text is what is actually on disk rather
+                            // than this arm's reconstruction of what the workspace
+                            // was asked to do.
+                            let (after, _) = read_before(ws, &target);
                             // The replaced text against the text that replaced it.
                             // Everything outside the match is byte-identical by
                             // construction, so this is the same answer comparing the
@@ -9728,6 +9744,7 @@ async fn dispatch(
                                 &target,
                                 search,
                                 &replacement,
+                                diffable.then(|| (before.as_str(), after.as_str())),
                             );
                             record_snapshot(store, run_id, step, &target, kept);
                             // The project's own checker, run against the edit
@@ -12150,6 +12167,13 @@ async fn stream_completion<P: Provider>(
 /// that reached the disk is not undone by failing to write its bookkeeping row,
 /// and turning the run into an error here would lose the work as well as the
 /// row.
+/// `file` is the whole file's text before and after, for the hunk, and is
+/// deliberately not the pair the counts are measured from (0.51.0). An
+/// `edit_file` measures the fragment it replaced — that is what its counts have
+/// meant since 0.18.0 — and a hunk needs the file's own line numbers or it is
+/// anchored to nothing. `None` when the previous contents could not be read, so
+/// a diff is never taken against a file wrongly believed to be empty.
+#[allow(clippy::too_many_arguments)]
 fn record_edit(
     store: &Store,
     run_id: i64,
@@ -12158,8 +12182,12 @@ fn record_edit(
     path: &str,
     before: &str,
     after: &str,
+    file: Option<(&str, &str)>,
 ) {
-    let edit = crate::state::Edit::measure(step, tool, path, before, after);
+    let mut edit = crate::state::Edit::measure(step, tool, path, before, after);
+    if let Some((was, now)) = file {
+        edit = edit.with_hunk(was, now);
+    }
     if let Err(e) = store.record_edit(run_id, &edit) {
         tracing::warn!("could not record the edit to {path} at step {step}: {e}");
     }

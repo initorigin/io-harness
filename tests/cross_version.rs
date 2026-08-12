@@ -236,9 +236,15 @@ fn is_added_since_0_22_0(stmt: &str) -> bool {
 /// turned out to be. Nullable, unread by every binary before it, and — like
 /// `memory`'s two — an addition the 0.29.0 generator's own database is made to
 /// prove rather than an alteration asserted on paper.
+/// 0.51.0 adds the third: `edits` gains `hunk`, the change itself as a unified
+/// diff, so a trace can say *what* a step changed and not only how many lines it
+/// changed. Nullable for exactly that reason — every row an earlier release
+/// wrote has no hunk, and is reported as having none rather than as having an
+/// empty one.
 const COLUMNS_ADDED_SINCE_0_22_0: &[(&str, &[&str])] = &[
     ("memory", &["kind TEXT", "pinned INTEGER"]),
     ("runs", &["turn_kind TEXT"]),
+    ("edits", &["hunk TEXT"]),
 ];
 
 /// Whether `new` is `old` with exactly the declared columns added, and nothing

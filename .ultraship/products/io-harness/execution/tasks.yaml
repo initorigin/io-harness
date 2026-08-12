@@ -46,7 +46,7 @@ tasks:
   why_required: The release's outcome is that a change stops being a pair of counts. The counts themselves
     have meant 'the size of the replacement' since 0.18.0 and rewriting them silently is the release's
     largest own-goal, so the two computations must be separate.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.51.0-T01
   acceptance_criteria:
@@ -77,12 +77,36 @@ tasks:
   - src/state.rs
   - src/run.rs
   - tests/edit_file.rs
-  evidence: []
+  evidence:
+  - 'tests/hunks.rs: 5 passed. a_stored_hunk_is_anchored_to_the_file_and_reverse_applies drives edit_file
+    at the start, the middle and the end of a file plus a file with no final newline, and reverse-applies
+    each stored hunk with a hand-rolled applier in the test — deliberately not the crate''s own, which
+    would pass for a renderer and an applier wrong in the same direction.'
+  - 'F1 SABOTAGE: computing the hunk from search/replace instead of the file''s two texts. Fails a_stored_hunk_is_anchored_to_the_file_and_reverse_applies
+    and nothing else — 4 passed, 1 failed.'
+  - 'F2 SABOTAGE FAILED NOTHING ON THE FIRST ATTEMPT, AND THAT IS A FINDING. Measuring the counts from
+    the whole-file texts passed the whole corpus, because for a tidy whole-line edit the two measures
+    agree: trimming the common head and tail of the fragment finds the same changed span as trimming them
+    over the file. A brute-force search over 400,000 single-substring replacements found the class that
+    diverges — a replacement that does not begin and end on a line boundary. Deleting a substring INSIDE
+    a line is (0 added, 1 removed) to the fragment and (1, 1) to the file, because the file still has
+    a line there. Two such cases were added to the corpus and the sabotage then failed the named test
+    and only it — 4 passed, 1 failed, left (1, 1) right (0, 1).'
+  - 'Line counts unchanged: the corpus asserts this build''s numbers for replacement, insertion, whole-line
+    deletion, in-line deletion, an off-boundary split, a whole-file write and a write of identical content.'
+  - DDL is one ALTER TABLE edits ADD COLUMN hunk TEXT, and the column is deliberately NOT named in the
+    CREATE TABLE. SQLite appends an added column to the statement it keeps in sqlite_master, so declaring
+    it in both would put it mid-table for a fresh store and last for a migrated one — the same shape memory.kind
+    and runs.turn_kind already use.
+  - 'tests/cross_version.rs caught the addition before any of this was declared: ''a statement 0.22.0
+    wrote is gone or altered''. Declared in COLUMNS_ADDED_SINCE_0_22_0 and the suite is green — 5 passed.'
+  - 'Neighbouring suites unchanged: edit_file 9, edit_tool 8, multi_file 3, rewind 13, review_change 2,
+    accounting 15, cross_version 5, cross_version_0_29_0 2, store_open 4 — all passed.'
 - id: US-IO-HARNESS-0.51.0-T03
   summary: Render a run's whole change as a step-ordered patch series.
   why_required: 'It is the operator-facing half of the fallback scope: a trace that holds hunks and cannot
     show them has not made the change reviewable.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.51.0-T02
   acceptance_criteria:
@@ -99,7 +123,15 @@ tasks:
   files:
   - src/state.rs
   - tests/edit_file.rs
-  evidence: []
+  evidence:
+  - 'a_runs_change_renders_as_a_step_ordered_patch_series passes: two edits to one file render two ---
+    a/ +++ b/ header pairs, in step order.'
+  - Rendered as a SERIES and documented as one. Two edits to the same file take their line numbers from
+    that file as it stood at each of them, so the second hunk is only correct once the first has been
+    applied. Joining the hunks under one pair of headers would look like a patch and not apply.
+  - An edit with no stored hunk contributes a comment line naming the step, tool, path and counts rather
+    than nothing — asserted by a_write_that_changes_nothing_stores_no_hunk, so a series never silently
+    omits a change.
 - id: US-IO-HARNESS-0.51.0-T04
   summary: 'Add patch_file: parse a unified diff, match every hunk against the original, write once.'
   why_required: A multi-hunk change costs one call per hunk today, and the all-or-nothing rule is what
