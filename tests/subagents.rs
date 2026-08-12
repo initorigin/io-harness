@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    run_tree, run_with, ApproveAll, Containment, DenyAll, Policy, Provider, RunOutcome, Store,
-    TaskContract, Verification,
+    resume_tree_with_decision, run_tree, run_with, ApproveAll, Containment, DenyAll, Policy,
+    Provider, RunOutcome, Store, TaskContract, Verification,
 };
 use serde_json::json;
 
@@ -995,4 +995,732 @@ async fn each_agent_keeps_its_own_durable_ledger_under_its_own_run_id() {
             .any(|o| o.text.contains("SEED-CONTENT")),
         "a child's observations belong to the child, not to its parent's ledger"
     );
+}
+
+/// A provider whose script carries what the agent *said* beside what it called,
+/// which the plain [`MockScript`] cannot express: it answers every call with tool
+/// calls alone and never with text.
+struct MockSaying {
+    steps: Vec<(Option<&'static str>, Vec<ToolCall>)>,
+    at: AtomicUsize,
+}
+
+impl MockSaying {
+    fn new(steps: Vec<(Option<&'static str>, Vec<ToolCall>)>) -> Self {
+        Self {
+            steps,
+            at: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Provider for MockSaying {
+    async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        let i = self.at.fetch_add(1, Ordering::SeqCst);
+        let (text, calls) = self.steps.get(i).cloned().unwrap_or((None, Vec::new()));
+        Ok(CompletionResponse {
+            text: text.map(str::to_string),
+            tool_calls: calls,
+            ..Default::default()
+        })
+    }
+}
+
+/// 0.50.0 — F1: a child hands its parent what it concluded, not a discriminant.
+///
+/// Until this release `compose_child` folded `[child 7 "goal" -> Success { steps:
+/// 1 }]` and nothing else, because `RunOutcome::Success` carries no text. A parent
+/// that fanned out to investigate learned that its children succeeded and nothing
+/// they found. The marker below is produced by the child's completion and by
+/// nothing else in the run, so its presence in the *parent's* ledger is the claim.
+#[tokio::test]
+async fn a_child_reports_what_it_concluded_to_its_parent() {
+    const FINDING: &str = "the cache key omits the tenant id";
+
+    let dir = ws();
+    let contract = TaskContract::workspace("Investigate, then write it up.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "report.txt".into(),
+            needle: "written".into(),
+        })
+        .with_max_steps(4);
+
+    // parent#1 spawns; child#1 writes its verify file and says what it found;
+    // parent#2 writes its own report.
+    let script = MockSaying::new(vec![
+        (None, vec![spawn("investigate", "found.txt", "FOUND")]),
+        (Some(FINDING), vec![write("found.txt", "FOUND")]),
+        (None, vec![write("report.txt", "written")]),
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.outcome, RunOutcome::Success { steps: 2 });
+
+    let child = *store
+        .children(result.run_id)
+        .unwrap()
+        .first()
+        .expect("the parent spawned a child");
+
+    let parent_rows = store.observations(result.run_id).unwrap();
+    let composed = parent_rows
+        .iter()
+        .find(|o| o.text.contains(&format!("[child {child}")))
+        .unwrap_or_else(|| panic!("the parent composed its child, got {parent_rows:?}"));
+
+    // The release: the conclusion reaches the parent.
+    assert!(
+        composed.text.contains(FINDING),
+        "the child's conclusion reaches its parent, got {:?}",
+        composed.text
+    );
+    // And what the parent already learned is still there — this adds, it replaces
+    // nothing.
+    assert!(
+        composed.text.contains("Success"),
+        "the outcome is still reported, got {:?}",
+        composed.text
+    );
+    assert!(
+        composed.text.contains(&child.to_string()),
+        "the child's run id is still reported, got {:?}",
+        composed.text
+    );
+}
+
+/// Defers every decision, so a child's write parks the whole tree on a human.
+struct Defer;
+impl Approver for Defer {
+    fn decide<'a>(&'a self, _r: &'a Request) -> DecisionFuture<'a> {
+        Box::pin(async { Decision::Defer })
+    }
+}
+
+/// 0.50.0 — F2: a child adopted after a pause reports the same words it would
+/// have reported had its parent waited.
+///
+/// The parent's spawn step is deliberately left uncommitted when a child pauses
+/// (0.7.0's fix for double execution), so the resume replays it — and the child
+/// that had already finished is composed from the store rather than from a loop
+/// that is no longer running. That is the path a restarted process takes, and it
+/// must not render the conclusion differently: there is one rendering, reading one
+/// set of `"said"` rows, which is why this is assertable at all.
+#[tokio::test]
+async fn an_adopted_child_reports_the_same_conclusion() {
+    const FINDING: &str = "alpha holds the stale index";
+
+    let dir = ws();
+    let contract = TaskContract::workspace("Delegate both halves.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "b.txt".into(),
+            needle: "BETA".into(),
+        })
+        .with_max_steps(4);
+
+    // a.txt is allowed outright; b.txt asks, and `Defer` parks it.
+    let policy = Policy::default()
+        .layer("base")
+        .allow_read("*")
+        .allow_write("a.txt")
+        .ask_write("b.txt");
+
+    let script = MockSaying::new(vec![
+        // parent#1 fans out to two children.
+        (
+            None,
+            vec![
+                spawn("do a", "a.txt", "ALPHA"),
+                spawn("do b", "b.txt", "BETA"),
+            ],
+        ),
+        // child A finishes and says what it found.
+        (Some(FINDING), vec![write("a.txt", "ALPHA")]),
+        // child B's write asks, and nothing in this process answers.
+        (None, vec![write("b.txt", "BETA")]),
+        // parent#1 replayed on resume: the same fan-out, one child already done.
+        (
+            None,
+            vec![
+                spawn("do a", "a.txt", "ALPHA"),
+                spawn("do b", "b.txt", "BETA"),
+            ],
+        ),
+        (None, vec![]),
+        (None, vec![]),
+    ]);
+    let store = Store::memory().unwrap();
+
+    let paused = run_tree(&contract, &script, &store, &policy, &Defer, &containment())
+        .await
+        .unwrap();
+    let request_id = match paused.outcome {
+        RunOutcome::AwaitingApproval { request_id, .. } => request_id,
+        other => panic!("expected the tree to pause on b.txt, got {other:?}"),
+    };
+
+    // Nothing was composed into the parent yet: its step never committed.
+    assert!(
+        !store
+            .observations(paused.run_id)
+            .unwrap()
+            .iter()
+            .any(|o| o.text.contains(FINDING)),
+        "the paused step is uncommitted, so nothing about the finished child is durable yet"
+    );
+
+    let resumed = resume_tree_with_decision(
+        &contract,
+        &script,
+        &store,
+        paused.run_id,
+        request_id,
+        Decision::Approve {
+            modified: None,
+            remember: vec![],
+        },
+        &policy,
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(resumed.outcome, RunOutcome::Success { .. }),
+        "the tree resumed to success, got {:?}",
+        resumed.outcome
+    );
+
+    let rows = store.observations(paused.run_id).unwrap();
+    assert!(
+        rows.iter().any(|o| o.text.contains(FINDING)),
+        "the adopted child's conclusion reaches the resumed parent, got {rows:?}"
+    );
+}
+
+/// 0.50.0 — F9: a contradiction in the spawn arguments is a typed observation the
+/// parent adapts to, and it costs nothing.
+///
+/// The two arguments this release adds can be combined into a request that has no
+/// meaning: a child you are not waiting for has no wall clock to cross. Answered
+/// where every other malformed spawn is answered — before a child is registered,
+/// admitted or written — so a parent that gets it wrong leaves no run row, no
+/// queue place and no `spawns` row behind, and carries on.
+#[tokio::test]
+async fn a_conflicting_spawn_costs_nothing_and_the_parent_carries_on() {
+    let dir = ws();
+    let contract = TaskContract::workspace("Delegate, then finish yourself.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "done.txt".into(),
+            needle: "ok".into(),
+        })
+        .with_max_steps(4);
+
+    let script = MockScript::new(vec![
+        vec![call(
+            "spawn_agent",
+            json!({
+                "goal": "impossible", "verify_file": "x.txt", "verify_contains": "X",
+                "wait": false, "background_after_secs": 30
+            }),
+        )],
+        vec![write("done.txt", "ok")],
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+
+    // The parent was not stopped by it.
+    assert_eq!(result.outcome, RunOutcome::Success { steps: 2 });
+
+    // It was told, in terms naming the conflict.
+    let rows = store.observations(result.run_id).unwrap();
+    assert!(
+        rows.iter()
+            .any(|o| o.text.contains("[spawn error]") && o.text.contains("background_after_secs")),
+        "the parent is told which two arguments conflict, got {rows:?}"
+    );
+
+    // And it cost nothing: no child run, and no spawn recorded against the step.
+    assert!(
+        store.children(result.run_id).unwrap().is_empty(),
+        "a conflicting spawn creates no child"
+    );
+    assert!(
+        store
+            .agent_events(result.run_id)
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != "spawn"),
+        "a conflicting spawn records no spawn event"
+    );
+}
+
+/// A provider that parks one scripted call, so a child can outlast its parent's
+/// stated patience without the test depending on how busy the machine is.
+struct MockParking {
+    steps: Vec<(Option<&'static str>, Vec<ToolCall>)>,
+    park: usize,
+    delay: std::time::Duration,
+    at: AtomicUsize,
+}
+
+impl Provider for MockParking {
+    async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        let i = self.at.fetch_add(1, Ordering::SeqCst);
+        if i == self.park {
+            tokio::time::sleep(self.delay).await;
+        }
+        let (text, calls) = self.steps.get(i).cloned().unwrap_or((None, Vec::new()));
+        Ok(CompletionResponse {
+            text: text.map(str::to_string),
+            tool_calls: calls,
+            ..Default::default()
+        })
+    }
+}
+
+/// 0.50.0 — F3: a detached child does not block its parent, and its report arrives
+/// at a later step.
+///
+/// Three facts together, because no one of them is the claim. The report is absent
+/// from the step that spawned the child (the parent did not wait), the parent went
+/// on to take further steps (it was not merely reordered), and the report is there
+/// at a strictly later step (nothing was lost by not waiting).
+#[tokio::test]
+async fn a_detached_child_reports_at_a_later_step() {
+    const FINDING: &str = "nothing here blocks the parent";
+
+    let dir = ws();
+    let contract = TaskContract::workspace("Delegate and carry on.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "done.txt".into(),
+            needle: "ok".into(),
+        })
+        .with_max_steps(5);
+
+    let detached = call(
+        "spawn_agent",
+        json!({
+            "goal": "look into it", "verify_file": "found.txt", "verify_contains": "FOUND",
+            "wait": false
+        }),
+    );
+    let script = MockSaying::new(vec![
+        (None, vec![detached]),
+        (Some(FINDING), vec![write("found.txt", "FOUND")]),
+        (None, vec![write("scratch.txt", "1")]),
+        (None, vec![write("done.txt", "ok")]),
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "the parent finished its own work, got {:?}",
+        result.outcome
+    );
+
+    let rows = store.observations(result.run_id).unwrap();
+    let report = rows
+        .iter()
+        .find(|o| o.text.contains(FINDING))
+        .unwrap_or_else(|| panic!("the detached child reported, got {rows:?}"));
+
+    // It was not folded into the step that spawned it.
+    assert!(
+        report.step > 1,
+        "the report arrives after the step that detached the child, got step {}",
+        report.step
+    );
+    // And the parent was told, at the spawning step, that it was not waiting.
+    let told = rows
+        .iter()
+        .find(|o| o.text.contains("detached"))
+        .expect("the parent is told the child was detached");
+    assert_eq!(told.step, 1, "it is told at the step it asked");
+    // The parent kept working in between rather than idling.
+    assert!(
+        store.steps(result.run_id).unwrap().len() >= 3,
+        "the parent took its own steps while the child ran"
+    );
+}
+
+/// 0.50.0 — F4: a spawn that names neither argument is the spawn it always was.
+///
+/// The negative control the whole release rests on. Two children in one step, both
+/// waited for, both folded into that step, and in the order the model asked for
+/// them rather than the order they finished — which is 0.12.0's determinism claim
+/// asserted again, because this release touches that stream.
+#[tokio::test]
+async fn a_blocking_spawn_folds_into_its_own_step_in_call_order() {
+    let dir = ws();
+    let contract = TaskContract::workspace("Delegate both, in order.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "b.txt".into(),
+            needle: "BETA".into(),
+        })
+        .with_max_steps(4);
+
+    let script = MockSaying::new(vec![
+        (
+            None,
+            vec![
+                spawn("do a", "a.txt", "ALPHA"),
+                spawn("do b", "b.txt", "BETA"),
+            ],
+        ),
+        (Some("A-SAID"), vec![write("a.txt", "ALPHA")]),
+        (Some("B-SAID"), vec![write("b.txt", "BETA")]),
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.outcome, RunOutcome::Success { steps: 1 });
+
+    let rows = store.observations(result.run_id).unwrap();
+    let a = rows.iter().position(|o| o.text.contains("A-SAID"));
+    let b = rows.iter().position(|o| o.text.contains("B-SAID"));
+    let (a, b) = (a.expect("child A reported"), b.expect("child B reported"));
+    assert!(a < b, "children fold in the order they were called for");
+    assert_eq!(
+        rows[a].step, 1,
+        "a waited-for child folds into its own step"
+    );
+    assert_eq!(
+        rows[b].step, 1,
+        "a waited-for child folds into its own step"
+    );
+    // And nothing was left running.
+    assert!(
+        !rows.iter().any(|o| o.text.contains("detached")),
+        "a spawn that named neither argument was never detached"
+    );
+}
+
+/// 0.50.0 — F6: a tree never returns while a child it started is running.
+///
+/// The parent detaches a child and finishes its own work in the same step, so the
+/// loop reaches its ending with a child still in flight. 0.48.0's rule is that
+/// everything a run starts is inside the boundary; the drain is what keeps that
+/// true for children, and it sits at the loop's one return rather than at each of
+/// its endings.
+#[tokio::test]
+async fn a_tree_drains_the_children_it_stopped_waiting_for() {
+    const FINDING: &str = "drained after the parent finished";
+
+    let dir = ws();
+    let contract = TaskContract::workspace("Delegate and finish at once.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "done.txt".into(),
+            needle: "ok".into(),
+        })
+        .with_max_steps(3);
+
+    let detached = call(
+        "spawn_agent",
+        json!({
+            "goal": "keep going", "verify_file": "found.txt", "verify_contains": "FOUND",
+            "wait": false
+        }),
+    );
+    // One parent step: detach a child AND satisfy the parent's own verification.
+    let script = MockSaying::new(vec![
+        (None, vec![detached, write("done.txt", "ok")]),
+        (Some(FINDING), vec![write("found.txt", "FOUND")]),
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.outcome, RunOutcome::Success { steps: 1 });
+
+    let child = *store
+        .children(result.run_id)
+        .unwrap()
+        .first()
+        .expect("the parent detached a child");
+
+    // The child is finished, not abandoned mid-run.
+    let summary = store
+        .run_summary(child)
+        .unwrap()
+        .expect("the drained child has an ending");
+    assert!(
+        summary.success,
+        "the drained child ran to completion, got {:?}",
+        summary.outcome
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("found.txt")).unwrap(),
+        "FOUND",
+        "its work reached the workspace"
+    );
+    // And its report is durable under the parent, where an operator finds it.
+    assert!(
+        store
+            .observations(result.run_id)
+            .unwrap()
+            .iter()
+            .any(|o| o.text.contains(FINDING)),
+        "a drained child's report is recorded against its parent"
+    );
+}
+
+/// 0.50.0 — F5: a wall clock moves a child to the background and does not kill it.
+///
+/// Both halves, and the second is the one that matters. `tokio::time::timeout` is
+/// the obvious way to write this and it is wrong: it drops the child's future,
+/// cancelling it mid-step and leaving its run row `running` forever —
+/// indistinguishable from a crashed process. Such an implementation passes the
+/// first assertion here and fails the second.
+#[tokio::test]
+async fn a_wall_clock_backgrounds_a_child_without_killing_it() {
+    const FINDING: &str = "slow but finished";
+
+    let dir = ws();
+    let contract = TaskContract::workspace("Delegate, but do not wait forever.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "done.txt".into(),
+            needle: "ok".into(),
+        })
+        .with_max_steps(5);
+
+    let patient = call(
+        "spawn_agent",
+        json!({
+            "goal": "take your time", "verify_file": "found.txt", "verify_contains": "FOUND",
+            "background_after_secs": 1
+        }),
+    );
+    let script = MockParking {
+        steps: vec![
+            (None, vec![patient]),
+            (Some(FINDING), vec![write("found.txt", "FOUND")]),
+            (None, vec![write("scratch.txt", "1")]),
+            (None, vec![write("done.txt", "ok")]),
+        ],
+        // The child's own completion, parked past the parent's one-second patience.
+        park: 1,
+        delay: std::time::Duration::from_millis(1_500),
+        at: AtomicUsize::new(0),
+    };
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "the parent finished its own work, got {:?}",
+        result.outcome
+    );
+
+    let rows = store.observations(result.run_id).unwrap();
+    // Half one: the parent stopped waiting, and was told so at the step it asked.
+    let moved = rows
+        .iter()
+        .find(|o| o.text.contains("moved to the background"))
+        .unwrap_or_else(|| panic!("the parent was told it stopped waiting, got {rows:?}"));
+    assert_eq!(moved.step, 1);
+
+    // Half two: the child was not dropped. It finished, its work landed, and it
+    // reported.
+    let child = *store.children(result.run_id).unwrap().first().unwrap();
+    let summary = store.run_summary(child).unwrap().expect("the child ended");
+    assert!(
+        summary.success,
+        "a backgrounded child is not cancelled, got {:?}",
+        summary.outcome
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("found.txt")).unwrap(),
+        "FOUND"
+    );
+    assert!(
+        rows.iter().any(|o| o.text.contains(FINDING)),
+        "the backgrounded child's report reaches its parent, got {rows:?}"
+    );
+}
+
+/// 0.50.0 — F5's other arm: a clock the child finishes inside changes nothing.
+///
+/// Ten seconds against an instantly-answering child, so the only way this reports
+/// a background move is if the race is decided by something other than the clock.
+#[tokio::test]
+async fn a_wall_clock_the_child_beats_is_an_ordinary_spawn() {
+    let dir = ws();
+    let contract = TaskContract::workspace("Delegate with a generous clock.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "found.txt".into(),
+            needle: "FOUND".into(),
+        })
+        .with_max_steps(3);
+
+    let patient = call(
+        "spawn_agent",
+        json!({
+            "goal": "be quick", "verify_file": "found.txt", "verify_contains": "FOUND",
+            "background_after_secs": 10
+        }),
+    );
+    let script = MockSaying::new(vec![
+        (None, vec![patient]),
+        (Some("QUICK"), vec![write("found.txt", "FOUND")]),
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.outcome, RunOutcome::Success { steps: 1 });
+
+    let rows = store.observations(result.run_id).unwrap();
+    assert!(
+        !rows
+            .iter()
+            .any(|o| o.text.contains("moved to the background")),
+        "a child that finishes inside its clock is never backgrounded, got {rows:?}"
+    );
+    let report = rows.iter().find(|o| o.text.contains("QUICK")).unwrap();
+    assert_eq!(report.step, 1, "it folds into the step that spawned it");
+}
+
+/// 0.50.0 — F8: the operator's settings narrow the model's, in both directions.
+///
+/// A contract clock reaches a spawn that named none and beats a spawn that named
+/// a longer one; a contract that refuses detachment answers `"wait": false` with
+/// an ordinary blocking spawn and a line saying so. Silence would be worse than
+/// either: a model that believes it fanned out and did not is a model reasoning
+/// about work that is not happening.
+#[tokio::test]
+async fn the_contract_narrows_what_a_spawn_may_ask_for() {
+    let dir = ws();
+    let strict = TaskContract::workspace("Delegate, but stay in step.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "done.txt".into(),
+            needle: "ok".into(),
+        })
+        .with_max_steps(4)
+        .without_detached_spawns();
+
+    let detached = call(
+        "spawn_agent",
+        json!({
+            "goal": "look into it", "verify_file": "found.txt", "verify_contains": "FOUND",
+            "wait": false
+        }),
+    );
+    let script = MockSaying::new(vec![
+        (None, vec![detached]),
+        (Some("SAID-IT"), vec![write("found.txt", "FOUND")]),
+        (None, vec![write("done.txt", "ok")]),
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &strict,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.outcome, RunOutcome::Success { .. }));
+
+    let rows = store.observations(result.run_id).unwrap();
+    let report = rows
+        .iter()
+        .find(|o| o.text.contains("SAID-IT"))
+        .expect("the child still reported");
+    // Waited for after all — folded into the step that asked, not a later one.
+    assert_eq!(report.step, 1, "the refused detachment became a plain wait");
+    // And the model was told, rather than left believing it had fanned out.
+    assert!(
+        report.text.contains("[spawn narrowed]"),
+        "the parent is told its request was narrowed, got {:?}",
+        report.text
+    );
+}
+
+/// 0.50.0 — F8's other direction: a contract clock is not raised by a spawn that
+/// asks for a longer one.
+#[test]
+fn a_contract_clock_is_a_ceiling_and_not_a_default_only() {
+    use std::time::Duration;
+
+    let none = TaskContract::workspace("g", "/repo");
+    assert_eq!(none.spawn_background_after, None);
+    assert!(none.detached_spawns);
+
+    let capped =
+        TaskContract::workspace("g", "/repo").with_spawn_background_after(Duration::from_secs(60));
+    assert_eq!(capped.spawn_background_after, Some(Duration::from_secs(60)));
+    assert!(
+        capped.detached_spawns,
+        "a clock does not by itself forbid detaching"
+    );
+
+    let strict = TaskContract::workspace("g", "/repo").without_detached_spawns();
+    assert!(!strict.detached_spawns);
 }

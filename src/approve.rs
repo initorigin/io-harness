@@ -179,8 +179,9 @@ impl Decision {
 }
 
 /// A boxed decision future. Boxed rather than `async fn` in the trait so that
-/// [`Approver`] stays object-safe — io-studio holds a `Box<dyn Approver>`
-/// backed by a UI channel while io-cli uses [`StdinApprover`].
+/// [`Approver`] stays object-safe — a desktop application holds a
+/// `Box<dyn Approver>` backed by a UI channel while a terminal one uses
+/// [`StdinApprover`].
 pub type DecisionFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>>;
 
 /// Why this action is being asked about, and what the run is for (0.42.0).
@@ -286,7 +287,7 @@ impl ApprovalContext {
 /// `&self` rather than `&mut self`, and `Send + Sync`, because one approver
 /// serves a whole [`run_tree`](crate::run_tree) — every agent in the tree asks
 /// the same one. State it needs goes behind a `Mutex` or a channel, as
-/// io-studio's does.
+/// a windowed application's does.
 pub trait Approver: Send + Sync {
     /// Decide on one request.
     fn decide<'a>(&'a self, request: &'a Request) -> DecisionFuture<'a>;
@@ -673,7 +674,7 @@ mod tests {
         assert!(matches!(DenyAll.decide(&req).await, Decision::Deny { .. }));
     }
 
-    /// io-studio's shape: an approver that is not a terminal, held behind a
+    /// A windowed application's shape: an approver that is not a terminal, held behind a
     /// trait object, answering from a channel.
     struct ChannelApprover {
         answer: std::sync::Mutex<Option<oneshot::Receiver<Decision>>>,

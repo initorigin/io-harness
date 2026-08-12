@@ -2,7 +2,7 @@
 //!
 //! Since 0.12.0 an application has been able to watch a run by implementing
 //! [`Observer`] — one method, one enum, and a `Flow` that can stop the run. That is
-//! the right shape for a Rust program and the wrong shape for the operator io-cli
+//! the right shape for a Rust program and the wrong shape for the operator a terminal
 //! serves, who has a config file and a shell script and no reason to own a compiler.
 //! A `[[hook]]` table is the same capability reached from the file: name the events
 //! you want, name a path to append them to or an argv to run, and the audit log, the

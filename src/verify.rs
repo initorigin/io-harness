@@ -62,7 +62,7 @@ use crate::state::{PolicyEvent, SandboxEvent, Store};
 /// `assert!(false, "this gate can never pass")` — which no correct
 /// implementation can satisfy — report a pass; a file opening with
 /// `#![cfg(any())]` deleted the criterion outright and the empty test binary
-/// exited 0. An agent found the first of these unprompted during io-cli 0.1.0's
+/// exited 0. An agent found the first of these unprompted during an application's own
 /// live runs (see `iterations/US-IO-HARNESS-0.8.0-I01`).
 ///
 /// The subject and the criterion are still compiled as **one crate** — that is

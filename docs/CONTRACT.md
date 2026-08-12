@@ -1525,6 +1525,72 @@ byte. Today the Anthropic family wraps sections in tagged blocks, as that vendor
 own prompting guidance asks for, and the others read the same text plainly. No
 claim is made anywhere that one family's wording performs better than another's.
 
+## How a child comes back, and what a parent gives up to stop waiting (0.50.0)
+
+A `spawn_agent` call takes two optional arguments beside the ones it always took.
+`wait` defaults to `true`; `background_after_secs` names a wall clock. Naming
+neither is the spawn every tree written before this release made: the parent waits,
+the results are folded into the step that asked for them in the order the model
+asked, and the trace is reproducible.
+
+`"wait": false` means the parent takes its next step immediately and the child's
+report reaches it later. `background_after_secs` means the parent waits, and stops
+waiting when the clock runs out. **The child is not cancelled in either case.**
+That is the difference between this and a timeout: dropping the child's future
+would cancel it mid-step and leave its run row `running` for ever, which nothing
+can tell apart from a crashed process. The two combined — a child you are not
+waiting for cannot cross a clock — is a contradiction, and it is answered with a
+typed observation naming both arguments, before any child is registered, admitted
+or written.
+
+**What a parent gives up.** For the calls that use them, the trace is no longer
+step-for-step reproducible: which step a report lands on depends on how long the
+child took. Two guarantees survive. Reports fold in the order the children were
+spawned, not the order they finished, so two children racing leave the same
+ledger. And a run that detaches nothing is byte-identical to one on 0.49.0.
+`TaskContract::without_detached_spawns` refuses detachment outright for an
+embedder who wants the old guarantee unconditionally; the refusal is stated in the
+parent's own ledger, never silent.
+
+**What a parent gets back.** Through 0.49.0 a finished child was composed as
+`[child 7 "goal" -> Success { steps: 4 }]` — a `Debug`-printed outcome and a step
+count, because `RunOutcome::Success` carries no text. A parent that fanned out to
+investigate four subsystems learned that four runs succeeded and none of what they
+found, and the only way a finding could travel was a file the parent then read.
+A child now reports what it concluded: the text of its last completion, beside its
+steps and its tokens, bounded by the same per-observation cap as everything else.
+An agent's own words are durable for the first time, as one `agent_events` row per
+step that said something; a child that never spoke says so rather than reporting
+an empty answer.
+
+**Concurrency, exactly.** A detached child is a future on its parent's own task,
+polled while the parent waits for its own completion — not a spawned task. It
+cannot be one: `rusqlite::Connection` is `Send` and not `Sync`, so the store
+cannot cross a task boundary, which is the same constraint that decided 0.41.0's
+read batch. The consequence is worth stating: a detached child makes progress
+while the parent is waiting on a provider, and it does not make progress while the
+parent is inside a synchronous stretch of its own.
+
+**Caps are unchanged.** A detached child holds its tier's slot until it finishes,
+so `Containment::max_concurrent_agents` throttles exactly as it did and
+`EventKind::Fleet`'s `working` counts it. A tree drained of its children reports
+zero.
+
+**Across a restart.** A detached child's step commits, so a resume starts after it
+and the spawn call is never replayed. The parent therefore takes its children back
+before its first step, resuming each from its own checkpoint through the ordinary
+spawn path — the same run row, not a second child. The whole spawn call is
+recorded to make that possible, because the `spawns` row holds five of the nine
+arguments and a rebuild from those five would resume a child under a wider policy
+than it was given.
+
+**The one window that is not covered.** The drain runs after the loop has recorded
+the parent's ending, so a process that dies *during* the drain leaves the parent
+`completed` and a child `running`. Resuming the parent then reports the terminal
+outcome and re-adopts nothing. The child is not lost — it is resumable by its own
+run id — but it is not picked up automatically, and closing that would mean
+deferring the run's own ending until its children are finished.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none

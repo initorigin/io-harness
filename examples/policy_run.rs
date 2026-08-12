@@ -13,8 +13,8 @@
 use io_harness::approve::{Approver, Decision, DecisionFuture, Request};
 use io_harness::{run_with, Policy, RunOutcome, Store, TaskContract, Verification};
 
-/// Prints what is being asked, then approves. The shape io-cli and io-studio
-/// each fill in with a prompt or a dialog.
+/// Prints what is being asked, then approves. The shape an application layer
+/// fills in with a prompt or a dialog.
 struct Narrating;
 
 impl Approver for Narrating {

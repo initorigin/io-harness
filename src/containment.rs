@@ -4,7 +4,7 @@
 //! with limits no spawned [`crate::TaskContract`] can raise: how many agents may
 //! exist, how many may run at once, how deep they may nest, and an aggregate
 //! spend ceiling the entire tree draws down *together*. It is serde-serializable
-//! like [`crate::Policy`], so io-cli and io-studio load it from config rather
+//! like [`crate::Policy`], so an application layer loads it from config rather
 //! than hand-build it.
 //!
 //! Two of those caps are deliberately different in kind (0.32.0).
