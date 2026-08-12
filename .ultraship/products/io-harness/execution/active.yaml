@@ -1,0 +1,51 @@
+product: io-harness
+version: 0.51.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      **No constraints are recorded for this workspace.** `ultraship constraints` reports none —
+      it refuses to record any while there is no active release — so this assessment is grounded in
+      the repository's own condition and in the twenty releases of measured history behind it, never
+      in a capacity figure, which UltraShip has no telemetry to supply and which would be fiction
+      with a decimal point.
+    - >
+      **Three of the four pieces are exposures of machinery that already exists.** The head-and-tail
+      trim the hunk needs is the computation `Edit::measure` already performs; the checker the new
+      tool runs is the one that already runs after every successful edit; the restore points the
+      step revert reasons about are already recorded per write. The release adds two nullable
+      columns, two tool schemas and one public function — it does not add a subsystem.
+    - >
+      **The store change is the smallest kind this repository makes.** Two `ALTER TABLE ADD COLUMN`
+      lines by the shape every addition since 0.13.0 has used, no new table, no index, and
+      `CHECKPOINT_FORMAT` unmoved — so cross-version is a null-column question rather than a
+      migration.
+    - >
+      **`probable` and not `high`, and the reason is a hand-written unified diff.** Final newlines,
+      the `\ No newline at end of file` marker, CRLF on the Windows leg and hunk offset arithmetic
+      are four ways to produce a diff that reads correctly and does not round-trip. This repository
+      has ten `windows-latest` matrix rounds of history saying a hand-written parser is where a
+      release loses its afternoon, and no plan can prove the fixtures right in advance.
+    - >
+      **The fallback scope is drawn along a line the release can be cut on.** The hunks and the
+      rendered patch are the half the other three rest on and need none of them; the checker tool,
+      the step revert and the patch tool each sit behind it and can be shed in that order. Recorded
+      at specification time for exactly that reason.
+  major_cost_drivers:
+    - >
+      Unified-diff edge cases: a file with no final newline, a hunk that ends the file, a hunk at
+      line 1, CRLF line endings, and where the `\ No newline at end of file` marker sits. Five cases
+      that each produce a diff that looks right and does not round-trip.
+    - >
+      Threading the file's two texts to the hunk computation while `Edit::measure` keeps being
+      called with the fragment, so 0.18.0's line counts do not move. The `edit_file` arm discards
+      the whole-file before text on purpose today and `Workspace::edit_file` does not hand back what
+      it wrote.
+    - >
+      The patch applier's offset arithmetic. Every hunk matches against the original file at its own
+      position and the write is composed once at the end; doing it as a running rewrite is the
+      obvious spelling and is wrong.
+  recommended_scope_change: null
