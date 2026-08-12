@@ -39,6 +39,36 @@ pub const WRITE_FILE_TOOL: &str = "write_file";
 /// touch. Gated by the same [`Act::Write`](crate::Act::Write) check on the same
 /// path, because it is the same act.
 pub const EDIT_FILE_TOOL: &str = "edit_file";
+/// The name the model uses to apply a unified diff to a file (0.51.0).
+///
+/// The third write tool, and the one that makes a multi-hunk change one call.
+/// [`EDIT_FILE_TOOL`] is a single search-and-replace, so four changes to one
+/// file are four calls — four gate evaluations, four checker runs and four round
+/// trips, with the file's line numbers moving under the text the model read
+/// after the first of them. A patch carries its own context lines, so the four
+/// are one call and each lands where it was written to land or not at all.
+///
+/// Gated by the same [`Act::Write`](crate::Act::Write) check on the same path as
+/// the other two, because it is the same act. It cannot create a file: a patch
+/// is anchored to text that already exists, and creating is
+/// [`WRITE_FILE_TOOL`]'s job.
+pub const PATCH_FILE_TOOL: &str = "patch_file";
+/// The name the model uses to ask the project's own checker (0.51.0).
+///
+/// The same ecosystem type-check the crate already runs after every successful
+/// write — `cargo check`, `tsc --noEmit`, `go build ./...` — offered as a
+/// question rather than only as a reflex. A model that wants to know whether the
+/// tree compiles *before* deciding what to write had to reach for
+/// [`EXEC_TOOL`] with an argv it guessed, on a project whose ecosystem this
+/// crate has already detected and whose check command it already knows.
+///
+/// Two things it is not. It is not a gate: it reports, and an edit is never
+/// failed on what it says. And it is not [`EXEC_TOOL`] with a shorter name — it
+/// takes no arguments, so what runs is the detection's answer and not the
+/// model's. It is an [`Act::Exec`](crate::Act::Exec) check on that program all
+/// the same, because a model-callable path to the project's build command must
+/// be refusable by the policy that refuses `exec`.
+pub const CHECK_TOOL: &str = "check";
 /// The name the model uses to run a command (0.17.0).
 ///
 /// The widest capability the crate grants, and the one that made a task in any

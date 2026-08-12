@@ -26,7 +26,8 @@ tasks:
 
     '
   files:
-  - src/state.rs
+  - src/diff.rs
+  - src/lib.rs
   evidence:
   - '17 unit tests in src/diff.rs pass: cargo test --lib diff:: — 17 passed, 0 failed.'
   - 'generated_pairs_round_trip_in_both_directions drives 2000 generated (old, new) pairs through render
@@ -76,7 +77,8 @@ tasks:
   files:
   - src/state.rs
   - src/run.rs
-  - tests/edit_file.rs
+  - tests/hunks.rs
+  - tests/cross_version.rs
   evidence:
   - 'tests/hunks.rs: 5 passed. a_stored_hunk_is_anchored_to_the_file_and_reverse_applies drives edit_file
     at the start, the middle and the end of a file plus a file with no final newline, and reverse-applies
@@ -122,7 +124,7 @@ tasks:
     '
   files:
   - src/state.rs
-  - tests/edit_file.rs
+  - tests/hunks.rs
   evidence:
   - 'a_runs_change_renders_as_a_step_ordered_patch_series passes: two edits to one file render two ---
     a/ +++ b/ header pairs, in step order.'
@@ -136,7 +138,7 @@ tasks:
   summary: 'Add patch_file: parse a unified diff, match every hunk against the original, write once.'
   why_required: A multi-hunk change costs one call per hunk today, and the all-or-nothing rule is what
     makes a patch safe rather than a way to half-write a file.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.51.0-T01
   acceptance_criteria:
@@ -166,13 +168,33 @@ tasks:
   - src/tools/mod.rs
   - src/tools/workspace.rs
   - src/run.rs
-  - tests/multi_file.rs
-  evidence: []
+  - tests/patch_tool.rs
+  evidence:
+  - 'tests/patch_tool.rs: 6 passed. a_three_hunk_patch_is_one_call_and_lands_where_three_edits_would drives
+    the same three changes twice — once as three edit_file calls, once as one patch_file — and asserts
+    the resulting files are byte-identical, one edits row, tool patch_file, observation ''applied 3 hunks''.'
+  - F3 SABOTAGE, and the FIRST FIXTURE WAS TOO WEAK TO CATCH IT. Locating each hunk in the file as the
+    previous hunks have already rewritten it — a running rewrite, the obvious spelling — passed, because
+    every hunk in the first fixture replaced one line with one line and there was no drift for the wrong
+    implementation to accumulate. The fixture now adds a line in its first hunk and removes one in its
+    third; the sabotage then failed the named test and nothing else. Recorded in the test's own doc comment
+    so the next person does not weaken it back.
+  - 'F4 SABOTAGE: apply and write each hunk as it validates, stopping at the first that does not fit.
+    Fails a_patch_whose_second_hunk_does_not_fit_changes_nothing AND a_three_hunk_patch_is_one_call —
+    two named tests rather than one, both about the same write path, which is honest rather than over-broad:
+    a per-hunk write breaks both the all-or-nothing claim and the offset claim.'
+  - 'All-or-nothing asserted as an absence AND a presence: the file byte-identical, no edits row, rewind
+    reporting Rewind::NotRecorded (so no snapshot row either), and the observation naming hunk 2 and the
+    line it expected.'
+  - patch_file cannot create a file and says to use write_file; a patch to a denied path is refused by
+    the same Act::Write gate and the file is untouched.
+  - Added to workspace_tools() only, so single-file mode is untouched. patch_file falls to Mutating in
+    tool_effect, as everything outside the read-only trio does.
 - id: US-IO-HARNESS-0.51.0-T05
   summary: 'Add check: the project''s own checker as an Act::Exec-gated tool that speaks its skips.'
   why_required: Without it the checker only ever answers after the write. The gate is not optional — a
     model-callable path to the project's build command must be refusable by the policy that refuses exec.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.51.0-T01
   acceptance_criteria:
@@ -204,8 +226,24 @@ tasks:
   - src/tools/mod.rs
   - src/tools/diagnostics.rs
   - src/run.rs
-  - tests/edit_tool.rs
-  evidence: []
+  - tests/patch_tool.rs
+  evidence:
+  - 'tests/patch_tool.rs the_checker_answers_clean_findings_and_no_checker_at_all passes all three shapes:
+    a clean crate says it found nothing, a crate with a type error returns the checker''s own findings
+    (mismatched types / E0308), and a workspace with no project marker names the skip.'
+  - 'F5 SABOTAGE: route the tool through diagnostics_after_write''s mapping, where Outcome::Skipped is
+    the empty string. Fails the named test and only it. The distinction is the point — silence costs nothing
+    when nobody asked, and reads as ''your project is clean'' when somebody did.'
+  - 'F6 SABOTAGE: run the checker without the Act::Exec gate. Fails the_check_tool_is_exec_gated_while_the_automatic_check_is_not
+    and only it.'
+  - The gate checks the same two targets exec checks — the program alone and the joined argv — so both
+    deny_exec("cargo") and deny_exec("cargo check*") reach it. No process spawned under a denying policy,
+    asserted by the absence of target/, which cargo always creates.
+  - 'The automatic post-edit checker stays UNGATED, and both halves are asserted in one test in two separate
+    runs. Two runs and not two steps: target/ is the evidence a checker ran, so one run doing both would
+    let the edit''s own check create it before the refusal could be asserted as an absence.'
+  - diagnostics::checker(tc) resolves the argv without running it, so the policy can be asked about a
+    command rather than about the word 'check'. after_edit is now that plus Checker::run.
 - id: US-IO-HARNESS-0.51.0-T06
   summary: 'Add rewind_step and Reverted: undo one step by reverse-applying its stored hunks.'
   why_required: Undo has one granularity today, so a twenty-step run with one wrong step is thrown away

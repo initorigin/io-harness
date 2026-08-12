@@ -65,10 +65,10 @@ const GIT_DIR: &str = ".git";
 #[cfg(feature = "media")]
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
-    Entry, FsTool, ToolEffect, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL,
-    FIND_TOOL, GREP_TOOL, LIST_DIR_TOOL, PROPOSE_PLAN_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL,
-    REMEMBER_TOOL, SHELL_KILL_TOOL, SHELL_POLL_TOOL, SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL,
-    WRITE_FILE_TOOL,
+    Entry, FsTool, ToolEffect, Toolbox, Workspace, ASK_QUESTION_TOOL, CHECK_TOOL, EDIT_FILE_TOOL,
+    EXEC_TOOL, FIND_TOOL, GREP_TOOL, LIST_DIR_TOOL, PATCH_FILE_TOOL, PROPOSE_PLAN_TOOL,
+    READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_KILL_TOOL, SHELL_POLL_TOOL,
+    SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
@@ -9787,6 +9787,177 @@ async fn dispatch(
                 }
             }
         }
+        PATCH_FILE_TOOL => {
+            let path = s("path").unwrap_or_default();
+            let patch = s("patch").unwrap_or_default();
+            if path.is_empty() || patch.trim().is_empty() {
+                return Ok(Dispatched::go(
+                    "patch missing arguments",
+                    "\n[patch error] patch_file needs a \"path\" and a non-empty \"patch\" \
+                     holding a unified diff\n",
+                ));
+            }
+            // The same act as `write_file` and `edit_file`, so the same gate on
+            // the same path. The patch body is offered as the content so a human
+            // answering an `Ask` sees the change rather than only where it lands.
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Write,
+                path,
+                Some(patch),
+                watch,
+                depth,
+                goal,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go {
+                    target,
+                    content,
+                    remember,
+                } => {
+                    let patch = content.unwrap_or_default();
+                    let (before, kept) = read_before(ws, &target);
+                    let diffable = !matches!(kept, Kept::Unkept(_));
+                    match ws.patch_file(&target, &patch) {
+                        Ok(wrote) => {
+                            let (after, _) = read_before(ws, &target);
+                            // Measured over the whole file, because a patch *is*
+                            // a whole-file change — there is no fragment here for
+                            // the counts to be about, which is the one way this
+                            // arm differs from `edit_file`'s.
+                            record_edit(
+                                store,
+                                run_id,
+                                step,
+                                PATCH_FILE_TOOL,
+                                &target,
+                                &before,
+                                &after,
+                                diffable.then(|| (before.as_str(), after.as_str())),
+                            );
+                            record_snapshot(store, run_id, step, &target, kept);
+                            let diagnostics =
+                                diagnostics_after_write(ws.root(), toolchain, exec_timeout, cap)
+                                    .await;
+                            Dispatched::Continue {
+                                decision: format!("patched {target}"),
+                                obs: bound(
+                                    &format!(
+                                        "\n[patched {target}] applied {} hunk{}{}\n{}",
+                                        patch.matches("\n@@ ").count()
+                                            + usize::from(patch.starts_with("@@ ")),
+                                        if patch.matches("@@ ").count() == 1 {
+                                            ""
+                                        } else {
+                                            "s"
+                                        },
+                                        if wrote.moved_the_workspace() {
+                                            ""
+                                        } else {
+                                            " — the patch reproduced what was already there, so \
+                                             the workspace did not change"
+                                        },
+                                        diagnostics
+                                    ),
+                                    cap,
+                                    ObsKind::Write,
+                                ),
+                                kind: ObsKind::Write,
+                                target: Some(target.clone()),
+                                changed: wrote.moved_the_workspace(),
+                                remember,
+                            }
+                        }
+                        // A patch that does not fit is the model's to fix and the
+                        // message says which hunk and what it expected. Nothing
+                        // was written, so reading the file again and rewriting the
+                        // patch is a complete recovery.
+                        Err(e) => Dispatched::go("patch error", format!("\n[patch error] {e}\n")),
+                    }
+                }
+            }
+        }
+        CHECK_TOOL => {
+            // Resolved before it is spawned, because the policy has to be asked
+            // about the command and not about the word "check".
+            let checker = match crate::tools::diagnostics::checker(toolchain) {
+                Ok(c) => c,
+                // A model that ASKED is told there is no checker. The automatic
+                // post-edit path stays silent on the same answer, and that is the
+                // difference between the two: silence costs nothing when nobody
+                // asked, and reads as "your project is clean" when somebody did.
+                Err(why) => {
+                    return Ok(Dispatched::go(
+                        "check skipped",
+                        format!("\n[check skipped] {why}\n"),
+                    ))
+                }
+            };
+            // The same two targets `exec` checks, for the same reason: the program
+            // alone is what `deny_exec("cargo")` names, and the whole argv is what
+            // a rule like `deny_exec("cargo check*")` names.
+            let program = checker.argv[0].clone();
+            let joined = checker.argv.join(" ");
+            let mut targets = vec![program];
+            if joined != targets[0] {
+                targets.push(joined);
+            }
+            let mut remembered: Vec<Rule> = Vec::new();
+            for target in targets {
+                match gate(
+                    ws,
+                    approver,
+                    store,
+                    run_id,
+                    step,
+                    Act::Exec,
+                    &target,
+                    None,
+                    watch,
+                    depth,
+                    goal,
+                )
+                .await?
+                {
+                    Gated::Refused { decision, obs } => return Ok(Dispatched::go(decision, obs)),
+                    Gated::Paused { request_id } => return Ok(Dispatched::Pause { request_id }),
+                    Gated::Go { remember, .. } => remembered.extend(remember),
+                }
+            }
+            let obs = match checker.run(ws.root(), exec_timeout, cap).await {
+                crate::tools::diagnostics::Outcome::Clean => {
+                    "\n[check] the project's own check found nothing\n".to_string()
+                }
+                crate::tools::diagnostics::Outcome::Found(text) => text,
+                // Both of these are silent on the post-edit path and neither is
+                // here. An empty answer to a direct question is read as approval.
+                crate::tools::diagnostics::Outcome::Skipped(why) => {
+                    format!("\n[check skipped] {why}\n")
+                }
+                crate::tools::diagnostics::Outcome::Failed(why) => {
+                    format!("\n[check did not run] {why}\n")
+                }
+            };
+            Dispatched::Continue {
+                decision: "checked the project".to_string(),
+                obs: bound(&obs, cap, ObsKind::Tool),
+                kind: ObsKind::Tool,
+                target: None,
+                // Deliberately not `changed`, for the reason `exec` is not: the
+                // stall signal asks whether the agent is getting anywhere, and
+                // running the same check a fourth time without editing anything
+                // in between is precisely the shape of an agent that is not.
+                changed: false,
+                remember: remembered,
+            }
+        }
         SHELL_TOOL => {
             let line_src = s("line").unwrap_or_default();
             if line_src.trim().is_empty() {
@@ -13598,6 +13769,42 @@ fn workspace_tools() -> Vec<ToolSpec> {
                 },
                 "required": ["path", "search", "replace"]
             }),
+        },
+        ToolSpec {
+            name: PATCH_FILE_TOOL.to_string(),
+            description: "Apply a unified diff to ONE existing file — use this instead of several \
+                          edit_file calls when a change touches more than one place in the same \
+                          file, because every hunk is anchored against the file as you last read \
+                          it rather than against a file your earlier edits have already moved. \
+                          The patch is hunk headers of the form \"@@ -12,7 +12,9 @@\" followed by \
+                          lines each prefixed with a space (context, unchanged), a minus \
+                          (removed) or a plus (added); three context lines either side is the \
+                          usual amount and is what makes a hunk find its place. If ANY hunk does \
+                          not match what is in the file, the whole patch is refused and nothing \
+                          changes, so read the file first and copy its lines exactly, whitespace \
+                          included. It cannot create a file — use write_file for that."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path relative to the workspace root. One file per call; patch each file separately." },
+                    "patch": { "type": "string", "description": "The unified diff for that one file: one or more @@ hunks. Any --- or +++ header lines are ignored, since the file is named by \"path\"." }
+                },
+                "required": ["path", "patch"]
+            }),
+        },
+        ToolSpec {
+            name: CHECK_TOOL.to_string(),
+            description: "Run the project's own type-check over the whole workspace and read back \
+                          what it says — the cheap check for whatever ecosystem this project is, \
+                          chosen for you. Takes no arguments. Use it before deciding what to \
+                          write, to find out whether the tree is already broken and where; the \
+                          same check runs automatically after every successful write, so calling \
+                          it straight after one tells you nothing new. It reports and never \
+                          blocks: a failing check does not undo an edit. If this project has no \
+                          checker it says so rather than staying silent."
+                .to_string(),
+            parameters: json!({ "type": "object", "properties": {} }),
         },
         ToolSpec {
             name: EXEC_TOOL.to_string(),

@@ -509,6 +509,45 @@ impl Workspace {
         Ok(did)
     }
 
+    /// Apply a unified diff to a file under the root, or change nothing (0.51.0).
+    ///
+    /// [`Workspace::edit_file`] is one search-and-replace, so a change touching
+    /// four places in a file is four calls — and after the second one the model
+    /// is editing a file whose line numbers have moved under the text it read.
+    /// This takes all four as one anchored patch. Same [`Act::Write`] check on
+    /// the same path, because it is the same act.
+    ///
+    /// **All or nothing.** Every hunk is matched against the file as it stands,
+    /// at its own recorded position, *before* anything is written; a patch whose
+    /// third hunk does not fit leaves the file byte-identical and says which hunk
+    /// and what it expected. A half-patched file is the outcome this ordering
+    /// exists to make impossible, and it is not something a caller can inspect
+    /// their way out of afterwards.
+    ///
+    /// It cannot create a file, for the reason [`Workspace::edit_file`] cannot:
+    /// a patch is anchored to text that is already there, and creating is
+    /// [`Workspace::write_file`]'s job.
+    pub fn patch_file(&self, rel: &str, patch: &str) -> Result<Wrote> {
+        let abs = self.resolve(rel)?;
+        self.enforce(Act::Write, rel)?;
+        if !abs.exists() {
+            return Err(Error::Config(format!(
+                "there is no {rel} to patch; a patch is anchored to text that is already there, \
+                 so use write_file to create a file"
+            )));
+        }
+        let current = std::fs::read_to_string(&abs).map_err(|e| {
+            Error::Config(format!(
+                "{rel} could not be read as text, so it cannot be patched: {e}"
+            ))
+        })?;
+        let hunks = crate::diff::parse(patch)?;
+        let updated = crate::diff::apply(&current, &hunks)?;
+        let did = Wrote::classify(std::fs::read(&abs), updated.as_bytes());
+        std::fs::write(abs, updated)?;
+        Ok(did)
+    }
+
     /// Read a file under the root as bytes, for a format that is not text.
     ///
     /// A path the policy denies is refused before anything is read, exactly as
