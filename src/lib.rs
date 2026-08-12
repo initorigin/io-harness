@@ -416,6 +416,7 @@ pub mod config;
 pub mod containment;
 pub mod context;
 mod contract;
+mod diff;
 mod error;
 pub mod hooks;
 pub mod mcp;

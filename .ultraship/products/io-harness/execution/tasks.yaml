@@ -6,7 +6,7 @@ tasks:
   why_required: Every other piece of the release reads or writes a hunk. Without a differ that round-trips
     there is nothing to store, nothing to render and nothing to revert, and a fragment-anchored diff is
     the failure F1 exists to catch.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F1 — a stored hunk is anchored to the file and reverse-applies byte for byte.** A run edits a file
@@ -27,7 +27,20 @@ tasks:
     '
   files:
   - src/state.rs
-  evidence: []
+  evidence:
+  - '17 unit tests in src/diff.rs pass: cargo test --lib diff:: — 17 passed, 0 failed.'
+  - 'generated_pairs_round_trip_in_both_directions drives 2000 generated (old, new) pairs through render
+    -> parse -> apply and render -> parse -> reverse -> apply, requiring both to reproduce the other side
+    byte for byte. It failed on case 106 and the failure was a real defect, not a fixture: a line''s identity
+    includes whether it is terminated, so comparing text alone made an unterminated last line equal to
+    the identically-spelled terminated one. Fixed by comparing (text, is-unterminated-last-line) as the
+    unit, which also deleted the special case the hand-written tests had needed.'
+  - 'Two defects the hand-written cases found first: str::lines() strips a trailing carriage return, so
+    parsing a CRLF patch silently deleted the \r from every line and wrote back mixed endings — parse
+    now splits on \n by hand; and a file that only gained or lost its final newline rendered a hunk of
+    pure context lines that changed nothing.'
+  - 'No dependency added: the differ is the common-head/common-tail walk Edit::measure already performs,
+    and the parser and applier are ~200 lines in src/diff.rs.'
 - id: US-IO-HARNESS-0.51.0-T02
   summary: Store the hunk on every edit, without moving the line counts.
   why_required: The release's outcome is that a change stops being a pair of counts. The counts themselves
