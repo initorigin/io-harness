@@ -2426,7 +2426,7 @@ pub struct Edit {
     /// `None` has three causes and none of them is "nothing happened":
     /// the row was written before 0.51.0; the file's previous contents were not
     /// kept, so there was nothing to diff against (over the snapshot cap or not
-    /// UTF-8 — the reason is on that path's [`Snapshot`] row); or the rendered
+    /// UTF-8 — the reason is on that path's snapshot row); or the rendered
     /// diff would itself have exceeded that cap. An absent hunk is reported as
     /// absent everywhere it is read, never treated as an empty patch.
     pub hunk: Option<String>,
