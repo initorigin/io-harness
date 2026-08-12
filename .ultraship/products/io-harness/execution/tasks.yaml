@@ -69,7 +69,7 @@ tasks:
   summary: A detached child runs in the parent's in-flight set and reports at a later step.
   why_required: This is the detached shape itself; F4's byte-identity control on the blocking path is
     what proves it did not change every existing tree run.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.50.0-T02
   acceptance_criteria:
@@ -95,12 +95,20 @@ tasks:
   - src/run.rs
   - src/observe.rs
   - tests/subagents.rs
-  evidence: []
+  evidence:
+  - 'F3 — a_detached_child_reports_at_a_later_step passes: the report is absent from the spawning step,
+    the parent took further steps of its own, and the report arrives at a strictly later step.'
+  - 'F4 — a_blocking_spawn_folds_into_its_own_step_in_call_order passes: two waited-for children fold
+    into step 1 in call order, and nothing was detached.'
+  - children_are_composed_in_spawn_order_not_completion_order (0.12.0's own determinism test) still passes
+    unchanged.
+  - The in-flight set is a FuturesUnordered on the parent's own task, driven against the parent's completion
+    by  — a detached child cannot be a spawned task because &Store is Send and not Sync.
 - id: US-IO-HARNESS-0.50.0-T04
   summary: background_after_secs races the child against a sleep and keeps the loser.
   why_required: A stuck child is unbounded from the parent's side today; without the race there is nothing
     between a child's step cap and halting the whole tree.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.50.0-T03
   acceptance_criteria:
@@ -117,12 +125,19 @@ tasks:
   - src/run.rs
   - src/observe.rs
   - tests/subagents.rs
-  evidence: []
+  evidence:
+  - 'F5 — a_wall_clock_backgrounds_a_child_without_killing_it passes both halves: the parent is told at
+    the step it asked, and the child (parked 1.5s against a 1s clock) still completes, lands its file
+    and reports.'
+  - 'F5''s other arm — a_wall_clock_the_child_beats_is_an_ordinary_spawn passes: a 10s clock against an
+    instant child never reports a background move and folds into step 1.'
+  - 'The race keeps the loser: futures_util::select over the child and a sleep, never tokio::time::timeout,
+    which drops the future and cancels the child mid-step.'
 - id: US-IO-HARNESS-0.50.0-T05
   summary: The parent drains every in-flight child before it returns.
   why_required: 0.48.0's rule is that everything a run starts is inside the boundary; a parent that returns
     while a child runs is a leak the crate has never had.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.50.0-T03
   acceptance_criteria:
@@ -136,7 +151,12 @@ tasks:
   files:
   - src/run.rs
   - tests/subagents.rs
-  evidence: []
+  evidence:
+  - 'F6 — a_tree_drains_the_children_it_stopped_waiting_for passes: a parent that detaches and finishes
+    in the same step still leaves the child successful, its file on disk, and its report durable under
+    the parent''s run id.'
+  - The drain sits at run_agent's single return rather than at agent_loop's twelve endings, and it runs
+    before the  so a run ending in an error drains too.
 - id: US-IO-HARNESS-0.50.0-T06
   summary: A resumed parent re-adopts every child it detached and left unfinished.
   why_required: A detached spawn's step commits, so the replay never re-enters spawn_child for it and
