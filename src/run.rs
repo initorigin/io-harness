@@ -6801,6 +6801,47 @@ fn run_agent<'f, P: Provider>(
     })
 }
 
+/// How a parent asked for its child to come back (0.50.0).
+///
+/// The default is [`Return::Wait`], which is every spawn written before this
+/// release and every spawn that names neither argument: a parent that says
+/// nothing gets the blocking, ordered, reproducible tree it has always had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Return {
+    /// Wait for the child, fold its report into this step.
+    Wait,
+    /// Do not wait: the child goes into the parent's in-flight set now and its
+    /// report arrives at a later step.
+    Detach,
+    /// Wait, but only this long. Past it the child keeps running and the parent
+    /// takes its next step — the child is moved to the background, never dropped.
+    WaitUntil(Duration),
+}
+
+/// Read the two 0.50.0 arguments off a spawn call.
+///
+/// `Err` is the message the parent reads. A contradiction is answered the way
+/// every other malformed spawn is — a typed observation naming it, no child, and
+/// a parent that carries on — rather than as a failure of the parent's run.
+///
+/// A zero-second wall clock is [`Return::Detach`] and not an error: "wait zero
+/// seconds for it" and "do not wait for it" are the same request, and refusing
+/// one spelling of a coherent instruction teaches a model nothing.
+fn spawn_return(a: &serde_json::Value) -> std::result::Result<Return, String> {
+    let wait = a.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
+    let after = a.get("background_after_secs").and_then(|v| v.as_u64());
+    match (wait, after) {
+        (false, Some(_)) => Err(
+            "\"wait\": false and \"background_after_secs\" cannot both be set — a child you are \
+             not waiting for has no wall clock to cross. Pick one."
+                .into(),
+        ),
+        (false, None) | (true, Some(0)) => Ok(Return::Detach),
+        (true, Some(s)) => Ok(Return::WaitUntil(Duration::from_secs(s))),
+        (true, None) => Ok(Return::Wait),
+    }
+}
+
 /// The result of one [`SPAWN_TOOL`] call.
 enum SpawnResult {
     /// The child finished; fold its composed result into the parent's log.
@@ -6845,6 +6886,21 @@ async fn spawn_child<P: Provider>(
             obs: "\n[spawn error] spawn_agent needs \"goal\" and \"verify_file\"\n".into(),
         });
     }
+
+    // 0.50.0 — how the parent asked for this child back, read before anything is
+    // registered, admitted or written. A contradiction must cost no run row, no
+    // slot and no queue place, and the only way to guarantee that is to answer it
+    // here.
+    let want = match spawn_return(a) {
+        Ok(w) => w,
+        Err(why) => {
+            return Ok(SpawnResult::Composed {
+                decision: "spawn arguments conflict".into(),
+                obs: format!("\n[spawn error] {why}\n"),
+            });
+        }
+    };
+    let _ = want;
 
     let child_depth = depth + 1;
 
@@ -12605,7 +12661,9 @@ fn tree_tools(agents: &Agents) -> Vec<ToolSpec> {
                 "verify_contains": { "type": "string", "description": "Text that file must contain for the sub-agent to succeed." },
                 "deny_write": { "type": "array", "items": { "type": "string" }, "description": "Optional globs the sub-agent must not write — tightens its inherited policy." },
                 "deny_net": { "type": "array", "items": { "type": "string" }, "description": "Optional host globs (host or host:port) the sub-agent must not reach — tightens its inherited policy." },
-                "max_steps": { "type": "integer", "description": "Optional step budget for the sub-agent." }
+                "max_steps": { "type": "integer", "description": "Optional step budget for the sub-agent." },
+                "wait": { "type": "boolean", "description": "Whether to wait for the sub-agent before taking your next step. Default true. Set false to carry on immediately; the sub-agent's report reaches you at a later step." },
+                "background_after_secs": { "type": "integer", "description": "Optional: wait at most this many seconds, then let the sub-agent carry on in the background and take your next step. Its report reaches you when it finishes. Cannot be combined with \"wait\": false." }
             },
             "required": ["goal", "verify_file", "verify_contains"]
         }),

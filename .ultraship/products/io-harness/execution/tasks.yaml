@@ -43,7 +43,7 @@ tasks:
   summary: spawn_agent takes wait and background_after_secs, and a conflicting pair is a typed observation.
   why_required: Both later shapes are selected per call through these arguments; without the schema and
     its refusal path there is no way for a parent to choose how a child returns.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.50.0-T01
   acceptance_criteria:
@@ -57,7 +57,14 @@ tasks:
   files:
   - src/run.rs
   - tests/subagents.rs
-  evidence: []
+  evidence:
+  - 'F9 — a_conflicting_spawn_costs_nothing_and_the_parent_carries_on (tests/subagents.rs) passes: the
+    parent is told which two arguments conflict, no child run exists, no spawn event was recorded, and
+    the run reached Success { steps: 2 }.'
+  - The conflict is answered before register_agent, try_admit and record_spawn, which is what makes "it
+    costs nothing" true rather than hoped for.
+  - 'A zero-second wall clock is Detach and not an error: "wait zero seconds" and "do not wait" are the
+    same request.'
 - id: US-IO-HARNESS-0.50.0-T03
   summary: A detached child runs in the parent's in-flight set and reports at a later step.
   why_required: This is the detached shape itself; F4's byte-identity control on the blocking path is

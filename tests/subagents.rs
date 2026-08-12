@@ -1200,3 +1200,70 @@ async fn an_adopted_child_reports_the_same_conclusion() {
         "the adopted child's conclusion reaches the resumed parent, got {rows:?}"
     );
 }
+
+/// 0.50.0 — F9: a contradiction in the spawn arguments is a typed observation the
+/// parent adapts to, and it costs nothing.
+///
+/// The two arguments this release adds can be combined into a request that has no
+/// meaning: a child you are not waiting for has no wall clock to cross. Answered
+/// where every other malformed spawn is answered — before a child is registered,
+/// admitted or written — so a parent that gets it wrong leaves no run row, no
+/// queue place and no `spawns` row behind, and carries on.
+#[tokio::test]
+async fn a_conflicting_spawn_costs_nothing_and_the_parent_carries_on() {
+    let dir = ws();
+    let contract = TaskContract::workspace("Delegate, then finish yourself.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "done.txt".into(),
+            needle: "ok".into(),
+        })
+        .with_max_steps(4);
+
+    let script = MockScript::new(vec![
+        vec![call(
+            "spawn_agent",
+            json!({
+                "goal": "impossible", "verify_file": "x.txt", "verify_contains": "X",
+                "wait": false, "background_after_secs": 30
+            }),
+        )],
+        vec![write("done.txt", "ok")],
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+
+    // The parent was not stopped by it.
+    assert_eq!(result.outcome, RunOutcome::Success { steps: 2 });
+
+    // It was told, in terms naming the conflict.
+    let rows = store.observations(result.run_id).unwrap();
+    assert!(
+        rows.iter()
+            .any(|o| o.text.contains("[spawn error]") && o.text.contains("background_after_secs")),
+        "the parent is told which two arguments conflict, got {rows:?}"
+    );
+
+    // And it cost nothing: no child run, and no spawn recorded against the step.
+    assert!(
+        store.children(result.run_id).unwrap().is_empty(),
+        "a conflicting spawn creates no child"
+    );
+    assert!(
+        store
+            .agent_events(result.run_id)
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != "spawn"),
+        "a conflicting spawn records no spawn event"
+    );
+}
