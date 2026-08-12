@@ -103,7 +103,8 @@ tasks:
   - children_are_composed_in_spawn_order_not_completion_order (0.12.0's own determinism test) still passes
     unchanged.
   - The in-flight set is a FuturesUnordered on the parent's own task, driven against the parent's completion
-    by  — a detached child cannot be a spawned task because &Store is Send and not Sync.
+    by the `driving` helper — a detached child cannot be a spawned task because `&Store` is `Send` and
+    not `Sync`.
 - id: US-IO-HARNESS-0.50.0-T04
   summary: background_after_secs races the child against a sleep and keeps the loser.
   why_required: A stuck child is unbounded from the parent's side today; without the race there is nothing
@@ -131,7 +132,7 @@ tasks:
     and reports.'
   - 'F5''s other arm — a_wall_clock_the_child_beats_is_an_ordinary_spawn passes: a 10s clock against an
     instant child never reports a background move and folds into step 1.'
-  - 'The race keeps the loser: futures_util::select over the child and a sleep, never tokio::time::timeout,
+  - 'The race keeps the loser: `futures_util::select` over the child and a sleep, never `tokio::time::timeout`,
     which drops the future and cancels the child mid-step.'
 - id: US-IO-HARNESS-0.50.0-T05
   summary: The parent drains every in-flight child before it returns.
@@ -161,7 +162,7 @@ tasks:
   summary: A resumed parent re-adopts every child it detached and left unfinished.
   why_required: A detached spawn's step commits, so the replay never re-enters spawn_child for it and
     the child would be orphaned across a restart.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.50.0-T05
   acceptance_criteria:
@@ -177,7 +178,23 @@ tasks:
   files:
   - src/run.rs
   - tests/checkpoint.rs
-  evidence: []
+  evidence:
+  - 'F7 — a_detached_child_is_readopted_after_a_restart (tests/checkpoint.rs) passes: the same child run
+    row is taken back, resumed from its own checkpoint, finishes, lands its file, and its conclusion reaches
+    the resumed parent.'
+  - 'The whole spawn call is recorded as an `AgentEvent::spawn_args` row rather than rebuilt from the
+    `spawns` row, which holds five of the nine arguments: a rebuild from those five would silently drop
+    `agent` and `deny_net` and resume the child under a WIDER policy than it was spawned with. No column
+    was added to record it.'
+  - Re-adoption goes through `spawn_child` itself, so admission, the narrowed policy and the adopt path
+    are the same code that ran the first time.
+  - 'Only steps below `start_step` are re-adopted: a step left uncommitted is replayed and re-adopts its
+    children through the ordinary path, and doing both would adopt one child twice.'
+  - 'FINDING, and it cost a test rewrite: the first version of this test interrupted the run inside the
+    drain, AFTER `finish` had already marked the parent completed — so `resume_tree` returned the terminal
+    outcome and never re-entered the loop. The drain runs after the run row is final, which leaves a narrow
+    window in which a crash orphans a child. Recorded as a known limitation with its recovery (resume
+    the child by its own run id) rather than papered over.'
 - id: US-IO-HARNESS-0.50.0-T07
   summary: TaskContract carries the operator's default wall clock and its refusal of detachment.
   why_required: The operator has to be able to narrow what the model may ask for, in the direction every

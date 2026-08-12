@@ -705,7 +705,8 @@ pub struct AgentEvent {
     pub run_id: i64,
     /// The step it occurred on.
     pub step: u32,
-    /// `"spawn"`, `"spawn_refused"`, `"budget_draw"`, or `"said"`.
+    /// `"spawn"`, `"spawn_refused"`, `"budget_draw"`, `"said"`, or
+    /// `"spawn_args"`.
     pub kind: String,
     /// The spawned child's run id, for a `"spawn"`.
     pub child_run_id: Option<i64>,
@@ -740,6 +741,32 @@ impl AgentEvent {
             kind: "spawn_refused".into(),
             child_run_id: None,
             detail: Some(cap.into()),
+            tokens: None,
+            remaining: None,
+        }
+    }
+
+    /// The arguments of a spawn, kept so a detached child can be re-adopted
+    /// after a restart (0.50.0).
+    ///
+    /// A blocking child never needs it: its parent's step is left uncommitted, so
+    /// the resume replays the spawn call and the arguments come with it. A child
+    /// the parent stopped waiting for commits its step and the call is gone —
+    /// while `spawns` holds only five of the nine arguments, so rebuilding from
+    /// that row would silently drop `agent` and `deny_net` and resume the child
+    /// under a wider policy than it was spawned with.
+    pub fn spawn_args(
+        run_id: i64,
+        step: u32,
+        child_run_id: i64,
+        arguments: &serde_json::Value,
+    ) -> Self {
+        Self {
+            run_id,
+            step,
+            kind: "spawn_args".into(),
+            child_run_id: Some(child_run_id),
+            detail: Some(arguments.to_string()),
             tokens: None,
             remaining: None,
         }

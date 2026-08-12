@@ -5965,6 +5965,66 @@ fn run_agent<'f, P: Provider>(
     })
 }
 
+/// Take back the children a previous process detached and never finished.
+///
+/// A detached child's step commits, so the resume starts at the step *after* it
+/// and the spawn call is never replayed — which without this would leave the child
+/// with a `running` run row nobody is driving, the exact orphan 0.48.0's boundary
+/// rule forbids. Each one is resumed through `spawn_child` itself, from the
+/// arguments the spawn recorded, so adoption, admission and the narrowed policy are
+/// the same code that ran the first time rather than a second implementation of it.
+async fn readopt_children<'f, P: Provider>(
+    tree: &'f Tree<'_, P>,
+    run_id: i64,
+    depth: u32,
+    policy: &Policy,
+    start_step: u32,
+    inflight: &mut Inflight<'f>,
+) -> Result<()> {
+    if start_step <= 1 {
+        return Ok(());
+    }
+    let mut seq = u64::MAX / 2;
+    for event in tree.store.agent_events(run_id)? {
+        if event.kind != "spawn_args" || event.step >= start_step {
+            continue;
+        }
+        let Some(child) = event.child_run_id else {
+            continue;
+        };
+        // Already finished before the process died: there is nothing to drive, and
+        // the ordinary fold will read its report off the store when it is asked
+        // for. Re-running it would spend a second child's worth of everything.
+        if terminal_outcome(tree.store, child)?.is_some() {
+            continue;
+        }
+        let Some(arguments) = event
+            .detail
+            .as_deref()
+            .and_then(|d| serde_json::from_str(d).ok())
+        else {
+            continue;
+        };
+        let call = ToolCall {
+            name: SPAWN_TOOL.to_string(),
+            arguments,
+        };
+        match spawn_child(tree, &call, run_id, depth, policy, event.step).await? {
+            SpawnOutcome::InFlight { fut, .. } => {
+                let ord = seq;
+                seq += 1;
+                inflight.push(Box::pin(async move { Ok((ord, fut.await?)) }));
+            }
+            // It finished inside the re-adoption, which is possible for a child
+            // that had one step left. Its report is on the store and the ordinary
+            // fold is not the place for it — this run never saw the spawn — so it
+            // is left where an operator reads it, under the child's own run id.
+            SpawnOutcome::Settled(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Fold the reports of every child that has finished into the parent's ledger.
 ///
 /// Sorted by the order the children were spawned in and not by the order they
@@ -6293,6 +6353,13 @@ where
         let mem_key = memory_key(&tree.root);
         // See the workspace loop: viewed images ride one step and are dropped.
         let pending_media = &mut PendingMedia::default();
+
+        // 0.50.0 — every child this agent stopped waiting for and did not live to
+        // see finish. Only for a resume, and only for steps that already
+        // committed: a step left uncommitted is replayed, and replaying it
+        // re-adopts its children through the ordinary spawn path — doing both
+        // would adopt one child twice.
+        readopt_children(tree, run_id, depth, policy, start_step, inflight).await?;
 
         for step in start_step..=contract.max_steps {
             // 0.48.0 — the same per-step refresh and drain the flat loop does. A
@@ -7414,6 +7481,21 @@ async fn spawn_child<'f, P: Provider>(
                     .map(|n| n as u32),
                 &deny_json,
             )?;
+            // 0.50.0 — the call itself, so a child the parent stopped waiting for
+            // can be re-adopted after a restart.
+            //
+            // A blocking child needs none of this: its step never commits, so the
+            // resume replays the spawn call and the arguments arrive with it. A
+            // detached child's step DOES commit, so the call is gone and only what
+            // was written survives — and `spawns` holds five of the nine
+            // arguments. Rebuilding a child from those five would silently drop
+            // `agent` and `deny_net`, which is to say it would resume a child under
+            // a WIDER policy than the one it was spawned with. The whole call goes
+            // in a row of the table the tree already writes to, so the rebuild is a
+            // replay rather than a reconstruction, and no column was added to
+            // record it.
+            tree.store
+                .record_agent_event(&AgentEvent::spawn_args(parent_run_id, step, child_run, a))?;
             (child_run, 1)
         }
     };
