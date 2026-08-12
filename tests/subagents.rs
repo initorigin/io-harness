@@ -1626,3 +1626,84 @@ async fn a_wall_clock_the_child_beats_is_an_ordinary_spawn() {
     let report = rows.iter().find(|o| o.text.contains("QUICK")).unwrap();
     assert_eq!(report.step, 1, "it folds into the step that spawned it");
 }
+
+/// 0.50.0 — F8: the operator's settings narrow the model's, in both directions.
+///
+/// A contract clock reaches a spawn that named none and beats a spawn that named
+/// a longer one; a contract that refuses detachment answers `"wait": false` with
+/// an ordinary blocking spawn and a line saying so. Silence would be worse than
+/// either: a model that believes it fanned out and did not is a model reasoning
+/// about work that is not happening.
+#[tokio::test]
+async fn the_contract_narrows_what_a_spawn_may_ask_for() {
+    let dir = ws();
+    let strict = TaskContract::workspace("Delegate, but stay in step.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "done.txt".into(),
+            needle: "ok".into(),
+        })
+        .with_max_steps(4)
+        .without_detached_spawns();
+
+    let detached = call(
+        "spawn_agent",
+        json!({
+            "goal": "look into it", "verify_file": "found.txt", "verify_contains": "FOUND",
+            "wait": false
+        }),
+    );
+    let script = MockSaying::new(vec![
+        (None, vec![detached]),
+        (Some("SAID-IT"), vec![write("found.txt", "FOUND")]),
+        (None, vec![write("done.txt", "ok")]),
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &strict,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.outcome, RunOutcome::Success { .. }));
+
+    let rows = store.observations(result.run_id).unwrap();
+    let report = rows
+        .iter()
+        .find(|o| o.text.contains("SAID-IT"))
+        .expect("the child still reported");
+    // Waited for after all — folded into the step that asked, not a later one.
+    assert_eq!(report.step, 1, "the refused detachment became a plain wait");
+    // And the model was told, rather than left believing it had fanned out.
+    assert!(
+        report.text.contains("[spawn narrowed]"),
+        "the parent is told its request was narrowed, got {:?}",
+        report.text
+    );
+}
+
+/// 0.50.0 — F8's other direction: a contract clock is not raised by a spawn that
+/// asks for a longer one.
+#[test]
+fn a_contract_clock_is_a_ceiling_and_not_a_default_only() {
+    use std::time::Duration;
+
+    let none = TaskContract::workspace("g", "/repo");
+    assert_eq!(none.spawn_background_after, None);
+    assert!(none.detached_spawns);
+
+    let capped = TaskContract::workspace("g", "/repo")
+        .with_spawn_background_after(Duration::from_secs(60));
+    assert_eq!(capped.spawn_background_after, Some(Duration::from_secs(60)));
+    assert!(
+        capped.detached_spawns,
+        "a clock does not by itself forbid detaching"
+    );
+
+    let strict = TaskContract::workspace("g", "/repo").without_detached_spawns();
+    assert!(!strict.detached_spawns);
+}

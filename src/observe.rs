@@ -1095,6 +1095,8 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "stalled",
     "spawned",
     "spawn_refused",
+    "child_detached",
+    "child_collected",
     "fleet",
     "memory_wrote",
     "todo_wrote",
@@ -1736,6 +1738,13 @@ mod tests {
                 port: 443,
                 allowed: true,
             },
+            EventKind::ChildDetached {
+                child_run_id: 2,
+                after: Some(Duration::from_secs(30)),
+            },
+            EventKind::ChildCollected {
+                text: "[child 2 \"survey the parser\" -> Success { steps: 4 }]".into(),
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
@@ -1795,6 +1804,9 @@ mod tests {
                 | EventKind::PromptComposed { .. }
                 // 0.46.0 — how this run's own commands are contained.
                 | EventKind::Contained { .. }
+                // 0.50.0 — a parent stopped waiting for a child, and later read it.
+                | EventKind::ChildDetached { .. }
+                | EventKind::ChildCollected { .. }
                 | EventKind::Finished { .. } => {}
             }
         }

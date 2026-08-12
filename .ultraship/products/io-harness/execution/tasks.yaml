@@ -199,7 +199,7 @@ tasks:
   summary: TaskContract carries the operator's default wall clock and its refusal of detachment.
   why_required: The operator has to be able to narrow what the model may ask for, in the direction every
     other spawn argument already travels.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.50.0-T04
   acceptance_criteria:
@@ -214,7 +214,18 @@ tasks:
   - src/contract.rs
   - src/run.rs
   - tests/subagents.rs
-  evidence: []
+  evidence:
+  - 'F8 — the_contract_narrows_what_a_spawn_may_ask_for passes: a contract that refuses detachment turns
+    `wait: false` into a plain wait folded into the spawning step, and the parent is told with a `[spawn
+    narrowed]` line rather than left believing it fanned out.'
+  - 'F8''s other direction — a_contract_clock_is_a_ceiling_and_not_a_default_only passes: the defaults
+    are None/true, a clock does not by itself forbid detaching, and `narrowed()` takes the minimum of
+    the spawn''s clock and the contract''s so a longer request never raises the ceiling.'
+  - 'Both knobs are carried tree-wide on `Tree`, read from the ROOT contract for the same reason `web`,
+    `tools`, `skills` and `agents` are: a child contract the model writes must not buy its own children
+    more patience than the operator allowed.'
+  - 'Free at the type level: `TaskContract` has been #[non_exhaustive] with builders since 0.35.0.'
+  - 'cargo test (default features): exit 0, 79 binaries, 1,614 passed.'
 - id: US-IO-HARNESS-0.50.0-T08
   summary: Bring every checked-in surface to 0.50.0.
   why_required: docs/CONTRACT.md, the README, the changelog and the crate-root prose are checked-in surfaces

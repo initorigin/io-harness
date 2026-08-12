@@ -2636,7 +2636,9 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 root,
                 root_run_id: run_id,
                 web: contract.web.clone(),
-            };
+                spawn_background_after: contract.spawn_background_after,
+                detached_spawns: contract.detached_spawns,
+                                            };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember.clone()))
@@ -2727,7 +2729,9 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 root,
                 root_run_id: run_id,
                 web: contract.web.clone(),
-            };
+                spawn_background_after: contract.spawn_background_after,
+                detached_spawns: contract.detached_spawns,
+                                            };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember))
@@ -4017,7 +4021,7 @@ async fn run_from<P: Provider>(
             // `None` for every contract that declared nothing, which is what the
             // three built-in providers read as "send the 0.21.0 body".
             web: contract.web.clone(),
-            // 0.31.0 — the tier the caller asked for, or `None` (every contract
+                                    // 0.31.0 — the tier the caller asked for, or `None` (every contract
             // before 0.31.0) to leave the vendor's own default in place.
             effort: contract.effort,
             // Single-file mode has no `view_image` tool, so only the caller's
@@ -4528,7 +4532,7 @@ async fn run_workspace_from<P: Provider>(
                 tools: tools.clone(),
                 // 0.22.0 — the run's web declaration, unchanged per step.
                 web: contract.web.clone(),
-                // 0.31.0 — the root's tier, unchanged per step.
+                                                // 0.31.0 — the root's tier, unchanged per step.
                 effort: contract.effort,
                 cache_boundary,
                 // 0.49.0 — the same breakpoint the line above names, counted in
@@ -5138,6 +5142,14 @@ struct Tree<'a, P: Provider> {
     /// would leave a sub-agent answering from memory on a task that needs the
     /// current answer.
     web: Option<crate::web::WebAccess>,
+    /// The ROOT contract's answer to how long a parent waits for a child, and
+    /// whether a child may outlive the step that spawned it (0.50.0).
+    ///
+    /// Tree-wide and read from the root for exactly the reason `web` is: a child
+    /// contract the *model* writes must not be able to buy its own children more
+    /// patience, or the right to leave one running, than the operator allowed.
+    spawn_background_after: Option<Duration>,
+    detached_spawns: bool,
 }
 
 /// What an agent that is not a session turn's root runs with: nothing.
@@ -5548,7 +5560,9 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
         root,
         root_run_id: run_id,
         web: contract.web.clone(),
-    };
+        spawn_background_after: contract.spawn_background_after,
+        detached_spawns: contract.detached_spawns,
+                    };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, 1, None).await;
     mcp.shutdown(store, run_id, watch).await;
     Ok(RunResult::new(outcome?, run_id))
@@ -5756,7 +5770,9 @@ pub async fn resume_tree_observed<P: Provider>(
         root,
         root_run_id: run_id,
         web: contract.web.clone(),
-    };
+        spawn_background_after: contract.spawn_background_after,
+        detached_spawns: contract.detached_spawns,
+                    };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step, None).await;
     mcp.shutdown(store, run_id, watch).await;
     Ok(RunResult::new(outcome?, run_id))
@@ -6497,7 +6513,7 @@ where
                     // root's, copied in by `spawn_child` rather than taken from the
                     // spawn arguments.
                     web: contract.web.clone(),
-                    // 0.31.0 — this role's tier, falling back to the run's. The
+                                                            // 0.31.0 — this role's tier, falling back to the run's. The
                     // definition wins because that is where "search cheaply, think hard
                     // only where thinking is the work" is said; the contract's is the
                     // root's own, and a child spawned without a definition inherits it.
@@ -7131,6 +7147,38 @@ enum Return {
     WaitUntil(Duration),
 }
 
+/// Narrow what the model asked for by what the operator allowed (0.50.0).
+///
+/// Both directions are one-way. A contract clock replaces a spawn that named
+/// none and beats a spawn that named a longer one, and never loses to it; a
+/// contract that refuses detachment turns every shape back into a plain wait. The
+/// second return is the line the parent reads when its request was narrowed —
+/// silence would leave a model believing it had fanned out when it had not.
+fn narrowed(
+    want: Return,
+    background_after: Option<Duration>,
+    detached_spawns: bool,
+) -> (Return, Option<&'static str>) {
+    if !detached_spawns {
+        return match want {
+            Return::Wait => (Return::Wait, None),
+            _ => (
+                Return::Wait,
+                Some(
+                    "this run does not allow a child to outlive the step that spawned it, so it \
+                     was waited for",
+                ),
+            ),
+        };
+    }
+    match (want, background_after) {
+        // A parent that never waits is already narrower than any clock.
+        (Return::Detach, _) | (_, None) => (want, None),
+        (Return::Wait, Some(cap)) => (Return::WaitUntil(cap), None),
+        (Return::WaitUntil(asked), Some(cap)) => (Return::WaitUntil(asked.min(cap)), None),
+    }
+}
+
 /// Read the two 0.50.0 arguments off a spawn call.
 ///
 /// `Err` is the message the parent reads. A contradiction is answered the way
@@ -7221,8 +7269,8 @@ async fn spawn_child<'f, P: Provider>(
     // registered, admitted or written. A contradiction must cost no run row, no
     // slot and no queue place, and the only way to guarantee that is to answer it
     // here.
-    let want = match spawn_return(a) {
-        Ok(w) => w,
+    let (want, narrowing) = match spawn_return(a) {
+        Ok(w) => narrowed(w, tree.spawn_background_after, tree.detached_spawns),
         Err(why) => {
             return Ok(SpawnOutcome::Settled(SpawnResult::Composed {
                 decision: "spawn arguments conflict".into(),
@@ -7546,8 +7594,20 @@ async fn spawn_child<'f, P: Provider>(
 
     // 0.50.0 — and now the only thing that differs between the three shapes: how
     // long the parent waits for that future.
+    // A narrowed request is said once, at the front of whatever the child comes
+    // back as, so the model reads it beside the result rather than instead of it.
+    let note = |obs: String| match narrowing {
+        Some(why) => format!("\n[spawn narrowed] {why}\n{}", obs.trim_start_matches('\n')),
+        None => obs,
+    };
     match want {
-        Return::Wait => Ok(SpawnOutcome::Settled(child.await?)),
+        Return::Wait => Ok(SpawnOutcome::Settled(match child.await? {
+            SpawnResult::Composed { decision, obs } => SpawnResult::Composed {
+                decision,
+                obs: note(obs),
+            },
+            other => other,
+        })),
         Return::Detach => {
             tree.watch.emit(RunEvent::at_depth(
                 parent_run_id,
