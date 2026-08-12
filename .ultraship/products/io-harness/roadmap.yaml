@@ -1219,13 +1219,24 @@ versions:
       A change becomes a reviewable artifact rather than a pair of counts. Three things land
       together: a patch tool taking unified diff beside `edit_file`, so a multi-hunk change is one
       call anchored to its context; the hunk itself kept in the store, where `Edit::measure`
-      (`src/state.rs:2293`) is handed both old and new text and today keeps only `lines_added` and
+      (`src/state.rs:2438`) is handed both old and new text and today keeps only `lines_added` and
       `lines_removed`, so a trace can emit a patch a human reviews; and the project's own checker as
       a tool the agent may call before an edit, not only automatically after one. With the hunks
       stored, undo gains a second granularity beside `rewind`'s one-restore-point-per-file: a run
       can be walked back a step at a time rather than only to the state before it first touched a
       file.
-    detail: outline
+
+      **Specification confirmed this entry against the code rather than assuming it, and the crate's
+      own source names this release as the work.** `src/verify.rs:746` says of the before-and-after
+      rendering a reviewer is handed: *"Not a unified diff: computing one is 0.51.0's work, where the
+      hunks are stored and a patch tool needs them."* Two facts the specification settled and the
+      outline did not know: `Edit::measure` is called for an `edit_file` with the **fragment**
+      (`search` against `replace`, `src/run.rs:9723-9731`), deliberately, so its two counts mean "the
+      size of the replacement" and must not move when the hunk starts being computed from the whole
+      file; and the crate already runs the ecosystem's cheap checker after every successful edit
+      (`src/tools/diagnostics.rs`, called at `src/run.rs:9738`), so the third item is exposing an
+      existing machine as a policy-gated tool rather than building one.
+    detail: specified
     status: planned
   - version: 0.52.0
     outcome: >
