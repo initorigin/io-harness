@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.49"
+io-harness = "0.50"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -282,6 +282,17 @@ bracketed prose narrating the assistant's own past actions in the third person.
 That produced no error and nothing in a log, only degraded instruction following.
 `CompletionRequest::user` is still filled and byte-identical to what it was, so a
 provider written against an earlier release keeps working.
+
+**A parent chooses how a child comes back, and a child says what it found.**
+`spawn_agent` takes `wait` and `background_after_secs`: a parent can carry on
+while a sub-agent works and read its report at a later step, and a child that
+outlasts a stated wall clock moves to the background instead of holding the tree.
+It is not cancelled — a parent that stops waiting is not a parent that stops the
+work — and a tree still never returns while a child it started is running. Through
+0.49.0 a child came back as `[child 7 "goal" -> Success { steps: 4 }]`: a
+discriminant and a step count, with nothing it concluded, so the only way a
+finding could travel was a file the parent then read. It now comes back with what
+it cost and what it said.
 
 **Provider-executed web search and fetch.** `TaskContract::with_web` declares what
 the provider may look up on the agent's behalf — search, optionally fetch, a cap on

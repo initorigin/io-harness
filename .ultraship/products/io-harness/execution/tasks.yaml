@@ -230,7 +230,7 @@ tasks:
   summary: Bring every checked-in surface to 0.50.0.
   why_required: docs/CONTRACT.md, the README, the changelog and the crate-root prose are checked-in surfaces
     gated by tests, and they change in this release rather than the next one.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.50.0-T07
   acceptance_criteria:
@@ -246,7 +246,18 @@ tasks:
   - CHANGELOG.md
   - src/lib.rs
   - docs/public-api.txt
-  evidence: []
+  evidence:
+  - O4 — tests/docs_drift.rs (15 passed) and tests/changelog.rs (5 passed) both exit 0 after the edits,
+    so the MSRV, the feature list, every relative link, the README's dependency snippet and the breaking-change
+    migration notes all agree with the code.
+  - 'docs/CONTRACT.md gains "How a child comes back, and what a parent gives up to stop waiting (0.50.0)":
+    the three shapes, why a backgrounded child is not a timeout, what reproducibility a detached spawn
+    costs, the concurrency shape and why it cannot be a spawned task, that caps are unchanged, what a
+    restart does — and the one window that is not covered.'
+  - CHANGELOG.md carries the behaviour break with its migration note; Cargo.toml, the README install snippet,
+    the README lead and the crate-root prose are at 0.50.0.
+  - 'docs/public-api.txt is BYTE-IDENTICAL: tests/public_api.rs passes unchanged. The additions are methods,
+    variants and fields on already-listed types, and that checker enumerates crate-root re-exports.'
 - id: US-IO-HARNESS-0.50.0-T09
   summary: Run the release gates and record the measured numbers.
   why_required: Every non-functional and operational claim in the contract is a number or an exit status

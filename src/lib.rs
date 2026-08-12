@@ -139,6 +139,16 @@
 //! what it was, so a [`Provider`] that reads it keeps working; it is retained for
 //! one release.
 //!
+//! **A parent that chooses how a child comes back.** [`SPAWN_TOOL`] takes `wait`
+//! and `background_after_secs`: a parent can carry on while a sub-agent works and
+//! read its report at a later step, and a child that outlasts a stated wall clock
+//! moves to the background rather than holding the tree. It is never cancelled —
+//! a parent that stops waiting is not a parent that stops the work — and the tree
+//! still does not return while a child it started is running. What a child hands
+//! back is what it concluded, beside what it cost;
+//! [`TaskContract::with_spawn_background_after`] and
+//! [`TaskContract::without_detached_spawns`] are the operator's ceiling on both.
+//!
 //! **Providers, with fallback.** [`OpenRouter`], [`Anthropic`] and [`OpenAi`]
 //! behind one [`Provider`] trait, over the crate's own HTTP+SSE client.
 //! [`provider::Fallback`] moves to the next configured provider when one is down
