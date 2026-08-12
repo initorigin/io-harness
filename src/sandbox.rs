@@ -411,7 +411,7 @@ impl ExecMode {
 }
 
 /// Resource caps applied to a sandboxed run. Serde-serializable like
-/// [`crate::Policy`] and [`crate::Containment`] so io-cli and io-studio load it
+/// [`crate::Policy`] and [`crate::Containment`] so an application layer loads it
 /// from config rather than hand-building it.
 ///
 /// Defaults are sized so an ordinary `rustc`/`cargo` verification passes out of
@@ -569,7 +569,7 @@ impl SandboxLimits {
 /// ```
 ///
 /// It derives `Serialize`/`Deserialize` for the same reason [`crate::Policy`]
-/// does: io-cli and io-studio load one from a config file rather than
+/// does: an application layer loads one from a config file rather than
 /// hand-building it. Each of its own three fields is `#[serde(default)]`, so a
 /// config file may name only what it changes — note that `limits`, if given at
 /// all, is a whole [`SandboxLimits`] and every cap in it must be spelled out.

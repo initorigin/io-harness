@@ -4,7 +4,7 @@
 //! evaluated deny-first: a deny in *any* layer wins over an allow in any other,
 //! so an overlay can add capability but can never re-allow what a layer beneath
 //! it denied. That single rule is what makes a shared base policy trustworthy
-//! when io-cli and io-studio each stack their own config over it.
+//! when an application layer stacks its own config over it.
 //!
 //! [`Policy::check`] and [`Policy::explain`] are the same function — `check` is
 //! `explain` — so an explanation can never describe a boundary different from

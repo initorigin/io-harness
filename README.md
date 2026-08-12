@@ -487,20 +487,6 @@ goes through a deprecation cycle rather than vanishing between two releases.
 
 [docs/CONTRACT.md](docs/CONTRACT.md) states the whole of it.
 
-## Part of initorigin
-
-`IO Harness` is one of the [initorigin](https://github.com/initorigin) products:
-
-| Product | What it is | Status |
-| --- | --- | --- |
-| [io-harness](https://github.com/initorigin/io-harness) | The Rust agent harness (the center product) | Released |
-| io-cli | Terminal app on io-harness | Not built |
-| io-studio | Desktop coding studio on io-harness | Not built |
-
-io-harness is the one you can go and read. The other two are named so the shape
-of the whole is visible, and carry no link because there is nothing to send you
-to.
-
 ## Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md). Work branches from `develop`, lands via

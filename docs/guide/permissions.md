@@ -288,7 +288,7 @@ already executing so an operator can watch it; see
 
 ## Sharing one policy between apps
 
-`Policy` is `serde`-serializable, so io-cli and io-studio read the same format
+`Policy` is `serde`-serializable, so an application layer reads the same format
 and neither writes its own parser. Compose layers with `merge`:
 
 ```rust

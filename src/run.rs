@@ -6178,6 +6178,7 @@ async fn drain_children<P: Provider>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn agent_loop<'f, 'i, P: Provider>(
     tree: &'f Tree<'_, P>,
     contract: &'f TaskContract,
@@ -7814,8 +7815,7 @@ fn child_conclusion(store: &Store, child_run: i64) -> Result<Option<String>> {
     Ok(store
         .agent_events(child_run)?
         .into_iter()
-        .filter(|e| e.kind == "said")
-        .next_back()
+        .rfind(|e| e.kind == "said")
         .and_then(|e| e.detail))
 }
 

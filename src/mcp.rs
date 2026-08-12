@@ -217,7 +217,7 @@ pub enum McpTransport {
 /// One session serves a whole 0.5.0 tree, so a child agent is offered the same
 /// servers without each spawning its own.
 ///
-/// `Serialize`/`Deserialize` because io-cli and io-studio will express these in
+/// `Serialize`/`Deserialize` because an application layer expresses these in
 /// their own config files, the same way they already express a [`Policy`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServer {
