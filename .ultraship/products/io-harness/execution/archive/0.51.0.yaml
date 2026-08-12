@@ -7,11 +7,11 @@ release_fit:
   assessment: probable
   reasons:
     - >
-      **No constraints are recorded for this workspace.** `ultraship constraints` reports none —
-      it refuses to record any while there is no active release — so this assessment is grounded in
-      the repository's own condition and in the twenty releases of measured history behind it, never
-      in a capacity figure, which UltraShip has no telemetry to supply and which would be fiction
-      with a decimal point.
+      **No constraints are recorded for this workspace.** `ultraship constraints` reports none — it
+      refuses to record any while there is no active release — so this assessment is grounded in the
+      repository's own condition and in the twenty releases of measured history behind it, never in
+      a capacity figure, which UltraShip has no telemetry to supply and which would be fiction with
+      a decimal point.
     - >
       **Three of the four pieces are exposures of machinery that already exists.** The head-and-tail
       trim the hunk needs is the computation `Edit::measure` already performs; the checker the new

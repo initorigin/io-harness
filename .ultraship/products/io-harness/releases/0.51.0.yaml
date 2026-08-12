@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.51.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -618,3 +618,262 @@ open_questions:
   **Does a step revert need to re-run the checker?** A revert changes the workspace and nothing tells
   the model. It is an operator-facing API rather than a tool today, so there is no model to tell;
   if `rewind_step` is ever exposed as a tool, the answer changes and so does its gate.
+
+released_at: 2026-08-12T22:20:00Z
+mode: published
+delivered: >
+  A change stopped being a pair of counts. Every `write_file`, `edit_file` and the new
+  `patch_file` records the change itself as a unified diff of the whole file, in `edits.hunk`;
+  `Store::patch` renders a run's whole change as a step-ordered patch series a human reviews; and
+  `rewind_step` reverse-applies one step's hunks, so a twenty-step run whose step eighteen was
+  wrong is no longer thrown away whole. Beside them, `patch_file` makes a multi-hunk change one
+  call anchored to its own context — all or nothing — and `check` offers the project's own
+  type-check as a question before a write rather than only as a note after one.
+
+  **The crate's own source had been pointing at this release since 0.42.0.** `src/verify.rs`
+  said, of the before-and-after rendering a reviewer is handed: *"Not a unified diff: computing
+  one is 0.51.0's work, where the hunks are stored and a patch tool needs them."* That comment is
+  corrected in this release rather than left to contradict the code.
+
+evidence:
+  tests:
+  - >
+    `cargo test` — exit 0, **81 binaries, 1,656 passed, 0 failed**, including **425 doctests**.
+    Run with `XDG_CONFIG_HOME` redirected, which is this machine's standing requirement for
+    `tests/plugin.rs`.
+  - >
+    `cargo test --all-features` — exit 0 on a target cleared first, **81 binaries, 1,742 passed,
+    0 failed**, including **428 doctests**. A separate invocation, as CI runs it.
+  - >
+    **F1** — `tests/hunks.rs::a_stored_hunk_is_anchored_to_the_file_and_reverse_applies` passes at
+    four positions: a change at the start of a file, in the middle, at the end, and in a file whose
+    last line has no terminator. Each stored hunk is reverse-applied by an applier written inside
+    the test — deliberately not the crate's own, which would pass for a renderer and an applier
+    wrong in the same direction — and must reproduce the before text byte for byte.
+    *Sabotage:* compute the hunk from `search`/`replace` rather than from the file's two texts →
+    fails this test and nothing else (4 passed, 1 failed).
+  - >
+    **F1, second half** — `a_runs_change_renders_as_a_step_ordered_patch_series` passes: two edits
+    to one file render two `--- a/f.txt` header pairs, in step order.
+  - >
+    **F2** — `the_line_counts_are_what_they_have_been_since_0_18_0` passes over seven cases:
+    replacement, insertion, whole-line deletion, in-line deletion, an off-boundary split, a
+    whole-file write, and a write of identical content.
+    *Sabotage:* measure the counts from the whole-file texts the hunk is computed from → fails this
+    test and only it, `left (1, 1) right (0, 1)`. **See `known_limitations` — this sabotage failed
+    nothing on its first attempt and the corpus was strengthened as a result.**
+  - >
+    **F3** — `tests/patch_tool.rs::a_three_hunk_patch_is_one_call_and_lands_where_three_edits_would`
+    passes: the same three changes driven once as three `edit_file` calls and once as one
+    `patch_file`, and the two files are byte-identical. One `edits` row, tool `patch_file`,
+    observation "applied 3 hunks".
+    *Sabotage:* locate each hunk in the file as the previous hunks have already rewritten it — a
+    running rewrite → fails this test and nothing else. **The first version of this fixture did not
+    catch that sabotage; see `known_limitations`.**
+  - >
+    **F4** — `a_patch_whose_second_hunk_does_not_fit_changes_nothing` passes, asserted as an absence
+    and a presence together: the file byte-identical, no `edits` row, `rewind` reporting
+    `Rewind::NotRecorded` so no restore point either, and an observation naming hunk 2, the line it
+    expected, and "Nothing was changed".
+    *Sabotage:* apply and write each hunk as it validates → fails this test **and** F3's, two named
+    tests about the same write path.
+  - >
+    **F5** — `the_checker_answers_clean_findings_and_no_checker_at_all` passes in all three shapes:
+    a clean crate says it found nothing, a crate with a type error returns the checker's own
+    findings (`mismatched types` / `E0308`), and a workspace with no project marker names the skip.
+    *Sabotage:* route the tool through `diagnostics_after_write`'s mapping, where `Skipped` is the
+    empty string → fails this test and only it.
+  - >
+    **F6** — `the_check_tool_is_exec_gated_while_the_automatic_check_is_not` passes, both halves in
+    two runs over one fixture: under `deny_exec("cargo")` a `check` call is refused and `target/`
+    does not exist, which cargo always creates; an `edit_file` under the same policy still succeeds
+    and its automatic post-edit check still runs, and `target/` then does. Two runs and not two
+    steps, because `target/` is the evidence and one run would let the edit's own check create it
+    before the refusal could be asserted as an absence.
+    *Sabotage:* run the checker without the `Act::Exec` gate → fails this test and only it.
+  - >
+    **F7** — `reverting_newest_first_restores_every_intermediate_state` passes: three edits at three
+    steps, reverted newest first, with the file asserted byte-identical after **each** revert rather
+    than only at the end — a build that reverse-applies in the wrong order can still reach the right
+    final text when the changes do not overlap.
+    *Sabotage:* apply the hunk forward instead of in reverse → fails this test and F10's, two named
+    tests that each assert a revert put something back.
+  - >
+    **F8** — `reverting_out_of_order_reports_stale_and_changes_nothing` passes. Its two edits overlap
+    deliberately, so the older hunk's context is gone and a fuzzy match would "succeed".
+    *Sabotage:* skip the context match and splice the old lines in at the stated position → fails
+    this test and only it.
+  - >
+    **F9** — `an_edit_with_no_stored_hunk_is_reported_rather_than_skipped` passes, with the absence
+    produced the way production produces it: a file whose previous contents are not UTF-8, so
+    `read_before` keeps no restore text and there is nothing to diff against.
+    *Sabotage:* treat a NULL hunk as an empty patch → fails this test and only it.
+  - >
+    **F10** — `a_step_revert_and_a_run_rewind_are_different_rows` passes: `Store::rewinds` reports
+    `undid_step: Some(step)` for the revert and `None` for the `rewind_run` on the same run, and
+    exactly one `EventKind::Reverted` fires carrying the count from the value being returned.
+    *Sabotage:* leave `undid_step` NULL for both → fails this test and only it.
+  - >
+    **The differ's own property sweep.** `src/diff.rs` carries 17 unit tests including
+    `generated_pairs_round_trip_in_both_directions`, which drives **2,000 generated (old, new)
+    pairs** through render → parse → apply and render → parse → reverse → apply, requiring both to
+    reproduce the other side byte for byte. It failed on case 106 and the failure was a real defect:
+    a line's identity includes whether it is terminated, so comparing text alone made an
+    unterminated last line equal to the identically-spelled terminated one.
+  - >
+    **O2** — `tests/cross_version.rs` 7 passed (was 5).
+    `an_edit_written_before_0_51_0_has_no_hunk_and_is_reported_as_having_none` opens the committed
+    fixture written by a real io-harness 0.22.0 from crates.io, whose `edits` table has one row and
+    no `hunk` column: the row reads back `None`, its 0.22.0 counts unchanged at (1, 0),
+    `rewind_step` reports `Reverted::NoHunk`, the file is byte-identical, and `Store::patch` names
+    the change as unrenderable rather than omitting it. The other direction is proven by a real old
+    binary: `cargo test --test cross_version_0_29_0 -- --ignored` →
+    `a_current_store_is_read_by_a_0_29_0_binary` ok.
+  - >
+    **O3** — no criterion in this release asserts on elapsed time. F5's and F6's checker fixtures are
+    zero-dependency crates whose `cargo check` needs no network, and every ordering claim is asserted
+    on step numbers and file bytes.
+  - >
+    **O4** — `tests/docs_drift.rs` 15, `tests/changelog.rs` 5, `tests/readme.rs` 8,
+    `tests/guide_pages.rs` 7, `tests/public_api.rs` 9 — all passed.
+  builds:
+  - >
+    `cargo fmt --check` — exit 0.
+  - >
+    `cargo clippy --all-targets --all-features -- -D warnings` — exit 0, after five findings fixed:
+    two `needless_range_loop` in the differ's context loops, one `manual_is_multiple_of`, three
+    `unnecessary_lazy_evaluations` (`then_some` is safe at these three sites — the argument is two
+    `as_str()` calls, not arithmetic, so 0.49.0's eager-evaluation trap does not apply), and one
+    `type_complexity` on the F2 corpus.
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0.
+    **It caught one error stable `cargo doc` did not report**: `Edit::hunk`'s doc comment linked
+    `[Snapshot]`, a private item, refused by `rustdoc::private_intra_doc_links`. Sixth release running
+    that this gate has found something.
+  - >
+    `cargo package --locked` — exit 0, **1,699,907 bytes**.
+  - >
+    **N1** — `cargo tree` is **402** lines, unchanged since 0.23.0. The differ, the unified-diff
+    parser and the applier are ~450 lines in a new crate-internal `src/diff.rs`; no crate was added.
+  - >
+    **N4** — `git diff main -- src/state.rs` shows exactly two DDL statements,
+    `ALTER TABLE edits ADD COLUMN hunk TEXT` and `ALTER TABLE rewinds ADD COLUMN undid_step INTEGER`,
+    and **no** `CREATE TABLE` and **no** `CREATE INDEX`. `CHECKPOINT_FORMAT` unmoved at **7**.
+  - >
+    **N3** — `docs/public-api.txt` gains exactly three lines by hand: `enum Reverted`,
+    `fn rewind_step`, `fn rewind_step_observed`. Three and not the two the criterion named; see
+    `known_limitations`.
+  - >
+    **N5, the release's own number**, on a four-hunk change to one 231-byte file where both arms
+    produce a byte-identical result. **`edit_file` × 4: 5 provider calls, 4 gate evaluations, 1,987
+    prompt bytes.** **`patch_file` × 1: 2 provider calls, 1 gate evaluation, 649 prompt bytes.** One
+    gate evaluation against four and one acting completion against four, asserted rather than
+    printed; **3.06× less prompt read**, recorded. The stored hunks are 424 bytes for the four edits
+    and 476 for the one patch — a patch stores marginally more, because its single hunk set carries
+    context the four separate hunks each carry once.
+  - >
+    **N6** — only three test files differ from `main`: `tests/hunks.rs` and `tests/patch_tool.rs` are
+    new, and `tests/cross_version.rs` gained two tests and one import line. **Every other suite in
+    the repository is byte-identical to `main` and passes**, which is a stronger statement of the
+    byte-identity control than an assertion inside a test would be.
+  - >
+    **N7** — `workspace_tools()` gains exactly two `ToolSpec`s and no existing tool's schema changes.
+    Single-file mode is untouched: `git diff main` shows no change to its tool list.
+  reviews:
+  - >
+    Ten sabotages, one per arm of every two-armed functional claim, each recorded above with which
+    named tests it failed. **Two of them failed nothing on their first attempt and both are reported
+    as findings rather than propped up** — see `known_limitations`.
+  - >
+    Every `scope.excluded` item re-checked against the tree at completion: `patch_file`'s schema
+    requires exactly `["path", "patch"]`; `check`'s parameters are `{}`; `src/verify.rs`'s
+    `review_change` has no non-comment change; no `CREATE TABLE` or `CREATE INDEX` was added;
+    `CHECKPOINT_FORMAT` is 7.
+  - >
+    Secret scan over the whole `git diff main`: every match for key/secret/token/password is the
+    English word "tokens" in prose about prompt cost. No credential, no key material.
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **The record is sealed before the crates.io upload.** `mode: published` states the authorised
+  target; the upload follows the merge into `main` and the GitHub Release, in that order, as the
+  standing flow requires.
+- >
+  **`docs/public-api.txt` gains THREE lines, not the two N3 named — a criterion met in a different
+  form, stated rather than glossed.** The third is `fn rewind_step_observed`. The contract named
+  `Reverted` and `rewind_step`; the observed twin exists because that is the shape
+  `rewind`/`rewind_run`/`rewind_run_observed` already has and because `EventKind::Reverted` needs an
+  observer to reach. The substance of N3 holds — the additions are enumerated, no name was removed
+  or renamed, and the count was not the claim.
+- >
+  **A fourth public addition the contract did not name: `Edit::with_hunk` is `pub`, not
+  `pub(crate)`.** It was written crate-private and `Store::patch`'s own doctest could not call it —
+  a doctest compiles as an external crate. Making it public is the coherent answer rather than a
+  workaround: `Edit::measure` and `Store::record_edit` are already public, so a caller recording its
+  own edit rows would otherwise be able to write a count and never a change, which makes
+  `Store::patch` useless to them. It adds no line to `docs/public-api.txt`, which enumerates
+  crate-root re-exports and not methods.
+- >
+  **F2's sabotage failed nothing on its first attempt, and the corpus was strengthened rather than
+  the sabotage abandoned.** Measuring the line counts from the whole-file texts passed the original
+  five-case corpus, because for a tidy whole-line edit the two measures agree — trimming the common
+  head and tail of the fragment finds the same changed span as trimming them over the file. A
+  brute-force search over 400,000 single-substring replacements found the class that diverges: a
+  replacement that does not begin and end on a line boundary. Deleting a substring *inside* a line is
+  (0 added, 1 removed) over the fragment and (1, 1) over the file. Two such cases joined the corpus
+  and the sabotage then failed the named test and only it. **The honest consequence: for most edits
+  the two measures coincide, so "the counts did not move" is a narrower claim than it sounds — it is
+  exact, and it bites only on off-boundary replacements.**
+- >
+  **F3's first fixture was too weak to catch its own sabotage.** Every hunk replaced one line with
+  one line, so a running-rewrite applier accumulated no drift and passed. The fixture now adds a line
+  in its first hunk and removes one in its third, and the reason is written into the test's own doc
+  comment so the next person does not weaken it back.
+- >
+  **The stored hunk is one head-and-tail-trimmed hunk per edit, not a minimal diff.** For an
+  `edit_file` — one contiguous replacement by construction — it *is* the minimal diff. For a
+  `write_file` that rewrote two distant regions of a file it is one hunk spanning both: a valid
+  unified diff that reverse-applies exactly, and not the shortest one. A Myers or patience diff is a
+  dependency or several hundred lines, and it buys shorter output rather than a capability.
+- >
+  **`patch_file` matches every hunk at its own recorded position, exactly, with no fuzz and no
+  offset search.** A patch written against a file that has since moved by even one line is refused
+  rather than relocated. That is deliberate on an all-or-nothing write path, and it means a model
+  must write its patch against a current read. Real `git diff` output satisfies it; a
+  hand-shifted patch does not.
+- >
+  **The `check` tool runs its checker outside the run's containment**, exactly as the automatic
+  post-edit checker has since 0.46.0. It is policy-gated — which the automatic one is not — but it is
+  not sandboxed, so `Act::Exec` is the whole of the boundary on it. Bringing both under
+  `TaskContract::exec_sandbox` is its own change and was not made here.
+- >
+  **`rewind_step` is an operator-facing API and not a tool.** No model can call it, so nothing tells
+  a model that the workspace moved under it. If it is ever exposed as a tool, the gate story and the
+  question of re-running the checker after a revert both change.
+- >
+  **Walking a run back is the caller's loop, and there is no automatic ordering.** Reverting out of
+  order reports `Reverted::Stale` and changes nothing, which is safe but silent about what to do
+  next; the newest-first rule is documented at the function, in `docs/CONTRACT.md`, in the guide and
+  in the changelog rather than enforced.
+- >
+  **O1 — the three-platform matrix has NOT run.** Every gate above is macOS. A hand-written
+  unified-diff parser is precisely the code that passes on the host that wrote the fixture and fails
+  on the one with different line endings, which is why the CRLF and final-newline cases are asserted
+  explicitly and why the criterion says outright that a green macOS gate is not evidence here. The
+  matrix runs on the release PR.
+- >
+  **One flake on the first `--all-features` run, and it is the ninth of a family already recorded.**
+  `a_handle_takes_the_cpu_cap_a_foreground_stage_takes` — a 0.48.0 containment test — reported a
+  spinning `awk` still `running` after the CPU cap should have ended it, on a machine that had just
+  built the whole all-features tree. It passed alone (5 of 5) and in the default suite. Nothing in
+  this release touches the handle or sandbox path. The suite was re-run with `--no-fail-fast` and was
+  green.
+- >
+  **One ordering to state rather than gloss.** The nightly rustdoc gate's fix — a doc-comment link in
+  `src/state.rs` — landed after the two suites had run. It cannot change behaviour, but rather than
+  assert that, `cargo test --doc` was re-run against the shipped tree (425 passed, exit 0) and
+  `cargo package` compiled the packaged crate from it.
+supersedes: 0.50.0
+next_recommended_version: 0.52.0
+immutable: true

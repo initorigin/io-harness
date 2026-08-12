@@ -1228,16 +1228,16 @@ versions:
 
       **Specification confirmed this entry against the code rather than assuming it, and the crate's
       own source names this release as the work.** `src/verify.rs:746` says of the before-and-after
-      rendering a reviewer is handed: *"Not a unified diff: computing one is 0.51.0's work, where the
-      hunks are stored and a patch tool needs them."* Two facts the specification settled and the
-      outline did not know: `Edit::measure` is called for an `edit_file` with the **fragment**
-      (`search` against `replace`, `src/run.rs:9723-9731`), deliberately, so its two counts mean "the
-      size of the replacement" and must not move when the hunk starts being computed from the whole
-      file; and the crate already runs the ecosystem's cheap checker after every successful edit
-      (`src/tools/diagnostics.rs`, called at `src/run.rs:9738`), so the third item is exposing an
-      existing machine as a policy-gated tool rather than building one.
+      rendering a reviewer is handed: *"Not a unified diff: computing one is 0.51.0's work, where
+      the hunks are stored and a patch tool needs them."* Two facts the specification settled and
+      the outline did not know: `Edit::measure` is called for an `edit_file` with the **fragment**
+      (`search` against `replace`, `src/run.rs:9723-9731`), deliberately, so its two counts mean
+      "the size of the replacement" and must not move when the hunk starts being computed from the
+      whole file; and the crate already runs the ecosystem's cheap checker after every successful
+      edit (`src/tools/diagnostics.rs`, called at `src/run.rs:9738`), so the third item is exposing
+      an existing machine as a policy-gated tool rather than building one.
     detail: specified
-    status: planned
+    status: released
   - version: 0.52.0
     outcome: >
       The agent navigates a codebase the way a language-aware editor does: definitions, references,
