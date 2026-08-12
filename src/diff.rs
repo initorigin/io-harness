@@ -153,8 +153,8 @@ pub(crate) fn render(old: &str, new: &str) -> Option<String> {
 
     // A context line exists only where `same` held, so the two sides agree about
     // the terminator and one flag answers for both.
-    for i in before..head {
-        push(Kind::Context, old_lines[i], old_bare(i));
+    for (i, line) in old_lines.iter().enumerate().take(head).skip(before) {
+        push(Kind::Context, line, old_bare(i));
     }
     for (i, line) in old_lines
         .iter()
@@ -172,8 +172,13 @@ pub(crate) fn render(old: &str, new: &str) -> Option<String> {
     {
         push(Kind::Added, line, new_bare(j));
     }
-    for i in (old_lines.len() - tail)..old_after {
-        push(Kind::Context, old_lines[i], old_bare(i));
+    for (i, line) in old_lines
+        .iter()
+        .enumerate()
+        .take(old_after)
+        .skip(old_lines.len() - tail)
+    {
+        push(Kind::Context, line, old_bare(i));
     }
     let old_count = old_after - before;
     let new_count = new_after - before;
@@ -674,7 +679,7 @@ mod tests {
         const WORDS: [&str; 6] = ["a", "b", "c", "a\r", "", "  d"];
         fn build(seed: &mut u64) -> String {
             let n = next(seed) % 9;
-            let nl = next(seed) % 2 == 0;
+            let nl = next(seed).is_multiple_of(2);
             let mut s = String::new();
             for _ in 0..n {
                 s.push_str(WORDS[next(seed) % WORDS.len()]);

@@ -2485,9 +2485,30 @@ impl Edit {
     /// and would silently change every number in every existing trace.
     ///
     /// `None` — the field is left as it was — when nothing changed, or when the
-    /// rendered diff would exceed [`MAX_SNAPSHOT_BYTES`]. A caller that could not
-    /// read the previous contents simply does not call this.
-    pub(crate) fn with_hunk(mut self, before: &str, after: &str) -> Self {
+    /// rendered diff would exceed the store's 1 MiB snapshot cap. A caller that
+    /// could not read the previous contents simply does not call this.
+    ///
+    /// Public for the reason [`Edit::measure`] and [`Store::record_edit`] are: a
+    /// caller recording its own edit rows would otherwise be able to write a
+    /// count and never a change, which makes [`Store::patch`] useless to them.
+    ///
+    /// ```
+    /// use io_harness::Edit;
+    ///
+    /// let before = "fn parse() {}\n";
+    /// let after = "fn parse(s: &str) {}\n";
+    /// let edit = Edit::measure(2, "edit_file", "src/parse.rs", before, after)
+    ///     .with_hunk(before, after);
+    ///
+    /// let hunk = edit.hunk.expect("a change renders a hunk");
+    /// assert!(hunk.starts_with("@@ -1,1 +1,1 @@"));
+    /// assert!(hunk.contains("-fn parse() {}"));
+    /// assert!(hunk.contains("+fn parse(s: &str) {}"));
+    ///
+    /// // Nothing changed, so there is nothing to render.
+    /// assert_eq!(Edit::measure(2, "write_file", "a", before, before).with_hunk(before, before).hunk, None);
+    /// ```
+    pub fn with_hunk(mut self, before: &str, after: &str) -> Self {
         self.hunk = crate::diff::render(before, after).filter(|h| h.len() <= MAX_SNAPSHOT_BYTES);
         self
     }

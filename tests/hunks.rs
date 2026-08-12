@@ -233,7 +233,10 @@ async fn a_runs_change_renders_as_a_step_ordered_patch_series() {
 #[tokio::test]
 async fn the_line_counts_are_what_they_have_been_since_0_18_0() {
     let plain = "one\ntwo\nthree\nfour\n";
-    let cases: Vec<(&str, &str, Vec<ToolCall>, (u64, u64))> = vec![
+    /// what it proves, the file it starts from, the script, and the counts this
+    /// build records.
+    type Case = (&'static str, &'static str, Vec<ToolCall>, (u64, u64));
+    let cases: Vec<Case> = vec![
         (
             "a one-line replacement is one out and one in",
             plain,

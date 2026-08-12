@@ -9844,7 +9844,7 @@ async fn dispatch(
                                 // A whole-file write measures the whole file
                                 // either way, so the hunk's texts and the
                                 // counts' texts happen to be the same pair here.
-                                diffable.then(|| (before.as_str(), body.as_str())),
+                                diffable.then_some((before.as_str(), body.as_str())),
                             );
                             record_snapshot(store, run_id, step, &target, kept);
                             // The same check `edit_file` runs, for the same
@@ -9956,7 +9956,7 @@ async fn dispatch(
                                 &target,
                                 search,
                                 &replacement,
-                                diffable.then(|| (before.as_str(), after.as_str())),
+                                diffable.then_some((before.as_str(), after.as_str())),
                             );
                             record_snapshot(store, run_id, step, &target, kept);
                             // The project's own checker, run against the edit
@@ -10052,7 +10052,7 @@ async fn dispatch(
                                 &target,
                                 &before,
                                 &after,
-                                diffable.then(|| (before.as_str(), after.as_str())),
+                                diffable.then_some((before.as_str(), after.as_str())),
                             );
                             record_snapshot(store, run_id, step, &target, kept);
                             let diagnostics =

@@ -12,9 +12,11 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use io_harness::approve::DecisionFuture;
 use io_harness::policy::Policy;
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::Workspace;
+use io_harness::Decision;
 use io_harness::{rewind, run_with, ApproveAll, Provider, Rewind, Store, TaskContract};
 use serde_json::json;
 
@@ -384,5 +386,186 @@ async fn the_check_tool_is_exec_gated_while_the_automatic_check_is_not() {
     assert!(
         dir.path().join("target").exists(),
         "the automatic post-edit check is ungated and did run"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// N5 — the release's own number
+// ---------------------------------------------------------------------------
+
+/// A provider that scripts its answers and records what it was handed.
+struct Measured {
+    steps: Vec<Vec<ToolCall>>,
+    at: AtomicUsize,
+    /// The byte length of the assembled user turn on each call.
+    prompts: std::sync::Mutex<Vec<usize>>,
+}
+
+impl Provider for Measured {
+    async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        self.prompts.lock().unwrap().push(req.user.len());
+        let i = self.at.fetch_add(1, Ordering::SeqCst);
+        Ok(CompletionResponse {
+            tool_calls: self.steps.get(i).cloned().unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+}
+
+/// An approver that says yes and counts how many times it was asked.
+#[derive(Default)]
+struct Counting(std::sync::atomic::AtomicU32);
+
+impl io_harness::Approver for Counting {
+    fn decide<'a>(&'a self, _r: &'a io_harness::Request) -> DecisionFuture<'a> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Decision::Approve {
+                modified: None,
+                remember: Vec::new(),
+            }
+        })
+    }
+}
+
+/// N5 — a four-hunk change costs one provider call and one gate evaluation
+/// instead of four of each, and the numbers are recorded rather than asserted
+/// loosely.
+///
+/// The structural claim is asserted (one against four); the byte figures are
+/// printed for the release record. A gate evaluation is counted by making the
+/// policy *ask* about writes and counting what the approver was handed, which is
+/// the only count of gate decisions the store does not already collapse — an
+/// outright allow records no event.
+#[tokio::test]
+async fn n5_a_four_hunk_change_costs_one_call_instead_of_four() {
+    let body = numbered();
+    let asks = || Policy::permissive().layer("ops").ask_write("*");
+
+    let edits: Vec<Vec<ToolCall>> = [(2, "TWO"), (9, "NINE"), (17, "SEVENTEEN"), (24, "TWENTY-FOUR")]
+        .iter()
+        .map(|(n, to)| {
+            vec![call(
+                "edit_file",
+                json!({ "path": "f.txt", "search": format!("line {n}\n"), "replace": format!("{to}\n") }),
+            )]
+        })
+        .collect();
+
+    let by_edits = tempfile::tempdir().unwrap();
+    std::fs::write(by_edits.path().join("f.txt"), &body).unwrap();
+    let edit_approver = Counting::default();
+    let edit_provider = Measured {
+        steps: edits,
+        at: AtomicUsize::new(0),
+        prompts: std::sync::Mutex::new(Vec::new()),
+    };
+    let store = Store::memory().unwrap();
+    let contract = TaskContract::workspace("change four places", by_edits.path()).with_max_steps(8);
+    let edit_run = run_with(&contract, &edit_provider, &store, &asks(), &edit_approver)
+        .await
+        .unwrap();
+    let expected = std::fs::read_to_string(by_edits.path().join("f.txt")).unwrap();
+    let edit_calls = store.provider_calls(edit_run.run_id).unwrap().len();
+    let edit_gates = edit_approver.0.load(Ordering::SeqCst);
+    let edit_prompt: usize = edit_provider.prompts.lock().unwrap().iter().sum();
+    let edit_patch_bytes = store.patch(edit_run.run_id).unwrap().len();
+
+    let patch = "\
+@@ -1,4 +1,4 @@
+ line 1
+-line 2
++TWO
+ line 3
+ line 4
+@@ -6,6 +6,6 @@
+ line 6
+ line 7
+ line 8
+-line 9
++NINE
+ line 10
+ line 11
+@@ -14,6 +14,6 @@
+ line 14
+ line 15
+ line 16
+-line 17
++SEVENTEEN
+ line 18
+ line 19
+@@ -21,6 +21,6 @@
+ line 21
+ line 22
+ line 23
+-line 24
++TWENTY-FOUR
+ line 25
+ line 26
+";
+    let by_patch = tempfile::tempdir().unwrap();
+    std::fs::write(by_patch.path().join("f.txt"), &body).unwrap();
+    let patch_approver = Counting::default();
+    let patch_provider = Measured {
+        steps: vec![vec![call(
+            "patch_file",
+            json!({ "path": "f.txt", "patch": patch }),
+        )]],
+        at: AtomicUsize::new(0),
+        prompts: std::sync::Mutex::new(Vec::new()),
+    };
+    let store2 = Store::memory().unwrap();
+    let contract2 =
+        TaskContract::workspace("change four places", by_patch.path()).with_max_steps(8);
+    let patch_run = run_with(
+        &contract2,
+        &patch_provider,
+        &store2,
+        &asks(),
+        &patch_approver,
+    )
+    .await
+    .unwrap();
+    let patch_calls = store2.provider_calls(patch_run.run_id).unwrap().len();
+    let patch_gates = patch_approver.0.load(Ordering::SeqCst);
+    let patch_prompt: usize = patch_provider.prompts.lock().unwrap().iter().sum();
+    let patch_bytes_stored = store2.patch(patch_run.run_id).unwrap().len();
+
+    assert_eq!(
+        std::fs::read_to_string(by_patch.path().join("f.txt")).unwrap(),
+        expected,
+        "both arms must produce the same file, or the comparison means nothing"
+    );
+
+    // The claim the patch tool is made of. A run ends with one more completion
+    // than it has tool-calling steps — the one that stops — so the arms are four
+    // writes against one, not four calls against one in the raw total.
+    assert_eq!(store.edits(edit_run.run_id).unwrap().len(), 4);
+    assert_eq!(store2.edits(patch_run.run_id).unwrap().len(), 1);
+    assert_eq!(
+        edit_gates, 4,
+        "one Act::Write gate evaluation per edit_file"
+    );
+    assert_eq!(patch_gates, 1, "one for the whole patch");
+    assert_eq!(
+        edit_calls, 5,
+        "four acting completions and the one that stops"
+    );
+    assert_eq!(
+        patch_calls, 2,
+        "one acting completion and the one that stops"
+    );
+    assert!(
+        patch_prompt < edit_prompt,
+        "the patch arm reads less context: {patch_prompt} vs {edit_prompt}"
+    );
+
+    println!(
+        "N5 four-hunk change, one file of {} bytes:\n  \
+         edit_file x4 : {edit_calls} provider calls, {edit_gates} gate evaluations, \
+         {edit_prompt} prompt bytes, {edit_patch_bytes} bytes of stored hunks\n  \
+         patch_file x1: {patch_calls} provider calls, {patch_gates} gate evaluations, \
+         {patch_prompt} prompt bytes, {patch_bytes_stored} bytes of stored hunks",
+        body.len()
     );
 }
