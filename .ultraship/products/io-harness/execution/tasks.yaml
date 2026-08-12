@@ -345,7 +345,7 @@ tasks:
   why_required: Two additive columns mean every row an earlier release wrote has no hunk. Treating an
     absent hunk as an empty one would revert nothing and report success, which is the one way this release
     can silently lose an operator's work.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.51.0-T02
   - US-IO-HARNESS-0.51.0-T06
@@ -367,7 +367,21 @@ tasks:
   files:
   - tests/cross_version.rs
   - tests/rewind.rs
-  evidence: []
+  evidence:
+  - 'tests/cross_version.rs: 7 passed (was 5). an_edit_written_before_0_51_0_has_no_hunk_and_is_reported_as_having_none
+    opens the committed 0.22.0 fixture — a database written by a real io-harness 0.22.0 from crates.io
+    — whose edits table has one row and no hunk column at all. Opening it adds both columns by ALTER TABLE;
+    the row reads back hunk: None, its 0.22.0 counts unchanged at (1, 0), rewind_step reports Reverted::NoHunk
+    and the file is byte-identical, and Store::patch names the change as unrenderable rather than omitting
+    it.'
+  - This is the case no other suite can cover, because it is about a column that did not exist. Reproducing
+    it inside tests/hunks.rs would mean writing NULL over a row this build wrote, which tests the reader
+    against a state the writer cannot produce.
+  - the_queries_a_0_50_0_binary_makes_still_answer_against_a_0_51_0_store runs the exact five-column SELECTs
+    a 0.50.0 binary makes against edits and rewinds, against a store this release wrote. Asserted by running
+    them rather than by arguing from the fact that the columns are nullable.
+  - the_schema_this_release_creates_adds_to_0_22_0s_and_alters_none_of_it and the_checkpoint_format_is_still_7
+    both pass with hunk declared in COLUMNS_ADDED_SINCE_0_22_0; CHECKPOINT_FORMAT is unmoved at 7.
 - id: US-IO-HARNESS-0.51.0-T09
   summary: Bring every checked-in documentation surface to 0.51.0, including the comment that named it.
   why_required: src/verify.rs says computing a unified diff is 0.51.0's work. Shipping the release while
