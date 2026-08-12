@@ -775,6 +775,30 @@ pub enum EventKind {
         /// How many queued children were dropped.
         queued: u32,
     },
+    /// One step's file changes were reverse-applied (0.51.0).
+    ///
+    /// Emitted by [`rewind_step_observed`](crate::rewind_step_observed) once the
+    /// work is done, and distinct from [`EventKind::Rewound`] because the two are
+    /// different acts: a rewind puts a run back to before it started, and this
+    /// puts one step back and leaves the rest of the run standing.
+    ///
+    /// The count comes from the value being returned, for the reason `Rewound`'s
+    /// three do.
+    ///
+    /// **The field is `undid_step` and not `step`.** The kind is flattened into
+    /// the envelope, which already carries a `step`, and a second one is a
+    /// duplicate key that compiles, serialises, and fails only on the way back —
+    /// caught by `every_variant_round_trips` rather than in production. The
+    /// envelope's own `step` is set to the step being undone, so the two agree
+    /// rather than competing.
+    Reverted {
+        /// The step whose changes were reverse-applied.
+        undid_step: u32,
+        /// How many paths were actually put back — not counting the ones
+        /// reported [`Reverted::Stale`](crate::Reverted::Stale) or
+        /// [`Reverted::NoHunk`](crate::Reverted::NoHunk), which changed nothing.
+        files: u32,
+    },
     /// A conversational turn was answered rather than run (0.37.0).
     ///
     /// Emitted by [`Session`](crate::Session) when a turn's own first completion
@@ -1120,6 +1144,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "plugin_dropped",
     "dialed",
     "rewound",
+    "reverted",
     "answered",
     "compacted",
     "cache_marked",
@@ -1650,6 +1675,10 @@ mod tests {
                 memory: 1,
                 queued: 0,
             },
+            EventKind::Reverted {
+                undid_step: 18,
+                files: 1,
+            },
             EventKind::Answered { turn_id: 3 },
             EventKind::Compacted {
                 through_step: 12,
@@ -1795,6 +1824,8 @@ mod tests {
                 | EventKind::PluginDropped { .. }
                 // 0.36.0 — a whole run put back.
                 | EventKind::Rewound { .. }
+                // 0.51.0 — one step's changes reverse-applied.
+                | EventKind::Reverted { .. }
                 // 0.37.0 — a turn answered instead of run.
                 | EventKind::Answered { .. }
                 // 0.43.0 — the run's older observations folded into a summary.

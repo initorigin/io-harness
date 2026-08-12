@@ -730,6 +730,9 @@ pub fn rewind_run_observed(
         &done.memory_restored,
         &done.memory_removed,
         &done.queue_cleared,
+        // `None`: this undid the run, not a step. The column is what lets a
+        // reader tell the two acts apart.
+        None,
     )?;
     // Built from the value being returned, never re-queried. The counts and the
     // `Rewound` a caller receives cannot disagree, because there is only one of
@@ -742,6 +745,215 @@ pub fn rewind_run_observed(
             files: done.files.len() as u32,
             memory: (done.memory_restored.len() + done.memory_removed.len()) as u32,
             queued: done.queue_cleared.len() as u32,
+        },
+    ));
+    Ok(done)
+}
+
+/// What reverting one step did to one file (0.51.0).
+///
+/// Three variants and not two, because "it did not happen" has two causes that
+/// an operator must be able to tell apart: the change is still there and this
+/// build **could** have undone it but the file has moved on, and the change is
+/// still there and this build has **nothing to undo it with**. The first is
+/// answered by reverting the later steps first; the second never will be.
+///
+/// ```
+/// use io_harness::tools::Workspace;
+/// use io_harness::{rewind_step, Reverted, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let ws = Workspace::new(dir.path());
+/// let store = Store::memory()?;
+/// let run = store.start_run("tidy the notes", &dir.path().display().to_string())?;
+///
+/// // This run wrote nothing, so its first step has nothing to put back — and,
+/// // crucially, nothing is touched.
+/// assert!(rewind_step(&ws, &store, run, 1)?.is_empty());
+///
+/// // After a real run there is one entry per path the step wrote, and each says
+/// // which of three things happened. Only the first changed anything.
+/// fn what_happened(r: &Reverted) -> &'static str {
+///     match r {
+///         Reverted::Applied(_) => "put back",
+///         Reverted::Stale(_) => "the file has moved on; nothing was changed",
+///         Reverted::NoHunk(_) => "there is no hunk to undo with; nothing was changed",
+///         _ => "something a later release added",
+///     }
+/// }
+/// # let _ = what_happened;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Reverted {
+    /// Put back, carrying what the workspace said — a revert that reproduces
+    /// what the file already held reports
+    /// [`Wrote::Unchanged`](crate::tools::Wrote::Unchanged).
+    Applied(Wrote),
+    /// The file no longer matches the hunk's context, so **nothing was
+    /// changed**. Carries the reason, naming the hunk and the line it expected.
+    ///
+    /// The ordinary cause is reverting out of order: a later step changed the
+    /// same lines and is still standing on top of this one. Revert newest first
+    /// and it applies.
+    Stale(String),
+    /// No hunk was stored for this edit, so there is nothing to reverse-apply,
+    /// and **nothing was changed**.
+    ///
+    /// Either the row predates 0.51.0, or the file's previous contents were not
+    /// kept — over the snapshot cap, or not text — in which case the reason is
+    /// on that path's snapshot row. [`rewind`] is what puts such a file back,
+    /// and it puts it back to before the run's first write rather than to before
+    /// this step.
+    NoHunk(String),
+}
+
+/// Undo one step's file changes by reverse-applying their stored hunks (0.51.0).
+///
+/// [`rewind`] answers "undo this file", [`rewind_run`] answers "undo this run",
+/// and neither answers "undo *that*". A run's restore point is the state of a
+/// file before the run's **first** write to it, so a twenty-step run whose step
+/// eighteen was wrong could be thrown away whole or not at all. This is the
+/// granularity in between, and it exists because 0.51.0 keeps the hunk.
+///
+/// **Walk backwards.** Reverse-application is order-sensitive: a step reverted
+/// while a later step's change still sits on top of it finds context that has
+/// moved, and the honest answer is [`Reverted::Stale`] and an untouched file,
+/// never a fuzzy match that quietly corrupts it. To walk a run back, call this
+/// for the newest step first and descend:
+///
+/// ```no_run
+/// use io_harness::{rewind_step, tools::Workspace, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// # let (ws, store, run_id) = (Workspace::new("."), Store::memory()?, 1i64);
+/// for step in (1..=18).rev() {
+///     for (path, what) in rewind_step(&ws, &store, run_id, step)? {
+///         println!("{step} {path}: {what:?}");
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// One entry per path this step wrote, in the order it wrote them. A step that
+/// wrote nothing returns an empty vector and changes nothing, which is not an
+/// error — asking to undo a step that read three files is a reasonable question
+/// with a short answer.
+///
+/// Writing goes through [`Workspace::write_file`], so the same path policy the
+/// edit obeyed governs the undo: a revert cannot put bytes anywhere the run
+/// could not have written them. Nothing in the trace is deleted, and the revert
+/// is itself written down — [`Store::rewinds`] reports it with `undid_step` set,
+/// which is what distinguishes it from a whole-run rewind.
+pub fn rewind_step(
+    ws: &Workspace,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+) -> Result<Vec<(String, Reverted)>> {
+    rewind_step_observed(ws, store, run_id, step, &crate::observe::Ignore)
+}
+
+/// [`rewind_step`], reporting to an [`Observer`](crate::Observer) (0.51.0).
+///
+/// One [`EventKind::Reverted`] once the work is done, carrying its counts from
+/// the value being returned rather than from a second query — a number re-read
+/// from the store would be true whether or not the revert happened, which is the
+/// defect 0.32.0 paid to learn.
+///
+/// ```
+/// use io_harness::tools::Workspace;
+/// use io_harness::{rewind_step_observed, EventKind, Flow, Observer, RunEvent, Store};
+/// use std::sync::Mutex;
+///
+/// #[derive(Default)]
+/// struct Seen(Mutex<Vec<String>>);
+/// impl Observer for Seen {
+///     fn event(&self, e: &RunEvent) -> Flow {
+///         if let EventKind::Reverted { undid_step, files } = &e.kind {
+///             self.0.lock().unwrap().push(format!("{undid_step}/{files}"));
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let ws = Workspace::new(dir.path());
+/// let store = Store::memory()?;
+/// let run = store.start_run("tidy up", &dir.path().display().to_string())?;
+///
+/// let seen = Seen::default();
+/// rewind_step_observed(&ws, &store, run, 4, &seen)?;
+/// assert_eq!(*seen.0.lock().unwrap(), ["4/0"], "it happened, and undid nothing");
+/// # Ok(())
+/// # }
+/// ```
+pub fn rewind_step_observed(
+    ws: &Workspace,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    observer: &dyn Observer,
+) -> Result<Vec<(String, Reverted)>> {
+    let mut done: Vec<(String, Reverted)> = Vec::new();
+    for edit in store.edits(run_id)?.into_iter().filter(|e| e.step == step) {
+        let Some(hunk) = edit.hunk.as_deref() else {
+            done.push((
+                edit.path,
+                Reverted::NoHunk(
+                    "no hunk was stored for this edit — it predates 0.51.0, or the file's \
+                     previous contents were not kept. `rewind` puts the file back to before \
+                     this run first wrote it"
+                        .to_string(),
+                ),
+            ));
+            continue;
+        };
+        // Read through the workspace, so a path the policy will not let us read
+        // is refused here rather than after a partial write.
+        let current = match ws.read_file(&edit.path) {
+            Ok(text) => text,
+            Err(e) => {
+                done.push((edit.path, Reverted::Stale(e.to_string())));
+                continue;
+            }
+        };
+        let restored = crate::diff::parse(hunk)
+            .and_then(|hunks| crate::diff::apply(&current, &crate::diff::reverse(&hunks)));
+        match restored {
+            Ok(text) => {
+                let wrote = ws.write_file(&edit.path, &text)?;
+                done.push((edit.path, Reverted::Applied(wrote)));
+            }
+            // Not an error: the file has moved on, which is an ordinary answer to
+            // an out-of-order revert and something the caller acts on rather than
+            // something that should end their loop over the other paths.
+            Err(e) => done.push((edit.path, Reverted::Stale(e.to_string()))),
+        }
+    }
+
+    let names: Vec<String> = done
+        .iter()
+        .filter(|(_, r)| matches!(r, Reverted::Applied(_)))
+        .map(|(p, _)| p.clone())
+        .collect();
+    let applied = names.len() as u32;
+    store.record_rewind(run_id, &names, &[], &[], &[], Some(step))?;
+    observer.event(&RunEvent::at_depth(
+        run_id,
+        step,
+        0,
+        EventKind::Reverted {
+            // Not `step`: the kind is `#[serde(flatten)]`ed into `RunEvent`,
+            // which already carries one, and a duplicate key compiles,
+            // serialises, and fails only on the way back.
+            undid_step: step,
+            files: applied,
         },
     ));
     Ok(done)

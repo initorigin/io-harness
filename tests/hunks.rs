@@ -13,7 +13,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
-use io_harness::{run, Edit, Provider, Store, TaskContract};
+use io_harness::tools::Workspace;
+use io_harness::{
+    rewind_run, rewind_step, rewind_step_observed, run, Edit, EventKind, Flow, Observer, Provider,
+    Reverted, RunEvent, Store, TaskContract,
+};
 use serde_json::json;
 
 /// A provider that returns a fixed script of tool-call responses, one per step,
@@ -49,14 +53,20 @@ async fn drive(
 ) -> (Store, i64, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(file), contents).unwrap();
-    let contract = TaskContract::workspace("change the file", dir.path());
+    let (store, run_id) = drive_in(dir.path(), steps).await;
+    (store, run_id, dir)
+}
+
+/// The same, over a directory the caller prepared.
+async fn drive_in(dir: &std::path::Path, steps: Vec<Vec<ToolCall>>) -> (Store, i64) {
+    let contract = TaskContract::workspace("change the file", dir);
     let script = MockScript {
         steps,
         at: AtomicUsize::new(0),
     };
     let store = Store::memory().unwrap();
     let result = run(&contract, &script, &store).await.unwrap();
-    (store, result.run_id, dir)
+    (store, result.run_id)
 }
 
 /// Apply a stored hunk in reverse, the way `rewind_step` does, using nothing but
@@ -331,4 +341,204 @@ fn measure_alone_carries_no_hunk() {
     let edit = Edit::measure(1, "edit_file", "a.rs", "fn one() {}\n", "fn two() {}\n");
     assert_eq!((edit.lines_added, edit.lines_removed), (1, 1));
     assert_eq!(edit.hunk, None);
+}
+
+// ---------------------------------------------------------------------------
+// F7 / F8 / F9 / F10 — walking a run back a step at a time
+// ---------------------------------------------------------------------------
+
+/// F7 — a newest-first walk restores every intermediate state exactly.
+///
+/// Asserted at each intermediate state and not only at the end. A build that
+/// reverse-applies in the wrong order can still arrive at the right final text
+/// when the changes do not overlap, so the end alone proves nothing.
+#[tokio::test]
+async fn reverting_newest_first_restores_every_intermediate_state() {
+    let start = "alpha\nbeta\ngamma\ndelta\n";
+    let (store, run_id, dir) = drive(
+        "f.txt",
+        start,
+        vec![
+            vec![call(
+                "edit_file",
+                json!({ "path": "f.txt", "search": "alpha", "replace": "ALPHA" }),
+            )],
+            vec![call(
+                "edit_file",
+                json!({ "path": "f.txt", "search": "beta", "replace": "BETA" }),
+            )],
+            vec![call(
+                "edit_file",
+                json!({ "path": "f.txt", "search": "delta", "replace": "DELTA" }),
+            )],
+        ],
+    )
+    .await;
+
+    let read = || std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
+    assert_eq!(read(), "ALPHA\nBETA\ngamma\nDELTA\n");
+
+    let ws = Workspace::new(dir.path());
+    let steps: Vec<u32> = store
+        .edits(run_id)
+        .unwrap()
+        .iter()
+        .map(|e| e.step)
+        .collect();
+    assert_eq!(steps.len(), 3, "three edits, one per step: {steps:?}");
+
+    // Newest first, and the state after each revert is what the file held at the
+    // end of the preceding step.
+    let expected = [
+        "ALPHA\nBETA\ngamma\ndelta\n",
+        "ALPHA\nbeta\ngamma\ndelta\n",
+        start,
+    ];
+    for (i, step) in steps.iter().rev().enumerate() {
+        let done = rewind_step(&ws, &store, run_id, *step).unwrap();
+        assert_eq!(done.len(), 1, "step {step} wrote one path");
+        assert!(
+            matches!(done[0].1, Reverted::Applied(_)),
+            "step {step}: {:?}",
+            done[0].1
+        );
+        assert_eq!(read(), expected[i], "after reverting step {step}");
+    }
+
+    // And the end state is what a whole-run rewind would have produced.
+    assert_eq!(read(), start);
+}
+
+/// F8 — an out-of-order revert reports `Stale` and touches nothing.
+///
+/// The two edits overlap deliberately: the second rewrote the line the first
+/// produced, so the first's hunk no longer has its context to find. A fuzzy
+/// match would "succeed" here and corrupt the file, which is why an exact match
+/// or nothing is the rule.
+#[tokio::test]
+async fn reverting_out_of_order_reports_stale_and_changes_nothing() {
+    let (store, run_id, dir) = drive(
+        "f.txt",
+        "one\ntwo\n",
+        vec![
+            vec![call(
+                "edit_file",
+                json!({ "path": "f.txt", "search": "one", "replace": "ONE" }),
+            )],
+            vec![call(
+                "edit_file",
+                json!({ "path": "f.txt", "search": "ONE", "replace": "UNO" }),
+            )],
+        ],
+    )
+    .await;
+    let before = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
+    assert_eq!(before, "UNO\ntwo\n");
+
+    let ws = Workspace::new(dir.path());
+    let first = store.edits(run_id).unwrap()[0].step;
+    let done = rewind_step(&ws, &store, run_id, first).unwrap();
+    assert!(
+        matches!(done[0].1, Reverted::Stale(_)),
+        "the older hunk's context is gone: {:?}",
+        done[0].1
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+        before,
+        "a stale revert must leave the file byte-identical"
+    );
+}
+
+/// F9 — an edit with no stored hunk is reported, not treated as empty.
+///
+/// The absence is produced the way production produces it: the file's previous
+/// contents were not text, so there was nothing to diff against and no hunk was
+/// stored. (The other cause — a row written before 0.51.0 — is a column that did
+/// not exist, which only a store from an earlier release can demonstrate, and
+/// `tests/cross_version.rs` is where that lives.)
+///
+/// Treating an absent hunk as an empty patch would report success having undone
+/// nothing, which is the one way this feature can silently lose an operator's
+/// work.
+#[tokio::test]
+async fn an_edit_with_no_stored_hunk_is_reported_rather_than_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    // Not valid UTF-8, so `read_before` keeps no restore text and there is
+    // nothing for a diff to be against.
+    std::fs::write(dir.path().join("f.dat"), [0xffu8, 0xfe, 0x00, 0x41]).unwrap();
+
+    let (store, run_id) = drive_in(
+        dir.path(),
+        vec![vec![call(
+            "write_file",
+            json!({ "path": "f.dat", "content": "now it is text\n" }),
+        )]],
+    )
+    .await;
+    let edits = store.edits(run_id).unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].hunk, None, "nothing to diff against, so no hunk");
+
+    let ws = Workspace::new(dir.path());
+    let done = rewind_step(&ws, &store, run_id, edits[0].step).unwrap();
+    assert!(
+        matches!(done[0].1, Reverted::NoHunk(_)),
+        "an absent hunk is absent, not empty: {:?}",
+        done[0].1
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f.dat")).unwrap(),
+        "now it is text\n",
+        "nothing was changed"
+    );
+    // And the series says the change is there and unrenderable, rather than
+    // leaving it out.
+    assert!(store.patch(run_id).unwrap().contains("no hunk stored"));
+}
+
+/// F10 — a step revert is distinguishable in the trace from a run rewind, and the
+/// event round-trips with no duplicate key.
+#[tokio::test]
+async fn a_step_revert_and_a_run_rewind_are_different_rows() {
+    let (store, run_id, dir) = drive(
+        "f.txt",
+        "one\ntwo\n",
+        vec![vec![call(
+            "edit_file",
+            json!({ "path": "f.txt", "search": "one", "replace": "ONE" }),
+        )]],
+    )
+    .await;
+    let ws = Workspace::new(dir.path());
+    let step = store.edits(run_id).unwrap()[0].step;
+
+    let seen = Seen::default();
+    rewind_step_observed(&ws, &store, run_id, step, &seen).unwrap();
+    rewind_run(&ws, &store, run_id).unwrap();
+
+    let rows = store.rewinds(run_id).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].undid_step,
+        Some(step),
+        "the step revert names its step"
+    );
+    assert_eq!(rows[1].undid_step, None, "a whole-run rewind names none");
+
+    // Exactly one event, its count taken from the value being returned.
+    assert_eq!(*seen.0.lock().unwrap(), [(step, 1u32)]);
+}
+
+/// An observer that keeps every `Reverted` it is handed.
+#[derive(Default)]
+struct Seen(std::sync::Mutex<Vec<(u32, u32)>>);
+
+impl Observer for Seen {
+    fn event(&self, e: &RunEvent) -> Flow {
+        if let EventKind::Reverted { undid_step, files } = &e.kind {
+            self.0.lock().unwrap().push((*undid_step, *files));
+        }
+        Flow::Continue
+    }
 }

@@ -479,9 +479,9 @@ pub use run::{
     resume_tree_with_plan_decision_observed, resume_with, resume_with_answer,
     resume_with_answer_observed, resume_with_decision, resume_with_decision_observed,
     resume_with_observed, resume_with_plan_decision, resume_with_plan_decision_observed,
-    retry_gate, retry_gate_observed, rewind, rewind_run, rewind_run_observed, run, run_observed,
-    run_tree, run_tree_observed, run_with, run_with_observed, Rewind, Rewound, RunOutcome,
-    RunResult, SPAWN_TOOL,
+    retry_gate, retry_gate_observed, rewind, rewind_run, rewind_run_observed, rewind_step,
+    rewind_step_observed, run, run_observed, run_tree, run_tree_observed, run_with,
+    run_with_observed, Reverted, Rewind, Rewound, RunOutcome, RunResult, SPAWN_TOOL,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, ExecMode, Sandbox, SandboxConfig, SandboxLimits,

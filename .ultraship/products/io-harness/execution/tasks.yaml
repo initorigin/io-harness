@@ -249,7 +249,7 @@ tasks:
   why_required: Undo has one granularity today, so a twenty-step run with one wrong step is thrown away
     whole. Reverse-application is order-sensitive, and reporting Stale rather than forcing an apply is
     what keeps it from corrupting a file.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.51.0-T02
   acceptance_criteria:
@@ -278,14 +278,34 @@ tasks:
     '
   files:
   - src/run.rs
-  - src/state.rs
-  - tests/rewind.rs
-  evidence: []
+  - src/lib.rs
+  - docs/public-api.txt
+  - tests/hunks.rs
+  evidence:
+  - 'tests/hunks.rs: 9 passed. reverting_newest_first_restores_every_intermediate_state drives three edits
+    at three steps and asserts the file byte-identical after EACH revert, not only at the end — a build
+    that reverse-applies in the wrong order can still arrive at the right final text when the changes
+    do not overlap.'
+  - 'F7 SABOTAGE: apply the hunk forward instead of in reverse. Fails reverting_newest_first_restores_every_intermediate_state
+    and a_step_revert_and_a_run_rewind_are_different_rows — two named tests, both of which assert that
+    a revert put something back.'
+  - 'F8 SABOTAGE: skip the context match and splice the hunk''s old lines in at its stated position. Fails
+    reverting_out_of_order_reports_stale_and_changes_nothing and only it. That test''s two edits overlap
+    deliberately, so the older hunk''s context is gone and a fuzzy match would ''succeed''.'
+  - 'F9 SABOTAGE: treat a NULL hunk as an empty patch. Fails an_edit_with_no_stored_hunk_is_reported_rather_than_skipped
+    and only it. The absence is produced the way production produces it — a file whose previous contents
+    were not UTF-8, so read_before kept no restore text.'
+  - 'Reverted is #[non_exhaustive] with three variants, because ''it did not happen'' has two causes an
+    operator must tell apart: Stale (the file has moved on — revert the later steps first) and NoHunk
+    (there is nothing to undo it with, and never will be).'
+  - 'docs/public-api.txt gains THREE enumerated lines, not the two the contract named: enum Reverted,
+    fn rewind_step and fn rewind_step_observed. The observed variant exists because that is the shape
+    rewind_run/rewind_run_observed already has and the event needs an observer. Stated rather than glossed.'
 - id: US-IO-HARNESS-0.51.0-T07
   summary: Record a step revert in the trace, distinguishably from a run rewind.
   why_required: Store::rewinds would otherwise report 'something was undone' for two different acts, and
     an event stream that cannot tell them apart cannot be audited.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.51.0-T06
   acceptance_criteria:
@@ -307,8 +327,19 @@ tasks:
   - src/state.rs
   - src/run.rs
   - src/observe.rs
-  - tests/rewind.rs
-  evidence: []
+  - tests/hunks.rs
+  evidence:
+  - 'F10: a_step_revert_and_a_run_rewind_are_different_rows passes — Store::rewinds reports undid_step:
+    Some(step) for the revert and None for the rewind_run on the same run, and exactly one EventKind::Reverted
+    fires with its count taken from the value being returned.'
+  - 'F10 SABOTAGE: leave undid_step NULL for both acts. Fails the named test and only it.'
+  - 'The event field is undid_step and NOT step. The kind is #[serde(flatten)]ed into RunEvent, which
+    already carries a step, and a duplicate key compiles, serialises and fails only on the way back —
+    decided while writing the contract rather than while implementing it. every_variant_round_trips covers
+    it.'
+  - 'Three census sites the enum has, all found by their own guards rather than by reading: the exhaustive
+    match at src/observe.rs:1776, the round-trip sample set, and the event_names list. Each named the
+    omission precisely.'
 - id: US-IO-HARNESS-0.51.0-T08
   summary: Prove the null-column case in both directions across versions.
   why_required: Two additive columns mean every row an earlier release wrote has no hunk. Treating an

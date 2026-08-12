@@ -2605,6 +2605,13 @@ pub struct RewindRecord {
     pub memory_removed: Vec<String>,
     /// The goals of the children that were still queued and no longer are.
     pub queue_cleared: Vec<String>,
+    /// The step this undid, or `None` for a whole-run rewind (0.51.0).
+    ///
+    /// Two different acts share this table and a reader has to be able to tell
+    /// them apart: [`crate::rewind_run`] puts a run back to before it started,
+    /// and [`crate::rewind_step`] reverse-applies one step's stored hunks. A
+    /// trace that reported both as "something was undone" could not be audited.
+    pub undid_step: Option<u32>,
 }
 
 /// One background process the run started, as the store last knew it.
@@ -4562,17 +4569,20 @@ impl Store {
         memory_restored: &[String],
         memory_removed: &[String],
         queue_cleared: &[(u32, String)],
+        undid_step: Option<u32>,
     ) -> Result<()> {
         let goals: Vec<&String> = queue_cleared.iter().map(|(_, g)| g).collect();
         self.conn.execute(
-            "INSERT INTO rewinds (run_id, files, memory_restored, memory_removed, queue_cleared)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO rewinds
+                 (run_id, files, memory_restored, memory_removed, queue_cleared, undid_step)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             (
                 run_id,
                 serde_json::to_string(files).unwrap_or_else(|_| "[]".into()),
                 serde_json::to_string(memory_restored).unwrap_or_else(|_| "[]".into()),
                 serde_json::to_string(memory_removed).unwrap_or_else(|_| "[]".into()),
                 serde_json::to_string(&goals).unwrap_or_else(|_| "[]".into()),
+                undid_step,
             ),
         )?;
         Ok(())
@@ -4609,8 +4619,8 @@ impl Store {
     /// ```
     pub fn rewinds(&self, run_id: i64) -> Result<Vec<RewindRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT at, files, memory_restored, memory_removed, queue_cleared FROM rewinds
-             INDEXED BY rewinds_run WHERE run_id = ?1 ORDER BY id",
+            "SELECT at, files, memory_restored, memory_removed, queue_cleared, undid_step
+             FROM rewinds INDEXED BY rewinds_run WHERE run_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map((run_id,), |r| {
             let list = |i: usize| -> rusqlite::Result<Vec<String>> {
@@ -4623,6 +4633,7 @@ impl Store {
                 memory_restored: list(2)?,
                 memory_removed: list(3)?,
                 queue_cleared: list(4)?,
+                undid_step: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
