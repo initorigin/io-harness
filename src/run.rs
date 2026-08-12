@@ -13830,3 +13830,76 @@ fn workspace_tools() -> Vec<ToolSpec> {
     });
     v
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 0.50.0 — the operator's ceiling, arm by arm.
+    ///
+    /// Written because a sabotage found nothing: turning `narrowed`'s `min` into a
+    /// `max` — which is the whole difference between a ceiling and a suggestion —
+    /// left every test in the suite passing. The end-to-end criterion exercises
+    /// the refusal switch, and the switch returns before the clock arithmetic is
+    /// ever reached, so the arithmetic had no test at all.
+    #[test]
+    fn a_contract_clock_is_a_ceiling_the_model_cannot_raise() {
+        let min = Duration::from_secs(30);
+        let cap = Duration::from_secs(60);
+
+        // A spawn asking for longer than the operator allows gets the operator's.
+        assert_eq!(
+            narrowed(Return::WaitUntil(Duration::from_secs(600)), Some(cap), true).0,
+            Return::WaitUntil(cap),
+        );
+        // A spawn asking for less keeps its own — narrowing works downward only.
+        assert_eq!(
+            narrowed(Return::WaitUntil(min), Some(cap), true).0,
+            Return::WaitUntil(min),
+        );
+        // A spawn that named no clock gets the operator's.
+        assert_eq!(
+            narrowed(Return::Wait, Some(cap), true).0,
+            Return::WaitUntil(cap),
+        );
+        // With no contract clock, what the model asked for stands.
+        assert_eq!(narrowed(Return::Wait, None, true).0, Return::Wait);
+        assert_eq!(
+            narrowed(Return::WaitUntil(min), None, true).0,
+            Return::WaitUntil(min),
+        );
+        // Not waiting at all is already narrower than any clock, so a clock does
+        // not turn a detach back into a wait.
+        assert_eq!(narrowed(Return::Detach, Some(cap), true).0, Return::Detach);
+
+        // And the refusal outranks every shape, with a line explaining itself.
+        for want in [Return::Detach, Return::WaitUntil(min)] {
+            let (got, why) = narrowed(want, Some(cap), false);
+            assert_eq!(got, Return::Wait);
+            assert!(why.is_some(), "a narrowed request is never silent");
+        }
+        // A plain wait was not narrowed by anything, so it says nothing.
+        assert!(narrowed(Return::Wait, None, false).1.is_none());
+    }
+
+    /// 0.50.0 — the two arguments, including the pair that means nothing.
+    #[test]
+    fn a_spawn_states_how_it_wants_its_child_back() {
+        let r = |v: serde_json::Value| spawn_return(&v);
+        assert_eq!(r(json!({})).unwrap(), Return::Wait);
+        assert_eq!(r(json!({ "wait": true })).unwrap(), Return::Wait);
+        assert_eq!(r(json!({ "wait": false })).unwrap(), Return::Detach);
+        assert_eq!(
+            r(json!({ "background_after_secs": 90 })).unwrap(),
+            Return::WaitUntil(Duration::from_secs(90)),
+        );
+        // "Wait zero seconds for it" and "do not wait for it" are one request.
+        assert_eq!(
+            r(json!({ "background_after_secs": 0 })).unwrap(),
+            Return::Detach,
+        );
+        // And the pair with no meaning is refused, in words naming both.
+        let why = r(json!({ "wait": false, "background_after_secs": 30 })).unwrap_err();
+        assert!(why.contains("wait") && why.contains("background_after_secs"), "{why}");
+    }
+}
