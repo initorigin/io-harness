@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.50.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -535,3 +535,135 @@ open_questions:
   which is arguably correct (the parent has waited that long either way) and arguably not. If the
   queue wait turns out to dominate in practice, measuring from admission is a one-line change and an
   iteration.
+released_at: 2026-08-12T18:20:00Z
+mode: published
+delivered: >
+  A parent chooses how a child returns, and a child returns something worth reading. `spawn_agent`
+  gains two optional arguments — `wait` (default true) and `background_after_secs` — so one call
+  site can block as it always did, detach and collect the report at a later step, or wait a stated
+  wall clock and then let the child carry on in the background. A tree still never returns while a
+  child it started is running: the loop drains at its one return rather than at each of its twelve
+  endings, which is what `run_agent` became a wrapper to do.
+
+  **The release's real story is a plan-time correction, and it is recorded rather than absorbed.**
+  The roadmap said a child "pours its whole tool output into the parent's context" and named a
+  *forked* child shape to prevent it. That was false: a child has always run its own ledger, and the
+  context saving the fork promised was already banked. What was actually missing was the other half —
+  `compose_child` handed the parent a `Debug`-printed discriminant with no text at all, because
+  `RunOutcome::Success` carries none, so a parent learned that a child succeeded and nothing it
+  found. The roadmap entry was rewritten to say so, and the conclusion is what shipped.
+
+  **Two decisions the type system made, not the design.** A detached child is a future in a
+  `FuturesUnordered` on the parent's own task, driven against the parent's completion — it cannot be
+  a spawned task, because `&Store` is `Send` and not `Sync`, the same constraint that decided
+  0.41.0's read batch. And the wall clock races the child against a sleep and **keeps the loser**: a
+  `tokio::time::timeout` would drop the future and cancel the child, which is why F5 asserts both
+  halves rather than only the observation.
+
+  Durability rides existing tables rather than a migration. `AgentEvent::said` makes an agent's own
+  words durable for the first time, and `AgentEvent::spawn_args` stores the whole spawn call, because
+  the `spawns` row holds five of nine arguments and a rebuild from those five would resume a child
+  under a WIDER policy than the operator allowed.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — exit 0, **79 test binaries, 1,616 passed, 0 failed**, including
+    **420** doctests. Run with `XDG_CONFIG_HOME` redirected to a scratch directory, this machine's
+    standing environment fix for `tests/plugin.rs` and unrelated to the release.
+  - >
+    `cargo test --all-features` — exit 0, **79 test binaries, 1,702 passed, 0 failed**, including
+    **423** doctests. A separate invocation after `rm -rf target`. Both counts were read only after
+    the process exited, which is 0.47.0's trap and this repository's standing rule.
+  - >
+    `cargo test --test cross_version_0_29_0 -- --ignored --exact
+    a_current_store_is_read_by_a_0_29_0_binary` — exit 0, 1 passed, after
+    `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` (exit 0). The generator's pin
+    control passes as well: `io-harness = "=0.29.0"` is still in the fixture manifest, which is what
+    makes that job evidence rather than a label (O2).
+  - >
+    **THE SABOTAGE THAT ONCE FAILED NOTHING, RE-RUN AND CONFIRMED CLOSED.** S8 turned `narrowed()`'s
+    `asked.min(cap)` into `asked.max(cap)` (`src/run.rs:7184`) — the operator's ceiling becoming a
+    floor — and the whole suite stayed green, because the only end-to-end criterion exercising F8
+    goes through the refusal switch and the switch returns before the arithmetic. That is a finding
+    about the tests, not about the sabotage. It was closed with unit tests in `src/run.rs`, and the
+    closure was re-verified against the shipped tree rather than trusted: `cargo test --lib` exits
+    101 and fails **exactly one** named test,
+    `run::tests::a_contract_clock_is_a_ceiling_the_model_cannot_raise` — 439 passed, 1 failed.
+    `src/run.rs` was restored and proven byte-identical by sha256 before anything was sealed.
+  - >
+    The remaining eight sabotages were run in the implementing session, one per arm, each failing the
+    tests its criterion names and no others. They are recorded per task in
+    `execution/archive/0.50.0.yaml`; only S8 is repeated here, because a sabotage that failed nothing
+    is the one worth carrying into the record.
+  - >
+    **Two failures seen in a previous session did NOT reproduce and were flakes, as suspected.**
+    `tests/handles.rs`'s `a_handle_that_exits_on_its_own_stops_reading_as_running` and
+    `killing_a_handle_kills_a_grandchild_whose_parent_already_exited` failed once on a loaded machine,
+    the second complaining that the orphan fixture never wrote its pid file. Both are clock and
+    child-process shaped, both passed in the run before it, and both suites above are 0 failed. Not a
+    regression, and re-run rather than assumed.
+  builds:
+  - >
+    `cargo fmt --check` — exit 0. Run **last**, against the shipped tree, after every temporary
+    instrumentation was reverted and hash-verified. This ordering is stated because the previous
+    release broke it and CI caught it.
+  - '`cargo clippy --all-targets --all-features -- -D warnings` — exit 0.'
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0.
+    The docs.rs build reproduced; it is not implied by a stable `cargo doc` and is run before the
+    release PR.
+  - >
+    `cargo +1.95 check --all-targets` — exit 0, and `cargo +1.95 check --all-targets --all-features`
+    — exit 0. Both polarities, which is the pair the `msrv` job runs, because eleven
+    `#[cfg(not(feature = ..))]` sites only compile with a feature off. MSRV unmoved at 1.95 (N2).
+  - >
+    `cargo clean && cargo package --locked` — exit 0, **234 files, 6.3MiB (1.6MiB compressed)**,
+    `target/package/io-harness-0.50.0.crate`.
+  - >
+    `cargo tree` for the default feature set — **402** lines, unchanged. No new runtime dependency:
+    `FuturesUnordered` and `select` come from `futures_util`, already present and already imported at
+    the spawn site (N1).
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **A process that dies inside the drain leaves a parent `completed` and a child `running`.** The
+  drain runs after the loop has recorded the parent's ending, so resuming that parent reports the
+  terminal outcome and re-adopts nothing. The child is not lost — it is resumable by its own run id —
+  but it is not picked up automatically. Found because the first F7 test crashed in exactly that
+  window, stated in `docs/CONTRACT.md` under "The one window that is not covered", and carried here
+  rather than fixed: closing it means deferring a run's own ending until its children finish, which
+  is a larger change than this release's scope.
+- >
+  **N5 was met as step counts against a parked scripted provider, not as a timed benchmark — stated,
+  not glossed.** The criterion asks for "the parent's completed step count over that interval", and
+  that is exactly the number recorded: the detached arm's report arrives at step 3 of 3, so **2
+  parent steps completed while the child ran**; the blocking arm folds both children into step 1 for
+  a parent total of 1 step, so **0 parent steps completed while the children ran**. Both satisfy the
+  criterion's own test (>0 detached, 0 blocking). What was not done is a wall-clock benchmark, and
+  deliberately so — O3 forbids gating a claim on a clock the test does not own. The figures were
+  taken from a temporary `eprintln!` in the two existing tests, which was then reverted and
+  `tests/subagents.rs` proven byte-identical by sha256.
+- >
+  **O1 had not run at the time this record was sealed.** The full suite on all three platforms,
+  including 0.47.0's `contained (ubuntu, userns restricted)` leg, runs on the release PR. Every gate
+  above is macOS, and a green macOS gate is explicitly not evidence for a concurrency release — that
+  is the criterion's own wording. If the matrix finds a defect, the correction is available only
+  before the merge into `main`.
+- >
+  **The record was sealed before the crates.io upload.** `mode: published` is the delivery this
+  release is authorised for and carries out; the upload itself follows both merges and the GitHub
+  Release, which is the standing order of this flow.
+- >
+  **A run that opts into detachment gives up step-for-step trace reproducibility** for the calls that
+  use it. A run that does not is unchanged, which is what N6 asserts and what F4 is the negative
+  control for.
+- >
+  **One behaviour change has no opt-out, and it is the release.** A parent's composed child
+  observation now carries the child's conclusion instead of a `Debug`-printed outcome. An embedder
+  asserting on the exact text of that line will see it; the changelog states the old and new shapes
+  so the fix is a one-line edit rather than a discovery.
+supersedes: 0.49.0
+next_recommended_version: 0.51.0
+immutable: true

@@ -15,8 +15,8 @@ release_fit:
     - >
       **Everything a detached child needs already exists and was built for a blocking tree.** The
       per-tier slots and FIFO queue (0.32.0), the `spawns` rows, adopt-on-resume, `Store::children`
-      and `terminal_outcome` are all in place and unchanged by this release. The release adds a
-      set of in-flight futures and a fold; it does not add durable state, a table, or a public break.
+      and `terminal_outcome` are all in place and unchanged by this release. The release adds a set
+      of in-flight futures and a fold; it does not add durable state, a table, or a public break.
     - >
       **The type system has already decided the one architectural question.** `rusqlite::Connection`
       is `Send` and not `Sync` and `run_agent` borrows the whole `Tree`, so a detached child cannot
@@ -30,8 +30,8 @@ release_fit:
       plan can prove in advance.
     - >
       **The fallback scope is drawn along a line the release can be cut on.** The child's conclusion
-      is the half that makes delegation useful and it needs none of the concurrency; detachment,
-      the wall clock and the operator knobs each sit behind it and can be shed in order. Recorded at
+      is the half that makes delegation useful and it needs none of the concurrency; detachment, the
+      wall clock and the operator knobs each sit behind it and can be shed in order. Recorded at
       specification time for exactly that reason.
   major_cost_drivers:
     - >

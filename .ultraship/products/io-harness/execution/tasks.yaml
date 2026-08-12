@@ -262,7 +262,7 @@ tasks:
   summary: Run the release gates and record the measured numbers.
   why_required: Every non-functional and operational claim in the contract is a number or an exit status
     that has to be seen rather than asserted, and the record quotes them.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.50.0-T08
   acceptance_criteria:
@@ -327,4 +327,55 @@ tasks:
   files:
   - Cargo.toml
   - Cargo.lock
-  evidence: []
+  evidence:
+  - 'N1 — `cargo tree` for the default feature set: **402** lines, unchanged. No new dependency; the
+    detachment set is `futures_util`, already present and already imported at the spawn site.'
+  - 'N2 — `cargo +1.95 check --all-targets` exit 0 and `cargo +1.95 check --all-targets --all-features`
+    exit 0, which is the pair the msrv job runs, one per feature polarity. MSRV unmoved at 1.95.'
+  - 'N3 — `docs/public-api.txt` is byte-identical to main (`git diff main -- docs/public-api.txt` empty),
+    and the out-of-tree 0.29.0 generator compiled against this build (exit 0), which is the compile-break
+    proof the criterion names. Met in the form the criterion itself anticipated: the additions are methods,
+    variants and fields on already-listed types, so a checker that enumerates crate-root re-exports sees
+    no new line.'
+  - 'N4 — `git diff main -- src/state.rs` adds **0** lines matching CREATE/ALTER TABLE, CREATE INDEX,
+    ADD COLUMN or DROP; 54 insertions, all read-path and doc. `CHECKPOINT_FORMAT` unmoved at 7
+    (`src/state.rs:107`).'
+  - 'N5 — MEASURED, and met as step counts rather than as a timed benchmark. Stated, not glossed: the
+    criterion asks for the parent''s completed step count over the interval a child is parked, and the
+    number recorded is that count against the scripted provider F3 and F4 already park, not a wall-clock
+    benchmark. Detached arm: report arrives at step 3 of 3, **2 parent steps completed while the child
+    ran**. Blocking arm: both children fold into step 1, parent total 1 step, **0 parent steps completed
+    while the children ran**. Both directions are what the criterion requires (>0 detached, 0 blocking).
+    Taken from a temporary `eprintln!` in the two tests, run, then reverted — `tests/subagents.rs`
+    restored and proven byte-identical by sha256 before anything was sealed.'
+  - 'N6 — every existing tree suite passes: `cargo test` (default) exit 0, 79 binaries, 1,616 passed,
+    0 failed, 420 doctests; `cargo test --all-features` a separate invocation after `rm -rf target`,
+    exit 0, 79 binaries, 1,702 passed, 0 failed, 423 doctests. Both with `XDG_CONFIG_HOME` redirected
+    to a scratch directory, this machine''s standing fix for `tests/plugin.rs` and unrelated to the
+    release.'
+  - 'N7 — `tree_tools` gains two optional properties inside the existing `spawn_agent` schema and nothing
+    else: the diff against main adds no `ToolSpec`, no tool name, and leaves `required` unchanged. The
+    catalogue''s shape, and therefore 0.38.0''s cacheable system prefix, moves by the schema''s own bytes.'
+  - 'O2 — `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` exit 0, then `cargo test
+    --test cross_version_0_29_0 -- --ignored --exact a_current_store_is_read_by_a_0_29_0_binary` exit
+    0, 1 passed. The generator''s pin control passes too: `io-harness = "=0.29.0"` still in the fixture
+    manifest, which is what makes the job evidence rather than a label.'
+  - 'O3 — the two flaky `tests/handles.rs` failures the previous session saw on a loaded machine
+    (`a_handle_that_exits_on_its_own_stops_reading_as_running` and
+    `killing_a_handle_kills_a_grandchild_whose_parent_already_exited`) did NOT reproduce: both suites
+    above are 0 failed. They were clock/child-process shaped, as suspected, and are not a regression.'
+  - 'SABOTAGE — S8 re-run and CONFIRMED CLOSED. It is recorded because it is the one that originally
+    failed nothing: turning `narrowed()`''s `asked.min(cap)` into `asked.max(cap)` (`src/run.rs:7184`)
+    once left the whole suite green, because the only end-to-end criterion exercised the refusal switch
+    and the switch returns before the arithmetic. Re-run now against the shipped tree: `cargo test --lib`
+    exits 101 and fails **exactly one** named test,
+    `run::tests::a_contract_clock_is_a_ceiling_the_model_cannot_raise` — 439 passed, 1 failed. `src/run.rs`
+    restored and proven byte-identical by sha256.'
+  - 'Build and packaging gates: `cargo fmt --check` exit 0 (re-run last, against the shipped tree, after
+    every temporary instrumentation was reverted and hash-verified); `cargo clippy --all-targets
+    --all-features -- -D warnings` exit 0; `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc
+    --all-features --no-deps` exit 0; `cargo clean && cargo package --locked` exit 0, **234 files, 6.3MiB
+    (1.6MiB compressed)**.'
+  - 'O1 is the one gate this machine cannot supply: the three-platform matrix, including 0.47.0''s
+    `contained (ubuntu, userns restricted)` leg, runs on the release PR. A green macOS gate is explicitly
+    not evidence for it, and it is carried as a known limitation rather than claimed here.'

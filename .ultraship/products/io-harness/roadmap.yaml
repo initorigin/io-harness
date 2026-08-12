@@ -1206,14 +1206,14 @@ versions:
       the correction is what makes the release worth shipping.** It said a child "pours its whole
       tool output into the parent's context" and named a *forked* shape that would prevent it. A
       child's tool output has never entered its parent's context: a child runs its own loop over its
-      own ledger, and `compose_child` (`src/run.rs:7219-7224`) hands the parent one line —
-      `[child 7 "<goal>" -> Success { steps: 4 }]`, a `Debug`-printed discriminant and a step count,
-      because `RunOutcome::Success` carries no text (`src/run.rs:216-218`). So the forked shape is
-      what every child already is, and the half that is actually missing is its **conclusion**: a
-      parent that fans out four researchers today learns only that four runs succeeded. This release
-      makes a child report what it found.
+      own ledger, and `compose_child` (`src/run.rs:7219-7224`) hands the parent one line — `[child 7
+      "<goal>" -> Success { steps: 4 }]`, a `Debug`-printed discriminant and a step count, because
+      `RunOutcome::Success` carries no text (`src/run.rs:216-218`). So the forked shape is what
+      every child already is, and the half that is actually missing is its **conclusion**: a parent
+      that fans out four researchers today learns only that four runs succeeded. This release makes
+      a child report what it found.
     detail: specified
-    status: planned
+    status: released
   - version: 0.51.0
     outcome: >
       A change becomes a reviewable artifact rather than a pair of counts. Three things land
