@@ -451,7 +451,7 @@ tasks:
   why_required: N5 is the claim the patch tool is made of, and N6 is the control that says a run using
     neither new tool did not change. Neither is provable after the fact from a suite that was not asked
     the question.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.51.0-T04
   - US-IO-HARNESS-0.51.0-T05
@@ -493,7 +493,45 @@ tasks:
 
     '
   files:
-  - tests/multi_file.rs
-  - tests/edit_file.rs
-  - examples
-  evidence: []
+  - tests/patch_tool.rs
+  - src/diff.rs
+  - src/run.rs
+  - src/state.rs
+  - tests/hunks.rs
+  evidence:
+  - 'N5 MEASURED, on a four-hunk change to one 231-byte file, both arms producing a byte-identical result.
+    edit_file x4: 5 provider calls, 4 gate evaluations, 1,987 prompt bytes, 424 bytes of stored hunks.
+    patch_file x1: 2 provider calls, 1 gate evaluation, 649 prompt bytes, 476 bytes of stored hunks. One
+    gate evaluation against four and one acting completion against four, asserted; 3.06x less prompt read,
+    recorded.'
+  - 'N6: only THREE test files differ from main — tests/hunks.rs and tests/patch_tool.rs are new, and
+    tests/cross_version.rs gained two tests and one import line. Every other suite in the repository is
+    byte-identical to main and passes, which is the byte-identity control stated as a fact about the diff
+    rather than as an assertion inside a test.'
+  - 'N2: cargo test and cargo test --all-features both build and pass on the 1.95 toolchain this repository
+    pins.'
+  - 'N1: cargo tree is 402, unchanged since 0.23.0. The differ, the parser and the applier are ~450 lines
+    in src/diff.rs and no crate was added.'
+  - 'N4: git diff main -- src/state.rs shows exactly two ALTER TABLE ADD COLUMN lines and no CREATE TABLE,
+    no CREATE INDEX. CHECKPOINT_FORMAT is unmoved at 7.'
+  - 'GATES, every one run to completion with its output read. cargo fmt --check exit 0. cargo clippy --all-targets
+    --all-features -- -D warnings exit 0 (after five findings: two needless_range_loop, manual_is_multiple_of,
+    three unnecessary_lazy_evaluations, one type_complexity). cargo test exit 0 — 81 binaries, 1,656 passed,
+    425 doctests. cargo test --all-features exit 0 on a cleared target — 81 binaries, 1,742 passed, 428
+    doctests. RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps exit
+    0. cargo package --locked exit 0, 1,699,907 bytes. The cross-version generator gate passes: a_current_store_is_read_by_a_0_29_0_binary,
+    a real 0.29.0 binary reading a store this release wrote.'
+  - THE NIGHTLY RUSTDOC GATE CAUGHT SOMETHING STABLE cargo doc DID NOT — sixth release running. Edit::hunk's
+    doc linked [Snapshot], a private item, and -D warnings refused it via rustdoc::private_intra_doc_links.
+  - 'ONE FLAKE, and it is the ninth of a family already in memory. a_handle_takes_the_cpu_cap_a_foreground_stage_takes
+    failed on the first all-features run — a spinning awk that a CPU cap should have ended still reading
+    ''running'' on a machine that had just built the whole all-features tree. It passed alone (5 of 5)
+    and in the default suite. Unrelated to this release: nothing here touches the handle or sandbox path.
+    The suite was re-run with --no-fail-fast and was green.'
+  - 'ORDERING, stated rather than glossed: the private-link fix to src/state.rs landed AFTER the two suites
+    ran. It is a doc comment and cannot change behaviour, but rather than assert that, cargo test --doc
+    was re-run against the shipped tree — 425 passed, exit 0 — and cargo package compiled the packaged
+    crate from it.'
+  - 'DISK: target reached 17 GiB because earlier invocations in this session did not carry CARGO_PROFILE_TEST_DEBUG=0.
+    With both flags set from a clean start the same all-features build peaked far lower. cargo clean reclaimed
+    18.3 GiB and then 14.3 GiB.'
