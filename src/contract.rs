@@ -300,6 +300,28 @@ pub struct TaskContract {
     /// the run's whole time budget and the run reports a budget stop, which is
     /// the wrong diagnosis for what happened.
     pub exec_timeout: Duration,
+    /// A wall clock for any child spawned without one of its own (0.50.0).
+    ///
+    /// `None` — the default — means a spawn that does not name
+    /// `background_after_secs` is waited for however long it takes, which is
+    /// every tree written before this release. Set it and a parent stops waiting
+    /// for a child that outlasts it, whether or not the model thought to ask.
+    ///
+    /// **It narrows and never widens.** A spawn naming a *longer* clock gets this
+    /// one; a spawn naming a shorter one keeps its own. That is the direction
+    /// every spawn argument already travels: a definition's `max_steps` outranks
+    /// the model's, and nothing the model writes in JSON can buy a child more
+    /// than the operator allowed.
+    pub spawn_background_after: Option<Duration>,
+    /// Whether a child may outlive the step that spawned it (0.50.0).
+    ///
+    /// `true` by default. Set it false and `"wait": false` is answered with a
+    /// blocking spawn and a line saying so — not an error, and never a silent
+    /// detachment. It is here for the embedder who wants 0.12.0's guarantee back
+    /// unconditionally: a tree whose children are all waited for produces the same
+    /// trace every time it is run, and a detached child gives that up for the
+    /// calls that use it.
+    pub detached_spawns: bool,
     /// Where this run's own commands may write, and under what caps.
     ///
     /// **Contained by default since 0.46.0.** The default is
@@ -490,6 +512,8 @@ impl TaskContract {
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
+            spawn_background_after: None,
+            detached_spawns: true,
             exec_sandbox: crate::sandbox::SandboxConfig {
                 limits: crate::sandbox::SandboxLimits::none(),
                 ..crate::sandbox::SandboxConfig::new()
@@ -557,6 +581,8 @@ impl TaskContract {
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
+            spawn_background_after: None,
+            detached_spawns: true,
             exec_sandbox: crate::sandbox::SandboxConfig {
                 limits: crate::sandbox::SandboxLimits::none(),
                 ..crate::sandbox::SandboxConfig::new()
@@ -1068,6 +1094,49 @@ impl TaskContract {
     #[must_use]
     pub fn with_max_parallel_reads(mut self, max_parallel_reads: usize) -> Self {
         self.max_parallel_reads = max_parallel_reads.max(1);
+        self
+    }
+
+    /// Stop waiting for any child that outlasts `after`, however the model asked
+    /// for it (0.50.0).
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use io_harness::TaskContract;
+    ///
+    /// let bounded = TaskContract::workspace("survey the crate", "/repo")
+    ///     .with_spawn_background_after(Duration::from_secs(120));
+    /// assert_eq!(bounded.spawn_background_after, Some(Duration::from_secs(120)));
+    ///
+    /// // The default: a child is waited for as long as it takes.
+    /// assert_eq!(
+    ///     TaskContract::workspace("survey the crate", "/repo").spawn_background_after,
+    ///     None,
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_spawn_background_after(mut self, after: Duration) -> Self {
+        self.spawn_background_after = Some(after);
+        self
+    }
+
+    /// Refuse to let a child outlive the step that spawned it (0.50.0).
+    ///
+    /// A `"wait": false` spawn becomes an ordinary blocking one and the parent is
+    /// told, so the model can adapt rather than believe it has fanned out. Use it
+    /// when a reproducible trace matters more than wall clock.
+    ///
+    /// ```
+    /// use io_harness::TaskContract;
+    ///
+    /// let strict = TaskContract::workspace("port the parser", "/repo")
+    ///     .without_detached_spawns();
+    /// assert!(!strict.detached_spawns);
+    /// assert!(TaskContract::workspace("port the parser", "/repo").detached_spawns);
+    /// ```
+    #[must_use]
+    pub fn without_detached_spawns(mut self) -> Self {
+        self.detached_spawns = false;
         self
     }
 

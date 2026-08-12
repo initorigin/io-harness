@@ -1120,3 +1120,165 @@ async fn a_tree_with_no_recorded_policy_is_refused_rather_than_resumed_permissiv
     .expect_err("a tree whose boundary cannot be recovered must not be resumed");
     assert!(matches!(&err, io_harness::Error::Resume { .. }), "{err:?}");
 }
+
+// ---------- 0.50.0 F7: a detached child is taken back after a restart ----------
+
+/// A coordinator that detaches one child and then finishes its own work, and a
+/// child that can be made slower than the process it is running in.
+///
+/// Stateless, like [`TreeProvider`]: which reply it gives is decided by what is in
+/// the request, so the same provider serves the run and the resume.
+struct DetachProvider {
+    child_delay: Duration,
+    /// Park the coordinator's *second* completion for ever, which is the honest
+    /// way to interrupt a run mid-step: the step is left uncommitted and the run
+    /// row stays `running`, exactly as a killed process leaves it.
+    park_parent: bool,
+}
+impl Provider for DetachProvider {
+    async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        if req.user.contains("COORDINATOR") {
+            // Once it has been told the child is detached, it gets on with its own
+            // work — so the spawn happens exactly once however often this is asked.
+            if req.user.contains("detached") {
+                if self.park_parent {
+                    std::future::pending::<()>().await;
+                }
+                return Ok(CompletionResponse {
+                    tool_calls: vec![call(
+                        "write_file",
+                        json!({ "path": "done.txt", "content": "ok" }),
+                    )],
+                    ..Default::default()
+                });
+            }
+            return Ok(CompletionResponse {
+                tool_calls: vec![call(
+                    "spawn_agent",
+                    json!({
+                        "goal": "FILE=a.txt CONTENT=ALPHA",
+                        "verify_file": "a.txt",
+                        "verify_contains": "ALPHA",
+                        "wait": false
+                    }),
+                )],
+                ..Default::default()
+            });
+        }
+        if req.user.contains("FILE=a.txt") {
+            if !self.child_delay.is_zero() {
+                tokio::time::sleep(self.child_delay).await;
+            }
+            return Ok(CompletionResponse {
+                text: Some("CHILD-CONCLUSION".into()),
+                tool_calls: vec![call(
+                    "write_file",
+                    json!({ "path": "a.txt", "content": "ALPHA" }),
+                )],
+                ..Default::default()
+            });
+        }
+        Ok(CompletionResponse::default())
+    }
+}
+
+/// 0.50.0 — F7: a child its parent stopped waiting for survives a process death.
+///
+/// A detached child's step **commits**, so the resume starts after it and the spawn
+/// call is never replayed. Without the re-adoption walk the child would be left
+/// with a `running` run row nobody drives — an orphan, and exactly what 0.48.0's
+/// "everything a run starts is inside the boundary" forbids. The child is resumed
+/// from its own checkpoint through the ordinary spawn path, so it is the same run
+/// row rather than a second child.
+#[tokio::test]
+async fn a_detached_child_is_readopted_after_a_restart() {
+    let dir = ws();
+    let db = dir.path().join("runs.db");
+    let store = Store::open(&db).unwrap();
+    let contract = TaskContract::workspace(
+        "COORDINATOR: delegate the file, do not wait, then finish.",
+        dir.path(),
+    )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "done.txt".into(),
+        needle: "ok".into(),
+    })
+    .with_max_steps(6);
+
+    // Cut the process off while the detached child is still working.
+    let slow = DetachProvider {
+        child_delay: Duration::from_secs(5),
+        park_parent: true,
+    };
+    let crashed = tokio::time::timeout(
+        Duration::from_millis(300),
+        run_tree(
+            &contract,
+            &slow,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &containment(),
+        ),
+    )
+    .await;
+    assert!(crashed.is_err(), "the run was cut off mid-flight");
+    let children_before = store.children(1).unwrap();
+    assert_eq!(children_before.len(), 1, "one child was detached");
+    assert!(
+        !dir.path().join("a.txt").exists(),
+        "the child had not finished when the process died"
+    );
+    drop(store);
+
+    // Restart: a fresh Store, a fresh in-memory ledger, nothing in flight.
+    let store = Store::open(&db).unwrap();
+    let fast = DetachProvider {
+        child_delay: Duration::ZERO,
+        park_parent: false,
+    };
+    let r = resume_tree(
+        &contract,
+        &fast,
+        &store,
+        1,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(r.outcome, RunOutcome::Success { .. }),
+        "the tree resumed to success, got {:?}",
+        r.outcome
+    );
+
+    // The same child, taken back rather than spawned again.
+    assert_eq!(
+        store.children(1).unwrap(),
+        children_before,
+        "the detached child was re-adopted, not duplicated"
+    );
+    let child = children_before[0];
+    let summary = store.run_summary(child).unwrap().expect("the child ended");
+    assert!(
+        summary.success,
+        "the re-adopted child finished, got {:?}",
+        summary.outcome
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "ALPHA",
+        "its work reached the workspace"
+    );
+    // And what it concluded is durable under its parent.
+    assert!(
+        store
+            .observations(1)
+            .unwrap()
+            .iter()
+            .any(|o| o.text.contains("CHILD-CONCLUSION")),
+        "the re-adopted child's report reaches its parent"
+    );
+}

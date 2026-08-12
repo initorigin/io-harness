@@ -5,7 +5,7 @@
 //! An operator writes `io.toml` and gets a permission boundary, sandbox caps,
 //! run budgets, per-ecosystem toolchain commands, MCP servers, a price table and
 //! — since 0.27.0 — which provider and model to run with what standing behind it,
-//! without compiling anything. io-cli and io-studio read the same file rather
+//! without compiling anything. An application layer reads the same file rather
 //! than inventing two formats that would have to be reconciled later, and `[app]`
 //! is the section that makes that literally true: the crate stores it and never
 //! looks inside.
@@ -259,8 +259,8 @@ struct File {
     // not a chain.
     #[serde(default)]
     provider: Vec<ProviderSpec>,
-    // 0.27.0. The one section this crate stores and never validates, so io-cli and
-    // io-studio keep their own settings in the same file. A `toml::value::Table`
+    // 0.27.0. The one section this crate stores and never validates, so an
+    // application layer keeps its own settings in the same file. A `toml::value::Table`
     // rather than a typed section is the whole feature; `Config::app` is generic
     // so no `toml` type reaches the public API.
     #[serde(default)]
@@ -993,7 +993,7 @@ impl Config {
     /// application's own type (0.27.0).
     ///
     /// This crate stores `[app]` and **never validates it**. That is the whole
-    /// feature: io-cli and io-studio keep their settings in the same file without the
+    /// feature: an application layer keeps its settings in the same file without the
     /// harness pretending to understand them, and an unknown key here is the caller's
     /// business rather than an error. Every other section still rejects what it does
     /// not know — this is one hole with a wall around it, not the wall coming down.

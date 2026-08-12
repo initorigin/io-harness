@@ -75,6 +75,7 @@
 
 use std::fmt;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -383,6 +384,28 @@ pub enum EventKind {
         child_run_id: i64,
         /// What the child was asked to do.
         goal: String,
+    },
+    /// (0.50.0) A parent stopped waiting for a child, which keeps running.
+    ///
+    /// Either because the spawn asked not to be waited for at all, or because it
+    /// named a wall clock the child crossed — `after` says which. The child is
+    /// **not** cancelled: a parent that stops waiting is not a parent that stops
+    /// the work, and the difference is the whole of `background_after_secs`.
+    ChildDetached {
+        /// The child's own run id.
+        child_run_id: i64,
+        /// The wall clock it crossed, when a clock is what ended the wait, and
+        /// `None` when the parent never waited at all.
+        after: Option<Duration>,
+    },
+    /// (0.50.0) A child a parent had stopped waiting for finished, and its report
+    /// reached the parent.
+    ///
+    /// Emitted at the step the report was folded into, which is later than the
+    /// step that spawned the child — that lateness is what detaching bought.
+    ChildCollected {
+        /// The report as the parent reads it.
+        text: String,
     },
     /// A spawn was refused by containment rather than performed.
     SpawnRefused {
@@ -1072,6 +1095,8 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "stalled",
     "spawned",
     "spawn_refused",
+    "child_detached",
+    "child_collected",
     "fleet",
     "memory_wrote",
     "todo_wrote",
@@ -1713,6 +1738,13 @@ mod tests {
                 port: 443,
                 allowed: true,
             },
+            EventKind::ChildDetached {
+                child_run_id: 2,
+                after: Some(Duration::from_secs(30)),
+            },
+            EventKind::ChildCollected {
+                text: "[child 2 \"survey the parser\" -> Success { steps: 4 }]".into(),
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
@@ -1772,6 +1804,9 @@ mod tests {
                 | EventKind::PromptComposed { .. }
                 // 0.46.0 — how this run's own commands are contained.
                 | EventKind::Contained { .. }
+                // 0.50.0 — a parent stopped waiting for a child, and later read it.
+                | EventKind::ChildDetached { .. }
+                | EventKind::ChildCollected { .. }
                 | EventKind::Finished { .. } => {}
             }
         }

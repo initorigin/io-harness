@@ -26,6 +26,72 @@ notes are produced from it.
 
 ### Security
 
+## [0.50.0] - 2026-08-12
+
+### Added
+
+- **A parent chooses how a child comes back.** `spawn_agent` takes two optional
+  arguments. `"wait": false` detaches the child: the parent takes its next step
+  immediately and the child's report reaches it at a later one.
+  `"background_after_secs"` waits, and stops waiting when the clock runs out. In
+  both cases the child keeps running — it is not cancelled, its work still lands,
+  and the tree does not return while it is going. Naming neither argument is the
+  spawn every existing caller writes today, unchanged: the parent waits, results
+  fold into the step that asked for them, and the trace is reproducible.
+- **A child reports what it concluded.** Through 0.49.0 a finished child was
+  composed into its parent's log as `[child 7 "goal" -> Success { steps: 4 }]` —
+  an outcome discriminant and a step count, and nothing it found, because
+  `RunOutcome::Success` carries no text. A parent that fanned out to investigate
+  four subsystems learned that four runs succeeded and none of their findings, and
+  the only way a finding could travel was a file the parent then read. A child's
+  composed result now carries the text of its last completion beside its steps and
+  its tokens, bounded by the same per-observation cap as everything else.
+- **An agent's own words are durable.** `AgentEvent::said` records what an agent
+  said on each step, in the table the tree already writes to. `steps.result` holds
+  the observations a step produced, and a completion's prose reached the ledger
+  only when it carried no tool call at all — so an agent that wrote a file and
+  explained why left the explanation nowhere. This is what a parent reads back as
+  its child's conclusion, including for a child a later process adopts.
+- **`AgentEvent::spawn_args`**, which records a spawn's own arguments so a
+  detached child can be resumed after a restart from the call that made it rather
+  than rebuilt from the five of nine arguments the `spawns` row keeps.
+- **`TaskContract::with_spawn_background_after`** applies a wall clock to any
+  child spawned without one, and **`TaskContract::without_detached_spawns`**
+  refuses to let a child outlive the step that spawned it at all. Both narrow and
+  never widen: a spawn asking for a longer clock gets the contract's, and a
+  refused detachment becomes an ordinary blocking spawn with a line in the
+  parent's log saying so.
+- **`EventKind::ChildDetached`** and **`EventKind::ChildCollected`**, so an
+  observer can render a fan-out that is no longer synchronous. Both are additive
+  on an enum that has been `#[non_exhaustive]` since 0.24.0.
+
+### Changed
+
+- **BREAKING (behaviour): a child's composed result carries its conclusion.** The
+  line a parent reads changed from `[child 7 "goal" -> Success { steps: 4 }]` to
+  the same opening plus the child's step and token counts and what it said. There
+  is no switch: a knob that reported the old shape would be a way to ask for this
+  release and quietly not get it. *Migration:* an embedder asserting on the exact
+  text of that observation matches the prefix `[child <id> "<goal>" ->` instead of
+  the whole line. Nothing about the outcome, the run id or the goal moved.
+- **A detached or backgrounded spawn gives up step-for-step trace
+  reproducibility** for the calls that use it: which step a report lands on depends
+  on how long the child took. Reports still fold in the order the children were
+  spawned rather than the order they finished, so two children racing leave the
+  same ledger, and a run that detaches nothing is byte-identical to one on 0.49.0.
+  `TaskContract::without_detached_spawns` refuses detachment outright.
+- A resumed parent takes back every child it detached and did not live to see
+  finish, before its first step, resuming each from its own checkpoint through the
+  ordinary spawn path rather than as a second child.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.49.0] - 2026-08-11
 
 ### Added

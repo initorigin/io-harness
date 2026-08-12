@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.49"
+io-harness = "0.50"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -283,6 +283,17 @@ That produced no error and nothing in a log, only degraded instruction following
 `CompletionRequest::user` is still filled and byte-identical to what it was, so a
 provider written against an earlier release keeps working.
 
+**A parent chooses how a child comes back, and a child says what it found.**
+`spawn_agent` takes `wait` and `background_after_secs`: a parent can carry on
+while a sub-agent works and read its report at a later step, and a child that
+outlasts a stated wall clock moves to the background instead of holding the tree.
+It is not cancelled — a parent that stops waiting is not a parent that stops the
+work — and a tree still never returns while a child it started is running. Through
+0.49.0 a child came back as `[child 7 "goal" -> Success { steps: 4 }]`: a
+discriminant and a step count, with nothing it concluded, so the only way a
+finding could travel was a file the parent then read. It now comes back with what
+it cost and what it said.
+
 **Provider-executed web search and fetch.** `TaskContract::with_web` declares what
 the provider may look up on the agent's behalf — search, optionally fetch, a cap on
 requests, and the hosts to allow or block — and each vendor translates that one
@@ -475,20 +486,6 @@ migration note saying what to write instead, and that a renamed or removed item
 goes through a deprecation cycle rather than vanishing between two releases.
 
 [docs/CONTRACT.md](docs/CONTRACT.md) states the whole of it.
-
-## Part of initorigin
-
-`IO Harness` is one of the [initorigin](https://github.com/initorigin) products:
-
-| Product | What it is | Status |
-| --- | --- | --- |
-| [io-harness](https://github.com/initorigin/io-harness) | The Rust agent harness (the center product) | Released |
-| io-cli | Terminal app on io-harness | Not built |
-| io-studio | Desktop coding studio on io-harness | Not built |
-
-io-harness is the one you can go and read. The other two are named so the shape
-of the whole is visible, and carry no link because there is nothing to send you
-to.
 
 ## Contributing
 

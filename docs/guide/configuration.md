@@ -338,7 +338,7 @@ width = 100
 open_tabs = ["trace", "policy"]
 ```
 
-The one section this crate keeps and does not understand, so io-cli, io-studio and
+The one section this crate keeps and does not understand, so an application layer and
 your own program keep their settings in the same file instead of inventing a
 second format beside it. Read it into your own type:
 
@@ -593,8 +593,8 @@ caller's own act — so treat a workspace the agent can write as a workspace who
 **The `[toolchain]` override is for the embedding application, not for this
 crate's run loop.** The harness detects a project's ecosystem for itself and does
 not consult a config, because reaching it would mean a new `TaskContract` field —
-a break this release does not carry. `Config::toolchain(detected)` gives io-cli,
-io-studio and any other caller the merged value today; the run loop wiring is a
+a break this release does not carry. `Config::toolchain(detected)` gives every
+caller the merged value today; the run loop wiring is a
 later release's job.
 
 **Two sections do not reject an unknown key, and they are these two.** A

@@ -244,7 +244,7 @@ Two working bypasses:
    ```
 
    made `assert!(false, "this gate can never pass")` — a criterion no honest file
-   can meet — report a pass. An agent found this unprompted during io-cli 0.1.0's
+   can meet — report a pass. An agent found this unprompted during an application's own
    live runs. It is not specific to `assert`: `assert_eq!` and every other
    prelude macro were open the same way, so a fix that blocklisted one name would
    have left the class open.

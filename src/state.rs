@@ -705,12 +705,13 @@ pub struct AgentEvent {
     pub run_id: i64,
     /// The step it occurred on.
     pub step: u32,
-    /// `"spawn"`, `"spawn_refused"`, or `"budget_draw"`.
+    /// `"spawn"`, `"spawn_refused"`, `"budget_draw"`, `"said"`, or
+    /// `"spawn_args"`.
     pub kind: String,
     /// The spawned child's run id, for a `"spawn"`.
     pub child_run_id: Option<i64>,
     /// Free-form detail: the child's goal for a spawn, the breached cap for a
-    /// refusal.
+    /// refusal, what the agent said for a `"said"`.
     pub detail: Option<String>,
     /// Tokens drawn, for a `"budget_draw"`.
     pub tokens: Option<u64>,
@@ -740,6 +741,57 @@ impl AgentEvent {
             kind: "spawn_refused".into(),
             child_run_id: None,
             detail: Some(cap.into()),
+            tokens: None,
+            remaining: None,
+        }
+    }
+
+    /// The arguments of a spawn, kept so a detached child can be re-adopted
+    /// after a restart (0.50.0).
+    ///
+    /// A blocking child never needs it: its parent's step is left uncommitted, so
+    /// the resume replays the spawn call and the arguments come with it. A child
+    /// the parent stopped waiting for commits its step and the call is gone —
+    /// while `spawns` holds only five of the nine arguments, so rebuilding from
+    /// that row would silently drop `agent` and `deny_net` and resume the child
+    /// under a wider policy than it was spawned with.
+    pub fn spawn_args(
+        run_id: i64,
+        step: u32,
+        child_run_id: i64,
+        arguments: &serde_json::Value,
+    ) -> Self {
+        Self {
+            run_id,
+            step,
+            kind: "spawn_args".into(),
+            child_run_id: Some(child_run_id),
+            detail: Some(arguments.to_string()),
+            tokens: None,
+            remaining: None,
+        }
+    }
+
+    /// What an agent said on this step, beside whatever it called (0.50.0).
+    ///
+    /// An agent's own words were durable nowhere before this: `steps.result`
+    /// holds the observations a step produced, and a completion's prose reached
+    /// the ledger only in the one case where it carried no tool call at all
+    /// (`(no tool call) …`). So an agent that wrote a file and explained why left
+    /// the explanation in memory and nothing else.
+    ///
+    /// The last of these rows for a run is what a parent composes as its child's
+    /// conclusion, and recording it per step rather than once at the end is what
+    /// makes that readable after the process that ran the child has exited —
+    /// including for a child a *later* process adopts. One row per step that said
+    /// something, alongside the `"budget_draw"` row every step already writes.
+    pub fn said(run_id: i64, step: u32, text: impl Into<String>) -> Self {
+        Self {
+            run_id,
+            step,
+            kind: "said".into(),
+            child_run_id: None,
+            detail: Some(text.into()),
             tokens: None,
             remaining: None,
         }
