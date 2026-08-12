@@ -1591,6 +1591,94 @@ outcome and re-adopts nothing. The child is not lost — it is resumable by its 
 run id — but it is not picked up automatically, and closing that would mean
 deferring the run's own ending until its children are finished.
 
+## What a change is kept as, and what an undo can reach (0.51.0)
+
+Every `write_file`, `edit_file` and `patch_file` records the change as a unified
+diff of the **whole file**, in `edits.hunk`, beside the two line counts it has
+recorded since 0.18.0. `Store::edits` hands it back and `Store::patch` renders a
+run's whole change as a step-ordered patch series — one `--- a/path` / `+++ b/path`
+header pair per edit, in the order the run made them.
+
+**A series, not one diff.** Two edits to the same file take their line numbers
+from that file as it stood at each of them, so the second hunk is only correct
+once the first has been applied. It applies as a sequence, the way a multi-commit
+diff does. Joining the hunks under one pair of headers would look like a patch and
+would not apply.
+
+**The counts did not change, and that is deliberate.** An `edit_file`'s
+`lines_added` and `lines_removed` still measure the fragment it replaced, not the
+file — which is what they have measured since 0.18.0. The two answers genuinely
+differ when a replacement does not begin and end on a line boundary: deleting a
+substring *inside* a line is nothing added and one line removed measured over the
+fragment, and one and one measured over the file. Computing both from the same
+texts would have been tidier and would have silently renumbered every trace ever
+recorded.
+
+**The hunk is one hunk, and not a minimal diff.** It is produced by trimming the
+common head and the common tail — the computation the counts already perform. For
+an `edit_file`, which is one contiguous replacement by construction, that *is* the
+minimal diff. For a `write_file` that rewrote two distant regions it is one hunk
+spanning both: a valid unified diff that reverse-applies exactly, and not the
+shortest one. A minimal diff is a dependency or several hundred lines of
+algorithm, and it buys shorter output rather than a capability.
+
+**Three reasons a hunk is absent, and none of them is "nothing happened".** The
+row was written before 0.51.0; the file's previous contents were not kept, so
+there was nothing to diff against — over the 1 MiB snapshot cap, or not UTF-8,
+and the reason is on that path's `snapshots` row; or the rendered diff would
+itself have exceeded that cap. An absent hunk is reported as absent everywhere it
+is read. It is never treated as an empty patch, because an empty patch reverts
+cleanly and reverts nothing.
+
+**`patch_file` is all or nothing.** Every hunk is matched against the file as it
+stands, at its own recorded position against the *original*, before anything is
+written. A patch whose third hunk does not fit leaves the file byte-identical,
+writes no `edits` row and no restore point, and says which hunk and what it
+expected. The match is exact: a fuzzy match is how a file gets quietly corrupted.
+One path per call, and it cannot create a file — a patch is anchored to text that
+already exists, and creating is `write_file`'s job.
+
+**`check` is the project's own checker as a question.** The same ecosystem
+type-check that has run automatically after every successful write since 0.20.0,
+callable before one. It takes no arguments, so what runs is the detection's
+answer and not the model's. It reports and never blocks: a failing check does not
+undo an edit.
+
+**`check` is `Act::Exec`-gated and the automatic post-edit check is not**, and the
+difference is deliberate rather than an oversight. The automatic one is the
+crate's own reflex after a write the policy already allowed. The tool is a
+model-callable path to the project's build command, so it is checked on the
+program *and* on the whole argv, exactly as `exec` is — `deny_exec("cargo")` and
+`deny_exec("cargo check*")` both reach it, and a refused call spawns nothing. The
+other difference: when there is no checker, the tool says so and the automatic
+path stays silent. Silence costs nothing when nobody asked and reads as "your
+project is clean" when somebody did.
+
+**`rewind_step` undoes one step, and you walk backwards.** `rewind` puts a file
+back to before the run's **first** write to it and `rewind_run` does that for a
+whole run; neither can undo step eighteen of twenty. `rewind_step` reverse-applies
+that step's stored hunks, one entry per path it wrote.
+
+Reverse-application is order-sensitive and the API says so rather than hiding it.
+A step reverted while a later step's change still sits on top of it finds context
+that has moved, and the answer is `Reverted::Stale` and an **untouched** file. To
+walk a run back, revert the newest step first and descend. `Reverted::NoHunk` is
+the other way nothing happens, and it is a different fact: there is nothing to
+undo with, and reverting the later steps first will not change that — `rewind` is
+what puts such a file back.
+
+Writing goes through `Workspace::write_file`, so the same path policy the edit
+obeyed governs the undo. Nothing in the trace is deleted, and the revert is itself
+written down: `Store::rewinds` reports it with `undid_step` set, which is what
+distinguishes it from a whole-run rewind, and one `EventKind::Reverted` is emitted
+carrying the count of paths actually put back.
+
+**What `rewind_step` does not do.** It does not replace `rewind`: a snapshot is a
+stronger restore than a chain of reverse-applies, and a run whose hunks are absent
+must still be fully undoable. It does not touch memory or the queue — those are
+`rewind_run`'s, and a step did not create them. And it is an operator-facing API,
+not a tool: no model can call it.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none

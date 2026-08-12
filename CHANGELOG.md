@@ -26,6 +26,91 @@ notes are produced from it.
 
 ### Security
 
+## [0.51.0] - 2026-08-12
+
+### Added
+
+- **A change is kept, not just counted.** Every `write_file`, `edit_file` and
+  `patch_file` now records the change as a unified diff of the whole file, in a
+  new nullable `edits.hunk` column read back through `Edit::hunk`. Through 0.50.0
+  a trace could say that step 7 added four lines to `src/parse.rs` and could not
+  say which: the two texts were compared, the lines counted, and both texts thrown
+  away. An operator reviewing an unattended run had to reconstruct the change from
+  the restore point, which exists per file per *run* and so cannot answer "what did
+  step 7 do" for a file the run wrote five times.
+- **`Store::patch`** renders a run's whole change as a step-ordered patch series —
+  one `--- a/path` / `+++ b/path` header pair per edit, in the order the run made
+  them. A series and not one diff, deliberately: two edits to the same file take
+  their line numbers from that file as it stood at each of them, so it applies as a
+  sequence the way a multi-commit diff does. An edit with no stored hunk contributes
+  a comment line saying so rather than being silently omitted.
+- **`patch_file`**, a third write tool taking a unified diff for one file. A change
+  touching four places in a file was four `edit_file` calls — four gate evaluations,
+  four checker runs and four round trips, with the file's line numbers moving under
+  the text the model read after the first of them. It is **all or nothing**: every
+  hunk is matched against the file at its own position, against the original, before
+  anything is written, so a patch whose third hunk does not fit leaves the file
+  byte-identical and says which hunk and what it expected. One path per call, and it
+  cannot create a file — that is still `write_file`.
+- **`check`**, the project's own type-check as a tool the agent may call *before* it
+  writes. The same ecosystem checker that has run automatically after every
+  successful write, asked as a question instead of received as a note. It takes no
+  arguments, so what runs is the detected command and not the model's guess. It is
+  an `Act::Exec` check on that command — the program *and* the whole argv, exactly
+  as `exec` is — because a model-callable path to the project's build command must
+  be refusable by the policy that refuses `exec`; the automatic post-edit check stays
+  ungated, being the crate's own reflex after a write the policy already allowed.
+  When there is no checker for this ecosystem the tool says so, where the automatic
+  path stays silent: an empty answer to a direct question reads as "your project is
+  clean".
+- **`rewind_step`** and **`rewind_step_observed`** undo one step by reverse-applying
+  its stored hunks, returning one `Reverted` per path that step wrote. `rewind` puts
+  a file back to before the run's *first* write to it and `rewind_run` does that for
+  a whole run; neither could undo step eighteen of twenty, so a run that did nineteen
+  right things and one wrong one had to be thrown away whole.
+- **`Reverted`**, with three variants because "it did not happen" has two causes an
+  operator must tell apart. `Stale` means the file has moved on — revert the later
+  steps first and it applies. `NoHunk` means there is nothing to undo with, and
+  never will be. Both leave the file untouched. **Reverse-application is
+  order-sensitive: walk a run back newest step first.**
+- **`rewinds.undid_step`** and **`RewindRecord::undid_step`**, so `Store::rewinds`
+  can tell a step revert from a whole-run rewind instead of reporting both as
+  "something was undone". `None` for a rewind.
+- **`EventKind::Reverted`**, additive on an enum `#[non_exhaustive]` since 0.24.0.
+
+### Changed
+
+- **BREAKING: `Edit` gains `hunk: Option<String>` and `RewindRecord` gains
+  `undid_step: Option<u32>`.** Both types are produced by the store and read by a
+  caller, and both derive `Default`, so `..Default::default()` keeps working and
+  only an exhaustive struct literal outside the crate breaks. *Migration:* add
+  `..Default::default()`, or name the new field. No trait method changed, so every
+  `impl Provider`, `impl Tool`, `impl Reviewer` and `impl Approver` compiles
+  unchanged.
+- **The line counts did not move, and that is the deliberate half.** An
+  `edit_file`'s `lines_added` and `lines_removed` still measure the fragment it
+  replaced rather than the file, which is what they have measured since 0.18.0. The
+  two answers genuinely differ when a replacement does not begin and end on a line
+  boundary — deleting a substring *inside* a line is nothing added and one line
+  removed over the fragment, and one and one over the file. Computing both from the
+  same texts would have been tidier and would have silently renumbered every trace
+  ever recorded.
+- **The tool catalogue grows by two schemas.** A run that calls neither new tool
+  behaves identically; `write_file` and `edit_file` take the same arguments, produce
+  the same observations and record the same counts.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+- **The new `check` tool cannot be used to run a build command the policy
+  refuses.** It is gated on the resolved argv before anything is spawned, and a
+  refused call spawns no process at all.
+
 ## [0.50.0] - 2026-08-12
 
 ### Added

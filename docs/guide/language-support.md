@@ -82,12 +82,25 @@ build system.
 `cargo test`, watch it fail, and have learned less than if it had been told to go
 and look.
 
-## The project's own checker, after an edit
+## The project's own checker, after an edit — and, since 0.51.0, before one
 
 Detection also decides what runs *after* an edit. As of 0.25.0 a successful
 `edit_file` in a project whose ecosystem `toolchain::detect` recognises runs that
 project's own type-check command and appends what it reported to the observation
 the model was going to read anyway.
+
+Since 0.51.0 the agent can also ask. The `check` tool runs the same command over
+the workspace on demand, so "is this tree already broken, and where" is a question
+before a write rather than a note after one. It takes no arguments: what runs is
+the detected command in the table below and not the model's guess at it.
+
+The two differ in exactly two ways, both deliberate. `check` is an `Act::Exec`
+check on the resolved command — the program *and* the whole argv, as `exec` is —
+because a model-callable path to the project's build command must be refusable by
+the policy that refuses `exec`; the automatic post-edit check is not gated, being
+the crate's own reflex after a write the policy already allowed. And when this
+ecosystem has no checker, `check` says so where the automatic path stays silent —
+an empty answer to a direct question reads as "your project is clean".
 
 What that buys is when the error arrives, not that it arrives. Until now an agent
 learned that its edit did not compile only by deciding to find out — call `exec`,

@@ -123,12 +123,13 @@ anywhere the run could not have written them. Removing is stricter: it refuses
 anything that is not an outright allow, because a write is content a human can
 inspect afterwards and a delete is not.
 
-**What one restore point per file per run does not offer.** There is no per-step
-undo, no rewind to step 4, and no redo. A previous file over 1 MiB or one that is
-not valid UTF-8 is `NotKept` — reported, and never guessed at, and never truncated.
-Only `write_file` and `edit_file` take a snapshot: a file changed by `shell`,
-`exec` or a git built-in has no restore point and answers `NotRecorded`. And
-`rewind` takes one path per call; `rewind_run` below is the whole-run form.
+**What one restore point per file per run does not offer.** There is no redo. A
+previous file over 1 MiB or one that is not valid UTF-8 is `NotKept` — reported,
+and never guessed at, and never truncated. Only `write_file`, `edit_file` and
+`patch_file` take a snapshot: a file changed by `shell`, `exec` or a git built-in
+has no restore point and answers `NotRecorded`. And `rewind` takes one path per
+call; `rewind_run` below is the whole-run form. Per-step undo was in this list
+until 0.51.0 and is now `rewind_step`, further down.
 
 ## Putting a whole run back (0.36.0)
 
@@ -173,6 +174,61 @@ not recalled, a migration is not reversed, a provider call is not un-billed, and
 a worktree is never removed. It is one run and not a tree — a caller wanting a
 subtree loops over it, which is honest about what "a rewind" means rather than
 inventing an ordering over children whose files may overlap.
+
+
+## Undoing one step (0.51.0)
+
+`rewind` undoes a file and `rewind_run` undoes a run. Neither can undo step
+eighteen of twenty, because the restore point is the state of a file before the
+run *first* wrote it. Since 0.51.0 every write also records the change itself, as
+a unified diff of the whole file, and `rewind_step` reverse-applies one step's:
+
+```rust
+use io_harness::{rewind_step, Reverted};
+
+for step in (1..=last).rev() {
+    for (path, what) in rewind_step(&workspace, &store, run_id, step)? {
+        match what {
+            Reverted::Applied(_) => println!("{step} {path}: put back"),
+            Reverted::Stale(why) => println!("{step} {path}: not touched — {why}"),
+            Reverted::NoHunk(why) => println!("{step} {path}: nothing to undo with — {why}"),
+        }
+    }
+}
+```
+
+**Walk backwards.** Reverse-application is order-sensitive: a step reverted while
+a later step's change still sits on top of it finds context that has moved, and
+the answer is `Stale` and an untouched file — never a fuzzy match that quietly
+corrupts it. Reverting the newest step first is what makes each one fit.
+
+`NoHunk` is the other way nothing happens, and it is a different fact: the row
+predates 0.51.0, or the file's previous contents were not kept, so there is
+nothing to undo with and reverting the later steps first will not change that.
+`rewind` is what puts such a file back.
+
+This does not replace `rewind`. A snapshot is a stronger restore than a chain of
+reverse-applies, and a run whose hunks are absent must still be fully undoable.
+And it undoes files only — memory and the queue are `rewind_run`'s, because a
+step did not create them.
+
+The revert is in the trace like everything else: `Store::rewinds` reports it with
+`undid_step` set, which is what distinguishes it from a whole-run rewind, and
+`rewind_step_observed` emits one `EventKind::Reverted` carrying how many paths
+were actually put back.
+
+## Reading a run's change as a patch (0.51.0)
+
+The same hunks answer a question that has nothing to do with undo. `Store::patch`
+renders a run's whole change as a step-ordered patch series — one
+`--- a/path` / `+++ b/path` header pair per edit, in the order the run made them —
+so an unattended run can be reviewed as a diff rather than as a list of line
+counts.
+
+It is a series, not one diff. Two edits to the same file take their line numbers
+from that file as it stood at each of them, so it applies as a sequence the way a
+multi-commit diff does; joining the hunks under one pair of headers would look
+like a patch and would not apply.
 
 ## See also
 

@@ -1,0 +1,903 @@
+product: io-harness
+version: 0.51.0
+status: released
+release_type: minor
+
+outcome:
+  user_can: >
+    Read what a run changed as a patch, hand a run a patch to apply, ask the project's own checker a
+    question before writing rather than only after, and walk a run's edits back one step at a time.
+    Four things that are one thing: **the change becomes an artifact the crate keeps, instead of a
+    pair of counts it throws away.**
+
+    **What a change is worth today, in the store, is two integers.** `Edit::measure`
+    (`src/state.rs:2438`) is handed the old text and the new text, computes the common head and the
+    common tail, and keeps `lines_added` and `lines_removed` — then discards both texts. The `edits`
+    table (`src/state.rs:3060-3069`) has no column for anything else. So a trace can say that step 7
+    added four lines and removed one to `src/parse.rs`, and cannot say **which**. An operator
+    reviewing an unattended run has to reconstruct the change from the restore point, which exists
+    per *file per run* (`src/run.rs:459-464`: "before the run's **first** write to it, not before its
+    last") and therefore cannot answer "what did step 7 do" for a file the run wrote five times.
+    The crate's own source already names this as the gap: `src/verify.rs:746` says, of the
+    before-and-after rendering a reviewer is handed, *"Not a unified diff: computing one is 0.51.0's
+    work, where the hunks are stored and a patch tool needs them."*
+
+    **A multi-hunk change costs one call per hunk.** `edit_file` is a single search-and-replace whose
+    search text must occur exactly once (`src/tools/workspace.rs:489-505`), so a change touching four
+    places in one file is four tool calls, four gate evaluations, four checker runs
+    (`src/run.rs:9738`) and four round trips — and after the second one the model is editing a file
+    whose line numbers have moved under the text it read. `write_file` is the escape hatch and it is
+    the wrong one: it costs tokens proportional to the file rather than to the change, and it
+    rewrites content the agent never intended to touch, which is the reason `edit_file` was added in
+    0.17.0 in the first place.
+
+    **The checker only ever speaks after the fact.** `diagnostics::after_edit` runs the ecosystem's
+    cheap type-check after a successful write (`src/run.rs:9733-9740`) and is deliberately unable to
+    fail the edit — "the write is already on disk by the time this runs". A model that wants to know
+    whether the tree currently compiles *before* it decides what to write has no way to ask; the only
+    route is `exec` with an argv it has to guess, on a project whose ecosystem the crate has already
+    detected (`toolchain::detect`) and whose check command it already knows
+    (`src/tools/diagnostics.rs:113-143`).
+
+    **And undo has one granularity.** `rewind` puts a file back to before the run's first write and
+    `rewind_run` (0.36.0) does that for every file plus memory and the queue. There is nothing
+    between "undo the whole run" and nothing at all. A twenty-step run whose step 18 was wrong is
+    rewound to step 0 or left alone.
+
+  business_value: >
+    **A trace that cannot show the change cannot be reviewed, and review is what the crate has been
+    building toward for four releases.** 0.28.0 added restore points, 0.36.0 added a whole-run undo,
+    0.42.0 added `Reviewer::review_change` and `ChangeReview`/`FileChange` so a model grades the
+    change rather than the outcome. Every one of those reads or writes *whole files*, because whole
+    files is all the store has. The reviewer is handed both texts and asked to work out the
+    difference itself — which is tokens spent re-deriving something the crate computed at write time
+    and threw away. Storing the hunk is the cheapest thing in this release and it is the one the
+    other three rest on.
+
+    **The per-call cost of an edit is the crate's most-paid tax.** Every `edit_file` is a gate
+    evaluation, a snapshot read, a policy event, a checker run and a full provider round trip with
+    the whole system prefix. A four-hunk change is that five times over — and the crate pays for the
+    tool catalogue on every request of every run under 0.38.0's cacheable prefix, so the fix has to
+    be one more schema rather than a protocol. A patch tool collapses N calls into one, and the
+    anchoring is what makes it safe: a unified diff carries its own context lines, so an edit that
+    no longer fits is refused with the hunk named instead of applied at a line that has moved.
+
+    **A checker the model can ask is the difference between a fix and a guess.** The crate already
+    knows the ecosystem, already knows the check command, already runs it, and already bounds it by
+    the run's own timeout and observation cap. Exposing it costs one tool schema and it turns "write,
+    then find out" into "find out, then write" — which is the loop a human uses and the one that
+    stops a model from stacking three edits on top of a break it introduced in the first.
+
+    **And step-granular undo is what makes an unattended run recoverable rather than disposable.**
+    Today the operator's only lever is all-or-nothing, so a run that did nineteen right things and
+    one wrong one is thrown away whole. With the hunks stored, walking back is reverse-applying them
+    newest first — no new durable state beyond the hunks themselves, and no second restore-point
+    mechanism competing with 0.28.0's.
+
+  evidence_of_value: >
+    Executed in the technique the last twenty releases used: a discriminating assertion per claim,
+    negative controls that must not move, one sabotage per arm of every two-armed claim, and a
+    sabotage that fails nothing reported as a finding rather than propped up.
+
+    **The hunk is proven by reverse-application, not by shape.** Asserting that the stored text
+    starts with `@@` would pass for a diff whose line numbers are the *fragment's* rather than the
+    file's — which is exactly the bug this release is most likely to ship, because
+    `record_edit`'s `edit_file` caller is handed `search` and `replacement` and not the file
+    (`src/run.rs:9723-9731`). The criterion applies the stored hunk in reverse to the file's after
+    text and requires the before text back **byte for byte**, which no wrong line number survives.
+
+    **The line counts are a byte-identity control, because this release must not move them.**
+    `lines_added`/`lines_removed` have meant "the size of the replacement" for `edit_file` since
+    0.18.0 and the reason is written down at the call site (`src/run.rs:9712-9715`). Computing the
+    hunk needs the whole file; measuring the counts from the whole file too would be the natural
+    tidy-up and would silently change every number in every existing trace. The criterion asserts the
+    counts are unchanged over a corpus, and the sabotage is the tidy-up.
+
+    **All-or-nothing patching is proven as an absence.** A patch whose second hunk does not fit must
+    leave the file byte-identical to what it was — asserted on the file's bytes and on the absence of
+    an `edits` row, because a build that applies hunks one at a time and stops at the first failure
+    passes any assertion that only reads the error message.
+
+    **The checker tool is proven to be gated, which is the security half.** `diagnostics::after_edit`
+    runs today with no `Act::Exec` check, and correctly — it is the crate's own reflex after a write
+    the policy already allowed. The moment a *model* can call it, an ungated path is a way to run the
+    project's build command on a policy that denies it. The criterion is that a policy denying the
+    checker's own program refuses the call and spawns nothing, asserted as an absence.
+
+    **Ordering is proven, because reverse-application is order-sensitive and the release says so.**
+    A step revert applied out of order finds context that no longer matches; the criterion asserts
+    that a newest-first walk restores each intermediate state exactly, and that an out-of-order
+    revert reports `Stale` and changes **nothing** — the honest answer, rather than a forced apply
+    that corrupts the file.
+
+    **And the old store is proven to still read.** Two additive columns mean a 0.50.0 store opened by
+    this build has `hunk` NULL for every edit it already holds. The criterion is that
+    `rewind_step` on such a run reports `NoHunk` and touches no file, rather than treating an absent
+    hunk as an empty one.
+
+scope:
+  included:
+  - >
+    **The hunk is stored, and it is anchored to the file.** `edits` gains one additive column
+    `hunk TEXT` by the established `let _ = conn.execute("ALTER TABLE edits ADD COLUMN hunk TEXT")`
+    line (`src/state.rs:3495` is the 0.37.0 precedent), and `Edit` gains `pub hunk: Option<String>`.
+    The text is a unified diff of the **whole file** before and after this edit — `@@` line numbers
+    that mean what a reader of that file expects — computed by the same common-head/common-tail walk
+    `Edit::measure` already performs, so one hunk per edit and no diff algorithm and no dependency.
+    `Edit::measure`'s own signature and its two counts are **untouched**: the hunk is a second,
+    separate computation over the file's two texts, so 0.18.0's fragment-measured counts keep the
+    meaning their call site documents.
+  - >
+    **A hunk is stored exactly when there is one to store, and the two absences are honest.**
+    `None` when the edit changed nothing (`Wrote::Unchanged`), when the before text was not kept —
+    over `MAX_SNAPSHOT_BYTES` or not UTF-8, which `read_before` (`src/run.rs:12185`) already
+    distinguishes and whose reason is already on the snapshot row — or when the rendered diff would
+    itself exceed that cap. No new cap constant, no new type: the bound that already governs a
+    restore point governs this.
+  - >
+    **`Store::patch(run_id)` renders a run's change as a step-ordered patch series.** One
+    `--- a/<path>` / `+++ b/<path>` header and one hunk per edit, in step order, which is what a
+    human reviews and what applies cleanly in sequence. Named and documented as a **series**, not as
+    one diff: successive edits to one file have shifting line numbers, and a rendering that implied
+    otherwise would be a patch that does not apply.
+  - >
+    **`patch_file`, a third write tool beside `write_file` and `edit_file`.** `PATCH_FILE_TOOL` in
+    `src/tools/mod.rs`, taking `path` and `patch` — a unified diff body for that one file, one or
+    many hunks. Gated by the same `Act::Write` check on the same path as the other two, because it is
+    the same act, with the patch body offered as the content so a human answering an `Ask` sees what
+    is going in. The parser accepts `@@ -a,b +c,d @@` headers, ` `/`-`/`+` body lines and
+    `\ No newline at end of file`, and refuses anything else by name rather than skipping it.
+  - >
+    **A patch is all-or-nothing, and the check happens before the write.** Every hunk's context and
+    removed lines are matched against the current file first; if any hunk does not fit, nothing is
+    written, no `edits` row and no snapshot row are recorded, and the observation names the hunk
+    index and the line it expected — the same shape `edit_file`'s zero-match and many-match refusals
+    already have (`src/tools/workspace.rs:491-504`), so the model recovers by reading and retrying
+    rather than by discovering a half-patched file. Later hunks are matched at their own offsets
+    against the *original* file, so a patch produced from one read of the file applies as a unit.
+  - >
+    **A patch cannot create a file and cannot delete one.** A patch against an absent path is the
+    same refusal `edit_file` gives, for the same reason: creating is `write_file`'s job and a
+    `/dev/null` header is a second semantics for a tool whose whole value is that it is anchored to
+    text that already exists.
+  - >
+    **`check`, the project's own checker as a tool the model may call.** `CHECK_TOOL` in
+    `src/tools/mod.rs`, no arguments, running the same `diagnostics::after_edit` machinery
+    (`src/tools/diagnostics.rs:162`) over the workspace root with the run's own `exec_timeout` and
+    observation cap — the detected ecosystem's cheap type-check, not its build, exactly as the
+    table at `src/tools/diagnostics.rs:113-143` already decides.
+  - >
+    **The checker tool is an `Act::Exec` check on the checker's own program, and a skip is spoken
+    aloud.** The automatic post-edit path stays ungated and stays silent on `Outcome::Skipped`
+    (`src/run.rs:11166-11168`) — there, silence costs nothing because the model did not ask. A model
+    that *asked* is told: `Skipped` becomes an observation naming the reason, because an empty answer
+    to a direct question reads as "your project is clean" and would be a lie in the one case the
+    variant exists to distinguish.
+  - >
+    **`rewind_step(ws, store, run_id, step)`, undoing one step's edits by reverse-applying their
+    stored hunks.** Returns `Vec<(String, Reverted)>` — one entry per path that step wrote, in the
+    order it wrote them. `Reverted` is a new `#[non_exhaustive]` enum with three variants that are
+    three different facts: `Applied(Wrote)` carrying what the workspace said, `Stale(String)` when
+    the file no longer matches the hunk's context so **nothing was changed**, and `NoHunk(String)`
+    when no hunk was stored for that edit. Writing goes through `Workspace::write_file` exactly as
+    `rewind` does, so an undo cannot put bytes anywhere the run could not have written them.
+  - >
+    **Walking a run back is a loop over `rewind_step`, newest step first, and the documentation says
+    so plainly.** Reverse-application is order-sensitive: a step reverted while a later step's change
+    still sits on top of it finds context that has moved, and the answer is `Stale` and an untouched
+    file — never a forced apply. This is the one property that decides whether the feature is safe,
+    so it is stated at the function, in `docs/CONTRACT.md` and in the changelog rather than left to
+    be discovered.
+  - >
+    **`rewind_step` never competes with `rewind`.** 0.28.0's restore point stays the answer to "undo
+    this run" and is unchanged; the hunks answer "undo this step". `rewind_run` is not rewritten to
+    use hunks — a snapshot is a stronger restore than a chain of reverse-applies and a run whose
+    hunks are absent must still be fully undoable.
+  - >
+    **The revert is in the trace, distinguishably.** `rewinds` gains one additive column
+    `undid_step INTEGER` (NULL for a whole-run rewind) and `RewindRecord` gains
+    `pub undid_step: Option<u32>`, so `Store::rewinds` can no longer report a step revert and a run
+    rewind as the same event. Plus one additive `EventKind::Reverted { undid_step, files }` —
+    deliberately **not** named `step`, because the kind is `#[serde(flatten)]`ed into `RunEvent` and
+    a variant field named like the envelope's is a duplicate key that compiles, serialises and fails
+    only on the way back.
+  - >
+    **The reporting surfaces, updated in this release and not the next one.** `docs/CONTRACT.md`
+    gains what is stored per edit, what a patch may and may not do, what the checker tool is gated on,
+    and the ordering rule for step reverts. `src/verify.rs:744-749`'s comment — which today says
+    computing a unified diff is 0.51.0's work — is rewritten to say the hunks are now stored and why
+    `review_change` still renders both texts. `src/lib.rs`, the README and `CHANGELOG.md` agree, and
+    `tests/docs_drift.rs` and `tests/changelog.rs` pass.
+  excluded:
+  - >
+    **A minimal diff.** The stored hunk is one hunk per edit, produced by trimming the common head
+    and the common tail — the computation `Edit::measure` already performs. For an `edit_file` that
+    is exactly the change. For a `write_file` that rewrote two distant regions it is one hunk
+    spanning both, which is a **valid** unified diff that reverse-applies exactly and is not the
+    smallest one. A Myers or patience diff is a dependency or several hundred lines of algorithm, and
+    it buys shorter output rather than a different capability. Stated in `known_limitations` rather
+    than implied by silence.
+  - >
+    **A multi-file patch in one call.** `patch_file` takes one `path` and the hunks for it. A
+    multi-file diff would mean N `Act::Write` gate evaluations inside one tool call, an answer for
+    what happens when the third path is refused after the first two were written, and a partial-
+    application story the all-or-nothing rule above exists to avoid. One path per call keeps the gate
+    exactly the gate it is.
+  - >
+    **Rendering the diff into `ChangeReview`.** 0.42.0's reviewer keeps being handed `before` and
+    `after` per file. What a rubric about what a change *did* needs is both texts, and both texts is
+    what the store already holds; swapping in a diff would narrow what the reviewer can see in order
+    to save tokens the reviewer is spending on purpose. The comment that pointed here is corrected,
+    not acted on.
+  - >
+    **Any new table or index, and any `CHECKPOINT_FORMAT` movement.** Two additive columns by
+    `ALTER TABLE ADD COLUMN`, which is the shape every addition since 0.13.0 has used, and no
+    checkpoint layout changes. A 0.50.0 store and a 0.51.0 store are the same store in both
+    directions.
+  - >
+    **Changing what `edit_file` or `write_file` do, by one byte.** Same arguments, same gate, same
+    refusals, same observation text, same line counts. The only difference is a column that now has
+    a value in it.
+  - >
+    **A checker the model can configure.** `check` takes no arguments. Choosing the command is
+    `toolchain::detect`'s job and overriding it is `exec`'s; a tool that took an argv would be `exec`
+    with a shorter name and without `exec`'s per-argument policy check.
+  - >
+    **Failing an edit on a checker verdict.** `check` reports; it never blocks. The automatic
+    post-edit call keeps being unable to fail a write, for the reason written at its call site, and
+    the new tool is a question rather than a gate.
+  fallback_scope:
+  - >
+    **The hunks are stored and the run's change renders as a patch.** The column, `Edit::hunk`,
+    `Store::patch`, and the documentation. This is a coherent release on its own and it is the half
+    the other three rest on: a trace that can show the change is what makes review, patching and
+    step-granular undo mean anything, and it is the thing the crate's own source has been pointing at
+    since 0.42.0.
+  - >
+    Dropped under pressure, in this order: the `check` tool first (it is the most separable — the
+    checker already runs after every edit, so the model is not blind, only late), then `rewind_step`
+    and its two trace surfaces (the hunks are stored either way and an operator can reverse-apply
+    them by hand), then `patch_file` — under which the release is the fallback above. Each dropped
+    piece stays in the roadmap as named work rather than being quietly lost.
+
+acceptance:
+  functional:
+  - >
+    **F1 — a stored hunk is anchored to the file and reverse-applies byte for byte.** A run edits a
+    file at a known line with `edit_file`; `Store::edits(run)` returns that edit with a `hunk` whose
+    `@@` header names the **file's** line numbers, and applying it in reverse to the file's after
+    text reproduces the before text byte for byte, trailing newline included. Asserted for a change
+    at the start of a file, in the middle, at the end, and in a file with no final newline —
+    four positions, because a fragment-anchored diff is right by accident at the start and wrong
+    everywhere else. Sabotage: compute the hunk from `search`/`replacement` rather than from the
+    file's two texts, under which every position but the first fails and nothing else here does.
+  - >
+    **F2 — the line counts do not move, and this is the negative control the release rests on.**
+    Over a corpus of `edit_file` and `write_file` calls covering replacement, insertion, deletion and
+    a rewrite with identical content, `lines_added` and `lines_removed` are identical to this build's
+    for every row. Sabotage: measure the counts from the whole-file texts the hunk is computed from —
+    the natural tidy-up — under which at least one count moves and F1 still passes.
+  - >
+    **F3 — `patch_file` applies a multi-hunk change in one call.** A patch with three hunks at
+    separated line ranges is applied by one tool call; the file afterwards is byte-identical to the
+    result of applying the same three changes as three `edit_file` calls, one `edits` row is written
+    for the patch, and one snapshot row. Sabotage: apply the hunks in sequence against the file as it
+    is being rewritten rather than at their own offsets against the original, under which the second
+    and third hunks land at moved lines and the byte-identity assertion fails.
+  - >
+    **F4 — a patch that does not fit changes nothing.** A patch whose first hunk fits and whose
+    second does not leaves the file byte-identical to what it was, writes **no** `edits` row and
+    **no** snapshot row, and produces an observation naming the failing hunk's index and the line it
+    expected. Asserted as an absence and a presence together, because a build that stops at the first
+    failure after writing the first hunk passes any assertion that reads only the message. Sabotage:
+    apply each hunk as it is validated, under which the byte-identity assertion fails and only this
+    fails.
+  - >
+    **F5 — the checker answers a question the model asked, including when it has nothing to say.** In
+    a workspace whose ecosystem has a check command, `check` on a clean tree returns an observation
+    saying so; on a broken tree it returns the checker's findings; and in a workspace with **no**
+    detected ecosystem it returns an observation naming the skip. The third is the discriminating
+    one: the automatic post-edit path maps `Outcome::Skipped` to the empty string
+    (`src/run.rs:11166-11168`) and the tool must not. Sabotage: route the tool through
+    `diagnostics_after_write`'s mapping, under which the skip arm returns nothing and only this
+    fails.
+  - >
+    **F6 — the checker tool is policy-gated and the automatic path is not.** Under a policy denying
+    `Act::Exec` on the detected checker's program, a `check` call is refused, **no process is
+    spawned**, and the refusal names the rule — while an `edit_file` under that same policy still
+    succeeds and still carries its automatic post-edit diagnostics, because that path is the crate's
+    own reflex after a write the policy already allowed. Both halves asserted in one test, since the
+    release's claim is the distinction between them. Sabotage: call `diagnostics::after_edit`
+    directly from the tool arm without the gate, under which the no-process assertion fails and only
+    this fails.
+  - >
+    **F7 — a newest-first walk restores every intermediate state exactly.** A run writes one file at
+    steps 2, 4 and 6; reverting step 6, then 4, then 2 leaves the file byte-identical, after each
+    revert, to what it held at the end of the preceding step, and byte-identical after the last to
+    what `rewind` for that run produces. Asserted at each intermediate state rather than only at the
+    end, because a build that reverse-applies in the wrong order can still arrive at the right final
+    text when the changes do not overlap. Sabotage: apply the hunk forward instead of in reverse,
+    under which the first intermediate assertion fails.
+  - >
+    **F8 — an out-of-order revert reports `Stale` and touches nothing.** Reverting step 2 while steps
+    4 and 6 still stand, where step 4 changed the same lines, returns `Reverted::Stale` and leaves
+    the file byte-identical; no write is attempted, so a read-only path under the policy is not
+    refused — it is not reached. Sabotage: skip the context match and apply anyway, under which the
+    byte-identity assertion fails and only this fails.
+  - >
+    **F9 — an edit with no stored hunk is reported, not treated as empty.** A run whose edit predates
+    this release — a 0.50.0 store opened by this build, so `hunk` is NULL — reports
+    `Reverted::NoHunk` for that path and leaves the file byte-identical. The same answer for an edit
+    whose before text was `Kept::Unkept`. Sabotage: treat a NULL hunk as an empty patch, under which
+    the revert reports success having done nothing and the assertion that it reported `NoHunk` fails.
+  - >
+    **F10 — a step revert is distinguishable in the trace from a run rewind.** `Store::rewinds`
+    reports `undid_step: Some(4)` for a step revert and `None` for a `rewind_run` on the same run,
+    and exactly one `EventKind::Reverted { undid_step, files }` is emitted per `rewind_step` call
+    carrying the count from the value being returned rather than from a second query. The event
+    round-trips through `serde` with no duplicate key, which is asserted rather than assumed.
+    Sabotage: leave `undid_step` NULL for both, under which the distinguishability assertion fails
+    and only this fails.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402**
+    crates on macOS and Linux. The differ is the head-and-tail walk `Edit::measure` already performs;
+    the unified-diff parser and applier are written in this crate. A diff or patch crate is a
+    criterion failure, not a trade-off.
+  - >
+    **N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
+  - >
+    **N3 — the break is exactly two fields on two read-only types, and it is stated rather than
+    discovered.** `Edit` gains `hunk: Option<String>` and `RewindRecord` gains
+    `undid_step: Option<u32>`. Both derive `Default` and both are produced by the store and consumed
+    by a caller, never constructed by one in any doc example, test or example in this repository — so
+    `..Default::default()` keeps working and only an exhaustive struct literal outside the crate
+    breaks, which is the same cost `media` (0.15.0) and `effort` (0.31.0) were counted at. Neither
+    takes `#[non_exhaustive]`: the attribute forbids functional update too, and `Edit` is the type a
+    caller reads out of a trace. No trait method changes, so every `impl Provider`, `impl Tool`,
+    `impl Reviewer` and `impl Approver` compiles unchanged. `docs/public-api.txt` gains **the
+    enumerated crate-root additions only** — `enum Reverted` and `fn rewind_step` — stated as the
+    enumerated additions rather than as a line count, because that checker enumerates crate-root
+    re-exports and a criterion promising a number has been met in a different form in four of the
+    last twelve releases. `PATCH_FILE_TOOL` and `CHECK_TOOL` live in `tools` and add no line, as
+    `EDIT_FILE_TOOL` does not.
+  - >
+    **N4 — the DDL is exactly two additive columns and nothing else.** `git diff main --
+    src/state.rs` shows `ALTER TABLE edits ADD COLUMN hunk TEXT` and
+    `ALTER TABLE rewinds ADD COLUMN undid_step INTEGER`, each by the established
+    `let _ = conn.execute(..)` line, and no `CREATE TABLE`, no `CREATE INDEX` and no
+    `CHECKPOINT_FORMAT` movement — it stays at 7.
+  - >
+    **N5 — the release's own number, and it is the per-call cost of a multi-hunk change.** A stated
+    four-hunk change to one file is driven twice against a scripted provider: once as four
+    `edit_file` calls and once as one `patch_file` call. Recorded in the release record: the provider
+    calls, the steps, the prompt tokens and the gate evaluations for each arm, and the stored hunk's
+    size against the file's size for the same edit. The patch arm must take **one** provider call and
+    **one** gate evaluation where the edit arm takes four of each; a figure that says otherwise is a
+    feature that did not ship rather than a test to adjust.
+  - >
+    **N6 — a run that uses neither new tool is byte-identical in trace to this build's.** Every
+    existing suite that touches these paths — `tests/edit_file.rs`, `tests/edit_tool.rs`,
+    `tests/multi_file.rs`, `tests/rewind.rs`, `tests/review_change.rs`, `tests/verify_gate.rs` —
+    passes unchanged apart from assertions that quote the tool catalogue, each of which is updated
+    with a sentence saying the catalogue deliberately grew. `steps.decision` and `steps.result` for a
+    run of `edit_file` and `write_file` calls are byte-identical, and the only observable difference
+    in the store is a column that now has a value.
+  - >
+    **N7 — the tool catalogue grows by exactly two schemas and no protocol.** `patch_file` and
+    `check` are added; no existing tool's schema changes, so 0.38.0's cacheable system prefix moves
+    by those two schemas' own bytes and nothing else. Asserted by the composed system prompt
+    differing from this build's only in the added schemas.
+  operational:
+  - >
+    **O1 — the full suite passes on all three platforms**, on the standing CI matrix including
+    0.47.0's `contained (ubuntu, userns restricted)` leg. A hand-written unified-diff parser is
+    precisely the code that passes on the host that wrote the fixture and fails on the one with
+    different line endings, so a green macOS gate is not evidence here: line-ending and
+    final-newline handling are asserted explicitly and on every platform.
+  - >
+    **O2 — cross-version is proven in both directions, including the NULL case.** A 0.50.0 store
+    opened by this build gains both columns by `ALTER TABLE` and reports `hunk: None` and
+    `undid_step: None` for every row it already held; a 0.51.0 store opened by 0.50.0 ignores both
+    columns and reads every other field unchanged. Asserted by the existing cross-version suites plus
+    the F9 case, which is the one an existing suite cannot cover because it is about a column that
+    did not exist.
+  - >
+    **O3 — no test gates on a wall clock it does not own.** The `check` tool runs a real project
+    checker, so its tests use a fixture workspace whose check is trivially fast and assert the
+    **structure** of the answer — clean, findings, skipped, refused — recording any timing rather than
+    asserting on it. A criterion that would fail on a busy runner is a flake this repository has paid
+    for eight times, and the standing rule applies.
+  - >
+    **O4 — the documentation surfaces agree with the code, in the same release.**
+    `docs/CONTRACT.md`, `src/lib.rs`, the README and `CHANGELOG.md` describe what is stored per edit,
+    what a patch may and may not do, what the checker tool is gated on, and the newest-first ordering
+    rule for step reverts. `src/verify.rs`'s comment naming this release as future work is corrected
+    in this release. `tests/docs_drift.rs`, `tests/changelog.rs`, `tests/readme.rs`,
+    `tests/guide_pages.rs` and `tests/public_api.rs` pass.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.51.0, GitHub at initorigin/io-harness with the tag `v0.51.0` and a
+    Release titled `io-harness 0.51.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.51.0` off `develop`, committed incrementally as it lands,
+    including the sealed UltraShip release record and the hand-appended lock pin. PR into `develop`,
+    merged with the PR button. `develop`'s head **and tree** checked against the tree the gates ran
+    on immediately before the release PR is opened. Release PR `develop` into `main`, merged the same
+    way. The GitHub Release is cut by `release.yml` —
+    `gh workflow run release.yml --ref main -f version=0.51.0` — which takes its notes verbatim from
+    the changelog. `cargo publish --locked` by hand afterwards, always last, after both merges and
+    the Release exist, with the registry token sourced from the repo-local `.env` in the same shell
+    invocation. `develop` synced to `main` fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    **Two additive columns, applied in place on open.** `edits.hunk` and `rewinds.undid_step`, by the
+    `ALTER TABLE ADD COLUMN` line every addition since 0.13.0 has used, tolerating the
+    already-exists error the same way. An operator does nothing. `CHECKPOINT_FORMAT` is unmoved at 7,
+    and a 0.50.0 store and a 0.51.0 store are the same store in both directions.
+  - >
+    **Rows written before this release have no hunk, and the crate says so rather than guessing.**
+    `rewind_step` on an edit recorded by an earlier version reports `Reverted::NoHunk` and changes
+    nothing. The whole-run `rewind` is unaffected, because it reads the snapshot and not the hunk.
+  - >
+    **One compile break, on two read-only types.** `Edit` and `RewindRecord` each gain one field. A
+    caller reading them out of the store — which is every caller, since neither is constructible in
+    any documented flow — changes nothing; an exhaustive struct literal outside the crate adds
+    `..Default::default()`. The changelog states both fields by name so the fix is a one-line edit
+    rather than a discovery.
+  - >
+    **No behaviour change to any existing tool.** `write_file` and `edit_file` take the same
+    arguments, produce the same observations and record the same line counts. Two tools are added,
+    and a model that never calls them runs identically.
+  observability:
+  - >
+    One additive `EventKind::Reverted { undid_step, files }`, emitted once per `rewind_step` beside
+    the existing `Rewound`, carrying its counts from the value being returned rather than from a
+    second query — a number re-read from the store would be true whether or not the revert happened,
+    which is the defect 0.32.0 paid to learn. Neither field is named like the envelope's.
+  - >
+    `Store::rewinds` distinguishes a step revert from a run rewind by `undid_step`, so the trace
+    answers "what was undone" and not only "something was".
+  - >
+    `Store::patch(run_id)` is the operator-facing read: the run's whole change as a step-ordered
+    patch series, from rows the run already wrote.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.51.1 and `cargo yank --version
+    0.51.0` is the escape hatch, leaving 0.50.0 as what `cargo install` resolves. Reverting the
+    behaviour needs no downgrade and no flag: a caller that calls neither new tool and reads neither
+    new field gets the crate it had, which is what N6 asserts. The store is forward and backward
+    compatible by construction — two nullable columns an older binary does not select — so a
+    downgrade after a run is a downgrade, not a migration.
+
+dependencies:
+  products: []
+  services:
+  - >
+    crates.io and GitHub Actions for the release itself, as every version.
+  - >
+    **No live provider call is required.** Every claim here is about this crate's own store, tools
+    and workspace, and is proven against a scripted provider. N5's measurement is a call and gate
+    count against a scripted fixture, not a vendor's counter.
+  human_approvals:
+  - >
+    **The stored hunk is one head-and-tail-trimmed hunk per edit, not a minimal diff.** Decided at
+    specification time, 2026-08-12: it is the computation the crate already performs, it reverse-
+    applies exactly, and a minimal diff is a dependency or several hundred lines for shorter output
+    rather than a new capability.
+  - >
+    **`Edit::measure`'s signature and its two counts are untouched.** Decided at specification time,
+    2026-08-12. Computing the counts from the whole file would be the natural tidy-up and would
+    silently change every existing trace's numbers; F2 is the control that forbids it.
+  - >
+    **`patch_file` is one path per call, and cannot create or delete.** Decided at specification
+    time, 2026-08-12, so the `Act::Write` gate stays exactly one check on exactly one target.
+  - >
+    **The `check` tool is `Act::Exec`-gated; the automatic post-edit checker is not.** Decided at
+    specification time, 2026-08-12. A model-callable path that runs the project's build command must
+    be refusable by the same policy that refuses `exec`; the crate's own reflex after an allowed
+    write is not a new capability and stays as it is.
+  - >
+    **`rewind_step` does not replace `rewind`, and reverse-application is newest-first.** Decided at
+    specification time, 2026-08-12. A snapshot is a stronger restore than a chain of reverse-applies,
+    and an out-of-order revert reports `Stale` rather than forcing a corrupt file.
+  - >
+    **`delivery.target_mode` is `published`.** Decided at specification time, 2026-08-12.
+  - >
+    The PR, both merges, the Release and the publish are pre-authorised for this version under the
+    standing flow.
+
+resource_profile:
+  complexity: medium
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    **Unified-diff edge cases are the whole difficulty, and they are all about newlines.** A file
+    with no final newline, a hunk that ends the file, a hunk at line 1, CRLF line endings on the
+    Windows leg, and the `\ No newline at end of file` marker's placement are five separate cases
+    that each produce a diff that looks right and does not round-trip. This is where the test
+    fixtures and the compile rounds will go, and F1's four positions plus O1's platform matrix exist
+    because of it.
+  - >
+    **Threading the file's two texts to `record_edit` without moving the counts.** The `edit_file`
+    arm deliberately discards the whole-file before text today (`src/run.rs:12712-12715` reasoning at
+    `:9708-9716`) and `Workspace::edit_file` does not hand back what it wrote. Getting both texts to
+    the hunk computation while `Edit::measure` keeps being called with the fragment is a small
+    restructuring of that arm and of the `write_file` arm beside it, and F2 is the assertion that
+    catches doing it the tidy way.
+  - >
+    **The patch applier's offset arithmetic.** Every hunk is matched against the original file at its
+    own `@@` position with a bounded search for the context, and the writes are composed once at the
+    end. Doing it as a running rewrite is the obvious spelling and is what F3's sabotage is.
+  - >
+    **The existing edit and rewind suites read the store's shape.** Each assertion that changes is a
+    decision to be stated in the record with its sentence, not a sweep — a test changed because the
+    behaviour deliberately changed is legitimate, and doing it without the sentence is not.
+  preferred_tools:
+  - >
+    `tests/edit_file.rs`, `tests/edit_tool.rs` and `tests/multi_file.rs` for the write-path claims,
+    `tests/rewind.rs` for the undo claims, and `tests/cross_version.rs` for the NULL-column case —
+    that is where every assertion about these paths already lives.
+  - >
+    `src/state.rs`'s and `src/tools/`'s own `#[cfg(test)]` modules for the differ, the parser and the
+    applier, which are pure functions and are cheapest to pin there; `cargo test --doc` for the two
+    new public items' worked examples, which `tests/public_api.rs` requires.
+  constraints:
+  - >
+    **No new runtime dependency.** `cargo tree` flat at 402.
+  - >
+    **MSRV 1.95, edition 2021, Apache-2.0.** Unchanged.
+  - >
+    **Every version stays 0.x.x.** No 1.0.0 is planned or implied by this release.
+  - >
+    **An `EventKind` variant may not carry a field named like the envelope's** — the kind is
+    `#[serde(flatten)]`ed into `RunEvent`, which carries `run_id`, `step` and `depth`. `Reverted`
+    names its field `undid_step` for that reason, and this was decided while writing the contract
+    rather than while implementing it.
+  - >
+    **`docs/CONTRACT.md`, the README, the changelog, the guide pages and the crate-root prose are
+    checked-in surfaces.** They change in this release, not in the next one.
+
+risks:
+- >
+  **A fragment-anchored hunk looks correct and is wrong everywhere but the first line.** The
+  `edit_file` arm has the fragment in hand and the file only if it goes looking, so the cheap
+  implementation produces `@@ -1,n +1,m @@` for every edit and passes any assertion that reads the
+  header's shape. Mitigation: F1 asserts a byte-exact reverse-apply at four positions, and names the
+  fragment computation as its sabotage.
+- >
+  **Computing the line counts from the whole file silently rewrites what every existing trace
+  means.** It is the tidy thing to do once both texts are in hand, it fails no test that does not
+  exist yet, and it changes numbers operators have been reading since 0.18.0. Mitigation: F2 is a
+  byte-identity control over a corpus and the tidy-up is its sabotage; the reasoning already at the
+  call site is quoted in the code rather than relied on.
+- >
+  **A patch applier that writes as it validates leaves a half-patched file, and the error message
+  looks the same either way.** Mitigation: F4 asserts the file's bytes and the absence of an `edits`
+  row, not the message; the design matches every hunk against the original before composing a single
+  write.
+- >
+  **Exposing the checker as a tool is a new way to run the project's build command.** An ungated
+  `check` would let a model reach `cargo`/`npm`/`go` on a policy written to deny exactly that.
+  Mitigation: the tool is an `Act::Exec` check on the detected program, F6 asserts no process is
+  spawned under a denying policy, and the criterion explicitly keeps the automatic post-edit path
+  ungated so the two are not conflated.
+- >
+  **Reverse-application is order-sensitive and a forced apply corrupts a file silently.** Two edits
+  to overlapping lines mean the older hunk's context no longer exists, and a fuzzy match would
+  "succeed". Mitigation: an exact context match or `Stale` and an untouched file; F8 asserts it; the
+  newest-first rule is documented at the function rather than left to a reader.
+- >
+  **The Windows leg is where a hand-written diff dies.** Line endings, the final-newline marker and
+  path separators in the `---`/`+++` headers are three ways to be correct on macOS and wrong on
+  `windows-latest`, and this repository has ten matrix rounds of history saying so. Mitigation: O1
+  asserts the newline cases on every platform, and the fixtures are written with explicit bytes
+  rather than with the host's convention.
+
+open_questions:
+- >
+  **Should `patch_file` accept a multi-file diff once the single-file shape is proven?** The plan
+  says no, for the gate reason above. If implementation shows models routinely producing multi-file
+  diffs and having to split them, the smallest fix is to accept a multi-file body and gate each path
+  before writing any of them — an iteration with the all-or-nothing rule extended across files, not
+  a redesign.
+- >
+  **Should the stored hunk carry the reason it is absent?** `hunk: Option<String>` says "not stored"
+  and the snapshot row one query away says why for the over-cap and not-UTF-8 cases. A second column
+  would make `Reverted::NoHunk`'s sentence specific rather than enumerating the causes. Deferred
+  because it is a column for a message, and the message is derivable; if operators report the answer
+  is unclear in practice, it is an additive column and an iteration.
+- >
+  **Should `check` be offered to a run whose contract has a `Verification::Command`?** The tool runs
+  the *ecosystem's* cheap type-check, which is not the contract's criterion — a model could read a
+  clean `check` as a passing gate. The plan keeps them separate and says so in the tool's own
+  description. Running the contract's criterion on demand is a different tool with a different
+  refusal story (it can spawn anything the caller named) and wants its own release.
+- >
+  **Does a step revert need to re-run the checker?** A revert changes the workspace and nothing tells
+  the model. It is an operator-facing API rather than a tool today, so there is no model to tell;
+  if `rewind_step` is ever exposed as a tool, the answer changes and so does its gate.
+
+released_at: 2026-08-12T22:20:00Z
+mode: published
+delivered: >
+  A change stopped being a pair of counts. Every `write_file`, `edit_file` and the new
+  `patch_file` records the change itself as a unified diff of the whole file, in `edits.hunk`;
+  `Store::patch` renders a run's whole change as a step-ordered patch series a human reviews; and
+  `rewind_step` reverse-applies one step's hunks, so a twenty-step run whose step eighteen was
+  wrong is no longer thrown away whole. Beside them, `patch_file` makes a multi-hunk change one
+  call anchored to its own context — all or nothing — and `check` offers the project's own
+  type-check as a question before a write rather than only as a note after one.
+
+  **The crate's own source had been pointing at this release since 0.42.0.** `src/verify.rs`
+  said, of the before-and-after rendering a reviewer is handed: *"Not a unified diff: computing
+  one is 0.51.0's work, where the hunks are stored and a patch tool needs them."* That comment is
+  corrected in this release rather than left to contradict the code.
+
+evidence:
+  tests:
+  - >
+    `cargo test` — exit 0, **81 binaries, 1,656 passed, 0 failed**, including **425 doctests**.
+    Run with `XDG_CONFIG_HOME` redirected, which is this machine's standing requirement for
+    `tests/plugin.rs`.
+  - >
+    `cargo test --all-features` — exit 0 on a target cleared first, **81 binaries, 1,742 passed,
+    0 failed**, including **428 doctests**. A separate invocation, as CI runs it.
+  - >
+    **F1** — `tests/hunks.rs::a_stored_hunk_is_anchored_to_the_file_and_reverse_applies` passes at
+    four positions: a change at the start of a file, in the middle, at the end, and in a file whose
+    last line has no terminator. Each stored hunk is reverse-applied by an applier written inside
+    the test — deliberately not the crate's own, which would pass for a renderer and an applier
+    wrong in the same direction — and must reproduce the before text byte for byte.
+    *Sabotage:* compute the hunk from `search`/`replace` rather than from the file's two texts →
+    fails this test and nothing else (4 passed, 1 failed).
+  - >
+    **F1, second half** — `a_runs_change_renders_as_a_step_ordered_patch_series` passes: two edits
+    to one file render two `--- a/f.txt` header pairs, in step order.
+  - >
+    **F2** — `the_line_counts_are_what_they_have_been_since_0_18_0` passes over seven cases:
+    replacement, insertion, whole-line deletion, in-line deletion, an off-boundary split, a
+    whole-file write, and a write of identical content.
+    *Sabotage:* measure the counts from the whole-file texts the hunk is computed from → fails this
+    test and only it, `left (1, 1) right (0, 1)`. **See `known_limitations` — this sabotage failed
+    nothing on its first attempt and the corpus was strengthened as a result.**
+  - >
+    **F3** — `tests/patch_tool.rs::a_three_hunk_patch_is_one_call_and_lands_where_three_edits_would`
+    passes: the same three changes driven once as three `edit_file` calls and once as one
+    `patch_file`, and the two files are byte-identical. One `edits` row, tool `patch_file`,
+    observation "applied 3 hunks".
+    *Sabotage:* locate each hunk in the file as the previous hunks have already rewritten it — a
+    running rewrite → fails this test and nothing else. **The first version of this fixture did not
+    catch that sabotage; see `known_limitations`.**
+  - >
+    **F4** — `a_patch_whose_second_hunk_does_not_fit_changes_nothing` passes, asserted as an absence
+    and a presence together: the file byte-identical, no `edits` row, `rewind` reporting
+    `Rewind::NotRecorded` so no restore point either, and an observation naming hunk 2, the line it
+    expected, and "Nothing was changed".
+    *Sabotage:* apply and write each hunk as it validates → fails this test **and** F3's, two named
+    tests about the same write path.
+  - >
+    **F5** — `the_checker_answers_clean_findings_and_no_checker_at_all` passes in all three shapes:
+    a clean crate says it found nothing, a crate with a type error returns the checker's own
+    findings (`mismatched types` / `E0308`), and a workspace with no project marker names the skip.
+    *Sabotage:* route the tool through `diagnostics_after_write`'s mapping, where `Skipped` is the
+    empty string → fails this test and only it.
+  - >
+    **F6** — `the_check_tool_is_exec_gated_while_the_automatic_check_is_not` passes, both halves in
+    two runs over one fixture: under `deny_exec("cargo")` a `check` call is refused and `target/`
+    does not exist, which cargo always creates; an `edit_file` under the same policy still succeeds
+    and its automatic post-edit check still runs, and `target/` then does. Two runs and not two
+    steps, because `target/` is the evidence and one run would let the edit's own check create it
+    before the refusal could be asserted as an absence.
+    *Sabotage:* run the checker without the `Act::Exec` gate → fails this test and only it.
+  - >
+    **F7** — `reverting_newest_first_restores_every_intermediate_state` passes: three edits at three
+    steps, reverted newest first, with the file asserted byte-identical after **each** revert rather
+    than only at the end — a build that reverse-applies in the wrong order can still reach the right
+    final text when the changes do not overlap.
+    *Sabotage:* apply the hunk forward instead of in reverse → fails this test and F10's, two named
+    tests that each assert a revert put something back.
+  - >
+    **F8** — `reverting_out_of_order_reports_stale_and_changes_nothing` passes. Its two edits overlap
+    deliberately, so the older hunk's context is gone and a fuzzy match would "succeed".
+    *Sabotage:* skip the context match and splice the old lines in at the stated position → fails
+    this test and only it.
+  - >
+    **F9** — `an_edit_with_no_stored_hunk_is_reported_rather_than_skipped` passes, with the absence
+    produced the way production produces it: a file whose previous contents are not UTF-8, so
+    `read_before` keeps no restore text and there is nothing to diff against.
+    *Sabotage:* treat a NULL hunk as an empty patch → fails this test and only it.
+  - >
+    **F10** — `a_step_revert_and_a_run_rewind_are_different_rows` passes: `Store::rewinds` reports
+    `undid_step: Some(step)` for the revert and `None` for the `rewind_run` on the same run, and
+    exactly one `EventKind::Reverted` fires carrying the count from the value being returned.
+    *Sabotage:* leave `undid_step` NULL for both → fails this test and only it.
+  - >
+    **The differ's own property sweep.** `src/diff.rs` carries 17 unit tests including
+    `generated_pairs_round_trip_in_both_directions`, which drives **2,000 generated (old, new)
+    pairs** through render → parse → apply and render → parse → reverse → apply, requiring both to
+    reproduce the other side byte for byte. It failed on case 106 and the failure was a real defect:
+    a line's identity includes whether it is terminated, so comparing text alone made an
+    unterminated last line equal to the identically-spelled terminated one.
+  - >
+    **O2** — `tests/cross_version.rs` 7 passed (was 5).
+    `an_edit_written_before_0_51_0_has_no_hunk_and_is_reported_as_having_none` opens the committed
+    fixture written by a real io-harness 0.22.0 from crates.io, whose `edits` table has one row and
+    no `hunk` column: the row reads back `None`, its 0.22.0 counts unchanged at (1, 0),
+    `rewind_step` reports `Reverted::NoHunk`, the file is byte-identical, and `Store::patch` names
+    the change as unrenderable rather than omitting it. The other direction is proven by a real old
+    binary: `cargo test --test cross_version_0_29_0 -- --ignored` →
+    `a_current_store_is_read_by_a_0_29_0_binary` ok.
+  - >
+    **O3** — no criterion in this release asserts on elapsed time. F5's and F6's checker fixtures are
+    zero-dependency crates whose `cargo check` needs no network, and every ordering claim is asserted
+    on step numbers and file bytes.
+  - >
+    **O4** — `tests/docs_drift.rs` 15, `tests/changelog.rs` 5, `tests/readme.rs` 8,
+    `tests/guide_pages.rs` 7, `tests/public_api.rs` 9 — all passed.
+  builds:
+  - >
+    `cargo fmt --check` — exit 0.
+  - >
+    `cargo clippy --all-targets --all-features -- -D warnings` — exit 0, after five findings fixed:
+    two `needless_range_loop` in the differ's context loops, one `manual_is_multiple_of`, three
+    `unnecessary_lazy_evaluations` (`then_some` is safe at these three sites — the argument is two
+    `as_str()` calls, not arithmetic, so 0.49.0's eager-evaluation trap does not apply), and one
+    `type_complexity` on the F2 corpus.
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0.
+    **It caught one error stable `cargo doc` did not report**: `Edit::hunk`'s doc comment linked
+    `[Snapshot]`, a private item, refused by `rustdoc::private_intra_doc_links`. Sixth release running
+    that this gate has found something.
+  - >
+    `cargo package --locked` — exit 0, **1,699,911 bytes** on the tree that ships. It was
+    1,699,907 on the pre-merge tree; the four bytes are the Dependabot lock bump plus the settled
+    gzip drift. See the re-gate note in `known_limitations`.
+  - >
+    **N1** — `cargo tree` is **402** lines, unchanged since 0.23.0. The differ, the unified-diff
+    parser and the applier are ~450 lines in a new crate-internal `src/diff.rs`; no crate was added.
+  - >
+    **N4** — `git diff main -- src/state.rs` shows exactly two DDL statements,
+    `ALTER TABLE edits ADD COLUMN hunk TEXT` and `ALTER TABLE rewinds ADD COLUMN undid_step INTEGER`,
+    and **no** `CREATE TABLE` and **no** `CREATE INDEX`. `CHECKPOINT_FORMAT` unmoved at **7**.
+  - >
+    **N3** — `docs/public-api.txt` gains exactly three lines by hand: `enum Reverted`,
+    `fn rewind_step`, `fn rewind_step_observed`. Three and not the two the criterion named; see
+    `known_limitations`.
+  - >
+    **N5, the release's own number**, on a four-hunk change to one 231-byte file where both arms
+    produce a byte-identical result. **`edit_file` × 4: 5 provider calls, 4 gate evaluations, 1,987
+    prompt bytes.** **`patch_file` × 1: 2 provider calls, 1 gate evaluation, 649 prompt bytes.** One
+    gate evaluation against four and one acting completion against four, asserted rather than
+    printed; **3.06× less prompt read**, recorded. The stored hunks are 424 bytes for the four edits
+    and 476 for the one patch — a patch stores marginally more, because its single hunk set carries
+    context the four separate hunks each carry once.
+  - >
+    **N6** — only three test files differ from `main`: `tests/hunks.rs` and `tests/patch_tool.rs` are
+    new, and `tests/cross_version.rs` gained two tests and one import line. **Every other suite in
+    the repository is byte-identical to `main` and passes**, which is a stronger statement of the
+    byte-identity control than an assertion inside a test would be.
+  - >
+    **N7** — `workspace_tools()` gains exactly two `ToolSpec`s and no existing tool's schema changes.
+    Single-file mode is untouched: `git diff main` shows no change to its tool list.
+  reviews:
+  - >
+    Ten sabotages, one per arm of every two-armed functional claim, each recorded above with which
+    named tests it failed. **Two of them failed nothing on their first attempt and both are reported
+    as findings rather than propped up** — see `known_limitations`.
+  - >
+    Every `scope.excluded` item re-checked against the tree at completion: `patch_file`'s schema
+    requires exactly `["path", "patch"]`; `check`'s parameters are `{}`; `src/verify.rs`'s
+    `review_change` has no non-comment change; no `CREATE TABLE` or `CREATE INDEX` was added;
+    `CHECKPOINT_FORMAT` is 7.
+  - >
+    Secret scan over the whole `git diff main`: every match for key/secret/token/password is the
+    English word "tokens" in prose about prompt cost. No credential, no key material.
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **The record is sealed before the crates.io upload.** `mode: published` states the authorised
+  target; the upload follows the merge into `main` and the GitHub Release, in that order, as the
+  standing flow requires.
+- >
+  **`docs/public-api.txt` gains THREE lines, not the two N3 named — a criterion met in a different
+  form, stated rather than glossed.** The third is `fn rewind_step_observed`. The contract named
+  `Reverted` and `rewind_step`; the observed twin exists because that is the shape
+  `rewind`/`rewind_run`/`rewind_run_observed` already has and because `EventKind::Reverted` needs an
+  observer to reach. The substance of N3 holds — the additions are enumerated, no name was removed
+  or renamed, and the count was not the claim.
+- >
+  **A fourth public addition the contract did not name: `Edit::with_hunk` is `pub`, not
+  `pub(crate)`.** It was written crate-private and `Store::patch`'s own doctest could not call it —
+  a doctest compiles as an external crate. Making it public is the coherent answer rather than a
+  workaround: `Edit::measure` and `Store::record_edit` are already public, so a caller recording its
+  own edit rows would otherwise be able to write a count and never a change, which makes
+  `Store::patch` useless to them. It adds no line to `docs/public-api.txt`, which enumerates
+  crate-root re-exports and not methods.
+- >
+  **F2's sabotage failed nothing on its first attempt, and the corpus was strengthened rather than
+  the sabotage abandoned.** Measuring the line counts from the whole-file texts passed the original
+  five-case corpus, because for a tidy whole-line edit the two measures agree — trimming the common
+  head and tail of the fragment finds the same changed span as trimming them over the file. A
+  brute-force search over 400,000 single-substring replacements found the class that diverges: a
+  replacement that does not begin and end on a line boundary. Deleting a substring *inside* a line is
+  (0 added, 1 removed) over the fragment and (1, 1) over the file. Two such cases joined the corpus
+  and the sabotage then failed the named test and only it. **The honest consequence: for most edits
+  the two measures coincide, so "the counts did not move" is a narrower claim than it sounds — it is
+  exact, and it bites only on off-boundary replacements.**
+- >
+  **F3's first fixture was too weak to catch its own sabotage.** Every hunk replaced one line with
+  one line, so a running-rewrite applier accumulated no drift and passed. The fixture now adds a line
+  in its first hunk and removes one in its third, and the reason is written into the test's own doc
+  comment so the next person does not weaken it back.
+- >
+  **The stored hunk is one head-and-tail-trimmed hunk per edit, not a minimal diff.** For an
+  `edit_file` — one contiguous replacement by construction — it *is* the minimal diff. For a
+  `write_file` that rewrote two distant regions of a file it is one hunk spanning both: a valid
+  unified diff that reverse-applies exactly, and not the shortest one. A Myers or patience diff is a
+  dependency or several hundred lines, and it buys shorter output rather than a capability.
+- >
+  **`patch_file` matches every hunk at its own recorded position, exactly, with no fuzz and no
+  offset search.** A patch written against a file that has since moved by even one line is refused
+  rather than relocated. That is deliberate on an all-or-nothing write path, and it means a model
+  must write its patch against a current read. Real `git diff` output satisfies it; a
+  hand-shifted patch does not.
+- >
+  **The `check` tool runs its checker outside the run's containment**, exactly as the automatic
+  post-edit checker has since 0.46.0. It is policy-gated — which the automatic one is not — but it is
+  not sandboxed, so `Act::Exec` is the whole of the boundary on it. Bringing both under
+  `TaskContract::exec_sandbox` is its own change and was not made here.
+- >
+  **`rewind_step` is an operator-facing API and not a tool.** No model can call it, so nothing tells
+  a model that the workspace moved under it. If it is ever exposed as a tool, the gate story and the
+  question of re-running the checker after a revert both change.
+- >
+  **Walking a run back is the caller's loop, and there is no automatic ordering.** Reverting out of
+  order reports `Reverted::Stale` and changes nothing, which is safe but silent about what to do
+  next; the newest-first rule is documented at the function, in `docs/CONTRACT.md`, in the guide and
+  in the changelog rather than enforced.
+- >
+  **O1 — the three-platform matrix has NOT run.** Every gate above is macOS. A hand-written
+  unified-diff parser is precisely the code that passes on the host that wrote the fixture and fails
+  on the one with different line endings, which is why the CRLF and final-newline cases are asserted
+  explicitly and why the criterion says outright that a green macOS gate is not evidence here. The
+  matrix runs on the release PR.
+- >
+  **The same flake TWICE, on both `--all-features` runs, and it is a family already recorded.**
+  `a_handle_takes_the_cpu_cap_a_foreground_stage_takes` — a 0.48.0 containment test — reported a
+  spinning `awk` still `running` after the CPU cap should have ended it, both times on a machine that
+  had just built the whole all-features tree from clean. It passed standalone 5 of 5 on both
+  occasions and in every default-suite run. Nothing in this release touches the handle or sandbox
+  path. Twice is no longer a coincidence: the test is load-dependent, and the honest reading is that
+  it asserts a wall clock it does not own.
+- >
+  **DEPENDABOT MERGED INTO `develop` WHILE THIS RELEASE WAS IN FLIGHT — 0.37.0's trap, second
+  occurrence — AND THE WHOLE GATE SET RE-RAN BECAUSE OF IT.** PR #149 landed five patch bumps above
+  the feature merge, including **`rusqlite` 0.40.1 → 0.40.2 and `libsqlite3-sys`**, this crate's
+  storage dependency. `git diff --quiet feat/0.51.0 develop` was therefore NOT quiet: `Cargo.lock`,
+  28 lines. The extra commits ship, so every gate was re-run against the merged tree before the
+  release PR was opened, which is the only window in which a sealed record may be corrected.
+  **Re-gate results, all on the merged tree:** `cargo fmt --check` exit 0; `cargo clippy
+  --all-targets --all-features -- -D warnings` exit 0; `cargo test` exit 0, 81 binaries, **1,656
+  passed**, 425 doctests — identical to the pre-merge run; `cargo test --all-features
+  --no-fail-fast` on a cleared target, 81 binaries, **1,742** (one being the flake above),
+  428 doctests; `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features
+  --no-deps` exit 0; `cargo package --locked` exit 0 at 1,699,911 bytes; `cargo tree` still **402**;
+  and the cross-version generator gate green, `a_current_store_is_read_by_a_0_29_0_binary` ok —
+  which is the one that matters most here, since a real 0.29.0 binary reading a store written by
+  this build is what a `rusqlite` patch bump could have broken.
+- >
+  **This record was amended after it was sealed, and that is legal only before the merge into
+  `main`.** The amendment carries the re-gate above, the corrected package size, and the second
+  occurrence of the flake. Nothing it claimed became false; the tree it describes moved, and the
+  record moved with it rather than being left describing a tree that no longer existed.
+- >
+  **One ordering to state rather than gloss.** The nightly rustdoc gate's fix — a doc-comment link in
+  `src/state.rs` — landed after the two suites had run. It cannot change behaviour, but rather than
+  assert that, `cargo test --doc` was re-run against the shipped tree (425 passed, exit 0) and
+  `cargo package` compiled the packaged crate from it.
+supersedes: 0.50.0
+next_recommended_version: 0.52.0
+immutable: true

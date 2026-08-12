@@ -87,6 +87,7 @@ enum Preset src/contract.rs
 enum PromptFamily src/provider/mod.rs
 enum ProviderErrorKind src/error.rs
 enum ProviderSpec src/config.rs
+enum Reverted src/run.rs
 enum Rewind src/run.rs
 enum RunOutcome src/run.rs
 enum RunStatus src/state.rs
@@ -101,6 +102,8 @@ enum Waiting src/attach.rs
 fn rewind src/run.rs
 fn rewind_run src/run.rs
 fn rewind_run_observed src/run.rs
+fn rewind_step src/run.rs
+fn rewind_step_observed src/run.rs
 fn select src/sandbox.rs
 struct AcceptPlan src/approve.rs
 struct AgentDef src/agent.rs

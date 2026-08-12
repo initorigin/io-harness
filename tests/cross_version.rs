@@ -41,9 +41,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
+use io_harness::tools::Workspace;
 use io_harness::{
-    resume_tree, resume_with_decision, ApproveAll, Containment, Decision, Policy, Provider,
-    RunOutcome, Store, TaskContract, Verification, CHECKPOINT_FORMAT,
+    resume_tree, resume_with_decision, rewind_run, rewind_step, ApproveAll, Containment, Decision,
+    Edit, Policy, Provider, Reverted, RunOutcome, Store, TaskContract, Verification,
+    CHECKPOINT_FORMAT,
 };
 use serde_json::{json, Value};
 
@@ -236,9 +238,15 @@ fn is_added_since_0_22_0(stmt: &str) -> bool {
 /// turned out to be. Nullable, unread by every binary before it, and — like
 /// `memory`'s two — an addition the 0.29.0 generator's own database is made to
 /// prove rather than an alteration asserted on paper.
+/// 0.51.0 adds the third: `edits` gains `hunk`, the change itself as a unified
+/// diff, so a trace can say *what* a step changed and not only how many lines it
+/// changed. Nullable for exactly that reason — every row an earlier release
+/// wrote has no hunk, and is reported as having none rather than as having an
+/// empty one.
 const COLUMNS_ADDED_SINCE_0_22_0: &[(&str, &[&str])] = &[
     ("memory", &["kind TEXT", "pinned INTEGER"]),
     ("runs", &["turn_kind TEXT"]),
+    ("edits", &["hunk TEXT"]),
 ];
 
 /// Whether `new` is `old` with exactly the declared columns added, and nothing
@@ -1014,4 +1022,93 @@ fn the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_alters_nothing() 
             ),
         );
     }
+}
+
+/// O2 / F9 — a store written before 0.51.0 has no hunk for any edit it holds, and
+/// the crate says so rather than treating the absence as an empty patch.
+///
+/// This is the case no other suite can cover, because it is about a column that
+/// did not exist. The 0.22.0 fixture holds one real `edits` row; opening it here
+/// adds the column by `ALTER TABLE` and every row it already had reads back
+/// `None`. Treating that as an empty patch would report a successful revert
+/// having undone nothing, which is the one way this feature can silently lose an
+/// operator's work.
+#[test]
+fn an_edit_written_before_0_51_0_has_no_hunk_and_is_reported_as_having_none() {
+    let (dir, db, _) = working_copy("populated", false);
+    let store = Store::open(&db).expect("a 0.22.0 store opens");
+    let run_id = store.last_run().unwrap().expect("the store holds a run");
+
+    let edits = store.edits(run_id).unwrap();
+    assert_eq!(
+        edits.len(),
+        1,
+        "the 0.22.0 fixture holds one edit: {edits:#?}"
+    );
+    assert_eq!(
+        edits[0].hunk, None,
+        "a row written before the column existed"
+    );
+    // The counts it recorded in 0.22.0 are the counts it reads back now.
+    assert_eq!((edits[0].lines_added, edits[0].lines_removed), (1, 0));
+
+    // Reverting that step touches nothing and says why.
+    let ws_dir = dir.path().join("ws");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    std::fs::write(ws_dir.join(&edits[0].path), "as the 0.22.0 run left it\n").unwrap();
+    let ws = Workspace::new(&ws_dir);
+    let done = rewind_step(&ws, &store, run_id, edits[0].step).unwrap();
+    assert!(
+        matches!(done[0].1, Reverted::NoHunk(_)),
+        "an absent hunk is absent, not empty: {:?}",
+        done[0].1
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws_dir.join(&edits[0].path)).unwrap(),
+        "as the 0.22.0 run left it\n"
+    );
+
+    // And the series says the change is there and unrenderable rather than
+    // omitting it, so a reader of the patch is not told the run changed nothing.
+    let patch = store.patch(run_id).unwrap();
+    assert!(patch.contains("no hunk stored"), "{patch}");
+    assert!(patch.contains(&edits[0].path), "{patch}");
+}
+
+/// O2, the other direction — the query an older binary makes still answers.
+///
+/// A 0.50.0 binary selects five named columns from `edits` and five from
+/// `rewinds`; it never mentions `hunk` or `undid_step`, so a store this release
+/// wrote must still satisfy those exact statements. Asserted by running them,
+/// rather than by arguing from the fact that the columns are nullable.
+#[test]
+fn the_queries_a_0_50_0_binary_makes_still_answer_against_a_0_51_0_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("new.sqlite3");
+    {
+        let store = Store::open(&db).unwrap();
+        let run = store
+            .start_run("write something", &dir.path().display().to_string())
+            .unwrap();
+        store
+            .record_edit(
+                run,
+                &Edit::measure(1, "write_file", "out.txt", "", "hello\n"),
+            )
+            .unwrap();
+        // A rewind of a run that wrote nothing still writes its own row, which is
+        // the `rewinds` row this half needs.
+        rewind_run(&Workspace::new(dir.path()), &store, run).unwrap();
+    }
+    let conn = sqlite(&db);
+    conn.prepare("SELECT step, tool, path, lines_added, lines_removed FROM edits")
+        .expect("0.50.0's edits query")
+        .query_map([], |_| Ok(()))
+        .unwrap()
+        .for_each(drop);
+    conn.prepare("SELECT at, files, memory_restored, memory_removed, queue_cleared FROM rewinds")
+        .expect("0.50.0's rewinds query")
+        .query_map([], |_| Ok(()))
+        .unwrap()
+        .for_each(drop);
 }
