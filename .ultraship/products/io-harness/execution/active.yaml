@@ -1,0 +1,49 @@
+product: io-harness
+version: 0.50.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      **No constraints are recorded for this workspace.** `ultraship constraints` reports none —
+      there is no active release to hold them — so this assessment is grounded in the repository's
+      own condition and in the nineteen releases of measured history behind it, never in a capacity
+      figure, which UltraShip has no telemetry to supply and which would be fiction with a decimal
+      point.
+    - >
+      **Everything a detached child needs already exists and was built for a blocking tree.** The
+      per-tier slots and FIFO queue (0.32.0), the `spawns` rows, adopt-on-resume, `Store::children`
+      and `terminal_outcome` are all in place and unchanged by this release. The release adds a
+      set of in-flight futures and a fold; it does not add durable state, a table, or a public break.
+    - >
+      **The type system has already decided the one architectural question.** `rusqlite::Connection`
+      is `Send` and not `Sync` and `run_agent` borrows the whole `Tree`, so a detached child cannot
+      be a spawned task. It is a future in the parent's own loop — the shape 0.41.0 settled for the
+      read batch — which removes the design space rather than leaving it open.
+    - >
+      **`probable` and not `high`, and the reason is lifetimes at exactly one point.** The child's
+      contract and policy are locals of `spawn_child` and `run_agent` returns a future borrowing
+      them, so holding that future across the parent's steps needs the future to own its inputs.
+      That is one restructuring, it is where the compile rounds will go, and it is not something a
+      plan can prove in advance.
+    - >
+      **The fallback scope is drawn along a line the release can be cut on.** The child's conclusion
+      is the half that makes delegation useful and it needs none of the concurrency; detachment,
+      the wall clock and the operator knobs each sit behind it and can be shed in order. Recorded at
+      specification time for exactly that reason.
+  major_cost_drivers:
+    - >
+      Restructuring `spawn_child` into a preparation step and a future that owns the child's
+      contract, policy and slot, so the future can outlive the frame that built it.
+    - >
+      Reaching the step loop's single commit point with a detached report without adding a second,
+      quieter commit path beside the `paused_by_child` argument already attached to it.
+    - >
+      Concurrency tests that assert step numbers and terminal states rather than elapsed time, so
+      the release does not buy an eighth clock flake on a loaded runner.
+    - >
+      The existing tree suites quote the composed child line, and every assertion that changes is a
+      stated decision rather than a sweep.
+  recommended_scope_change: null

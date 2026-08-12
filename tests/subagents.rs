@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    run_tree, run_with, ApproveAll, Containment, DenyAll, Policy, Provider, RunOutcome, Store,
-    TaskContract, Verification,
+    resume_tree_with_decision, run_tree, run_with, ApproveAll, Containment, DenyAll, Policy,
+    Provider, RunOutcome, Store, TaskContract, Verification,
 };
 use serde_json::json;
 
@@ -994,5 +994,209 @@ async fn each_agent_keeps_its_own_durable_ledger_under_its_own_run_id() {
             .iter()
             .any(|o| o.text.contains("SEED-CONTENT")),
         "a child's observations belong to the child, not to its parent's ledger"
+    );
+}
+
+/// A provider whose script carries what the agent *said* beside what it called,
+/// which the plain [`MockScript`] cannot express: it answers every call with tool
+/// calls alone and never with text.
+struct MockSaying {
+    steps: Vec<(Option<&'static str>, Vec<ToolCall>)>,
+    at: AtomicUsize,
+}
+
+impl MockSaying {
+    fn new(steps: Vec<(Option<&'static str>, Vec<ToolCall>)>) -> Self {
+        Self {
+            steps,
+            at: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Provider for MockSaying {
+    async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        let i = self.at.fetch_add(1, Ordering::SeqCst);
+        let (text, calls) = self.steps.get(i).cloned().unwrap_or((None, Vec::new()));
+        Ok(CompletionResponse {
+            text: text.map(str::to_string),
+            tool_calls: calls,
+            ..Default::default()
+        })
+    }
+}
+
+/// 0.50.0 — F1: a child hands its parent what it concluded, not a discriminant.
+///
+/// Until this release `compose_child` folded `[child 7 "goal" -> Success { steps:
+/// 1 }]` and nothing else, because `RunOutcome::Success` carries no text. A parent
+/// that fanned out to investigate learned that its children succeeded and nothing
+/// they found. The marker below is produced by the child's completion and by
+/// nothing else in the run, so its presence in the *parent's* ledger is the claim.
+#[tokio::test]
+async fn a_child_reports_what_it_concluded_to_its_parent() {
+    const FINDING: &str = "the cache key omits the tenant id";
+
+    let dir = ws();
+    let contract = TaskContract::workspace("Investigate, then write it up.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "report.txt".into(),
+            needle: "written".into(),
+        })
+        .with_max_steps(4);
+
+    // parent#1 spawns; child#1 writes its verify file and says what it found;
+    // parent#2 writes its own report.
+    let script = MockSaying::new(vec![
+        (None, vec![spawn("investigate", "found.txt", "FOUND")]),
+        (Some(FINDING), vec![write("found.txt", "FOUND")]),
+        (None, vec![write("report.txt", "written")]),
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.outcome, RunOutcome::Success { steps: 2 });
+
+    let child = *store
+        .children(result.run_id)
+        .unwrap()
+        .first()
+        .expect("the parent spawned a child");
+
+    let parent_rows = store.observations(result.run_id).unwrap();
+    let composed = parent_rows
+        .iter()
+        .find(|o| o.text.contains(&format!("[child {child}")))
+        .unwrap_or_else(|| panic!("the parent composed its child, got {parent_rows:?}"));
+
+    // The release: the conclusion reaches the parent.
+    assert!(
+        composed.text.contains(FINDING),
+        "the child's conclusion reaches its parent, got {:?}",
+        composed.text
+    );
+    // And what the parent already learned is still there — this adds, it replaces
+    // nothing.
+    assert!(
+        composed.text.contains("Success"),
+        "the outcome is still reported, got {:?}",
+        composed.text
+    );
+    assert!(
+        composed.text.contains(&child.to_string()),
+        "the child's run id is still reported, got {:?}",
+        composed.text
+    );
+}
+
+/// Defers every decision, so a child's write parks the whole tree on a human.
+struct Defer;
+impl Approver for Defer {
+    fn decide<'a>(&'a self, _r: &'a Request) -> DecisionFuture<'a> {
+        Box::pin(async { Decision::Defer })
+    }
+}
+
+/// 0.50.0 — F2: a child adopted after a pause reports the same words it would
+/// have reported had its parent waited.
+///
+/// The parent's spawn step is deliberately left uncommitted when a child pauses
+/// (0.7.0's fix for double execution), so the resume replays it — and the child
+/// that had already finished is composed from the store rather than from a loop
+/// that is no longer running. That is the path a restarted process takes, and it
+/// must not render the conclusion differently: there is one rendering, reading one
+/// set of `"said"` rows, which is why this is assertable at all.
+#[tokio::test]
+async fn an_adopted_child_reports_the_same_conclusion() {
+    const FINDING: &str = "alpha holds the stale index";
+
+    let dir = ws();
+    let contract = TaskContract::workspace("Delegate both halves.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "b.txt".into(),
+            needle: "BETA".into(),
+        })
+        .with_max_steps(4);
+
+    // a.txt is allowed outright; b.txt asks, and `Defer` parks it.
+    let policy = Policy::default()
+        .layer("base")
+        .allow_read("*")
+        .allow_write("a.txt")
+        .ask_write("b.txt");
+
+    let script = MockSaying::new(vec![
+        // parent#1 fans out to two children.
+        (
+            None,
+            vec![spawn("do a", "a.txt", "ALPHA"), spawn("do b", "b.txt", "BETA")],
+        ),
+        // child A finishes and says what it found.
+        (Some(FINDING), vec![write("a.txt", "ALPHA")]),
+        // child B's write asks, and nothing in this process answers.
+        (None, vec![write("b.txt", "BETA")]),
+        // parent#1 replayed on resume: the same fan-out, one child already done.
+        (
+            None,
+            vec![spawn("do a", "a.txt", "ALPHA"), spawn("do b", "b.txt", "BETA")],
+        ),
+        (None, vec![]),
+        (None, vec![]),
+    ]);
+    let store = Store::memory().unwrap();
+
+    let paused = run_tree(&contract, &script, &store, &policy, &Defer, &containment())
+        .await
+        .unwrap();
+    let request_id = match paused.outcome {
+        RunOutcome::AwaitingApproval { request_id, .. } => request_id,
+        other => panic!("expected the tree to pause on b.txt, got {other:?}"),
+    };
+
+    // Nothing was composed into the parent yet: its step never committed.
+    assert!(
+        !store
+            .observations(paused.run_id)
+            .unwrap()
+            .iter()
+            .any(|o| o.text.contains(FINDING)),
+        "the paused step is uncommitted, so nothing about the finished child is durable yet"
+    );
+
+    let resumed = resume_tree_with_decision(
+        &contract,
+        &script,
+        &store,
+        paused.run_id,
+        request_id,
+        Decision::Approve {
+            modified: None,
+            remember: vec![],
+        },
+        &policy,
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(resumed.outcome, RunOutcome::Success { .. }),
+        "the tree resumed to success, got {:?}",
+        resumed.outcome
+    );
+
+    let rows = store.observations(paused.run_id).unwrap();
+    assert!(
+        rows.iter().any(|o| o.text.contains(FINDING)),
+        "the adopted child's conclusion reaches the resumed parent, got {rows:?}"
     );
 }

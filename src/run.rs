@@ -6300,6 +6300,17 @@ fn run_agent<'f, P: Provider>(
                 },
             );
 
+            // 0.50.0 — and made durable, which `turns` is not. The last of these
+            // rows is what this agent's parent composes as its conclusion, so it
+            // has to survive the process: a parent that adopts a child a previous
+            // process left behind reads the same words a parent that waited does.
+            // Here rather than in `finish` because every ending is a different
+            // return and `turns` is in scope at exactly one place.
+            if let Some(said) = response.text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                tree.store
+                    .record_agent_event(&AgentEvent::said(run_id, step, said))?;
+            }
+
             let mut decisions: Vec<String> = Vec::new();
             let mut calls_json: Vec<String> = Vec::new();
             let mut step_changed = false;
@@ -6946,7 +6957,7 @@ async fn spawn_child<P: Provider>(
     let adopted = match tree.store.find_spawn(parent_run_id, step, goal)? {
         Some(row) => {
             if let Some(o) = terminal_outcome(tree.store, row.child_run_id)? {
-                return Ok(compose_child(row.child_run_id, goal, o));
+                return compose_child(tree.store, row.child_run_id, goal, o);
             }
             Some(row)
         }
@@ -7117,7 +7128,7 @@ async fn spawn_child<P: Provider>(
         return Ok(SpawnResult::Asked { question_id });
     }
 
-    Ok(compose_child(child_run, goal, outcome))
+    compose_child(tree.store, child_run, goal, outcome)
 }
 
 /// How many agents are waiting at each tier: `(tier, waiting)`, one entry per
@@ -7216,11 +7227,57 @@ fn emit_fleet<P: Provider>(
 }
 
 /// Fold one child's finished result back into the parent's observation log.
-fn compose_child(child_run: i64, goal: &str, outcome: RunOutcome) -> SpawnResult {
-    SpawnResult::Composed {
+///
+/// 0.50.0 — what the child *concluded*, not only that it finished. Until this
+/// release the parent read `[child 7 "goal" -> Success { steps: 4 }]` and nothing
+/// more, because [`RunOutcome::Success`] carries no text: a parent that fanned out
+/// to investigate four subsystems learned that four runs succeeded and none of
+/// what they found. The only way a finding could travel was a file the parent then
+/// read, which is why `verify_file` was doing double duty as a return channel.
+///
+/// **Read from the store rather than carried out of the child's loop, and that is
+/// the point.** A child this process ran and a child it adopted from a previous
+/// process both leave the same `"said"` rows, so the two paths cannot render one
+/// conclusion two ways — there is one rendering, and a resume composes exactly
+/// what waiting composes.
+fn compose_child(
+    store: &Store,
+    child_run: i64,
+    goal: &str,
+    outcome: RunOutcome,
+) -> Result<SpawnResult> {
+    // What it cost comes off the run's own row, so the number a parent reads and
+    // the number an auditor reads are the same number.
+    let spend = match store.run_summary(child_run)? {
+        Some(s) => format!(", {} steps, {} tokens", s.steps, s.tokens),
+        None => String::new(),
+    };
+    let said = child_conclusion(store, child_run)?;
+    let body = match &said {
+        Some(text) => format!("\n{text}\n"),
+        // Stated, not omitted: a parent that reads nothing must be able to tell
+        // "it said nothing" from "this build does not report what it said".
+        None => "\n(it ended without saying anything; read its trace by run id)\n".into(),
+    };
+    Ok(SpawnResult::Composed {
         decision: format!("spawned child {child_run}: {outcome:?}"),
-        obs: format!("\n[child {child_run} \"{goal}\" -> {outcome:?}]\n"),
-    }
+        obs: format!("\n[child {child_run} \"{goal}\" -> {outcome:?}{spend}]{body}"),
+    })
+}
+
+/// The last thing an agent said, from its durable trace.
+///
+/// The *last* rather than a summary of all of them: an agent's closing completion
+/// is its answer, and the ones before it are working notes the parent did not ask
+/// for. Bounded on the way in by the same `entry_cap` every observation is bounded
+/// by, so a talkative child cannot flood its parent.
+fn child_conclusion(store: &Store, child_run: i64) -> Result<Option<String>> {
+    Ok(store
+        .agent_events(child_run)?
+        .into_iter()
+        .filter(|e| e.kind == "said")
+        .next_back()
+        .and_then(|e| e.detail))
 }
 
 /// The rules an approver asked to remember, as a mergeable top layer.

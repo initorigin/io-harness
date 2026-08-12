@@ -705,12 +705,12 @@ pub struct AgentEvent {
     pub run_id: i64,
     /// The step it occurred on.
     pub step: u32,
-    /// `"spawn"`, `"spawn_refused"`, or `"budget_draw"`.
+    /// `"spawn"`, `"spawn_refused"`, `"budget_draw"`, or `"said"`.
     pub kind: String,
     /// The spawned child's run id, for a `"spawn"`.
     pub child_run_id: Option<i64>,
     /// Free-form detail: the child's goal for a spawn, the breached cap for a
-    /// refusal.
+    /// refusal, what the agent said for a `"said"`.
     pub detail: Option<String>,
     /// Tokens drawn, for a `"budget_draw"`.
     pub tokens: Option<u64>,
@@ -740,6 +740,31 @@ impl AgentEvent {
             kind: "spawn_refused".into(),
             child_run_id: None,
             detail: Some(cap.into()),
+            tokens: None,
+            remaining: None,
+        }
+    }
+
+    /// What an agent said on this step, beside whatever it called (0.50.0).
+    ///
+    /// An agent's own words were durable nowhere before this: `steps.result`
+    /// holds the observations a step produced, and a completion's prose reached
+    /// the ledger only in the one case where it carried no tool call at all
+    /// (`(no tool call) …`). So an agent that wrote a file and explained why left
+    /// the explanation in memory and nothing else.
+    ///
+    /// The last of these rows for a run is what a parent composes as its child's
+    /// conclusion, and recording it per step rather than once at the end is what
+    /// makes that readable after the process that ran the child has exited —
+    /// including for a child a *later* process adopts. One row per step that said
+    /// something, alongside the `"budget_draw"` row every step already writes.
+    pub fn said(run_id: i64, step: u32, text: impl Into<String>) -> Self {
+        Self {
+            run_id,
+            step,
+            kind: "said".into(),
+            child_run_id: None,
+            detail: Some(text.into()),
             tokens: None,
             remaining: None,
         }
