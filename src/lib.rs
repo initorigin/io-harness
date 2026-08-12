@@ -57,8 +57,19 @@
 //! # What it does
 //!
 //! **The loop.** [`TaskContract::workspace`] gives the agent `grep`, `find`,
-//! `read_file`, `write_file` and `edit_file` across a repository root;
-//! [`TaskContract::new`] names one file to edit.
+//! `read_file`, `write_file`, `edit_file` and `patch_file` across a repository
+//! root; [`TaskContract::new`] names one file to edit. A change touching several
+//! places in one file is one `patch_file` call taking a unified diff, applied as
+//! a unit or not at all ([`tools::PATCH_FILE_TOOL`]), and the project's own
+//! type-check is a question the agent can ask before it writes rather than only
+//! a note it gets afterwards ([`tools::CHECK_TOOL`]).
+//!
+//! **What a change is kept as.** Every write records the change as a unified diff
+//! of the whole file ([`Edit::hunk`]), so a trace can show *what* a step changed
+//! and not only how many lines it changed: [`Store::patch`] renders a run's whole
+//! change as a step-ordered patch series a human reviews. That is also what makes
+//! undo finer than a run — [`rewind_step`] reverse-applies one step's hunks, and
+//! walking a run back is that call newest step first.
 //!
 //! **Commands, under the same boundary as everything else.** The agent runs the
 //! project's own build, tests, linter or package manager through an `exec` tool
@@ -416,6 +427,7 @@ pub mod config;
 pub mod containment;
 pub mod context;
 mod contract;
+mod diff;
 mod error;
 pub mod hooks;
 pub mod mcp;
@@ -478,9 +490,9 @@ pub use run::{
     resume_tree_with_plan_decision_observed, resume_with, resume_with_answer,
     resume_with_answer_observed, resume_with_decision, resume_with_decision_observed,
     resume_with_observed, resume_with_plan_decision, resume_with_plan_decision_observed,
-    retry_gate, retry_gate_observed, rewind, rewind_run, rewind_run_observed, run, run_observed,
-    run_tree, run_tree_observed, run_with, run_with_observed, Rewind, Rewound, RunOutcome,
-    RunResult, SPAWN_TOOL,
+    retry_gate, retry_gate_observed, rewind, rewind_run, rewind_run_observed, rewind_step,
+    rewind_step_observed, run, run_observed, run_tree, run_tree_observed, run_with,
+    run_with_observed, Reverted, Rewind, Rewound, RunOutcome, RunResult, SPAWN_TOOL,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, ExecMode, Sandbox, SandboxConfig, SandboxLimits,

@@ -1,381 +1,537 @@
 product: io-harness
-version: 0.50.0
+version: 0.51.0
 tasks:
-- id: US-IO-HARNESS-0.50.0-T01
-  summary: A child returns its conclusion instead of a Debug-printed outcome.
-  why_required: Without it the parent learns that a child succeeded and nothing it found, which is the
-    release's outcome and the whole of its fallback scope.
+- id: US-IO-HARNESS-0.51.0-T01
+  summary: Render a whole-file unified diff, and reverse-apply one, as pure functions in this crate.
+  why_required: Every other piece of the release reads or writes a hunk. Without a differ that round-trips
+    there is nothing to store, nothing to render and nothing to revert, and a fragment-anchored diff is
+    the failure F1 exists to catch.
   status: done
   depends_on: []
   acceptance_criteria:
-  - '**F1 — a child''s conclusion reaches its parent.** A child whose final completion says a marker string
-    produces a parent observation containing that string, and the parent''s next `CompletionRequest` contains
-    it. The marker is produced by the child''s provider only, so nothing else in the run can have written
-    it. Asserted together with the report''s other fields — the child''s run id, its outcome and its step
-    count are all still present, because the release adds to what the parent learns and removes nothing.
-    Sabotage: restore `compose_child`''s `{outcome:?}` line, under which the marker assertion fails and
-    every other criterion here still passes.
+  - '**F1 — a stored hunk is anchored to the file and reverse-applies byte for byte.** A run edits a file
+    at a known line with `edit_file`; `Store::edits(run)` returns that edit with a `hunk` whose `@@` header
+    names the **file''s** line numbers, and applying it in reverse to the file''s after text reproduces
+    the before text byte for byte, trailing newline included. Asserted for a change at the start of a
+    file, in the middle, at the end, and in a file with no final newline — four positions, because a fragment-anchored
+    diff is right by accident at the start and wrong everywhere else. Sabotage: compute the hunk from
+    `search`/`replacement` rather than from the file''s two texts, under which every position but the
+    first fails and nothing else here does.
 
     '
-  - '**F2 — an adopted child''s conclusion is read from the store and is the same text.** A tree interrupted
-    mid-flight and resumed, whose child had already reached a terminal outcome, composes a report whose
-    conclusion is byte-identical to the one the in-process path produced for the same child. Asserted
-    as equality between the two renderings rather than against a literal, because two sources of one fact
-    drifting is the failure this criterion exists to catch. Sabotage: have the store path return the run''s
-    goal instead of its last untooled text, under which the equality fails and only this fails.
+  - '**N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402** crates
+    on macOS and Linux. The differ is the head-and-tail walk `Edit::measure` already performs; the unified-diff
+    parser and applier are written in this crate. A diff or patch crate is a criterion failure, not a
+    trade-off.
+
+    '
+  files:
+  - src/diff.rs
+  - src/lib.rs
+  evidence:
+  - '17 unit tests in src/diff.rs pass: cargo test --lib diff:: — 17 passed, 0 failed.'
+  - 'generated_pairs_round_trip_in_both_directions drives 2000 generated (old, new) pairs through render
+    -> parse -> apply and render -> parse -> reverse -> apply, requiring both to reproduce the other side
+    byte for byte. It failed on case 106 and the failure was a real defect, not a fixture: a line''s identity
+    includes whether it is terminated, so comparing text alone made an unterminated last line equal to
+    the identically-spelled terminated one. Fixed by comparing (text, is-unterminated-last-line) as the
+    unit, which also deleted the special case the hand-written tests had needed.'
+  - 'Two defects the hand-written cases found first: str::lines() strips a trailing carriage return, so
+    parsing a CRLF patch silently deleted the \r from every line and wrote back mixed endings — parse
+    now splits on \n by hand; and a file that only gained or lost its final newline rendered a hunk of
+    pure context lines that changed nothing.'
+  - 'No dependency added: the differ is the common-head/common-tail walk Edit::measure already performs,
+    and the parser and applier are ~200 lines in src/diff.rs.'
+- id: US-IO-HARNESS-0.51.0-T02
+  summary: Store the hunk on every edit, without moving the line counts.
+  why_required: The release's outcome is that a change stops being a pair of counts. The counts themselves
+    have meant 'the size of the replacement' since 0.18.0 and rewriting them silently is the release's
+    largest own-goal, so the two computations must be separate.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.51.0-T01
+  acceptance_criteria:
+  - '**F1 — a stored hunk is anchored to the file and reverse-applies byte for byte.** A run edits a file
+    at a known line with `edit_file`; `Store::edits(run)` returns that edit with a `hunk` whose `@@` header
+    names the **file''s** line numbers, and applying it in reverse to the file''s after text reproduces
+    the before text byte for byte, trailing newline included. Asserted for a change at the start of a
+    file, in the middle, at the end, and in a file with no final newline — four positions, because a fragment-anchored
+    diff is right by accident at the start and wrong everywhere else. Sabotage: compute the hunk from
+    `search`/`replacement` rather than from the file''s two texts, under which every position but the
+    first fails and nothing else here does.
+
+    '
+  - '**F2 — the line counts do not move, and this is the negative control the release rests on.** Over
+    a corpus of `edit_file` and `write_file` calls covering replacement, insertion, deletion and a rewrite
+    with identical content, `lines_added` and `lines_removed` are identical to this build''s for every
+    row. Sabotage: measure the counts from the whole-file texts the hunk is computed from — the natural
+    tidy-up — under which at least one count moves and F1 still passes.
+
+    '
+  - '**N4 — the DDL is exactly two additive columns and nothing else.** `git diff main -- src/state.rs`
+    shows `ALTER TABLE edits ADD COLUMN hunk TEXT` and `ALTER TABLE rewinds ADD COLUMN undid_step INTEGER`,
+    each by the established `let _ = conn.execute(..)` line, and no `CREATE TABLE`, no `CREATE INDEX`
+    and no `CHECKPOINT_FORMAT` movement — it stays at 7.
+
+    '
+  files:
+  - src/state.rs
+  - src/run.rs
+  - tests/hunks.rs
+  - tests/cross_version.rs
+  evidence:
+  - 'tests/hunks.rs: 5 passed. a_stored_hunk_is_anchored_to_the_file_and_reverse_applies drives edit_file
+    at the start, the middle and the end of a file plus a file with no final newline, and reverse-applies
+    each stored hunk with a hand-rolled applier in the test — deliberately not the crate''s own, which
+    would pass for a renderer and an applier wrong in the same direction.'
+  - 'F1 SABOTAGE: computing the hunk from search/replace instead of the file''s two texts. Fails a_stored_hunk_is_anchored_to_the_file_and_reverse_applies
+    and nothing else — 4 passed, 1 failed.'
+  - 'F2 SABOTAGE FAILED NOTHING ON THE FIRST ATTEMPT, AND THAT IS A FINDING. Measuring the counts from
+    the whole-file texts passed the whole corpus, because for a tidy whole-line edit the two measures
+    agree: trimming the common head and tail of the fragment finds the same changed span as trimming them
+    over the file. A brute-force search over 400,000 single-substring replacements found the class that
+    diverges — a replacement that does not begin and end on a line boundary. Deleting a substring INSIDE
+    a line is (0 added, 1 removed) to the fragment and (1, 1) to the file, because the file still has
+    a line there. Two such cases were added to the corpus and the sabotage then failed the named test
+    and only it — 4 passed, 1 failed, left (1, 1) right (0, 1).'
+  - 'Line counts unchanged: the corpus asserts this build''s numbers for replacement, insertion, whole-line
+    deletion, in-line deletion, an off-boundary split, a whole-file write and a write of identical content.'
+  - DDL is one ALTER TABLE edits ADD COLUMN hunk TEXT, and the column is deliberately NOT named in the
+    CREATE TABLE. SQLite appends an added column to the statement it keeps in sqlite_master, so declaring
+    it in both would put it mid-table for a fresh store and last for a migrated one — the same shape memory.kind
+    and runs.turn_kind already use.
+  - 'tests/cross_version.rs caught the addition before any of this was declared: ''a statement 0.22.0
+    wrote is gone or altered''. Declared in COLUMNS_ADDED_SINCE_0_22_0 and the suite is green — 5 passed.'
+  - 'Neighbouring suites unchanged: edit_file 9, edit_tool 8, multi_file 3, rewind 13, review_change 2,
+    accounting 15, cross_version 5, cross_version_0_29_0 2, store_open 4 — all passed.'
+- id: US-IO-HARNESS-0.51.0-T03
+  summary: Render a run's whole change as a step-ordered patch series.
+  why_required: 'It is the operator-facing half of the fallback scope: a trace that holds hunks and cannot
+    show them has not made the change reviewable.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.51.0-T02
+  acceptance_criteria:
+  - '**F1 — a stored hunk is anchored to the file and reverse-applies byte for byte.** A run edits a file
+    at a known line with `edit_file`; `Store::edits(run)` returns that edit with a `hunk` whose `@@` header
+    names the **file''s** line numbers, and applying it in reverse to the file''s after text reproduces
+    the before text byte for byte, trailing newline included. Asserted for a change at the start of a
+    file, in the middle, at the end, and in a file with no final newline — four positions, because a fragment-anchored
+    diff is right by accident at the start and wrong everywhere else. Sabotage: compute the hunk from
+    `search`/`replacement` rather than from the file''s two texts, under which every position but the
+    first fails and nothing else here does.
+
+    '
+  files:
+  - src/state.rs
+  - tests/hunks.rs
+  evidence:
+  - 'a_runs_change_renders_as_a_step_ordered_patch_series passes: two edits to one file render two ---
+    a/ +++ b/ header pairs, in step order.'
+  - Rendered as a SERIES and documented as one. Two edits to the same file take their line numbers from
+    that file as it stood at each of them, so the second hunk is only correct once the first has been
+    applied. Joining the hunks under one pair of headers would look like a patch and not apply.
+  - An edit with no stored hunk contributes a comment line naming the step, tool, path and counts rather
+    than nothing — asserted by a_write_that_changes_nothing_stores_no_hunk, so a series never silently
+    omits a change.
+- id: US-IO-HARNESS-0.51.0-T04
+  summary: 'Add patch_file: parse a unified diff, match every hunk against the original, write once.'
+  why_required: A multi-hunk change costs one call per hunk today, and the all-or-nothing rule is what
+    makes a patch safe rather than a way to half-write a file.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.51.0-T01
+  acceptance_criteria:
+  - '**F3 — `patch_file` applies a multi-hunk change in one call.** A patch with three hunks at separated
+    line ranges is applied by one tool call; the file afterwards is byte-identical to the result of applying
+    the same three changes as three `edit_file` calls, one `edits` row is written for the patch, and one
+    snapshot row. Sabotage: apply the hunks in sequence against the file as it is being rewritten rather
+    than at their own offsets against the original, under which the second and third hunks land at moved
+    lines and the byte-identity assertion fails.
+
+    '
+  - '**F4 — a patch that does not fit changes nothing.** A patch whose first hunk fits and whose second
+    does not leaves the file byte-identical to what it was, writes **no** `edits` row and **no** snapshot
+    row, and produces an observation naming the failing hunk''s index and the line it expected. Asserted
+    as an absence and a presence together, because a build that stops at the first failure after writing
+    the first hunk passes any assertion that reads only the message. Sabotage: apply each hunk as it is
+    validated, under which the byte-identity assertion fails and only this fails.
+
+    '
+  - '**N7 — the tool catalogue grows by exactly two schemas and no protocol.** `patch_file` and `check`
+    are added; no existing tool''s schema changes, so 0.38.0''s cacheable system prefix moves by those
+    two schemas'' own bytes and nothing else. Asserted by the composed system prompt differing from this
+    build''s only in the added schemas.
+
+    '
+  files:
+  - src/tools/mod.rs
+  - src/tools/workspace.rs
+  - src/run.rs
+  - tests/patch_tool.rs
+  evidence:
+  - 'tests/patch_tool.rs: 6 passed. a_three_hunk_patch_is_one_call_and_lands_where_three_edits_would drives
+    the same three changes twice — once as three edit_file calls, once as one patch_file — and asserts
+    the resulting files are byte-identical, one edits row, tool patch_file, observation ''applied 3 hunks''.'
+  - F3 SABOTAGE, and the FIRST FIXTURE WAS TOO WEAK TO CATCH IT. Locating each hunk in the file as the
+    previous hunks have already rewritten it — a running rewrite, the obvious spelling — passed, because
+    every hunk in the first fixture replaced one line with one line and there was no drift for the wrong
+    implementation to accumulate. The fixture now adds a line in its first hunk and removes one in its
+    third; the sabotage then failed the named test and nothing else. Recorded in the test's own doc comment
+    so the next person does not weaken it back.
+  - 'F4 SABOTAGE: apply and write each hunk as it validates, stopping at the first that does not fit.
+    Fails a_patch_whose_second_hunk_does_not_fit_changes_nothing AND a_three_hunk_patch_is_one_call —
+    two named tests rather than one, both about the same write path, which is honest rather than over-broad:
+    a per-hunk write breaks both the all-or-nothing claim and the offset claim.'
+  - 'All-or-nothing asserted as an absence AND a presence: the file byte-identical, no edits row, rewind
+    reporting Rewind::NotRecorded (so no snapshot row either), and the observation naming hunk 2 and the
+    line it expected.'
+  - patch_file cannot create a file and says to use write_file; a patch to a denied path is refused by
+    the same Act::Write gate and the file is untouched.
+  - Added to workspace_tools() only, so single-file mode is untouched. patch_file falls to Mutating in
+    tool_effect, as everything outside the read-only trio does.
+- id: US-IO-HARNESS-0.51.0-T05
+  summary: 'Add check: the project''s own checker as an Act::Exec-gated tool that speaks its skips.'
+  why_required: Without it the checker only ever answers after the write. The gate is not optional — a
+    model-callable path to the project's build command must be refusable by the policy that refuses exec.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.51.0-T01
+  acceptance_criteria:
+  - '**F5 — the checker answers a question the model asked, including when it has nothing to say.** In
+    a workspace whose ecosystem has a check command, `check` on a clean tree returns an observation saying
+    so; on a broken tree it returns the checker''s findings; and in a workspace with **no** detected ecosystem
+    it returns an observation naming the skip. The third is the discriminating one: the automatic post-edit
+    path maps `Outcome::Skipped` to the empty string (`src/run.rs:11166-11168`) and the tool must not.
+    Sabotage: route the tool through `diagnostics_after_write`''s mapping, under which the skip arm returns
+    nothing and only this fails.
+
+    '
+  - '**F6 — the checker tool is policy-gated and the automatic path is not.** Under a policy denying `Act::Exec`
+    on the detected checker''s program, a `check` call is refused, **no process is spawned**, and the
+    refusal names the rule — while an `edit_file` under that same policy still succeeds and still carries
+    its automatic post-edit diagnostics, because that path is the crate''s own reflex after a write the
+    policy already allowed. Both halves asserted in one test, since the release''s claim is the distinction
+    between them. Sabotage: call `diagnostics::after_edit` directly from the tool arm without the gate,
+    under which the no-process assertion fails and only this fails.
+
+    '
+  - '**N7 — the tool catalogue grows by exactly two schemas and no protocol.** `patch_file` and `check`
+    are added; no existing tool''s schema changes, so 0.38.0''s cacheable system prefix moves by those
+    two schemas'' own bytes and nothing else. Asserted by the composed system prompt differing from this
+    build''s only in the added schemas.
+
+    '
+  files:
+  - src/tools/mod.rs
+  - src/tools/diagnostics.rs
+  - src/run.rs
+  - tests/patch_tool.rs
+  evidence:
+  - 'tests/patch_tool.rs the_checker_answers_clean_findings_and_no_checker_at_all passes all three shapes:
+    a clean crate says it found nothing, a crate with a type error returns the checker''s own findings
+    (mismatched types / E0308), and a workspace with no project marker names the skip.'
+  - 'F5 SABOTAGE: route the tool through diagnostics_after_write''s mapping, where Outcome::Skipped is
+    the empty string. Fails the named test and only it. The distinction is the point — silence costs nothing
+    when nobody asked, and reads as ''your project is clean'' when somebody did.'
+  - 'F6 SABOTAGE: run the checker without the Act::Exec gate. Fails the_check_tool_is_exec_gated_while_the_automatic_check_is_not
+    and only it.'
+  - The gate checks the same two targets exec checks — the program alone and the joined argv — so both
+    deny_exec("cargo") and deny_exec("cargo check*") reach it. No process spawned under a denying policy,
+    asserted by the absence of target/, which cargo always creates.
+  - 'The automatic post-edit checker stays UNGATED, and both halves are asserted in one test in two separate
+    runs. Two runs and not two steps: target/ is the evidence a checker ran, so one run doing both would
+    let the edit''s own check create it before the refusal could be asserted as an absence.'
+  - diagnostics::checker(tc) resolves the argv without running it, so the policy can be asked about a
+    command rather than about the word 'check'. after_edit is now that plus Checker::run.
+- id: US-IO-HARNESS-0.51.0-T06
+  summary: 'Add rewind_step and Reverted: undo one step by reverse-applying its stored hunks.'
+  why_required: Undo has one granularity today, so a twenty-step run with one wrong step is thrown away
+    whole. Reverse-application is order-sensitive, and reporting Stale rather than forcing an apply is
+    what keeps it from corrupting a file.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.51.0-T02
+  acceptance_criteria:
+  - '**F7 — a newest-first walk restores every intermediate state exactly.** A run writes one file at
+    steps 2, 4 and 6; reverting step 6, then 4, then 2 leaves the file byte-identical, after each revert,
+    to what it held at the end of the preceding step, and byte-identical after the last to what `rewind`
+    for that run produces. Asserted at each intermediate state rather than only at the end, because a
+    build that reverse-applies in the wrong order can still arrive at the right final text when the changes
+    do not overlap. Sabotage: apply the hunk forward instead of in reverse, under which the first intermediate
+    assertion fails.
+
+    '
+  - '**F8 — an out-of-order revert reports `Stale` and touches nothing.** Reverting step 2 while steps
+    4 and 6 still stand, where step 4 changed the same lines, returns `Reverted::Stale` and leaves the
+    file byte-identical; no write is attempted, so a read-only path under the policy is not refused —
+    it is not reached. Sabotage: skip the context match and apply anyway, under which the byte-identity
+    assertion fails and only this fails.
+
+    '
+  - '**F9 — an edit with no stored hunk is reported, not treated as empty.** A run whose edit predates
+    this release — a 0.50.0 store opened by this build, so `hunk` is NULL — reports `Reverted::NoHunk`
+    for that path and leaves the file byte-identical. The same answer for an edit whose before text was
+    `Kept::Unkept`. Sabotage: treat a NULL hunk as an empty patch, under which the revert reports success
+    having done nothing and the assertion that it reported `NoHunk` fails.
 
     '
   files:
   - src/run.rs
-  - tests/subagents.rs
+  - src/lib.rs
+  - docs/public-api.txt
+  - tests/hunks.rs
   evidence:
-  - 'F1 — a_child_reports_what_it_concluded_to_its_parent (tests/subagents.rs) passes. Watched it fail
-    first against the shipped composition, which the panic quoted verbatim: the parent''s ledger held
-    "[child 2 \"investigate\" -> Success { steps: 1 }]" and nothing else.'
-  - 'F2 — an_adopted_child_reports_the_same_conclusion (tests/subagents.rs) passes: a parent whose spawn
-    step was left uncommitted by a sibling''s approval pause replays it on resume, and the already-finished
-    child is composed from the store with the same words.'
-  - Both paths read one source — the child's "said" rows in agent_events — so the two renderings cannot
-    drift; there is one rendering.
-  - 'cargo test --test subagents --test agents --test checkpoint --test fleet --test session_fanout --test
-    custom_tools: exit 0, 78 passed across six binaries, no existing tree assertion needed changing.'
-- id: US-IO-HARNESS-0.50.0-T02
-  summary: spawn_agent takes wait and background_after_secs, and a conflicting pair is a typed observation.
-  why_required: Both later shapes are selected per call through these arguments; without the schema and
-    its refusal path there is no way for a parent to choose how a child returns.
+  - 'tests/hunks.rs: 9 passed. reverting_newest_first_restores_every_intermediate_state drives three edits
+    at three steps and asserts the file byte-identical after EACH revert, not only at the end — a build
+    that reverse-applies in the wrong order can still arrive at the right final text when the changes
+    do not overlap.'
+  - 'F7 SABOTAGE: apply the hunk forward instead of in reverse. Fails reverting_newest_first_restores_every_intermediate_state
+    and a_step_revert_and_a_run_rewind_are_different_rows — two named tests, both of which assert that
+    a revert put something back.'
+  - 'F8 SABOTAGE: skip the context match and splice the hunk''s old lines in at its stated position. Fails
+    reverting_out_of_order_reports_stale_and_changes_nothing and only it. That test''s two edits overlap
+    deliberately, so the older hunk''s context is gone and a fuzzy match would ''succeed''.'
+  - 'F9 SABOTAGE: treat a NULL hunk as an empty patch. Fails an_edit_with_no_stored_hunk_is_reported_rather_than_skipped
+    and only it. The absence is produced the way production produces it — a file whose previous contents
+    were not UTF-8, so read_before kept no restore text.'
+  - 'Reverted is #[non_exhaustive] with three variants, because ''it did not happen'' has two causes an
+    operator must tell apart: Stale (the file has moved on — revert the later steps first) and NoHunk
+    (there is nothing to undo it with, and never will be).'
+  - 'docs/public-api.txt gains THREE enumerated lines, not the two the contract named: enum Reverted,
+    fn rewind_step and fn rewind_step_observed. The observed variant exists because that is the shape
+    rewind_run/rewind_run_observed already has and the event needs an observer. Stated rather than glossed.'
+- id: US-IO-HARNESS-0.51.0-T07
+  summary: Record a step revert in the trace, distinguishably from a run rewind.
+  why_required: Store::rewinds would otherwise report 'something was undone' for two different acts, and
+    an event stream that cannot tell them apart cannot be audited.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.50.0-T01
+  - US-IO-HARNESS-0.51.0-T06
   acceptance_criteria:
-  - '**F9 — a malformed spawn is a typed observation, not a failure.** `wait: false` together with `background_after_secs`
-    produces an error observation naming the conflict, no child is created, no slot is taken, no `spawns`
-    row is written, and the parent''s run continues. Asserted as an absence (no new row, no ledger movement)
-    and a presence (the observation) together. Sabotage: treat the conflict as the detached case, under
-    which the absence assertion fails and only this fails.
+  - '**F10 — a step revert is distinguishable in the trace from a run rewind.** `Store::rewinds` reports
+    `undid_step: Some(4)` for a step revert and `None` for a `rewind_run` on the same run, and exactly
+    one `EventKind::Reverted { undid_step, files }` is emitted per `rewind_step` call carrying the count
+    from the value being returned rather than from a second query. The event round-trips through `serde`
+    with no duplicate key, which is asserted rather than assumed. Sabotage: leave `undid_step` NULL for
+    both, under which the distinguishability assertion fails and only this fails.
+
+    '
+  - '**N4 — the DDL is exactly two additive columns and nothing else.** `git diff main -- src/state.rs`
+    shows `ALTER TABLE edits ADD COLUMN hunk TEXT` and `ALTER TABLE rewinds ADD COLUMN undid_step INTEGER`,
+    each by the established `let _ = conn.execute(..)` line, and no `CREATE TABLE`, no `CREATE INDEX`
+    and no `CHECKPOINT_FORMAT` movement — it stays at 7.
 
     '
   files:
-  - src/run.rs
-  - tests/subagents.rs
-  evidence:
-  - 'F9 — a_conflicting_spawn_costs_nothing_and_the_parent_carries_on (tests/subagents.rs) passes: the
-    parent is told which two arguments conflict, no child run exists, no spawn event was recorded, and
-    the run reached Success { steps: 2 }.'
-  - The conflict is answered before register_agent, try_admit and record_spawn, which is what makes "it
-    costs nothing" true rather than hoped for.
-  - 'A zero-second wall clock is Detach and not an error: "wait zero seconds" and "do not wait" are the
-    same request.'
-- id: US-IO-HARNESS-0.50.0-T03
-  summary: A detached child runs in the parent's in-flight set and reports at a later step.
-  why_required: This is the detached shape itself; F4's byte-identity control on the blocking path is
-    what proves it did not change every existing tree run.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.50.0-T02
-  acceptance_criteria:
-  - '**F3 — a detached child does not block its parent, and its report arrives later.** A parent that
-    spawns with `wait: false` commits the spawning step **without** the child''s report, takes at least
-    one further step, and receives the report at a strictly later step. Asserted as three facts together
-    — the report is absent from step *n*, the parent''s step count advanced, and the report is present
-    at step *m > n* — because any one alone passes for a build that merely reordered the fold. Sabotage:
-    await the detached child inline, under which the "absent from step *n*" assertion fails and the blocking
-    control (F4) still passes.
-
-    '
-  - '**F4 — a blocking spawn is unchanged, and this is the negative control the release rests on.** A
-    spawn with neither new argument folds its report into **its own** step, in the model''s call order,
-    with the tree''s trace — `steps.decision` and `steps.result` for every step — byte-identical to this
-    build''s apart from the conclusion text F1 adds. Two children whose completion order is forced to
-    differ from their call order produce the same trace either way, which is 0.12.0''s determinism claim
-    asserted again because this release touches that stream. Sabotage: make `wait: false` the default,
-    under which this fails and F3 still passes.
-
-    '
-  files:
+  - src/state.rs
   - src/run.rs
   - src/observe.rs
-  - tests/subagents.rs
+  - tests/hunks.rs
   evidence:
-  - 'F3 — a_detached_child_reports_at_a_later_step passes: the report is absent from the spawning step,
-    the parent took further steps of its own, and the report arrives at a strictly later step.'
-  - 'F4 — a_blocking_spawn_folds_into_its_own_step_in_call_order passes: two waited-for children fold
-    into step 1 in call order, and nothing was detached.'
-  - children_are_composed_in_spawn_order_not_completion_order (0.12.0's own determinism test) still passes
-    unchanged.
-  - The in-flight set is a FuturesUnordered on the parent's own task, driven against the parent's completion
-    by the `driving` helper — a detached child cannot be a spawned task because `&Store` is `Send` and
-    not `Sync`.
-- id: US-IO-HARNESS-0.50.0-T04
-  summary: background_after_secs races the child against a sleep and keeps the loser.
-  why_required: A stuck child is unbounded from the parent's side today; without the race there is nothing
-    between a child's step cap and halting the whole tree.
+  - 'F10: a_step_revert_and_a_run_rewind_are_different_rows passes — Store::rewinds reports undid_step:
+    Some(step) for the revert and None for the rewind_run on the same run, and exactly one EventKind::Reverted
+    fires with its count taken from the value being returned.'
+  - 'F10 SABOTAGE: leave undid_step NULL for both acts. Fails the named test and only it.'
+  - 'The event field is undid_step and NOT step. The kind is #[serde(flatten)]ed into RunEvent, which
+    already carries a step, and a duplicate key compiles, serialises and fails only on the way back —
+    decided while writing the contract rather than while implementing it. every_variant_round_trips covers
+    it.'
+  - 'Three census sites the enum has, all found by their own guards rather than by reading: the exhaustive
+    match at src/observe.rs:1776, the round-trip sample set, and the event_names list. Each named the
+    omission precisely.'
+- id: US-IO-HARNESS-0.51.0-T08
+  summary: Prove the null-column case in both directions across versions.
+  why_required: Two additive columns mean every row an earlier release wrote has no hunk. Treating an
+    absent hunk as an empty one would revert nothing and report success, which is the one way this release
+    can silently lose an operator's work.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.50.0-T03
+  - US-IO-HARNESS-0.51.0-T02
+  - US-IO-HARNESS-0.51.0-T06
   acceptance_criteria:
-  - '**F5 — a wall clock moves a child to the background and does not kill it.** A spawn carrying `background_after_secs`
-    whose child is parked past that clock ends the parent''s step with a "moved to the background" observation
-    naming the child, **and** the child subsequently completes and delivers its report to a later step.
-    Both halves are asserted, because an implementation built on `tokio::time::timeout` passes the first
-    and silently drops the child. Sabotage: replace the race with `timeout`, under which the second half
-    fails and only this fails; and separately, set the clock past the child''s own duration, under which
-    the child must report in its own step and no background observation is emitted.
+  - '**O2 — cross-version is proven in both directions, including the NULL case.** A 0.50.0 store opened
+    by this build gains both columns by `ALTER TABLE` and reports `hunk: None` and `undid_step: None`
+    for every row it already held; a 0.51.0 store opened by 0.50.0 ignores both columns and reads every
+    other field unchanged. Asserted by the existing cross-version suites plus the F9 case, which is the
+    one an existing suite cannot cover because it is about a column that did not exist.
+
+    '
+  - '**F9 — an edit with no stored hunk is reported, not treated as empty.** A run whose edit predates
+    this release — a 0.50.0 store opened by this build, so `hunk` is NULL — reports `Reverted::NoHunk`
+    for that path and leaves the file byte-identical. The same answer for an edit whose before text was
+    `Kept::Unkept`. Sabotage: treat a NULL hunk as an empty patch, under which the revert reports success
+    having done nothing and the assertion that it reported `NoHunk` fails.
 
     '
   files:
-  - src/run.rs
-  - src/observe.rs
-  - tests/subagents.rs
+  - tests/cross_version.rs
+  - tests/rewind.rs
   evidence:
-  - 'F5 — a_wall_clock_backgrounds_a_child_without_killing_it passes both halves: the parent is told at
-    the step it asked, and the child (parked 1.5s against a 1s clock) still completes, lands its file
-    and reports.'
-  - 'F5''s other arm — a_wall_clock_the_child_beats_is_an_ordinary_spawn passes: a 10s clock against an
-    instant child never reports a background move and folds into step 1.'
-  - 'The race keeps the loser: `futures_util::select` over the child and a sleep, never `tokio::time::timeout`,
-    which drops the future and cancels the child mid-step.'
-- id: US-IO-HARNESS-0.50.0-T05
-  summary: The parent drains every in-flight child before it returns.
-  why_required: 0.48.0's rule is that everything a run starts is inside the boundary; a parent that returns
-    while a child runs is a leak the crate has never had.
+  - 'tests/cross_version.rs: 7 passed (was 5). an_edit_written_before_0_51_0_has_no_hunk_and_is_reported_as_having_none
+    opens the committed 0.22.0 fixture — a database written by a real io-harness 0.22.0 from crates.io
+    — whose edits table has one row and no hunk column at all. Opening it adds both columns by ALTER TABLE;
+    the row reads back hunk: None, its 0.22.0 counts unchanged at (1, 0), rewind_step reports Reverted::NoHunk
+    and the file is byte-identical, and Store::patch names the change as unrenderable rather than omitting
+    it.'
+  - This is the case no other suite can cover, because it is about a column that did not exist. Reproducing
+    it inside tests/hunks.rs would mean writing NULL over a row this build wrote, which tests the reader
+    against a state the writer cannot produce.
+  - the_queries_a_0_50_0_binary_makes_still_answer_against_a_0_51_0_store runs the exact five-column SELECTs
+    a 0.50.0 binary makes against edits and rewinds, against a store this release wrote. Asserted by running
+    them rather than by arguing from the fact that the columns are nullable.
+  - the_schema_this_release_creates_adds_to_0_22_0s_and_alters_none_of_it and the_checkpoint_format_is_still_7
+    both pass with hunk declared in COLUMNS_ADDED_SINCE_0_22_0; CHECKPOINT_FORMAT is unmoved at 7.
+- id: US-IO-HARNESS-0.51.0-T09
+  summary: Bring every checked-in documentation surface to 0.51.0, including the comment that named it.
+  why_required: src/verify.rs says computing a unified diff is 0.51.0's work. Shipping the release while
+    the source still calls it future work is a surface that contradicts the code, and docs_drift, changelog,
+    readme, guide_pages and public_api are gates that fail on it.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.50.0-T03
+  - US-IO-HARNESS-0.51.0-T03
+  - US-IO-HARNESS-0.51.0-T04
+  - US-IO-HARNESS-0.51.0-T05
+  - US-IO-HARNESS-0.51.0-T07
   acceptance_criteria:
-  - '**F6 — a tree never returns with a child still running.** A parent that detaches a child and then
-    reaches its own ending — verification passed, step cap, or a stall — drains before it returns: the
-    returned outcome is accompanied by every detached child in a terminal state, the tier''s `Fleet` tally
-    reports zero working, and every report is in the trace. Sabotage: return without draining, under which
-    the terminal-state assertion fails and only this fails.
+  - '**N3 — the break is exactly two fields on two read-only types, and it is stated rather than discovered.**
+    `Edit` gains `hunk: Option<String>` and `RewindRecord` gains `undid_step: Option<u32>`. Both derive
+    `Default` and both are produced by the store and consumed by a caller, never constructed by one in
+    any doc example, test or example in this repository — so `..Default::default()` keeps working and
+    only an exhaustive struct literal outside the crate breaks, which is the same cost `media` (0.15.0)
+    and `effort` (0.31.0) were counted at. Neither takes `#[non_exhaustive]`: the attribute forbids functional
+    update too, and `Edit` is the type a caller reads out of a trace. No trait method changes, so every
+    `impl Provider`, `impl Tool`, `impl Reviewer` and `impl Approver` compiles unchanged. `docs/public-api.txt`
+    gains **the enumerated crate-root additions only** — `enum Reverted` and `fn rewind_step` — stated
+    as the enumerated additions rather than as a line count, because that checker enumerates crate-root
+    re-exports and a criterion promising a number has been met in a different form in four of the last
+    twelve releases. `PATCH_FILE_TOOL` and `CHECK_TOOL` live in `tools` and add no line, as `EDIT_FILE_TOOL`
+    does not.
 
     '
-  files:
-  - src/run.rs
-  - tests/subagents.rs
-  evidence:
-  - 'F6 — a_tree_drains_the_children_it_stopped_waiting_for passes: a parent that detaches and finishes
-    in the same step still leaves the child successful, its file on disk, and its report durable under
-    the parent''s run id.'
-  - The drain sits at run_agent's single return rather than at agent_loop's twelve endings, and it runs
-    before the  so a run ending in an error drains too.
-- id: US-IO-HARNESS-0.50.0-T06
-  summary: A resumed parent re-adopts every child it detached and left unfinished.
-  why_required: A detached spawn's step commits, so the replay never re-enters spawn_child for it and
-    the child would be orphaned across a restart.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.50.0-T05
-  acceptance_criteria:
-  - '**F7 — an in-flight detached child survives a process death and is re-adopted.** A tree killed while
-    a detached child is mid-run, then resumed, re-adopts that child from its own last committed step (not
-    from step 1, and not as a second child), completes it, and folds its report. Asserted on the child''s
-    run id being the same row and its step count continuing rather than restarting — the same properties
-    the existing adopt-on-resume tests assert for a blocking child. Sabotage: skip the re-adoption walk
-    on resume, under which the child is never completed and F6''s drain finds nothing to drain, failing
-    this and not F6''s own test.
-
-    '
-  files:
-  - src/run.rs
-  - tests/checkpoint.rs
-  evidence:
-  - 'F7 — a_detached_child_is_readopted_after_a_restart (tests/checkpoint.rs) passes: the same child run
-    row is taken back, resumed from its own checkpoint, finishes, lands its file, and its conclusion reaches
-    the resumed parent.'
-  - 'The whole spawn call is recorded as an `AgentEvent::spawn_args` row rather than rebuilt from the
-    `spawns` row, which holds five of the nine arguments: a rebuild from those five would silently drop
-    `agent` and `deny_net` and resume the child under a WIDER policy than it was spawned with. No column
-    was added to record it.'
-  - Re-adoption goes through `spawn_child` itself, so admission, the narrowed policy and the adopt path
-    are the same code that ran the first time.
-  - 'Only steps below `start_step` are re-adopted: a step left uncommitted is replayed and re-adopts its
-    children through the ordinary path, and doing both would adopt one child twice.'
-  - 'FINDING, and it cost a test rewrite: the first version of this test interrupted the run inside the
-    drain, AFTER `finish` had already marked the parent completed — so `resume_tree` returned the terminal
-    outcome and never re-entered the loop. The drain runs after the run row is final, which leaves a narrow
-    window in which a crash orphans a child. Recorded as a known limitation with its recovery (resume
-    the child by its own run id) rather than papered over.'
-- id: US-IO-HARNESS-0.50.0-T07
-  summary: TaskContract carries the operator's default wall clock and its refusal of detachment.
-  why_required: The operator has to be able to narrow what the model may ask for, in the direction every
-    other spawn argument already travels.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.50.0-T04
-  acceptance_criteria:
-  - '**F8 — the operator''s knobs narrow and never widen.** A `TaskContract` that refuses detachment turns
-    a `wait: false` call into a blocking spawn with a stated observation, not into an error and not into
-    a silent detachment; a contract default wall clock applies to a spawn naming none and is **not** raised
-    by a spawn naming a longer one. Asserted in both directions. Sabotage: let the model''s `background_after_secs`
-    override the contract''s, under which the narrowing assertion fails and only this fails.
-
-    '
-  files:
-  - src/contract.rs
-  - src/run.rs
-  - tests/subagents.rs
-  evidence:
-  - 'F8 — the_contract_narrows_what_a_spawn_may_ask_for passes: a contract that refuses detachment turns
-    `wait: false` into a plain wait folded into the spawning step, and the parent is told with a `[spawn
-    narrowed]` line rather than left believing it fanned out.'
-  - 'F8''s other direction — a_contract_clock_is_a_ceiling_and_not_a_default_only passes: the defaults
-    are None/true, a clock does not by itself forbid detaching, and `narrowed()` takes the minimum of
-    the spawn''s clock and the contract''s so a longer request never raises the ceiling.'
-  - 'Both knobs are carried tree-wide on `Tree`, read from the ROOT contract for the same reason `web`,
-    `tools`, `skills` and `agents` are: a child contract the model writes must not buy its own children
-    more patience than the operator allowed.'
-  - 'Free at the type level: `TaskContract` has been #[non_exhaustive] with builders since 0.35.0.'
-  - 'cargo test (default features): exit 0, 79 binaries, 1,614 passed.'
-- id: US-IO-HARNESS-0.50.0-T08
-  summary: Bring every checked-in surface to 0.50.0.
-  why_required: docs/CONTRACT.md, the README, the changelog and the crate-root prose are checked-in surfaces
-    gated by tests, and they change in this release rather than the next one.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.50.0-T07
-  acceptance_criteria:
   - '**O4 — the documentation surfaces agree with the code, in the same release.** `docs/CONTRACT.md`,
-    `src/lib.rs`, the README and `CHANGELOG.md` describe what a child returns, the three shapes, the reproducibility
-    a detached spawn gives up, and what a resume does with an in-flight child. `tests/docs_drift.rs` and
-    `tests/changelog.rs` pass.
+    `src/lib.rs`, the README and `CHANGELOG.md` describe what is stored per edit, what a patch may and
+    may not do, what the checker tool is gated on, and the newest-first ordering rule for step reverts.
+    `src/verify.rs`''s comment naming this release as future work is corrected in this release. `tests/docs_drift.rs`,
+    `tests/changelog.rs`, `tests/readme.rs`, `tests/guide_pages.rs` and `tests/public_api.rs` pass.
 
     '
   files:
   - docs/CONTRACT.md
+  - docs/public-api.txt
+  - docs/guide/durable-runs.md
+  - docs/guide/language-support.md
+  - src/lib.rs
+  - src/verify.rs
   - README.md
   - CHANGELOG.md
-  - src/lib.rs
-  - docs/public-api.txt
+  - Cargo.toml
   evidence:
-  - O4 — tests/docs_drift.rs (15 passed) and tests/changelog.rs (5 passed) both exit 0 after the edits,
-    so the MSRV, the feature list, every relative link, the README's dependency snippet and the breaking-change
-    migration notes all agree with the code.
-  - 'docs/CONTRACT.md gains "How a child comes back, and what a parent gives up to stop waiting (0.50.0)":
-    the three shapes, why a backgrounded child is not a timeout, what reproducibility a detached spawn
-    costs, the concurrency shape and why it cannot be a spawned task, that caps are unchanged, what a
-    restart does — and the one window that is not covered.'
-  - CHANGELOG.md carries the behaviour break with its migration note; Cargo.toml, the README install snippet,
-    the README lead and the crate-root prose are at 0.50.0.
-  - 'docs/public-api.txt is BYTE-IDENTICAL: tests/public_api.rs passes unchanged. The additions are methods,
-    variants and fields on already-listed types, and that checker enumerates crate-root re-exports.'
-- id: US-IO-HARNESS-0.50.0-T09
-  summary: Run the release gates and record the measured numbers.
-  why_required: Every non-functional and operational claim in the contract is a number or an exit status
-    that has to be seen rather than asserted, and the record quotes them.
+  - 'All five documentation gates pass: docs_drift 15, changelog 5, readme 8, guide_pages 7, public_api
+    9.'
+  - docs/CONTRACT.md gains 'What a change is kept as, and what an undo can reach (0.51.0)' — the series-not-one-diff
+    rule, why the line counts did not move, the three reasons a hunk is absent, patch_file's all-or-nothing
+    rule, why check is gated and the automatic checker is not, and the newest-first ordering rule for
+    reverts.
+  - src/verify.rs's comment naming this release as future work is corrected, not deleted. It said 'computing
+    one is 0.51.0's work'; it now says the hunks ARE stored and why review_change still renders both texts
+    — handing a reviewer a diff would narrow what it can see in order to save tokens it is spending on
+    purpose.
+  - 'src/lib.rs crate prose, README, docs/guide/durable-runs.md (two new sections: undoing one step, and
+    reading a run''s change as a patch) and docs/guide/language-support.md (the checker before an edit,
+    and the two deliberate differences from the automatic one).'
+  - CHANGELOG 0.51.0 entry states the break by name — Edit::hunk and RewindRecord::undid_step, both on
+    Default-deriving read types — with the migration, and states under Changed that the line counts deliberately
+    did NOT move and why.
+  - 'docs/public-api.txt gains exactly three lines by hand: enum Reverted, fn rewind_step, fn rewind_step_observed.
+    Version bumped to 0.51.0 in Cargo.toml and README, which docs_drift''s readme_dependency_version_matches_cargo_toml
+    caught.'
+- id: US-IO-HARNESS-0.51.0-T10
+  summary: Measure the release's own number and prove the untouched paths are untouched.
+  why_required: N5 is the claim the patch tool is made of, and N6 is the control that says a run using
+    neither new tool did not change. Neither is provable after the fact from a suite that was not asked
+    the question.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.50.0-T08
+  - US-IO-HARNESS-0.51.0-T04
+  - US-IO-HARNESS-0.51.0-T05
+  - US-IO-HARNESS-0.51.0-T06
+  - US-IO-HARNESS-0.51.0-T07
   acceptance_criteria:
-  - '**N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402** crates
-    on macOS and Linux. `FuturesUnordered` and `select` come from `futures_util`, which is already a dependency
-    and already imported at the spawn site (`src/run.rs:6476`).
+  - '**N5 — the release''s own number, and it is the per-call cost of a multi-hunk change.** A stated
+    four-hunk change to one file is driven twice against a scripted provider: once as four `edit_file`
+    calls and once as one `patch_file` call. Recorded in the release record: the provider calls, the steps,
+    the prompt tokens and the gate evaluations for each arm, and the stored hunk''s size against the file''s
+    size for the same edit. The patch arm must take **one** provider call and **one** gate evaluation
+    where the edit arm takes four of each; a figure that says otherwise is a feature that did not ship
+    rather than a test to adjust.
+
+    '
+  - '**N6 — a run that uses neither new tool is byte-identical in trace to this build''s.** Every existing
+    suite that touches these paths — `tests/edit_file.rs`, `tests/edit_tool.rs`, `tests/multi_file.rs`,
+    `tests/rewind.rs`, `tests/review_change.rs`, `tests/verify_gate.rs` — passes unchanged apart from
+    assertions that quote the tool catalogue, each of which is updated with a sentence saying the catalogue
+    deliberately grew. `steps.decision` and `steps.result` for a run of `edit_file` and `write_file` calls
+    are byte-identical, and the only observable difference in the store is a column that now has a value.
 
     '
   - '**N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
 
     '
-  - '**N3 — zero compile breaks, and it is asserted rather than intended.** `TaskContract` is `#[non_exhaustive]`
-    with builders (`src/contract.rs:186-188`) and `EventKind` has been `#[non_exhaustive]` since 0.24.0,
-    so both additions are free; `Containment`, `RunOutcome`, `RunResult`, `CompletionRequest`, `ToolCall`
-    and every `Provider` method are untouched. Proven by the cross-version fixture generator, which is
-    an out-of-tree crate compiled against this build. `docs/public-api.txt` gains **the enumerated crate-root
-    additions only** — stated as "the enumerated additions" rather than as a line count, because that
-    checker enumerates crate-root re-exports and a criterion promising a number has been met in a different
-    form in four of the last eleven releases.
-
-    '
-  - '**N4 — no durable state moves.** `git diff main -- src/state.rs` shows **no DDL**: no table, column
-    or index, and `CHECKPOINT_FORMAT` unmoved at 7. `Store::children` and `find_spawn` are read paths
-    that already exist and are called, not altered.
-
-    '
-  - '**N5 — the parent works while a detached child runs, measured.** With a child parked for a stated
-    interval, the parent''s completed step count over that interval is recorded for a blocking spawn and
-    for a detached one, in the release record. This is the release''s own number: it must be greater than
-    zero for the detached arm and zero for the blocking arm, and a figure that says otherwise is a feature
-    that did not ship rather than a test to adjust.
-
-    '
-  - '**N6 — a run that detaches nothing is byte-identical in trace to this build.** Every existing tree
-    suite — `tests/subagents.rs`, `tests/agents.rs`, `tests/checkpoint.rs`, `tests/session_fanout.rs`,
-    `tests/custom_tools.rs` — passes unchanged apart from assertions that quote the composed child line,
-    each of which is updated with a sentence saying the composition deliberately changed. 0.32.0''s queue,
-    0.36.0''s worktrees, 0.39.0''s contained turns and 0.41.0''s read batch are unaffected.
-
-    '
-  - '**N7 — the tree prompt does not grow a protocol.** `spawn_agent` gains two optional properties and
-    no tool is added, so the tool catalogue''s shape — and therefore 0.38.0''s cacheable system prefix
-    — moves by the schema''s own bytes and nothing else. Asserted by the composed system prompt differing
-    from this build''s only inside the `spawn_agent` schema.
-
-    '
   - '**O1 — the full suite passes on all three platforms**, on the standing CI matrix including 0.47.0''s
-    `contained (ubuntu, userns restricted)` leg. Concurrency changes are exactly the kind that pass on
-    one host and fail on a loaded runner, so a green macOS gate is not evidence here.
+    `contained (ubuntu, userns restricted)` leg. A hand-written unified-diff parser is precisely the code
+    that passes on the host that wrote the fixture and fails on the one with different line endings, so
+    a green macOS gate is not evidence here: line-ending and final-newline handling are asserted explicitly
+    and on every platform.
 
     '
-  - '**O2 — cross-version is unaffected and proven so.** No DDL, so a 0.49.0 store and a 0.50.0 store
-    are the same store in both directions, asserted by the existing cross-version suites.
-
-    '
-  - '**O3 — no test gates on a wall clock it does not own.** F5''s clock is the test''s own (milliseconds,
-    against a provider the test parks deliberately) and F3''s ordering is asserted on step numbers rather
-    than on elapsed time. A criterion that would fail on a busy runner is a flake this repository has
-    paid for seven times, and the standing rule applies: assert the structure, record the timing.
+  - '**O3 — no test gates on a wall clock it does not own.** The `check` tool runs a real project checker,
+    so its tests use a fixture workspace whose check is trivially fast and assert the **structure** of
+    the answer — clean, findings, skipped, refused — recording any timing rather than asserting on it.
+    A criterion that would fail on a busy runner is a flake this repository has paid for eight times,
+    and the standing rule applies.
 
     '
   files:
-  - Cargo.toml
-  - Cargo.lock
+  - tests/patch_tool.rs
+  - src/diff.rs
+  - src/run.rs
+  - src/state.rs
+  - tests/hunks.rs
   evidence:
-  - 'N1 — `cargo tree` for the default feature set: **402** lines, unchanged. No new dependency; the
-    detachment set is `futures_util`, already present and already imported at the spawn site.'
-  - 'N2 — `cargo +1.95 check --all-targets` exit 0 and `cargo +1.95 check --all-targets --all-features`
-    exit 0, which is the pair the msrv job runs, one per feature polarity. MSRV unmoved at 1.95.'
-  - 'N3 — `docs/public-api.txt` is byte-identical to main (`git diff main -- docs/public-api.txt` empty),
-    and the out-of-tree 0.29.0 generator compiled against this build (exit 0), which is the compile-break
-    proof the criterion names. Met in the form the criterion itself anticipated: the additions are methods,
-    variants and fields on already-listed types, so a checker that enumerates crate-root re-exports sees
-    no new line.'
-  - 'N4 — `git diff main -- src/state.rs` adds **0** lines matching CREATE/ALTER TABLE, CREATE INDEX,
-    ADD COLUMN or DROP; 54 insertions, all read-path and doc. `CHECKPOINT_FORMAT` unmoved at 7
-    (`src/state.rs:107`).'
-  - 'N5 — MEASURED, and met as step counts rather than as a timed benchmark. Stated, not glossed: the
-    criterion asks for the parent''s completed step count over the interval a child is parked, and the
-    number recorded is that count against the scripted provider F3 and F4 already park, not a wall-clock
-    benchmark. Detached arm: report arrives at step 3 of 3, **2 parent steps completed while the child
-    ran**. Blocking arm: both children fold into step 1, parent total 1 step, **0 parent steps completed
-    while the children ran**. Both directions are what the criterion requires (>0 detached, 0 blocking).
-    Taken from a temporary `eprintln!` in the two tests, run, then reverted — `tests/subagents.rs`
-    restored and proven byte-identical by sha256 before anything was sealed.'
-  - 'N6 — every existing tree suite passes: `cargo test` (default) exit 0, 79 binaries, 1,616 passed,
-    0 failed, 420 doctests; `cargo test --all-features` a separate invocation after `rm -rf target`,
-    exit 0, 79 binaries, 1,702 passed, 0 failed, 423 doctests. Both with `XDG_CONFIG_HOME` redirected
-    to a scratch directory, this machine''s standing fix for `tests/plugin.rs` and unrelated to the
-    release.'
-  - 'N7 — `tree_tools` gains two optional properties inside the existing `spawn_agent` schema and nothing
-    else: the diff against main adds no `ToolSpec`, no tool name, and leaves `required` unchanged. The
-    catalogue''s shape, and therefore 0.38.0''s cacheable system prefix, moves by the schema''s own bytes.'
-  - 'O2 — `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` exit 0, then `cargo test
-    --test cross_version_0_29_0 -- --ignored --exact a_current_store_is_read_by_a_0_29_0_binary` exit
-    0, 1 passed. The generator''s pin control passes too: `io-harness = "=0.29.0"` still in the fixture
-    manifest, which is what makes the job evidence rather than a label.'
-  - 'O3 — the two flaky `tests/handles.rs` failures the previous session saw on a loaded machine
-    (`a_handle_that_exits_on_its_own_stops_reading_as_running` and
-    `killing_a_handle_kills_a_grandchild_whose_parent_already_exited`) did NOT reproduce: both suites
-    above are 0 failed. They were clock/child-process shaped, as suspected, and are not a regression.'
-  - 'SABOTAGE — S8 re-run and CONFIRMED CLOSED. It is recorded because it is the one that originally
-    failed nothing: turning `narrowed()`''s `asked.min(cap)` into `asked.max(cap)` (`src/run.rs:7184`)
-    once left the whole suite green, because the only end-to-end criterion exercised the refusal switch
-    and the switch returns before the arithmetic. Re-run now against the shipped tree: `cargo test --lib`
-    exits 101 and fails **exactly one** named test,
-    `run::tests::a_contract_clock_is_a_ceiling_the_model_cannot_raise` — 439 passed, 1 failed. `src/run.rs`
-    restored and proven byte-identical by sha256.'
-  - 'Build and packaging gates: `cargo fmt --check` exit 0 (re-run last, against the shipped tree, after
-    every temporary instrumentation was reverted and hash-verified); `cargo clippy --all-targets
-    --all-features -- -D warnings` exit 0; `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc
-    --all-features --no-deps` exit 0; `cargo clean && cargo package --locked` exit 0, **234 files, 6.3MiB
-    (1.6MiB compressed)**.'
-  - 'O1 is the one gate this machine cannot supply: the three-platform matrix, including 0.47.0''s
-    `contained (ubuntu, userns restricted)` leg, runs on the release PR. A green macOS gate is explicitly
-    not evidence for it, and it is carried as a known limitation rather than claimed here.'
+  - 'N5 MEASURED, on a four-hunk change to one 231-byte file, both arms producing a byte-identical result.
+    edit_file x4: 5 provider calls, 4 gate evaluations, 1,987 prompt bytes, 424 bytes of stored hunks.
+    patch_file x1: 2 provider calls, 1 gate evaluation, 649 prompt bytes, 476 bytes of stored hunks. One
+    gate evaluation against four and one acting completion against four, asserted; 3.06x less prompt read,
+    recorded.'
+  - 'N6: only THREE test files differ from main — tests/hunks.rs and tests/patch_tool.rs are new, and
+    tests/cross_version.rs gained two tests and one import line. Every other suite in the repository is
+    byte-identical to main and passes, which is the byte-identity control stated as a fact about the diff
+    rather than as an assertion inside a test.'
+  - 'N2: cargo test and cargo test --all-features both build and pass on the 1.95 toolchain this repository
+    pins.'
+  - 'N1: cargo tree is 402, unchanged since 0.23.0. The differ, the parser and the applier are ~450 lines
+    in src/diff.rs and no crate was added.'
+  - 'N4: git diff main -- src/state.rs shows exactly two ALTER TABLE ADD COLUMN lines and no CREATE TABLE,
+    no CREATE INDEX. CHECKPOINT_FORMAT is unmoved at 7.'
+  - 'GATES, every one run to completion with its output read. cargo fmt --check exit 0. cargo clippy --all-targets
+    --all-features -- -D warnings exit 0 (after five findings: two needless_range_loop, manual_is_multiple_of,
+    three unnecessary_lazy_evaluations, one type_complexity). cargo test exit 0 — 81 binaries, 1,656 passed,
+    425 doctests. cargo test --all-features exit 0 on a cleared target — 81 binaries, 1,742 passed, 428
+    doctests. RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps exit
+    0. cargo package --locked exit 0, 1,699,907 bytes. The cross-version generator gate passes: a_current_store_is_read_by_a_0_29_0_binary,
+    a real 0.29.0 binary reading a store this release wrote.'
+  - THE NIGHTLY RUSTDOC GATE CAUGHT SOMETHING STABLE cargo doc DID NOT — sixth release running. Edit::hunk's
+    doc linked [Snapshot], a private item, and -D warnings refused it via rustdoc::private_intra_doc_links.
+  - 'ONE FLAKE, and it is the ninth of a family already in memory. a_handle_takes_the_cpu_cap_a_foreground_stage_takes
+    failed on the first all-features run — a spinning awk that a CPU cap should have ended still reading
+    ''running'' on a machine that had just built the whole all-features tree. It passed alone (5 of 5)
+    and in the default suite. Unrelated to this release: nothing here touches the handle or sandbox path.
+    The suite was re-run with --no-fail-fast and was green.'
+  - 'ORDERING, stated rather than glossed: the private-link fix to src/state.rs landed AFTER the two suites
+    ran. It is a doc comment and cannot change behaviour, but rather than assert that, cargo test --doc
+    was re-run against the shipped tree — 425 passed, exit 0 — and cargo package compiled the packaged
+    crate from it.'
+  - 'DISK: target reached 17 GiB because earlier invocations in this session did not carry CARGO_PROFILE_TEST_DEBUG=0.
+    With both flags set from a clean start the same all-features build peaked far lower. cargo clean reclaimed
+    18.3 GiB and then 14.3 GiB.'

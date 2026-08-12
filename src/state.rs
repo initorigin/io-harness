@@ -2408,7 +2408,7 @@ pub struct ProviderCall {
 pub struct Edit {
     /// The step that made the change.
     pub step: u32,
-    /// The tool that made it — `write_file` or `edit_file`.
+    /// The tool that made it — `write_file`, `edit_file` or `patch_file`.
     pub tool: String,
     /// The path, as the agent named it (relative to the workspace root).
     pub path: String,
@@ -2416,6 +2416,20 @@ pub struct Edit {
     pub lines_added: u64,
     /// Lines present before and not after.
     pub lines_removed: u64,
+    /// The change as a unified diff of the whole file, or `None` (0.51.0).
+    ///
+    /// `@@` line numbers are the **file's**, so the text reads and applies
+    /// against the file a human opens. It is a body only — no `---`/`+++`
+    /// headers, which [`Store::patch`] writes because it is the only caller that
+    /// knows the path.
+    ///
+    /// `None` has three causes and none of them is "nothing happened":
+    /// the row was written before 0.51.0; the file's previous contents were not
+    /// kept, so there was nothing to diff against (over the snapshot cap or not
+    /// UTF-8 — the reason is on that path's snapshot row); or the rendered
+    /// diff would itself have exceeded that cap. An absent hunk is reported as
+    /// absent everywhere it is read, never treated as an empty patch.
+    pub hunk: Option<String>,
 }
 
 impl Edit {
@@ -2456,7 +2470,47 @@ impl Edit {
             path: path.to_string(),
             lines_added: (new.len() - head - tail) as u64,
             lines_removed: (old.len() - head - tail) as u64,
+            hunk: None,
         }
+    }
+
+    /// Attach the change as a unified diff of the **whole file** (0.51.0).
+    ///
+    /// Separate from [`Edit::measure`], and called with different texts, which is
+    /// the point rather than an inconvenience. `measure` is handed the fragment
+    /// an `edit_file` replaced, so its counts have meant "the size of the
+    /// replacement" since 0.18.0 and the reason is written at its call site.
+    /// A hunk needs the file's own line numbers, so it is computed from the
+    /// file's two texts. Folding the two together would be the natural tidy-up
+    /// and would silently change every number in every existing trace.
+    ///
+    /// `None` — the field is left as it was — when nothing changed, or when the
+    /// rendered diff would exceed the store's 1 MiB snapshot cap. A caller that
+    /// could not read the previous contents simply does not call this.
+    ///
+    /// Public for the reason [`Edit::measure`] and [`Store::record_edit`] are: a
+    /// caller recording its own edit rows would otherwise be able to write a
+    /// count and never a change, which makes [`Store::patch`] useless to them.
+    ///
+    /// ```
+    /// use io_harness::Edit;
+    ///
+    /// let before = "fn parse() {}\n";
+    /// let after = "fn parse(s: &str) {}\n";
+    /// let edit = Edit::measure(2, "edit_file", "src/parse.rs", before, after)
+    ///     .with_hunk(before, after);
+    ///
+    /// let hunk = edit.hunk.expect("a change renders a hunk");
+    /// assert!(hunk.starts_with("@@ -1,1 +1,1 @@"));
+    /// assert!(hunk.contains("-fn parse() {}"));
+    /// assert!(hunk.contains("+fn parse(s: &str) {}"));
+    ///
+    /// // Nothing changed, so there is nothing to render.
+    /// assert_eq!(Edit::measure(2, "write_file", "a", before, before).with_hunk(before, before).hunk, None);
+    /// ```
+    pub fn with_hunk(mut self, before: &str, after: &str) -> Self {
+        self.hunk = crate::diff::render(before, after).filter(|h| h.len() <= MAX_SNAPSHOT_BYTES);
+        self
     }
 }
 
@@ -2572,6 +2626,13 @@ pub struct RewindRecord {
     pub memory_removed: Vec<String>,
     /// The goals of the children that were still queued and no longer are.
     pub queue_cleared: Vec<String>,
+    /// The step this undid, or `None` for a whole-run rewind (0.51.0).
+    ///
+    /// Two different acts share this table and a reader has to be able to tell
+    /// them apart: [`crate::rewind_run`] puts a run back to before it started,
+    /// and [`crate::rewind_step`] reverse-applies one step's stored hunks. A
+    /// trace that reported both as "something was undone" could not be audited.
+    pub undid_step: Option<u32>,
 }
 
 /// One background process the run started, as the store last knew it.
@@ -3534,6 +3595,35 @@ impl Store {
              CREATE INDEX IF NOT EXISTS summaries_run ON summaries (run_id, folded);",
         )?;
 
+        // 0.51.0 — the change itself, and which act an undo was.
+        //
+        // `edits.hunk` is the unified diff of the whole file this edit made, so a
+        // trace can show *what* changed rather than only how many lines did. NULL
+        // for every row an earlier release wrote, for a file whose previous
+        // contents were not kept, and for a diff over the snapshot cap — three
+        // causes, all reported as an absent hunk and never as an empty one.
+        //
+        // `rewinds.undid_step` is the step a revert undid, and NULL for a
+        // whole-run rewind. Without it [`Self::rewinds`] reports two different
+        // acts as the same event and the trace cannot be audited.
+        //
+        // Both additive, and NOT a `CHECKPOINT_FORMAT` bump: no checkpoint layout
+        // changed, an older binary never selects either column, and bumping the
+        // format would make [`Self::check_resumable`] refuse every 0.50.x store
+        // over two columns it does not read. `let _ =` on both, as every addition
+        // since 0.13.0 has used: `ALTER TABLE ADD COLUMN` errors when the column
+        // is already there, which is the ordinary case on the second open.
+        //
+        // **Neither column is named in its `CREATE TABLE` above, and that is
+        // deliberate** — `memory.kind` and `runs.turn_kind` are added the same
+        // way. SQLite appends an added column to the statement it keeps in
+        // `sqlite_master`, so a table created here and then altered has the
+        // column last; declaring it in the `CREATE` too would put it in the
+        // middle for a fresh store and at the end for a migrated one, and the
+        // two would no longer be the same database.
+        let _ = conn.execute("ALTER TABLE edits ADD COLUMN hunk TEXT", []);
+        let _ = conn.execute("ALTER TABLE rewinds ADD COLUMN undid_step INTEGER", []);
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -4235,11 +4325,12 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Record one file change and its line counts (0.18.0).
+    /// Record one file change, its line counts, and the hunk it made (0.18.0,
+    /// hunk 0.51.0).
     pub fn record_edit(&self, run_id: i64, edit: &Edit) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO edits (run_id, step, tool, path, lines_added, lines_removed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO edits (run_id, step, tool, path, lines_added, lines_removed, hunk)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 run_id,
                 edit.step,
@@ -4247,6 +4338,7 @@ impl Store {
                 &edit.path,
                 edit.lines_added,
                 edit.lines_removed,
+                &edit.hunk,
             ),
         )?;
         Ok(())
@@ -4255,7 +4347,7 @@ impl Store {
     /// Every file change recorded for a run, in the order they were made.
     pub fn edits(&self, run_id: i64) -> Result<Vec<Edit>> {
         let mut stmt = self.conn.prepare(
-            "SELECT step, tool, path, lines_added, lines_removed
+            "SELECT step, tool, path, lines_added, lines_removed, hunk
              FROM edits WHERE run_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map([run_id], |r| {
@@ -4265,9 +4357,66 @@ impl Store {
                 path: r.get(2)?,
                 lines_added: r.get(3)?,
                 lines_removed: r.get(4)?,
+                // NULL for every row an earlier release wrote, and for a change
+                // this one could not render. `None` is reported as `None` — an
+                // absent hunk treated as an empty patch would undo nothing and
+                // call it a success.
+                hunk: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// A run's whole change as a step-ordered patch series (0.51.0).
+    ///
+    /// **A series, not one diff, and the distinction is load-bearing.** Two edits
+    /// to the same file have line numbers taken from that file as it stood at
+    /// each of them, so the second hunk's `@@` header is only correct once the
+    /// first has been applied. Rendered in step order with a `---`/`+++` header
+    /// per edit, it applies as a sequence — which is what `git apply` and `patch`
+    /// do with a multi-file, multi-commit diff, and what a human reads. Joining
+    /// the hunks under one pair of headers would produce something that looks
+    /// like a patch and does not apply.
+    ///
+    /// An edit with no stored hunk contributes a comment line saying so rather
+    /// than nothing, because a patch that silently omits a change misrepresents
+    /// the run.
+    ///
+    /// ```
+    /// use io_harness::{Edit, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// # let store = Store::memory()?;
+    /// # let run_id = store.start_run("rename the function", "src/parse.rs")?;
+    /// store.record_edit(run_id, &Edit::measure(
+    ///     2,
+    ///     "edit_file",
+    ///     "src/parse.rs",
+    ///     "fn parse() {}\n",
+    ///     "fn parse(s: &str) {}\n",
+    /// ).with_hunk("fn parse() {}\n", "fn parse(s: &str) {}\n"))?;
+    ///
+    /// let patch = store.patch(run_id)?;
+    /// assert!(patch.contains("--- a/src/parse.rs"));
+    /// assert!(patch.contains("-fn parse() {}"));
+    /// assert!(patch.contains("+fn parse(s: &str) {}"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn patch(&self, run_id: i64) -> Result<String> {
+        let mut out = String::new();
+        for edit in self.edits(run_id)? {
+            match &edit.hunk {
+                Some(hunk) => {
+                    out.push_str(&format!("--- a/{}\n+++ b/{}\n{hunk}", edit.path, edit.path))
+                }
+                None => out.push_str(&format!(
+                    "# step {} {} {}: +{} -{} lines, no hunk stored\n",
+                    edit.step, edit.tool, edit.path, edit.lines_added, edit.lines_removed
+                )),
+            }
+        }
+        Ok(out)
     }
 
     /// Record the state of a file before this run first wrote it (0.28.0).
@@ -4441,17 +4590,20 @@ impl Store {
         memory_restored: &[String],
         memory_removed: &[String],
         queue_cleared: &[(u32, String)],
+        undid_step: Option<u32>,
     ) -> Result<()> {
         let goals: Vec<&String> = queue_cleared.iter().map(|(_, g)| g).collect();
         self.conn.execute(
-            "INSERT INTO rewinds (run_id, files, memory_restored, memory_removed, queue_cleared)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO rewinds
+                 (run_id, files, memory_restored, memory_removed, queue_cleared, undid_step)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             (
                 run_id,
                 serde_json::to_string(files).unwrap_or_else(|_| "[]".into()),
                 serde_json::to_string(memory_restored).unwrap_or_else(|_| "[]".into()),
                 serde_json::to_string(memory_removed).unwrap_or_else(|_| "[]".into()),
                 serde_json::to_string(&goals).unwrap_or_else(|_| "[]".into()),
+                undid_step,
             ),
         )?;
         Ok(())
@@ -4488,8 +4640,8 @@ impl Store {
     /// ```
     pub fn rewinds(&self, run_id: i64) -> Result<Vec<RewindRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT at, files, memory_restored, memory_removed, queue_cleared FROM rewinds
-             INDEXED BY rewinds_run WHERE run_id = ?1 ORDER BY id",
+            "SELECT at, files, memory_restored, memory_removed, queue_cleared, undid_step
+             FROM rewinds INDEXED BY rewinds_run WHERE run_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map((run_id,), |r| {
             let list = |i: usize| -> rusqlite::Result<Vec<String>> {
@@ -4502,6 +4654,7 @@ impl Store {
                 memory_restored: list(2)?,
                 memory_removed: list(3)?,
                 queue_cleared: list(4)?,
+                undid_step: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)

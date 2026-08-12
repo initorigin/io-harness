@@ -65,10 +65,10 @@ const GIT_DIR: &str = ".git";
 #[cfg(feature = "media")]
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
-    Entry, FsTool, ToolEffect, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL,
-    FIND_TOOL, GREP_TOOL, LIST_DIR_TOOL, PROPOSE_PLAN_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL,
-    REMEMBER_TOOL, SHELL_KILL_TOOL, SHELL_POLL_TOOL, SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL,
-    WRITE_FILE_TOOL,
+    Entry, FsTool, ToolEffect, Toolbox, Workspace, ASK_QUESTION_TOOL, CHECK_TOOL, EDIT_FILE_TOOL,
+    EXEC_TOOL, FIND_TOOL, GREP_TOOL, LIST_DIR_TOOL, PATCH_FILE_TOOL, PROPOSE_PLAN_TOOL,
+    READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_KILL_TOOL, SHELL_POLL_TOOL,
+    SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
@@ -730,6 +730,9 @@ pub fn rewind_run_observed(
         &done.memory_restored,
         &done.memory_removed,
         &done.queue_cleared,
+        // `None`: this undid the run, not a step. The column is what lets a
+        // reader tell the two acts apart.
+        None,
     )?;
     // Built from the value being returned, never re-queried. The counts and the
     // `Rewound` a caller receives cannot disagree, because there is only one of
@@ -742,6 +745,215 @@ pub fn rewind_run_observed(
             files: done.files.len() as u32,
             memory: (done.memory_restored.len() + done.memory_removed.len()) as u32,
             queued: done.queue_cleared.len() as u32,
+        },
+    ));
+    Ok(done)
+}
+
+/// What reverting one step did to one file (0.51.0).
+///
+/// Three variants and not two, because "it did not happen" has two causes that
+/// an operator must be able to tell apart: the change is still there and this
+/// build **could** have undone it but the file has moved on, and the change is
+/// still there and this build has **nothing to undo it with**. The first is
+/// answered by reverting the later steps first; the second never will be.
+///
+/// ```
+/// use io_harness::tools::Workspace;
+/// use io_harness::{rewind_step, Reverted, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let ws = Workspace::new(dir.path());
+/// let store = Store::memory()?;
+/// let run = store.start_run("tidy the notes", &dir.path().display().to_string())?;
+///
+/// // This run wrote nothing, so its first step has nothing to put back — and,
+/// // crucially, nothing is touched.
+/// assert!(rewind_step(&ws, &store, run, 1)?.is_empty());
+///
+/// // After a real run there is one entry per path the step wrote, and each says
+/// // which of three things happened. Only the first changed anything.
+/// fn what_happened(r: &Reverted) -> &'static str {
+///     match r {
+///         Reverted::Applied(_) => "put back",
+///         Reverted::Stale(_) => "the file has moved on; nothing was changed",
+///         Reverted::NoHunk(_) => "there is no hunk to undo with; nothing was changed",
+///         _ => "something a later release added",
+///     }
+/// }
+/// # let _ = what_happened;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Reverted {
+    /// Put back, carrying what the workspace said — a revert that reproduces
+    /// what the file already held reports
+    /// [`Wrote::Unchanged`](crate::tools::Wrote::Unchanged).
+    Applied(Wrote),
+    /// The file no longer matches the hunk's context, so **nothing was
+    /// changed**. Carries the reason, naming the hunk and the line it expected.
+    ///
+    /// The ordinary cause is reverting out of order: a later step changed the
+    /// same lines and is still standing on top of this one. Revert newest first
+    /// and it applies.
+    Stale(String),
+    /// No hunk was stored for this edit, so there is nothing to reverse-apply,
+    /// and **nothing was changed**.
+    ///
+    /// Either the row predates 0.51.0, or the file's previous contents were not
+    /// kept — over the snapshot cap, or not text — in which case the reason is
+    /// on that path's snapshot row. [`rewind`] is what puts such a file back,
+    /// and it puts it back to before the run's first write rather than to before
+    /// this step.
+    NoHunk(String),
+}
+
+/// Undo one step's file changes by reverse-applying their stored hunks (0.51.0).
+///
+/// [`rewind`] answers "undo this file", [`rewind_run`] answers "undo this run",
+/// and neither answers "undo *that*". A run's restore point is the state of a
+/// file before the run's **first** write to it, so a twenty-step run whose step
+/// eighteen was wrong could be thrown away whole or not at all. This is the
+/// granularity in between, and it exists because 0.51.0 keeps the hunk.
+///
+/// **Walk backwards.** Reverse-application is order-sensitive: a step reverted
+/// while a later step's change still sits on top of it finds context that has
+/// moved, and the honest answer is [`Reverted::Stale`] and an untouched file,
+/// never a fuzzy match that quietly corrupts it. To walk a run back, call this
+/// for the newest step first and descend:
+///
+/// ```no_run
+/// use io_harness::{rewind_step, tools::Workspace, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// # let (ws, store, run_id) = (Workspace::new("."), Store::memory()?, 1i64);
+/// for step in (1..=18).rev() {
+///     for (path, what) in rewind_step(&ws, &store, run_id, step)? {
+///         println!("{step} {path}: {what:?}");
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// One entry per path this step wrote, in the order it wrote them. A step that
+/// wrote nothing returns an empty vector and changes nothing, which is not an
+/// error — asking to undo a step that read three files is a reasonable question
+/// with a short answer.
+///
+/// Writing goes through [`Workspace::write_file`], so the same path policy the
+/// edit obeyed governs the undo: a revert cannot put bytes anywhere the run
+/// could not have written them. Nothing in the trace is deleted, and the revert
+/// is itself written down — [`Store::rewinds`] reports it with `undid_step` set,
+/// which is what distinguishes it from a whole-run rewind.
+pub fn rewind_step(
+    ws: &Workspace,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+) -> Result<Vec<(String, Reverted)>> {
+    rewind_step_observed(ws, store, run_id, step, &crate::observe::Ignore)
+}
+
+/// [`rewind_step`], reporting to an [`Observer`](crate::Observer) (0.51.0).
+///
+/// One [`EventKind::Reverted`] once the work is done, carrying its counts from
+/// the value being returned rather than from a second query — a number re-read
+/// from the store would be true whether or not the revert happened, which is the
+/// defect 0.32.0 paid to learn.
+///
+/// ```
+/// use io_harness::tools::Workspace;
+/// use io_harness::{rewind_step_observed, EventKind, Flow, Observer, RunEvent, Store};
+/// use std::sync::Mutex;
+///
+/// #[derive(Default)]
+/// struct Seen(Mutex<Vec<String>>);
+/// impl Observer for Seen {
+///     fn event(&self, e: &RunEvent) -> Flow {
+///         if let EventKind::Reverted { undid_step, files } = &e.kind {
+///             self.0.lock().unwrap().push(format!("{undid_step}/{files}"));
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let ws = Workspace::new(dir.path());
+/// let store = Store::memory()?;
+/// let run = store.start_run("tidy up", &dir.path().display().to_string())?;
+///
+/// let seen = Seen::default();
+/// rewind_step_observed(&ws, &store, run, 4, &seen)?;
+/// assert_eq!(*seen.0.lock().unwrap(), ["4/0"], "it happened, and undid nothing");
+/// # Ok(())
+/// # }
+/// ```
+pub fn rewind_step_observed(
+    ws: &Workspace,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    observer: &dyn Observer,
+) -> Result<Vec<(String, Reverted)>> {
+    let mut done: Vec<(String, Reverted)> = Vec::new();
+    for edit in store.edits(run_id)?.into_iter().filter(|e| e.step == step) {
+        let Some(hunk) = edit.hunk.as_deref() else {
+            done.push((
+                edit.path,
+                Reverted::NoHunk(
+                    "no hunk was stored for this edit — it predates 0.51.0, or the file's \
+                     previous contents were not kept. `rewind` puts the file back to before \
+                     this run first wrote it"
+                        .to_string(),
+                ),
+            ));
+            continue;
+        };
+        // Read through the workspace, so a path the policy will not let us read
+        // is refused here rather than after a partial write.
+        let current = match ws.read_file(&edit.path) {
+            Ok(text) => text,
+            Err(e) => {
+                done.push((edit.path, Reverted::Stale(e.to_string())));
+                continue;
+            }
+        };
+        let restored = crate::diff::parse(hunk)
+            .and_then(|hunks| crate::diff::apply(&current, &crate::diff::reverse(&hunks)));
+        match restored {
+            Ok(text) => {
+                let wrote = ws.write_file(&edit.path, &text)?;
+                done.push((edit.path, Reverted::Applied(wrote)));
+            }
+            // Not an error: the file has moved on, which is an ordinary answer to
+            // an out-of-order revert and something the caller acts on rather than
+            // something that should end their loop over the other paths.
+            Err(e) => done.push((edit.path, Reverted::Stale(e.to_string()))),
+        }
+    }
+
+    let names: Vec<String> = done
+        .iter()
+        .filter(|(_, r)| matches!(r, Reverted::Applied(_)))
+        .map(|(p, _)| p.clone())
+        .collect();
+    let applied = names.len() as u32;
+    store.record_rewind(run_id, &names, &[], &[], &[], Some(step))?;
+    observer.event(&RunEvent::at_depth(
+        run_id,
+        step,
+        0,
+        EventKind::Reverted {
+            // Not `step`: the kind is `#[serde(flatten)]`ed into `RunEvent`,
+            // which already carries one, and a duplicate key compiles,
+            // serialises, and fails only on the way back.
+            undid_step: step,
+            files: applied,
         },
     ));
     Ok(done)
@@ -9615,6 +9827,10 @@ async fn dispatch(
                     // point; this is measurement, and the content never reaches
                     // the model.
                     let (before, kept) = read_before(ws, &target);
+                    // A `Kept::Unkept` before text is `""` and is not what was
+                    // there, so it is not something to diff against. Read here
+                    // rather than from `kept`, which is moved below.
+                    let diffable = !matches!(kept, Kept::Unkept(_));
                     match ws.write_file(&target, &body) {
                         Ok(wrote) => {
                             record_edit(
@@ -9625,6 +9841,10 @@ async fn dispatch(
                                 &target,
                                 &before,
                                 &body,
+                                // A whole-file write measures the whole file
+                                // either way, so the hunk's texts and the
+                                // counts' texts happen to be the same pair here.
+                                diffable.then_some((before.as_str(), body.as_str())),
                             );
                             record_snapshot(store, run_id, step, &target, kept);
                             // The same check `edit_file` runs, for the same
@@ -9705,17 +9925,25 @@ async fn dispatch(
                     remember,
                 } => {
                     let replacement = content.unwrap_or_default();
-                    // The restore point, read here because nothing else on this
-                    // path reads the file: `record_edit` below compares `search`
-                    // against `replacement`, and `Workspace::edit_file` does its
-                    // own read internally and does not hand back what it found.
-                    // The measurement half is discarded for exactly that reason —
-                    // taking `before` here instead would change the line counts
-                    // this arm has reported since 0.18.0 from "the size of the
-                    // replacement" to "the size of the file".
-                    let (_, kept) = read_before(ws, &target);
+                    // The restore point, and — since 0.51.0 — the hunk's "before".
+                    // `Workspace::edit_file` does its own read internally and does
+                    // not hand back what it found, so this is the only place the
+                    // file's previous text exists on this path.
+                    //
+                    // It is still NOT what the counts are measured from. Those
+                    // compare `search` against `replacement`, which is what has
+                    // made them "the size of the replacement" rather than "the
+                    // size of the file" since 0.18.0; folding the two together is
+                    // the tidy-up that would silently renumber every trace.
+                    let (before, kept) = read_before(ws, &target);
+                    let diffable = !matches!(kept, Kept::Unkept(_));
                     match ws.edit_file(&target, search, &replacement) {
                         Ok(wrote) => {
+                            // The file as it now stands, through the same reader,
+                            // so the after text is what is actually on disk rather
+                            // than this arm's reconstruction of what the workspace
+                            // was asked to do.
+                            let (after, _) = read_before(ws, &target);
                             // The replaced text against the text that replaced it.
                             // Everything outside the match is byte-identical by
                             // construction, so this is the same answer comparing the
@@ -9728,6 +9956,7 @@ async fn dispatch(
                                 &target,
                                 search,
                                 &replacement,
+                                diffable.then_some((before.as_str(), after.as_str())),
                             );
                             record_snapshot(store, run_id, step, &target, kept);
                             // The project's own checker, run against the edit
@@ -9768,6 +9997,177 @@ async fn dispatch(
                         Err(e) => Dispatched::go("edit error", format!("\n[edit error] {e}\n")),
                     }
                 }
+            }
+        }
+        PATCH_FILE_TOOL => {
+            let path = s("path").unwrap_or_default();
+            let patch = s("patch").unwrap_or_default();
+            if path.is_empty() || patch.trim().is_empty() {
+                return Ok(Dispatched::go(
+                    "patch missing arguments",
+                    "\n[patch error] patch_file needs a \"path\" and a non-empty \"patch\" \
+                     holding a unified diff\n",
+                ));
+            }
+            // The same act as `write_file` and `edit_file`, so the same gate on
+            // the same path. The patch body is offered as the content so a human
+            // answering an `Ask` sees the change rather than only where it lands.
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Write,
+                path,
+                Some(patch),
+                watch,
+                depth,
+                goal,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go {
+                    target,
+                    content,
+                    remember,
+                } => {
+                    let patch = content.unwrap_or_default();
+                    let (before, kept) = read_before(ws, &target);
+                    let diffable = !matches!(kept, Kept::Unkept(_));
+                    match ws.patch_file(&target, &patch) {
+                        Ok(wrote) => {
+                            let (after, _) = read_before(ws, &target);
+                            // Measured over the whole file, because a patch *is*
+                            // a whole-file change — there is no fragment here for
+                            // the counts to be about, which is the one way this
+                            // arm differs from `edit_file`'s.
+                            record_edit(
+                                store,
+                                run_id,
+                                step,
+                                PATCH_FILE_TOOL,
+                                &target,
+                                &before,
+                                &after,
+                                diffable.then_some((before.as_str(), after.as_str())),
+                            );
+                            record_snapshot(store, run_id, step, &target, kept);
+                            let diagnostics =
+                                diagnostics_after_write(ws.root(), toolchain, exec_timeout, cap)
+                                    .await;
+                            Dispatched::Continue {
+                                decision: format!("patched {target}"),
+                                obs: bound(
+                                    &format!(
+                                        "\n[patched {target}] applied {} hunk{}{}\n{}",
+                                        patch.matches("\n@@ ").count()
+                                            + usize::from(patch.starts_with("@@ ")),
+                                        if patch.matches("@@ ").count() == 1 {
+                                            ""
+                                        } else {
+                                            "s"
+                                        },
+                                        if wrote.moved_the_workspace() {
+                                            ""
+                                        } else {
+                                            " — the patch reproduced what was already there, so \
+                                             the workspace did not change"
+                                        },
+                                        diagnostics
+                                    ),
+                                    cap,
+                                    ObsKind::Write,
+                                ),
+                                kind: ObsKind::Write,
+                                target: Some(target.clone()),
+                                changed: wrote.moved_the_workspace(),
+                                remember,
+                            }
+                        }
+                        // A patch that does not fit is the model's to fix and the
+                        // message says which hunk and what it expected. Nothing
+                        // was written, so reading the file again and rewriting the
+                        // patch is a complete recovery.
+                        Err(e) => Dispatched::go("patch error", format!("\n[patch error] {e}\n")),
+                    }
+                }
+            }
+        }
+        CHECK_TOOL => {
+            // Resolved before it is spawned, because the policy has to be asked
+            // about the command and not about the word "check".
+            let checker = match crate::tools::diagnostics::checker(toolchain) {
+                Ok(c) => c,
+                // A model that ASKED is told there is no checker. The automatic
+                // post-edit path stays silent on the same answer, and that is the
+                // difference between the two: silence costs nothing when nobody
+                // asked, and reads as "your project is clean" when somebody did.
+                Err(why) => {
+                    return Ok(Dispatched::go(
+                        "check skipped",
+                        format!("\n[check skipped] {why}\n"),
+                    ))
+                }
+            };
+            // The same two targets `exec` checks, for the same reason: the program
+            // alone is what `deny_exec("cargo")` names, and the whole argv is what
+            // a rule like `deny_exec("cargo check*")` names.
+            let program = checker.argv[0].clone();
+            let joined = checker.argv.join(" ");
+            let mut targets = vec![program];
+            if joined != targets[0] {
+                targets.push(joined);
+            }
+            let mut remembered: Vec<Rule> = Vec::new();
+            for target in targets {
+                match gate(
+                    ws,
+                    approver,
+                    store,
+                    run_id,
+                    step,
+                    Act::Exec,
+                    &target,
+                    None,
+                    watch,
+                    depth,
+                    goal,
+                )
+                .await?
+                {
+                    Gated::Refused { decision, obs } => return Ok(Dispatched::go(decision, obs)),
+                    Gated::Paused { request_id } => return Ok(Dispatched::Pause { request_id }),
+                    Gated::Go { remember, .. } => remembered.extend(remember),
+                }
+            }
+            let obs = match checker.run(ws.root(), exec_timeout, cap).await {
+                crate::tools::diagnostics::Outcome::Clean => {
+                    "\n[check] the project's own check found nothing\n".to_string()
+                }
+                crate::tools::diagnostics::Outcome::Found(text) => text,
+                // Both of these are silent on the post-edit path and neither is
+                // here. An empty answer to a direct question is read as approval.
+                crate::tools::diagnostics::Outcome::Skipped(why) => {
+                    format!("\n[check skipped] {why}\n")
+                }
+                crate::tools::diagnostics::Outcome::Failed(why) => {
+                    format!("\n[check did not run] {why}\n")
+                }
+            };
+            Dispatched::Continue {
+                decision: "checked the project".to_string(),
+                obs: bound(&obs, cap, ObsKind::Tool),
+                kind: ObsKind::Tool,
+                target: None,
+                // Deliberately not `changed`, for the reason `exec` is not: the
+                // stall signal asks whether the agent is getting anywhere, and
+                // running the same check a fourth time without editing anything
+                // in between is precisely the shape of an agent that is not.
+                changed: false,
+                remember: remembered,
             }
         }
         SHELL_TOOL => {
@@ -12150,6 +12550,13 @@ async fn stream_completion<P: Provider>(
 /// that reached the disk is not undone by failing to write its bookkeeping row,
 /// and turning the run into an error here would lose the work as well as the
 /// row.
+/// `file` is the whole file's text before and after, for the hunk, and is
+/// deliberately not the pair the counts are measured from (0.51.0). An
+/// `edit_file` measures the fragment it replaced — that is what its counts have
+/// meant since 0.18.0 — and a hunk needs the file's own line numbers or it is
+/// anchored to nothing. `None` when the previous contents could not be read, so
+/// a diff is never taken against a file wrongly believed to be empty.
+#[allow(clippy::too_many_arguments)]
 fn record_edit(
     store: &Store,
     run_id: i64,
@@ -12158,8 +12565,12 @@ fn record_edit(
     path: &str,
     before: &str,
     after: &str,
+    file: Option<(&str, &str)>,
 ) {
-    let edit = crate::state::Edit::measure(step, tool, path, before, after);
+    let mut edit = crate::state::Edit::measure(step, tool, path, before, after);
+    if let Some((was, now)) = file {
+        edit = edit.with_hunk(was, now);
+    }
     if let Err(e) = store.record_edit(run_id, &edit) {
         tracing::warn!("could not record the edit to {path} at step {step}: {e}");
     }
@@ -13570,6 +13981,42 @@ fn workspace_tools() -> Vec<ToolSpec> {
                 },
                 "required": ["path", "search", "replace"]
             }),
+        },
+        ToolSpec {
+            name: PATCH_FILE_TOOL.to_string(),
+            description: "Apply a unified diff to ONE existing file — use this instead of several \
+                          edit_file calls when a change touches more than one place in the same \
+                          file, because every hunk is anchored against the file as you last read \
+                          it rather than against a file your earlier edits have already moved. \
+                          The patch is hunk headers of the form \"@@ -12,7 +12,9 @@\" followed by \
+                          lines each prefixed with a space (context, unchanged), a minus \
+                          (removed) or a plus (added); three context lines either side is the \
+                          usual amount and is what makes a hunk find its place. If ANY hunk does \
+                          not match what is in the file, the whole patch is refused and nothing \
+                          changes, so read the file first and copy its lines exactly, whitespace \
+                          included. It cannot create a file — use write_file for that."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path relative to the workspace root. One file per call; patch each file separately." },
+                    "patch": { "type": "string", "description": "The unified diff for that one file: one or more @@ hunks. Any --- or +++ header lines are ignored, since the file is named by \"path\"." }
+                },
+                "required": ["path", "patch"]
+            }),
+        },
+        ToolSpec {
+            name: CHECK_TOOL.to_string(),
+            description: "Run the project's own type-check over the whole workspace and read back \
+                          what it says — the cheap check for whatever ecosystem this project is, \
+                          chosen for you. Takes no arguments. Use it before deciding what to \
+                          write, to find out whether the tree is already broken and where; the \
+                          same check runs automatically after every successful write, so calling \
+                          it straight after one tells you nothing new. It reports and never \
+                          blocks: a failing check does not undo an edit. If this project has no \
+                          checker it says so rather than staying silent."
+                .to_string(),
+            parameters: json!({ "type": "object", "properties": {} }),
         },
         ToolSpec {
             name: EXEC_TOOL.to_string(),

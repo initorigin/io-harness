@@ -165,17 +165,52 @@ pub(crate) async fn after_edit(
     timeout: Duration,
     cap: usize,
 ) -> Outcome {
+    match checker(tc) {
+        Ok(checker) => checker.run(root, timeout, cap).await,
+        Err(why) => Outcome::Skipped(why),
+    }
+}
+
+/// The checker this project would run, resolved without running it (0.51.0).
+///
+/// Split out of [`after_edit`] because the `check` tool has to know **what** it
+/// is about to spawn before it spawns it: a model-callable path to the project's
+/// build command must be an [`Act::Exec`](crate::Act::Exec) check on that
+/// command, and a policy cannot be asked about an argv nobody has resolved yet.
+/// The automatic post-edit path needs no such split — it is the crate's own
+/// reflex after a write the policy already allowed, and it stays ungated.
+///
+/// `Err` carries the reason there is no checker, which is a [`Outcome::Skipped`]
+/// to `after_edit` and an observation to the tool.
+pub(crate) fn checker(tc: Option<&Toolchain>) -> std::result::Result<Checker, String> {
     let Some(tc) = tc else {
-        return Outcome::Skipped("no project marker in the workspace root".into());
+        return Err("no project marker in the workspace root".into());
     };
     let Some((_, argv, format)) = CHECKERS.iter().find(|(eco, _, _)| *eco == tc.ecosystem) else {
-        return Outcome::Skipped(format!(
+        return Err(format!(
             "no check command cheap enough to run after every edit for a {} project",
             tc.ecosystem
         ));
     };
-    let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
-    run(root, &argv, *format, timeout, cap).await
+    Ok(Checker {
+        argv: argv.iter().map(|s| (*s).to_string()).collect(),
+        format: *format,
+    })
+}
+
+/// A resolved checker: the argv a policy can be asked about, and how to read
+/// what it prints (0.51.0).
+pub(crate) struct Checker {
+    /// The command, program first. Public to the crate because the gate needs it.
+    pub(crate) argv: Vec<String>,
+    format: Format,
+}
+
+impl Checker {
+    /// Run it. Never `Err`, for the reason [`after_edit`] never is.
+    pub(crate) async fn run(&self, root: &Path, timeout: Duration, cap: usize) -> Outcome {
+        run(root, &self.argv, self.format, timeout, cap).await
+    }
 }
 
 /// Spawn one checker and classify what it produced.
