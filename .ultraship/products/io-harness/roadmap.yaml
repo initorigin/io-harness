@@ -1196,13 +1196,23 @@ versions:
     status: released
   - version: 0.50.0
     outcome: >
-      A parent chooses how a child returns. A child today blocks its parent and pours its whole tool
-      output into the parent's context. Three shapes are added: a detached child that reports on
-      completion instead of blocking, a forked child whose tool output never enters the parent's
-      context at all and only its conclusion does, and an automatic move to the background after a
-      stated wall clock so one stuck child cannot hold the tree. On a wide fan-out the forked shape
-      is the largest context saving available to the crate.
-    detail: outline
+      A parent chooses how a child returns, and a child returns something worth reading. Two shapes
+      are added beside today's blocking spawn: a detached child the parent does not wait for, whose
+      report arrives at a later step, and an automatic move to the background after a stated wall
+      clock, so one stuck child cannot hold the tree. Both use the same in-flight set, and a tree
+      still never returns while a child it started is running.
+
+      **This entry's original premise was falsified by the code while it was being specified, and
+      the correction is what makes the release worth shipping.** It said a child "pours its whole
+      tool output into the parent's context" and named a *forked* shape that would prevent it. A
+      child's tool output has never entered its parent's context: a child runs its own loop over its
+      own ledger, and `compose_child` (`src/run.rs:7219-7224`) hands the parent one line —
+      `[child 7 "<goal>" -> Success { steps: 4 }]`, a `Debug`-printed discriminant and a step count,
+      because `RunOutcome::Success` carries no text (`src/run.rs:216-218`). So the forked shape is
+      what every child already is, and the half that is actually missing is its **conclusion**: a
+      parent that fans out four researchers today learns only that four runs succeeded. This release
+      makes a child report what it found.
+    detail: specified
     status: planned
   - version: 0.51.0
     outcome: >
