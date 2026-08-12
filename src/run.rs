@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::future::{select, Either};
-use futures_util::FutureExt;
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::FutureExt;
 use serde_json::json;
 use tracing::info;
 
@@ -2638,7 +2638,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 web: contract.web.clone(),
                 spawn_background_after: contract.spawn_background_after,
                 detached_spawns: contract.detached_spawns,
-                                            };
+            };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember.clone()))
@@ -2731,7 +2731,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 web: contract.web.clone(),
                 spawn_background_after: contract.spawn_background_after,
                 detached_spawns: contract.detached_spawns,
-                                            };
+            };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember))
@@ -4021,7 +4021,7 @@ async fn run_from<P: Provider>(
             // `None` for every contract that declared nothing, which is what the
             // three built-in providers read as "send the 0.21.0 body".
             web: contract.web.clone(),
-                                    // 0.31.0 — the tier the caller asked for, or `None` (every contract
+            // 0.31.0 — the tier the caller asked for, or `None` (every contract
             // before 0.31.0) to leave the vendor's own default in place.
             effort: contract.effort,
             // Single-file mode has no `view_image` tool, so only the caller's
@@ -4532,7 +4532,7 @@ async fn run_workspace_from<P: Provider>(
                 tools: tools.clone(),
                 // 0.22.0 — the run's web declaration, unchanged per step.
                 web: contract.web.clone(),
-                                                // 0.31.0 — the root's tier, unchanged per step.
+                // 0.31.0 — the root's tier, unchanged per step.
                 effort: contract.effort,
                 cache_boundary,
                 // 0.49.0 — the same breakpoint the line above names, counted in
@@ -5562,7 +5562,7 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
         web: contract.web.clone(),
         spawn_background_after: contract.spawn_background_after,
         detached_spawns: contract.detached_spawns,
-                    };
+    };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, 1, None).await;
     mcp.shutdown(store, run_id, watch).await;
     Ok(RunResult::new(outcome?, run_id))
@@ -5772,7 +5772,7 @@ pub async fn resume_tree_observed<P: Provider>(
         web: contract.web.clone(),
         spawn_background_after: contract.spawn_background_after,
         detached_spawns: contract.detached_spawns,
-                    };
+    };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step, None).await;
     mcp.shutdown(store, run_id, watch).await;
     Ok(RunResult::new(outcome?, run_id))
@@ -6155,12 +6155,12 @@ async fn drain_children<P: Provider>(
     while let Some(done) = inflight.next().await {
         let text = match done?.1 {
             SpawnResult::Composed { obs, .. } => obs,
-            SpawnResult::Paused { request_id } => format!(
-                "\n[child awaiting approval (request {request_id}) after this run ended]\n"
-            ),
-            SpawnResult::Asked { question_id } => format!(
-                "\n[child awaiting answer (question {question_id}) after this run ended]\n"
-            ),
+            SpawnResult::Paused { request_id } => {
+                format!("\n[child awaiting approval (request {request_id}) after this run ended]\n")
+            }
+            SpawnResult::Asked { question_id } => {
+                format!("\n[child awaiting answer (question {question_id}) after this run ended]\n")
+            }
         };
         tree.watch.emit(RunEvent::at_depth(
             run_id,
@@ -6513,7 +6513,7 @@ where
                     // root's, copied in by `spawn_child` rather than taken from the
                     // spawn arguments.
                     web: contract.web.clone(),
-                                                            // 0.31.0 — this role's tier, falling back to the run's. The
+                    // 0.31.0 — this role's tier, falling back to the run's. The
                     // definition wins because that is where "search cheaply, think hard
                     // only where thinking is the work" is said; the contract's is the
                     // root's own, and a child spawned without a definition inherits it.
@@ -6616,7 +6616,12 @@ where
             // process left behind reads the same words a parent that waited does.
             // Here rather than in `finish` because every ending is a different
             // return and `turns` is in scope at exactly one place.
-            if let Some(said) = response.text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            if let Some(said) = response
+                .text
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
                 tree.store
                     .record_agent_event(&AgentEvent::said(run_id, step, said))?;
             }
@@ -7542,8 +7547,12 @@ async fn spawn_child<'f, P: Provider>(
             // in a row of the table the tree already writes to, so the rebuild is a
             // replay rather than a reconstruction, and no column was added to
             // record it.
-            tree.store
-                .record_agent_event(&AgentEvent::spawn_args(parent_run_id, step, child_run, a))?;
+            tree.store.record_agent_event(&AgentEvent::spawn_args(
+                parent_run_id,
+                step,
+                child_run,
+                a,
+            ))?;
             (child_run, 1)
         }
     };
@@ -13900,6 +13909,9 @@ mod tests {
         );
         // And the pair with no meaning is refused, in words naming both.
         let why = r(json!({ "wait": false, "background_after_secs": 30 })).unwrap_err();
-        assert!(why.contains("wait") && why.contains("background_after_secs"), "{why}");
+        assert!(
+            why.contains("wait") && why.contains("background_after_secs"),
+            "{why}"
+        );
     }
 }

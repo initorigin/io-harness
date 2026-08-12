@@ -1138,7 +1138,10 @@ async fn an_adopted_child_reports_the_same_conclusion() {
         // parent#1 fans out to two children.
         (
             None,
-            vec![spawn("do a", "a.txt", "ALPHA"), spawn("do b", "b.txt", "BETA")],
+            vec![
+                spawn("do a", "a.txt", "ALPHA"),
+                spawn("do b", "b.txt", "BETA"),
+            ],
         ),
         // child A finishes and says what it found.
         (Some(FINDING), vec![write("a.txt", "ALPHA")]),
@@ -1147,7 +1150,10 @@ async fn an_adopted_child_reports_the_same_conclusion() {
         // parent#1 replayed on resume: the same fan-out, one child already done.
         (
             None,
-            vec![spawn("do a", "a.txt", "ALPHA"), spawn("do b", "b.txt", "BETA")],
+            vec![
+                spawn("do a", "a.txt", "ALPHA"),
+                spawn("do b", "b.txt", "BETA"),
+            ],
         ),
         (None, vec![]),
         (None, vec![]),
@@ -1386,7 +1392,10 @@ async fn a_blocking_spawn_folds_into_its_own_step_in_call_order() {
     let script = MockSaying::new(vec![
         (
             None,
-            vec![spawn("do a", "a.txt", "ALPHA"), spawn("do b", "b.txt", "BETA")],
+            vec![
+                spawn("do a", "a.txt", "ALPHA"),
+                spawn("do b", "b.txt", "BETA"),
+            ],
         ),
         (Some("A-SAID"), vec![write("a.txt", "ALPHA")]),
         (Some("B-SAID"), vec![write("b.txt", "BETA")]),
@@ -1410,8 +1419,14 @@ async fn a_blocking_spawn_folds_into_its_own_step_in_call_order() {
     let b = rows.iter().position(|o| o.text.contains("B-SAID"));
     let (a, b) = (a.expect("child A reported"), b.expect("child B reported"));
     assert!(a < b, "children fold in the order they were called for");
-    assert_eq!(rows[a].step, 1, "a waited-for child folds into its own step");
-    assert_eq!(rows[b].step, 1, "a waited-for child folds into its own step");
+    assert_eq!(
+        rows[a].step, 1,
+        "a waited-for child folds into its own step"
+    );
+    assert_eq!(
+        rows[b].step, 1,
+        "a waited-for child folds into its own step"
+    );
     // And nothing was left running.
     assert!(
         !rows.iter().any(|o| o.text.contains("detached")),
@@ -1620,7 +1635,9 @@ async fn a_wall_clock_the_child_beats_is_an_ordinary_spawn() {
 
     let rows = store.observations(result.run_id).unwrap();
     assert!(
-        !rows.iter().any(|o| o.text.contains("moved to the background")),
+        !rows
+            .iter()
+            .any(|o| o.text.contains("moved to the background")),
         "a child that finishes inside its clock is never backgrounded, got {rows:?}"
     );
     let report = rows.iter().find(|o| o.text.contains("QUICK")).unwrap();
@@ -1696,8 +1713,8 @@ fn a_contract_clock_is_a_ceiling_and_not_a_default_only() {
     assert_eq!(none.spawn_background_after, None);
     assert!(none.detached_spawns);
 
-    let capped = TaskContract::workspace("g", "/repo")
-        .with_spawn_background_after(Duration::from_secs(60));
+    let capped =
+        TaskContract::workspace("g", "/repo").with_spawn_background_after(Duration::from_secs(60));
     assert_eq!(capped.spawn_background_after, Some(Duration::from_secs(60)));
     assert!(
         capped.detached_spawns,
