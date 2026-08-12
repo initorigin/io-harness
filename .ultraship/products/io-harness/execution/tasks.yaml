@@ -387,7 +387,7 @@ tasks:
   why_required: src/verify.rs says computing a unified diff is 0.51.0's work. Shipping the release while
     the source still calls it future work is a surface that contradicts the code, and docs_drift, changelog,
     readme, guide_pages and public_api are gates that fail on it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.51.0-T03
   - US-IO-HARNESS-0.51.0-T04
@@ -419,12 +419,33 @@ tasks:
   files:
   - docs/CONTRACT.md
   - docs/public-api.txt
+  - docs/guide/durable-runs.md
+  - docs/guide/language-support.md
   - src/lib.rs
   - src/verify.rs
   - README.md
   - CHANGELOG.md
-  - tests/docs_drift.rs
-  evidence: []
+  - Cargo.toml
+  evidence:
+  - 'All five documentation gates pass: docs_drift 15, changelog 5, readme 8, guide_pages 7, public_api
+    9.'
+  - docs/CONTRACT.md gains 'What a change is kept as, and what an undo can reach (0.51.0)' — the series-not-one-diff
+    rule, why the line counts did not move, the three reasons a hunk is absent, patch_file's all-or-nothing
+    rule, why check is gated and the automatic checker is not, and the newest-first ordering rule for
+    reverts.
+  - src/verify.rs's comment naming this release as future work is corrected, not deleted. It said 'computing
+    one is 0.51.0's work'; it now says the hunks ARE stored and why review_change still renders both texts
+    — handing a reviewer a diff would narrow what it can see in order to save tokens it is spending on
+    purpose.
+  - 'src/lib.rs crate prose, README, docs/guide/durable-runs.md (two new sections: undoing one step, and
+    reading a run''s change as a patch) and docs/guide/language-support.md (the checker before an edit,
+    and the two deliberate differences from the automatic one).'
+  - CHANGELOG 0.51.0 entry states the break by name — Edit::hunk and RewindRecord::undid_step, both on
+    Default-deriving read types — with the migration, and states under Changed that the line counts deliberately
+    did NOT move and why.
+  - 'docs/public-api.txt gains exactly three lines by hand: enum Reverted, fn rewind_step, fn rewind_step_observed.
+    Version bumped to 0.51.0 in Cargo.toml and README, which docs_drift''s readme_dependency_version_matches_cargo_toml
+    caught.'
 - id: US-IO-HARNESS-0.51.0-T10
   summary: Measure the release's own number and prove the untouched paths are untouched.
   why_required: N5 is the claim the patch tool is made of, and N6 is the control that says a run using

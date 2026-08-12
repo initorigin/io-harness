@@ -743,10 +743,13 @@ impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> Reviewer for 
 
     /// The change, rendered before-and-after per file.
     ///
-    /// Not a unified diff: computing one is 0.51.0's work, where the hunks are
-    /// stored and a patch tool needs them. What a model needs to answer "did this
-    /// change lose something" is both texts, and both texts is what the store
-    /// already holds.
+    /// Not a unified diff, and 0.51.0 — which stores the hunks — did not change
+    /// that. What a model needs to answer "did this change lose something" is
+    /// both texts, and both texts is what the store already holds; handing it a
+    /// diff instead would narrow what it can see in order to save tokens it is
+    /// spending on purpose. The hunks are there for the trace
+    /// ([`crate::Store::patch`]) and for undo ([`crate::rewind_step`]), which are
+    /// different questions.
     fn review_change<'a>(&'a self, request: ChangeReview) -> Reviewing<'a> {
         Box::pin(async move {
             let mut user = format!(

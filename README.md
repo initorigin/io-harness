@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.50"
+io-harness = "0.51"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -123,11 +123,22 @@ dependency tree is held deliberately small.
 
 **The loop.** A [`TaskContract`] names the goal, the subject, and — optionally —
 the criterion. Workspace mode gives the agent `grep`, `find`, `read_file`,
-`write_file` and `edit_file` across a repository root. Single-file mode edits one
-file. In a project whose ecosystem the harness recognises, a successful
-`edit_file` runs that project's own type-check command and attaches what it
-found, so a mistake arrives with the edit rather than twenty steps later — see
-[language support](docs/guide/language-support.md).
+`write_file`, `edit_file` and `patch_file` across a repository root. Single-file
+mode edits one file. A change touching four places in one file is one
+`patch_file` call taking a unified diff — applied as a unit or not at all, so a
+patch that no longer fits is refused with the hunk named rather than half
+written. In a project whose ecosystem the harness recognises, a successful write
+runs that project's own type-check command and attaches what it found, so a
+mistake arrives with the edit rather than twenty steps later; `check` asks the
+same question *before* a write, and is refused by the same policy that refuses
+`exec` — see [language support](docs/guide/language-support.md).
+
+**What a change is kept as.** Every write records the change as a unified diff of
+the whole file, so a trace can show what a step changed and not only how many
+lines it changed. `Store::patch` renders a run's whole change as a step-ordered
+patch series for review, and `rewind_step` reverse-applies one step's hunks —
+undo at a granularity finer than "throw the run away", walking backwards from the
+newest step.
 
 **Commands, under the same boundary as everything else.** The agent runs the
 project's own build, tests, linter or package manager through an `exec` tool
