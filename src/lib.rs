@@ -430,6 +430,7 @@ mod contract;
 mod diff;
 mod error;
 pub mod hooks;
+pub mod lsp;
 pub mod mcp;
 mod net;
 pub mod observe;

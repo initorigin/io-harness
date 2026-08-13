@@ -8,7 +8,7 @@ tasks:
     by arrival order or framed by character count works against the first fixture written for it and fails
     against every real server, so the fixture that answers out of order and interleaves notifications
     is written before the client it tests.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F1 — the client frames by bytes and the header terminator is `\r\n`.** The bytes the client writes
@@ -36,7 +36,26 @@ tasks:
   - src/lsp.rs
   - src/lib.rs
   - tests/lsp.rs
-  evidence: []
+  evidence:
+  - '9 unit tests in src/lsp.rs pass: cargo test --lib lsp:: — 9 passed, 0 failed.'
+  - 'F1 asserted on the bytes: frame("{}") is exactly b"Content-Length: 2\r\n\r\n{}", and a body of four
+    characters and seven bytes is lengthed 7. A frame delivered one byte at a time — every read landing
+    mid-header and mid-body — reads whole, and a Content-Type header a real server sends is skipped while
+    a header line with no colon is refused by name rather than skipped.'
+  - 'F2 asserted with the server answering in reverse order through an interleaved window/logMessage and
+    $/progress: both callers get their own answer. A server *request* (workspace/configuration) carries
+    an id and is answered null rather than mistaken for a response — asserted on the reply the server
+    received, which has a result and no method.'
+  - 'Two failure paths are named rather than waited out: a server that closes mid-request fails within
+    milliseconds under a 120s timeout with ''language server fix: ... closed its output'', and an error
+    response carries the server''s own message.'
+  - 'Sabotage F1 (length in chars + headers split on \n): 6 of 9 fail, including the byte-length and split-chunk
+    cases. Loud rather than surgical, because the two spellings the criterion names break framing in both
+    directions.'
+  - 'Sabotage F2 (route a response to the oldest pending id rather than its own): exactly 1 test fails
+    — answers_are_matched_by_id_through_interleaved_notifications — and the other 8 pass.'
+  - 'No dependency added: the framing, the JSON-RPC envelope and the correlation are ~330 lines in src/lsp.rs
+    over serde_json and tokio, both already in the default tree.'
 - id: US-IO-HARNESS-0.52.0-T02
   summary: Add the [[lsp]] table to io.toml and the LspServer type beside McpServer.
   why_required: A server is named in configuration or there is no server. Nothing in the release can be
