@@ -441,30 +441,31 @@ tasks:
   evidence:
   - examples/lsp_live.rs drives a REAL rust-analyzer 1.95.0 over a real three-file crate through the real
     loop, and all six tools answer correctly — verified on two consecutive runs. lsp_definition from a
-    use site resolves to src/lib.rs:1:12 (the struct declaration); lsp_references returns four locations
+    use site resolves to src/lib.rs:1:12, the struct declaration; lsp_references returns four locations
     across two files; lsp_symbols returns the file's tree (struct, its field, the module, the function)
     and the workspace search finds Ledger; lsp_hover returns rust-analyzer's real type block including
     'size = 8, align = 0x8, no Drop'; lsp_rename returns a two-file patch series and src/lib.rs still
-    says  afterwards.
-  - 'THE LIVE RUN FOUND THREE DEFECTS THE FIXTURE COULD NOT, AND THIS IS WHY IT EXISTS. (1) The client
-    never advertised , so rust-analyzer sent NO $/progress at all — leaving the crate with no way to tell
-    ''still indexing'' from ''no references''. (2) A semantic request answered during start-up comes back
-    EMPTY, not as an error: documentSymbol (syntax only) answered correctly while definition, references
-    and hover all returned nothing, which is precisely the silent-empty this release promises never to
-    produce. (3) lsp_symbols with a query and no path matched the empty string against every server''s
-    extensions list and reported that no server answered, while five other tools were being answered by
-    one.'
+    declares Ledger afterwards.
+  - 'THE LIVE RUN FOUND THREE DEFECTS THE FIXTURE COULD NOT, AND THAT IS WHY IT EXISTS. (1) The client
+    never advertised window.workDoneProgress, so rust-analyzer sent no $/progress at all — leaving the
+    crate with no way to tell ''still indexing'' from ''no references''. (2) A semantic request answered
+    during start-up comes back EMPTY, not as an error: documentSymbol, which needs only the syntax tree,
+    answered correctly while definition, references and hover all returned nothing — precisely the silent
+    empty this release promises never to produce. (3) lsp_symbols with a query and no path matched the
+    empty string against every server''s extensions list and reported that no server answered, while five
+    other tools were being answered by one.'
   - 'The fix is generic rather than rust-analyzer-specific: the client tracks work-done progress tokens
-    (created and begun, ended), and an empty answer from a server that has not yet been observed warm
-    is retried after that work settles, bounded by the server''s own timeout_secs. A server that announces
-    no work stops after one round, so nothing in the test suite waits on a clock. SETTLE is 1.5s and is
-    documented as the knob — it is the width of the GAP between two of a server''s start-up jobs (rust-analyzer
-    reports Fetching, then Building CrateGraph, then Roots Scanned, with sub-second silences between),
-    not a guess about how long indexing takes.'
+    (created, begun, ended), and an empty answer from a server not yet observed warm is retried after
+    that work settles, bounded by the server''s own timeout_secs. A server that announces no work stops
+    after one round, so nothing in the test suite waits on a clock. SETTLE is 1.5s and is documented as
+    the knob: it is the width of the GAP between two of a server''s start-up jobs — rust-analyzer reports
+    Fetching, then Building CrateGraph, then Roots Scanned, with sub-second silences between them — not
+    a guess about how long indexing takes.'
   - 'It is an example rather than a test, following documents_live and media_git_live: a real server''s
     index is minutes on a real repository, and a gate that waits minutes is a gate someone eventually
-    deletes. rust-analyzer needed  on this machine — the rustup shim exists without it, and the crate
-    reported its absence correctly as ''initialize was not answered: the server closed its output''.'
+    deletes. rust-analyzer needed ''rustup component add rust-analyzer'' on this machine — the rustup
+    shim exists without the component — and the crate reported its absence correctly as ''initialize was
+    not answered: the server closed its output''.'
 - id: US-IO-HARNESS-0.52.0-T12
   summary: 'Run the release gate set: three platforms, cross-version untouched, MSRV, no DDL.'
   why_required: A hand-written wire protocol passes on the host that wrote the fixture. The platform matrix
