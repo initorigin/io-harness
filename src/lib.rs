@@ -461,6 +461,7 @@ pub use context::{Compaction, ContextBudget};
 pub use contract::{Preset, Routing, SystemPrompt, TaskContract};
 pub use error::{Error, ProviderErrorKind, Result};
 pub use hooks::Hooks;
+pub use lsp::LspServer;
 pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
 // The `net` module itself stays private, so the default request deadline is
 // surfaced here as well as from each provider module. A caller overriding it with

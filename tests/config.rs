@@ -2287,3 +2287,83 @@ fn an_unknown_key_inside_a_compatible_provider_is_rejected_naming_it() {
     );
     assert!(err.contains("io.toml"), "and the file it is in, got: {err}");
 }
+
+// ---------------------------------------------------------------------------
+// 0.52.0 — `[[lsp]]`
+// ---------------------------------------------------------------------------
+
+/// The table is accepted in the project scope, and the reason is the same one
+/// `[[mcp]]` rests on: the boundary is the `Act::Exec` check on the named binary,
+/// not the scope of the file that named it. A committed `io.toml` naming a server
+/// therefore loads, and starting that server is still refusable.
+#[test]
+fn an_lsp_server_is_accepted_in_the_project_scope_and_carried_to_the_contract() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        "[[lsp]]\nid = \"rust\"\ncommand = \"rust-analyzer\"\nextensions = [\".rs\"]\n\
+         timeout_secs = 30\n",
+    );
+
+    let config = Config::discover(project.path()).unwrap();
+    assert_eq!(config.lsp_servers().len(), 1);
+    assert_eq!(config.lsp_servers()[0].command, "rust-analyzer");
+    assert_eq!(config.lsp_servers()[0].timeout_secs, 30);
+
+    let contract = config.apply_to(contract(project.path()));
+    assert_eq!(contract.lsp.len(), 1, "the table reaches the contract");
+    assert_eq!(contract.lsp[0].id, "rust");
+}
+
+/// A misspelled key inside an `[[lsp]]` table is rejected naming it — unlike
+/// `[[mcp]]`, whose `#[serde(flatten)]` transport forbids `deny_unknown_fields`.
+/// The keys being misspelled here name a program to spawn and the files it
+/// answers for, which is worth rejecting rather than ignoring.
+#[test]
+fn an_unknown_key_inside_an_lsp_table_is_rejected_naming_it() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        "[[lsp]]\nid = \"rust\"\ncommand = \"rust-analyzer\"\nextension = [\".rs\"]\n",
+    );
+
+    let err = Config::discover(project.path()).unwrap_err().to_string();
+    assert!(
+        err.contains("extension"),
+        "the error must name the misspelled key, got: {err}"
+    );
+}
+
+/// A narrower scope replaces the whole set rather than appending to it, the way
+/// `[[hook]]` and `[[provider]]` do: the servers that run are the servers of one
+/// file, not a pile assembled from three.
+#[test]
+fn a_narrower_scope_replaces_the_lsp_set_whole() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        user_dir.path(),
+        "io.toml",
+        "[[lsp]]\nid = \"mine\"\ncommand = \"my-server\"\n",
+    );
+    write(
+        project.path(),
+        "io.toml",
+        "[[lsp]]\nid = \"theirs\"\ncommand = \"their-server\"\n",
+    );
+
+    let config = Config::discover(project.path()).unwrap();
+    let ids: Vec<_> = config
+        .lsp_servers()
+        .iter()
+        .map(|s| s.id.as_str())
+        .collect();
+    assert_eq!(ids, ["theirs"], "the project scope replaces, never appends");
+}

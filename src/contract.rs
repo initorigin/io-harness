@@ -236,6 +236,15 @@ pub struct TaskContract {
     /// extend.
     #[allow(clippy::doc_markdown)]
     pub mcp: Vec<crate::mcp::McpServer>,
+    /// Language servers to start for this run (0.52.0). Their navigation tools —
+    /// definition, references, symbols, hover, rename — are offered to the model
+    /// beside the built-ins.
+    ///
+    /// Empty by default, and empty means the five schemas are absent from the
+    /// catalogue entirely rather than present and failing: a run that configures
+    /// no server is byte-identical, in composed prompt and in trace, to one on
+    /// 0.51.0. Workspace mode only, for the reason [`mcp`](Self::mcp) is.
+    pub lsp: Vec<crate::lsp::LspServer>,
     /// Images handed to the agent alongside the goal, shown to the model on
     /// every step of the run.
     ///
@@ -503,6 +512,7 @@ impl TaskContract {
             max_tokens: None,
             max_retries: 2,
             mcp: Vec::new(),
+            lsp: Vec::new(),
             commit_identity: crate::tools::git::Identity::default(),
             #[cfg(feature = "media")]
             images: Vec::new(),
@@ -572,6 +582,7 @@ impl TaskContract {
             max_tokens: None,
             max_retries: 2,
             mcp: Vec::new(),
+            lsp: Vec::new(),
             commit_identity: crate::tools::git::Identity::default(),
             #[cfg(feature = "media")]
             images: Vec::new(),
@@ -643,6 +654,31 @@ impl TaskContract {
         I: IntoIterator<Item = crate::mcp::McpServer>,
     {
         self.mcp = servers.into_iter().collect();
+        self
+    }
+
+    /// Navigate the codebase through a language server (0.52.0).
+    ///
+    /// Each server is authorized before it is started — spawning one is an
+    /// [`Act::Exec`](crate::Act::Exec) check on its binary — so configuring a
+    /// server here does not grant access to it. A server is started in the
+    /// background at run start, so its index is warming while the model composes
+    /// its first step rather than inside the first tool call that needs it.
+    ///
+    /// ```
+    /// use io_harness::{LspServer, TaskContract};
+    ///
+    /// let contract = TaskContract::workspace("rename Ledger to Tally", "/repo")
+    ///     .with_lsp([LspServer::new("rust", "rust-analyzer").with_extensions([".rs"])]);
+    ///
+    /// assert_eq!(contract.lsp.len(), 1);
+    /// ```
+    #[must_use]
+    pub fn with_lsp<I>(mut self, servers: I) -> Self
+    where
+        I: IntoIterator<Item = crate::lsp::LspServer>,
+    {
+        self.lsp = servers.into_iter().collect();
         self
     }
 

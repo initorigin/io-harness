@@ -61,7 +61,7 @@ tasks:
   why_required: A server is named in configuration or there is no server. Nothing in the release can be
     reached without the table that declares one, and its project-scope rule is a boundary decision that
     must be settled before anything spawns.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.52.0-T01
   acceptance_criteria:
@@ -80,7 +80,22 @@ tasks:
   - src/lsp.rs
   - src/lib.rs
   - tests/config.rs
-  evidence: []
+  evidence:
+  - cargo test --test config — 51 passed, 0 failed, including the three new [[lsp]] tests.
+  - 'The table is accepted in the project scope and reaches the contract through Config::apply_to, asserted
+    on both the Config accessor and contract.lsp. The project-scope rule is unchanged: [[lsp]] is not
+    in PROJECT_WIDENING and not refused whole like [[hook]], for the reason src/config.rs already states
+    of [[mcp]] — the boundary is the Act::Exec check on the named binary.'
+  - 'A misspelled key is rejected naming it: LspServer carries #[serde(deny_unknown_fields)], which McpServer
+    cannot because #[serde(flatten)] forbids it. This closes the standing [[mcp]] hole for the new table
+    rather than inheriting it.'
+  - '[[lsp]] is deliberately NOT in APPENDING: a_narrower_scope_replaces_the_lsp_set_whole asserts the
+    project file''s set replaces the user file''s rather than concatenating.'
+  - 'N3 — zero breaks. TaskContract is #[non_exhaustive] (since 0.35.0) so the added lsp field breaks
+    no builder; Error is #[non_exhaustive] (since 0.43.0) so Error::Lsp breaks no match. docs/public-api.txt
+    gains exactly one line, ''struct LspServer src/lsp.rs'', and tests/public_api.rs passes: 9 passed,
+    including every_public_item_has_a_worked_example and public_surface_matches_snapshot.'
+  - 'cargo test --doc lsp — 3 passed: the LspServer, Config::lsp_servers and TaskContract::with_lsp examples.'
 - id: US-IO-HARNESS-0.52.0-T03
   summary: 'LspSession: gate the argv with authorize_spawn, spawn, hand it initialize in the background,
     and shut it down at every run entry point.'

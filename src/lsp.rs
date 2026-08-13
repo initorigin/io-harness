@@ -33,16 +33,159 @@
 //! `id` too, and is answered `null` rather than dropped: a server waiting forever
 //! for a reply is a run that hangs for a reason no log explains.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
 use crate::error::{Error, Result};
+
+/// The per-request bound a server gets when its configuration names none.
+///
+/// Sixty seconds is the same default an MCP server gets, and for the same reason:
+/// a third-party process that never answers must not become a run that never
+/// ends. It is a *request* bound, not an indexing bound — the index is warmed in
+/// the background from run start, and a request that arrives before it is ready
+/// waits this long and then says why.
+fn default_timeout_secs() -> u64 {
+    60
+}
+
+/// One configured language server.
+///
+/// A server is named here or there is no server: nothing is downloaded at run
+/// time, nothing is resolved from `PATH` by ecosystem, and a configured server
+/// that is not installed is a refusal naming it rather than a silent fallback to
+/// text search. Starting it is an [`Act::Exec`](crate::Act::Exec) check on
+/// [`command`](Self::command), so configuring one here does not grant access to
+/// it — without `allow_exec` naming that binary the run ends in
+/// [`Error::Lsp`](crate::Error::Lsp) before the process exists.
+///
+/// ```
+/// use io_harness::LspServer;
+///
+/// let server = LspServer::new("rust", "rust-analyzer")
+///     .with_extensions([".rs"])
+///     // A server that never answers must not become a run that never ends.
+///     .with_timeout(std::time::Duration::from_secs(30));
+///
+/// assert_eq!(server.id, "rust");
+/// assert_eq!(server.timeout_secs, 30);
+/// // Which files this server answers for. An empty list answers for every file,
+/// // which is what a single-language project wants and what a mixed one does not.
+/// assert_eq!(server.extensions, [".rs"]);
+/// ```
+///
+/// `Serialize`/`Deserialize` because an application layer expresses these in its
+/// own config files, the same way it already expresses an
+/// [`McpServer`](crate::McpServer) or a [`Policy`](crate::Policy). Unlike
+/// `McpServer` this carries `deny_unknown_fields`: there is no `#[serde(flatten)]`
+/// here to forbid it, and a misspelled key in a table that names a program to
+/// spawn is worth rejecting rather than ignoring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LspServer {
+    /// Short name for this server, used in the trace and in every error about
+    /// it. Keep it stable: it is what an operator reads to know which server
+    /// answered.
+    pub id: String,
+    /// The server binary. Checked as [`Act::Exec`](crate::Act::Exec) before it is
+    /// spawned.
+    pub command: String,
+    /// Arguments passed to it.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment for the child.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// The file suffixes this server answers for, e.g. `[".rs"]`.
+    ///
+    /// Empty answers for every file. Where two servers claim the same suffix the
+    /// first in declaration order wins, which is a documented rule rather than a
+    /// discovery.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Per-request timeout in seconds.
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl LspServer {
+    /// A server the harness spawns as a child process and speaks LSP to.
+    pub fn new(id: impl Into<String>, command: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            command: command.into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            extensions: Vec::new(),
+            timeout_secs: default_timeout_secs(),
+        }
+    }
+
+    /// Arguments to start it with.
+    #[must_use]
+    pub fn with_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Extra environment for the child.
+    #[must_use]
+    pub fn with_env<I, K, V>(mut self, env: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.env = env
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        self
+    }
+
+    /// Which file suffixes this server answers for.
+    #[must_use]
+    pub fn with_extensions<I, S>(mut self, extensions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extensions = extensions.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Bound every request to this server.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout_secs = timeout.as_secs();
+        self
+    }
+
+    /// Whether this server answers for `path`.
+    pub(crate) fn answers_for(&self, path: &str) -> bool {
+        self.extensions.is_empty()
+            || self
+                .extensions
+                .iter()
+                .any(|ext| path.to_ascii_lowercase().ends_with(&ext.to_ascii_lowercase()))
+    }
+
+    /// The bound one request gets.
+    pub(crate) fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs)
+    }
+}
 
 /// The frame header this protocol uses, lowercased for comparison.
 const CONTENT_LENGTH: &str = "content-length:";
