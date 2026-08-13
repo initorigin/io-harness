@@ -8,7 +8,7 @@ tasks:
   why_required: Every other task in the release sends a request through this client. A client that correlates
     by arrival order deadlocks the moment a page emits events mid-request, which every real page does,
     so the fixture that floods events and answers out of order is written before the client it tests.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F1 — the client frames on NUL and survives arbitrary chunking.** The bytes the client writes for
@@ -30,13 +30,20 @@ tasks:
   - src/browser.rs
   - tests/browser.rs
   - examples/browser_fixture.rs
-  evidence: []
+  evidence:
+  - 'src/browser.rs — the CDP client over AsyncRead + AsyncWrite: NUL framing, id correlation, an event
+    route that stays live while a request is outstanding.'
+  - 10 unit tests over tokio::io::duplex pass, including a message split mid-object and mid-multi-byte-character,
+    two messages in one chunk, a payload containing a newline, and answers returned in reverse order through
+    a flood of events.
+  - The framing, the startup failure mode and the `Uncaught` field were measured against the installed
+    browser in a spike BEFORE the contract was written, not discovered here.
 - id: US-IO-HARNESS-0.53.0-T02
   summary: 'Launch the browser over a pipe pair on descriptors 3 and 4: binary resolution, the Act::Exec
     spawn gate, kill-on-drop, the temporary profile, and the typed Windows refusal.'
   why_required: The client is useless without a child to speak to, and the ways a child goes wrong — never
     started, started and denied, outliving its run — are the release's safety claims rather than its plumbing.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.53.0-T01
   acceptance_criteria:
@@ -62,14 +69,20 @@ tasks:
   - src/browser.rs
   - src/error.rs
   - tests/browser.rs
-  evidence: []
+  evidence:
+  - 'src/browser.rs — launch over descriptors 3 and 4: both ends moved above 3/4 with F_DUPFD before dup2,
+    because duplicating straight onto them can clobber a pipe end.'
+  - Resolution, the shared Act::Exec spawn gate, a temporary profile the run removes, kill-on-drop, and
+    a typed Windows refusal.
+  - tests/browser.rs::a_missing_browser_is_a_refusal_naming_it and ::a_denied_browser_binary_starts_no_process
+    pass; the second asserts on the fixture never recording a start, not on the error text.
 - id: US-IO-HARNESS-0.53.0-T03
   summary: Gate every document navigation at the paused request against the run's own Policy, and wire
     browser_navigate on top of it.
   why_required: This is the release's central claim. A browser that reaches any host the policy denies
     is not a bounded capability, and the gate has to sit at the request for the claim to survive a navigation
     the model did not type.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.53.0-T02
   acceptance_criteria:
@@ -93,12 +106,18 @@ tasks:
   - src/tools/browser.rs
   - src/run.rs
   - tests/browser.rs
-  evidence: []
+  evidence:
+  - Every document navigation is paused and answered from the run's own Policy, from inside the message
+    loop — the only place that sees a navigation the model did not type.
+  - tests/browser.rs::a_navigation_to_a_denied_host_is_failed_at_the_request_and_a_permitted_one_continues
+    asserts on the fixture's own record of `continue R1` and `fail R2 BlockedByClient`.
+  - tests/browser.rs::a_navigation_a_click_causes_is_refused_by_the_same_gate makes NO browser_navigate
+    call at all and still records the refusal.
 - id: US-IO-HARNESS-0.53.0-T04
   summary: browser_read, and the console and page-error capture that rides every action's observation.
   why_required: Reading the rendered page is the outcome's first half, and an action whose console output
     is discarded tells the model nothing about why the page did not change.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.53.0-T03
   acceptance_criteria:
@@ -114,13 +133,20 @@ tasks:
   - src/browser.rs
   - src/tools/browser.rs
   - tests/browser.rs
-  evidence: []
+  evidence:
+  - browser_read returns the text the page renders; console output and uncaught page errors ride the observation
+    of the action that produced them and add no tool.
+  - tests/browser.rs::console_output_and_page_errors_ride_the_action_that_produced_them asserts the two
+    arms separately, and ::an_action_that_produced_no_console_output_says_so asserts the empty case is
+    stated rather than omitted.
+  - The uncaught error is read from the exception's description, not from the `text` field the real browser
+    fills with the bare word `Uncaught`.
 - id: US-IO-HARNESS-0.53.0-T05
   summary: browser_screenshot, staged through the existing media path so the model actually looks at the
     image.
   why_required: The screenshot is the evidence the text cannot give, and an image that is recorded but
     never reaches the provider is the failure that looks like success.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.53.0-T04
   acceptance_criteria:
@@ -136,13 +162,17 @@ tasks:
   - src/tools/browser.rs
   - src/run.rs
   - tests/browser.rs
-  evidence: []
+  evidence:
+  - browser_screenshot stages a PNG through 0.15.0's existing media path.
+  - tests/browser.rs::a_screenshot_is_sent_to_the_model_as_an_image asserts on the OUTBOUND request carrying
+    the image, not on a stored row — staging and sending are different bugs and only the first leaves
+    a row.
 - id: US-IO-HARNESS-0.53.0-T06
   summary: browser_click, browser_type and browser_scroll — trusted input events at a resolved element,
     and a typed failure when the selector matches nothing.
   why_required: 'Without these the agent can look at a page and not use it. The no-match case is the one
     that must fail loudly: a model that believes it clicked reasons forward from a state that never happened.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.53.0-T05
   acceptance_criteria:
@@ -157,14 +187,20 @@ tasks:
   - src/browser.rs
   - src/tools/browser.rs
   - tests/browser.rs
-  evidence: []
+  evidence:
+  - browser_click, browser_type and browser_scroll dispatch trusted input at an element resolved through
+    DOM.querySelector and DOM.getBoxModel.
+  - tests/browser.rs::a_selector_that_matches_nothing_fails_and_dispatches_no_input asserts both the named
+    failure and the ABSENCE of a dispatched event.
+  - 'The live run proves the click is trusted: it changed the page''s title, which a synthetic event a
+    page can ignore would not have done and the fixture cannot tell apart.'
 - id: US-IO-HARNESS-0.53.0-T07
   summary: The [browser] config table with its project-scope refusal, the cargo feature, and tool registration
     conditional on a configured browser.
   why_required: The release is off by default twice over, and the negative control — a run that configures
     nothing is byte-identical to the previous release — is what protects every existing consumer's cached
     prompt prefix and trace.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.53.0-T06
   acceptance_criteria:
@@ -192,14 +228,19 @@ tasks:
   - src/run.rs
   - tests/config.rs
   - tests/prompt.rs
-  evidence: []
+  evidence:
+  - The `browser` cargo feature is not in `default` and implies `media`; the [browser] table is refused
+    at project scope by refuse_widening, like [[hook]].
+  - tests/browser.rs::a_run_with_no_browser_configured_is_offered_no_browser_tools and ::a_configured_run_is_offered_exactly_the_six
+    are the two halves of the negative control.
+  - Config::browser()'s doctest asserts the project-scope refusal names the key.
 - id: US-IO-HARNESS-0.53.0-T08
   summary: The two events, the checked-in doc surfaces, the public-API snapshot, and the no-durable-state
     assertion.
   why_required: A boundary nobody can audit is not a boundary, and this repository's doc surfaces are
     gated by tests that fail the build when a release changes behaviour without changing what the docs
     claim.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.53.0-T07
   acceptance_criteria:
@@ -228,12 +269,19 @@ tasks:
   - README.md
   - CHANGELOG.md
   - src/lib.rs
-  evidence: []
+  evidence:
+  - EventKind::BrowserStarted and EventKind::BrowserNavigated, additive, with EVENT_NAMES, the census
+    fixture and the exhaustive match all updated.
+  - docs/CONTRACT.md, docs/guide/browser.md, docs/CAPABILITIES.md, README.md, CHANGELOG.md, src/lib.rs
+    and docs/public-api.txt updated; tests/docs_drift.rs (15), tests/readme.rs (5), tests/guide_pages.rs
+    (7), tests/changelog.rs (5) and tests/public_api.rs (9) all pass.
+  - docs/public-api.txt gains exactly ONE line — struct BrowserConfig — which is the number the contract
+    named in advance under N4.
 - id: US-IO-HARNESS-0.53.0-T09
   summary: examples/browser_live.rs against the real installed browser, and the release's own measurement.
   why_required: A fixture proves the client and cannot prove the protocol was understood — the previous
     release found three defects this way, every one invisible to a green suite.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.53.0-T08
   acceptance_criteria:
@@ -254,7 +302,15 @@ tasks:
   - examples/browser_live.rs
   - Cargo.toml
   - docs/MEASUREMENTS.md
-  evidence: []
+  evidence:
+  - examples/browser_live.rs drives the installed browser through the whole surface against a page it
+    serves on loopback, so the host gate is exercised against a real host:port.
+  - 'All six live claims held against Google Chrome 151: rendered text, console output, an uncaught error
+    read as its description, a click that actually changed the page, a screenshot delivered as an image,
+    and a navigation to an unnamed host refused.'
+  - The live run found NO defects — recorded as a fact rather than passed over, because the point of running
+    it is that it can find them.
+  - 'Measured: cold start 2,426 ms; the page as text 44 bytes against 13,166 bytes as a PNG.'
 - id: US-IO-HARNESS-0.53.0-T10
   summary: 'The gate set: both suites, the dependency count, the nightly rustdoc gate, the three-platform
     matrix and the sabotage pass.'
