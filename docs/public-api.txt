@@ -115,6 +115,7 @@ struct ApproveAll src/approve.rs
 struct Attach src/attach.rs
 struct Broadcast src/observe.rs
 struct ChangeReview src/verify.rs
+struct BrowserConfig src/browser.rs
 struct CheckpointEvent src/state.rs
 struct Citation src/web.rs
 struct Compatible src/provider/compatible.rs

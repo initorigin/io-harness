@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.52"
+io-harness = "0.53"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -143,6 +143,18 @@ binary the operator named. `lsp_rename` **writes nothing** — it answers with a
 patch series you apply with `patch_file`, one gate check per file. Configure no
 server and nothing changes: the five schemas are absent from the catalogue
 entirely. See [language support](docs/guide/language-support.md).
+
+**Driving a browser.** Behind the `browser` feature, off by default, the agent can
+open a page, click, type, scroll, read the text the page actually renders, and take
+a screenshot it is then shown — with the console output and the uncaught errors each
+action produced. **Every document navigation is an `Act::Net` check against the
+host, decided at the paused request rather than at the URL a tool was handed**, so a
+navigation caused by a click, a redirect or a script is decided by the same rule as
+one the model typed, and every decision is a row in the trace. It is driven over a
+pipe on the child's own descriptors and opens **no debugging port**, which is both
+the smaller attack surface and the reason it needs no new dependency. Nothing is
+ever downloaded: the browser is one already installed, and its absence is a refusal.
+See [driving a browser](docs/guide/browser.md).
 
 **What a change is kept as.** Every write records the change as a unified diff of
 the whole file, so a trace can show what a step changed and not only how many

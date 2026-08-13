@@ -85,6 +85,11 @@ const GUIDES: &[(&str, bool)] = &[
     // that an operator watching neither report channel can run without deny rules
     // they believe are installed.
     ("plugins.md", true),
+    // 0.53.0. It carries a limits block because a browser is defined by what it
+    // is not allowed to do: one platform is unsupported by design, subresources
+    // are not individually decided, nothing is ever downloaded, and a selector
+    // that matches nothing must fail rather than read as a click that happened.
+    ("browser.md", true),
 ];
 
 fn guide_dir() -> PathBuf {

@@ -26,6 +26,74 @@ notes are produced from it.
 
 ### Security
 
+## [0.53.0] - 2026-08-13
+
+### Added
+
+- **An agent can drive a real browser and see what it did.** Six tools —
+  `browser_navigate`, `browser_read`, `browser_screenshot`, `browser_click`,
+  `browser_type` and `browser_scroll` — behind the new `browser` cargo feature,
+  which is not in `default`. Through 0.52.0 a run could read files and run
+  commands; a page whose content is assembled by script was, to this crate, the
+  handful of bytes the server sent before any of it ran. `browser_read` returns
+  the text the page actually renders, and `browser_screenshot` puts a picture of
+  it in front of the model — which is different evidence, not a nicer form of the
+  same evidence: text says a heading exists, a screenshot says it is white on
+  white, off-screen, or under a dialog.
+- **Every document navigation is an `Act::Net` check against its `host:port`,
+  decided at the paused request rather than at the URL a tool was handed.** That
+  is what makes the boundary hold for a navigation the model never typed — a click
+  on a link, a redirect, a script assigning `location` — and it is the difference
+  between this and a browser wrapper. Each decision is one
+  `EventKind::BrowserNavigated { host, permitted }`, so a trace records every place
+  the browser went **and every place it was stopped from going**.
+- **The browser is driven over a pipe on the child's own descriptors, and no
+  debugging port is ever opened.** A remote debugging port is a TCP listener any
+  other local process can connect to and drive with full control of the browser,
+  including reading whatever the page can read. Avoiding it also costs nothing:
+  NUL-framed JSON over two descriptors needs no websocket client, no TLS to
+  localhost and no protocol crate, so **this release adds no dependency** and
+  `cargo tree` does not move.
+- **Console output and uncaught page errors ride the observation of the action
+  that produced them**, and add no tool of their own. A run that clicks a button
+  and gets a page that looks unchanged has learned nothing; the same run reading
+  `Uncaught TypeError` from that click has learned the whole answer. An action that
+  produced neither says so rather than omitting the section.
+- **`BrowserConfig` and the `[browser]` table** — binary, extra arguments,
+  headless, viewport and per-action timeout. Nothing is ever downloaded: the
+  browser is one already installed, named outright or resolved from a documented
+  ordered list of executable names, and its absence is a refusal naming what was
+  looked for. A configured binary that is missing does **not** fall back to the
+  list — falling back would drive a browser other than the one asked for. Refused
+  in a project-scoped `io.toml` for the reason `[[hook]]` is: it names a program to
+  execute, and that file arrives with a `git clone`.
+- **`EventKind::BrowserStarted { binary, headless, ready_ms }`**, once per run,
+  naming the binary that was actually resolved rather than the one that was asked
+  for. The browser starts lazily, so a run that configures one and never browses
+  starts no process at all.
+
+### Changed
+
+- A run that does not enable the `browser` feature, or enables it and configures
+  no browser, is byte-identical to 0.52.0 in composed prompt and in trace. No tool
+  schema, no process, no event.
+
+### Security
+
+- A page a run's policy does not permit is not reached. The check is enforced at
+  the browser, on the paused request, rather than stated before one — so a
+  navigation caused by page content is decided by the same rule as one caused by
+  a tool call, and a refusal is recorded either way.
+- The browser runs against a temporary profile the run owns and removes, so the
+  operator's own cookies, extensions, history and logged-in sessions are not
+  visible to it.
+- No debugging port is opened, so the browser this crate drives cannot be driven
+  by anything else on the machine.
+
+### Fixed
+
+- Nothing. This release adds a capability and changes no existing behaviour.
+
 ## [0.52.0] - 2026-08-13
 
 ### Added

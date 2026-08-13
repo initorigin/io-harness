@@ -114,8 +114,49 @@ enabling a feature only ever adds to the surface.
 | `pptx` | PowerPoint text extraction, read-only | `zip`, `quick-xml` |
 | `pdf` | PDF generate, extract text, watermark, fill AcroForm fields | `lopdf`, `pdf-extract` |
 | `barcode` | Barcode and QR decoding from an image | `rxing`, `image` |
+| `browser` | Driving a real browser: `BrowserConfig`, the `[browser]` table, and the six `browser_*` built-ins | **No new crate.** Implies `media`, because a screenshot is only worth taking if the model looks at it |
 
 Nothing here binds a C or C++ library, so no runner needs a system package.
+
+### What `browser` does and does not claim
+
+A run drives a browser already installed on the machine — named in `[browser]`,
+or resolved from a documented ordered list of executable names. **Nothing is
+downloaded, ever**, and a browser that is not there is a refusal naming what was
+looked for.
+
+The browser is driven over a **pipe on the child's own descriptors**, not over a
+remote debugging port. A debugging port is a TCP listener any other local process
+can connect to and drive with full control of the browser; this crate opens no
+such port, and needs no websocket client to avoid it.
+
+**Every document navigation is an `Act::Net` check against its `host:port`,
+decided at the paused request rather than at the URL a tool was handed.** That is
+what makes the boundary hold for a navigation the model never typed — a click on
+a link, a redirect, a script assigning `location`. Each decision is one
+`BrowserNavigated { host, permitted }` event, so a trace records every place the
+browser went *and every place it was stopped from going*.
+
+What it does **not** claim, stated rather than left to be discovered:
+
+- **Subresources are not individually policy-checked.** Images, stylesheets,
+  fonts and XHR are the page's own traffic to a host already permitted. Document
+  navigations bound where the browser *goes*; under containment everything it
+  sends takes the run's own egress proxy, like every other contained command.
+- **Windows is not supported in 0.53.0.** The pipe transport needs two inherited
+  descriptors at fixed numbers, which the standard library does not expose on
+  Windows. Every entry point there returns a typed configuration error naming the
+  platform. It is planned work, not an accident.
+- **One page per run.** No tabs, windows, downloads, uploads, PDF printing,
+  device emulation, request mocking, or cookie and storage manipulation.
+- **No waiting on arbitrary page conditions.** An action settles on the page's own
+  load state, bounded by the configured timeout; the bound expiring is a normal
+  outcome that still returns the page, never an error.
+- **A selector that matches nothing fails, naming the selector.** It is never
+  reported as a click that happened — a model cannot detect that from a
+  successful-looking result.
+- **`[browser]` is refused at project scope**, like `[[hook]]`, because it names a
+  program to execute and `io.toml` arrives with a `git clone`.
 
 `Workspace::read_bytes`, `Workspace::write_bytes` and
 `Verification::DocumentContains` are present in **every** build. Without the
