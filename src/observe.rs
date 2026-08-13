@@ -756,6 +756,33 @@ pub enum EventKind {
         /// How long the handshake took, from spawn to first observed ready.
         ready_ms: u64,
     },
+    /// A browser started and is answering (0.53.0).
+    ///
+    /// Emitted once per run, when the first browser action starts one — the
+    /// process is lazy, so a run that configures a browser and never uses it
+    /// emits nothing. `binary` is what was actually resolved rather than what was
+    /// asked for, so a trace says which browser answered.
+    BrowserStarted {
+        /// The executable that was resolved and started.
+        binary: String,
+        /// Whether it ran without a visible window.
+        headless: bool,
+        /// How long from spawn to the page being attached.
+        ready_ms: u64,
+    },
+    /// A document navigation was decided by the run's policy (0.53.0).
+    ///
+    /// One per document navigation the browser attempted — **including the ones
+    /// the model never typed**: a click on a link, a redirect, a script assigning
+    /// `location`. This is the row that makes the boundary auditable, because it
+    /// records every place the browser went and every place it was stopped from
+    /// going, rather than only the URLs a tool was handed.
+    BrowserNavigated {
+        /// The `host:port` the policy decided about.
+        host: String,
+        /// Whether the navigation was allowed to proceed.
+        permitted: bool,
+    },
     /// A declared capability bundle was not loaded, and the run went on (0.35.0).
     ///
     /// The other half of "dropped and reported, never fatal": a bundle that fails
@@ -1163,6 +1190,8 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "plugin_loaded",
     "plugin_dropped",
     "lsp_started",
+    "browser_started",
+    "browser_navigated",
     "dialed",
     "rewound",
     "reverted",
@@ -1696,6 +1725,15 @@ mod tests {
                 root: "/repo".into(),
                 ready_ms: 812,
             },
+            EventKind::BrowserStarted {
+                binary: "/usr/bin/chromium".into(),
+                headless: true,
+                ready_ms: 431,
+            },
+            EventKind::BrowserNavigated {
+                host: "example.com:443".into(),
+                permitted: false,
+            },
             EventKind::Rewound {
                 files: 2,
                 memory: 1,
@@ -1850,6 +1888,10 @@ mod tests {
                 | EventKind::PluginDropped { .. }
                 // 0.52.0 — a language server that came up.
                 | EventKind::LspStarted { .. }
+                // 0.53.0 — a browser that came up, and every navigation it
+                // attempted, including the ones the model never typed.
+                | EventKind::BrowserStarted { .. }
+                | EventKind::BrowserNavigated { .. }
                 // 0.36.0 — a whole run put back.
                 | EventKind::Rewound { .. }
                 // 0.51.0 — one step's changes reverse-applied.

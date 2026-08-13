@@ -169,6 +169,19 @@ jobs:
           --example orphan
           --example plan_gate_fixture
           --example tick
+      # 0.53.0: the browser fixture cannot join the line above. It is behind the
+      # `browser` feature, so naming it on the default polarity fails outright —
+      # cargo refuses a `--example` whose `required-features` are not enabled.
+      # It is built on the all-features leg only, which is the leg whose tests
+      # spawn it: `tests/browser.rs` is `#![cfg(all(feature = "browser", unix))]`
+      # and compiles to nothing without the feature.
+      #
+      # `tests/ci_workflow.rs` scans this whole file for `--example`, so this
+      # step is what keeps that guard satisfied — and the guard is what caught
+      # the omission in the first place rather than a missing-file failure on a
+      # runner.
+      - if: matrix.features == 'all'
+        run: cargo build --all-features --example browser_fixture
       # 0.15.0: the git built-ins are in the default build but need the binary.
       # Git is preinstalled on all three runners — asserted rather than
       # installed, because "no system package on any runner" is the constraint

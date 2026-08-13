@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.52.0"
+version = "0.53.0"
 edition = "2021"
 # `libsqlite3-sys` 0.38.1 sets the floor from 0.23.0 on: its build script — and
 # `rusqlite` 0.40's own source — call the std `cfg_select!` macro, stabilised in
@@ -222,6 +222,13 @@ optional = true
 # common case is one word.
 default = []
 media = ["dep:base64"]
+# Driving a real browser (0.53.0), off by default like documents. It implies
+# `media` rather than duplicating it: a screenshot is only worth taking because
+# the model looks at it, and 0.15.0 already built the path that puts an image in
+# front of a provider. No crate is added by this feature — the protocol client is
+# written in this repository over `tokio` and `serde_json`, which the default
+# build already carries, so `cargo tree` does not move.
+browser = ["media"]
 documents = ["xlsx", "docx", "pptx", "pdf", "barcode"]
 docx = ["dep:docx-rs"]
 pptx = ["dep:zip", "dep:quick-xml"]
@@ -243,3 +250,16 @@ required-features = ["documents"]
 [[example]]
 name = "media_git_live"
 required-features = ["media", "barcode"]
+
+# The fake browser the suite spawns. Declared so `cargo build --all-targets` on
+# the default build skips it rather than compiling a fixture for a feature that
+# is off.
+[[example]]
+name = "browser_fixture"
+required-features = ["browser"]
+
+# 0.53.0's live run, against whatever browser is installed. Outside the default
+# gate, and the release is not sealed without having run it.
+[[example]]
+name = "browser_live"
+required-features = ["browser"]

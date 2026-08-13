@@ -11,6 +11,8 @@
 //! the same policy and the same trace. Out-of-process extension stays where
 //! 0.8.0 put it — the MCP client in [`crate::mcp`].
 
+#[cfg(feature = "browser")]
+pub(crate) mod browser;
 pub mod custom;
 pub(crate) mod diagnostics;
 pub mod documents;
@@ -104,6 +106,30 @@ pub const LSP_HOVER_TOOL: &str = "lsp_hover";
 /// 0.51.0 excluded, with the additional property that this crate did not compute
 /// the change.
 pub const LSP_RENAME_TOOL: &str = "lsp_rename";
+
+/// The names the model uses to drive a browser (0.53.0).
+///
+/// Offered only to a run that configured one. A run that did not sees none of
+/// these in its catalogue, which is what keeps its composed prompt — and the
+/// cacheable prefix that prompt is billed against — byte-identical to a build
+/// made before this release.
+#[cfg(feature = "browser")]
+pub const BROWSER_NAVIGATE_TOOL: &str = "browser_navigate";
+/// The rendered text of the page, after its scripts have run.
+#[cfg(feature = "browser")]
+pub const BROWSER_READ_TOOL: &str = "browser_read";
+/// A picture of the page, which the model is shown.
+#[cfg(feature = "browser")]
+pub const BROWSER_SCREENSHOT_TOOL: &str = "browser_screenshot";
+/// A trusted click at a resolved element.
+#[cfg(feature = "browser")]
+pub const BROWSER_CLICK_TOOL: &str = "browser_click";
+/// Typing into a focused element.
+#[cfg(feature = "browser")]
+pub const BROWSER_TYPE_TOOL: &str = "browser_type";
+/// Scrolling the page.
+#[cfg(feature = "browser")]
+pub const BROWSER_SCROLL_TOOL: &str = "browser_scroll";
 /// The name the model uses to run a command (0.17.0).
 ///
 /// The widest capability the crate grants, and the one that made a task in any
