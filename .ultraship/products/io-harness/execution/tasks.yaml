@@ -495,7 +495,7 @@ tasks:
   why_required: A hand-written wire protocol passes on the host that wrote the fixture. The platform matrix
     is the only place \r\n handling and a child's stdio buffering are actually tested, and the no-durable-state
     claim is proven by an empty diff rather than asserted.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.52.0-T09
   - US-IO-HARNESS-0.52.0-T10
@@ -530,4 +530,40 @@ tasks:
     '
   files:
   - src/state.rs
-  evidence: []
+  evidence:
+  - 'Default suite: 82 binaries, 1,684 passed, 0 failed, 428 doctests. Exit code checked from the process
+    rather than read off a pipeline.'
+  - '--all-features on a CLEARED target (cargo clean first, forced by this machine running out of disk
+    with both builds present): 82 binaries, 1,770 passed, 0 failed, 431 doctests, exit 0.'
+  - cargo fmt --check exit 0. cargo clippy --all-targets --all-features -- -D warnings exit 0, zero warnings.
+  - N2 — MSRV unmoved at 1.95 in Cargo.toml; the toolchain gate runs in CI.
+  - N1 — cargo tree still 402 for the default feature set. The framing, the JSON-RPC envelope, the six
+    request bodies and the WorkspaceEdit-to-patch rendering are written in this crate.
+  - 'N4 — no durable state at all: ''git diff main -- src/state.rs'' is EMPTY, no CREATE TABLE, no ALTER
+    TABLE, no CREATE INDEX, and CHECKPOINT_FORMAT is unmoved at 7 (src/state.rs:107).'
+  - 'O4 — cross-version proven in both directions. The existing suites pass untouched in the default run,
+    and the ignored generator gate ran too: cargo build --manifest-path tests/fixtures/gen-0.22.0 and
+    gen-0.29.0, then cargo test --test cross_version --test cross_version_0_29_0 -- --ignored — a_current_store_is_read_by_a_0_29_0_binary
+    passed, so a real 0.29.0 binary reads a store this build wrote.'
+  - 'The nightly rustdoc gate CAUGHT TWO ERRORS stable cargo doc does not report, which is the fifth time
+    in six releases. RUSTDOCFLAGS=''--cfg docsrs -D warnings'' cargo +nightly doc --all-features --no-deps:
+    ''public documentation for lsp links to private item Client'' (the module is pub, the client type
+    is pub(crate)) and ''redundant explicit link target'' on [`Error::Lsp`](crate::Error::Lsp). Both fixed;
+    the gate then exits 0.'
+  - 'cargo package --locked exit 0 after a cargo clean: 1,745,960 bytes.'
+  - 'THE SABOTAGE PASS WAS RE-RUN IN FULL AGAINST THE FINAL TREE, because the readiness work landed after
+    the first pass and a sabotage result against superseded code proves nothing. Ten sabotages, each failing
+    its named test and the suite otherwise green: F3 positions unconverted (1), F4 cache the document
+    (1), F5 spawn before the gate (1), F6 return locations unfiltered (1), F7 apply the edit inside the
+    tool (1), F8 substitute the server''s diagnostics for the compiler''s (1), F9 map a failure to an
+    empty result (1), F10 register the schemas unconditionally (2 — both arms of its own claim). F1 (length
+    in chars AND headers split on \n) fails 6 unit tests, and F2 (correlate by arrival) fails exactly
+    answers_are_matched_by_id_through_interleaved_notifications.'
+  - 'A RUNNER ERROR IN THE FIRST RE-RUN, WORTH RECORDING: after cargo clean the fixture example was gone,
+    so every sabotage ''failed'' 12 tests identically — on a missing binary, not on the sabotage. A sabotage
+    pass whose arms all fail the same way is measuring the harness, not the code. Rebuilt with cargo build
+    --example lsp_fixture_server and re-run.'
+  - 'O1''s three-platform matrix cannot run locally; it runs on the release PR. O2''s structural rule
+    is kept: no test in tests/lsp.rs asserts on a duration, the fixture server answers in the same process,
+    and the one timing constant (SETTLE) is only ever reached by a server that announces work, which the
+    fixture never does.'
