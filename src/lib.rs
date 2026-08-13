@@ -434,6 +434,9 @@
 pub mod agent;
 pub mod approve;
 pub mod attach;
+#[cfg(feature = "browser")]
+#[cfg_attr(docsrs, doc(cfg(feature = "browser")))]
+pub mod browser;
 pub mod config;
 pub mod containment;
 pub mod context;
@@ -466,6 +469,9 @@ pub use approve::{
     FixedResponder, ModelApprover, Plan, PlanGate, PlanGateNone, PlanReview, PlanStep, PlanVerdict,
     Question, Request, Responder, ResponderNone, StdinApprover, StdinPlanGate, StdinResponder,
 };
+#[cfg(feature = "browser")]
+#[cfg_attr(docsrs, doc(cfg(feature = "browser")))]
+pub use browser::BrowserConfig;
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
 pub use context::{Compaction, ContextBudget};

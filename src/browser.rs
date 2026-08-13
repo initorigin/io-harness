@@ -1,0 +1,977 @@
+//! Driving a real browser, over a pipe rather than a debugging port (0.53.0).
+//!
+//! A run that can open a page, use it, and look at what it rendered is the first
+//! capability in this crate that observes something the crate did not itself
+//! produce. That is why the boundary comes first here and the convenience second:
+//! a browser executes untrusted code from whatever host it lands on, and one
+//! click can navigate anywhere.
+//!
+//! # The transport is a pipe, and that is a boundary decision
+//!
+//! The browser is spawned with its pipe-transport flag and speaks the DevTools
+//! protocol over descriptors 3 and 4 — messages in on 3, messages out on 4, one
+//! JSON object per message terminated by a NUL byte. The alternative, a remote
+//! debugging *port*, is a TCP listener that any other process on the machine can
+//! connect to and drive with complete control of the browser, including reading
+//! whatever the page can read. This crate opens no such port.
+//!
+//! It also costs nothing: NUL-framed JSON over two descriptors needs no websocket
+//! client, no TLS to localhost and no protocol crate, so the whole client lives in
+//! this repository where a test can make it misbehave, and the dependency tree
+//! does not move.
+//!
+//! # Where the policy is enforced
+//!
+//! Every *document* navigation the browser attempts is paused at the browser and
+//! answered from the run's own [`Policy`](crate::Policy) as an
+//! [`Act::Net`](crate::Act::Net) check against its `host:port`. The check is at
+//! the paused request rather than at the URL a tool was handed, and the difference
+//! is the whole claim: a click on a link, a redirect and a script assigning
+//! `location` are all navigations the model never typed, and all three are gated
+//! by exactly the same code as the one it did.
+//!
+//! Subresources — images, stylesheets, fonts, XHR — are deliberately not
+//! individually checked. They are traffic to a page already permitted, and under
+//! containment they take the run's own egress proxy like every other contained
+//! command's traffic. `docs/CONTRACT.md` states this boundary rather than leaving
+//! a reader to infer it.
+//!
+//! # What is written over `AsyncRead + AsyncWrite`
+//!
+//! [`Client`] takes a duplex pair, not a child process. Framing, correlation and
+//! the navigation gate are therefore driven in tests by a fixture browser this
+//! repository writes, over [`tokio::io::duplex`] — one that answers out of order,
+//! floods events between a request and its answer, and records whether it was told
+//! to continue a request or fail it. A real browser's cold start is a cost a CI
+//! gate must not take, and its version is not a thing this repository controls.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::oneshot;
+
+use crate::error::{Error, Result};
+use crate::policy::{Act, Effect, Policy};
+
+/// The default per-action bound, in seconds.
+///
+/// A page load is the slowest thing this module does and the one most able to
+/// hang: a page that polls never reaches network idle, so every wait here is
+/// bounded and the bound expiring is a normal outcome that still returns the
+/// page.
+fn default_timeout_secs() -> u64 {
+    30
+}
+
+fn default_width() -> u32 {
+    1280
+}
+
+fn default_height() -> u32 {
+    800
+}
+
+fn default_headless() -> bool {
+    true
+}
+
+/// The browser a run may drive, as named in `io.toml`'s `[browser]` table.
+///
+/// Absent from a project's configuration, there is no browser: no tool schema is
+/// offered to the model, no process is started, and the run is byte-identical to
+/// one built before this release.
+///
+/// ```
+/// use io_harness::BrowserConfig;
+///
+/// // The machine's own browser, resolved from a documented list of names.
+/// let anywhere = BrowserConfig::default();
+/// assert!(anywhere.binary.is_none());
+/// assert!(anywhere.headless);
+///
+/// // Or one named outright, with a viewport this run wants.
+/// let named = BrowserConfig::default()
+///     .with_binary("/usr/bin/chromium")
+///     .with_viewport(1920, 1080);
+/// assert_eq!(named.binary.as_deref(), Some("/usr/bin/chromium"));
+/// assert_eq!(named.width, 1920);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserConfig {
+    /// The browser executable. `None` resolves it from a documented ordered list
+    /// of well-known names — see [`RESOLUTION_ORDER`] — so an operator reads
+    /// which binary will be picked rather than running it to find out.
+    #[serde(default)]
+    pub binary: Option<String>,
+    /// Extra arguments appended after the ones this crate requires.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Whether to run without a visible window. On by default: a run is usually
+    /// unattended, and a browser that steals focus on a developer's machine is a
+    /// surprise rather than a feature.
+    #[serde(default = "default_headless")]
+    pub headless: bool,
+    /// Viewport width in pixels, which a screenshot is taken at.
+    #[serde(default = "default_width")]
+    pub width: u32,
+    /// Viewport height in pixels.
+    #[serde(default = "default_height")]
+    pub height: u32,
+    /// Per-action bound in seconds.
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            binary: None,
+            args: Vec::new(),
+            headless: default_headless(),
+            width: default_width(),
+            height: default_height(),
+            timeout_secs: default_timeout_secs(),
+        }
+    }
+}
+
+impl BrowserConfig {
+    /// Name the executable outright rather than resolving one.
+    pub fn with_binary(mut self, binary: impl Into<String>) -> Self {
+        self.binary = Some(binary.into());
+        self
+    }
+
+    /// Set the viewport a page renders and screenshots at.
+    pub fn with_viewport(mut self, width: u32, height: u32) -> Self {
+        self.width = width;
+        self.height = height;
+        self
+    }
+
+    /// Run with a visible window.
+    pub fn with_window(mut self) -> Self {
+        self.headless = false;
+        self
+    }
+
+    /// Set the per-action bound.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout_secs = timeout.as_secs().max(1);
+        self
+    }
+
+    /// The per-action bound as a [`Duration`].
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs.max(1))
+    }
+}
+
+/// The executable names tried, in this order, when `[browser]` names none.
+///
+/// A documented list rather than a search: an operator reads which browser a run
+/// will pick. Nothing here is ever downloaded — a machine with none of these has
+/// no browser, and the tool says so naming what it looked for.
+pub const RESOLUTION_ORDER: &[&str] = &[
+    "chromium",
+    "chromium-browser",
+    "google-chrome",
+    "google-chrome-stable",
+    "microsoft-edge",
+];
+
+/// The conventional install locations searched after `PATH`, per host.
+#[cfg(target_os = "macos")]
+pub(crate) const WELL_KNOWN: &[&str] = &[
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+];
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) const WELL_KNOWN: &[&str] = &[
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/opt/google/chrome/chrome",
+];
+
+/// An error naming the browser, which is the only kind this module returns.
+pub(crate) fn fail(reason: impl Into<String>) -> Error {
+    Error::Browser {
+        reason: reason.into(),
+    }
+}
+
+/// Frame one message: the JSON object, then a single NUL.
+///
+/// The protocol's whole framing. Measured against the real browser before it was
+/// written down — there is no length header and no newline delimiter, and a
+/// client that splits on newline works until a page logs a string containing one.
+fn frame(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 1);
+    out.extend_from_slice(text.as_bytes());
+    out.push(0);
+    out
+}
+
+/// Read one NUL-terminated message, or `None` at a clean end of stream.
+///
+/// Chunking is the transport's business, not the protocol's: a message may arrive
+/// split across any number of reads, and several may arrive in one. `read_until`
+/// owns that, which is why this function is three lines and has no buffer of its
+/// own to get wrong.
+async fn read_frame<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<Option<Value>> {
+    let mut buf = Vec::new();
+    let read = reader
+        .read_until(0, &mut buf)
+        .await
+        .map_err(|e| fail(format!("reading from the browser failed: {e}")))?;
+    if read == 0 {
+        return Ok(None);
+    }
+    // A stream that ends without its terminator is a truncated message, not a
+    // clean close, and saying so is what stops it being read as an empty answer.
+    if buf.last() != Some(&0) {
+        return Err(fail("the browser closed mid-message"));
+    }
+    buf.pop();
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&buf)
+        .map(Some)
+        .map_err(|e| fail(format!("the browser sent something unreadable: {e}")))
+}
+
+/// What a page said, in the order it said it.
+///
+/// Console output and uncaught errors ride the observation of the action that
+/// produced them rather than a tool of their own — 0.52.0's decision about
+/// diagnostics, for the same reason: a model should not have to remember to ask
+/// what the page reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Line {
+    /// `log`, `warn`, `error`, or `page error` for an uncaught exception.
+    pub(crate) kind: String,
+    /// The message text.
+    pub(crate) text: String,
+}
+
+/// How many console lines one action may carry back.
+const MAX_LINES: usize = 50;
+/// How many bytes of console text one action may carry back.
+const MAX_LINE_BYTES: usize = 2_000;
+
+/// The decision for one document navigation, and the record of it.
+///
+/// Holds the run's policy rather than a copy of its answers, because a policy is
+/// narrowed mid-run by a plan gate and a cached verdict would outlive the
+/// narrowing that replaced it.
+pub(crate) struct NavGate {
+    policy: Policy,
+    /// Every decision made, in order: the target and whether it was permitted.
+    /// Read by the tool layer to write one event per navigation, which is what
+    /// makes the boundary auditable — every place the browser went, and every
+    /// place it was stopped from going.
+    decisions: Mutex<Vec<(String, bool)>>,
+}
+
+impl NavGate {
+    pub(crate) fn new(policy: Policy) -> Self {
+        Self {
+            policy,
+            decisions: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Whether this URL may be navigated to, recorded either way.
+    ///
+    /// `Ask` counts as **not permitted** here, following 0.40.0's rule for
+    /// `Act::Net`: there is nobody to ask inside a paused request, and a
+    /// navigation is not undoable once the bytes are in the page.
+    pub(crate) fn permits(&self, url: &str) -> bool {
+        let target = target_of(url);
+        let permitted = match target.as_deref() {
+            // A URL with no host — `about:blank`, and the `data:` URLs the tests
+            // use — reaches no network and is not a network decision. Recording
+            // it would fill the trace with rows about nothing.
+            None => return true,
+            Some(t) => self.policy.check(Act::Net, t).effect == Effect::Allow,
+        };
+        self.decisions
+            .lock()
+            .expect("navigation decisions are not poisoned")
+            .push((target.unwrap_or_default(), permitted));
+        permitted
+    }
+
+    /// Take the decisions recorded so far.
+    pub(crate) fn drain(&self) -> Vec<(String, bool)> {
+        std::mem::take(
+            &mut *self
+                .decisions
+                .lock()
+                .expect("navigation decisions are not poisoned"),
+        )
+    }
+}
+
+/// The `host:port` a URL resolves to, or `None` for a URL that reaches no host.
+///
+/// Written by hand because this crate parses no URLs and adding a dependency to
+/// do it would cost more than the twenty lines. Only the authority is needed: the
+/// policy matches on host and optional port, and never on a path.
+pub(crate) fn target_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|a| !a.is_empty())?;
+    // Credentials in a URL are not part of the host the policy decides about.
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let default_port = match scheme.as_str() {
+        "http" | "ws" => 80,
+        "https" | "wss" => 443,
+        // Any other scheme reaches no host this policy can decide about.
+        _ => return None,
+    };
+    // An IPv6 literal carries its own colons and is bracketed.
+    if let Some(end) = authority.strip_prefix('[').and_then(|a| a.find(']')) {
+        let (host, tail) = authority.split_at(end + 2.min(authority.len() - end));
+        let port = tail.strip_prefix(':').unwrap_or("");
+        let port = if port.is_empty() {
+            default_port.to_string()
+        } else {
+            port.to_string()
+        };
+        return Some(format!("{host}:{port}"));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            Some(format!("{host}:{port}"))
+        }
+        _ => Some(format!("{authority}:{default_port}")),
+    }
+}
+
+/// A speaker on a browser that someone else owns.
+#[derive(Clone)]
+pub(crate) struct Handle {
+    writer: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
+    next_id: Arc<AtomicI64>,
+    /// Why the reader stopped, if it did. Read when a request finds its channel
+    /// closed, so "the browser exited" is reported instead of "channel closed".
+    gone: Arc<Mutex<Option<String>>>,
+    /// What the page has said since the last drain.
+    console: Arc<Mutex<Vec<Line>>>,
+}
+
+/// A browser client: one message loop over a duplex pair.
+///
+/// The loop owns the read half because there is no point in the stream at which
+/// "read the next message" belongs to one caller. Events arrive whenever the page
+/// feels like it — a console line, a paused request, a frame navigating — and an
+/// answer may arrive after any number of them.
+pub(crate) struct Client {
+    inner: Handle,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Client {
+    /// Take a duplex pair and start reading.
+    ///
+    /// `gate` is consulted for every paused document request, from inside the
+    /// message loop, because that is the only place that sees a navigation the
+    /// model did not type.
+    pub(crate) fn over<R, W>(read: R, write: W, gate: Arc<NavGate>) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> = Arc::default();
+        let gone: Arc<Mutex<Option<String>>> = Arc::default();
+        let console: Arc<Mutex<Vec<Line>>> = Arc::default();
+        let writer: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
+            Arc::new(tokio::sync::Mutex::new(Box::new(write)));
+        let next_id = Arc::new(AtomicI64::new(1));
+
+        let reader = tokio::spawn(read_loop(
+            BufReader::new(read),
+            Arc::clone(&pending),
+            Arc::clone(&writer),
+            Arc::clone(&gone),
+            Arc::clone(&console),
+            Arc::clone(&next_id),
+            gate,
+        ));
+
+        Self {
+            inner: Handle {
+                writer,
+                pending,
+                next_id,
+                gone,
+                console,
+            },
+            reader,
+        }
+    }
+
+    /// Send a command and wait for the answer with that id.
+    pub(crate) async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        session: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.inner.request(method, params, session, timeout).await
+    }
+
+    /// Take everything the page has said since the last drain.
+    pub(crate) fn drain_console(&self) -> Vec<Line> {
+        self.inner.drain_console()
+    }
+}
+
+impl Handle {
+    /// Send a command and wait for the answer with that id.
+    pub(crate) async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        session: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .expect("pending map is not poisoned")
+            .insert(id, tx);
+
+        let mut body = json!({"id": id, "method": method, "params": params});
+        if let Some(session) = session {
+            body["sessionId"] = json!(session);
+        }
+        if let Err(e) = send(&self.writer, &body).await {
+            self.pending
+                .lock()
+                .expect("pending map is not poisoned")
+                .remove(&id);
+            return Err(e);
+        }
+
+        let answer = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(v)) => v,
+            // The sender was dropped, which happens only when the reader stopped.
+            Ok(Err(_)) => {
+                self.forget(id);
+                let why = self
+                    .gone
+                    .lock()
+                    .expect("reason is not poisoned")
+                    .clone()
+                    .unwrap_or_else(|| "the browser closed its output".into());
+                return Err(fail(format!("{method} was not answered: {why}")));
+            }
+            Err(_) => {
+                self.forget(id);
+                return Err(fail(format!(
+                    "{method} did not answer within {}s",
+                    timeout.as_secs()
+                )));
+            }
+        };
+
+        if let Some(error) = answer.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("no message");
+            return Err(fail(format!("{method} failed: {message}")));
+        }
+        Ok(answer.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    fn forget(&self, id: i64) {
+        self.pending
+            .lock()
+            .expect("pending map is not poisoned")
+            .remove(&id);
+    }
+
+    /// Take everything the page has said since the last drain.
+    pub(crate) fn drain_console(&self) -> Vec<Line> {
+        std::mem::take(&mut *self.console.lock().expect("console is not poisoned"))
+    }
+}
+
+/// Write one framed message.
+async fn send(
+    writer: &Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    body: &Value,
+) -> Result<()> {
+    let text = serde_json::to_string(body).map_err(|e| fail(format!("{e}")))?;
+    let mut writer = writer.lock().await;
+    writer
+        .write_all(&frame(&text))
+        .await
+        .map_err(|e| fail(format!("writing to the browser failed: {e}")))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| fail(format!("writing to the browser failed: {e}")))
+}
+
+/// Read messages until the stream ends, routing each one.
+///
+/// Three kinds arrive on one stream and each goes somewhere different: an answer
+/// to whoever is waiting on that id, a paused request to the gate, and everything
+/// else the page says to the console buffer.
+#[allow(clippy::too_many_arguments)]
+async fn read_loop<R: AsyncRead + Unpin>(
+    mut reader: BufReader<R>,
+    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
+    writer: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    gone: Arc<Mutex<Option<String>>>,
+    console: Arc<Mutex<Vec<Line>>>,
+    next_id: Arc<AtomicI64>,
+    gate: Arc<NavGate>,
+) {
+    let reason = loop {
+        match read_frame(&mut reader).await {
+            Ok(Some(message)) => {
+                let id = message.get("id").and_then(Value::as_i64);
+                match (id, message.get("method").and_then(Value::as_str)) {
+                    // An answer: route it to whoever is waiting for that id. A
+                    // client that instead took the next message would be answered
+                    // the first console line the page emitted.
+                    (Some(id), None) => {
+                        let waiting = pending
+                            .lock()
+                            .expect("pending map is not poisoned")
+                            .remove(&id);
+                        if let Some(tx) = waiting {
+                            let _ = tx.send(message);
+                        }
+                    }
+                    (_, Some(method)) => {
+                        route_event(method, &message, &console, &writer, &next_id, &gate).await;
+                    }
+                    (None, None) => {}
+                }
+            }
+            Ok(None) => break "the browser closed its output".to_string(),
+            Err(e) => break format!("{e}"),
+        }
+    };
+    *gone.lock().expect("reason is not poisoned") = Some(reason);
+    // Every waiter learns the stream ended, rather than waiting out its bound.
+    pending.lock().expect("pending map is not poisoned").clear();
+}
+
+/// Route one server-initiated message.
+async fn route_event(
+    method: &str,
+    message: &Value,
+    console: &Arc<Mutex<Vec<Line>>>,
+    writer: &Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    next_id: &Arc<AtomicI64>,
+    gate: &Arc<NavGate>,
+) {
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let session = message.get("sessionId").and_then(Value::as_str);
+    match method {
+        // A document navigation, held before it leaves the process. This is the
+        // gate: the answer decides whether the browser goes there, and it covers
+        // the navigations the model never typed.
+        "Fetch.requestPaused" => {
+            let request_id = params
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let url = params
+                .get("request")
+                .and_then(|r| r.get("url"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let permitted = gate.permits(url);
+            let id = next_id.fetch_add(1, Ordering::Relaxed);
+            let mut body = if permitted {
+                json!({"id": id, "method": "Fetch.continueRequest",
+                       "params": {"requestId": request_id}})
+            } else {
+                json!({"id": id, "method": "Fetch.failRequest",
+                       "params": {"requestId": request_id, "errorReason": "BlockedByClient"}})
+            };
+            if let Some(session) = session {
+                body["sessionId"] = json!(session);
+            }
+            // Nothing awaits this answer: the pause is released either way, and a
+            // write that fails here is reported by the next request instead.
+            let _ = send(writer, &body).await;
+        }
+        "Runtime.consoleAPICalled" => {
+            let kind = params
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("log")
+                .to_string();
+            let text = params
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|args| args.iter().map(argument_text).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default();
+            push(console, Line { kind, text });
+        }
+        // An uncaught page error. The readable message is in the exception's own
+        // description: `exceptionDetails.text` is the bare word `Uncaught`, which
+        // a client reporting it would present as the whole error.
+        "Runtime.exceptionThrown" => {
+            let details = params.get("exceptionDetails");
+            let text = details
+                .and_then(|d| d.get("exception"))
+                .and_then(|e| e.get("description"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    details
+                        .and_then(|d| d.get("exception"))
+                        .and_then(|e| e.get("value"))
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| details.and_then(|d| d.get("text")).and_then(Value::as_str))
+                .unwrap_or("an uncaught error with no description")
+                .to_string();
+            push(
+                console,
+                Line {
+                    kind: "page error".to_string(),
+                    text,
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
+/// One console argument as text.
+fn argument_text(arg: &Value) -> String {
+    match arg.get("value") {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => arg
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+/// Record one line, bounded.
+///
+/// A page in a loop can log without end, and an observation is prompt bytes on
+/// the next request. The cap is stated in the observation rather than applied
+/// silently, so a model reading a short list knows whether it is short because
+/// the page was quiet or because this stopped listening.
+fn push(console: &Arc<Mutex<Vec<Line>>>, mut line: Line) {
+    let mut lines = console.lock().expect("console is not poisoned");
+    if lines.len() >= MAX_LINES {
+        return;
+    }
+    if line.text.len() > MAX_LINE_BYTES {
+        let cut = (0..=MAX_LINE_BYTES)
+            .rev()
+            .find(|i| line.text.is_char_boundary(*i))
+            .unwrap_or(0);
+        line.text.truncate(cut);
+        line.text.push_str(" … (truncated)");
+    }
+    lines.push(line);
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gate() -> Arc<NavGate> {
+        Arc::new(NavGate::new(Policy::permissive()))
+    }
+
+    /// Write one framed message onto a stream, as the browser would.
+    async fn say<W: AsyncWrite + Unpin>(w: &mut W, body: Value) {
+        w.write_all(&frame(&serde_json::to_string(&body).unwrap()))
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+    }
+
+    #[test]
+    fn a_message_is_framed_by_one_nul_and_nothing_else() {
+        let bytes = frame(r#"{"id":1}"#);
+        assert_eq!(bytes, b"{\"id\":1}\0");
+        // No length header, no newline: a client that adds either is speaking a
+        // protocol the browser does not read.
+        assert!(!bytes.contains(&b'\n'));
+        assert_eq!(bytes.iter().filter(|b| **b == 0).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_message_split_across_chunks_reads_whole_and_two_in_one_chunk_read_separately() {
+        let (mut theirs, ours) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(ours);
+
+        // One message, delivered in pieces that split mid-object and mid-
+        // multi-byte-character. The three-byte ellipsis is deliberate: a reader
+        // that decodes per chunk rather than per message fails here and passes
+        // every ASCII fixture.
+        let whole = format!(r#"{{"id":1,"result":{{"text":"a…b"}}}}"#);
+        let bytes = frame(&whole);
+        let (head, tail) = bytes.split_at(12);
+        let (mid, end) = tail.split_at(9);
+        theirs.write_all(head).await.unwrap();
+        theirs.flush().await.unwrap();
+        theirs.write_all(mid).await.unwrap();
+        theirs.flush().await.unwrap();
+        theirs.write_all(end).await.unwrap();
+
+        // Then two whole messages in a single write, which must come back as two.
+        let mut both = frame(r#"{"id":2}"#);
+        both.extend_from_slice(&frame(r#"{"id":3}"#));
+        theirs.write_all(&both).await.unwrap();
+        theirs.flush().await.unwrap();
+
+        let first = read_frame(&mut reader).await.unwrap().unwrap();
+        assert_eq!(first["result"]["text"], "a…b");
+        assert_eq!(read_frame(&mut reader).await.unwrap().unwrap()["id"], 2);
+        assert_eq!(read_frame(&mut reader).await.unwrap().unwrap()["id"], 3);
+    }
+
+    #[tokio::test]
+    async fn a_payload_containing_a_newline_is_one_message() {
+        let (mut theirs, ours) = tokio::io::duplex(256);
+        let mut reader = BufReader::new(ours);
+        // The exact shape that breaks a newline-framed client: a console line
+        // carrying a newline is ordinary, and NUL is the only terminator.
+        say(
+            &mut theirs,
+            json!({"id": 1, "result": {"text": "one\ntwo"}}),
+        )
+        .await;
+        let message = read_frame(&mut reader).await.unwrap().unwrap();
+        assert_eq!(message["result"]["text"], "one\ntwo");
+    }
+
+    #[tokio::test]
+    async fn a_clean_end_of_stream_is_not_an_error_and_a_truncated_message_is() {
+        let (theirs, ours) = tokio::io::duplex(64);
+        drop(theirs);
+        let mut reader = BufReader::new(ours);
+        assert!(read_frame(&mut reader).await.unwrap().is_none());
+
+        let (mut theirs, ours) = tokio::io::duplex(64);
+        theirs.write_all(br#"{"id":1}"#).await.unwrap();
+        drop(theirs);
+        let mut reader = BufReader::new(ours);
+        let err = read_frame(&mut reader).await.unwrap_err();
+        assert!(format!("{err}").contains("closed mid-message"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn answers_are_matched_by_id_through_a_flood_of_events() {
+        let (theirs, ours) = tokio::io::duplex(4096);
+        let (mut their_read, mut their_write) = tokio::io::split(theirs);
+        let (our_read, our_write) = tokio::io::split(ours);
+        let client = Client::over(our_read, our_write, gate());
+
+        // Two outstanding requests, answered in reverse order with events either
+        // side of them. A client that takes the next message as its answer is
+        // handed a console line here.
+        let a = client.request("A.one", json!({}), None, Duration::from_secs(5));
+        let b = client.request("B.two", json!({}), None, Duration::from_secs(5));
+
+        let server = async move {
+            let mut seen = Vec::new();
+            let mut reader = BufReader::new(&mut their_read);
+            while seen.len() < 2 {
+                let m = read_frame(&mut reader).await.unwrap().unwrap();
+                seen.push(m);
+            }
+            let first = seen[0]["id"].as_i64().unwrap();
+            let second = seen[1]["id"].as_i64().unwrap();
+
+            for _ in 0..3 {
+                say(
+                    &mut their_write,
+                    json!({"method": "Runtime.consoleAPICalled",
+                           "params": {"type": "log", "args": [{"value": "noise"}]}}),
+                )
+                .await;
+            }
+            // The second request answered first.
+            say(
+                &mut their_write,
+                json!({"id": second, "result": {"who": "second"}}),
+            )
+            .await;
+            say(
+                &mut their_write,
+                json!({"method": "Runtime.consoleAPICalled",
+                       "params": {"type": "warn", "args": [{"value": "more noise"}]}}),
+            )
+            .await;
+            say(
+                &mut their_write,
+                json!({"id": first, "result": {"who": "first"}}),
+            )
+            .await;
+            // Held open: dropping the write half ends the client's read loop.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+
+        let (ra, rb, _) = tokio::join!(a, b, server);
+        assert_eq!(ra.unwrap()["who"], "first");
+        assert_eq!(rb.unwrap()["who"], "second");
+
+        // And the events reached the console rather than being taken for answers.
+        let lines = client.drain_console();
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines.iter().all(|l| l.text.contains("noise")));
+    }
+
+    #[tokio::test]
+    async fn an_error_answer_names_what_the_browser_said() {
+        let (theirs, ours) = tokio::io::duplex(1024);
+        let (mut their_read, mut their_write) = tokio::io::split(theirs);
+        let (our_read, our_write) = tokio::io::split(ours);
+        let client = Client::over(our_read, our_write, gate());
+
+        let call = client.request("Page.navigate", json!({}), None, Duration::from_secs(5));
+        let server = async move {
+            let mut reader = BufReader::new(&mut their_read);
+            let m = read_frame(&mut reader).await.unwrap().unwrap();
+            say(
+                &mut their_write,
+                json!({"id": m["id"], "error": {"message": "Cannot navigate to invalid URL"}}),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let (answer, _) = tokio::join!(call, server);
+        let err = answer.unwrap_err();
+        assert!(
+            format!("{err}").contains("Cannot navigate to invalid URL"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_browser_that_closes_is_reported_by_name_rather_than_waited_out() {
+        let (theirs, ours) = tokio::io::duplex(1024);
+        let (our_read, our_write) = tokio::io::split(ours);
+        let client = Client::over(our_read, our_write, gate());
+        drop(theirs);
+        let err = client
+            .request("Page.navigate", json!({}), None, Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        let message = format!("{err}");
+        // The discriminating assertion is structural rather than a clock: the
+        // failure must be the dead transport, named, and *not* the bound
+        // expiring. A client that waited out its 30s timeout would report the
+        // timeout, and that string is what this forbids. Whether the death
+        // surfaces on the write or on the read is the operating system's
+        // business — both are the browser being gone, and both are prompt.
+        assert!(matches!(err, Error::Browser { .. }), "{message}");
+        assert!(
+            !message.contains("did not answer within"),
+            "a dead browser was waited out rather than reported: {message}"
+        );
+        assert!(
+            message.contains("closed") || message.contains("broken pipe"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncaught_error_is_read_from_its_description_not_from_the_word_uncaught() {
+        let (theirs, ours) = tokio::io::duplex(1024);
+        let (_their_read, mut their_write) = tokio::io::split(theirs);
+        let (our_read, our_write) = tokio::io::split(ours);
+        let client = Client::over(our_read, our_write, gate());
+
+        // The exact shape the real browser sends: `text` is the useless word, and
+        // the message a person needs is in the exception's description.
+        say(
+            &mut their_write,
+            json!({"method": "Runtime.exceptionThrown",
+                   "params": {"exceptionDetails": {
+                       "text": "Uncaught",
+                       "exception": {"description": "TypeError: undefined is not a function"}}}}),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let lines = client.drain_console();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].kind, "page error");
+        assert_eq!(lines[0].text, "TypeError: undefined is not a function");
+    }
+
+    #[test]
+    fn a_url_becomes_the_host_and_port_the_policy_decides_about() {
+        assert_eq!(
+            target_of("https://example.com/a/b"),
+            Some("example.com:443".into())
+        );
+        assert_eq!(
+            target_of("http://example.com"),
+            Some("example.com:80".into())
+        );
+        assert_eq!(
+            target_of("https://example.com:8443/x"),
+            Some("example.com:8443".into())
+        );
+        assert_eq!(
+            target_of("http://user:pw@example.com/x"),
+            Some("example.com:80".into())
+        );
+        // A URL that reaches no host is not a network decision.
+        assert_eq!(target_of("about:blank"), None);
+        assert_eq!(target_of("data:text/html,<h1>hi</h1>"), None);
+        assert_eq!(target_of("file:///etc/passwd"), None);
+    }
+
+    #[test]
+    fn a_denied_host_is_refused_and_an_unruled_one_is_too() {
+        let policy = Policy::default().allow_net("good.example.com");
+        let gate = NavGate::new(policy);
+        assert!(gate.permits("https://good.example.com/page"));
+        // Not allowed anywhere is not permitted: there is nobody to ask inside a
+        // paused request, and a navigation is not undoable once it has happened.
+        assert!(!gate.permits("https://other.example.com/page"));
+        let decisions = gate.drain();
+        assert_eq!(
+            decisions,
+            vec![
+                ("good.example.com:443".to_string(), true),
+                ("other.example.com:443".to_string(), false),
+            ]
+        );
+    }
+}

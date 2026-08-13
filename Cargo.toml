@@ -222,6 +222,13 @@ optional = true
 # common case is one word.
 default = []
 media = ["dep:base64"]
+# Driving a real browser (0.53.0), off by default like documents. It implies
+# `media` rather than duplicating it: a screenshot is only worth taking because
+# the model looks at it, and 0.15.0 already built the path that puts an image in
+# front of a provider. No crate is added by this feature — the protocol client is
+# written in this repository over `tokio` and `serde_json`, which the default
+# build already carries, so `cargo tree` does not move.
+browser = ["media"]
 documents = ["xlsx", "docx", "pptx", "pdf", "barcode"]
 docx = ["dep:docx-rs"]
 pptx = ["dep:zip", "dep:quick-xml"]
