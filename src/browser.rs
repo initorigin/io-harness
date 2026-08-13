@@ -147,6 +147,16 @@ impl BrowserConfig {
         self
     }
 
+    /// Extra arguments, appended after the ones this crate requires.
+    pub fn with_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Set the viewport a page renders and screenshots at.
     pub fn with_viewport(mut self, width: u32, height: u32) -> Self {
         self.width = width;

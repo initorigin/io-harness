@@ -13,13 +13,17 @@
 //! at the request" is asserted on the fixture's own record rather than on an
 //! error message.
 //!
-//! Environment:
+//! Settings arrive as command-line arguments rather than as environment
+//! variables, and that is not a style choice: `std::env::set_var` is
+//! process-global, so a suite running these tests in parallel would have one
+//! test's settings decide another test's child. An argument belongs to one spawn.
 //!
-//! - `IO_FIXTURE_RECORD` — append a line per interesting event to this path.
-//! - `IO_FIXTURE_LINKS` — comma-separated URLs a click navigates to, in order.
-//! - `IO_FIXTURE_TEXT` — what the page's text read returns.
-//! - `IO_FIXTURE_NO_SELECTOR` — every selector matches nothing.
-//! - `IO_FIXTURE_SILENT` — start, and never answer anything.
+//! - `--io-fixture-record=<path>` — append a line per interesting event.
+//! - `--io-fixture-links=<url,url>` — URLs a click navigates to, in order.
+//! - `--io-fixture-text=<text>` — what the page's text read returns.
+//! - `--io-fixture-no-selector` — every selector matches nothing.
+//! - `--io-fixture-console` — the page logs and throws while loading.
+//! - `--io-fixture-silent` — start, and never answer anything.
 
 // The transport is two inherited descriptors, which is a unix arrangement. On
 // Windows the browser feature refuses, so its fixture has nothing to do.
@@ -37,9 +41,23 @@ use serde_json::{json, Value};
 #[cfg(unix)]
 const PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
+/// One `--io-fixture-<name>=<value>` argument, if it was given.
+#[cfg(unix)]
+fn arg(name: &str) -> Option<String> {
+    let prefix = format!("--io-fixture-{name}=");
+    std::env::args().find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
+}
+
+/// Whether a bare `--io-fixture-<name>` flag was given.
+#[cfg(unix)]
+fn flag(name: &str) -> bool {
+    let want = format!("--io-fixture-{name}");
+    std::env::args().any(|a| a == want)
+}
+
 #[cfg(unix)]
 fn record(line: &str) {
-    if let Ok(path) = std::env::var("IO_FIXTURE_RECORD") {
+    if let Some(path) = arg("record") {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -65,8 +83,10 @@ fn main() {
         unsafe { std::fs::File::from_raw_fd(4) }
     };
 
-    record("started");
-    if std::env::var("IO_FIXTURE_SILENT").is_ok() {
+    // The pid, so a test can assert the process is gone after the run rather
+    // than assert that a shutdown call was made.
+    record(&format!("started {}", std::process::id()));
+    if flag("silent") {
         // Started and useless: the parent must bound its wait rather than hang.
         std::thread::sleep(std::time::Duration::from_secs(600));
         return;
@@ -79,7 +99,7 @@ fn main() {
         let _ = out.flush();
     };
 
-    let links: Vec<String> = std::env::var("IO_FIXTURE_LINKS")
+    let links: Vec<String> = arg("links")
         .unwrap_or_default()
         .split(',')
         .filter(|s| !s.is_empty())
@@ -138,6 +158,26 @@ fn main() {
                     event["sessionId"] = json!(s);
                 }
                 say(event, &mut output);
+                // What the page said while loading. A console line and an
+                // uncaught error, in the exact shape the real browser sends them
+                // — `text` is the useless word `Uncaught` and the readable
+                // message is in the exception's description.
+                if flag("console") {
+                    let mut log = json!({"method": "Runtime.consoleAPICalled",
+                                         "params": {"type": "log",
+                                                    "args": [{"value": "page said hello"}]}});
+                    let mut boom = json!({"method": "Runtime.exceptionThrown",
+                                          "params": {"exceptionDetails": {
+                                              "text": "Uncaught",
+                                              "exception": {"description":
+                                                  "TypeError: undefined is not a function"}}}});
+                    if let Some(s) = &session {
+                        log["sessionId"] = json!(s);
+                        boom["sessionId"] = json!(s);
+                    }
+                    say(log, &mut output);
+                    say(boom, &mut output);
+                }
                 // The answer to the navigate command itself comes after the pause
                 // is resolved, which is the order a real browser uses.
                 say(answer(json!({"frameId": "F1"})), &mut output);
@@ -165,8 +205,17 @@ fn main() {
                 say(answer(json!({})), &mut output);
             }
             "Runtime.evaluate" => {
-                let text = std::env::var("IO_FIXTURE_TEXT")
-                    .unwrap_or_else(|_| "fixture page text".to_string());
+                let expression = params
+                    .get("expression")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                // A page that reports its load state is what lets the parent
+                // settle without waiting out its bound on every navigation.
+                let text = if expression.contains("readyState") {
+                    "complete".to_string()
+                } else {
+                    arg("text").unwrap_or_else(|| "fixture page text".to_string())
+                };
                 say(
                     answer(json!({"result": {"type": "string", "value": text}})),
                     &mut output,
@@ -178,7 +227,7 @@ fn main() {
             // must turn into a named failure rather than a silent success.
             "DOM.getDocument" => say(answer(json!({"root": {"nodeId": 1}})), &mut output),
             "DOM.querySelector" => {
-                let found = std::env::var("IO_FIXTURE_NO_SELECTOR").is_err();
+                let found = !flag("no-selector");
                 say(
                     answer(json!({"nodeId": if found { 2 } else { 0 }})),
                     &mut output,
