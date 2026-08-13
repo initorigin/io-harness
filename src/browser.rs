@@ -1144,7 +1144,7 @@ mod tests {
         // multi-byte-character. The three-byte ellipsis is deliberate: a reader
         // that decodes per chunk rather than per message fails here and passes
         // every ASCII fixture.
-        let whole = format!(r#"{{"id":1,"result":{{"text":"a…b"}}}}"#);
+        let whole = r#"{"id":1,"result":{"text":"a…b"}}"#.to_string();
         let bytes = frame(&whole);
         let (head, tail) = bytes.split_at(12);
         let (mid, end) = tail.split_at(9);

@@ -189,7 +189,7 @@ async fn main() {
         .allow_read("*")
         .allow_write("*")
         .allow_exec("*")
-        .allow_net(&format!("{}:{}", addr.ip(), addr.port()));
+        .allow_net(format!("{}:{}", addr.ip(), addr.port()));
 
     let store = Store::memory().expect("a store");
     let events = Events::default();
