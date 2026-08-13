@@ -1249,7 +1249,27 @@ versions:
       own analysis omits the errors a gate depends on. Two bounds ship with it: the server's argv is
       an `Act::Exec` check under the run's sandbox mode, and a server indexes the whole root
       including paths a `deny_read` rule covers, which is stated rather than discovered.
-    detail: outline
+
+      **Specification confirmed this entry against the code and changed four things the outline had
+      wrong or had left open.** (1) The crate already spawns a configured child process, gates its
+      argv and shuts it down per run: `McpSession::connect` (`src/mcp.rs:308`) calls
+      `authorize_spawn` (`src/mcp.rs:540`), which is the `Act::Exec` check this entry asks for, at
+      the nine call sites in `src/run.rs` a run already has. `LspSession` is that shape again, not a
+      new one. (2) `[[lsp]]` is allowed in the project scope for the reason `[[mcp]]` is, which the
+      config module already writes down (`src/config.rs:103`: "`[[mcp]]` still names a command and
+      the boundary against the agent is still the `Policy` the caller loaded") — the spawn gate is
+      the boundary, not the file's scope. (3) **Rename does not write.** `textDocument/rename`
+      returns a `WorkspaceEdit` over many files, and 0.51.0 excluded a multi-file write in one call
+      on purpose; so rename renders a **patch series** in 0.51.0's own format, which the model
+      applies with `patch_file`, one `Act::Write` gate per path, no new write path at all. (4)
+      Diagnostics add **no tool**: they are folded into 0.51.0's `check` and into the automatic
+      post-edit observation, which is what "augment the compiler stream" means in code, and they
+      reuse `diagnostics::Outcome`'s existing four states (`src/tools/diagnostics.rs:74`) rather
+      than inventing a third-state vocabulary beside it. The `deny_read` bound is enforced rather
+      than only stated: every location handed back is checked with the same `Act::Read` check
+      `read_file` uses, omissions are counted and named, and what remains true — that the server
+      process itself indexed those bytes — is the sentence in the documentation.
+    detail: specified
     status: planned
   - version: 0.53.0
     outcome: >
