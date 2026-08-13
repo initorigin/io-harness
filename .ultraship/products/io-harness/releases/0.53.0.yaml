@@ -1,0 +1,568 @@
+product: io-harness
+version: 0.53.0
+status: planned
+release_type: minor
+
+outcome:
+  user_can: >
+    Give a run a real browser and watch what it did. Open a page, click the thing, type into the
+    field, scroll, read what the page actually says, and take a screenshot the model looks at — and
+    with every one of those, the console output and the page errors that action produced. The browser
+    is one already installed on the machine, named in `io.toml` or resolved from a documented list of
+    binary names on `PATH`. Nothing is downloaded, ever, and a browser that is not there is a refusal
+    naming it.
+
+    **Today a run cannot see a rendered page at all, and the gap is not a missing convenience.** The
+    crate reads files, runs commands and searches a repository. A page whose content is assembled by
+    script is, to this crate, the handful of bytes the server sent before any of it ran — and there is
+    no path to those bytes anyway, because `Act::Net` egress is a boundary the crate enforces on
+    commands rather than a fetch it performs (`src/web.rs` states this: the provider dials, so
+    `Act::Net` never sees it). The result is that an agent asked to check a deployment, reproduce a
+    reported failure on a page, or confirm a change actually renders has exactly one move available:
+    run a command and read its text output. Everything a person does with a browser is outside what
+    the run can observe.
+
+    **A screenshot is the half that changes what the model knows.** 0.15.0 built the media path — an
+    image staged for the next turn and put in front of the model (`Session::attach`, `PendingMedia`).
+    Nothing in the crate produces one. A rendered page is the case where the picture and the text are
+    genuinely different evidence: text says a heading exists, the screenshot says it is white on
+    white, off-screen, or under a modal. Handing the model both, from one action, is the release.
+
+    **And the console is where a page says what went wrong.** A run that clicks a button and gets a
+    page that looks unchanged has learned nothing; the same run reading `Uncaught TypeError` from that
+    click has learned the whole answer. Console output and uncaught page errors are attached to the
+    action that produced them rather than to a tool the model must remember to call.
+
+  business_value: >
+    **This is the first capability that lets the crate observe something it did not itself produce.**
+    Every surface up to here reads the repository or runs the project's own commands. The boundary
+    work — 0.46.0's containment default, 0.47.0's Linux chain, 0.48.0's per-host egress through a
+    proxy the run owns — built the machinery for a run to reach the network safely and then had
+    almost nothing that wanted to. A browser is the thing that wants to, and it arrives after the
+    boundary rather than before it, which is the only order in which it is responsible.
+
+    **The boundary is the feature, not a tax on it.** A browser is the largest attack surface a
+    process can start: it executes untrusted code from whatever host it lands on, and one click can
+    navigate anywhere. So this release does not merely check the URL the model typed. Every document
+    navigation the browser attempts — the typed one, the one a click causes, the one a redirect
+    causes, the one a script causes — is paused at the browser and answered from the run's own
+    `Policy`. A run whose policy names two hosts reaches those two hosts, and a click that would leave
+    them is stopped with a row saying so. That is a claim `Act::Net` can make about a browser only
+    because the gate sits at the request rather than at the argument.
+
+    **It is off twice over, so a consumer who wants none of this pays nothing.** It is behind a cargo
+    feature that is not in `default`, exactly as documents are, so the default dependency tree and the
+    default build are byte-identical to 0.52.0's. And within a build that has the feature, a run that
+    configures no browser registers no tool schemas, starts no process and emits no event — which is
+    what keeps 0.38.0's cacheable system prefix, and every existing trace, unchanged.
+
+    **The transport choice is a security property, not an implementation detail.** The browser is
+    driven over a pipe pair on the child's own file descriptors, not over a debugging port. A
+    debugging port is a TCP listener that anything else on the machine can connect to and drive with
+    full control of the browser; this release opens no port at all. It also costs no dependency — no
+    websocket client, no TLS to localhost, no protocol crate — which keeps `cargo tree` at 402 and
+    keeps the whole client inside this repository where it can be made to misbehave in a test.
+
+  evidence_of_value: >
+    Executed in the technique the last twenty-two releases used: a discriminating assertion per claim,
+    negative controls that must not move, one sabotage per arm of every two-armed claim, and a
+    sabotage that fails nothing reported as a finding rather than propped up.
+
+    **The transport was measured before it was specified, which is why this contract can be exact
+    about it.** A spike drove the browser installed on the development machine over the pipe pair and
+    completed the whole round trip — version handshake, target creation, flat session attach,
+    navigation, console capture, uncaught-exception capture, an `innerText` read and a PNG screenshot
+    — with nothing but two file descriptors. Three facts came out of it and are written into the
+    scope rather than discovered during implementation: the framing is one JSON object per message
+    terminated by a NUL byte; the child reports `Remote debugging pipe file descriptors are not open`
+    and exits if the descriptors are absent, which is a named startup failure rather than a hang; and
+    an uncaught page error arrives with the useless text `Uncaught`, the readable message being in the
+    exception's own description field. A client written against the first guess would have reported
+    every page error as the word `Uncaught`.
+
+    **The protocol is proven against a fixture the repository writes, not against an installed
+    browser.** The client is written over an `AsyncRead + AsyncWrite` pair — 0.52.0's shape, and the
+    reason that release's protocol was testable — so every framing, correlation and gating claim is
+    driven over `tokio::io::duplex` by a fake browser that answers instantly, runs identically on all
+    three platforms, and can be made to misbehave on purpose: answer out of order, flood events
+    between a request and its answer, pause a navigation and never resume, report a selector that
+    matches nothing. A real browser's cold start is the one cost a CI gate must not take, and its
+    version is not a thing this repository controls.
+
+    **The gate is proven at the request, because that is the half a plausible implementation gets
+    wrong.** Checking the URL the model typed is easy and insufficient. F3 asserts a typed navigation
+    to a denied host is refused; F4 asserts a *click* that navigates to a denied host is refused by
+    the same mechanism, with its own sabotage — gate only the tool's argument — under which F4 fails
+    and F3 still passes. Two criteria, two sabotages, because they are two claims and only the second
+    one is hard.
+
+    **The absences are asserted as absences.** A denied navigation means the request was never
+    continued — asserted on the fixture recording that it was told to fail, not on the error text. A
+    run that ends means no browser process survives it — asserted on the process being gone, not on a
+    shutdown call having been made. A run with no browser configured means no schema, no child, no
+    event and a byte-identical composed prompt.
+
+    **And a live run against the real browser is a gate of this release, not an optional extra.**
+    0.52.0's transferable lesson was that a fixture proves the client and cannot prove the protocol
+    was understood: three defects in that release were found only by running against a real server,
+    every one invisible to a suite that was green. `examples/browser_live.rs` drives the installed
+    browser through the whole surface and is run before the record is sealed, with what it found
+    written into the record.
+
+scope:
+  included:
+  - >
+    **`src/browser.rs`, a Chrome DevTools Protocol client written in this crate against
+    `AsyncRead + AsyncWrite`.** NUL-terminated JSON messages, JSON-RPC-style correlation by `id`,
+    `sessionId` carried on every message for a flat-mode attached target, server-initiated events read
+    and routed rather than discarded, and a bounded wait per request. Built with `serde_json` and
+    `tokio`, which the crate already depends on: **no new dependency**, no protocol crate, no
+    websocket client, and `cargo tree` stays flat at 402.
+  - >
+    **The transport is a pipe pair on the child's descriptors 3 and 4, and no debugging port is ever
+    opened.** The child is spawned with the pipe-transport flag and the two descriptors installed by a
+    `pre_exec` `dup2` on unix. This is the security half of the release: a debugging port is a TCP
+    listener any local process can drive with full control of the browser, and this release does not
+    open one. The `dup2` target survives the exec because a duplicated descriptor does not carry the
+    close-on-exec flag — verified in the spike, where the child names the failure exactly
+    (`Remote debugging pipe file descriptors are not open`) when they are missing.
+  - >
+    **`BrowserSession`, the `McpSession`/`LspSession` shape a third time rather than a third shape.**
+    Connected and shut down at the same run entry points those two already use, so the browser's life
+    is the run's life and a child cannot outlive the run that spawned it. The process is killed on
+    drop as well as on shutdown, because a run that panics must not leave a browser running.
+  - >
+    **The spawn is an `Act::Exec` check on the browser binary, through the existing shared gate.**
+    The same `authorize_spawn` both other sessions call: same `PolicyEvent`, same refusal shape, same
+    `Error::Refused`. A denied browser is a typed failure of the run rather than a silent downgrade.
+  - >
+    **Every document navigation is paused at the browser and answered from the run's own `Policy`.**
+    Request interception is enabled for document requests at the request stage; each paused navigation
+    is checked as `Act::Net` against its `host:port` and either continued or failed as blocked. This
+    is what makes the boundary hold for a navigation the model did not type — a click, a redirect, a
+    script — and it is the difference between this release and a browser wrapper.
+  - >
+    **Under containment, the browser is pointed at the run's own egress proxy.** 0.48.0 gave every
+    contained run a loopback proxy that asks the run's `Policy` about each `host:port`; the browser is
+    launched with its proxy flag naming that proxy, so a contained run's browser traffic takes the
+    same path every other contained command's traffic takes rather than a second one beside it.
+  - >
+    **Six tool schemas, registered only when a browser is configured.** `browser_navigate`,
+    `browser_read`, `browser_screenshot`, `browser_click`, `browser_type` and `browser_scroll`, added
+    to the catalogue the way the MCP and LSP tool specs already are. A run that configures no browser
+    sees none of them.
+  - >
+    **Console output and uncaught page errors are appended to the observation of the action that
+    produced them, and add no tool.** This is 0.52.0's diagnostics decision applied again: the model
+    should not have to remember to ask what the page said. Each action drains what arrived during it,
+    labelled by kind, bounded in count and bytes with the truncation stated. An uncaught error is read
+    from the exception's description rather than from its `text`, which the spike showed is the
+    uninformative word `Uncaught`.
+  - >
+    **`browser_screenshot` returns an image the model actually looks at**, staged through 0.15.0's
+    existing media path rather than a second one, which is why the cargo feature depends on `media`.
+    The bytes are PNG, the encoding is the base64 the media path already uses, and the observation
+    names the viewport it was taken at.
+  - >
+    **`browser_click` and `browser_type` dispatch real input events at a resolved element, and a
+    selector that matches nothing is a typed failure.** An element is located by CSS selector and its
+    box resolved, then input is dispatched at it — not by calling the element's own click method,
+    which produces an untrusted event a real page may ignore. A selector matching nothing names the
+    selector and fails; it never silently succeeds, which is the classic browser-automation defect and
+    the one a model cannot detect from a successful-looking result.
+  - >
+    **`[browser]` in `io.toml`.** The binary, extra arguments, headless or not, viewport, per-action
+    timeout, and whether it is enabled at all. Refused at project scope under the standing trust rule,
+    because it names a program to execute — the rule `src/config.rs` already applies to `${cmd:}` and
+    `[[hook]]`, and this inherits it rather than arguing for an exception.
+  - >
+    **Binary resolution is a documented ordered list of names, not a discovery.** When `io.toml` does
+    not name a binary, a short fixed list of well-known browser executable names is tried on `PATH`
+    and at the conventional install locations for the host, in a stated order, and the one found is
+    reported in the trace. The list is in the documentation, so an operator reads which binary will be
+    picked rather than running it to find out.
+  - >
+    **The whole surface is behind a `browser` cargo feature that is not in `default`.** The default
+    build's dependency tree, tool catalogue, composed prompt and trace are byte-identical to 0.52.0's.
+  - >
+    **The reporting surfaces, updated in this release and not the next one.** Additive
+    `EventKind::BrowserStarted { binary, headless, ready_ms }` once per run, and
+    `EventKind::BrowserNavigated { host, permitted }` per document navigation decision.
+    `docs/CONTRACT.md` gains what the browser is gated on, what is and is not intercepted, and the
+    platform row. `src/lib.rs`, the README, a `docs/guide/` page, `docs/CAPABILITIES.md` and
+    `CHANGELOG.md` agree, and `tests/docs_drift.rs`, `tests/readme.rs`, `tests/guide_pages.rs`,
+    `tests/changelog.rs` and `tests/public_api.rs` pass.
+  excluded:
+  - >
+    **Windows.** The pipe transport needs two inherited descriptors at fixed numbers, which is a
+    `pre_exec` `dup2` on unix and an explicit handle-inheritance list on Windows that the standard
+    library does not expose. The honest move, and the one 0.47.0 already made rather than spending ten
+    matrix rounds discovering it, is to plan it out: on Windows the feature compiles and every entry
+    point returns a typed configuration error naming the platform. Asserted on Windows in CI rather
+    than left to a reader, and carried into the roadmap as its own work.
+  - >
+    **Gating subresources.** Images, stylesheets, fonts, XHR and every other request a page makes are
+    not individually policy-checked. Document navigations are, which is what bounds where the browser
+    *goes*; the rest is the browser's own traffic to a host already permitted, and under containment
+    it takes the run's proxy like everything else. Per-request policy evaluation for every asset on a
+    page is a different release with its own cost argument, and claiming it here without the
+    evaluation storm it implies would be the kind of over-claim 0.30.0's N2 shipped.
+  - >
+    **Downloading, installing or managing a browser.** No driver, no version manager, no fetch at
+    runtime. A browser is installed on the machine or the tool refuses naming it. This is the same
+    rule 0.52.0 applied to language servers and the same reason OCR was cut.
+  - >
+    **Any durable state.** No table, column or index; nothing about a page survives the run;
+    `CHECKPOINT_FORMAT` unmoved at 7; `git diff main -- src/state.rs` empty. Cookies, profiles and the
+    browser's user data directory live in a temporary directory the run owns and removes.
+  - >
+    **Multiple tabs, multiple windows, file downloads, file uploads, PDF printing, device emulation,
+    request mocking, and cookie or storage manipulation.** One page per run. Every one of these is a
+    real capability and none is needed for "drive a browser and see what it did"; each would add
+    schemas to the catalogue and surface to the boundary argument.
+  - >
+    **Waiting on arbitrary page conditions.** No `wait_for_selector`, no polling predicate. An action
+    settles on the browser's own load and network-idle signals, bounded by the configured timeout;
+    a model that needs a later state navigates or reads again. A general wait primitive invites a
+    model to spend a run's clock on a page that will never settle.
+  - >
+    **Changing what any existing tool does, by one byte.** Nothing about `read_file`, `exec`, `shell`,
+    the git built-ins or the LSP tools moves.
+  fallback_scope:
+  - >
+    **Navigate, read, screenshot — with the request gate, the console capture and the process
+    lifetime intact.** That is a coherent release on its own: an agent can open a page under the run's
+    boundary, read what it renders, look at it, and see what the page reported. It is also the half
+    every other half rests on, since click, type and scroll are the same client and the same gate with
+    a different request.
+  - >
+    Dropped under pressure, in this order: **`browser_scroll` first** (the cheapest to lose — a read
+    already returns the page's text regardless of scroll position, so its absence costs the model
+    almost nothing), then **`browser_type`**, then **`browser_click`**. The gate, the console capture,
+    the screenshot and the process-lifetime guarantee are never dropped: they are what make the
+    release responsible rather than merely capable, and a browser without them is the thing this
+    contract exists to not ship.
+
+acceptance:
+  functional:
+  - >
+    **F1 — the client frames on NUL and survives arbitrary chunking.** The bytes the client writes for
+    a known request are asserted exactly: one JSON object followed by a single `0x00`, with no length
+    header and no newline framing. Reading is asserted symmetrically over a stream that delivers three
+    messages in chunks split mid-object and mid-multi-byte-character, and over one message arriving in
+    a single chunk with two others. Sabotage: frame on newline instead of NUL, under which the
+    chunked cases and a message whose payload contains a newline fail, and nothing else here does.
+  - >
+    **F2 — a response is matched to its request by `id` while events flood in.** Two requests are
+    outstanding; the fixture sends a burst of unsolicited events, answers the **second** request, more
+    events, then the first. Each call receives its own answer, neither event is returned as one, and
+    the events still reach the console drain. Sabotage: take the next message as the answer, under
+    which both calls receive the wrong value and only this fails.
+  - >
+    **F3 — a navigation to a denied host is stopped at the request and the run is told why.** Under a
+    policy permitting one host and denying another, `browser_navigate` at the denied host produces a
+    refusal observation naming the act, the target and the rule, the fixture records that the request
+    was **failed rather than continued**, and a `BrowserNavigated { permitted: false }` event is
+    written. The permitted host in the same run continues and loads. Both halves in one test, since
+    the claim is the distinction. Sabotage: continue every paused request, under which the denied
+    half fails and only this fails.
+  - >
+    **F4 — a navigation the model did not type is gated by the same mechanism.** A click on a link
+    whose target is a denied host, and a script-initiated navigation to one, are both stopped at the
+    request with the same event and the same refusal, with no `browser_navigate` call anywhere in the
+    run. Sabotage: gate the `browser_navigate` argument instead of the paused request — under which
+    **F4 fails and F3 still passes**, which is the point of having both.
+  - >
+    **F5 — a selector that matches nothing fails and names itself.** `browser_click` and
+    `browser_type` against a selector matching no element each return a typed failure naming the
+    selector, no input event is dispatched — asserted on the fixture never being asked to dispatch one
+    — and the run continues. A selector that matches produces a dispatched input event at the resolved
+    box. Sabotage: treat a missing element as a no-op success, under which both no-match assertions
+    fail and only these do.
+  - >
+    **F6 — console output and uncaught page errors reach the observation of the action that produced
+    them.** An action that causes a console message and an uncaught error produces an observation
+    containing both, labelled by kind, with the error's readable description rather than the bare word
+    `Uncaught`; an action that causes neither says so rather than omitting the section. Sabotage: drop
+    the exception route and keep the console route, under which the error arm fails and the console
+    arm passes — the two arms are separately asserted for exactly this reason.
+  - >
+    **F7 — a screenshot reaches the model as an image.** `browser_screenshot` stages a PNG through the
+    existing media path and the next request carries it as image content, asserted on the outbound
+    request rather than on a stored row, because staging and sending are different bugs and only the
+    first leaves a row. The observation names the viewport. Sabotage: return the base64 as observation
+    text instead of staging it, under which the outbound-request assertion fails and only this fails.
+  - >
+    **F8 — no browser process survives the run.** After a run that started a browser ends — normally,
+    and by being dropped mid-action — the child process is gone, asserted on the process rather than
+    on a shutdown call having been issued, and the temporary user-data directory is removed. Sabotage:
+    remove the kill-on-drop, under which the dropped-run arm fails and only this fails.
+  - >
+    **F9 — a browser that is not installed is a refusal naming it, never a download.** A configured
+    binary that does not exist produces a typed configuration error naming the binary, no process is
+    spawned, and no network request of any kind is made by the crate. Sabotage: fall back to the first
+    name on the PATH list when the configured binary is missing, under which the naming assertion
+    fails and only this fails.
+  - >
+    **F10 — a run with no browser configured is this build's run, byte for byte.** No tool schema in
+    the catalogue, no child process, no event, and a composed prompt byte-identical to the same run
+    on 0.52.0. Asserted on the bytes, since this is the negative control the whole release rests on.
+    Sabotage: register the schemas unconditionally, under which the byte-identity assertion fails and
+    only this fails.
+  - >
+    **F11 — on Windows the feature refuses cleanly.** Every entry point returns a typed configuration
+    error naming the platform, no process is spawned, and the rest of the crate is unaffected.
+    Asserted on the Windows leg of the matrix, which is the only place it can be.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` is 402 lines on macOS and Linux with the feature off and
+    with it on, because the feature adds only `base64` through `media`, which the count already
+    carries when that feature is enabled. Asserted by the existing dependency test and stated with
+    the number in the record.
+  - >
+    **N2 — the default build is unchanged.** With no features, the compiled tool catalogue, the
+    composed prompt and the dependency tree are byte-identical to 0.52.0's, and `src/browser.rs` is
+    not compiled at all.
+  - >
+    **N3 — no durable state.** `git diff main -- src/state.rs` is empty, `CHECKPOINT_FORMAT` is 7, and
+    a 0.52.0 store and a 0.53.0 store are the same store in both directions.
+  - >
+    **N4 — the public surface addition is stated in advance and met exactly.** `docs/public-api.txt`
+    gains the crate-root re-exports this release adds and no others; the number is named in the record
+    and any difference is explained rather than absorbed. The file tracks crate-root re-exports only,
+    so methods on existing types add no line — a fact this criterion states rather than rediscovers.
+  - >
+    **N5 — the release's own measurement, recorded and not asserted.** For one real page: its text
+    through `browser_read` in bytes, the same page's screenshot in base64 bytes, the browser's launch
+    time, and the per-action round-trip time. The point of the number is operator guidance on when a
+    screenshot is worth its bytes, and it is recorded in the release record and `docs/MEASUREMENTS.md`
+    with the machine named. **No clock is a pass/fail gate**, per the standing rule.
+  - >
+    **N6 — the six schemas are the only prompt-byte change, and only for a configured run.** The
+    difference between a configured and an unconfigured run's composed prompt is exactly those six
+    schemas, asserted as a diff rather than as a size.
+  operational:
+  - >
+    **O1 — the three-platform matrix is green**, with the browser suite running its fixture-driven
+    tests on macOS and Linux and its refusal test on Windows. A green macOS gate alone is not evidence
+    for this release: the transport is the platform-specific half.
+  - >
+    **O2 — nothing in the suite gates on a wall clock.** Every settle is on a protocol signal or a
+    bounded timeout whose expiry is a typed outcome, never an assertion that something happened within
+    N milliseconds. This release adds a process spawn and a page load, which are the two slowest
+    things the suite will contain, on the runner that is roughly three times slower than the
+    development machine.
+  - >
+    **O3 — `examples/browser_live.rs` is run against the real installed browser before the record is
+    sealed**, driving navigation, a click, typing, a scroll, a read, a screenshot and the console
+    capture, and what it found is written into the record. This is a gate of this release, not an
+    optional extra: 0.52.0's three live-run defects were all invisible to a green fixture suite.
+  - >
+    **O4 — the checked-in doc surfaces are updated in this release.** `docs/CONTRACT.md` gains the
+    gate, the interception boundary and the platform row; the README's feature list and platform table
+    move; a `docs/guide/` page exists and `docs/CAPABILITIES.md` names it; the changelog entry exists;
+    every new public item carries a worked example. The four doc tests and `tests/public_api.rs` pass.
+  - >
+    **O5 — the nightly rustdoc gate passes with `-D warnings`.** Run before the release PR. A
+    brand-new `pub mod` is the shape that trips the private-intra-doc-links rule, which this release
+    adds and which caught something in five of the last six releases.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.53.0, GitHub at initorigin/io-harness with the tag `v0.53.0` and a
+    Release titled `io-harness 0.53.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.53.0` off `develop`, committed incrementally as it lands,
+    including the sealed UltraShip release record and the hand-appended lock pin. PR into `develop`,
+    merged with the PR button. `develop`'s head **and tree** checked against the tree the gates ran on
+    immediately before the release PR is opened — `git diff --quiet feat/0.53.0 develop` — because a
+    Dependabot merge has landed above the feature merge in two of the last seventeen releases. Release
+    PR `develop` into `main`, merged the same way. The GitHub Release is cut by `release.yml` from a
+    tag pushed alone, which takes its notes verbatim from the changelog. `cargo publish --locked` by
+    hand afterwards, always last, after both merges and the Release exist, with the registry token
+    sourced from the repo-local `.env` in the same shell invocation. `develop` synced to `main`
+    fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    **None, and that is a claim this release makes rather than an omission.** No table, column or
+    index; `CHECKPOINT_FORMAT` unmoved at 7; a 0.52.0 store and a 0.53.0 store are the same store in
+    both directions. An operator does nothing.
+  - >
+    **No compile break.** A consumer upgrading changes nothing. `EventKind` gains two additive
+    variants, the shape every addition since 0.13.0 has used.
+  - >
+    **Opt-in twice.** A consumer who does not enable the `browser` cargo feature compiles none of it;
+    a consumer who does but configures no browser runs identically to 0.52.0, byte-identical in
+    composed prompt and in trace, which is what F10 asserts.
+  observability:
+  - >
+    `EventKind::BrowserStarted { binary, headless, ready_ms }` once per run when the browser is ready,
+    naming the binary actually resolved so a trace says which browser answered rather than which one
+    was asked for.
+  - >
+    `EventKind::BrowserNavigated { host, permitted }` per document navigation decision, which is the
+    row that makes the boundary auditable: every place the browser went, and every place it was
+    stopped from going, including the ones the model never typed.
+  - >
+    The `Act::Exec` decision on the browser binary is a `PolicyEvent` row through the shared spawn
+    gate, identical in shape to the one a configured MCP or LSP child already writes.
+  - >
+    Every `browser_*` call is a step with its own observation like any other tool, carrying the
+    console and error lines that action produced and the truncation statement when they were bounded.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.53.1 and `cargo yank --version
+    0.53.0` is the escape hatch, leaving 0.52.0 as what `cargo install` resolves. Reverting the
+    behaviour needs no downgrade, no flag and no migration: not enabling the cargo feature, or
+    deleting the `[browser]` table, returns the crate to 0.52.0's behaviour exactly, which is what F10
+    asserts on bytes. There is no durable state, so a downgrade after a run is a downgrade rather than
+    a migration.
+
+dependencies:
+  products: []
+  services:
+  - >
+    crates.io and GitHub Actions for the release itself, as every version.
+  - >
+    **No live provider call is required.** Every claim is about this crate's client, its policy and
+    its media path, proven against a scripted provider and a fixture browser in the same process.
+  - >
+    **An installed browser for O3 and for N5's measurement only**, outside the default gate. Its
+    absence skips that example and fails no criterion, but the release is not sealed without having
+    run it.
+  human_approvals:
+  - >
+    **No new dependency: the protocol is written in this crate, over a pipe rather than a websocket.**
+    Decided at specification time, 2026-08-13, and measured before it was decided. A debugging port
+    would need a websocket client and would open a listener anything local could drive; the pipe
+    transport needs neither and is strictly the smaller surface.
+  - >
+    **The gate is at the paused request, not at the tool's argument.** Decided at specification time,
+    2026-08-13. It is the only version of the claim that survives a click, a redirect or a script
+    navigating the page, and F4 exists to prove the difference.
+  - >
+    **Console output and page errors add no tool and ride the action's observation.** Decided at
+    specification time, 2026-08-13, following 0.52.0's diagnostics decision for the same reason.
+  - >
+    **Windows is planned out of this release, not discovered out of it.** Decided at specification
+    time, 2026-08-13, on the 0.47.0 precedent: the transport needs handle inheritance the standard
+    library does not expose, and finding that out across ten matrix rounds is the expensive way to
+    learn it.
+  - >
+    **`[browser]` is refused at project scope**, under the standing trust rule, because it names a
+    program to execute. Decided at specification time, 2026-08-13.
+  - >
+    **`delivery.target_mode` is `published`.** Decided at specification time, 2026-08-13.
+  - >
+    The PR, both merges, the Release and the publish are pre-authorised for this version under the
+    standing flow.
+
+resource_profile:
+  complexity: large
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    **The request-interception gate is the hardest correct thing here.** Pausing document requests,
+    resolving each to a `host:port`, answering from the policy, and doing it without deadlocking a
+    navigation that is waiting on the answer — while events continue to arrive on the same pipe — is
+    where the release will spend its debugging. The client must be able to answer an event while a
+    request is outstanding, which is a property of the message loop rather than of any one call.
+  - >
+    **The fixture browser is real work and is written before the client.** It must speak enough of the
+    protocol to be wrong on purpose: answer out of order, flood events, pause a navigation and never
+    resume, report a selector that matches nothing, record whether it was told to continue or fail a
+    request. It is the test infrastructure for the whole release.
+  - >
+    **Descriptor plumbing is unsafe code in a `pre_exec` closure and is easy to get subtly wrong.**
+    The spike proved the shape and named the failure the child reports when it is wrong, which removes
+    the discovery cost but not the care: the closure runs between fork and exec, where almost nothing
+    is safe to call.
+  - >
+    **Resolving an element and dispatching trusted input is more protocol than it looks.** A selector
+    becomes a node, a node becomes a box, a box becomes coordinates, and each step has its own
+    not-found case that must not collapse into a silent success.
+  - >
+    **Conditional tool registration touches the composed prompt, which several suites assert
+    byte-identical.** Getting six schemas to appear only for a configured run, in a stable order, is
+    where the prompt suites will fail first.
+  - >
+    **A feature-gated module doubles the build matrix locally.** The all-features suite is already the
+    largest disk consumer in this repository, and this adds a module to it.
+  preferred_tools:
+  - >
+    A new `tests/browser.rs` for the protocol, the six tools, the gate and the lifetime; `tests/config.rs`
+    for the `[browser]` table and its scope refusal; `tests/prompt.rs` for F10's byte-identity, where
+    the catalogue is already asserted.
+  - >
+    `src/browser.rs`'s own `#[cfg(test)]` module for the framing and the message loop, which are pure
+    functions and cheapest to pin there; `cargo test --doc` for the new public items' worked examples,
+    which `tests/public_api.rs` requires.
+  - >
+    `examples/browser_live.rs`, declared with `required-features`, for O3 and N5.
+  constraints:
+  - >
+    **No new runtime dependency.** `cargo tree` flat at 402.
+  - >
+    **MSRV 1.95, edition 2021, Apache-2.0.** Unchanged.
+  - >
+    **Every version stays 0.x.x.** No 1.0.0 is planned or implied by this release.
+  - >
+    **An `EventKind` variant may not carry a field named like the envelope's** — the kind is
+    `#[serde(flatten)]`ed into `RunEvent`, which carries `run_id`, `step` and `depth`. The two new
+    variants name their fields accordingly, decided while writing this contract rather than while
+    implementing it.
+  - >
+    **No durable state.** Nothing this release produces is written to the store beyond the events and
+    observations every tool already writes.
+  - >
+    **`docs/CONTRACT.md`, the README, the changelog, the guide pages and the crate-root prose are
+    checked-in surfaces.** They change in this release, not in the next one.
+
+risks:
+- >
+  **The gate is written at the tool argument and looks complete.** Checking the URL the model typed
+  passes every test that only ever navigates by tool call, and leaves a click able to take the browser
+  anywhere. This is the defect most likely to ship and the most serious one, because the release's
+  whole claim is the boundary. Mitigation: F4 is a separate criterion with a separate sabotage that
+  passes F3, so the incomplete implementation is failed by name.
+- >
+  **A silent no-op on a selector that matches nothing.** The model reads a successful result, believes
+  it clicked, and reasons forward from a state that never happened. Mitigation: F5 asserts the typed
+  failure and the absence of a dispatched event, in both tools.
+- >
+  **A browser process outliving its run.** A run that panics or is dropped mid-action leaves a browser
+  holding a temporary profile and, under containment, a proxy connection. Mitigation: kill on drop as
+  well as on shutdown, and F8 asserts the dropped-run arm specifically rather than the tidy one.
+- >
+  **The message loop deadlocks when an event arrives while a request is outstanding**, or when a
+  paused request needs an answer the loop cannot send because it is awaiting a response. Mitigation:
+  the client is written as a loop that owns the pipe with requests and answers going through channels,
+  and F2's fixture floods events between a request and its answer.
+- >
+  **A page error reported as the word `Uncaught`.** The spike found this exact shape: the obvious
+  field is uninformative and the readable message is elsewhere. Mitigation: written into the scope,
+  and F6 asserts the description rather than the presence of a section.
+- >
+  **The all-features build and the disk.** This repository's all-features suite has filled the
+  development volume twice in recent releases, and this release adds a module and an example to it.
+  Mitigation: the standing build discipline — both debug-info variables exported, `cargo clean`
+  between gate runs, and `df -h .` before the gate set rather than after a confusing failure.
+
+open_questions:
+- >
+  **Whether a read returns the page's text, its accessibility tree, or both.** Text is what a model
+  reasons about and is what the spike measured; the accessibility tree is what names the clickable
+  things, and a model that must click needs names rather than prose. The plan is text with the
+  interactive elements listed beside it, and the exact shape is settled during implementation against
+  what actually helps a model click the right thing.
+- >
+  **Whether `browser_navigate` should settle on load or on network idle.** Load fires before
+  script-assembled content exists, which is the case this release exists for; network idle can never
+  arrive on a page that polls. The plan is network idle bounded by the configured timeout with the
+  timeout being a normal outcome that still returns the page, and the alternative is stated in the
+  record either way.
+- >
+  **Whether the browser starts at connect time or on the first `browser_*` call.** Starting early
+  warms it while the model composes, as the LSP session does; starting late means a run that never
+  browses never pays. The plan is lazy, because unlike a language server the browser has no index to
+  warm and a run that configures one may still not use it.
