@@ -537,7 +537,12 @@ fn announce(watch: &Watch<'_>, run_id: i64, depth: u32, e: &McpEvent) {
 /// `Ask` is refused rather than routed to a human: connecting happens before the
 /// run's first step, and a server is configuration the operator wrote, not an
 /// action the agent chose. Allow it in the policy or do not configure it.
-fn authorize_spawn(
+/// The gate a configured child process passes before it exists.
+///
+/// Shared with [`crate::lsp`] since 0.52.0 rather than copied: a language server
+/// and an MCP server are the same act — a program the operator named, spawned by
+/// this process — and two spellings of one check is how the two drift.
+pub(crate) fn authorize_spawn(
     command: &str,
     policy: &Policy,
     store: &Store,

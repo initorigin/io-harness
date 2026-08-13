@@ -31,6 +31,7 @@ use crate::context::{
 };
 use crate::contract::{Preset, SystemPrompt, TaskContract};
 use crate::error::{Error, Result};
+use crate::lsp::LspSession;
 use crate::mcp::McpSession;
 use crate::net::{self, NetGuard};
 use crate::observe::{EventKind, Ignore, Observer, RunEvent};
@@ -66,6 +67,7 @@ const GIT_DIR: &str = ".git";
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
     Entry, FsTool, ToolEffect, Toolbox, Workspace, ASK_QUESTION_TOOL, CHECK_TOOL, EDIT_FILE_TOOL,
+    LSP_DEFINITION_TOOL, LSP_HOVER_TOOL, LSP_REFERENCES_TOOL, LSP_RENAME_TOOL, LSP_SYMBOLS_TOOL,
     EXEC_TOOL, FIND_TOOL, GREP_TOOL, LIST_DIR_TOOL, PATCH_FILE_TOOL, PROPOSE_PLAN_TOOL,
     READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_KILL_TOOL, SHELL_POLL_TOOL,
     SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
@@ -1296,12 +1298,14 @@ pub(crate) async fn run_with_extras<P: Provider>(
     match contract.root.clone() {
         Some(root) => {
             let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
+            let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
             let result = run_workspace_from(
-                contract, provider, store, run_id, &root, 1, policy, approver, &mcp, &skills,
+                contract, provider, store, run_id, &root, 1, policy, approver, &mcp, &lsp, &skills,
                 watch, extras,
             )
             .await;
             mcp.shutdown(store, run_id, watch).await;
+            lsp.shutdown().await;
             result
         }
         // Single-file mode has no policy-aware tool layer in 0.4.0. Silently
@@ -2257,6 +2261,7 @@ pub async fn resume_with_observed<P: Provider>(
                 }
             };
             let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
+            let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
             let result = run_workspace_from(
                 contract,
                 provider,
@@ -2267,12 +2272,14 @@ pub async fn resume_with_observed<P: Provider>(
                 policy,
                 approver,
                 &mcp,
+                &lsp,
                 &skills,
                 watch,
                 &TurnExtras::default(),
             )
             .await;
             mcp.shutdown(store, run_id, watch).await;
+            lsp.shutdown().await;
             result
         }
         // The same refusal [`run_with_observed`] makes, for the same reason:
@@ -2505,6 +2512,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
             )?;
             let remember = remember.clone();
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
+            let lsp = lsp_for(contract, &effective, store, run_id, watch).await?;
             let result = run_workspace_from(
                 contract,
                 provider,
@@ -2515,12 +2523,14 @@ pub async fn resume_with_decision_observed<P: Provider>(
                 &effective,
                 approver,
                 &mcp,
+                &lsp,
                 &skills,
                 watch,
                 &TurnExtras::default(),
             )
             .await;
             mcp.shutdown(store, run_id, watch).await;
+            lsp.shutdown().await;
             result.map(|r| r.with_remembered(remember))
         }
         Decision::Approve { modified, remember } => {
@@ -2587,6 +2597,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
 
             // Continue the run under its original id, from the next step.
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
+            let lsp = lsp_for(contract, &effective, store, run_id, watch).await?;
             let result = run_workspace_from(
                 contract,
                 provider,
@@ -2597,12 +2608,14 @@ pub async fn resume_with_decision_observed<P: Provider>(
                 &effective,
                 approver,
                 &mcp,
+                &lsp,
                 &skills,
                 watch,
                 &TurnExtras::default(),
             )
             .await;
             mcp.shutdown(store, run_id, watch).await;
+            lsp.shutdown().await;
             result.map(|r| r.with_remembered(remember))
         }
     }
@@ -2832,8 +2845,10 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 &backlog,
             );
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
+            let lsp = lsp_for(contract, &effective, store, run_id, watch).await?;
             let tree = Tree {
                 mcp: &mcp,
+                lsp: &lsp,
                 tools: &contract.tools,
                 skills: &skills,
                 agents: &contract.agents,
@@ -2853,6 +2868,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
+            lsp.shutdown().await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember.clone()))
         }
         Decision::Approve { modified, remember } => {
@@ -2925,8 +2941,10 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 &backlog,
             );
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
+            let lsp = lsp_for(contract, &effective, store, run_id, watch).await?;
             let tree = Tree {
                 mcp: &mcp,
+                lsp: &lsp,
                 tools: &contract.tools,
                 skills: &skills,
                 agents: &contract.agents,
@@ -2946,6 +2964,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
+            lsp.shutdown().await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember))
         }
     }
@@ -4366,6 +4385,7 @@ async fn run_workspace_from<P: Provider>(
     policy: &Policy,
     approver: &dyn Approver,
     mcp: &McpSession,
+    lsp: &LspSession,
     skills: &Skills,
     watch: &Watch<'_>,
     extras: &TurnExtras<'_>,
@@ -4396,6 +4416,7 @@ async fn run_workspace_from<P: Provider>(
     // between grep and find.
     let mut extra = contract.tools.specs();
     extra.extend(mcp.tool_specs());
+    extra.extend(lsp_tools(lsp));
     extra.extend(skill_tool(skills));
     // 0.45.0 — composed once, here, and reused on every step. A system prompt that
     // varied between steps would move 0.38.0's cache breakpoint every turn and bill
@@ -4996,6 +5017,7 @@ async fn run_workspace_from<P: Provider>(
                         run_id,
                         step,
                         mcp,
+                        lsp,
                         &contract.tools,
                         skills,
                         entry_cap,
@@ -5295,6 +5317,148 @@ async fn run_workspace_from<P: Provider>(
     ))
 }
 
+/// A 1-based position from a tool call, or the observation that says why not.
+///
+/// Line 0 is not a line any file has, and a model that sends one is off by one
+/// rather than pointing at the top of the file — so it is refused by name rather
+/// than clamped into an answer about the wrong line.
+fn at(a: &serde_json::Value) -> std::result::Result<(u32, u32), String> {
+    let read = |key: &str| {
+        a.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    match (read("line"), read("column").or_else(|| read("character"))) {
+        (Some(line), Some(column)) if line >= 1 && column >= 1 => Ok((line, column)),
+        (Some(_), Some(_)) => Err("\n[lsp error] \"line\" and \"column\" are 1-based, the way \
+                                   read_file shows them and a compiler reports them; 0 is not a \
+                                   position a file has\n"
+            .to_string()),
+        _ => Err("\n[lsp error] this tool needs \"line\" and \"column\" as 1-based numbers\n"
+            .to_string()),
+    }
+}
+
+/// Turn a navigation answer, or the reason there is none, into one observation.
+///
+/// A failure here is an observation and never a failed run: a server that has not
+/// finished indexing, or that does not answer this question, is something the
+/// model adapts to, the way it adapts to a refused path or a bad regex. What it
+/// must never be is empty — an empty answer to "who calls this" reads as "nobody
+/// does".
+fn navigated(name: &str, answer: Result<String>, cap: usize) -> Dispatched {
+    let obs = match answer {
+        Ok(text) => format!("\n[{name}]\n{text}\n"),
+        Err(e) => format!("\n[{name} unavailable] {e}\n"),
+    };
+    Dispatched::Continue {
+        decision: format!("asked the language server: {name}"),
+        obs: bound(&obs, cap, ObsKind::Tool),
+        kind: ObsKind::Tool,
+        target: None,
+        // A question changes nothing, so it is not progress for the stall signal —
+        // the same reasoning `check` is not.
+        changed: false,
+        remember: Vec::new(),
+    }
+}
+
+/// The five navigation schemas, offered only to a run that configured a server.
+///
+/// Conditional on purpose, and it is the release's negative control: a run with
+/// no `[[lsp]]` table gets an empty vector here, so its composed system prompt is
+/// byte-identical to the one 0.51.0 composed. Under 0.38.0's cacheable prefix a
+/// schema is paid for on every request of every run, so "free for a consumer who
+/// does not want it" has to be true on bytes rather than in spirit.
+fn lsp_tools(lsp: &LspSession) -> Vec<ToolSpec> {
+    if lsp.is_empty() {
+        return Vec::new();
+    }
+    let position = |what: &str| {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File path relative to the workspace root." },
+                "line": { "type": "integer", "description": format!("1-based line of {what}, as read_file shows it.") },
+                "column": { "type": "integer", "description": format!("1-based column of {what}.") }
+            },
+            "required": ["path", "line", "column"]
+        })
+    };
+    vec![
+        ToolSpec {
+            name: LSP_DEFINITION_TOOL.to_string(),
+            description: "Where the symbol at this position is defined, resolved by the language \
+                          server rather than guessed from a text search."
+                .to_string(),
+            parameters: position("the symbol"),
+        },
+        ToolSpec {
+            name: LSP_REFERENCES_TOOL.to_string(),
+            description: "Every place the symbol at this position is used, resolved by the \
+                          language server — not the lines a text search would match."
+                .to_string(),
+            parameters: position("the symbol"),
+        },
+        ToolSpec {
+            name: LSP_SYMBOLS_TOOL.to_string(),
+            description: "The symbols in one file, or — with \"query\" — where a symbol with that \
+                          name is in the workspace."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "One file's symbols, path relative to the workspace root." },
+                    "query": { "type": "string", "description": "Search the whole workspace for symbols with this name instead." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: LSP_HOVER_TOOL.to_string(),
+            description: "What the symbol at this position is: its type, signature and \
+                          documentation, as an editor would show on hover."
+                .to_string(),
+            parameters: position("the symbol"),
+        },
+        ToolSpec {
+            name: LSP_RENAME_TOOL.to_string(),
+            description: "Rename the symbol at this position everywhere it is used. Writes \
+                          NOTHING: it answers with a patch series, which you apply per file with \
+                          patch_file."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path relative to the workspace root." },
+                    "line": { "type": "integer", "description": "1-based line of the symbol." },
+                    "column": { "type": "integer", "description": "1-based column of the symbol." },
+                    "new_name": { "type": "string", "description": "What to rename it to." }
+                },
+                "required": ["path", "line", "column", "new_name"]
+            }),
+        },
+    ]
+}
+
+/// Start every language server the contract configured, rooted at its workspace.
+///
+/// One helper rather than the same three lines at eight call sites: the root a
+/// server is told to index is the run's own workspace root, and a site that spelled
+/// it differently would point one server somewhere else.
+async fn lsp_for(
+    contract: &TaskContract,
+    policy: &Policy,
+    store: &Store,
+    run_id: i64,
+    watch: &Watch<'_>,
+) -> Result<LspSession> {
+    let root = contract
+        .root
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    LspSession::connect(&contract.lsp, policy, &root, store, run_id, watch).await
+}
+
 /// Shared context for one agent tree: everything every agent in the tree
 /// draws on — the provider, the store, the one approver, the shared spend
 /// ledger, the containment caps, and the workspace root.
@@ -5303,6 +5467,10 @@ struct Tree<'a, P: Provider> {
     /// 100 concurrent agents get 100 views of one connection, not 100 of their
     /// own — the same reason the ledger and the store are shared here.
     mcp: &'a McpSession,
+    /// One language-server session for the whole tree, for the reason `mcp` is
+    /// shared: a server is a stateful process with one index, and a child agent
+    /// asking where a symbol is defined is asking the same server its parent did.
+    lsp: &'a LspSession,
     /// The caller's registered tools, shared by the whole tree. A child is
     /// offered exactly what its parent was: inheritance grants the tool, and the
     /// child's own narrowed policy still decides each call. Carried here rather
@@ -5756,8 +5924,10 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
         }
     };
     let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
+    let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
     let tree = Tree {
         mcp: &mcp,
+        lsp: &lsp,
         tools: &contract.tools,
         skills: &skills,
         agents: &contract.agents,
@@ -5777,6 +5947,7 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
     };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, 1, None).await;
     mcp.shutdown(store, run_id, watch).await;
+    lsp.shutdown().await;
     Ok(RunResult::new(outcome?, run_id))
 }
 
@@ -5966,8 +6137,10 @@ pub async fn resume_tree_observed<P: Provider>(
         }
     };
     let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
+    let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
     let tree = Tree {
         mcp: &mcp,
+        lsp: &lsp,
         tools: &contract.tools,
         skills: &skills,
         agents: &contract.agents,
@@ -5987,6 +6160,7 @@ pub async fn resume_tree_observed<P: Provider>(
     };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step, None).await;
     mcp.shutdown(store, run_id, watch).await;
+    lsp.shutdown().await;
     Ok(RunResult::new(outcome?, run_id))
 }
 
@@ -6457,6 +6631,7 @@ where
         // call something the run had already paid to set up.
         let mut extra = tree.tools.specs();
         extra.extend(tree.mcp.tool_specs());
+        extra.extend(lsp_tools(tree.lsp));
         extra.extend(skill_tool(tree.skills));
         // A role is PREPENDED, never a replacement: the tree prompt is what tells an
         // agent how to use its tools and that its result composes back into its
@@ -6919,6 +7094,7 @@ where
                     run_id,
                     step,
                     tree.mcp,
+                    tree.lsp,
                     tree.tools,
                     tree.skills,
                     entry_cap,
@@ -9180,6 +9356,7 @@ async fn dispatch(
     run_id: i64,
     step: u32,
     mcp: &McpSession,
+    lsp: &LspSession,
     custom: &Toolbox,
     skills: &Skills,
     cap: usize,
@@ -10169,6 +10346,57 @@ async fn dispatch(
                 changed: false,
                 remember: remembered,
             }
+        }
+        LSP_DEFINITION_TOOL | LSP_REFERENCES_TOOL | LSP_HOVER_TOOL => {
+            let path = s("path").unwrap_or_default();
+            let (line, column) = match at(a) {
+                Ok(pair) => pair,
+                Err(why) => return Ok(Dispatched::go("lsp bad position", why)),
+            };
+            let ask = match call.name.as_str() {
+                LSP_DEFINITION_TOOL => crate::lsp::Nav::Definition { path, line, column },
+                LSP_REFERENCES_TOOL => crate::lsp::Nav::References { path, line, column },
+                _ => crate::lsp::Nav::Hover { path, line, column },
+            };
+            navigated(&call.name, lsp.navigate(ask, ws, run_id, watch).await, cap)
+        }
+        LSP_RENAME_TOOL => {
+            let path = s("path").unwrap_or_default();
+            let new_name = s("new_name").unwrap_or_default();
+            if new_name.is_empty() {
+                return Ok(Dispatched::go(
+                    "lsp rename missing name",
+                    "\n[lsp error] lsp_rename needs \"new_name\"\n".to_string(),
+                ));
+            }
+            let (line, column) = match at(a) {
+                Ok(pair) => pair,
+                Err(why) => return Ok(Dispatched::go("lsp bad position", why)),
+            };
+            // No `Act::Write` check here, and that is the design rather than an
+            // omission: this call writes nothing. Each file's section is applied
+            // by `patch_file`, which is gated on that path like any other write.
+            let ask = crate::lsp::Nav::Rename {
+                path,
+                line,
+                column,
+                new_name,
+            };
+            navigated(&call.name, lsp.navigate(ask, ws, run_id, watch).await, cap)
+        }
+        LSP_SYMBOLS_TOOL => {
+            let path = s("path");
+            let query = s("query");
+            if path.is_none() && query.is_none() {
+                return Ok(Dispatched::go(
+                    "lsp symbols missing target",
+                    "\n[lsp error] lsp_symbols needs either \"path\", for one file's symbols, or \
+                     \"query\", to search the workspace\n"
+                        .to_string(),
+                ));
+            }
+            let ask = crate::lsp::Nav::Symbols { path, query };
+            navigated(&call.name, lsp.navigate(ask, ws, run_id, watch).await, cap)
         }
         SHELL_TOOL => {
             let line_src = s("line").unwrap_or_default();

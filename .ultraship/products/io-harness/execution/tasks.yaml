@@ -102,7 +102,7 @@ tasks:
   why_required: The spawn gate is one of the release's two bounds, and a child that outlives its run is
     the defect a second session threaded through nine call sites is most likely to introduce. An unready
     or dead server must be unknown-and-why here, before any tool depends on it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.52.0-T02
   acceptance_criteria:
@@ -128,14 +128,35 @@ tasks:
   - src/run.rs
   - src/observe.rs
   - tests/lsp.rs
-  evidence: []
+  evidence:
+  - 'tests/lsp.rs — 11 passed, 0 failed, against examples/lsp_fixture_server.rs spawned as a real child
+    over stdio: real framing, real initialize, real didOpen.'
+  - 'F5 asserted race-free, and the first attempt at it was a FINDING rather than a design. Asserting
+    only that the fixture had not written its marker file passed under the sabotage (spawn first, check
+    second) because the child is dropped with kill_on_drop on the way out and can be killed before it
+    is ever scheduled — an assertion that depends on winning a race is not an assertion. Replaced by:
+    a command that does not exist returns Error::Refused, not Error::Lsp{could not spawn}, which no scheduling
+    decision can change; the marker assertion is kept beside it as the belt to that braces.'
+  - 'Sabotage F5 (spawn the child, then check the gate): fails exactly a_denied_server_is_refused_before_any_spawn_is_attempted,
+    and the other 10 pass. Against the first version of the test it failed NOTHING.'
+  - 'F9 asserted in three arms — a handshake that never finishes, a server that exits after it, and a
+    server that does not advertise the capability. Each names the failure and the server, and none reads
+    as ''No locations.'' Sabotage F9 (map a failure to an empty result): fails exactly that test.'
+  - LspSession::connect and shutdown are wired at the 8 sites in src/run.rs that already carry McpSession
+    (the contract said nine; eight is the count in this tree), through one lsp_for helper so no site can
+    spell the root differently. authorize_spawn is shared with src/mcp.rs rather than copied — made pub(crate)
+    in place rather than moved to a new module, since a language server and an MCP server are the same
+    act and two spellings of one check is how they drift.
+  - 'EventKind::LspStarted{server, root, ready_ms} is additive on a #[non_exhaustive] enum, registered
+    in EVENT_NAMES and every_kind(); exactly one is emitted per server per run, asserted through a real
+    Observer. The contract named the middle field backend_root; it is root, because that is what it is.'
 - id: US-IO-HARNESS-0.52.0-T04
   summary: The four read tools — definition, references, symbols, hover — with 1-based positions and a
     per-request didOpen re-sync.
   why_required: This is the release's outcome. Without these four the agent still infers structure from
     grep. The position conversion and the document re-sync are both silent-wrong-answer defects, so they
     are built and asserted with the tools rather than after them.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.52.0-T03
   acceptance_criteria:
@@ -159,14 +180,28 @@ tasks:
   - src/tools/mod.rs
   - src/run.rs
   - tests/lsp.rs
-  evidence: []
+  evidence:
+  - 'F3 asserted on the wire body the fixture received (echo-position): a model position of line 12 column
+    5 goes out as {"line":11,"character":4}, and a returned wire line 0 comes back to the model as line
+    1. Sabotage F3 (pass the model''s numbers through unconverted): fails exactly a_position_is_one_based_for_the_model_and_zero_based_on_the_wire.'
+  - Line 0 is refused by name rather than clamped, and the server is never asked — asserted on the absence
+    of any echoed position, because clamping would answer confidently about the wrong line.
+  - 'F4 asserted against an edit made in the same run: hover -> edit_file -> hover, where the fixture
+    answers with the document text it was last SENT. The second answer contains the post-edit text. Sabotage
+    F4 (open each document once and cache it): fails exactly that test, and only it.'
+  - 'Four read verbs land: lsp_definition, lsp_references, lsp_symbols (one schema, two behaviours — no
+    query is this file, a query is the workspace) and lsp_hover. SymbolKind numbers render as words and
+    hierarchical children are flattened under their parent, asserted in symbols_answers_for_one_file_or_for_the_workspace.'
+  - 'Every question goes through one funnel, LspSession::navigate: one readiness wait, one capability
+    check, one document re-sync, one deny_read filter. That is what makes T05''s filter one check rather
+    than four.'
 - id: US-IO-HARNESS-0.52.0-T05
   summary: Filter every returned location through the same Act::Read check read_file uses, and name the
     omission count in the answer.
   why_required: The second of the release's two bounds. Four tools return locations and a filter applied
     in four places is a filter missing from one, so every path returns through one function before any
     more callers exist.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.52.0-T04
   acceptance_criteria:
@@ -183,14 +218,25 @@ tasks:
   - src/lsp.rs
   - src/run.rs
   - tests/lsp.rs
-  evidence: []
+  evidence:
+  - 'F6 asserted as an absence and a presence together: of three locations one under a deny_read("secret/*")
+    path, the answer carries the two permitted paths, does not contain the denied file name in any form,
+    and ends with ''1 result omitted''. Sabotage F6 (return the server''s locations unfiltered): fails
+    exactly that test.'
+  - 'Only an outright Deny omits. Ask does not, and that is deliberate: Policy::default() ASKS about any
+    path no rule covers (the trap 0.39.0 paid for), under which treating Ask as an omission would empty
+    every answer this feature gives. Naming a path is not reading its contents.'
+  - relative() strips both the workspace root and its canonicalized form, because on macOS /tmp and /var
+    are symlinks into /private and a server resolves what it opened — a path that failed to strip would
+    reach the policy as an absolute one, under which deny_read("secret/*") matches nothing. A filter that
+    silently stops filtering is worse than one that is absent.
 - id: US-IO-HARNESS-0.52.0-T06
   summary: Register the five schemas only for a run that configured a server, and prove an unconfigured
     run is byte-identical to 0.51.0.
   why_required: The release's negative control. Every existing prompt, parity and determinism suite asserts
     the catalogue, and the claim that a consumer who configures nothing pays nothing is either true on
     bytes or it is marketing.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.52.0-T04
   acceptance_criteria:
@@ -218,13 +264,20 @@ tasks:
   - src/tools/mod.rs
   - tests/lsp.rs
   - tests/prompt.rs
-  evidence: []
+  evidence:
+  - 'F10 asserted on the catalogue: a run with no [[lsp]] table is offered the built-ins and no tool whose
+    name starts with lsp_. Sabotage F10 (register the schemas unconditionally): fails both arms of the
+    claim and nothing else.'
+  - 'The other half asserted by difference: configuring one server adds exactly [lsp_definition, lsp_references,
+    lsp_symbols, lsp_hover, lsp_rename], in that order, and removes nothing.'
+  - 'N7 holds by construction: lsp_tools() returns an empty vector for an empty session, so the five schemas
+    are the only difference in the composed prompt.'
 - id: US-IO-HARNESS-0.52.0-T07
   summary: lsp_rename renders a WorkspaceEdit as a 0.51.0 patch series and writes nothing.
   why_required: Rename is the case where a text search is not merely expensive but wrong, and it is the
     reason the release adds no write path. A rename that wrote its own files would satisfy the end state
     and violate the release.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.52.0-T05
   acceptance_criteria:
@@ -243,7 +296,20 @@ tasks:
   - src/tools/mod.rs
   - src/run.rs
   - tests/lsp.rs
-  evidence: []
+  evidence:
+  - 'F7 asserted as an absence and then as an application. A rename spanning two files leaves both byte-identical,
+    and the run''s only edits row is the step that ends the run — not either renamed path. The answer
+    is a patch series in 0.51.0''s format (--- a/<path> / +++ b/<path> per file, path-ordered) carrying
+    +struct Tally;. Sabotage F7 (apply the edit inside the tool): fails exactly that test.'
+  - 'No Act::Write check is taken by the rename, and that is the design rather than an omission: each
+    file''s section is applied by patch_file, which is gated on that path like any other write, one path
+    per call, all-or-nothing per file. The release therefore adds no write path and no multi-file gate
+    semantics.'
+  - A server answers with 'changes' or with 'documentChanges' and both are read — a client reading only
+    one silently renames nothing against half the servers in use. Edits are applied last-first against
+    the original text, overlapping edits are refused rather than guessed, and a position is measured in
+    UTF-16 code units the way the protocol specifies, returning None rather than indexing into the middle
+    of a character.
 - id: US-IO-HARNESS-0.52.0-T08
   summary: Append a server's pull diagnostics to check and to the automatic post-edit observation, in
     Outcome's existing four states.

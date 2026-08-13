@@ -253,6 +253,867 @@ fn protocol(reason: &str) -> Error {
     }
 }
 
+/// What a server said when it finished its handshake, or why it never did.
+type Handshake = Option<std::result::Result<Value, String>>;
+
+/// One spawned server and everything the run needs to talk to it.
+struct Started {
+    config: LspServer,
+    client: Client,
+    /// Set once by the background handshake task. `None` until it finishes.
+    ready: tokio::sync::watch::Receiver<Handshake>,
+    /// The child, kept so shutdown can end it even if it ignores `exit`.
+    child: tokio::sync::Mutex<tokio::process::Child>,
+    /// Paths this client has told the server about, so a re-sync knows whether
+    /// to close first.
+    opened: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// The root the server was told to index, carried into the event so a trace
+    /// says what this server was pointed at.
+    root: String,
+    /// When the spawn happened, so `ready_ms` is measured rather than guessed.
+    spawned: std::time::Instant,
+    /// Whether [`EventKind::LspStarted`](crate::EventKind::LspStarted) has been
+    /// emitted for this server yet.
+    announced: std::sync::atomic::AtomicBool,
+}
+
+/// Every language server a run configured, for the life of that run.
+///
+/// The shape is [`McpSession`](crate::mcp)'s, deliberately: a configured child
+/// process, gated on its argv, started at run start and ended with the run. The
+/// one difference is where the waiting happens. An MCP server's handshake is
+/// awaited before the run's first step, because its *tool list* is part of the
+/// prompt. A language server's index is minutes on a real repository and no
+/// prompt depends on it, so the handshake runs in the background from the moment
+/// the child exists and the first navigation call is what waits.
+pub(crate) struct LspSession {
+    servers: Vec<Started>,
+}
+
+impl LspSession {
+    /// Spawn every configured server, checking each against `policy` first.
+    ///
+    /// A server that cannot be spawned fails the run with [`Error::Lsp`] rather
+    /// than being skipped, for the reason an MCP server does: silently navigating
+    /// by text search while the operator believes a language server is answering
+    /// is the worse failure, because the run looks successful.
+    pub(crate) async fn connect(
+        servers: &[LspServer],
+        policy: &crate::Policy,
+        root: &std::path::Path,
+        store: &crate::Store,
+        run_id: i64,
+        watch: &crate::run::Watch<'_>,
+    ) -> Result<Self> {
+        let mut started = Vec::new();
+        for config in servers {
+            crate::mcp::authorize_spawn(&config.command, policy, store, run_id, watch)?;
+
+            let mut cmd = tokio::process::Command::new(&config.command);
+            cmd.args(&config.args)
+                .current_dir(root)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                // A language server logs to stderr freely and nothing here reads
+                // it. Inheriting it would put a server's chatter in the host
+                // application's own output.
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            for (k, v) in &config.env {
+                cmd.env(k, v);
+            }
+            let mut child = cmd.spawn().map_err(|e| Error::Lsp {
+                server: config.id.clone(),
+                reason: format!("could not spawn {}: {e}", config.command),
+            })?;
+            let stdin = child.stdin.take().expect("stdin was piped");
+            let stdout = child.stdout.take().expect("stdout was piped");
+            let client = Client::over(&config.id, stdout, stdin);
+
+            let (tx, ready) = tokio::sync::watch::channel(None);
+            handshake(&client, root, config.timeout(), tx);
+
+            started.push(Started {
+                config: config.clone(),
+                client,
+                ready,
+                child: tokio::sync::Mutex::new(child),
+                opened: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+                root: root.to_string_lossy().into_owned(),
+                spawned: std::time::Instant::now(),
+                announced: std::sync::atomic::AtomicBool::new(false),
+            });
+        }
+        Ok(Self { servers: started })
+    }
+
+    /// Whether any server is configured. The five tool schemas are registered
+    /// only when this is true, which is what keeps an unconfigured run's prompt
+    /// byte-identical to 0.51.0's.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    /// The server that answers for `path`, first in declaration order.
+    ///
+    /// First match wins where two servers claim one suffix. That is a documented
+    /// rule rather than a discovery: refusing the configuration would be the
+    /// other defensible answer, and it turns a working setup into a startup
+    /// failure over an ambiguity the operator can simply not create.
+    fn server_for(&self, path: &str) -> Option<&Started> {
+        self.servers.iter().find(|s| s.config.answers_for(path))
+    }
+
+    /// Wait for a server's handshake and hand back its capabilities.
+    ///
+    /// This is where the background start is paid for, and where an unready
+    /// server becomes a reason rather than an empty answer. The wait is bounded
+    /// by the server's own configured timeout.
+    ///
+    /// [`EventKind::LspStarted`](crate::EventKind::LspStarted) is emitted here,
+    /// the first time a run observes a server usable, rather than from the
+    /// handshake task — a `&Store` cannot cross a task boundary, and a number
+    /// re-read later is not the one that was measured.
+    async fn ready(
+        &self,
+        server: &Started,
+        run_id: i64,
+        watch: &crate::run::Watch<'_>,
+    ) -> Result<Value> {
+        let mut rx = server.ready.clone();
+        let waited = tokio::time::timeout(server.config.timeout(), rx.wait_for(Option::is_some))
+            .await
+            .map_err(|_| Error::Lsp {
+                server: server.config.id.clone(),
+                reason: format!(
+                    "was still starting up after {}s, so this question was not asked",
+                    server.config.timeout_secs
+                ),
+            })?;
+        let seen = waited
+            .map_err(|_| Error::Lsp {
+                server: server.config.id.clone(),
+                reason: "stopped before it finished starting up".into(),
+            })?
+            .clone();
+        let caps = match seen {
+            Some(Ok(caps)) => caps,
+            Some(Err(reason)) => {
+                return Err(Error::Lsp {
+                    server: server.config.id.clone(),
+                    reason: format!("did not start: {reason}"),
+                })
+            }
+            // `wait_for` returned, so the value is set.
+            None => unreachable!("wait_for returned on a value that is still None"),
+        };
+        if !server
+            .announced
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            watch.emit(crate::observe::RunEvent::new(
+                run_id,
+                0,
+                crate::observe::EventKind::LspStarted {
+                    server: server.config.id.clone(),
+                    root: server.root.clone(),
+                    ready_ms: u64::try_from(server.spawned.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                },
+            ));
+        }
+        Ok(caps)
+    }
+
+    /// Answer one navigation question, or say why it could not be answered.
+    ///
+    /// Every navigation tool comes through here, and that is deliberate: the
+    /// `deny_read` filter below is one check on one path, and a filter written
+    /// four times is a filter missing from one of them.
+    pub(crate) async fn navigate(
+        &self,
+        ask: Nav<'_>,
+        ws: &crate::tools::Workspace,
+        run_id: i64,
+        watch: &crate::run::Watch<'_>,
+    ) -> Result<String> {
+        let path = ask.path();
+        let server = match self.server_for(path.unwrap_or("")) {
+            Some(s) => s,
+            None => {
+                return Err(Error::Lsp {
+                    server: String::new(),
+                    reason: format!(
+                        "no configured server answers for {}",
+                        path.unwrap_or("this workspace")
+                    ),
+                })
+            }
+        };
+        let caps = self.ready(server, run_id, watch).await?;
+        let capability = ask.capability();
+        if caps.get(capability).is_none_or(|v| v == &Value::Bool(false)) {
+            return Err(Error::Lsp {
+                server: server.config.id.clone(),
+                reason: format!(
+                    "does not advertise {capability}, so this question has no answer from it \
+                     rather than an empty one"
+                ),
+            });
+        }
+
+        // The document the question is about, re-sent from disk. See `sync`.
+        if let Some(path) = path {
+            self.sync(server, ws, path).await?;
+        }
+        let result = server
+            .client
+            .request(ask.method(), ask.params(ws.root()), server.config.timeout())
+            .await?;
+        Ok(render(&ask, &result, ws))
+    }
+
+    /// Tell the server what a file says *now*.
+    ///
+    /// The server's view of a file is whatever was last sent to it, so a run that
+    /// edited a file and then asks about it must not be answered from the text as
+    /// it was before its own edit. Re-opening is one file re-parsed and leaves the
+    /// index warm; tracking changes incrementally would mean this crate keeping a
+    /// second copy of the workspace correct.
+    async fn sync(
+        &self,
+        server: &Started,
+        ws: &crate::tools::Workspace,
+        path: &str,
+    ) -> Result<()> {
+        let full = ws.root().join(path);
+        let text = std::fs::read_to_string(&full).map_err(|e| Error::Lsp {
+            server: server.config.id.clone(),
+            reason: format!("could not read {path}: {e}"),
+        })?;
+        let uri = uri_for(&full);
+        let mut opened = server.opened.lock().await;
+        if opened.contains(&uri) {
+            server
+                .client
+                .notify("textDocument/didClose", json!({"textDocument": {"uri": uri}}))
+                .await?;
+        }
+        server
+            .client
+            .notify(
+                "textDocument/didOpen",
+                json!({"textDocument": {
+                    "uri": uri,
+                    "languageId": language_id(path),
+                    "version": 1,
+                    "text": text,
+                }}),
+            )
+            .await?;
+        opened.insert(uri);
+        Ok(())
+    }
+
+    /// End every server, then the run.
+    ///
+    /// `shutdown` then `exit` is what the protocol asks for and is sent
+    /// best-effort under a short bound; the child is killed either way, because a
+    /// language server that ignores `exit` must not outlive the run that spawned
+    /// it.
+    pub(crate) async fn shutdown(self) {
+        for s in self.servers {
+            let polite = async {
+                let _ = s
+                    .client
+                    .request("shutdown", Value::Null, Duration::from_secs(2))
+                    .await;
+                let _ = s.client.notify("exit", Value::Null).await;
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(2), polite).await;
+            let mut child = s.child.lock().await;
+            let _ = child.start_kill();
+        }
+    }
+}
+
+/// Run `initialize` and `initialized` in the background, publishing the result.
+///
+/// Detached on purpose. Nothing in the prompt depends on a server's capabilities,
+/// so making run start wait for an index would buy nothing and cost minutes.
+fn handshake(
+    client: &Client,
+    root: &std::path::Path,
+    timeout: Duration,
+    tx: tokio::sync::watch::Sender<Handshake>,
+) {
+    // The client is owned by the session and outlives this task; the task talks
+    // to the same child through its own handle on the writer and pending map.
+    let uri = uri_for(root);
+    let params = json!({
+        "processId": std::process::id(),
+        "rootUri": uri,
+        "workspaceFolders": [{"uri": uri, "name": "workspace"}],
+        "capabilities": {
+            "textDocument": {
+                "definition": {"linkSupport": true},
+                "references": {},
+                "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
+                "hover": {"contentFormat": ["plaintext", "markdown"]},
+                "rename": {},
+                "diagnostic": {},
+                "synchronization": {"didSave": false},
+            },
+            "workspace": {"symbol": {}, "workspaceFolders": true},
+        },
+    });
+    let sender = client.handle();
+    tokio::spawn(async move {
+        let outcome = match sender.request("initialize", params, timeout).await {
+            Ok(result) => {
+                let _ = sender.notify("initialized", json!({})).await;
+                Ok(result
+                    .get("capabilities")
+                    .cloned()
+                    .unwrap_or(Value::Object(Default::default())))
+            }
+            Err(e) => Err(format!("{e}")),
+        };
+        let _ = tx.send(Some(outcome));
+    });
+}
+
+/// One question a navigation tool asks.
+///
+/// An enum rather than five methods so every question goes through one funnel:
+/// one readiness wait, one capability check, one document re-sync and one
+/// `deny_read` filter. Five methods would be five places for one of those to be
+/// missing.
+pub(crate) enum Nav<'a> {
+    /// Where is the thing at this position defined.
+    Definition { path: &'a str, line: u32, column: u32 },
+    /// Everywhere the thing at this position is used.
+    References { path: &'a str, line: u32, column: u32 },
+    /// What is in this file, or — with a query — where in the workspace a symbol
+    /// with that name is. One tool, because two schemas for one question is
+    /// prompt bytes on every request of every run.
+    Symbols {
+        path: Option<&'a str>,
+        query: Option<&'a str>,
+    },
+    /// What is the thing at this position.
+    Hover { path: &'a str, line: u32, column: u32 },
+    /// Rename the thing at this position, everywhere. Answers with a patch; see
+    /// [`LspSession::navigate`]'s caller — nothing here writes.
+    Rename {
+        path: &'a str,
+        line: u32,
+        column: u32,
+        new_name: &'a str,
+    },
+}
+
+impl Nav<'_> {
+    /// The file this question is about, if it is about one.
+    fn path(&self) -> Option<&str> {
+        match self {
+            Nav::Definition { path, .. }
+            | Nav::References { path, .. }
+            | Nav::Hover { path, .. }
+            | Nav::Rename { path, .. } => Some(path),
+            Nav::Symbols { path, .. } => *path,
+        }
+    }
+
+    /// The protocol method that answers it.
+    fn method(&self) -> &'static str {
+        match self {
+            Nav::Definition { .. } => "textDocument/definition",
+            Nav::References { .. } => "textDocument/references",
+            Nav::Symbols { query: Some(_), .. } => "workspace/symbol",
+            Nav::Symbols { .. } => "textDocument/documentSymbol",
+            Nav::Hover { .. } => "textDocument/hover",
+            Nav::Rename { .. } => "textDocument/rename",
+        }
+    }
+
+    /// The capability a server must advertise to be asked this.
+    ///
+    /// A server that does not advertise it answers with the reason rather than
+    /// being absent from the catalogue: the catalogue is composed before the
+    /// handshake has finished, so absence would depend on a race.
+    fn capability(&self) -> &'static str {
+        match self {
+            Nav::Definition { .. } => "definitionProvider",
+            Nav::References { .. } => "referencesProvider",
+            Nav::Symbols { query: Some(_), .. } => "workspaceSymbolProvider",
+            Nav::Symbols { .. } => "documentSymbolProvider",
+            Nav::Hover { .. } => "hoverProvider",
+            Nav::Rename { .. } => "renameProvider",
+        }
+    }
+
+    /// The request body, with positions converted to the wire's zero base.
+    fn params(&self, root: &std::path::Path) -> Value {
+        let at = |path: &str, line: u32, column: u32| {
+            json!({
+                "textDocument": {"uri": uri_for(&root.join(path))},
+                "position": {"line": to_wire(line), "character": to_wire(column)},
+            })
+        };
+        match self {
+            Nav::Definition { path, line, column } | Nav::Hover { path, line, column } => {
+                at(path, *line, *column)
+            }
+            Nav::References { path, line, column } => {
+                let mut body = at(path, *line, *column);
+                body["context"] = json!({"includeDeclaration": true});
+                body
+            }
+            Nav::Rename {
+                path,
+                line,
+                column,
+                new_name,
+            } => {
+                let mut body = at(path, *line, *column);
+                body["newName"] = json!(new_name);
+                body
+            }
+            Nav::Symbols {
+                query: Some(query), ..
+            } => json!({"query": query}),
+            Nav::Symbols { path, .. } => json!({
+                "textDocument": {"uri": uri_for(&root.join(path.unwrap_or_default()))}
+            }),
+        }
+    }
+}
+
+/// Turn a server's answer into the text the model reads.
+fn render(ask: &Nav<'_>, result: &Value, ws: &crate::tools::Workspace) -> String {
+    match ask {
+        Nav::Rename { new_name, .. } => rename_patch(result, ws, new_name),
+        Nav::Hover { .. } => {
+            let text = hover_text(result);
+            if text.trim().is_empty() {
+                "The server has nothing to say about that position.".to_string()
+            } else {
+                text
+            }
+        }
+        Nav::Symbols { .. } => {
+            let (lines, omitted) = symbols(result, ws);
+            with_omissions(
+                if lines.is_empty() {
+                    "No symbols.".to_string()
+                } else {
+                    lines.join("\n")
+                },
+                omitted,
+            )
+        }
+        _ => {
+            let (lines, omitted) = locations(result, ws);
+            with_omissions(
+                if lines.is_empty() {
+                    "No locations.".to_string()
+                } else {
+                    lines.join("\n")
+                },
+                omitted,
+            )
+        }
+    }
+}
+
+/// State an omission rather than returning a quietly shorter list.
+///
+/// A list with results removed and nothing said is a wrong answer to "who calls
+/// this": the model reads three call sites where there are four and concludes it
+/// has seen them all.
+fn with_omissions(body: String, omitted: usize) -> String {
+    if omitted == 0 {
+        return body;
+    }
+    let plural = if omitted == 1 { "" } else { "s" };
+    format!(
+        "{body}\n\n({omitted} result{plural} omitted: the policy denies reading \
+         the file{plural} they are in.)"
+    )
+}
+
+/// Whether this run may be told about a path at all.
+///
+/// Only an outright `Deny` omits. `Ask` does not, and that is deliberate: naming
+/// a path is not reading its contents, and `Policy::default()` *asks* about any
+/// path no rule covers — under which treating `Ask` as an omission would empty
+/// every answer this feature gives.
+fn readable(ws: &crate::tools::Workspace, path: &str) -> bool {
+    ws.policy().check(crate::Act::Read, path).effect != crate::Effect::Deny
+}
+
+/// Every location in an answer, as `path:line:column`, with denied ones dropped.
+fn locations(result: &Value, ws: &crate::tools::Workspace) -> (Vec<String>, usize) {
+    let mut raw = Vec::new();
+    match result {
+        Value::Array(items) => raw.extend(items.iter().cloned()),
+        Value::Null => {}
+        one => raw.push(one.clone()),
+    }
+    let mut lines = Vec::new();
+    let mut omitted = 0;
+    for item in raw {
+        // A `LocationLink` spells its target differently from a `Location`, and a
+        // server may answer with either.
+        let uri = item
+            .get("uri")
+            .or_else(|| item.get("targetUri"))
+            .and_then(Value::as_str);
+        let range = item.get("range").or_else(|| item.get("targetSelectionRange"));
+        let (Some(uri), Some(range)) = (uri, range) else {
+            continue;
+        };
+        let Some(path) = path_of(uri) else { continue };
+        let shown = relative(ws, &path);
+        if !readable(ws, &shown) {
+            omitted += 1;
+            continue;
+        }
+        lines.push(format!("{shown}:{}", position(range)));
+    }
+    (lines, omitted)
+}
+
+/// Every symbol in an answer, flattened, with denied ones dropped.
+fn symbols(result: &Value, ws: &crate::tools::Workspace) -> (Vec<String>, usize) {
+    let mut lines = Vec::new();
+    let mut omitted = 0;
+    let mut stack: Vec<(&Value, usize)> = Vec::new();
+    if let Value::Array(items) = result {
+        stack.extend(items.iter().rev().map(|i| (i, 0)));
+    }
+    while let Some((item, depth)) = stack.pop() {
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("?");
+        let kind = kind_name(item.get("kind").and_then(Value::as_u64).unwrap_or(0));
+        // A `DocumentSymbol` carries its own range; a `SymbolInformation` carries
+        // a whole `location`.
+        let (uri, range) = match item.get("location") {
+            Some(loc) => (
+                loc.get("uri").and_then(Value::as_str),
+                loc.get("range").cloned(),
+            ),
+            None => (None, item.get("selectionRange").or(item.get("range")).cloned()),
+        };
+        let where_ = match (uri.and_then(path_of), range) {
+            (Some(path), Some(range)) => {
+                let shown = relative(ws, &path);
+                if !readable(ws, &shown) {
+                    omitted += 1;
+                    continue;
+                }
+                format!(" {shown}:{}", position(&range))
+            }
+            (None, Some(range)) => format!(" :{}", position(&range)),
+            _ => String::new(),
+        };
+        lines.push(format!("{}{name} ({kind}){where_}", "  ".repeat(depth)));
+        if let Some(Value::Array(children)) = item.get("children") {
+            stack.extend(children.iter().rev().map(|c| (c, depth + 1)));
+        }
+    }
+    (lines, omitted)
+}
+
+/// `line:column`, as a reader counts them.
+fn position(range: &Value) -> String {
+    let start = range.get("start").unwrap_or(range);
+    let line = from_wire(start.get("line").and_then(Value::as_u64).unwrap_or(0));
+    let column = from_wire(start.get("character").and_then(Value::as_u64).unwrap_or(0));
+    format!("{line}:{column}")
+}
+
+/// Hover contents, which the protocol spells three different ways.
+fn hover_text(result: &Value) -> String {
+    let contents = result.get("contents").unwrap_or(&Value::Null);
+    match contents {
+        Value::String(s) => s.clone(),
+        Value::Object(o) => o
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        Value::Array(items) => items
+            .iter()
+            .map(hover_one)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn hover_one(item: &Value) -> String {
+    match item {
+        Value::String(s) => s.clone(),
+        Value::Object(o) => o
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// A path relative to the workspace root, which is how every other tool names one.
+fn relative(ws: &crate::tools::Workspace, path: &str) -> String {
+    let candidate = std::path::Path::new(path);
+    // Both spellings of the root, because on macOS `/tmp` and `/var` are symlinks
+    // into `/private` and a server resolves what it opened. A path that failed to
+    // strip would be handed to the policy as an absolute one, under which a
+    // `deny_read("secret/*")` rule matches nothing — a filter that silently stops
+    // filtering is worse than one that is absent.
+    let roots = [
+        Some(ws.root().to_path_buf()),
+        std::fs::canonicalize(ws.root()).ok(),
+    ];
+    for root in roots.into_iter().flatten() {
+        if let Ok(rest) = candidate.strip_prefix(&root) {
+            return rest.to_string_lossy().replace('\\', "/");
+        }
+    }
+    path.to_string()
+}
+
+/// The `languageId` a `didOpen` carries, from the file's suffix.
+///
+/// Servers vary in how much they care; the ones that do care refuse a document
+/// whose id they do not recognise, so an unknown suffix says `plaintext` rather
+/// than guessing.
+fn language_id(path: &str) -> &'static str {
+    match path.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()) {
+        Some(ext) => match ext.as_str() {
+            "rs" => "rust",
+            "go" => "go",
+            "py" => "python",
+            "ts" => "typescript",
+            "tsx" => "typescriptreact",
+            "js" => "javascript",
+            "jsx" => "javascriptreact",
+            "c" | "h" => "c",
+            "cc" | "cpp" | "hpp" => "cpp",
+            "java" => "java",
+            "rb" => "ruby",
+            "cs" => "csharp",
+            _ => "plaintext",
+        },
+        None => "plaintext",
+    }
+}
+
+/// The protocol's `SymbolKind`, which is a number on the wire.
+fn kind_name(kind: u64) -> &'static str {
+    const KINDS: [&str; 26] = [
+        "file",
+        "module",
+        "namespace",
+        "package",
+        "class",
+        "method",
+        "property",
+        "field",
+        "constructor",
+        "enum",
+        "interface",
+        "function",
+        "variable",
+        "constant",
+        "string",
+        "number",
+        "boolean",
+        "array",
+        "object",
+        "key",
+        "null",
+        "enum member",
+        "struct",
+        "event",
+        "operator",
+        "type parameter",
+    ];
+    kind.checked_sub(1)
+        .and_then(|i| usize::try_from(i).ok())
+        .and_then(|i| KINDS.get(i).copied())
+        .unwrap_or("symbol")
+}
+
+
+/// A `WorkspaceEdit` rendered as a patch series, in 0.51.0's own format.
+///
+/// **Nothing here writes.** The server resolved the rename; this composes what
+/// the change *would* be, per file, from that file's current bytes — and the
+/// model applies whichever parts it wants with `patch_file`, one
+/// [`Act::Write`](crate::Act::Write) check per path. A tool that wrote N files on
+/// a server's say-so would be the multi-file write 0.51.0 excluded on purpose,
+/// with the additional property that this crate did not compute the change.
+fn rename_patch(result: &Value, ws: &crate::tools::Workspace, new_name: &str) -> String {
+    let mut per_file: Vec<(String, Vec<Value>)> = Vec::new();
+    // A server answers with `changes` or with `documentChanges`, and a client
+    // that reads only one of them silently renames nothing against half of them.
+    if let Some(Value::Object(changes)) = result.get("changes") {
+        for (uri, edits) in changes {
+            if let Value::Array(edits) = edits {
+                per_file.push((uri.clone(), edits.clone()));
+            }
+        }
+    }
+    if let Some(Value::Array(docs)) = result.get("documentChanges") {
+        for doc in docs {
+            let uri = doc["textDocument"]["uri"].as_str().unwrap_or_default();
+            if let Value::Array(edits) = &doc["edits"] {
+                per_file.push((uri.to_string(), edits.clone()));
+            }
+        }
+    }
+    // Path order, so two runs of the same rename produce the same patch.
+    per_file.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = String::new();
+    let mut skipped = Vec::new();
+    let mut omitted = 0;
+    for (uri, edits) in per_file {
+        let Some(path) = path_of(&uri) else { continue };
+        let shown = relative(ws, &path);
+        if !readable(ws, &shown) {
+            omitted += 1;
+            continue;
+        }
+        let Ok(before) = std::fs::read_to_string(&path) else {
+            skipped.push(format!("{shown} (could not be read)"));
+            continue;
+        };
+        match apply_edits(&before, &edits) {
+            Some(after) => match crate::diff::render(&before, &after) {
+                Some(hunk) => out.push_str(&format!("--- a/{shown}\n+++ b/{shown}\n{hunk}")),
+                // The server asked for a change that changes nothing. Saying so
+                // beats emitting a header with no hunk under it, which is a patch
+                // `patch_file` would refuse.
+                None => skipped.push(format!("{shown} (the edit changes nothing)")),
+            },
+            None => skipped.push(format!("{shown} (an edit named a position the file does not have)")),
+        }
+    }
+
+    if out.is_empty() && skipped.is_empty() && omitted == 0 {
+        return format!("The server found nothing to rename to {new_name}.");
+    }
+    let mut text = if out.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Nothing has been written. Apply each file's section below with patch_file.\n\n{out}"
+        )
+    };
+    if !skipped.is_empty() {
+        text.push_str(&format!("\n(not patched: {})\n", skipped.join(", ")));
+    }
+    with_omissions(text, omitted)
+}
+
+/// Apply a file's `TextEdit`s to its text, or `None` if one names a position the
+/// file does not have.
+///
+/// Applied last-first, which is what makes the ranges mean what the server meant:
+/// they are all against the text as the server saw it, so applying the first one
+/// moves every later one. That is the same reasoning `patch_file` applies its
+/// hunks at their own offsets against the original rather than as a running
+/// rewrite.
+fn apply_edits(text: &str, edits: &[Value]) -> Option<String> {
+    let mut offsets: Vec<(usize, usize, String)> = Vec::new();
+    for edit in edits {
+        let range = edit.get("range")?;
+        let start = offset_of(text, range.get("start")?)?;
+        let end = offset_of(text, range.get("end")?)?;
+        if end < start {
+            return None;
+        }
+        offsets.push((
+            start,
+            end,
+            edit.get("newText").and_then(Value::as_str)?.to_string(),
+        ));
+    }
+    offsets.sort_by_key(|(start, _, _)| *start);
+    // Overlapping edits have no defined result, and guessing one is how a rename
+    // silently corrupts a file.
+    if offsets.windows(2).any(|w| w[0].1 > w[1].0) {
+        return None;
+    }
+    let mut out = text.to_string();
+    for (start, end, new_text) in offsets.into_iter().rev() {
+        out.replace_range(start..end, &new_text);
+    }
+    Some(out)
+}
+
+/// The byte offset of a wire position, counting UTF-16 code units within a line.
+///
+/// The protocol measures a character offset in UTF-16 by default, which for every
+/// ASCII line is the same number as bytes and for a line with an emoji in it is
+/// not. Getting this wrong splits a character, and `String::replace_range` panics
+/// on a non-boundary rather than producing a wrong file — so this returns `None`
+/// instead of indexing blind.
+fn offset_of(text: &str, position: &Value) -> Option<usize> {
+    let line = usize::try_from(position.get("line")?.as_u64()?).ok()?;
+    let character = usize::try_from(position.get("character")?.as_u64()?).ok()?;
+    let mut offset = 0;
+    for _ in 0..line {
+        offset += text.get(offset..)?.find('\n')? + 1;
+    }
+    let rest = text.get(offset..)?;
+    let mut units = 0;
+    for (i, ch) in rest.char_indices() {
+        if units == character {
+            return Some(offset + i);
+        }
+        if ch == '\n' && units < character {
+            // A position past the end of its line clamps to the line's end, which
+            // is what a server means by "the end of this line".
+            return Some(offset + i);
+        }
+        units += ch.len_utf16();
+    }
+    Some(text.len())
+}
+
+/// A `file://` URI for a path, which is what every request here carries.
+///
+/// Built by hand rather than through a URL crate: the only escaping this needs is
+/// the one Windows requires, where a path begins with a drive letter rather than
+/// with a separator.
+pub(crate) fn uri_for(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    if text.starts_with('/') {
+        format!("file://{text}")
+    } else {
+        format!("file:///{text}")
+    }
+}
+
+/// The path a `file://` URI names, or `None` for anything else.
+pub(crate) fn path_of(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    // A Windows URI is `file:///C:/x`; a POSIX one is `file:///home/x` and needs
+    // its leading separator back.
+    if rest.len() > 1 && rest.as_bytes()[1] == b':' {
+        Some(rest.to_string())
+    } else {
+        Some(format!("/{rest}"))
+    }
+}
+
 /// One connected language server, correlated by request id.
 ///
 /// The reader runs as its own task for the life of the client: a response can
@@ -260,12 +1121,23 @@ fn protocol(reason: &str) -> Error {
 /// feels like it, so there is no point in the stream at which "read the next
 /// message" belongs to one caller.
 pub(crate) struct Client {
+    inner: Handle,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+/// A cloneable way to speak to a client that someone else owns.
+///
+/// The handshake runs as its own task while the session holds the [`Client`], so
+/// there are two speakers on one child from the moment it exists. They share the
+/// id counter — two speakers minting the same id would be answered each other's
+/// questions, which is exactly the defect correlation exists to prevent.
+#[derive(Clone)]
+pub(crate) struct Handle {
     /// The configured id, carried so every error names the server the operator wrote.
     id: String,
     writer: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
-    next_id: AtomicI64,
-    reader: tokio::task::JoinHandle<()>,
+    next_id: Arc<AtomicI64>,
     /// Why the reader stopped, if it did. Read when a request finds its channel
     /// closed, so "the server exited" is reported instead of "channel closed".
     gone: Arc<Mutex<Option<String>>>,
@@ -292,15 +1164,39 @@ impl Client {
         ));
 
         Self {
-            id,
-            writer,
-            pending,
-            next_id: AtomicI64::new(1),
+            inner: Handle {
+                id,
+                writer,
+                pending,
+                next_id: Arc::new(AtomicI64::new(1)),
+                gone,
+            },
             reader,
-            gone,
         }
     }
 
+    /// A second speaker on the same child, for the background handshake.
+    pub(crate) fn handle(&self) -> Handle {
+        self.inner.clone()
+    }
+
+    /// Send a request and wait for the response with that id.
+    pub(crate) async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.inner.request(method, params, timeout).await
+    }
+
+    /// Send a notification, which by definition is never answered.
+    pub(crate) async fn notify(&self, method: &str, params: Value) -> Result<()> {
+        self.inner.notify(method, params).await
+    }
+}
+
+impl Handle {
     /// Send a request and wait for the response with that id.
     pub(crate) async fn request(
         &self,
