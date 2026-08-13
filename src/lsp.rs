@@ -147,10 +147,7 @@ impl LspServer {
         K: Into<String>,
         V: Into<String>,
     {
-        self.env = env
-            .into_iter()
-            .map(|(k, v)| (k.into(), v.into()))
-            .collect();
+        self.env = env.into_iter().map(|(k, v)| (k.into(), v.into())).collect();
         self
     }
 
@@ -175,10 +172,10 @@ impl LspServer {
     /// Whether this server answers for `path`.
     pub(crate) fn answers_for(&self, path: &str) -> bool {
         self.extensions.is_empty()
-            || self
-                .extensions
-                .iter()
-                .any(|ext| path.to_ascii_lowercase().ends_with(&ext.to_ascii_lowercase()))
+            || self.extensions.iter().any(|ext| {
+                path.to_ascii_lowercase()
+                    .ends_with(&ext.to_ascii_lowercase())
+            })
     }
 
     /// The bound one request gets.
@@ -230,11 +227,19 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<O
             // A header line with no colon is not a header. Refused by name
             // rather than skipped, because a client that skips what it does not
             // understand desynchronises silently.
-            None => return Err(protocol(&format!("malformed frame header: {:?}", text.trim()))),
+            None => {
+                return Err(protocol(&format!(
+                    "malformed frame header: {:?}",
+                    text.trim()
+                )))
+            }
         };
         if name.to_ascii_lowercase() + ":" == CONTENT_LENGTH {
             len = Some(value.trim().parse().map_err(|_| {
-                protocol(&format!("Content-Length is not a number: {:?}", value.trim()))
+                protocol(&format!(
+                    "Content-Length is not a number: {:?}",
+                    value.trim()
+                ))
             })?);
         }
     }
@@ -465,7 +470,10 @@ impl LspSession {
         };
         let caps = self.ready(server, run_id, watch).await?;
         let capability = ask.capability();
-        if caps.get(capability).is_none_or(|v| v == &Value::Bool(false)) {
+        if caps
+            .get(capability)
+            .is_none_or(|v| v == &Value::Bool(false))
+        {
             return Err(Error::Lsp {
                 server: server.config.id.clone(),
                 reason: format!(
@@ -547,12 +555,7 @@ impl LspSession {
     /// it was before its own edit. Re-opening is one file re-parsed and leaves the
     /// index warm; tracking changes incrementally would mean this crate keeping a
     /// second copy of the workspace correct.
-    async fn sync(
-        &self,
-        server: &Started,
-        ws: &crate::tools::Workspace,
-        path: &str,
-    ) -> Result<()> {
+    async fn sync(&self, server: &Started, ws: &crate::tools::Workspace, path: &str) -> Result<()> {
         let full = ws.root().join(path);
         let text = std::fs::read_to_string(&full).map_err(|e| Error::Lsp {
             server: server.config.id.clone(),
@@ -563,7 +566,10 @@ impl LspSession {
         if opened.contains(&uri) {
             server
                 .client
-                .notify("textDocument/didClose", json!({"textDocument": {"uri": uri}}))
+                .notify(
+                    "textDocument/didClose",
+                    json!({"textDocument": {"uri": uri}}),
+                )
                 .await?;
         }
         server
@@ -745,9 +751,17 @@ fn handshake(
 /// missing.
 pub(crate) enum Nav<'a> {
     /// Where is the thing at this position defined.
-    Definition { path: &'a str, line: u32, column: u32 },
+    Definition {
+        path: &'a str,
+        line: u32,
+        column: u32,
+    },
     /// Everywhere the thing at this position is used.
-    References { path: &'a str, line: u32, column: u32 },
+    References {
+        path: &'a str,
+        line: u32,
+        column: u32,
+    },
     /// What is in this file, or — with a query — where in the workspace a symbol
     /// with that name is. One tool, because two schemas for one question is
     /// prompt bytes on every request of every run.
@@ -756,7 +770,11 @@ pub(crate) enum Nav<'a> {
         query: Option<&'a str>,
     },
     /// What is the thing at this position.
-    Hover { path: &'a str, line: u32, column: u32 },
+    Hover {
+        path: &'a str,
+        line: u32,
+        column: u32,
+    },
     /// Rename the thing at this position, everywhere. Answers with a patch; see
     /// [`LspSession::navigate`]'s caller — nothing here writes.
     Rename {
@@ -924,7 +942,9 @@ fn locations(result: &Value, ws: &crate::tools::Workspace) -> (Vec<String>, usiz
             .get("uri")
             .or_else(|| item.get("targetUri"))
             .and_then(Value::as_str);
-        let range = item.get("range").or_else(|| item.get("targetSelectionRange"));
+        let range = item
+            .get("range")
+            .or_else(|| item.get("targetSelectionRange"));
         let (Some(uri), Some(range)) = (uri, range) else {
             continue;
         };
@@ -957,7 +977,10 @@ fn symbols(result: &Value, ws: &crate::tools::Workspace) -> (Vec<String>, usize)
                 loc.get("uri").and_then(Value::as_str),
                 loc.get("range").cloned(),
             ),
-            None => (None, item.get("selectionRange").or(item.get("range")).cloned()),
+            None => (
+                None,
+                item.get("selectionRange").or(item.get("range")).cloned(),
+            ),
         };
         let where_ = match (uri.and_then(path_of), range) {
             (Some(path), Some(range)) => {
@@ -1046,7 +1069,10 @@ fn relative(ws: &crate::tools::Workspace, path: &str) -> String {
 /// whose id they do not recognise, so an unknown suffix says `plaintext` rather
 /// than guessing.
 fn language_id(path: &str) -> &'static str {
-    match path.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()) {
+    match path
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+    {
         Some(ext) => match ext.as_str() {
             "rs" => "rust",
             "go" => "go",
@@ -1102,7 +1128,6 @@ fn kind_name(kind: u64) -> &'static str {
         .unwrap_or("symbol")
 }
 
-
 /// A `WorkspaceEdit` rendered as a patch series, in 0.51.0's own format.
 ///
 /// **Nothing here writes.** The server resolved the rename; this composes what
@@ -1155,7 +1180,9 @@ fn rename_patch(result: &Value, ws: &crate::tools::Workspace, new_name: &str) ->
                 // `patch_file` would refuse.
                 None => skipped.push(format!("{shown} (the edit changes nothing)")),
             },
-            None => skipped.push(format!("{shown} (an edit named a position the file does not have)")),
+            None => skipped.push(format!(
+                "{shown} (an edit named a position the file does not have)"
+            )),
         }
     }
 
@@ -1240,7 +1267,6 @@ fn offset_of(text: &str, position: &Value) -> Option<usize> {
     }
     Some(text.len())
 }
-
 
 /// Every diagnostic in a pull answer, as one line each.
 ///
@@ -1474,7 +1500,10 @@ impl Client {
                         .working
                         .lock()
                         .expect("progress set is not poisoned");
-                    (set.is_empty(), self.inner.announced_work.load(Ordering::Relaxed))
+                    (
+                        set.is_empty(),
+                        self.inner.announced_work.load(Ordering::Relaxed),
+                    )
                 };
                 if idle && !ever {
                     // Nothing announced yet. That is either a server that never
@@ -1658,8 +1687,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
                             let params = &message["params"];
                             if let Some(token) = token_of(&params["token"]) {
                                 let kind = params["value"]["kind"].as_str().unwrap_or_default();
-                                let mut set =
-                                    working.lock().expect("progress set is not poisoned");
+                                let mut set = working.lock().expect("progress set is not poisoned");
                                 match kind {
                                     "begin" => {
                                         set.insert(token);
@@ -1691,12 +1719,8 @@ async fn read_loop<R: AsyncRead + Unpin>(
         .clear();
     settled.notify_waiters();
     // Dropping the senders is what wakes every outstanding request.
-    pending
-        .lock()
-        .expect("pending map is not poisoned")
-        .clear();
+    pending.lock().expect("pending map is not poisoned").clear();
 }
-
 
 /// Whether an answer carries nothing — which is not the same as carrying "no".
 fn is_empty(result: &Value) -> bool {

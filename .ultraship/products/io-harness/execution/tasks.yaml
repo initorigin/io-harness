@@ -397,7 +397,7 @@ tasks:
   why_required: Shipping an LSP client while a module doc says an LSP client was rejected is a surface
     contradicting the code — the mistake 0.51.0 caught in verify.rs. The docs gates fail the build without
     this, and the record cannot claim the surfaces agree.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.52.0-T07
   - US-IO-HARNESS-0.52.0-T08
@@ -419,7 +419,31 @@ tasks:
   - README.md
   - CHANGELOG.md
   - docs/public-api.txt
-  evidence: []
+  evidence:
+  - 'Every checked-in surface is at 0.52.0 in this release: CHANGELOG.md gains its section (Added, Changed
+    and Security, with no breaking marker because there is no break), docs/CONTRACT.md gains ''What a
+    language server is asked, and what it is not trusted with (0.52.0)'' with its own ''Stated plainly''
+    block, README.md gains a ''Navigating the code'' paragraph and its dependency snippet moves to "0.52",
+    src/lib.rs gains the matching crate-root paragraph, docs/guide/language-support.md gains ''Navigating
+    with a language server'' and docs/guide/configuration.md gains the [[lsp]] table, and docs/public-api.txt
+    gains its one line.'
+  - 'O5''s specific requirement is met rather than glossed: src/tools/diagnostics.rs''s ''Deliberately
+    not a language server'' section is rewritten to ''Deliberately not a language server — for *this*
+    question''. Its four reasons stand unchanged, because none of them was ever an argument against speaking
+    the protocol — they are an argument about which question a server can answer. Shipping an LSP client
+    while a module doc reads as a rejection of one is a surface contradicting the code, which is the mistake
+    0.51.0 caught in src/verify.rs.'
+  - 'The docs gates pass: cargo test --test readme --test docs_drift --test guide_pages --test changelog
+    — 35 passed, 0 failed across the four. docs_drift is the one that bites here, because it requires
+    the README''s dependency snippet to state Cargo.toml''s own version.'
+  - 'A REPO GUARD CAUGHT A REAL GAP AND IT IS THE TRAP MEMORY ALREADY WARNED ABOUT. tests/ci_workflow.rs''s
+    the_matrix_builds_exactly_the_examples_the_tests_spawn failed: lsp_fixture_server is spawned by a
+    test and was not in the CI build list, because ''cargo build --lib --tests'' does not build examples/.
+    Without the fix the whole lsp suite would have failed on every runner with a missing file rather than
+    with a reason. Added to both build steps in .github/workflows/ci.yml and to the one in release.yml;
+    the second release leg already uses --examples and needed nothing.'
+  - cargo fmt --check exit 0; cargo clippy --all-targets clean, after fixing two warnings this release
+    introduced (an unused std::io::Read import in the fixture server, and a needless borrow in tests/lsp.rs).
 - id: US-IO-HARNESS-0.52.0-T11
   summary: One opt-in live test against a real rust-analyzer, outside the default gate.
   why_required: A fixture server proves the client and cannot prove the protocol was understood. Without

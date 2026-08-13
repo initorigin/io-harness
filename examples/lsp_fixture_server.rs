@@ -29,7 +29,7 @@
 //! Everything else is returned as written.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 
 use serde_json::{json, Value};
 
@@ -42,8 +42,10 @@ fn main() {
     }
 
     let script: Value = match std::env::var("IO_HARNESS_LSP_SCRIPT") {
-        Ok(path) => serde_json::from_str(&std::fs::read_to_string(path).expect("script is readable"))
-            .expect("script is JSON"),
+        Ok(path) => {
+            serde_json::from_str(&std::fs::read_to_string(path).expect("script is readable"))
+                .expect("script is JSON")
+        }
         Err(_) => json!({}),
     };
 

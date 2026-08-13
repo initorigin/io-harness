@@ -2418,6 +2418,69 @@ Acrobat, so real-world quirks those applications emit are untested.
 
 ## Related
 
+## What a language server is asked, and what it is not trusted with (0.52.0)
+
+A run that names a server in `[[lsp]]` — or on the contract with
+`TaskContract::with_lsp` — is offered five tools: `lsp_definition`,
+`lsp_references`, `lsp_symbols`, `lsp_hover` and `lsp_rename`. A run that names
+none is offered **none of them**, and its composed prompt is byte-identical to the
+one it had on 0.51.0.
+
+**Starting one is an `Act::Exec` check on its program**, the same check an
+`[[mcp]]` stdio server passes, and it happens before any spawn is attempted.
+Without `allow_exec` naming that binary the run ends in `Error::Lsp`/`Error::Refused`
+and no process exists. A server that cannot be spawned fails the run rather than
+being skipped.
+
+**A server is named or there is no server.** Nothing is downloaded at run time,
+nothing is resolved from `PATH` by ecosystem, and the detected toolchain is
+deliberately not consulted — mapping an ecosystem to a binary would be a guess
+about the operator's machine.
+
+**`lsp_rename` writes nothing.** It answers with a patch series in `patch_file`'s
+format. Every byte that reaches the workspace goes through `write_file`,
+`edit_file` or `patch_file` and their gates: one `Act::Write` check per path,
+all-or-nothing per file.
+
+**Positions are 1-based** on the way in and out, as `read_file` shows them and a
+compiler reports them. The protocol's zero base is an internal detail. Line 0 is
+refused by name rather than clamped.
+
+**A file is re-sent from disk on every request that names it**, so a run that edits
+a file and then asks about it is never answered from the text as it was before its
+own edit.
+
+**Diagnostics augment and never replace.** Where a server advertises the pull
+capability, its findings are appended to what the project's own checker reported,
+attributed to the server's id. The compiler's stream is never filtered: a language
+server's own analysis omits borrow-check errors, monomorphisation errors and every
+lint. Push diagnostics are not used — they have no completion signal, so an empty
+result cannot be told from a slow one.
+
+### Stated plainly
+
+- **A server indexes the whole root it is pointed at, including files a
+  `deny_read` rule covers.** What this crate does about that is refuse to carry
+  those locations into the model's context: every location handed back passes the
+  same `Act::Read` check `read_file` passes, and an omission is counted in the
+  answer rather than leaving a silently shorter list. What it does **not** do is
+  stop the server process reading those files, and it cannot.
+- **A language server runs at this process's own privilege**, like an MCP stdio
+  server and unlike a command run through `exec` or `shell`. It is not placed
+  inside the run's execution sandbox.
+- **An empty answer cannot always be told from an unready one.** The protocol has
+  no readiness signal, and a server still building its index answers `[]` rather
+  than erroring. This crate tracks the work a server announces through
+  `$/progress` and retries an empty answer once that work settles, bounded by the
+  server's `timeout_secs` — but a server that reports no progress for a start-up
+  phase can still return an empty answer that means "not yet".
+- **Where two servers claim the same file suffix, the first in declaration order
+  answers.** A workspace-wide question, which names no file, goes to the first
+  configured server.
+- **Completion, signature help, code lens, semantic tokens and call hierarchy are
+  not offered.** A model does not type, and the hierarchy requests are named
+  roadmap work rather than added here to round out a list.
+
 - [CHANGELOG.md](../CHANGELOG.md) — the release history, with a migration note on
   every break.
 - [CAPABILITIES.md](CAPABILITIES.md) — the guide index.

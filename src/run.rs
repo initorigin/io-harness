@@ -67,8 +67,8 @@ const GIT_DIR: &str = ".git";
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
     Entry, FsTool, ToolEffect, Toolbox, Workspace, ASK_QUESTION_TOOL, CHECK_TOOL, EDIT_FILE_TOOL,
-    LSP_DEFINITION_TOOL, LSP_HOVER_TOOL, LSP_REFERENCES_TOOL, LSP_RENAME_TOOL, LSP_SYMBOLS_TOOL,
-    EXEC_TOOL, FIND_TOOL, GREP_TOOL, LIST_DIR_TOOL, PATCH_FILE_TOOL, PROPOSE_PLAN_TOOL,
+    EXEC_TOOL, FIND_TOOL, GREP_TOOL, LIST_DIR_TOOL, LSP_DEFINITION_TOOL, LSP_HOVER_TOOL,
+    LSP_REFERENCES_TOOL, LSP_RENAME_TOOL, LSP_SYMBOLS_TOOL, PATCH_FILE_TOOL, PROPOSE_PLAN_TOOL,
     READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_KILL_TOOL, SHELL_POLL_TOOL,
     SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
@@ -5340,7 +5340,9 @@ fn lsp_diagnostics_text(
                 out.push_str(&format!("\n[language server {server}] found nothing\n"));
             }
             Outcome::Failed(why) | Outcome::Skipped(why) if asked => {
-                out.push_str(&format!("\n[language server {server} did not answer] {why}\n"));
+                out.push_str(&format!(
+                    "\n[language server {server} did not answer] {why}\n"
+                ));
             }
             _ => {}
         }
@@ -5361,12 +5363,16 @@ fn at(a: &serde_json::Value) -> std::result::Result<(u32, u32), String> {
     };
     match (read("line"), read("column").or_else(|| read("character"))) {
         (Some(line), Some(column)) if line >= 1 && column >= 1 => Ok((line, column)),
-        (Some(_), Some(_)) => Err("\n[lsp error] \"line\" and \"column\" are 1-based, the way \
+        (Some(_), Some(_)) => Err(
+            "\n[lsp error] \"line\" and \"column\" are 1-based, the way \
                                    read_file shows them and a compiler reports them; 0 is not a \
                                    position a file has\n"
-            .to_string()),
-        _ => Err("\n[lsp error] this tool needs \"line\" and \"column\" as 1-based numbers\n"
-            .to_string()),
+                .to_string(),
+        ),
+        _ => Err(
+            "\n[lsp error] this tool needs \"line\" and \"column\" as 1-based numbers\n"
+                .to_string(),
+        ),
     }
 }
 
@@ -10060,9 +10066,16 @@ async fn dispatch(
                             // a type error in a file the model just created is
                             // worth exactly as much to know about as one it
                             // edited into an existing file.
-                            let diagnostics =
-                                diagnostics_after_write(ws, toolchain, exec_timeout, cap, lsp, run_id, watch)
-                                    .await;
+                            let diagnostics = diagnostics_after_write(
+                                ws,
+                                toolchain,
+                                exec_timeout,
+                                cap,
+                                lsp,
+                                run_id,
+                                watch,
+                            )
+                            .await;
                             Dispatched::Continue {
                                 decision: format!("wrote {target}"),
                                 // A write that changed nothing says so, to the model as
@@ -10172,9 +10185,16 @@ async fn dispatch(
                             // write is already on disk by the time this runs, so
                             // a checker that is missing, slow or broken costs
                             // the model a note and nothing else.
-                            let diagnostics =
-                                diagnostics_after_write(ws, toolchain, exec_timeout, cap, lsp, run_id, watch)
-                                    .await;
+                            let diagnostics = diagnostics_after_write(
+                                ws,
+                                toolchain,
+                                exec_timeout,
+                                cap,
+                                lsp,
+                                run_id,
+                                watch,
+                            )
+                            .await;
                             Dispatched::Continue {
                                 decision: format!("edited {target}"),
                                 obs: bound(
@@ -10263,9 +10283,16 @@ async fn dispatch(
                                 diffable.then_some((before.as_str(), after.as_str())),
                             );
                             record_snapshot(store, run_id, step, &target, kept);
-                            let diagnostics =
-                                diagnostics_after_write(ws, toolchain, exec_timeout, cap, lsp, run_id, watch)
-                                    .await;
+                            let diagnostics = diagnostics_after_write(
+                                ws,
+                                toolchain,
+                                exec_timeout,
+                                cap,
+                                lsp,
+                                run_id,
+                                watch,
+                            )
+                            .await;
                             Dispatched::Continue {
                                 decision: format!("patched {target}"),
                                 obs: bound(

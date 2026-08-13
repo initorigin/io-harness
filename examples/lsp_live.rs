@@ -134,7 +134,14 @@ async fn main() -> io_harness::Result<()> {
         .allow_write("*")
         .allow_exec("*");
 
-    let result = run_with(&contract, &provider, &Store::memory()?, &policy, &ApproveAll).await?;
+    let result = run_with(
+        &contract,
+        &provider,
+        &Store::memory()?,
+        &policy,
+        &ApproveAll,
+    )
+    .await?;
     println!("outcome: {:?}\n", result.outcome);
 
     // The last prompt carries every observation the run produced, which is what a

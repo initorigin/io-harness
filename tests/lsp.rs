@@ -18,8 +18,7 @@ use std::sync::Mutex;
 use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    run_with, ApproveAll, Error, LspServer, Policy, Provider, Store, TaskContract,
-    Verification,
+    run_with, ApproveAll, Error, LspServer, Policy, Provider, Store, TaskContract, Verification,
 };
 use serde_json::{json, Value};
 
@@ -162,7 +161,10 @@ fn contract(root: &Path, steps: u32) -> TaskContract {
 /// The step that satisfies the gate, so the run ends deliberately rather than by
 /// running out of script.
 fn finish() -> Vec<ToolCall> {
-    vec![call("write_file", json!({"path": "done.txt", "content": "ok"}))]
+    vec![call(
+        "write_file",
+        json!({"path": "done.txt", "content": "ok"}),
+    )]
 }
 
 fn uri(dir: &Path, rel: &str) -> String {
@@ -208,10 +210,13 @@ impl Observer for Seen {
 async fn a_position_is_one_based_for_the_model_and_zero_based_on_the_wire() {
     let dir = workspace();
     let store = Store::memory().unwrap();
-    let provider = Script::new(vec![vec![call(
-        "lsp_hover",
-        json!({"path": "src/lib.rs", "line": 12, "column": 5}),
-    )], finish()]);
+    let provider = Script::new(vec![
+        vec![call(
+            "lsp_hover",
+            json!({"path": "src/lib.rs", "line": 12, "column": 5}),
+        )],
+        finish(),
+    ]);
     let contract = contract(dir.path(), 4).with_lsp([fixture(
         dir.path(),
         json!({"responses": {"textDocument/hover": "echo-position"}}),
@@ -234,10 +239,13 @@ async fn a_position_is_one_based_for_the_model_and_zero_based_on_the_wire() {
 async fn a_zero_line_is_refused_by_name_rather_than_clamped() {
     let dir = workspace();
     let store = Store::memory().unwrap();
-    let provider = Script::new(vec![vec![call(
-        "lsp_hover",
-        json!({"path": "src/lib.rs", "line": 0, "column": 1}),
-    )], finish()]);
+    let provider = Script::new(vec![
+        vec![call(
+            "lsp_hover",
+            json!({"path": "src/lib.rs", "line": 0, "column": 1}),
+        )],
+        finish(),
+    ]);
     let contract = contract(dir.path(), 4).with_lsp([fixture(
         dir.path(),
         json!({"responses": {"textDocument/hover": "echo-position"}}),
@@ -355,7 +363,7 @@ async fn a_denied_server_is_refused_before_any_spawn_is_attempted() {
         .layer("app")
         .allow_read("*")
         .allow_write("*")
-        .deny_exec(&fixture_server().display().to_string());
+        .deny_exec(fixture_server().display().to_string());
     let present = contract(dir.path(), 4).with_lsp([server]);
     let err = run_with(
         &present,
@@ -386,10 +394,13 @@ async fn an_allowed_server_starts_answers_and_reports_that_it_came_up() {
         Some(&marker),
     );
 
-    let provider = Script::new(vec![vec![call(
-        "lsp_definition",
-        json!({"path": "src/lib.rs", "line": 4, "column": 8}),
-    )], finish()]);
+    let provider = Script::new(vec![
+        vec![call(
+            "lsp_definition",
+            json!({"path": "src/lib.rs", "line": 4, "column": 8}),
+        )],
+        finish(),
+    ]);
     let contract = contract(dir.path(), 4).with_lsp([server]);
     let seen = Seen::default();
 
@@ -433,7 +444,11 @@ async fn an_allowed_server_starts_answers_and_reports_that_it_came_up() {
 async fn a_denied_location_is_omitted_from_the_answer_and_the_omission_is_named() {
     let dir = workspace();
     std::fs::create_dir_all(dir.path().join("secret")).unwrap();
-    std::fs::write(dir.path().join("secret/keys.rs"), "const KEY: &str = \"x\";\n").unwrap();
+    std::fs::write(
+        dir.path().join("secret/keys.rs"),
+        "const KEY: &str = \"x\";\n",
+    )
+    .unwrap();
     let store = Store::memory().unwrap();
 
     let server = fixture(
@@ -444,10 +459,13 @@ async fn a_denied_location_is_omitted_from_the_answer_and_the_omission_is_named(
             location(dir.path(), "src/lib.rs", 0, 7),
         ]}}),
     );
-    let provider = Script::new(vec![vec![call(
-        "lsp_references",
-        json!({"path": "src/lib.rs", "line": 1, "column": 8}),
-    )], finish()]);
+    let provider = Script::new(vec![
+        vec![call(
+            "lsp_references",
+            json!({"path": "src/lib.rs", "line": 1, "column": 8}),
+        )],
+        finish(),
+    ]);
     let contract = contract(dir.path(), 4).with_lsp([server]);
     let policy = Policy::default()
         .layer("app")
@@ -510,10 +528,13 @@ async fn a_rename_returns_a_patch_series_and_writes_nothing() {
         }}}}),
     );
 
-    let provider = Script::new(vec![vec![call(
-        "lsp_rename",
-        json!({"path": "src/lib.rs", "line": 1, "column": 8, "new_name": "Tally"}),
-    )], finish()]);
+    let provider = Script::new(vec![
+        vec![call(
+            "lsp_rename",
+            json!({"path": "src/lib.rs", "line": 1, "column": 8, "new_name": "Tally"}),
+        )],
+        finish(),
+    ]);
     let contract = contract(dir.path(), 4).with_lsp([server]);
 
     run_with(&contract, &provider, &store, &permitted(), &ApproveAll)
@@ -573,10 +594,13 @@ async fn a_server_that_cannot_answer_says_why_rather_than_answering_nothing() {
             // Short enough that the hanging arm is a test rather than a wait, and
             // asserted on structure rather than on how long it took.
             .with_timeout(std::time::Duration::from_secs(2));
-        let provider = Script::new(vec![vec![call(
-            "lsp_definition",
-            json!({"path": "src/lib.rs", "line": 1, "column": 8}),
-        )], finish()]);
+        let provider = Script::new(vec![
+            vec![call(
+                "lsp_definition",
+                json!({"path": "src/lib.rs", "line": 1, "column": 8}),
+            )],
+            finish(),
+        ]);
         let contract = contract(dir.path(), 4).with_lsp([server]);
 
         run_with(&contract, &provider, &store, &permitted(), &ApproveAll)

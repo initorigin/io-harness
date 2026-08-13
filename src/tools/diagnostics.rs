@@ -12,7 +12,16 @@
 //! model was going to read anyway. The error arrives in the same turn as the edit
 //! that caused it, and costs the model no decision.
 //!
-//! ## Deliberately not a language server
+//! ## Deliberately not a language server — for *this* question
+//!
+//! 0.52.0 ships a language-server client ([`crate::lsp`]) and this section stands
+//! unchanged, because it was never an argument against speaking the protocol. It
+//! is an argument about **which question a language server can answer**. A server
+//! is the right way to ask where a symbol is defined and who calls it; it is the
+//! wrong way to ask "does the edit I just made compile", and the four reasons
+//! below are why. The two live side by side: a server's diagnostics are *appended*
+//! to what this module produces, never substituted for it, and the third reason
+//! below is exactly why substituting them would lose the errors that matter.
 //!
 //! The obvious implementation is an LSP client, and it was researched and rejected
 //! for four separate reasons, any one of which is disqualifying.
@@ -37,6 +46,13 @@
 //! going to be used here: this is a one-shot question asked after a write, not an
 //! interactive editing session, so incremental analysis has nothing to be
 //! incremental about.
+//!
+//! Since 0.52.0, where a run has configured a server that answers *pull*
+//! diagnostics, what that server sees is appended to what this module found — a
+//! server notices things a cheap type-check does not, and the cost of asking one
+//! that is already running and already indexed is a round trip. The compiler's
+//! stream is never filtered and never replaced. Push diagnostics are still not
+//! used, for the completion-signal reason above.
 //!
 //! ## The check is workspace-wide, which is why it is bounded
 //!

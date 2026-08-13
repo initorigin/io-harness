@@ -2360,10 +2360,6 @@ fn a_narrower_scope_replaces_the_lsp_set_whole() {
     );
 
     let config = Config::discover(project.path()).unwrap();
-    let ids: Vec<_> = config
-        .lsp_servers()
-        .iter()
-        .map(|s| s.id.as_str())
-        .collect();
+    let ids: Vec<_> = config.lsp_servers().iter().map(|s| s.id.as_str()).collect();
     assert_eq!(ids, ["theirs"], "the project scope replaces, never appends");
 }
