@@ -92,7 +92,7 @@ fn main() {
         return;
     }
 
-    let mut say = |value: Value, out: &mut std::fs::File| {
+    let say = |value: Value, out: &mut std::fs::File| {
         let mut bytes = serde_json::to_vec(&value).unwrap();
         bytes.push(0);
         let _ = out.write_all(&bytes);
