@@ -46,9 +46,14 @@ pub(crate) struct BrowserSession;
 
 #[cfg(not(feature = "browser"))]
 impl BrowserSession {
-    fn configured(&self) -> bool {
-        false
-    }
+    /// Shut down nothing. The one method the shim genuinely needs: the run loop
+    /// calls it unconditionally, beside every language-server shutdown.
+    ///
+    /// There is deliberately no `configured()` here. The two sites that ask it
+    /// are themselves behind `#[cfg(feature = "browser")]`, so a shim method
+    /// would be dead code in every build that compiles this file — and a
+    /// `dead_code` warning in the default build is exactly the kind of wart that
+    /// a release should not ship.
     async fn shutdown(&self) {}
 }
 use crate::mcp::McpSession;
