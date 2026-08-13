@@ -15,7 +15,7 @@
 //! JSON-RPC crate and no `lsp-types` — the dependency discipline this crate has kept
 //! since 0.1.0 is worth more than the six request bodies below.
 //!
-//! [`Client`] is written over `AsyncRead + AsyncWrite` rather than over a child
+//! The client is written over `AsyncRead + AsyncWrite` rather than over a child
 //! process, and the spawn is a thin wrapper. That is not abstraction for its own
 //! sake: it is what lets the tests drive a server that misbehaves on purpose —
 //! answering out of order, interleaving notifications, omitting a capability,
@@ -64,7 +64,7 @@ fn default_timeout_secs() -> u64 {
 /// text search. Starting it is an [`Act::Exec`](crate::Act::Exec) check on
 /// [`command`](Self::command), so configuring one here does not grant access to
 /// it — without `allow_exec` naming that binary the run ends in
-/// [`Error::Lsp`](crate::Error::Lsp) before the process exists.
+/// [`Error::Lsp`] before the process exists.
 ///
 /// ```
 /// use io_harness::LspServer;
