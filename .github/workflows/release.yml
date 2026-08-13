@@ -193,6 +193,7 @@ jobs:
           --example crash_fixture
           --example fleet_fixture
           --example flood
+          --example lsp_fixture_server
           --example mcp_fixture_server
           --example orphan
           --example plan_gate_fixture

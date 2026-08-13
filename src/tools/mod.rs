@@ -69,6 +69,41 @@ pub const PATCH_FILE_TOOL: &str = "patch_file";
 /// the same, because a model-callable path to the project's build command must
 /// be refusable by the policy that refuses `exec`.
 pub const CHECK_TOOL: &str = "check";
+/// Where the thing at this position is defined (0.52.0).
+///
+/// The five `lsp_*` names below are offered **only** when the contract or
+/// `io.toml` configured a language server. A run that configured none is offered
+/// exactly the catalogue 0.51.0 offered, byte for byte — which is what makes this
+/// feature free for a consumer who does not want it, under 0.38.0's cacheable
+/// system prefix where every schema is paid for on every request of every run.
+///
+/// Positions are 1-based, as `read_file` shows them and as a compiler reports
+/// them. The protocol counts from zero and the conversion happens in one place.
+pub const LSP_DEFINITION_TOOL: &str = "lsp_definition";
+/// Everywhere the thing at this position is used (0.52.0).
+///
+/// The question `grep` cannot answer: a text search returns the comments, the
+/// string literals, the identically-named method on an unrelated type and the
+/// definition itself, and a model has to read each hit to tell them apart.
+pub const LSP_REFERENCES_TOOL: &str = "lsp_references";
+/// What is in this file, or where a symbol is in the workspace (0.52.0).
+///
+/// One schema with two behaviours — no `query` is this file's symbols, a `query`
+/// is the workspace's — because two schemas for one question is prompt bytes on
+/// every request of every run.
+pub const LSP_SYMBOLS_TOOL: &str = "lsp_symbols";
+/// What the thing at this position is (0.52.0).
+pub const LSP_HOVER_TOOL: &str = "lsp_hover";
+/// Rename the thing at this position everywhere, as a patch (0.52.0).
+///
+/// **It writes nothing.** The server resolves the rename across the workspace and
+/// this returns the change as a patch series in [`PATCH_FILE_TOOL`]'s own format,
+/// which the model then applies one file at a time — one
+/// [`Act::Write`](crate::Act::Write) check per path, all-or-nothing per file.
+/// A tool that wrote N files on a server's say-so would be the multi-file write
+/// 0.51.0 excluded, with the additional property that this crate did not compute
+/// the change.
+pub const LSP_RENAME_TOOL: &str = "lsp_rename";
 /// The name the model uses to run a command (0.17.0).
 ///
 /// The widest capability the crate grants, and the one that made a task in any

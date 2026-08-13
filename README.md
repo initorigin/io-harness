@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.51"
+io-harness = "0.52"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -132,6 +132,17 @@ runs that project's own type-check command and attaches what it found, so a
 mistake arrives with the edit rather than twenty steps later; `check` asks the
 same question *before* a write, and is refused by the same policy that refuses
 `exec` — see [language support](docs/guide/language-support.md).
+
+**Navigating the code.** Point the harness at a language server in `io.toml` and
+the agent asks the questions an editor answers rather than the ones a text search
+answers: `lsp_definition`, `lsp_references`, `lsp_symbols`, `lsp_hover` and
+`lsp_rename`. Where is this defined, who calls it, what is in this file, what is
+this. The server starts once per run in the background, so its index is paid for
+once and not inside a tool call, and starting it is an `Act::Exec` check on the
+binary the operator named. `lsp_rename` **writes nothing** — it answers with a
+patch series you apply with `patch_file`, one gate check per file. Configure no
+server and nothing changes: the five schemas are absent from the catalogue
+entirely. See [language support](docs/guide/language-support.md).
 
 **What a change is kept as.** Every write records the change as a unified diff of
 the whole file, so a trace can show what a step changed and not only how many

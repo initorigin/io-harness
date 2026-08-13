@@ -250,3 +250,80 @@ tooling asks.
 - [Command execution](command-execution.md) — what `exec` does and does not bound
 - [Verification](verification.md) — what a passing gate proves, and what it does not
 - [Execution sandbox](sandbox.md) — the container a `Command` criterion runs in
+
+## Navigating with a language server (0.52.0)
+
+`grep` answers "which lines contain this text". An editor answers "where is this
+defined", "who calls it", "what is this", and it answers them from a resolution
+rather than from a match. 0.52.0 gives the agent the second kind of question.
+
+Name a server in `io.toml`:
+
+```toml
+[[lsp]]
+id = "rust"
+command = "rust-analyzer"
+extensions = [".rs"]
+timeout_secs = 60
+```
+
+or on the contract:
+
+```rust,ignore
+use io_harness::{LspServer, TaskContract};
+
+let contract = TaskContract::workspace("rename Ledger to Tally", "/repo")
+    .with_lsp([LspServer::new("rust", "rust-analyzer").with_extensions([".rs"])]);
+```
+
+That adds five tools, and only for a run that configured a server:
+
+| Tool | Question |
+| --- | --- |
+| `lsp_definition` | Where is the symbol at this position defined? |
+| `lsp_references` | Everywhere it is used — resolved, not matched |
+| `lsp_symbols` | What is in this file, or — with `query` — where a symbol is in the workspace |
+| `lsp_hover` | What is this: its type, signature and documentation |
+| `lsp_rename` | Rename it everywhere, **as a patch you apply yourself** |
+
+Positions are 1-based, the way `read_file` shows them.
+
+### What it costs, and what it saves
+
+The server starts once per run, in the background, so a cold index is paid once
+rather than inside a tool call. Starting it is an `Act::Exec` check on the binary
+named — without `allow_exec` for it the run refuses before the process exists.
+
+Measured over one question ("where is this defined and which call sites use it")
+against the same repository: **three provider calls and 6,052 prompt bytes**
+through the server, against **six calls and 11,901 bytes** through
+`grep`/`find`/`read_file`.
+
+### Rename writes nothing
+
+`lsp_rename` returns a patch series — one `--- a/<path>` / `+++ b/<path>` header
+and its hunks per file. Apply the parts you want with `patch_file`, one path per
+call. That keeps every byte reaching the workspace behind an `Act::Write` check on
+the path it lands in, and keeps the all-or-nothing guarantee `patch_file` already
+gives.
+
+### Diagnostics
+
+Where a configured server answers diagnostic requests, its findings are appended
+to what `check` and the automatic post-edit checker already report, attributed to
+the server. They are never a substitute: a language server's analysis omits
+borrow-check errors, monomorphisation errors and every lint — precisely the errors
+a model writes.
+
+### Stated plainly
+
+- A server indexes the whole root, including files a `deny_read` rule covers. Every
+  location handed back is checked against the same `Act::Read` rule `read_file` is,
+  and an omission is counted in the answer — but the server process has still read
+  those files.
+- The server runs at the harness's own privilege, like an MCP stdio server. It is
+  not inside the execution sandbox.
+- A server still indexing answers `[]` rather than an error. This crate waits for
+  the work a server announces and asks again, bounded by its `timeout_secs`, but a
+  server that announces nothing about a start-up phase can still answer "nothing"
+  when it means "not yet".

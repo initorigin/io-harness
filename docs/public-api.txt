@@ -140,6 +140,7 @@ struct Identity src/tools/git.rs
 struct Ignore src/observe.rs
 struct Layer src/policy.rs
 struct Ledger src/containment.rs
+struct LspServer src/lsp.rs
 struct McpEvent src/state.rs
 struct McpServer src/mcp.rs
 struct Media src/provider/mod.rs (feature = "media")

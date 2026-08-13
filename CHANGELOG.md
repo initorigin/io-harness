@@ -26,6 +26,81 @@ notes are produced from it.
 
 ### Security
 
+## [0.52.0] - 2026-08-13
+
+### Added
+
+- **The agent navigates a codebase the way an editor does.** Five tools —
+  `lsp_definition`, `lsp_references`, `lsp_symbols`, `lsp_hover` and `lsp_rename`
+  — answered by a language server named in `io.toml` or on the contract with
+  `TaskContract::with_lsp`. Through 0.51.0 the only way to ask "where is `Ledger`
+  defined" was to grep the spellings a definition might have, read the files that
+  matched, and work out which hit was the definition; "who calls `measure`" meant
+  grepping the identifier and reading every hit to discard the comment, the string
+  literal and the identically-named method on another type. Each of those is a
+  provider round trip carrying the whole system prefix, and the answer at the end
+  is a text match that resembles a resolution. Measured over one such question:
+  three provider calls and 6,052 prompt bytes against six and 11,901.
+- **`LspServer` and the `[[lsp]]` table**, one entry per server: `id`, `command`,
+  `args`, `env`, `extensions` and `timeout_secs`. Nothing is downloaded, guessed,
+  or resolved from `PATH` by ecosystem — a server is named or there is no server,
+  and a configured server that is not installed is a refusal naming it. Allowed in
+  a project-scoped `io.toml` for the reason `[[mcp]]` is: the boundary is the
+  `Act::Exec` check on the named binary, not the scope of the file that named it.
+  Unlike `[[mcp]]`, a misspelled key inside an `[[lsp]]` table is rejected by name.
+- **`lsp_symbols` is one tool with two behaviours** — no `query` is this file's
+  symbols, a `query` searches the workspace — because two schemas for one question
+  is prompt bytes on every request of every run.
+- **`lsp_rename` writes nothing.** The server resolves the rename across the
+  workspace and the tool answers with a **patch series** in `patch_file`'s own
+  format, which you apply per file: one `Act::Write` check per path,
+  all-or-nothing per file. A tool that wrote N files on a server's say-so would be
+  the multi-file write 0.51.0 excluded, with the additional property that this
+  crate did not compute the change.
+- **A server's diagnostics are appended to the project's own checker**, in `check`
+  and in the automatic post-edit note — never in place of it, because a language
+  server's analysis omits borrow-check errors, monomorphisation errors and every
+  lint, which are the errors a model writes. Pull only (`textDocument/diagnostic`,
+  `workspace/diagnostic`): push diagnostics have no completion signal, so an empty
+  result is indistinguishable from a slow one. A server that does not advertise the
+  capability says so rather than reporting nothing.
+- **`EventKind::LspStarted`**, once per configured server per run, carrying the
+  root it was told to index and how long its handshake took.
+- **`Error::Lsp`**, additive on an enum `#[non_exhaustive]` since 0.43.0.
+
+### Changed
+
+- **Every location a server returns passes the same `Act::Read` check `read_file`
+  passes**, and a location the policy denies reading is dropped from the answer
+  **with the omission counted in it**. A quietly shorter list is a wrong answer to
+  "who calls this": the model reads two call sites where there are three and
+  concludes it has seen them all. Only an outright `deny_read` omits — `Ask` does
+  not, because naming a path is not reading its contents. Stated plainly: the
+  server process itself has still indexed those files on disk. This crate can
+  refuse to carry those bytes into the model's context; it cannot stop a server
+  reading a directory it was pointed at.
+- **An empty answer from a server that has not finished starting up is not
+  believed.** The protocol has no readiness signal and a busy server answers `[]`
+  rather than erroring, so an empty result from a server not yet observed warm is
+  retried once its announced work settles, bounded by that server's own
+  `timeout_secs`. A server that announces no work at all is asked once more and
+  then believed.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+- **A language server is spawned only after an `Act::Exec` check on its program**,
+  through the same gate an `[[mcp]]` stdio server passes, and a refusal happens
+  **before** any spawn is attempted. A denied server ends the run with
+  `Error::Refused` rather than being skipped: silently navigating by text search
+  while the operator believes a language server is answering is the worse failure,
+  because the run looks successful.
+
 ## [0.51.0] - 2026-08-12
 
 ### Added
