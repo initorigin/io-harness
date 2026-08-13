@@ -1270,7 +1270,7 @@ versions:
       `read_file` uses, omissions are counted and named, and what remains true — that the server
       process itself indexed those bytes — is the sentence in the documentation.
     detail: specified
-    status: planned
+    status: released
   - version: 0.53.0
     outcome: >
       An agent can drive a real browser and see what it did: navigate, click, type, scroll, read the
