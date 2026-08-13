@@ -9522,6 +9522,14 @@ async fn dispatch(
     // 0.42.0 — the operator's own `before_tool` checks, or `None`.
     hooks: Option<&crate::hooks::Hooks>,
 ) -> Result<Dispatched> {
+    // The browser session is threaded to every dispatch site unconditionally, so
+    // the call sites need no `#[cfg]`; without the feature the arm that reads it
+    // is compiled out and the parameter is genuinely unused. Named here rather
+    // than silenced with an attribute on the whole function, which would also
+    // hide a real unused variable.
+    #[cfg(not(feature = "browser"))]
+    let _ = browser;
+
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
     // Announced before the call is made, so a watcher sees what the run is about

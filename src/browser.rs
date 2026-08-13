@@ -23,8 +23,8 @@
 //! # Where the policy is enforced
 //!
 //! Every *document* navigation the browser attempts is paused at the browser and
-//! answered from the run's own [`Policy`](crate::Policy) as an
-//! [`Act::Net`](crate::Act::Net) check against its `host:port`. The check is at
+//! answered from the run's own [`Policy`] as an [`Act::Net`] check against its
+//! `host:port`. The check is at
 //! the paused request rather than at the URL a tool was handed, and the difference
 //! is the whole claim: a click on a link, a redirect and a script assigning
 //! `location` are all navigations the model never typed, and all three are gated
@@ -38,7 +38,7 @@
 //!
 //! # What is written over `AsyncRead + AsyncWrite`
 //!
-//! [`Client`] takes a duplex pair, not a child process. Framing, correlation and
+//! The client takes a duplex pair, not a child process. Framing, correlation and
 //! the navigation gate are therefore driven in tests by a fixture browser this
 //! repository writes, over [`tokio::io::duplex`] — one that answers out of order,
 //! floods events between a request and its answer, and records whether it was told
