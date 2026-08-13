@@ -1316,22 +1316,23 @@ impl Config {
     /// execute and `io.toml` arrives with a `git clone` — the same rule that
     /// refuses `[[hook]]` there, for the same reason.
     ///
+    /// Write it in `io.local.toml` or the user-scope file, which
+    /// [`Config::discover`] reads; there is no project-scope route to a browser.
+    ///
     /// ```
     /// use io_harness::Config;
     ///
-    /// let config = Config::from_toml_local(r#"
-    ///     [browser]
-    ///     binary = "/usr/bin/chromium"
-    ///     headless = true
-    /// "#).unwrap();
-    /// assert_eq!(config.browser().unwrap().binary.as_deref(), Some("/usr/bin/chromium"));
-    ///
-    /// // The same table in the project scope is refused by name.
+    /// // The project scope refuses the table by name, before anything is run.
     /// let err = Config::from_toml(r#"
     ///     [browser]
     ///     binary = "/usr/bin/chromium"
     /// "#).unwrap_err();
     /// assert!(err.to_string().contains("browser"), "{err}");
+    ///
+    /// // A configuration that declares none simply has none — the default, and
+    /// // what keeps a run byte-identical to one built before this release.
+    /// let plain = Config::from_toml("[run]\nmax_steps = 3\n").unwrap();
+    /// assert!(plain.browser().is_none());
     /// ```
     #[cfg(feature = "browser")]
     #[cfg_attr(docsrs, doc(cfg(feature = "browser")))]
