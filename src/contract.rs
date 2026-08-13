@@ -245,6 +245,14 @@ pub struct TaskContract {
     /// no server is byte-identical, in composed prompt and in trace, to one on
     /// 0.51.0. Workspace mode only, for the reason [`mcp`](Self::mcp) is.
     pub lsp: Vec<crate::lsp::LspServer>,
+    /// The browser this run may drive (0.53.0).
+    ///
+    /// `None` by default, and `None` means the six schemas are absent from the
+    /// catalogue entirely rather than present and refusing: a run that configures
+    /// no browser is byte-identical, in composed prompt and in trace, to one on
+    /// 0.52.0. No process is started until an action needs one.
+    #[cfg(feature = "browser")]
+    pub browser: Option<crate::browser::BrowserConfig>,
     /// Images handed to the agent alongside the goal, shown to the model on
     /// every step of the run.
     ///
@@ -513,6 +521,8 @@ impl TaskContract {
             max_retries: 2,
             mcp: Vec::new(),
             lsp: Vec::new(),
+            #[cfg(feature = "browser")]
+            browser: None,
             commit_identity: crate::tools::git::Identity::default(),
             #[cfg(feature = "media")]
             images: Vec::new(),
@@ -583,6 +593,8 @@ impl TaskContract {
             max_retries: 2,
             mcp: Vec::new(),
             lsp: Vec::new(),
+            #[cfg(feature = "browser")]
+            browser: None,
             commit_identity: crate::tools::git::Identity::default(),
             #[cfg(feature = "media")]
             images: Vec::new(),
@@ -679,6 +691,34 @@ impl TaskContract {
         I: IntoIterator<Item = crate::lsp::LspServer>,
     {
         self.lsp = servers.into_iter().collect();
+        self
+    }
+
+    /// Drive a real browser (0.53.0).
+    ///
+    /// The browser is authorized before it is started — spawning one is an
+    /// [`Act::Exec`](crate::Act::Exec) check on its binary — so configuring one
+    /// here does not grant access to it. Every document navigation it then
+    /// attempts is an [`Act::Net`](crate::Act::Net) check against the host, including
+    /// the navigations a click, a redirect or a script causes rather than only the
+    /// ones a tool was handed.
+    ///
+    /// Nothing is downloaded: the browser is one already installed, named here or
+    /// resolved from a documented list, and its absence is a refusal.
+    ///
+    /// ```
+    /// use io_harness::{BrowserConfig, TaskContract};
+    ///
+    /// let contract = TaskContract::workspace("check the login page renders", "/repo")
+    ///     .with_browser(BrowserConfig::default().with_viewport(1440, 900));
+    ///
+    /// assert!(contract.browser.is_some());
+    /// ```
+    #[cfg(feature = "browser")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "browser")))]
+    #[must_use]
+    pub fn with_browser(mut self, browser: crate::browser::BrowserConfig) -> Self {
+        self.browser = Some(browser);
         self
     }
 

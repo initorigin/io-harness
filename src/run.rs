@@ -32,6 +32,25 @@ use crate::context::{
 use crate::contract::{Preset, SystemPrompt, TaskContract};
 use crate::error::{Error, Result};
 use crate::lsp::LspSession;
+#[cfg(feature = "browser")]
+use crate::tools::browser::BrowserSession;
+
+/// The browser session a run carries when the feature is compiled out.
+///
+/// A shim rather than a `#[cfg]` at each of the ten sites that thread the real
+/// one: the threading is identical either way, and the difference that actually
+/// exists — whether any browser behaviour is reachable — lives in the two places
+/// that read `configured()`.
+#[cfg(not(feature = "browser"))]
+pub(crate) struct BrowserSession;
+
+#[cfg(not(feature = "browser"))]
+impl BrowserSession {
+    fn configured(&self) -> bool {
+        false
+    }
+    async fn shutdown(&self) {}
+}
 use crate::mcp::McpSession;
 use crate::net::{self, NetGuard};
 use crate::observe::{EventKind, Ignore, Observer, RunEvent};
@@ -1299,13 +1318,15 @@ pub(crate) async fn run_with_extras<P: Provider>(
         Some(root) => {
             let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
             let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
+            let browser = browser_for(contract, policy);
             let result = run_workspace_from(
-                contract, provider, store, run_id, &root, 1, policy, approver, &mcp, &lsp, &skills,
-                watch, extras,
+                contract, provider, store, run_id, &root, 1, policy, approver, &mcp, &lsp,
+                &browser, &skills, watch, extras,
             )
             .await;
             mcp.shutdown(store, run_id, watch).await;
             lsp.shutdown().await;
+            browser.shutdown().await;
             result
         }
         // Single-file mode has no policy-aware tool layer in 0.4.0. Silently
@@ -2262,6 +2283,7 @@ pub async fn resume_with_observed<P: Provider>(
             };
             let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
             let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
+            let browser = browser_for(contract, policy);
             let result = run_workspace_from(
                 contract,
                 provider,
@@ -2273,6 +2295,7 @@ pub async fn resume_with_observed<P: Provider>(
                 approver,
                 &mcp,
                 &lsp,
+                &browser,
                 &skills,
                 watch,
                 &TurnExtras::default(),
@@ -2280,6 +2303,7 @@ pub async fn resume_with_observed<P: Provider>(
             .await;
             mcp.shutdown(store, run_id, watch).await;
             lsp.shutdown().await;
+            browser.shutdown().await;
             result
         }
         // The same refusal [`run_with_observed`] makes, for the same reason:
@@ -2513,6 +2537,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
             let remember = remember.clone();
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let lsp = lsp_for(contract, &effective, store, run_id, watch).await?;
+            let browser = browser_for(contract, &effective);
             let result = run_workspace_from(
                 contract,
                 provider,
@@ -2524,6 +2549,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
                 approver,
                 &mcp,
                 &lsp,
+                &browser,
                 &skills,
                 watch,
                 &TurnExtras::default(),
@@ -2531,6 +2557,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
             .await;
             mcp.shutdown(store, run_id, watch).await;
             lsp.shutdown().await;
+            browser.shutdown().await;
             result.map(|r| r.with_remembered(remember))
         }
         Decision::Approve { modified, remember } => {
@@ -2598,6 +2625,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
             // Continue the run under its original id, from the next step.
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let lsp = lsp_for(contract, &effective, store, run_id, watch).await?;
+            let browser = browser_for(contract, &effective);
             let result = run_workspace_from(
                 contract,
                 provider,
@@ -2609,6 +2637,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
                 approver,
                 &mcp,
                 &lsp,
+                &browser,
                 &skills,
                 watch,
                 &TurnExtras::default(),
@@ -2616,6 +2645,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
             .await;
             mcp.shutdown(store, run_id, watch).await;
             lsp.shutdown().await;
+            browser.shutdown().await;
             result.map(|r| r.with_remembered(remember))
         }
     }
@@ -2846,9 +2876,11 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             );
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let lsp = lsp_for(contract, &effective, store, run_id, watch).await?;
+            let browser = browser_for(contract, &effective);
             let tree = Tree {
                 mcp: &mcp,
                 lsp: &lsp,
+                browser: &browser,
                 tools: &contract.tools,
                 skills: &skills,
                 agents: &contract.agents,
@@ -2869,6 +2901,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
             lsp.shutdown().await;
+            browser.shutdown().await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember.clone()))
         }
         Decision::Approve { modified, remember } => {
@@ -2942,9 +2975,11 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             );
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let lsp = lsp_for(contract, &effective, store, run_id, watch).await?;
+            let browser = browser_for(contract, &effective);
             let tree = Tree {
                 mcp: &mcp,
                 lsp: &lsp,
+                browser: &browser,
                 tools: &contract.tools,
                 skills: &skills,
                 agents: &contract.agents,
@@ -2965,6 +3000,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
             lsp.shutdown().await;
+            browser.shutdown().await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember))
         }
     }
@@ -4386,6 +4422,7 @@ async fn run_workspace_from<P: Provider>(
     approver: &dyn Approver,
     mcp: &McpSession,
     lsp: &LspSession,
+    browser: &BrowserSession,
     skills: &Skills,
     watch: &Watch<'_>,
     extras: &TurnExtras<'_>,
@@ -4417,6 +4454,10 @@ async fn run_workspace_from<P: Provider>(
     let mut extra = contract.tools.specs();
     extra.extend(mcp.tool_specs());
     extra.extend(lsp_tools(lsp));
+    #[cfg(feature = "browser")]
+    if browser.configured() {
+        extra.extend(crate::tools::browser::browser_tools());
+    }
     extra.extend(skill_tool(skills));
     // 0.45.0 — composed once, here, and reused on every step. A system prompt that
     // varied between steps would move 0.38.0's cache breakpoint every turn and bill
@@ -4576,6 +4617,8 @@ async fn run_workspace_from<P: Provider>(
     let egress = start_egress_proxy(policy, containment.as_ref()).await;
     let containment = match (&containment, &egress) {
         (Some(c), Some((proxy, _, _))) => {
+            #[cfg(feature = "browser")]
+            browser.route_through(proxy.addr());
             Some(std::sync::Arc::new(c.with_proxy(Some(proxy.addr()))))
         }
         _ => containment,
@@ -5018,6 +5061,7 @@ async fn run_workspace_from<P: Provider>(
                         step,
                         mcp,
                         lsp,
+                        browser,
                         &contract.tools,
                         skills,
                         entry_cap,
@@ -5383,6 +5427,21 @@ fn at(a: &serde_json::Value) -> std::result::Result<(u32, u32), String> {
 /// model adapts to, the way it adapts to a refused path or a bad regex. What it
 /// must never be is empty — an empty answer to "who calls this" reads as "nobody
 /// does".
+/// Turn a screenshot's base64 into the media the next request carries.
+///
+/// The browser hands back base64 and the media path takes bytes, so this is the
+/// one place the two meet. A screenshot that will not decode is dropped with its
+/// reason rather than failing the action: the text half of the answer is still
+/// worth having.
+#[cfg(feature = "browser")]
+fn decode_screenshot(encoded: &str) -> std::result::Result<crate::provider::Media, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("the browser sent an unreadable screenshot: {e}"))?;
+    crate::provider::Media::image("image/png", &bytes).map_err(|e| e.to_string())
+}
+
 fn navigated(name: &str, answer: Result<String>, cap: usize) -> Dispatched {
     let obs = match answer {
         Ok(text) => format!("\n[{name}]\n{text}\n"),
@@ -5496,6 +5555,21 @@ async fn lsp_for(
     LspSession::connect(&contract.lsp, policy, &root, store, run_id, watch).await
 }
 
+/// The browser session for one run, which starts no process.
+///
+/// Lazy by design, unlike `lsp_for`: a language server has an index worth warming
+/// while the model composes, and a browser has nothing to warm. A run that
+/// configures one and never browses pays for no process at all.
+#[cfg(feature = "browser")]
+fn browser_for(contract: &TaskContract, _policy: &Policy) -> BrowserSession {
+    BrowserSession::new(contract.browser.clone())
+}
+
+#[cfg(not(feature = "browser"))]
+fn browser_for(_contract: &TaskContract, _policy: &Policy) -> BrowserSession {
+    BrowserSession
+}
+
 /// Shared context for one agent tree: everything every agent in the tree
 /// draws on — the provider, the store, the one approver, the shared spend
 /// ledger, the containment caps, and the workspace root.
@@ -5508,6 +5582,10 @@ struct Tree<'a, P: Provider> {
     /// shared: a server is a stateful process with one index, and a child agent
     /// asking where a symbol is defined is asking the same server its parent did.
     lsp: &'a LspSession,
+    /// One browser for the whole tree, for the reason `mcp` and `lsp` are shared:
+    /// it is a stateful process, and a child agent looking at a page is looking
+    /// at the page its parent left open.
+    browser: &'a BrowserSession,
     /// The caller's registered tools, shared by the whole tree. A child is
     /// offered exactly what its parent was: inheritance grants the tool, and the
     /// child's own narrowed policy still decides each call. Carried here rather
@@ -5962,9 +6040,11 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
     };
     let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
     let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
+    let browser = browser_for(contract, policy);
     let tree = Tree {
         mcp: &mcp,
         lsp: &lsp,
+        browser: &browser,
         tools: &contract.tools,
         skills: &skills,
         agents: &contract.agents,
@@ -5985,6 +6065,7 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
     let outcome = run_agent(&tree, contract, run_id, 0, policy, 1, None).await;
     mcp.shutdown(store, run_id, watch).await;
     lsp.shutdown().await;
+    browser.shutdown().await;
     Ok(RunResult::new(outcome?, run_id))
 }
 
@@ -6175,9 +6256,11 @@ pub async fn resume_tree_observed<P: Provider>(
     };
     let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
     let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
+    let browser = browser_for(contract, policy);
     let tree = Tree {
         mcp: &mcp,
         lsp: &lsp,
+        browser: &browser,
         tools: &contract.tools,
         skills: &skills,
         agents: &contract.agents,
@@ -6198,6 +6281,7 @@ pub async fn resume_tree_observed<P: Provider>(
     let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step, None).await;
     mcp.shutdown(store, run_id, watch).await;
     lsp.shutdown().await;
+    browser.shutdown().await;
     Ok(RunResult::new(outcome?, run_id))
 }
 
@@ -6669,6 +6753,10 @@ where
         let mut extra = tree.tools.specs();
         extra.extend(tree.mcp.tool_specs());
         extra.extend(lsp_tools(tree.lsp));
+        #[cfg(feature = "browser")]
+        if tree.browser.configured() {
+            extra.extend(crate::tools::browser::browser_tools());
+        }
         extra.extend(skill_tool(tree.skills));
         // A role is PREPENDED, never a replacement: the tree prompt is what tells an
         // agent how to use its tools and that its result composes back into its
@@ -6778,6 +6866,8 @@ where
         let egress = start_egress_proxy(policy, containment.as_ref()).await;
         let containment = match (&containment, &egress) {
             (Some(c), Some((proxy, _, _))) => {
+                #[cfg(feature = "browser")]
+                tree.browser.route_through(proxy.addr());
                 Some(std::sync::Arc::new(c.with_proxy(Some(proxy.addr()))))
             }
             _ => containment,
@@ -7132,6 +7222,7 @@ where
                     step,
                     tree.mcp,
                     tree.lsp,
+                    tree.browser,
                     tree.tools,
                     tree.skills,
                     entry_cap,
@@ -9394,6 +9485,7 @@ async fn dispatch(
     step: u32,
     mcp: &McpSession,
     lsp: &LspSession,
+    browser: &BrowserSession,
     custom: &Toolbox,
     skills: &Skills,
     cap: usize,
@@ -10463,6 +10555,161 @@ async fn dispatch(
             }
             let ask = crate::lsp::Nav::Symbols { path, query };
             navigated(&call.name, lsp.navigate(ask, ws, run_id, watch).await, cap)
+        }
+        #[cfg(feature = "browser")]
+        name if crate::tools::browser::is_browser_tool(name) => {
+            use crate::tools::browser::Action;
+            let need = |what: &str, why: &str| {
+                Dispatched::go(
+                    format!("{name} missing {what}"),
+                    format!("\n[{name} error] {why}\n"),
+                )
+            };
+            let action =
+                match name {
+                    crate::tools::BROWSER_NAVIGATE_TOOL => {
+                        match s("url").filter(|u| !u.trim().is_empty()) {
+                            Some(url) => Action::Navigate {
+                                url: url.to_string(),
+                            },
+                            None => return Ok(need("url", "browser_navigate needs a \"url\"")),
+                        }
+                    }
+                    crate::tools::BROWSER_READ_TOOL => Action::Read {
+                        selector: s("selector")
+                            .filter(|v| !v.trim().is_empty())
+                            .map(str::to_string),
+                    },
+                    crate::tools::BROWSER_SCREENSHOT_TOOL => Action::Screenshot,
+                    crate::tools::BROWSER_CLICK_TOOL => {
+                        match s("selector").filter(|v| !v.trim().is_empty()) {
+                            Some(selector) => Action::Click {
+                                selector: selector.to_string(),
+                            },
+                            None => return Ok(need(
+                                "selector",
+                                "browser_click needs a CSS \"selector\" for the element to click",
+                            )),
+                        }
+                    }
+                    crate::tools::BROWSER_TYPE_TOOL => {
+                        let Some(selector) = s("selector").filter(|v| !v.trim().is_empty()) else {
+                            return Ok(need("selector", "browser_type needs a CSS \"selector\""));
+                        };
+                        match s("text") {
+                            Some(text) => Action::Type {
+                                selector: selector.to_string(),
+                                text: text.to_string(),
+                            },
+                            None => return Ok(need("text", "browser_type needs \"text\" to type")),
+                        }
+                    }
+                    _ => Action::Scroll {
+                        dy: a.get("dy").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                    },
+                };
+
+            let acted = match browser.act(action, ws.policy(), store, run_id, watch).await {
+                Ok(acted) => acted,
+                // The browser could not be started at all — a configuration
+                // failure, not an action failure.
+                Err(e) => {
+                    return Ok(Dispatched::go(
+                        "browser unavailable",
+                        format!("\n[{name} unavailable] {e}\n"),
+                    ))
+                }
+            };
+
+            if let Some(started) = acted.started {
+                watch.emit(crate::observe::RunEvent::new(
+                    run_id,
+                    step,
+                    crate::observe::EventKind::BrowserStarted {
+                        binary: started.binary,
+                        headless: started.headless,
+                        ready_ms: u64::try_from(started.ready_ms).unwrap_or(u64::MAX),
+                    },
+                ));
+            }
+            // One row per navigation the browser attempted, including the ones
+            // this call never named.
+            let refused: Vec<String> = acted
+                .decisions
+                .iter()
+                .filter(|d| !d.permitted)
+                .map(|d| match &d.rule {
+                    Some(rule) => format!("{} (rule {rule})", d.target),
+                    None => d.target.clone(),
+                })
+                .collect();
+            for decision in &acted.decisions {
+                watch.emit(crate::observe::RunEvent::new(
+                    run_id,
+                    step,
+                    crate::observe::EventKind::BrowserNavigated {
+                        host: decision.target.clone(),
+                        permitted: decision.permitted,
+                    },
+                ));
+            }
+
+            // A refusal is reported as a refusal, whatever the browser called it.
+            // The blocked load surfaces from the protocol as an opaque network
+            // error, and handing the model that instead of the boundary's own
+            // words would tell it nothing about what to change.
+            if !refused.is_empty() {
+                return Ok(Dispatched::go(
+                    format!("browser navigation refused: {}", refused.join(", ")),
+                    format!(
+                        "\n[{name} refused] net to {} is not permitted by this run's policy. \
+                         This applies to every navigation the page attempts, including ones a \
+                         click or a redirect causes.\n",
+                        refused.join(", ")
+                    ),
+                ));
+            }
+
+            match acted.outcome {
+                Ok(outcome) => {
+                    let mut obs = format!("\n[{name}]\n{}\n", outcome.text);
+                    if let Some(encoded) = outcome.image {
+                        match decode_screenshot(&encoded) {
+                            Ok(media) => {
+                                obs = format!(
+                                    "\n[{name}]\n{}\nattached to the next request \
+                                     ({} bytes, digest {})\n",
+                                    outcome.text,
+                                    media.byte_len(),
+                                    media.digest()
+                                );
+                                pending_media.push(media);
+                            }
+                            Err(e) => {
+                                obs = format!(
+                                    "\n[{name}]\n{}\n[screenshot dropped] {e}\n",
+                                    outcome.text
+                                )
+                            }
+                        }
+                    }
+                    Dispatched::Continue {
+                        decision: format!("drove the browser: {name}"),
+                        obs: bound(&obs, cap, ObsKind::Tool),
+                        kind: ObsKind::Tool,
+                        target: None,
+                        // Looking at a page changes nothing in the workspace, so
+                        // it is not progress for the stall signal — the same
+                        // reasoning `check` and the navigation tools follow.
+                        changed: false,
+                        remember: Vec::new(),
+                    }
+                }
+                Err(e) => Dispatched::go(
+                    format!("browser action failed: {name}"),
+                    format!("\n[{name} error] {e}\n"),
+                ),
+            }
         }
         SHELL_TOOL => {
             let line_src = s("line").unwrap_or_default();

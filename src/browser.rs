@@ -275,11 +275,28 @@ const MAX_LINE_BYTES: usize = 2_000;
 /// narrowing that replaced it.
 pub(crate) struct NavGate {
     policy: Policy,
-    /// Every decision made, in order: the target and whether it was permitted.
-    /// Read by the tool layer to write one event per navigation, which is what
-    /// makes the boundary auditable — every place the browser went, and every
-    /// place it was stopped from going.
-    decisions: Mutex<Vec<(String, bool)>>,
+    /// Every decision made, in order. Read by the tool layer to write one event
+    /// per navigation, which is what makes the boundary auditable — every place
+    /// the browser went, and every place it was stopped from going, including the
+    /// ones the model never typed.
+    decisions: Mutex<Vec<Decision>>,
+}
+
+/// One navigation decision, with what decided it.
+///
+/// The rule and the layer are carried rather than re-derived: a refusal the model
+/// reads must name what to change, and asking the policy again later could answer
+/// differently after a plan gate has narrowed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Decision {
+    /// The `host:port` the policy decided about.
+    pub(crate) target: String,
+    /// Whether the navigation was allowed to proceed.
+    pub(crate) permitted: bool,
+    /// The glob that decided, or `None` when the tier default did.
+    pub(crate) rule: Option<String>,
+    /// The layer the deciding rule came from.
+    pub(crate) layer: Option<String>,
 }
 
 impl NavGate {
@@ -296,23 +313,28 @@ impl NavGate {
     /// `Act::Net`: there is nobody to ask inside a paused request, and a
     /// navigation is not undoable once the bytes are in the page.
     pub(crate) fn permits(&self, url: &str) -> bool {
-        let target = target_of(url);
-        let permitted = match target.as_deref() {
-            // A URL with no host — `about:blank`, and the `data:` URLs the tests
-            // use — reaches no network and is not a network decision. Recording
-            // it would fill the trace with rows about nothing.
-            None => return true,
-            Some(t) => self.policy.check(Act::Net, t).effect == Effect::Allow,
+        // A URL with no host — `about:blank`, and the `data:` URLs the tests use
+        // — reaches no network and is not a network decision. Recording it would
+        // fill the trace with rows about nothing.
+        let Some(target) = target_of(url) else {
+            return true;
         };
+        let verdict = self.policy.check(Act::Net, &target);
+        let permitted = verdict.effect == Effect::Allow;
         self.decisions
             .lock()
             .expect("navigation decisions are not poisoned")
-            .push((target.unwrap_or_default(), permitted));
+            .push(Decision {
+                target,
+                permitted,
+                rule: verdict.rule,
+                layer: verdict.layer,
+            });
         permitted
     }
 
     /// Take the decisions recorded so far.
-    pub(crate) fn drain(&self) -> Vec<(String, bool)> {
+    pub(crate) fn drain(&self) -> Vec<Decision> {
         std::mem::take(
             &mut *self
                 .decisions
@@ -808,6 +830,11 @@ impl Browser {
     /// The gate, for draining the navigation decisions into events.
     pub(crate) fn gate(&self) -> &Arc<NavGate> {
         &self.gate
+    }
+
+    /// The viewport this page renders and screenshots at.
+    pub(crate) fn viewport(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
     }
 
     /// Send one command to the attached page.
@@ -1333,12 +1360,19 @@ mod tests {
         // paused request, and a navigation is not undoable once it has happened.
         assert!(!gate.permits("https://other.example.com/page"));
         let decisions = gate.drain();
+        let seen: Vec<(String, bool)> = decisions
+            .iter()
+            .map(|d| (d.target.clone(), d.permitted))
+            .collect();
         assert_eq!(
-            decisions,
+            seen,
             vec![
                 ("good.example.com:443".to_string(), true),
                 ("other.example.com:443".to_string(), false),
             ]
         );
+        // A refusal carries what to change, so the model is told the rule rather
+        // than only that it was stopped.
+        assert_eq!(decisions[0].rule.as_deref(), Some("good.example.com"));
     }
 }
