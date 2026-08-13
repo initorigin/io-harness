@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.53.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -566,3 +566,158 @@ open_questions:
   warms it while the model composes, as the LSP session does; starting late means a run that never
   browses never pays. The plan is lazy, because unlike a language server the browser has no index to
   warm and a run that configures one may still not use it.
+
+released_at: 2026-08-13T21:30:00Z
+mode: published
+delivered: >
+  An agent drives a real browser and sees what it did. Six tools behind a `browser`
+  cargo feature that is not in `default` — `browser_navigate`, `browser_read`,
+  `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll` — with the
+  console output and uncaught page errors each action produced riding that action's
+  own observation rather than a tool the model must remember to call.
+
+  **The transport was measured before it was specified, and that is why this
+  contract could be exact.** A spike drove the installed browser over the pipe pair
+  and completed the whole round trip before a line of the release was planned. Three
+  facts came back and went into the scope rather than being discovered during
+  implementation: the framing is one JSON object terminated by a single NUL; a child
+  whose descriptors are absent says so by name and exits; and an uncaught page error
+  carries the useless text `Uncaught`, with the readable message in the exception's
+  own description. A client written against the first guess would have reported every
+  page error as the word `Uncaught`.
+
+  **THE DECISION THAT DEFINES IT: the gate is at the paused request, not at the
+  tool's argument.** Checking the URL the model typed is easy, passes every test that
+  only navigates by tool call, and leaves a click able to take the browser anywhere.
+  F3 and F4 are two criteria with two sabotages for exactly that reason.
+
+  **No new dependency, and the reason is a boundary argument rather than a budget
+  one.** A remote debugging port is a TCP listener any other local process can drive
+  with full control of the browser. The pipe transport opens none — and it happens to
+  need no websocket client, no TLS to localhost and no protocol crate, so `cargo
+  tree` is unmoved at 402.
+evidence:
+  tests:
+  - >
+    **Default suite, locally: 83 binaries / 1,684 passed.** 0.52.0 was 82 / 1,684, so
+    the default build gains **one binary and zero tests** — `tests/browser.rs` is
+    `#![cfg(all(feature = "browser", unix))]` and compiles to nothing without the
+    feature. That is the opt-in claim proved on numbers rather than asserted.
+  - >
+    **21 tests written for this release**: 10 unit tests over `tokio::io::duplex`
+    (framing on NUL, a message split mid-object and mid-multi-byte-character, two
+    messages in one chunk, a payload containing a newline, answers returned in
+    reverse order through a flood of events, a dead transport reported rather than
+    waited out) and 11 integration tests against a real child process speaking the
+    real protocol over the real descriptors.
+  - >
+    **The boundary assertions are made on what the browser was TOLD** — the fixture's
+    own record of `continue R1` and `fail R2 BlockedByClient` — rather than on the
+    error text the run produced. A build that reported a refusal it never enforced
+    satisfies the second and fails the first.
+  - >
+    **Twelve sabotage arms, every one killed by a named test.** S1 frame-on-newline
+    (killed as a HANG), S2 answer-is-next-message, S3 continue-every-request, S4
+    gate-the-argument, S5 missing-element-is-a-no-op, S6 drop-page-errors, S7
+    screenshot-as-text, S8b no-kill-on-drop-at-all, S9 fall-back-to-the-list, S10
+    register-unconditionally.
+  - >
+    **A live run against the installed browser (Google Chrome 151) checked six claims
+    and all six held**: the rendered text reached the model, the console output
+    reached it, an uncaught error arrived as its description rather than as
+    `Uncaught`, a dispatched click **actually changed the page**, a screenshot
+    arrived as an image, and a navigation to an unnamed host was refused. The click
+    is the one only a real browser can prove — a synthetic event a page may ignore
+    would leave the title untouched, and the fixture cannot tell the two apart.
+    **The live run found no defects**, recorded as a fact rather than passed over.
+  builds:
+  - >
+    `cargo fmt --check` exit 0. `cargo clippy --all-targets --all-features -D
+    warnings` exit 0, and `--features media` exit 0 — a third polarity that neither
+    the default build nor all-features exercises, and the one that caught an unused
+    parameter.
+  - >
+    `cargo tree` **402** lines, unchanged. `CHECKPOINT_FORMAT` unmoved at **7**.
+    `git diff main -- src/state.rs` **EMPTY** — no table, column or index.
+    `docs/public-api.txt` **+1 line** (`struct BrowserConfig`), which is the number
+    the contract named in advance under N4.
+  - >
+    `cargo package --locked` exit 0, **1,788,506 bytes**.
+  reviews:
+  - >
+    The nightly docs.rs gate found three errors stable `cargo doc` does not report,
+    all in the new module's doc block: a public module linking `Client`, which is
+    `pub(crate)`, and two `redundant explicit link target`s. A brand-new `pub mod`
+    tripping the private-intra-doc-links rule is the shape this gate exists for, and
+    it has now caught something in six of the last seven releases.
+  deployments:
+  - >
+    PR #154 (`feat/0.53.0` → `develop`). The three-platform matrix is the gate that
+    matters for this release and it ran there rather than locally: `test (ubuntu, all)`,
+    `test (macos, all)`, `test (*, default)`, all three doctest legs, `docs.rs
+    (nightly)`, `lint`, `msrv`, `examples (compile)`, `cross-version-0.29.0`,
+    `links-consumer` and `contained (ubuntu, userns restricted)`.
+  health_checks:
+  - >
+    A run that enables the feature and configures no browser starts no process,
+    registers no tool schema and emits no event — asserted by
+    `a_run_with_no_browser_configured_is_offered_no_browser_tools`, with
+    `a_configured_run_is_offered_exactly_the_six` as its other half so absence is
+    shown to be a decision rather than the tools never existing.
+  - >
+    No browser process survives its run, asserted on the process itself rather than
+    on a shutdown call having been issued.
+known_limitations:
+- >
+  **Windows is unsupported in 0.53.0, planned out rather than discovered out.** The
+  pipe transport needs two inherited descriptors at fixed numbers, which the standard
+  library does not expose there; every entry point returns a typed configuration
+  error naming the platform. Decided at specification time on the 0.47.0 precedent,
+  where the Windows half was cut only after ten matrix rounds.
+- >
+  **Subresources are not individually policy-checked.** Document navigations bound
+  where the browser *goes*; images, stylesheets, fonts and XHR are the page's own
+  traffic to a host already permitted. Under containment everything it sends takes
+  the run's egress proxy, but an uncontained run gets no per-asset decision.
+- >
+  **Console attribution slips by one action when an action FAILS.** `tools::browser::act`
+  drains the console while building its `Outcome`, so a failed action — a refused
+  navigation, a selector that matched nothing — returns before the drain and its
+  console lines attach to the NEXT action's observation. F6's claim holds for every
+  action that succeeded, which is what the criterion tests. Found by reading the code
+  rather than by a gate, and stated here rather than left for a consumer to find.
+- >
+  **F4's sabotage prediction was wrong, in the release's favour.** The contract said
+  gating the tool's argument would fail F4 while F3 still passed. It fails BOTH,
+  because F3 asserts on what the browser was told rather than on the refusal text —
+  an implementation that refuses at the argument never lets the request reach the
+  browser, so the browser is never told to fail it. F3 therefore already discriminates
+  gate placement; F4 adds the case with no `browser_navigate` call anywhere in the run.
+- >
+  **S8 SURVIVED its first form, and the claim proved over-determined.** Removing
+  `Drop`'s `start_kill` and `shutdown`'s `close` failed nothing, because the spawn also
+  sets tokio's own `kill_on_drop(true)` — a third guarantee that alone makes "no browser
+  process survives the run" true. Reported as a finding rather than propped up; S8b
+  removed all three and killed the named test. All three are kept, because they cover
+  different exits: a panic, a tidy end, and a dropped future.
+- >
+  **N6 was met in a different form.** It named a byte diff of the composed prompt; the
+  difference is asserted as the **tool list** instead — one test names the six schemas
+  exactly and sorted, another asserts no `browser_` name appears at all. Same claim at
+  the altitude the catalogue is built at, and it does not rot the way a whole-prompt
+  byte diff would.
+- >
+  **The all-features suite was not completed locally, and the reason is stated rather
+  than glossed.** The development volume was shared with another repository's build
+  that held eight of nine compile slots for hours; the local run was abandoned in
+  favour of CI, which ran the all-features suite on all three platforms. The default
+  suite, the sabotage pass, the live run, the packaging and every lint DID run locally.
+- >
+  **O1's three-platform matrix could not run locally at all** — every local gate is
+  macOS, and the Windows arm is the one that proves the refusal. It runs on the PRs.
+- >
+  **The record was sealed before the crates.io upload**, which follows both merges and
+  the GitHub Release.
+supersedes: 0.52.0
+next_recommended_version: 0.54.0
+immutable: true

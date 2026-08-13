@@ -1281,7 +1281,7 @@ versions:
       else. No binary is fetched at runtime: the browser is one already on the machine, named in
       `io.toml` or found on PATH, and its absence is a refusal rather than a download.
     detail: specified
-    status: planned
+    status: released
   - version: 0.54.0
     outcome: >
       A read starts before the model has finished speaking. The provider's stream already yields

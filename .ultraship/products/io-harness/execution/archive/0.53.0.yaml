@@ -1,0 +1,46 @@
+product: io-harness
+version: 0.53.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - "**No constraints are recorded for this workspace.** `ultraship state` reports `constraints:
+      null`, so this assessment is grounded in the repository's own condition, in the release
+      contract's own stated constraints, and in the twenty-two releases of measured history behind
+      it — never in a capacity figure, which UltraShip has no telemetry to supply."
+    - "**The transport was measured before the contract was written, which is what moves this off
+      `uncertain`.** A spike drove the installed browser over the pipe pair and completed the whole
+      round trip — handshake, attach, navigate, console, uncaught error, text read, PNG screenshot,
+      input dispatch. The riskiest unknown in the release was settled before any of it was planned,
+      and three facts it returned are written into the scope."
+    - "**The release adds a protocol, not an architecture.** Every structural piece it needs exists
+      and is reused rather than re-invented: the session shape and its run entry points are
+      `McpSession`/`LspSession`'s, the spawn gate is the shared `authorize_spawn`, the image path is
+      0.15.0's media staging, and the egress path under containment is 0.48.0's own proxy. The
+      genuinely new code is one module and one fixture."
+    - "**The contract's `no new runtime dependency` constraint forces the client to be written here,
+      and that is bounded work rather than uncertain work** — a NUL-framed JSON envelope and a dozen
+      request bodies over transport this crate already spawns."
+    - "**The contract's `no durable state` constraint removes the class of risk several recent
+      releases carried:** no DDL, no migration, no cross-version case that does not already exist.
+      `git diff main -- src/state.rs` being empty is a criterion rather than a hope."
+    - "**Verification does not depend on an installed browser.** The client is written over
+      `AsyncRead + AsyncWrite`, so every protocol, gating and lifetime claim is driven over
+      `tokio::io::duplex` by a fixture this repository writes and can make misbehave — faster than a
+      real browser and strictly more discriminating than one."
+  major_cost_drivers:
+    - "The request-interception gate: answering a paused navigation from the policy while events
+      continue to arrive on the same pipe, without deadlocking the navigation that is waiting on the
+      answer."
+    - The fixture browser, which is written before the client and must be wrong on purpose — answer
+      out of order, flood events, pause a navigation and never resume, report a selector that
+      matches nothing, and record whether it was told to continue or fail.
+    - Descriptor plumbing in a `pre_exec` closure, which is unsafe code running between fork and
+      exec where almost nothing is safe to call.
+    - Conditional tool registration, which touches a composed prompt several suites assert
+      byte-identical.
+    - The all-features build on a development volume that has filled twice in recent releases, now
+      carrying one more module and one more example.
+  recommended_scope_change: null
