@@ -82,6 +82,16 @@
 //! series the model applies with `patch_file`, one gate check per file. Configure
 //! no server and none of the five schemas exists.
 //!
+//! **Driving a browser.** Behind the `browser` feature, off by default, a run can
+//! open a page and use it — [`tools::BROWSER_NAVIGATE_TOOL`] and its five siblings
+//! — reading the text the page actually renders and taking a screenshot the model
+//! is shown. Console output and uncaught page errors ride the observation of the
+//! action that produced them. **Every document navigation is an [`Act::Net`] check
+//! against its host, decided at the paused request**, so a navigation a click or a
+//! script causes is gated by the same code as one the model typed. It speaks over a
+//! pipe on the child's own descriptors and opens no debugging port, and the browser
+//! is one already installed ([`BrowserConfig`]) — nothing is ever downloaded.
+//!
 //! **Commands, under the same boundary as everything else.** The agent runs the
 //! project's own build, tests, linter or package manager through an `exec` tool
 //! ([`tools::EXEC_TOOL`]) taking a fixed argv and never a shell string, so there
@@ -434,6 +444,9 @@
 pub mod agent;
 pub mod approve;
 pub mod attach;
+#[cfg(feature = "browser")]
+#[cfg_attr(docsrs, doc(cfg(feature = "browser")))]
+pub mod browser;
 pub mod config;
 pub mod containment;
 pub mod context;
@@ -466,6 +479,9 @@ pub use approve::{
     FixedResponder, ModelApprover, Plan, PlanGate, PlanGateNone, PlanReview, PlanStep, PlanVerdict,
     Question, Request, Responder, ResponderNone, StdinApprover, StdinPlanGate, StdinResponder,
 };
+#[cfg(feature = "browser")]
+#[cfg_attr(docsrs, doc(cfg(feature = "browser")))]
+pub use browser::BrowserConfig;
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
 pub use context::{Compaction, ContextBudget};

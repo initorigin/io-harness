@@ -1,569 +1,348 @@
 product: io-harness
-version: 0.52.0
+version: 0.53.0
 tasks:
-- id: US-IO-HARNESS-0.52.0-T01
-  summary: Write the LSP client — Content-Length framing, JSON-RPC correlation — over AsyncRead + AsyncWrite,
-    with the fixture server that misbehaves on purpose.
-  why_required: Every other task in the release sends a request through this client. A client correlated
-    by arrival order or framed by character count works against the first fixture written for it and fails
-    against every real server, so the fixture that answers out of order and interleaves notifications
-    is written before the client it tests.
+- id: US-IO-HARNESS-0.53.0-T01
+  summary: Write the CDP client — NUL framing, id correlation, an event route that stays live while a
+    request is outstanding — over AsyncRead + AsyncWrite, with the fixture browser that misbehaves on
+    purpose.
+  why_required: Every other task in the release sends a request through this client. A client that correlates
+    by arrival order deadlocks the moment a page emits events mid-request, which every real page does,
+    so the fixture that floods events and answers out of order is written before the client it tests.
   status: done
   depends_on: []
   acceptance_criteria:
-  - '**F1 — the client frames by bytes and the header terminator is `\r\n`.** The bytes the client writes
-    for a known request are asserted exactly: `Content-Length: N\r\n\r\n` followed by N bytes, with N
-    equal to the body''s **byte** length for a body containing a multi-byte character, and no other header.
-    Reading is asserted symmetrically over a stream that delivers a frame split across three chunks mid-header
-    and mid-body. Sabotage: split headers on `\n` and length the body in `chars`, under which the multi-byte
-    case and the split-chunk case fail and nothing else here does.
+  - '**F1 — the client frames on NUL and survives arbitrary chunking.** The bytes the client writes for
+    a known request are asserted exactly: one JSON object followed by a single `0x00`, with no length
+    header and no newline framing. Reading is asserted symmetrically over a stream that delivers three
+    messages in chunks split mid-object and mid-multi-byte-character, and over one message arriving in
+    a single chunk with two others. Sabotage: frame on newline instead of NUL, under which the chunked
+    cases and a message whose payload contains a newline fail, and nothing else here does.
 
     '
-  - '**F2 — a response is matched to its request by `id`, not by arrival.** Two requests are outstanding;
-    the fixture server sends `window/logMessage`, then `$/progress`, then answers the **second** request,
-    then the first. Each call receives its own answer, and neither notification is returned as one. Sabotage:
-    take the next message as the answer, under which both calls receive the wrong value and only this
-    fails.
-
-    '
-  - '**N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402** crates
-    on macOS and Linux. The framing, the JSON-RPC envelope and the six request bodies are written in this
-    crate over `serde_json` and `tokio`. An LSP types crate, a JSON-RPC crate or a client crate is a criterion
-    failure, not a trade-off.
+  - '**F2 — a response is matched to its request by `id` while events flood in.** Two requests are outstanding;
+    the fixture sends a burst of unsolicited events, answers the **second** request, more events, then
+    the first. Each call receives its own answer, neither event is returned as one, and the events still
+    reach the console drain. Sabotage: take the next message as the answer, under which both calls receive
+    the wrong value and only this fails.
 
     '
   files:
-  - src/lsp.rs
-  - src/lib.rs
-  - tests/lsp.rs
+  - src/browser.rs
+  - tests/browser.rs
+  - examples/browser_fixture.rs
   evidence:
-  - '9 unit tests in src/lsp.rs pass: cargo test --lib lsp:: — 9 passed, 0 failed.'
-  - 'F1 asserted on the bytes: frame("{}") is exactly b"Content-Length: 2\r\n\r\n{}", and a body of four
-    characters and seven bytes is lengthed 7. A frame delivered one byte at a time — every read landing
-    mid-header and mid-body — reads whole, and a Content-Type header a real server sends is skipped while
-    a header line with no colon is refused by name rather than skipped.'
-  - 'F2 asserted with the server answering in reverse order through an interleaved window/logMessage and
-    $/progress: both callers get their own answer. A server *request* (workspace/configuration) carries
-    an id and is answered null rather than mistaken for a response — asserted on the reply the server
-    received, which has a result and no method.'
-  - 'Two failure paths are named rather than waited out: a server that closes mid-request fails within
-    milliseconds under a 120s timeout with ''language server fix: ... closed its output'', and an error
-    response carries the server''s own message.'
-  - 'Sabotage F1 (length in chars + headers split on \n): 6 of 9 fail, including the byte-length and split-chunk
-    cases. Loud rather than surgical, because the two spellings the criterion names break framing in both
-    directions.'
-  - 'Sabotage F2 (route a response to the oldest pending id rather than its own): exactly 1 test fails
-    — answers_are_matched_by_id_through_interleaved_notifications — and the other 8 pass.'
-  - 'No dependency added: the framing, the JSON-RPC envelope and the correlation are ~330 lines in src/lsp.rs
-    over serde_json and tokio, both already in the default tree.'
-- id: US-IO-HARNESS-0.52.0-T02
-  summary: Add the [[lsp]] table to io.toml and the LspServer type beside McpServer.
-  why_required: A server is named in configuration or there is no server. Nothing in the release can be
-    reached without the table that declares one, and its project-scope rule is a boundary decision that
-    must be settled before anything spawns.
+  - 'src/browser.rs — the CDP client over AsyncRead + AsyncWrite: NUL framing, id correlation, an event
+    route that stays live while a request is outstanding.'
+  - 10 unit tests over tokio::io::duplex pass, including a message split mid-object and mid-multi-byte-character,
+    two messages in one chunk, a payload containing a newline, and answers returned in reverse order through
+    a flood of events.
+  - The framing, the startup failure mode and the `Uncaught` field were measured against the installed
+    browser in a spike BEFORE the contract was written, not discovered here.
+- id: US-IO-HARNESS-0.53.0-T02
+  summary: 'Launch the browser over a pipe pair on descriptors 3 and 4: binary resolution, the Act::Exec
+    spawn gate, kill-on-drop, the temporary profile, and the typed Windows refusal.'
+  why_required: The client is useless without a child to speak to, and the ways a child goes wrong — never
+    started, started and denied, outliving its run — are the release's safety claims rather than its plumbing.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.52.0-T01
+  - US-IO-HARNESS-0.53.0-T01
   acceptance_criteria:
-  - '**N3 — zero compile breaks, and the additions are enumerated rather than counted.** No existing public
-    item changes shape: no field is added to a constructed type, no trait method changes, no enum that
-    is not already `#[non_exhaustive]` gains a variant reachable by an exhaustive match outside the crate.
-    `EventKind` is additive as it has been since 0.13.0. `docs/public-api.txt` gains the enumerated crate-root
-    additions — `struct LspServer` and nothing else — stated as the enumerated additions rather than as
-    a line count, because that checker enumerates crate-root re-exports and a criterion promising a number
-    has been met in a different form in five of the last thirteen releases. The five tool-name constants
-    live in `tools` and add no line, as `PATCH_FILE_TOOL` does not.
+  - '**F8 — no browser process survives the run.** After a run that started a browser ends — normally,
+    and by being dropped mid-action — the child process is gone, asserted on the process rather than on
+    a shutdown call having been issued, and the temporary user-data directory is removed. Sabotage: remove
+    the kill-on-drop, under which the dropped-run arm fails and only this fails.
+
+    '
+  - '**F9 — a browser that is not installed is a refusal naming it, never a download.** A configured binary
+    that does not exist produces a typed configuration error naming the binary, no process is spawned,
+    and no network request of any kind is made by the crate. Sabotage: fall back to the first name on
+    the PATH list when the configured binary is missing, under which the naming assertion fails and only
+    this fails.
+
+    '
+  - '**F11 — on Windows the feature refuses cleanly.** Every entry point returns a typed configuration
+    error naming the platform, no process is spawned, and the rest of the crate is unaffected. Asserted
+    on the Windows leg of the matrix, which is the only place it can be.
+
+    '
+  files:
+  - src/browser.rs
+  - src/error.rs
+  - tests/browser.rs
+  evidence:
+  - 'src/browser.rs — launch over descriptors 3 and 4: both ends moved above 3/4 with F_DUPFD before dup2,
+    because duplicating straight onto them can clobber a pipe end.'
+  - Resolution, the shared Act::Exec spawn gate, a temporary profile the run removes, kill-on-drop, and
+    a typed Windows refusal.
+  - tests/browser.rs::a_missing_browser_is_a_refusal_naming_it and ::a_denied_browser_binary_starts_no_process
+    pass; the second asserts on the fixture never recording a start, not on the error text.
+- id: US-IO-HARNESS-0.53.0-T03
+  summary: Gate every document navigation at the paused request against the run's own Policy, and wire
+    browser_navigate on top of it.
+  why_required: This is the release's central claim. A browser that reaches any host the policy denies
+    is not a bounded capability, and the gate has to sit at the request for the claim to survive a navigation
+    the model did not type.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.53.0-T02
+  acceptance_criteria:
+  - '**F3 — a navigation to a denied host is stopped at the request and the run is told why.** Under a
+    policy permitting one host and denying another, `browser_navigate` at the denied host produces a refusal
+    observation naming the act, the target and the rule, the fixture records that the request was **failed
+    rather than continued**, and a `BrowserNavigated { permitted: false }` event is written. The permitted
+    host in the same run continues and loads. Both halves in one test, since the claim is the distinction.
+    Sabotage: continue every paused request, under which the denied half fails and only this fails.
+
+    '
+  - '**F4 — a navigation the model did not type is gated by the same mechanism.** A click on a link whose
+    target is a denied host, and a script-initiated navigation to one, are both stopped at the request
+    with the same event and the same refusal, with no `browser_navigate` call anywhere in the run. Sabotage:
+    gate the `browser_navigate` argument instead of the paused request — under which **F4 fails and F3
+    still passes**, which is the point of having both.
+
+    '
+  files:
+  - src/browser.rs
+  - src/tools/browser.rs
+  - src/run.rs
+  - tests/browser.rs
+  evidence:
+  - Every document navigation is paused and answered from the run's own Policy, from inside the message
+    loop — the only place that sees a navigation the model did not type.
+  - tests/browser.rs::a_navigation_to_a_denied_host_is_failed_at_the_request_and_a_permitted_one_continues
+    asserts on the fixture's own record of `continue R1` and `fail R2 BlockedByClient`.
+  - tests/browser.rs::a_navigation_a_click_causes_is_refused_by_the_same_gate makes NO browser_navigate
+    call at all and still records the refusal.
+- id: US-IO-HARNESS-0.53.0-T04
+  summary: browser_read, and the console and page-error capture that rides every action's observation.
+  why_required: Reading the rendered page is the outcome's first half, and an action whose console output
+    is discarded tells the model nothing about why the page did not change.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.53.0-T03
+  acceptance_criteria:
+  - '**F6 — console output and uncaught page errors reach the observation of the action that produced
+    them.** An action that causes a console message and an uncaught error produces an observation containing
+    both, labelled by kind, with the error''s readable description rather than the bare word `Uncaught`;
+    an action that causes neither says so rather than omitting the section. Sabotage: drop the exception
+    route and keep the console route, under which the error arm fails and the console arm passes — the
+    two arms are separately asserted for exactly this reason.
+
+    '
+  files:
+  - src/browser.rs
+  - src/tools/browser.rs
+  - tests/browser.rs
+  evidence:
+  - browser_read returns the text the page renders; console output and uncaught page errors ride the observation
+    of the action that produced them and add no tool.
+  - tests/browser.rs::console_output_and_page_errors_ride_the_action_that_produced_them asserts the two
+    arms separately, and ::an_action_that_produced_no_console_output_says_so asserts the empty case is
+    stated rather than omitted.
+  - The uncaught error is read from the exception's description, not from the `text` field the real browser
+    fills with the bare word `Uncaught`.
+- id: US-IO-HARNESS-0.53.0-T05
+  summary: browser_screenshot, staged through the existing media path so the model actually looks at the
+    image.
+  why_required: The screenshot is the evidence the text cannot give, and an image that is recorded but
+    never reaches the provider is the failure that looks like success.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.53.0-T04
+  acceptance_criteria:
+  - '**F7 — a screenshot reaches the model as an image.** `browser_screenshot` stages a PNG through the
+    existing media path and the next request carries it as image content, asserted on the outbound request
+    rather than on a stored row, because staging and sending are different bugs and only the first leaves
+    a row. The observation names the viewport. Sabotage: return the base64 as observation text instead
+    of staging it, under which the outbound-request assertion fails and only this fails.
+
+    '
+  files:
+  - src/browser.rs
+  - src/tools/browser.rs
+  - src/run.rs
+  - tests/browser.rs
+  evidence:
+  - browser_screenshot stages a PNG through 0.15.0's existing media path.
+  - tests/browser.rs::a_screenshot_is_sent_to_the_model_as_an_image asserts on the OUTBOUND request carrying
+    the image, not on a stored row — staging and sending are different bugs and only the first leaves
+    a row.
+- id: US-IO-HARNESS-0.53.0-T06
+  summary: browser_click, browser_type and browser_scroll — trusted input events at a resolved element,
+    and a typed failure when the selector matches nothing.
+  why_required: 'Without these the agent can look at a page and not use it. The no-match case is the one
+    that must fail loudly: a model that believes it clicked reasons forward from a state that never happened.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.53.0-T05
+  acceptance_criteria:
+  - '**F5 — a selector that matches nothing fails and names itself.** `browser_click` and `browser_type`
+    against a selector matching no element each return a typed failure naming the selector, no input event
+    is dispatched — asserted on the fixture never being asked to dispatch one — and the run continues.
+    A selector that matches produces a dispatched input event at the resolved box. Sabotage: treat a missing
+    element as a no-op success, under which both no-match assertions fail and only these do.
+
+    '
+  files:
+  - src/browser.rs
+  - src/tools/browser.rs
+  - tests/browser.rs
+  evidence:
+  - browser_click, browser_type and browser_scroll dispatch trusted input at an element resolved through
+    DOM.querySelector and DOM.getBoxModel.
+  - tests/browser.rs::a_selector_that_matches_nothing_fails_and_dispatches_no_input asserts both the named
+    failure and the ABSENCE of a dispatched event.
+  - 'The live run proves the click is trusted: it changed the page''s title, which a synthetic event a
+    page can ignore would not have done and the fixture cannot tell apart.'
+- id: US-IO-HARNESS-0.53.0-T07
+  summary: The [browser] config table with its project-scope refusal, the cargo feature, and tool registration
+    conditional on a configured browser.
+  why_required: The release is off by default twice over, and the negative control — a run that configures
+    nothing is byte-identical to the previous release — is what protects every existing consumer's cached
+    prompt prefix and trace.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.53.0-T06
+  acceptance_criteria:
+  - '**F10 — a run with no browser configured is this build''s run, byte for byte.** No tool schema in
+    the catalogue, no child process, no event, and a composed prompt byte-identical to the same run on
+    0.52.0. Asserted on the bytes, since this is the negative control the whole release rests on. Sabotage:
+    register the schemas unconditionally, under which the byte-identity assertion fails and only this
+    fails.
+
+    '
+  - '**N2 — the default build is unchanged.** With no features, the compiled tool catalogue, the composed
+    prompt and the dependency tree are byte-identical to 0.52.0''s, and `src/browser.rs` is not compiled
+    at all.
+
+    '
+  - '**N6 — the six schemas are the only prompt-byte change, and only for a configured run.** The difference
+    between a configured and an unconfigured run''s composed prompt is exactly those six schemas, asserted
+    as a diff rather than as a size.
 
     '
   files:
   - src/config.rs
-  - src/lsp.rs
+  - Cargo.toml
   - src/lib.rs
+  - src/run.rs
   - tests/config.rs
-  evidence:
-  - cargo test --test config — 51 passed, 0 failed, including the three new [[lsp]] tests.
-  - 'The table is accepted in the project scope and reaches the contract through Config::apply_to, asserted
-    on both the Config accessor and contract.lsp. The project-scope rule is unchanged: [[lsp]] is not
-    in PROJECT_WIDENING and not refused whole like [[hook]], for the reason src/config.rs already states
-    of [[mcp]] — the boundary is the Act::Exec check on the named binary.'
-  - 'A misspelled key is rejected naming it: LspServer carries #[serde(deny_unknown_fields)], which McpServer
-    cannot because #[serde(flatten)] forbids it. This closes the standing [[mcp]] hole for the new table
-    rather than inheriting it.'
-  - '[[lsp]] is deliberately NOT in APPENDING: a_narrower_scope_replaces_the_lsp_set_whole asserts the
-    project file''s set replaces the user file''s rather than concatenating.'
-  - 'N3 — zero breaks. TaskContract is #[non_exhaustive] (since 0.35.0) so the added lsp field breaks
-    no builder; Error is #[non_exhaustive] (since 0.43.0) so Error::Lsp breaks no match. docs/public-api.txt
-    gains exactly one line, ''struct LspServer src/lsp.rs'', and tests/public_api.rs passes: 9 passed,
-    including every_public_item_has_a_worked_example and public_surface_matches_snapshot.'
-  - 'cargo test --doc lsp — 3 passed: the LspServer, Config::lsp_servers and TaskContract::with_lsp examples.'
-- id: US-IO-HARNESS-0.52.0-T03
-  summary: 'LspSession: gate the argv with authorize_spawn, spawn, hand it initialize in the background,
-    and shut it down at every run entry point.'
-  why_required: The spawn gate is one of the release's two bounds, and a child that outlives its run is
-    the defect a second session threaded through nine call sites is most likely to introduce. An unready
-    or dead server must be unknown-and-why here, before any tool depends on it.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.52.0-T02
-  acceptance_criteria:
-  - '**F5 — a denied server spawns no process, and the run fails typed.** Under a policy denying `Act::Exec`
-    on the configured server''s program, the run returns `Error::Refused` naming the act, the target,
-    the rule and the layer, **no child process is created** — asserted by a wrapper the test can observe
-    rather than by the error text — and a `PolicyEvent` refusal row is written. Under a policy that allows
-    it, the same configuration starts and answers. Both halves in one test, since the claim is the distinction.
-    Sabotage: spawn before the check, under which the no-process assertion fails and only this fails.
-
-    '
-  - '**F9 — an unready or dead server is unknown-and-why, not empty.** A fixture that never completes
-    `initialize`, and a fixture that exits after the handshake, each produce `Outcome::Failed` whose reason
-    names the server and what happened, within the configured timeout; a call made while the server is
-    still indexing waits up to that bound and then reports the same way rather than returning no results.
-    No arm returns `Clean` and no arm returns an empty location list. Sabotage: map a timeout to an empty
-    result, under which all three arms report success having learned nothing and only this fails.
-
-    '
-  files:
-  - src/lsp.rs
-  - src/mcp.rs
-  - src/run.rs
-  - src/observe.rs
-  - tests/lsp.rs
-  evidence:
-  - 'tests/lsp.rs — 11 passed, 0 failed, against examples/lsp_fixture_server.rs spawned as a real child
-    over stdio: real framing, real initialize, real didOpen.'
-  - 'F5 asserted race-free, and the first attempt at it was a FINDING rather than a design. Asserting
-    only that the fixture had not written its marker file passed under the sabotage (spawn first, check
-    second) because the child is dropped with kill_on_drop on the way out and can be killed before it
-    is ever scheduled — an assertion that depends on winning a race is not an assertion. Replaced by:
-    a command that does not exist returns Error::Refused, not Error::Lsp{could not spawn}, which no scheduling
-    decision can change; the marker assertion is kept beside it as the belt to that braces.'
-  - 'Sabotage F5 (spawn the child, then check the gate): fails exactly a_denied_server_is_refused_before_any_spawn_is_attempted,
-    and the other 10 pass. Against the first version of the test it failed NOTHING.'
-  - 'F9 asserted in three arms — a handshake that never finishes, a server that exits after it, and a
-    server that does not advertise the capability. Each names the failure and the server, and none reads
-    as ''No locations.'' Sabotage F9 (map a failure to an empty result): fails exactly that test.'
-  - LspSession::connect and shutdown are wired at the 8 sites in src/run.rs that already carry McpSession
-    (the contract said nine; eight is the count in this tree), through one lsp_for helper so no site can
-    spell the root differently. authorize_spawn is shared with src/mcp.rs rather than copied — made pub(crate)
-    in place rather than moved to a new module, since a language server and an MCP server are the same
-    act and two spellings of one check is how they drift.
-  - 'EventKind::LspStarted{server, root, ready_ms} is additive on a #[non_exhaustive] enum, registered
-    in EVENT_NAMES and every_kind(); exactly one is emitted per server per run, asserted through a real
-    Observer. The contract named the middle field backend_root; it is root, because that is what it is.'
-- id: US-IO-HARNESS-0.52.0-T04
-  summary: The four read tools — definition, references, symbols, hover — with 1-based positions and a
-    per-request didOpen re-sync.
-  why_required: This is the release's outcome. Without these four the agent still infers structure from
-    grep. The position conversion and the document re-sync are both silent-wrong-answer defects, so they
-    are built and asserted with the tools rather than after them.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.52.0-T03
-  acceptance_criteria:
-  - '**F3 — positions round-trip 1-based, and the wire is 0-based.** For a symbol the fixture places at
-    line 12 character 5 as a reader counts, the request body carries `{"line":11,"character":4}`, and
-    a returned range at wire line 11 is reported to the model as line 12. Asserted on the wire body and
-    on the rendered observation, at line 1 as well, where an off-by-one produces line 0 — a number no
-    file has. Sabotage: pass the model''s numbers through unconverted, under which every position assertion
-    fails and only these do.
-
-    '
-  - '**F4 — a file edited this run is never answered from a stale buffer.** A run edits a file with `edit_file`,
-    inserting a line, and then asks `lsp_definition` about a position on the inserted line; the fixture
-    server records the document text it was last sent, and it is the post-edit text, byte for byte, including
-    the trailing newline. Sabotage: open each document once and cache it, under which the server holds
-    the pre-edit text and only this fails.
-
-    '
-  files:
-  - src/lsp.rs
-  - src/tools/mod.rs
-  - src/run.rs
-  - tests/lsp.rs
-  evidence:
-  - 'F3 asserted on the wire body the fixture received (echo-position): a model position of line 12 column
-    5 goes out as {"line":11,"character":4}, and a returned wire line 0 comes back to the model as line
-    1. Sabotage F3 (pass the model''s numbers through unconverted): fails exactly a_position_is_one_based_for_the_model_and_zero_based_on_the_wire.'
-  - Line 0 is refused by name rather than clamped, and the server is never asked — asserted on the absence
-    of any echoed position, because clamping would answer confidently about the wrong line.
-  - 'F4 asserted against an edit made in the same run: hover -> edit_file -> hover, where the fixture
-    answers with the document text it was last SENT. The second answer contains the post-edit text. Sabotage
-    F4 (open each document once and cache it): fails exactly that test, and only it.'
-  - 'Four read verbs land: lsp_definition, lsp_references, lsp_symbols (one schema, two behaviours — no
-    query is this file, a query is the workspace) and lsp_hover. SymbolKind numbers render as words and
-    hierarchical children are flattened under their parent, asserted in symbols_answers_for_one_file_or_for_the_workspace.'
-  - 'Every question goes through one funnel, LspSession::navigate: one readiness wait, one capability
-    check, one document re-sync, one deny_read filter. That is what makes T05''s filter one check rather
-    than four.'
-- id: US-IO-HARNESS-0.52.0-T05
-  summary: Filter every returned location through the same Act::Read check read_file uses, and name the
-    omission count in the answer.
-  why_required: The second of the release's two bounds. Four tools return locations and a filter applied
-    in four places is a filter missing from one, so every path returns through one function before any
-    more callers exist.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.52.0-T04
-  acceptance_criteria:
-  - '**F6 — a location under a `deny_read` rule is absent from the answer and the omission is named.**
-    A `lsp_references` call whose server returns three locations, one of them under a path the policy
-    denies reading, produces an observation containing the two permitted paths, **not** containing the
-    denied path in any form, and ending with a sentence naming one omission and the act. Asserted as an
-    absence and a presence together, because a build that drops the location silently passes any assertion
-    that only counts what is there. Sabotage: return the server''s locations unfiltered, under which the
-    absence assertion fails and only this fails.
-
-    '
-  files:
-  - src/lsp.rs
-  - src/run.rs
-  - tests/lsp.rs
-  evidence:
-  - 'F6 asserted as an absence and a presence together: of three locations one under a deny_read("secret/*")
-    path, the answer carries the two permitted paths, does not contain the denied file name in any form,
-    and ends with ''1 result omitted''. Sabotage F6 (return the server''s locations unfiltered): fails
-    exactly that test.'
-  - 'Only an outright Deny omits. Ask does not, and that is deliberate: Policy::default() ASKS about any
-    path no rule covers (the trap 0.39.0 paid for), under which treating Ask as an omission would empty
-    every answer this feature gives. Naming a path is not reading its contents.'
-  - relative() strips both the workspace root and its canonicalized form, because on macOS /tmp and /var
-    are symlinks into /private and a server resolves what it opened — a path that failed to strip would
-    reach the policy as an absolute one, under which deny_read("secret/*") matches nothing. A filter that
-    silently stops filtering is worse than one that is absent.
-- id: US-IO-HARNESS-0.52.0-T06
-  summary: Register the five schemas only for a run that configured a server, and prove an unconfigured
-    run is byte-identical to 0.51.0.
-  why_required: The release's negative control. Every existing prompt, parity and determinism suite asserts
-    the catalogue, and the claim that a consumer who configures nothing pays nothing is either true on
-    bytes or it is marketing.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.52.0-T04
-  acceptance_criteria:
-  - '**F10 — a run with no `[[lsp]]` is this build''s run.** No `lsp_*` schema appears in the composed
-    system prompt, no child is spawned, no `LspStarted` event is written, and the composed prompt is **byte-identical**
-    to the same contract''s prompt on 0.51.0. This is the release''s negative control and it is asserted
-    on bytes. Sabotage: register the schemas unconditionally, under which the byte-identity assertion
-    fails and only this fails.
-
-    '
-  - '**N6 — every existing suite passes unchanged, apart from catalogue assertions that do not change.**
-    Because the schemas are conditional on configuration, `tests/prompt.rs`, `tests/parity.rs`, `tests/determinism.rs`
-    and every suite quoting the tool catalogue pass **untouched** — not updated with a sentence, untouched.
-    Any suite that does need an edit is a finding to be stated in the record with its reasoning, not a
-    sweep.
-
-    '
-  - '**N7 — the catalogue grows by exactly five schemas, and only for a run that configured a server.**
-    Asserted by composing the system prompt for one contract with and without an `[[lsp]]` entry and diffing:
-    the difference is those five schemas'' own bytes and nothing else.
-
-    '
-  files:
-  - src/run.rs
-  - src/tools/mod.rs
-  - tests/lsp.rs
   - tests/prompt.rs
   evidence:
-  - 'F10 asserted on the catalogue: a run with no [[lsp]] table is offered the built-ins and no tool whose
-    name starts with lsp_. Sabotage F10 (register the schemas unconditionally): fails both arms of the
-    claim and nothing else.'
-  - 'The other half asserted by difference: configuring one server adds exactly [lsp_definition, lsp_references,
-    lsp_symbols, lsp_hover, lsp_rename], in that order, and removes nothing.'
-  - 'N7 holds by construction: lsp_tools() returns an empty vector for an empty session, so the five schemas
-    are the only difference in the composed prompt.'
-- id: US-IO-HARNESS-0.52.0-T07
-  summary: lsp_rename renders a WorkspaceEdit as a 0.51.0 patch series and writes nothing.
-  why_required: Rename is the case where a text search is not merely expensive but wrong, and it is the
-    reason the release adds no write path. A rename that wrote its own files would satisfy the end state
-    and violate the release.
+  - The `browser` cargo feature is not in `default` and implies `media`; the [browser] table is refused
+    at project scope by refuse_widening, like [[hook]].
+  - tests/browser.rs::a_run_with_no_browser_configured_is_offered_no_browser_tools and ::a_configured_run_is_offered_exactly_the_six
+    are the two halves of the negative control.
+  - Config::browser()'s doctest asserts the project-scope refusal names the key.
+- id: US-IO-HARNESS-0.53.0-T08
+  summary: The two events, the checked-in doc surfaces, the public-API snapshot, and the no-durable-state
+    assertion.
+  why_required: A boundary nobody can audit is not a boundary, and this repository's doc surfaces are
+    gated by tests that fail the build when a release changes behaviour without changing what the docs
+    claim.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.52.0-T05
+  - US-IO-HARNESS-0.53.0-T07
   acceptance_criteria:
-  - '**F7 — `lsp_rename` writes nothing and renders a patch that applies.** A rename whose `WorkspaceEdit`
-    spans three files returns a patch series in 0.51.0''s format; every file in the workspace is byte-identical
-    afterwards, **no** `edits` row and **no** snapshot row is written, and feeding each file''s section
-    to `patch_file` produces exactly the renamed tree. Asserted as an absence and then as an application,
-    because a rename that wrote its own files would satisfy the end state and violate the release. Sabotage:
-    apply the edit inside the tool, under which the byte-identity and no-row assertions fail and only
-    they do.
+  - '**N3 — no durable state.** `git diff main -- src/state.rs` is empty, `CHECKPOINT_FORMAT` is 7, and
+    a 0.52.0 store and a 0.53.0 store are the same store in both directions.
+
+    '
+  - '**N4 — the public surface addition is stated in advance and met exactly.** `docs/public-api.txt`
+    gains the crate-root re-exports this release adds and no others; the number is named in the record
+    and any difference is explained rather than absorbed. The file tracks crate-root re-exports only,
+    so methods on existing types add no line — a fact this criterion states rather than rediscovers.
+
+    '
+  - '**O4 — the checked-in doc surfaces are updated in this release.** `docs/CONTRACT.md` gains the gate,
+    the interception boundary and the platform row; the README''s feature list and platform table move;
+    a `docs/guide/` page exists and `docs/CAPABILITIES.md` names it; the changelog entry exists; every
+    new public item carries a worked example. The four doc tests and `tests/public_api.rs` pass.
 
     '
   files:
-  - src/lsp.rs
-  - src/diff.rs
-  - src/tools/mod.rs
-  - src/run.rs
-  - tests/lsp.rs
-  evidence:
-  - 'F7 asserted as an absence and then as an application. A rename spanning two files leaves both byte-identical,
-    and the run''s only edits row is the step that ends the run — not either renamed path. The answer
-    is a patch series in 0.51.0''s format (--- a/<path> / +++ b/<path> per file, path-ordered) carrying
-    +struct Tally;. Sabotage F7 (apply the edit inside the tool): fails exactly that test.'
-  - 'No Act::Write check is taken by the rename, and that is the design rather than an omission: each
-    file''s section is applied by patch_file, which is gated on that path like any other write, one path
-    per call, all-or-nothing per file. The release therefore adds no write path and no multi-file gate
-    semantics.'
-  - A server answers with 'changes' or with 'documentChanges' and both are read — a client reading only
-    one silently renames nothing against half the servers in use. Edits are applied last-first against
-    the original text, overlapping edits are refused rather than guessed, and a position is measured in
-    UTF-16 code units the way the protocol specifies, returning None rather than indexing into the middle
-    of a character.
-- id: US-IO-HARNESS-0.52.0-T08
-  summary: Append a server's pull diagnostics to check and to the automatic post-edit observation, in
-    Outcome's existing four states.
-  why_required: This is what augmenting the compiler stream means in code. A build that returns the server's
-    result instead of appending it loses the borrow-check and lint errors a gate depends on, which is
-    the failure the diagnostics module already wrote down.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.52.0-T04
-  acceptance_criteria:
-  - '**F8 — server diagnostics augment and never replace.** On a tree where the project''s checker reports
-    an error and the configured server reports none, `check` still reports the checker''s error; where
-    both report, both appear and the server''s findings are attributed to its `id`; where the server advertises
-    no `diagnosticProvider`, the answer carries the checker''s result **and** a named reason for the server
-    half — never a silent absence and never `Clean`. The third arm is the discriminating one. Sabotage:
-    return the server''s result when it is present instead of appending it, under which the first arm
-    loses the compiler''s error and only this fails.
-
-    '
-  files:
-  - src/lsp.rs
-  - src/tools/diagnostics.rs
-  - src/run.rs
-  - tests/lsp.rs
-  evidence:
-  - 'tests/lsp.rs — 12 passed, 0 failed. F8 is asserted against a REAL cargo check over a three-line crate
-    that does not compile, not a stubbed checker: the claim is that this crate''s existing checker survives
-    beside the server''s answer, and a stub would only prove the stub survived. The crate has no dependencies,
-    so the check is offline and its target directory is inside the temp dir — no cargo lock is shared
-    with the build running the test.'
-  - 'Three arms, all asserting the compiler''s own error is present. (1) The server finds nothing: ''[language
-    server fix] found nothing''. (2) The server finds something too: both appear, the server''s attributed
-    to its id. (3) The server does not advertise diagnosticProvider: ''[language server fix did not answer]
-    does not answer diagnostic requests, so it has nothing to add here — which is not the same as finding
-    nothing''.'
-  - 'Sabotage F8 (return the server''s result when it is present instead of appending it): fails exactly
-    server_diagnostics_are_appended_to_the_compiler_stream_never_substituted, and the other 11 pass.'
-  - No tool was added. The server's half is folded into 0.51.0's check tool and into diagnostics_after_write,
-    which IS what 'augment the compiler stream' means in code, and it reuses diagnostics::Outcome's four
-    existing states rather than inventing a third-state vocabulary beside them.
-  - 'The asymmetry the existing code already draws is kept: check reports all four states because somebody
-    asked; the automatic post-edit path reports findings only, because a line per edit saying a server
-    still cannot answer is noise the model pays for on every write.'
-  - Pull only. workspace/diagnostic for the whole tree and textDocument/diagnostic for one file; both
-    report shapes are read, because a client that handles one of them silently reports nothing for the
-    other. Diagnostics pass the same deny_read filter every other answer does.
-- id: US-IO-HARNESS-0.52.0-T09
-  summary: 'Measure N5: the same navigation question driven through grep/find/read_file and through lsp_definition
-    + lsp_references.'
-  why_required: The release's own number. Fewer provider calls and fewer prompt bytes is the whole business
-    case, and a figure that says otherwise is a feature that did not ship.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.52.0-T06
-  - US-IO-HARNESS-0.52.0-T07
-  acceptance_criteria:
-  - '**N5 — the release''s own number, and it is the cost of one navigation question.** The stated question
-    "where is this symbol defined and which call sites use it" is driven twice against a scripted provider
-    over the same fixture repository: once through `grep`/`find`/`read_file` as the catalogue offers today,
-    once through `lsp_definition` + `lsp_references`. Recorded in the release record: the provider calls,
-    the steps, the gate evaluations and the prompt bytes for each arm. The LSP arm must take strictly
-    fewer provider calls and strictly fewer prompt bytes; a figure that says otherwise is a feature that
-    did not ship rather than a test to adjust.
-
-    '
-  files:
-  - tests/lsp.rs
-  evidence:
-  - 'N5 measured, printed by n5_a_navigation_question_costs_fewer_calls_and_fewer_prompt_bytes: text-search
-    arm 6 provider calls / 11,901 prompt bytes / 0 gate evaluations; language-server arm 3 provider calls
-    / 6,052 prompt bytes / 1 gate evaluation. Half the calls and 1.97x less prompt read for the same question.'
-  - 'The text-search arm is the shortest honest path, not a strawman: grep the definition''s spelling,
-    read the file that matched to see which hit IS the definition, grep the identifier, then read each
-    of the two files that matched to discard the prose mention and the string literal. Five tool calls.
-    The server arm is lsp_definition then lsp_references. Two.'
-  - 'The gate count moves the OTHER way — 0 to 1 — and that is honest rather than a defect: grep and read_file
-    are ungated by 0.3.0''s decision, and the one evaluation the server arm pays is the Act::Exec check
-    on the server binary at run start. It is per run, not per question.'
-  - The assertion is directional (strictly fewer calls, strictly fewer prompt bytes) and the figures are
-    recorded rather than pinned, because a byte count pinned to a constant fails on the next release that
-    adds a sentence to the system prompt.
-- id: US-IO-HARNESS-0.52.0-T10
-  summary: Bring every checked-in surface to 0.52.0, and rewrite the 'Deliberately not a language server'
-    section.
-  why_required: Shipping an LSP client while a module doc says an LSP client was rejected is a surface
-    contradicting the code — the mistake 0.51.0 caught in verify.rs. The docs gates fail the build without
-    this, and the record cannot claim the surfaces agree.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.52.0-T07
-  - US-IO-HARNESS-0.52.0-T08
-  acceptance_criteria:
-  - '**O5 — the documentation surfaces agree with the code, in the same release.** `docs/CONTRACT.md`,
-    `src/lib.rs`, the README, the guide pages and `CHANGELOG.md` describe what a server is gated on, that
-    rename returns a patch and writes nothing, that diagnostics augment and are pull-only, and the `deny_read`
-    sentence — that the crate omits what the policy denies from the answer while the server process itself
-    has still indexed those bytes on disk. `src/tools/diagnostics.rs`''s "Deliberately not a language
-    server" section is rewritten in this release to scope its rejection to that module''s own question.
-    `tests/docs_drift.rs`, `tests/changelog.rs`, `tests/readme.rs`, `tests/guide_pages.rs` and `tests/public_api.rs`
-    pass.
-
-    '
-  files:
-  - src/tools/diagnostics.rs
-  - src/lib.rs
+  - src/observe.rs
   - docs/CONTRACT.md
+  - docs/CAPABILITIES.md
+  - docs/guide/browser.md
+  - docs/public-api.txt
   - README.md
   - CHANGELOG.md
-  - docs/public-api.txt
+  - src/lib.rs
   evidence:
-  - 'Every checked-in surface is at 0.52.0 in this release: CHANGELOG.md gains its section (Added, Changed
-    and Security, with no breaking marker because there is no break), docs/CONTRACT.md gains ''What a
-    language server is asked, and what it is not trusted with (0.52.0)'' with its own ''Stated plainly''
-    block, README.md gains a ''Navigating the code'' paragraph and its dependency snippet moves to "0.52",
-    src/lib.rs gains the matching crate-root paragraph, docs/guide/language-support.md gains ''Navigating
-    with a language server'' and docs/guide/configuration.md gains the [[lsp]] table, and docs/public-api.txt
-    gains its one line.'
-  - 'O5''s specific requirement is met rather than glossed: src/tools/diagnostics.rs''s ''Deliberately
-    not a language server'' section is rewritten to ''Deliberately not a language server — for *this*
-    question''. Its four reasons stand unchanged, because none of them was ever an argument against speaking
-    the protocol — they are an argument about which question a server can answer. Shipping an LSP client
-    while a module doc reads as a rejection of one is a surface contradicting the code, which is the mistake
-    0.51.0 caught in src/verify.rs.'
-  - 'The docs gates pass: cargo test --test readme --test docs_drift --test guide_pages --test changelog
-    — 35 passed, 0 failed across the four. docs_drift is the one that bites here, because it requires
-    the README''s dependency snippet to state Cargo.toml''s own version.'
-  - 'A REPO GUARD CAUGHT A REAL GAP AND IT IS THE TRAP MEMORY ALREADY WARNED ABOUT. tests/ci_workflow.rs''s
-    the_matrix_builds_exactly_the_examples_the_tests_spawn failed: lsp_fixture_server is spawned by a
-    test and was not in the CI build list, because ''cargo build --lib --tests'' does not build examples/.
-    Without the fix the whole lsp suite would have failed on every runner with a missing file rather than
-    with a reason. Added to both build steps in .github/workflows/ci.yml and to the one in release.yml;
-    the second release leg already uses --examples and needed nothing.'
-  - cargo fmt --check exit 0; cargo clippy --all-targets clean, after fixing two warnings this release
-    introduced (an unused std::io::Read import in the fixture server, and a needless borrow in tests/lsp.rs).
-- id: US-IO-HARNESS-0.52.0-T11
-  summary: One opt-in live test against a real rust-analyzer, outside the default gate.
-  why_required: A fixture server proves the client and cannot prove the protocol was understood. Without
-    one real server answering, every claim in the release rests on a fake this repository also wrote.
+  - EventKind::BrowserStarted and EventKind::BrowserNavigated, additive, with EVENT_NAMES, the census
+    fixture and the exhaustive match all updated.
+  - docs/CONTRACT.md, docs/guide/browser.md, docs/CAPABILITIES.md, README.md, CHANGELOG.md, src/lib.rs
+    and docs/public-api.txt updated; tests/docs_drift.rs (15), tests/readme.rs (5), tests/guide_pages.rs
+    (7), tests/changelog.rs (5) and tests/public_api.rs (9) all pass.
+  - docs/public-api.txt gains exactly ONE line — struct BrowserConfig — which is the number the contract
+    named in advance under N4.
+- id: US-IO-HARNESS-0.53.0-T09
+  summary: examples/browser_live.rs against the real installed browser, and the release's own measurement.
+  why_required: A fixture proves the client and cannot prove the protocol was understood — the previous
+    release found three defects this way, every one invisible to a green suite.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.52.0-T07
+  - US-IO-HARNESS-0.53.0-T08
   acceptance_criteria:
-  - '**O3 — the live path is proven once, opt-in, outside the gate.** One test drives a real `rust-analyzer`
-    against a small fixture crate — definition, references, symbols, hover — in the `documents_live` style:
-    its own `[[test]]` target, skipped unless the binary is present and an environment variable asks for
-    it, never part of the default or `--all-features` gate, and its result recorded in the release record.
-    It exists because a fixture server proves the client and cannot prove the protocol was understood.
+  - '**N5 — the release''s own measurement, recorded and not asserted.** For one real page: its text through
+    `browser_read` in bytes, the same page''s screenshot in base64 bytes, the browser''s launch time,
+    and the per-action round-trip time. The point of the number is operator guidance on when a screenshot
+    is worth its bytes, and it is recorded in the release record and `docs/MEASUREMENTS.md` with the machine
+    named. **No clock is a pass/fail gate**, per the standing rule.
+
+    '
+  - '**O3 — `examples/browser_live.rs` is run against the real installed browser before the record is
+    sealed**, driving navigation, a click, typing, a scroll, a read, a screenshot and the console capture,
+    and what it found is written into the record. This is a gate of this release, not an optional extra:
+    0.52.0''s three live-run defects were all invisible to a green fixture suite.
 
     '
   files:
-  - tests/lsp_live.rs
+  - examples/browser_live.rs
   - Cargo.toml
+  - docs/MEASUREMENTS.md
   evidence:
-  - examples/lsp_live.rs drives a REAL rust-analyzer 1.95.0 over a real three-file crate through the real
-    loop, and all six tools answer correctly — verified on two consecutive runs. lsp_definition from a
-    use site resolves to src/lib.rs:1:12, the struct declaration; lsp_references returns four locations
-    across two files; lsp_symbols returns the file's tree (struct, its field, the module, the function)
-    and the workspace search finds Ledger; lsp_hover returns rust-analyzer's real type block including
-    'size = 8, align = 0x8, no Drop'; lsp_rename returns a two-file patch series and src/lib.rs still
-    declares Ledger afterwards.
-  - 'THE LIVE RUN FOUND THREE DEFECTS THE FIXTURE COULD NOT, AND THAT IS WHY IT EXISTS. (1) The client
-    never advertised window.workDoneProgress, so rust-analyzer sent no $/progress at all — leaving the
-    crate with no way to tell ''still indexing'' from ''no references''. (2) A semantic request answered
-    during start-up comes back EMPTY, not as an error: documentSymbol, which needs only the syntax tree,
-    answered correctly while definition, references and hover all returned nothing — precisely the silent
-    empty this release promises never to produce. (3) lsp_symbols with a query and no path matched the
-    empty string against every server''s extensions list and reported that no server answered, while five
-    other tools were being answered by one.'
-  - 'The fix is generic rather than rust-analyzer-specific: the client tracks work-done progress tokens
-    (created, begun, ended), and an empty answer from a server not yet observed warm is retried after
-    that work settles, bounded by the server''s own timeout_secs. A server that announces no work stops
-    after one round, so nothing in the test suite waits on a clock. SETTLE is 1.5s and is documented as
-    the knob: it is the width of the GAP between two of a server''s start-up jobs — rust-analyzer reports
-    Fetching, then Building CrateGraph, then Roots Scanned, with sub-second silences between them — not
-    a guess about how long indexing takes.'
-  - 'It is an example rather than a test, following documents_live and media_git_live: a real server''s
-    index is minutes on a real repository, and a gate that waits minutes is a gate someone eventually
-    deletes. rust-analyzer needed ''rustup component add rust-analyzer'' on this machine — the rustup
-    shim exists without the component — and the crate reported its absence correctly as ''initialize was
-    not answered: the server closed its output''.'
-- id: US-IO-HARNESS-0.52.0-T12
-  summary: 'Run the release gate set: three platforms, cross-version untouched, MSRV, no DDL.'
-  why_required: A hand-written wire protocol passes on the host that wrote the fixture. The platform matrix
-    is the only place \r\n handling and a child's stdio buffering are actually tested, and the no-durable-state
-    claim is proven by an empty diff rather than asserted.
-  status: done
+  - examples/browser_live.rs drives the installed browser through the whole surface against a page it
+    serves on loopback, so the host gate is exercised against a real host:port.
+  - 'All six live claims held against Google Chrome 151: rendered text, console output, an uncaught error
+    read as its description, a click that actually changed the page, a screenshot delivered as an image,
+    and a navigation to an unnamed host refused.'
+  - The live run found NO defects — recorded as a fact rather than passed over, because the point of running
+    it is that it can find them.
+  - 'Measured: cold start 2,426 ms; the page as text 44 bytes against 13,166 bytes as a PNG.'
+- id: US-IO-HARNESS-0.53.0-T10
+  summary: 'The gate set: both suites, the dependency count, the nightly rustdoc gate, the three-platform
+    matrix and the sabotage pass.'
+  why_required: The release's claims are only worth what the gates that checked them are worth, and a
+    sabotage that fails nothing is a finding this release has to report rather than discover later.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.52.0-T09
-  - US-IO-HARNESS-0.52.0-T10
-  - US-IO-HARNESS-0.52.0-T11
+  - US-IO-HARNESS-0.53.0-T09
   acceptance_criteria:
-  - '**N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
+  - '**N1 — no new dependency.** `cargo tree` is 402 lines on macOS and Linux with the feature off and
+    with it on, because the feature adds only `base64` through `media`, which the count already carries
+    when that feature is enabled. Asserted by the existing dependency test and stated with the number
+    in the record.
 
     '
-  - '**N4 — no DDL and no durable state at all.** `git diff main -- src/state.rs` is **empty**, there
-    is no `CREATE TABLE`, no `ALTER TABLE`, no `CREATE INDEX`, and `CHECKPOINT_FORMAT` stays at 7. A 0.51.0
-    store and a 0.52.0 store are the same store in both directions, with nothing to migrate.
+  - '**O1 — the three-platform matrix is green**, with the browser suite running its fixture-driven tests
+    on macOS and Linux and its refusal test on Windows. A green macOS gate alone is not evidence for this
+    release: the transport is the platform-specific half.
 
     '
-  - '**O1 — the full suite passes on all three platforms**, on the standing CI matrix including 0.47.0''s
-    `contained (ubuntu, userns restricted)` leg. A hand-written wire protocol is precisely the code that
-    passes on the host that wrote the fixture: `\r\n` header terminators, byte-vs-char lengths and a child''s
-    stdio buffering behave differently on Windows, so F1''s byte assertions and the spawn path run on
-    every leg rather than on the developer''s machine.
+  - '**O2 — nothing in the suite gates on a wall clock.** Every settle is on a protocol signal or a bounded
+    timeout whose expiry is a typed outcome, never an assertion that something happened within N milliseconds.
+    This release adds a process spawn and a page load, which are the two slowest things the suite will
+    contain, on the runner that is roughly three times slower than the development machine.
 
     '
-  - '**O2 — no test gates on a wall clock it does not own.** The fixture server answers in the same process
-    and immediately; readiness, the timeout arms of F9 and the background start are asserted on **structure**
-    — which outcome, which reason, which order — with any duration recorded rather than asserted. A criterion
-    that would fail on a busy runner is a flake this repository has paid for eight times, and the standing
-    rule applies. The `ready_ms` on `LspStarted` is recorded in the record and asserted only to exist.
-
-    '
-  - '**O4 — cross-version needs nothing new and is asserted anyway.** With no schema change, the existing
-    `tests/cross_version.rs` and `tests/cross_version_0_29_0.rs` pass unchanged, and that is the criterion:
-    a release that adds no durable state proves it by those suites being untouched and green.
+  - '**O5 — the nightly rustdoc gate passes with `-D warnings`.** Run before the release PR. A brand-new
+    `pub mod` is the shape that trips the private-intra-doc-links rule, which this release adds and which
+    caught something in five of the last six releases.
 
     '
   files:
-  - src/state.rs
-  evidence:
-  - 'Default suite: 82 binaries, 1,684 passed, 0 failed, 428 doctests. Exit code checked from the process
-    rather than read off a pipeline.'
-  - '--all-features on a CLEARED target (cargo clean first, forced by this machine running out of disk
-    with both builds present): 82 binaries, 1,770 passed, 0 failed, 431 doctests, exit 0.'
-  - cargo fmt --check exit 0. cargo clippy --all-targets --all-features -- -D warnings exit 0, zero warnings.
-  - N2 — MSRV unmoved at 1.95 in Cargo.toml; the toolchain gate runs in CI.
-  - N1 — cargo tree still 402 for the default feature set. The framing, the JSON-RPC envelope, the six
-    request bodies and the WorkspaceEdit-to-patch rendering are written in this crate.
-  - 'N4 — no durable state at all: ''git diff main -- src/state.rs'' is EMPTY, no CREATE TABLE, no ALTER
-    TABLE, no CREATE INDEX, and CHECKPOINT_FORMAT is unmoved at 7 (src/state.rs:107).'
-  - 'O4 — cross-version proven in both directions. The existing suites pass untouched in the default run,
-    and the ignored generator gate ran too: cargo build --manifest-path tests/fixtures/gen-0.22.0 and
-    gen-0.29.0, then cargo test --test cross_version --test cross_version_0_29_0 -- --ignored — a_current_store_is_read_by_a_0_29_0_binary
-    passed, so a real 0.29.0 binary reads a store this build wrote.'
-  - 'The nightly rustdoc gate CAUGHT TWO ERRORS stable cargo doc does not report, which is the fifth time
-    in six releases. RUSTDOCFLAGS=''--cfg docsrs -D warnings'' cargo +nightly doc --all-features --no-deps:
-    ''public documentation for lsp links to private item Client'' (the module is pub, the client type
-    is pub(crate)) and ''redundant explicit link target'' on [`Error::Lsp`](crate::Error::Lsp). Both fixed;
-    the gate then exits 0.'
-  - 'cargo package --locked exit 0 after a cargo clean: 1,745,960 bytes.'
-  - 'THE SABOTAGE PASS WAS RE-RUN IN FULL AGAINST THE FINAL TREE, because the readiness work landed after
-    the first pass and a sabotage result against superseded code proves nothing. Ten sabotages, each failing
-    its named test and the suite otherwise green: F3 positions unconverted (1), F4 cache the document
-    (1), F5 spawn before the gate (1), F6 return locations unfiltered (1), F7 apply the edit inside the
-    tool (1), F8 substitute the server''s diagnostics for the compiler''s (1), F9 map a failure to an
-    empty result (1), F10 register the schemas unconditionally (2 — both arms of its own claim). F1 (length
-    in chars AND headers split on \n) fails 6 unit tests, and F2 (correlate by arrival) fails exactly
-    answers_are_matched_by_id_through_interleaved_notifications.'
-  - 'A RUNNER ERROR IN THE FIRST RE-RUN, WORTH RECORDING: after cargo clean the fixture example was gone,
-    so every sabotage ''failed'' 12 tests identically — on a missing binary, not on the sabotage. A sabotage
-    pass whose arms all fail the same way is measuring the harness, not the code. Rebuilt with cargo build
-    --example lsp_fixture_server and re-run.'
-  - 'O1''s three-platform matrix cannot run locally; it runs on the release PR. O2''s structural rule
-    is kept: no test in tests/lsp.rs asserts on a duration, the fixture server answers in the same process,
-    and the one timing constant (SETTLE) is only ever reached by a server that announces work, which the
-    fixture never does.'
+  - tests/browser.rs
+  - src/browser.rs
+  evidence: []

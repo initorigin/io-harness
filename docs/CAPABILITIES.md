@@ -13,6 +13,7 @@ the limits that capability actually has.
 
 | Guide | What it covers |
 | --- | --- |
+| [Driving a browser](guide/browser.md) | Opening a page, using it, reading what it rendered and looking at it — with every document navigation decided by the run's own policy at the paused request |
 | [Permissions and approval](guide/permissions.md) | Layered deny-first rules, what asks and what is refused, deferring a decision past process exit |
 | [Command execution](guide/command-execution.md) | Running a project's own toolchain under an `Act::Exec` check on the whole argv, and the bound that is not there |
 | [Language support](guide/language-support.md) | Toolchain detection, a criterion in any language, and migrating off the Rust-specific gates |

@@ -326,6 +326,22 @@ pub enum Error {
         reason: String,
     },
 
+    /// A browser could not be started or spoke something this client could not
+    /// read (0.53.0). Typed separately from [`Error::Lsp`] for the reason that
+    /// one is separate from [`Error::Mcp`]: a configured capability that never
+    /// came up is a configuration problem, and the run says so rather than
+    /// quietly carrying on blind.
+    ///
+    /// A *refused navigation* is not this. A page the policy denies comes back
+    /// to the model as an observation naming the act, the target and the rule —
+    /// it is the boundary working, not the browser failing, and a run that hits
+    /// it should adapt rather than end.
+    #[error("browser: {reason}")]
+    Browser {
+        /// What went wrong.
+        reason: String,
+    },
+
     /// A durable run could not be resumed from its checkpoint — the checkpoint
     /// format is newer than this binary supports, the run row is missing or
     /// corrupt, or the run has already finished. Typed separately so a caller

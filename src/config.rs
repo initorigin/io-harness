@@ -250,6 +250,12 @@ struct File {
     // appended set of servers is not a set.
     #[serde(default)]
     lsp: Vec<crate::lsp::LspServer>,
+    // 0.53.0. The browser a run may drive. Refused in the project scope by
+    // `refuse_widening` for the reason `[[hook]]` is: it names a program to
+    // execute on this machine, and `io.toml` arrives with a `git clone`.
+    #[cfg(feature = "browser")]
+    #[serde(default)]
+    browser: Option<crate::browser::BrowserConfig>,
     // 0.21.0. `AgentDef` carries `deny_unknown_fields` of its own, so unlike
     // `[[mcp]]` above a misspelled key inside one of these tables IS rejected —
     // which matters more here than anywhere else in this file, because the keys
@@ -1304,6 +1310,36 @@ impl Config {
         &self.file.lsp
     }
 
+    /// The browser this configuration declares, if any (0.53.0).
+    ///
+    /// `[browser]` is refused in the project scope, because it names a program to
+    /// execute and `io.toml` arrives with a `git clone` — the same rule that
+    /// refuses `[[hook]]` there, for the same reason.
+    ///
+    /// Write it in `io.local.toml` or the user-scope file, which
+    /// [`Config::discover`] reads; there is no project-scope route to a browser.
+    ///
+    /// ```
+    /// use io_harness::Config;
+    ///
+    /// // The project scope refuses the table by name, before anything is run.
+    /// let err = Config::from_toml(r#"
+    ///     [browser]
+    ///     binary = "/usr/bin/chromium"
+    /// "#).unwrap_err();
+    /// assert!(err.to_string().contains("browser"), "{err}");
+    ///
+    /// // A configuration that declares none simply has none — the default, and
+    /// // what keeps a run byte-identical to one built before this release.
+    /// let plain = Config::from_toml("[run]\nmax_steps = 3\n").unwrap();
+    /// assert!(plain.browser().is_none());
+    /// ```
+    #[cfg(feature = "browser")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "browser")))]
+    pub fn browser(&self) -> Option<&crate::browser::BrowserConfig> {
+        self.file.browser.as_ref()
+    }
+
     /// The named agent definitions this configuration declares (0.21.0).
     ///
     /// `[[agent]]` tables **accumulate** across scopes the way `policy.layers` does,
@@ -1488,6 +1524,13 @@ impl Config {
         // reason: a file that declares only servers must still get its servers.
         if !self.file.lsp.is_empty() {
             out = out.with_lsp(self.file.lsp.iter().cloned());
+        }
+        // 0.53.0 — `[browser]` is top-level, and carried whenever the table is
+        // present. No process starts from this: the contract records that a
+        // browser is configured, and one is spawned only if an action needs it.
+        #[cfg(feature = "browser")]
+        if let Some(browser) = &self.file.browser {
+            out = out.with_browser(browser.clone());
         }
         // 0.21.0 — `[[agent]]` is top-level, not part of `[run]`, so it is applied
         // before the `[run]` guard below: a file that declares a roster and nothing
@@ -1702,6 +1745,18 @@ fn refuse_widening(table: &toml::value::Table, path: &Path) -> Result<()> {
             "{}: key `hook`: a project-scoped file may not declare hooks, because a hook \
              runs or writes on this machine and `{PROJECT_FILE}` arrives with a `git clone`. \
              Write it in `{LOCAL_FILE}` or the user-scope file instead.",
+            path.display()
+        )));
+    }
+    // 0.53.0. Same hazard, same answer: `[browser]` names a binary to execute,
+    // and the run then drives it against whatever the page contains. A repository
+    // that could choose the browser could choose the program.
+    #[cfg(feature = "browser")]
+    if table.contains_key("browser") {
+        return Err(Error::Config(format!(
+            "{}: key `browser`: a project-scoped file may not configure a browser, because \
+             it names a program to execute on this machine and `{PROJECT_FILE}` arrives \
+             with a `git clone`. Write it in `{LOCAL_FILE}` or the user-scope file instead.",
             path.display()
         )));
     }
