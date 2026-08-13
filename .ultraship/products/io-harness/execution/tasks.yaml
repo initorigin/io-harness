@@ -316,7 +316,7 @@ tasks:
   why_required: This is what augmenting the compiler stream means in code. A build that returns the server's
     result instead of appending it loses the borrow-check and lint errors a gate depends on, which is
     the failure the diagnostics module already wrote down.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.52.0-T04
   acceptance_criteria:
@@ -334,7 +334,28 @@ tasks:
   - src/tools/diagnostics.rs
   - src/run.rs
   - tests/lsp.rs
-  evidence: []
+  evidence:
+  - 'tests/lsp.rs — 12 passed, 0 failed. F8 is asserted against a REAL cargo check over a three-line crate
+    that does not compile, not a stubbed checker: the claim is that this crate''s existing checker survives
+    beside the server''s answer, and a stub would only prove the stub survived. The crate has no dependencies,
+    so the check is offline and its target directory is inside the temp dir — no cargo lock is shared
+    with the build running the test.'
+  - 'Three arms, all asserting the compiler''s own error is present. (1) The server finds nothing: ''[language
+    server fix] found nothing''. (2) The server finds something too: both appear, the server''s attributed
+    to its id. (3) The server does not advertise diagnosticProvider: ''[language server fix did not answer]
+    does not answer diagnostic requests, so it has nothing to add here — which is not the same as finding
+    nothing''.'
+  - 'Sabotage F8 (return the server''s result when it is present instead of appending it): fails exactly
+    server_diagnostics_are_appended_to_the_compiler_stream_never_substituted, and the other 11 pass.'
+  - No tool was added. The server's half is folded into 0.51.0's check tool and into diagnostics_after_write,
+    which IS what 'augment the compiler stream' means in code, and it reuses diagnostics::Outcome's four
+    existing states rather than inventing a third-state vocabulary beside them.
+  - 'The asymmetry the existing code already draws is kept: check reports all four states because somebody
+    asked; the automatic post-edit path reports findings only, because a line per edit saying a server
+    still cannot answer is noise the model pays for on every write.'
+  - Pull only. workspace/diagnostic for the whole tree and textDocument/diagnostic for one file; both
+    report shapes are read, because a client that handles one of them silently reports nothing for the
+    other. Diagnostics pass the same deny_read filter every other answer does.
 - id: US-IO-HARNESS-0.52.0-T09
   summary: 'Measure N5: the same navigation question driven through grep/find/read_file and through lsp_definition
     + lsp_references.'

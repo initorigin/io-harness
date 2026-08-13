@@ -5317,6 +5317,37 @@ async fn run_workspace_from<P: Provider>(
     ))
 }
 
+/// The server half of a diagnostics answer, attributed to the server that gave it.
+///
+/// `asked` is the same distinction `check` already draws against the automatic
+/// post-edit path. A model that ASKED is told everything, including that a server
+/// had nothing to add and why — an empty answer to a direct question reads as
+/// "your project is clean". Nobody asked after an edit, so only findings are
+/// spoken there; a line per edit saying a server still cannot answer is noise the
+/// model pays for on every write.
+fn lsp_diagnostics_text(
+    reports: &[(String, crate::tools::diagnostics::Outcome)],
+    asked: bool,
+) -> String {
+    use crate::tools::diagnostics::Outcome;
+    let mut out = String::new();
+    for (server, outcome) in reports {
+        match outcome {
+            Outcome::Found(text) => {
+                out.push_str(&format!("\n[language server {server}]\n{text}\n"));
+            }
+            Outcome::Clean if asked => {
+                out.push_str(&format!("\n[language server {server}] found nothing\n"));
+            }
+            Outcome::Failed(why) | Outcome::Skipped(why) if asked => {
+                out.push_str(&format!("\n[language server {server} did not answer] {why}\n"));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// A 1-based position from a tool call, or the observation that says why not.
 ///
 /// Line 0 is not a line any file has, and a model that sends one is off by one
@@ -10030,7 +10061,7 @@ async fn dispatch(
                             // worth exactly as much to know about as one it
                             // edited into an existing file.
                             let diagnostics =
-                                diagnostics_after_write(ws.root(), toolchain, exec_timeout, cap)
+                                diagnostics_after_write(ws, toolchain, exec_timeout, cap, lsp, run_id, watch)
                                     .await;
                             Dispatched::Continue {
                                 decision: format!("wrote {target}"),
@@ -10142,7 +10173,7 @@ async fn dispatch(
                             // a checker that is missing, slow or broken costs
                             // the model a note and nothing else.
                             let diagnostics =
-                                diagnostics_after_write(ws.root(), toolchain, exec_timeout, cap)
+                                diagnostics_after_write(ws, toolchain, exec_timeout, cap, lsp, run_id, watch)
                                     .await;
                             Dispatched::Continue {
                                 decision: format!("edited {target}"),
@@ -10233,7 +10264,7 @@ async fn dispatch(
                             );
                             record_snapshot(store, run_id, step, &target, kept);
                             let diagnostics =
-                                diagnostics_after_write(ws.root(), toolchain, exec_timeout, cap)
+                                diagnostics_after_write(ws, toolchain, exec_timeout, cap, lsp, run_id, watch)
                                     .await;
                             Dispatched::Continue {
                                 decision: format!("patched {target}"),
@@ -10334,6 +10365,14 @@ async fn dispatch(
                     format!("\n[check did not run] {why}\n")
                 }
             };
+            // The compiler's stream is never replaced and never filtered: what a
+            // server sees is added to it. `src/tools/diagnostics.rs` says why —
+            // a server's own analysis omits borrow-check errors, monomorphisation
+            // errors and every lint, which are the errors a model writes.
+            let obs = format!(
+                "{obs}{}",
+                lsp_diagnostics_text(&lsp.diagnose(ws, None, run_id, watch).await, true)
+            );
             Dispatched::Continue {
                 decision: "checked the project".to_string(),
                 obs: bound(&obs, cap, ObsKind::Tool),
@@ -11783,23 +11822,32 @@ enum Gated {
 /// feature that can take down the tool it informs on is a worse trade than not
 /// having it.
 async fn diagnostics_after_write(
-    root: &Path,
+    ws: &Workspace,
     toolchain: Option<&crate::toolchain::Toolchain>,
     timeout: Duration,
     cap: usize,
+    lsp: &LspSession,
+    run_id: i64,
+    watch: &Watch<'_>,
 ) -> String {
+    let root = ws.root();
+    // 0.52.0 — what a configured server sees, appended to what the compiler said
+    // and never in place of it. Findings only here: nobody asked, so a line per
+    // edit about a server that cannot answer is noise the model pays for on every
+    // write. `check` reports all four states, because there somebody did ask.
+    let served = lsp_diagnostics_text(&lsp.diagnose(ws, None, run_id, watch).await, false);
     match crate::tools::diagnostics::after_edit(root, toolchain, timeout, cap).await {
-        crate::tools::diagnostics::Outcome::Found(text) => text,
-        crate::tools::diagnostics::Outcome::Clean => String::new(),
+        crate::tools::diagnostics::Outcome::Found(text) => format!("{text}{served}"),
+        crate::tools::diagnostics::Outcome::Clean => served,
         // A skip is silent. There is no ecosystem here, so there is nothing the
         // model could do differently and nothing worth spending its context on.
-        crate::tools::diagnostics::Outcome::Skipped(_) => String::new(),
+        crate::tools::diagnostics::Outcome::Skipped(_) => served,
         // A failure is not silent, and that is the point. An absent diagnostics
         // section and a check that never ran look identical to a model, and one
         // of them means "this file is fine" while the other means nothing at
         // all.
         crate::tools::diagnostics::Outcome::Failed(why) => {
-            format!("\n[check did not run] {why}\n")
+            format!("\n[check did not run] {why}\n{served}")
         }
     }
 }

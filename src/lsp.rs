@@ -515,6 +515,87 @@ impl LspSession {
         Ok(())
     }
 
+    /// What the configured servers say about the code, beside what the project's
+    /// own checker said.
+    ///
+    /// **Appended, never substituted.** `src/tools/diagnostics.rs` explains at
+    /// length why this crate reads the compiler's own stream rather than a
+    /// server's analysis: rust-analyzer's answer omits borrow-check errors,
+    /// monomorphisation errors and every clippy lint, which are precisely the
+    /// errors a model writes. That reasoning is unchanged. A server sees things
+    /// the compiler does not — unused imports it has already resolved, a lint the
+    /// project's cheap check does not run — and those are worth having *as well*.
+    ///
+    /// Pull only. Push diagnostics have no completion signal, so an empty result
+    /// is indistinguishable from a slow one, and that is the exact distinction
+    /// [`Outcome`](crate::tools::diagnostics::Outcome) exists to preserve. A
+    /// server that does not advertise the pull capability is `Failed` with that
+    /// reason, never `Clean`.
+    pub(crate) async fn diagnose(
+        &self,
+        ws: &crate::tools::Workspace,
+        path: Option<&str>,
+        run_id: i64,
+        watch: &crate::run::Watch<'_>,
+    ) -> Vec<(String, crate::tools::diagnostics::Outcome)> {
+        use crate::tools::diagnostics::Outcome;
+        let asked: Vec<&Started> = match path {
+            Some(path) => self.server_for(path).into_iter().collect(),
+            None => self.servers.iter().collect(),
+        };
+        let mut out = Vec::new();
+        for server in asked {
+            let id = server.config.id.clone();
+            let caps = match self.ready(server, run_id, watch).await {
+                Ok(caps) => caps,
+                Err(e) => {
+                    out.push((id, Outcome::Failed(format!("{e}"))));
+                    continue;
+                }
+            };
+            if caps.get("diagnosticProvider").is_none() {
+                out.push((
+                    id,
+                    Outcome::Failed(
+                        "does not answer diagnostic requests, so it has nothing to add here —                          which is not the same as finding nothing"
+                            .into(),
+                    ),
+                ));
+                continue;
+            }
+            if let Some(path) = path {
+                if let Err(e) = self.sync(server, ws, path).await {
+                    out.push((id, Outcome::Failed(format!("{e}"))));
+                    continue;
+                }
+            }
+            let (method, params) = match path {
+                Some(path) => (
+                    "textDocument/diagnostic",
+                    json!({"textDocument": {"uri": uri_for(&ws.root().join(path))}}),
+                ),
+                None => ("workspace/diagnostic", json!({"previousResultIds": []})),
+            };
+            let answer = server
+                .client
+                .request(method, params, server.config.timeout())
+                .await;
+            let outcome = match answer {
+                Ok(result) => {
+                    let lines = diagnostics(&result, ws, path);
+                    if lines.is_empty() {
+                        Outcome::Clean
+                    } else {
+                        Outcome::Found(lines.join("\n"))
+                    }
+                }
+                Err(e) => Outcome::Failed(format!("{e}")),
+            };
+            out.push((id, outcome));
+        }
+        out
+    }
+
     /// End every server, then the run.
     ///
     /// `shutdown` then `exit` is what the protocol asks for and is sent
@@ -1085,6 +1166,61 @@ fn offset_of(text: &str, position: &Value) -> Option<usize> {
         units += ch.len_utf16();
     }
     Some(text.len())
+}
+
+
+/// Every diagnostic in a pull answer, as one line each.
+///
+/// Both shapes: `textDocument/diagnostic` answers a report for the one file, and
+/// `workspace/diagnostic` answers a list of reports each naming its own uri. A
+/// reader that handles one of them reports nothing for the other, silently.
+fn diagnostics(result: &Value, ws: &crate::tools::Workspace, path: Option<&str>) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut take = |items: &Value, where_: String| {
+        if where_.is_empty() {
+            return;
+        }
+        if let Value::Array(items) = items {
+            for item in items {
+                let severity = match item.get("severity").and_then(Value::as_u64) {
+                    Some(1) => "error",
+                    Some(2) => "warning",
+                    Some(3) => "note",
+                    Some(4) => "hint",
+                    _ => "diagnostic",
+                };
+                let message = item
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(no message)");
+                let at = item.get("range").map(position).unwrap_or_default();
+                lines.push(format!("{where_}:{at}: {severity}: {message}"));
+            }
+        }
+    };
+    match result.get("items") {
+        // A workspace report: a list of per-file reports.
+        Some(Value::Array(reports)) if reports.iter().any(|r| r.get("uri").is_some()) => {
+            for report in reports {
+                let shown = report
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .and_then(path_of)
+                    .map(|p| relative(ws, &p))
+                    .unwrap_or_default();
+                // The same filter every other answer passes: a diagnostic names a
+                // path, and a path the policy denies reading is not carried here.
+                if shown.is_empty() || !readable(ws, &shown) {
+                    continue;
+                }
+                take(report.get("items").unwrap_or(&Value::Null), shown);
+            }
+        }
+        // A single-file report, whose path is the one that was asked about.
+        Some(items) => take(items, path.map(str::to_string).unwrap_or_default()),
+        None => {}
+    }
+    lines
 }
 
 /// A `file://` URI for a path, which is what every request here carries.

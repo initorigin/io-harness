@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    run_with, ApproveAll, Error, LspServer, Policy, Provider, RunOutcome, Store, TaskContract,
+    run_with, ApproveAll, Error, LspServer, Policy, Provider, Store, TaskContract,
     Verification,
 };
 use serde_json::{json, Value};
@@ -738,4 +738,91 @@ async fn symbols_answers_for_one_file_or_for_the_workspace() {
         transcript.contains("src/lib.rs:1:8"),
         "the workspace search reports where: {transcript}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// F8 — server diagnostics augment the compiler stream and never replace it
+// ---------------------------------------------------------------------------
+
+/// A real `cargo check` over a three-line crate that does not compile.
+///
+/// Real rather than scripted because the claim is about *this* crate's existing
+/// checker surviving beside the server's answer, and a stubbed checker would be
+/// asserting that the stub survived. It is a crate with no dependencies, so the
+/// check is offline and its own target directory is inside the temp dir — no lock
+/// is shared with the build running this test.
+fn broken_crate() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"broken\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn add(a: u8) -> u8 { a + \"not a number\" }\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// Three arms, and the third is the discriminating one. A build that returns the
+/// server's result *instead of* appending it loses the compiler's error in the
+/// first arm; a build that stays silent when a server cannot answer tells the
+/// model nothing in the third, which reads as "there was nothing to say".
+#[tokio::test]
+async fn server_diagnostics_are_appended_to_the_compiler_stream_never_substituted() {
+    let dir = broken_crate();
+    let at = |line: u64| {
+        json!({
+            "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 3}},
+            "severity": 2,
+            "message": "unused import from the server"
+        })
+    };
+
+    for (name, script, expect) in [
+        (
+            "the server finds nothing",
+            json!({"responses": {"workspace/diagnostic": {"items": []}}}),
+            "[language server fix] found nothing",
+        ),
+        (
+            "the server finds something too",
+            json!({"responses": {"workspace/diagnostic": {"items": [
+                {"uri": uri(dir.path(), "src/lib.rs"), "kind": "full", "items": [at(0)]}
+            ]}}}),
+            "unused import from the server",
+        ),
+        (
+            "the server cannot answer at all",
+            json!({"capabilities": {"hoverProvider": true}}),
+            "[language server fix did not answer]",
+        ),
+    ] {
+        // The arms share one crate so the cargo check is compiled once. The gate
+        // marker must not survive between them, or the next run ends before its
+        // own observation ever reaches a prompt.
+        let _ = std::fs::remove_file(dir.path().join("done.txt"));
+        let store = Store::memory().unwrap();
+        let provider = Script::new(vec![vec![call("check", json!({}))], finish()]);
+        let contract = contract(dir.path(), 4).with_lsp([fixture(dir.path(), script)]);
+
+        run_with(&contract, &provider, &store, &permitted(), &ApproveAll)
+            .await
+            .unwrap();
+
+        let transcript = provider.transcript();
+        // The compiler's own finding, every time. This is the half that must not
+        // be lost, because a server's analysis omits exactly this class of error.
+        assert!(
+            transcript.contains("mismatched types") || transcript.contains("cannot add"),
+            "{name}: the compiler's error survives: {transcript}"
+        );
+        assert!(
+            transcript.contains(expect),
+            "{name}: and the server's half is there: {transcript}"
+        );
+    }
 }
