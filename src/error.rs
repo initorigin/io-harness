@@ -305,6 +305,27 @@ pub enum Error {
         reason: String,
     },
 
+    /// A language server could not be started or spoke something this client
+    /// could not read (0.52.0). Typed separately from [`Error::Mcp`] for the same
+    /// reason that one is separate from [`Error::Provider`]: a configured
+    /// capability that never came up is a configuration problem, and the run says
+    /// so rather than quietly navigating by text search instead.
+    ///
+    /// Failures *during* a call — a request that timed out, a server with no
+    /// answer for this position, a capability the server does not advertise — are
+    /// not this. They come back to the model as observations naming the reason,
+    /// because an empty answer that means "I could not ask" and an empty answer
+    /// that means "there are no references" are the distinction the whole surface
+    /// exists to preserve.
+    #[error("language server {server}: {reason}")]
+    Lsp {
+        /// The configured server's id, empty only for a framing error found
+        /// before any server was named.
+        server: String,
+        /// What went wrong.
+        reason: String,
+    },
+
     /// A durable run could not be resumed from its checkpoint — the checkpoint
     /// format is newer than this binary supports, the run row is missing or
     /// corrupt, or the run has already finished. Typed separately so a caller

@@ -71,6 +71,17 @@
 //! undo finer than a run — [`rewind_step`] reverse-applies one step's hunks, and
 //! walking a run back is that call newest step first.
 //!
+//! **Navigating the code.** Point the harness at a language server — in `io.toml`
+//! or with [`TaskContract::with_lsp`] — and the agent asks the questions an editor
+//! answers rather than the ones a text search answers: `lsp_definition`,
+//! `lsp_references`, `lsp_symbols`, `lsp_hover` and `lsp_rename`
+//! ([`tools::LSP_DEFINITION_TOOL`] and its four siblings). The server starts once
+//! per run in the background, so a cold index is paid once rather than inside a
+//! tool call, and starting it is an [`Act::Exec`] check on the binary the operator
+//! named ([`LspServer`]). `lsp_rename` **writes nothing**: it answers with a patch
+//! series the model applies with `patch_file`, one gate check per file. Configure
+//! no server and none of the five schemas exists.
+//!
 //! **Commands, under the same boundary as everything else.** The agent runs the
 //! project's own build, tests, linter or package manager through an `exec` tool
 //! ([`tools::EXEC_TOOL`]) taking a fixed argv and never a shell string, so there
@@ -430,6 +441,7 @@ mod contract;
 mod diff;
 mod error;
 pub mod hooks;
+pub mod lsp;
 pub mod mcp;
 mod net;
 pub mod observe;
@@ -460,6 +472,7 @@ pub use context::{Compaction, ContextBudget};
 pub use contract::{Preset, Routing, SystemPrompt, TaskContract};
 pub use error::{Error, ProviderErrorKind, Result};
 pub use hooks::Hooks;
+pub use lsp::LspServer;
 pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
 // The `net` module itself stays private, so the default request deadline is
 // surfaced here as well as from each provider module. A caller overriding it with

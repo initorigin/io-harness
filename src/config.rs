@@ -239,6 +239,17 @@ struct File {
     // tables is not rejected. Stated in the guide rather than papered over.
     #[serde(default)]
     mcp: Vec<McpServer>,
+    // 0.52.0. Language servers, for the navigation tools. Allowed in the project
+    // scope for the reason `[[mcp]]` is, stated in the module doc above: the
+    // spawn is an `Act::Exec` check on the named binary, so the boundary is the
+    // policy the caller loaded rather than the scope of the file that named it.
+    // `LspServer` carries `deny_unknown_fields` of its own — there is no
+    // `#[serde(flatten)]` here to forbid it — so a misspelled key in a table that
+    // names a program to spawn IS rejected, unlike `[[mcp]]`. Deliberately *not*
+    // in `APPENDING`: a later scope replaces the set whole, because a half-
+    // appended set of servers is not a set.
+    #[serde(default)]
+    lsp: Vec<crate::lsp::LspServer>,
     // 0.21.0. `AgentDef` carries `deny_unknown_fields` of its own, so unlike
     // `[[mcp]]` above a misspelled key inside one of these tables IS rejected —
     // which matters more here than anywhere else in this file, because the keys
@@ -1263,6 +1274,36 @@ impl Config {
         &self.file.mcp
     }
 
+    /// The language servers this configuration declares (0.52.0).
+    ///
+    /// ```
+    /// use io_harness::Config;
+    ///
+    /// let config = Config::from_toml(r#"
+    ///     [[lsp]]
+    ///     id = "rust"
+    ///     command = "rust-analyzer"
+    ///     extensions = [".rs"]
+    /// "#).unwrap();
+    ///
+    /// assert_eq!(config.lsp_servers()[0].id, "rust");
+    /// // Unset keys take their defaults rather than becoming absent.
+    /// assert_eq!(config.lsp_servers()[0].timeout_secs, 60);
+    ///
+    /// // A misspelled key is rejected by name rather than ignored: this table
+    /// // names a program to spawn.
+    /// let err = Config::from_toml(r#"
+    ///     [[lsp]]
+    ///     id = "rust"
+    ///     command = "rust-analyzer"
+    ///     extension = [".rs"]
+    /// "#).unwrap_err();
+    /// assert!(err.to_string().contains("extension"), "{err}");
+    /// ```
+    pub fn lsp_servers(&self) -> &[crate::lsp::LspServer] {
+        &self.file.lsp
+    }
+
     /// The named agent definitions this configuration declares (0.21.0).
     ///
     /// `[[agent]]` tables **accumulate** across scopes the way `policy.layers` does,
@@ -1442,6 +1483,11 @@ impl Config {
         let mut out = contract;
         if !self.file.mcp.is_empty() {
             out = out.with_mcp(self.file.mcp.iter().cloned());
+        }
+        // 0.52.0 — same shape as `[[mcp]]` above, and top-level for the same
+        // reason: a file that declares only servers must still get its servers.
+        if !self.file.lsp.is_empty() {
+            out = out.with_lsp(self.file.lsp.iter().cloned());
         }
         // 0.21.0 — `[[agent]]` is top-level, not part of `[run]`, so it is applied
         // before the `[run]` guard below: a file that declares a roster and nothing

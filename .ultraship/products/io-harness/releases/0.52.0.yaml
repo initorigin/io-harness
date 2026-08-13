@@ -1,0 +1,753 @@
+product: io-harness
+version: 0.52.0
+status: released
+release_type: minor
+
+outcome:
+  user_can: >
+    Ask the codebase the questions an editor answers instead of the questions a text search answers.
+    Where is this defined. Who calls it. What is in this file. Where is the symbol called `Ledger`.
+    What is this thing, in one hover. Rename it everywhere, and show me the patch before anything is
+    written. The crate speaks the language-server protocol to servers the operator names in
+    `io.toml`, started once per run in the background, so the index is paid once and not inside a
+    tool call.
+
+    **Today the agent infers structure from `grep`, and the inference is the cost.** `GREP_TOOL` and
+    `FIND_TOOL` (`src/tools/mod.rs:129-131`) return lines that match a regex. Asking "where is
+    `Ledger` defined" means grepping `struct Ledger`, then `enum Ledger`, then `type Ledger`, reading
+    the three files that matched to find which one is the definition and which are uses, and being
+    wrong whenever the definition is generated, re-exported or spelled differently. Asking "who calls
+    `measure`" means grepping `measure(` and reading every hit to discard the comments, the string
+    literals, the unrelated `measure` on another type and the definition itself. Every one of those
+    is a `read_file` — a provider round trip with the whole cacheable system prefix, a gate
+    evaluation and an observation the assembler carries for the rest of the run. The answer a
+    language server gives is one call, and it is the *resolved* answer rather than a text match that
+    resembles one.
+
+    **And rename is the case where the text search is not merely expensive but wrong.** A model
+    renaming a widely used symbol today either edits the definition and hopes, or greps the
+    identifier and rewrites hits it cannot distinguish from a substring of another word, a field on
+    an unrelated type, or a mention in a doc comment that should change and a string literal that
+    should not. There is no way for it to ask the question that has a correct answer.
+
+    **The crate is already the right distance from this.** It already spawns a configured child
+    process, gates that child's argv against the run's own `Policy`, keeps it for the life of the run
+    and shuts it down: `McpSession::connect` (`src/mcp.rs:308`) and `authorize_spawn`
+    (`src/mcp.rs:540`), wired at the nine run entry points in `src/run.rs`. It already turns a child
+    process's answers into tool schemas the model sees (`McpSession::tool_specs`, `src/mcp.rs:415`).
+    What is missing is one protocol.
+
+  business_value: >
+    **The unit of cost in this crate is the provider round trip, and navigation is where a run spends
+    them without deciding anything.** 0.41.0 batched read-only calls, 0.38.0 and 0.44.0 made the
+    unchanging prefix cacheable, 0.51.0 collapsed a four-hunk change from four calls to one. Every
+    one of those attacked the same tax from a different side. Codebase navigation is the largest
+    remaining pocket: a question with a single correct answer, currently answered by three to six
+    calls of text search and file reading, each of which is a full request.
+
+    **A resolved answer is different in kind from a matching line, and the difference shows up as
+    wrong edits.** A run that edits the wrong `measure` because two types have one is not slower, it
+    is incorrect, and the failure surfaces at the verification gate long after the step that caused
+    it. This is the same argument 0.25.0 made for running the checker after an edit rather than
+    leaving the model to decide to look: give the loop the fact rather than the opportunity to
+    derive it.
+
+    **Rename with a patch the operator reads is the shape this crate has been converging on.** 0.51.0
+    made a change a reviewable artifact and gave the crate a patch tool anchored to context. A rename
+    that renders as a patch series — rather than as a multi-file write inside one tool call, which
+    0.51.0 excluded on purpose — costs no new write path, no new gate semantics and no partial-
+    application story. It is the server's resolution plus machinery that already exists.
+
+    **And it is opt-in, so a consumer who configures nothing pays nothing.** No server is downloaded,
+    guessed or started unless `io.toml` names one, and the five tool schemas are absent from the
+    catalogue when none is configured — which is what keeps 0.38.0's cacheable prefix, and every
+    existing run's trace, byte-identical.
+
+  evidence_of_value: >
+    Executed in the technique the last twenty-one releases used: a discriminating assertion per
+    claim, negative controls that must not move, one sabotage per arm of every two-armed claim, and a
+    sabotage that fails nothing reported as a finding rather than propped up.
+
+    **The protocol is proven against a fixture server in the same process, not against an installed
+    binary.** The client is written over an `AsyncRead + AsyncWrite` pair, and the spawn is a thin
+    wrapper that supplies a child's stdio. Every protocol claim is therefore driven over
+    `tokio::io::duplex` by a fake server this repository writes, which answers instantly, runs
+    identically on all three platforms, and can be made to misbehave on purpose — out-of-order
+    responses, an interleaved notification, a missing capability, a handshake that never completes.
+    None of that is expressible against a real server, and a real server's cold start is the one cost
+    a CI gate must not take. A single opt-in live test against `rust-analyzer` exists beside it, in
+    the `documents_live` style, outside the default gate.
+
+    **Framing is proven by the bytes, because this is where a hand-written client is wrong on one
+    platform only.** LSP frames are `Content-Length: N\r\n\r\n` followed by exactly N bytes of UTF-8.
+    A parser that splits headers on `\n`, or that counts characters rather than bytes, passes every
+    test on the host that wrote the fixture. The criterion asserts the exact wire bytes the client
+    writes and feeds it a response containing a multi-byte character, so the length is a byte count
+    and not a character count.
+
+    **Correlation is proven by making the answers arrive in the wrong order.** A response is matched
+    to its request by `id`. A client that assumes the next message is its answer works perfectly
+    until a server sends `window/logMessage` or `$/progress` mid-flight, which every real server
+    does. The fixture interleaves both and answers two outstanding requests in reverse order.
+
+    **Staleness is proven against an edit made in the same run.** The server's view of a file is
+    whatever was last sent to it. A client that opens a document once and caches it answers a
+    position request from the text as it was before the agent's own `edit_file`, which is a wrong
+    answer that looks like a right one. The criterion edits a file and then asks about the line the
+    edit created.
+
+    **The two bounds are proven as absences.** A policy denying `Act::Exec` on the server's program
+    means **no process is spawned** — asserted on the absence of the child, not on the error message.
+    A location resolving under a path a `deny_read` rule covers is **absent from the answer**, and
+    the count of omissions is named in it — asserted on the returned text containing neither the path
+    nor a silent gap.
+
+    **And the release's negative control is that a run without `[[lsp]]` is this build's run.** No
+    tool schema, no child, no event, byte-identical composed prompt and byte-identical trace. Every
+    claim above is about a run that opted in.
+
+scope:
+  included:
+  - >
+    **`src/lsp.rs`, a language-server client written in this crate against `AsyncRead + AsyncWrite`.**
+    `Content-Length` framing over `\r\n\r\n`, JSON-RPC 2.0 request/response correlation by `id`,
+    server-initiated notifications and requests read and discarded except where named below, and a
+    bounded wait per request. Built with `serde_json` and `tokio`, which the crate already depends
+    on: **no new dependency**, so no `lsp-types`, no `tower-lsp`, no JSON-RPC crate, and `cargo tree`
+    stays flat at 402.
+  - >
+    **`LspSession`, the `McpSession` shape again rather than a second one.** `LspSession::connect`
+    is called and `LspSession::shutdown` is awaited at exactly the nine sites in `src/run.rs` that
+    already call `McpSession::connect`/`shutdown` (`src/run.rs:1298`, `:2259`, `:2507`, `:2589`,
+    `:2834`, `:2927`, `:5758`, `:5968`, and the tree loop), so a server's life is the run's life and
+    a child cannot outlive the run that spawned it. Each configured server is spawned, handed
+    `initialize` with the workspace root and this client's capabilities, and sent `initialized` — all
+    of it started **in the background at connect time**, so the index is warming while the model is
+    composing its first step.
+  - >
+    **The spawn is an `Act::Exec` check on the server's own program, through the existing gate.**
+    `authorize_spawn` (`src/mcp.rs:540`) is moved to a shared location and called by both sessions
+    unchanged: same `PolicyEvent`, same refusal shape, same `Error::Refused`. A denied server is a
+    typed failure of the run, exactly as a denied MCP server is, because a run that silently
+    continued without a capability the operator configured is the worse failure — the reasoning
+    already written at `src/mcp.rs:302-307`.
+  - >
+    **`[[lsp]]` in `io.toml`, one table per server.** `id`, `command`, `args`, `env`, `extensions`
+    (which file suffixes this server answers for) and `timeout`, on `File` beside `mcp`
+    (`src/config.rs:241`). Allowed in the project scope for the reason `[[mcp]]` is, which the module
+    already states (`src/config.rs:103`): the spawn gate is the boundary, not the file's scope. It is
+    **not** in `APPENDING` — a later scope replaces the set whole, as `[[hook]]` and `[[provider]]`
+    do, because a half-appended set of servers is not a set.
+  - >
+    **Five tool schemas, and only when a server is configured.** `lsp_definition`, `lsp_references`,
+    `lsp_symbols`, `lsp_hover` and `lsp_rename` in `src/tools/mod.rs`, extended onto the catalogue
+    the way `mcp.tool_specs()` already is (`src/run.rs:4398`). `lsp_symbols` is one schema with two
+    behaviours — no `query` means this file's symbols (`textDocument/documentSymbol`), a `query`
+    means the workspace's (`workspace/symbol`) — because two schemas for one question is prompt bytes
+    on every request of every run under 0.38.0's cacheable prefix.
+  - >
+    **Positions are 1-based on the way in and on the way out, and 0-based only on the wire.** A model
+    reads a file through `read_file` and sees the line numbers a human sees; LSP counts from zero.
+    The conversion happens in one place, in both directions, and is asserted rather than assumed —
+    an off-by-one here answers the neighbouring line and reads as a plausible answer.
+  - >
+    **A file is re-synced from disk on every request that names it.** `textDocument/didOpen` with the
+    file's current bytes, preceded by `didClose` when this client already has it open. The server's
+    view of a file is whatever was last sent to it, and a run that edits a file and then asks about
+    it must not be answered from the text as it was before its own edit. No incremental `didChange`
+    tracking: re-sending one file is cheap, the index stays warm either way, and a change-tracking
+    buffer is a second copy of the workspace this crate would have to keep correct.
+  - >
+    **Every location handed back passes the same `Act::Read` check `read_file` uses, and an omission
+    is counted in the answer.** A server indexes the whole root, including paths a `deny_read` rule
+    covers. The crate cannot change that and does not pretend to: what it can do is refuse to be the
+    thing that carries those bytes into the model's context. Filtered locations are dropped and the
+    observation ends with the count omitted and the act that omitted them, because a silently shorter
+    list is a wrong answer to "who calls this".
+  - >
+    **`lsp_rename` writes nothing.** `textDocument/rename` returns a `WorkspaceEdit` spanning files;
+    the tool renders it as a **patch series in 0.51.0's own format** — one `--- a/<path>` /
+    `+++ b/<path>` header and its hunks per file, in path order — and returns it. The model applies
+    what it wants with `patch_file`, one path per call, one `Act::Write` gate per path, all-or-nothing
+    per file. This is why the release adds no write path, no multi-file gate semantics and no partial-
+    application story: 0.51.0 already built the half that writes.
+  - >
+    **Server diagnostics augment the compiler stream and add no tool.** Where a configured server
+    advertises `diagnosticProvider`, `textDocument/diagnostic` is pulled for the workspace and its
+    findings are appended — attributed to the server by id — to what `check` (`src/run.rs:10099`)
+    and the automatic post-edit path (`src/run.rs:11557`) already report from the project's own
+    checker. The compiler's stream is never replaced and never filtered: `src/tools/diagnostics.rs`
+    states, and this release keeps true, that a server's own analysis omits borrow-check errors,
+    monomorphisation errors and every lint — precisely the errors a model writes.
+  - >
+    **The three states are `diagnostics::Outcome`'s existing states, not a new vocabulary.**
+    `Outcome::Clean`, `Outcome::Found`, `Outcome::Failed(reason)` and `Outcome::Skipped(reason)`
+    already exist and already mean exactly clean / findings / unknown-and-why / nothing-was-going-to-
+    run (`src/tools/diagnostics.rs:74-90`). A server that does not advertise the pull capability, that
+    has not finished indexing, or that failed is `Failed` with the reason named — never `Clean`,
+    because an empty answer that means "I could not ask" and an empty answer that means "your code is
+    fine" are the distinction this whole surface exists to preserve.
+  - >
+    **`src/tools/diagnostics.rs`'s "Deliberately not a language server" section is rewritten in this
+    release.** Its four reasons are correct and stay, scoped to the question that module asks — a
+    one-shot check after a write. Shipping an LSP client while a module doc says an LSP client was
+    rejected is a surface contradicting the code, which is the mistake 0.51.0 caught in
+    `src/verify.rs` and the reason that check is now part of specification.
+  - >
+    **The reporting surfaces, updated in this release and not the next one.** One additive
+    `EventKind::LspStarted { server, backend_root, ready_ms }` per server per run. `docs/CONTRACT.md`
+    gains what a server is gated on, what rename does and does not do, and the `deny_read` sentence.
+    `src/lib.rs`, the README, the guide pages and `CHANGELOG.md` agree, and `tests/docs_drift.rs`,
+    `tests/readme.rs`, `tests/guide_pages.rs` and `tests/changelog.rs` pass.
+  excluded:
+  - >
+    **Any write path through the language server.** No `workspace/applyEdit`, no code actions
+    applied, no quick fixes, no formatting. `lsp_rename` returns a patch; every byte that reaches the
+    workspace goes through `write_file`, `edit_file` or `patch_file` and their gates. A tool that
+    wrote N files on a server's say-so would be exactly the multi-file write 0.51.0 excluded, with
+    the additional property that the crate did not compute the change.
+  - >
+    **Completion, signature help, code lens, semantic tokens, call hierarchy and type hierarchy.** A
+    model does not type; completion is the request an editor needs and an agent does not. The
+    hierarchy requests are a real answer to a real question and are the natural 0.5x follow-up, named
+    in the roadmap rather than added here to round out a list.
+  - >
+    **Push diagnostics (`textDocument/publishDiagnostics`).** They have no completion signal — a
+    server sends them when it decides to, so an empty result is indistinguishable from a slow one,
+    which is the exact distinction this release refuses to blur. `src/tools/diagnostics.rs:20-24`
+    already wrote this down. Pull only; a server without the pull capability is `Failed` with that
+    reason, and this is stated in `known_limitations` rather than implied.
+  - >
+    **Downloading, installing or guessing a server.** A server is named in `io.toml` or there is no
+    server. Nothing is fetched at runtime, nothing is resolved from `PATH` by ecosystem, and a
+    configured server that is not installed is a refusal naming it. `toolchain::detect`
+    (`src/toolchain.rs:398`) knows the ecosystem and is deliberately not consulted: mapping an
+    ecosystem to a binary is a guess about the operator's machine.
+  - >
+    **Any new table, column or index, and any `CHECKPOINT_FORMAT` movement.** Nothing here is
+    durable. A run's LSP answers are observations like every other tool's, and the session dies with
+    the run. `git diff main -- src/state.rs` is empty.
+  - >
+    **Changing what `grep`, `find` or `read_file` do, by one byte.** They remain the answer for text,
+    for an unconfigured project and for every ecosystem with no server. Navigation is added beside
+    them, never routed through them.
+  fallback_scope:
+  - >
+    **The five read verbs, the config table, the spawn gate and the `deny_read` filter.**
+    `lsp_definition`, `lsp_references`, `lsp_symbols` and `lsp_hover` — with `lsp_rename` dropped —
+    is a coherent release on its own: it is the whole "navigate like an editor" claim, and it is the
+    half every other half rests on, since rename and diagnostics are both the same client with a
+    different request.
+  - >
+    Dropped under pressure, in this order: **server diagnostics first** (the compiler stream already
+    answers the question and the model is not blind, so this is the most separable piece and the one
+    whose absence costs the least), then **`lsp_rename`** (the model renames as it does today, and
+    the patch-series rendering is named roadmap work rather than lost). Under both, the release is
+    the fallback above. `lsp_hover` is dropped last and only with the rest, because it is one request
+    against a client that already exists.
+
+acceptance:
+  functional:
+  - >
+    **F1 — the client frames by bytes and the header terminator is `\r\n`.** The bytes the client
+    writes for a known request are asserted exactly: `Content-Length: N\r\n\r\n` followed by N bytes,
+    with N equal to the body's **byte** length for a body containing a multi-byte character, and no
+    other header. Reading is asserted symmetrically over a stream that delivers a frame split across
+    three chunks mid-header and mid-body. Sabotage: split headers on `\n` and length the body in
+    `chars`, under which the multi-byte case and the split-chunk case fail and nothing else here
+    does.
+  - >
+    **F2 — a response is matched to its request by `id`, not by arrival.** Two requests are
+    outstanding; the fixture server sends `window/logMessage`, then `$/progress`, then answers the
+    **second** request, then the first. Each call receives its own answer, and neither notification
+    is returned as one. Sabotage: take the next message as the answer, under which both calls receive
+    the wrong value and only this fails.
+  - >
+    **F3 — positions round-trip 1-based, and the wire is 0-based.** For a symbol the fixture places
+    at line 12 character 5 as a reader counts, the request body carries `{"line":11,"character":4}`,
+    and a returned range at wire line 11 is reported to the model as line 12. Asserted on the wire
+    body and on the rendered observation, at line 1 as well, where an off-by-one produces line 0 —
+    a number no file has. Sabotage: pass the model's numbers through unconverted, under which every
+    position assertion fails and only these do.
+  - >
+    **F4 — a file edited this run is never answered from a stale buffer.** A run edits a file with
+    `edit_file`, inserting a line, and then asks `lsp_definition` about a position on the inserted
+    line; the fixture server records the document text it was last sent, and it is the post-edit
+    text, byte for byte, including the trailing newline. Sabotage: open each document once and cache
+    it, under which the server holds the pre-edit text and only this fails.
+  - >
+    **F5 — a denied server spawns no process, and the run fails typed.** Under a policy denying
+    `Act::Exec` on the configured server's program, the run returns `Error::Refused` naming the act,
+    the target, the rule and the layer, **no child process is created** — asserted by a wrapper the
+    test can observe rather than by the error text — and a `PolicyEvent` refusal row is written.
+    Under a policy that allows it, the same configuration starts and answers. Both halves in one
+    test, since the claim is the distinction. Sabotage: spawn before the check, under which the
+    no-process assertion fails and only this fails.
+  - >
+    **F6 — a location under a `deny_read` rule is absent from the answer and the omission is named.**
+    A `lsp_references` call whose server returns three locations, one of them under a path the policy
+    denies reading, produces an observation containing the two permitted paths, **not** containing
+    the denied path in any form, and ending with a sentence naming one omission and the act.
+    Asserted as an absence and a presence together, because a build that drops the location silently
+    passes any assertion that only counts what is there. Sabotage: return the server's locations
+    unfiltered, under which the absence assertion fails and only this fails.
+  - >
+    **F7 — `lsp_rename` writes nothing and renders a patch that applies.** A rename whose
+    `WorkspaceEdit` spans three files returns a patch series in 0.51.0's format; every file in the
+    workspace is byte-identical afterwards, **no** `edits` row and **no** snapshot row is written,
+    and feeding each file's section to `patch_file` produces exactly the renamed tree. Asserted as an
+    absence and then as an application, because a rename that wrote its own files would satisfy the
+    end state and violate the release. Sabotage: apply the edit inside the tool, under which the
+    byte-identity and no-row assertions fail and only they do.
+  - >
+    **F8 — server diagnostics augment and never replace.** On a tree where the project's checker
+    reports an error and the configured server reports none, `check` still reports the checker's
+    error; where both report, both appear and the server's findings are attributed to its `id`; where
+    the server advertises no `diagnosticProvider`, the answer carries the checker's result **and** a
+    named reason for the server half — never a silent absence and never `Clean`. The third arm is the
+    discriminating one. Sabotage: return the server's result when it is present instead of appending
+    it, under which the first arm loses the compiler's error and only this fails.
+  - >
+    **F9 — an unready or dead server is unknown-and-why, not empty.** A fixture that never completes
+    `initialize`, and a fixture that exits after the handshake, each produce `Outcome::Failed` whose
+    reason names the server and what happened, within the configured timeout; a call made while the
+    server is still indexing waits up to that bound and then reports the same way rather than
+    returning no results. No arm returns `Clean` and no arm returns an empty location list. Sabotage:
+    map a timeout to an empty result, under which all three arms report success having learned
+    nothing and only this fails.
+  - >
+    **F10 — a run with no `[[lsp]]` is this build's run.** No `lsp_*` schema appears in the composed
+    system prompt, no child is spawned, no `LspStarted` event is written, and the composed prompt is
+    **byte-identical** to the same contract's prompt on 0.51.0. This is the release's negative
+    control and it is asserted on bytes. Sabotage: register the schemas unconditionally, under which
+    the byte-identity assertion fails and only this fails.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402**
+    crates on macOS and Linux. The framing, the JSON-RPC envelope and the six request bodies are
+    written in this crate over `serde_json` and `tokio`. An LSP types crate, a JSON-RPC crate or a
+    client crate is a criterion failure, not a trade-off.
+  - >
+    **N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
+  - >
+    **N3 — zero compile breaks, and the additions are enumerated rather than counted.** No existing
+    public item changes shape: no field is added to a constructed type, no trait method changes, no
+    enum that is not already `#[non_exhaustive]` gains a variant reachable by an exhaustive match
+    outside the crate. `EventKind` is additive as it has been since 0.13.0. `docs/public-api.txt`
+    gains the enumerated crate-root additions — `struct LspServer` and nothing else — stated as the
+    enumerated additions rather than as a line count, because that checker enumerates crate-root
+    re-exports and a criterion promising a number has been met in a different form in five of the
+    last thirteen releases. The five tool-name constants live in `tools` and add no line, as
+    `PATCH_FILE_TOOL` does not.
+  - >
+    **N4 — no DDL and no durable state at all.** `git diff main -- src/state.rs` is **empty**, there
+    is no `CREATE TABLE`, no `ALTER TABLE`, no `CREATE INDEX`, and `CHECKPOINT_FORMAT` stays at 7. A
+    0.51.0 store and a 0.52.0 store are the same store in both directions, with nothing to migrate.
+  - >
+    **N5 — the release's own number, and it is the cost of one navigation question.** The stated
+    question "where is this symbol defined and which call sites use it" is driven twice against a
+    scripted provider over the same fixture repository: once through `grep`/`find`/`read_file` as the
+    catalogue offers today, once through `lsp_definition` + `lsp_references`. Recorded in the release
+    record: the provider calls, the steps, the gate evaluations and the prompt bytes for each arm.
+    The LSP arm must take strictly fewer provider calls and strictly fewer prompt bytes; a figure
+    that says otherwise is a feature that did not ship rather than a test to adjust.
+  - >
+    **N6 — every existing suite passes unchanged, apart from catalogue assertions that do not
+    change.** Because the schemas are conditional on configuration, `tests/prompt.rs`,
+    `tests/parity.rs`, `tests/determinism.rs` and every suite quoting the tool catalogue pass
+    **untouched** — not updated with a sentence, untouched. Any suite that does need an edit is a
+    finding to be stated in the record with its reasoning, not a sweep.
+  - >
+    **N7 — the catalogue grows by exactly five schemas, and only for a run that configured a
+    server.** Asserted by composing the system prompt for one contract with and without an `[[lsp]]`
+    entry and diffing: the difference is those five schemas' own bytes and nothing else.
+  operational:
+  - >
+    **O1 — the full suite passes on all three platforms**, on the standing CI matrix including
+    0.47.0's `contained (ubuntu, userns restricted)` leg. A hand-written wire protocol is precisely
+    the code that passes on the host that wrote the fixture: `\r\n` header terminators, byte-vs-char
+    lengths and a child's stdio buffering behave differently on Windows, so F1's byte assertions and
+    the spawn path run on every leg rather than on the developer's machine.
+  - >
+    **O2 — no test gates on a wall clock it does not own.** The fixture server answers in the same
+    process and immediately; readiness, the timeout arms of F9 and the background start are asserted
+    on **structure** — which outcome, which reason, which order — with any duration recorded rather
+    than asserted. A criterion that would fail on a busy runner is a flake this repository has paid
+    for eight times, and the standing rule applies. The `ready_ms` on `LspStarted` is recorded in the
+    record and asserted only to exist.
+  - >
+    **O3 — the live path is proven once, opt-in, outside the gate.** One test drives a real
+    `rust-analyzer` against a small fixture crate — definition, references, symbols, hover — in the
+    `documents_live` style: its own `[[test]]` target, skipped unless the binary is present and an
+    environment variable asks for it, never part of the default or `--all-features` gate, and its
+    result recorded in the release record. It exists because a fixture server proves the client and
+    cannot prove the protocol was understood.
+  - >
+    **O4 — cross-version needs nothing new and is asserted anyway.** With no schema change, the
+    existing `tests/cross_version.rs` and `tests/cross_version_0_29_0.rs` pass unchanged, and that is
+    the criterion: a release that adds no durable state proves it by those suites being untouched and
+    green.
+  - >
+    **O5 — the documentation surfaces agree with the code, in the same release.**
+    `docs/CONTRACT.md`, `src/lib.rs`, the README, the guide pages and `CHANGELOG.md` describe what a
+    server is gated on, that rename returns a patch and writes nothing, that diagnostics augment and
+    are pull-only, and the `deny_read` sentence — that the crate omits what the policy denies from
+    the answer while the server process itself has still indexed those bytes on disk.
+    `src/tools/diagnostics.rs`'s "Deliberately not a language server" section is rewritten in this
+    release to scope its rejection to that module's own question. `tests/docs_drift.rs`,
+    `tests/changelog.rs`, `tests/readme.rs`, `tests/guide_pages.rs` and `tests/public_api.rs` pass.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.52.0, GitHub at initorigin/io-harness with the tag `v0.52.0` and a
+    Release titled `io-harness 0.52.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.52.0` off `develop`, committed incrementally as it lands,
+    including the sealed UltraShip release record and the hand-appended lock pin. PR into `develop`,
+    merged with the PR button. `develop`'s head **and tree** checked against the tree the gates ran
+    on immediately before the release PR is opened — `git diff --quiet feat/0.52.0 develop` — because
+    a Dependabot merge has landed above the feature merge in two of the last sixteen releases. Release
+    PR `develop` into `main`, merged the same way. The GitHub Release is cut by `release.yml` from a
+    tag pushed alone, which takes its notes verbatim from the changelog. `cargo publish --locked` by
+    hand afterwards, always last, after both merges and the Release exist, with the registry token
+    sourced from the repo-local `.env` in the same shell invocation. `develop` synced to `main`
+    fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    **None, and that is a claim this release makes rather than an omission.** No table, column or
+    index; `CHECKPOINT_FORMAT` unmoved at 7; a 0.51.0 store and a 0.52.0 store are the same store in
+    both directions. An operator does nothing.
+  - >
+    **No compile break.** A consumer upgrading changes nothing. `EventKind` gains one additive
+    variant, which is the shape every addition since 0.13.0 has used.
+  - >
+    **Opt-in by configuration.** A project with no `[[lsp]]` table runs identically to 0.51.0,
+    byte-identical in composed prompt and in trace, which is what F10 asserts. Enabling the feature
+    is adding a table naming a server the machine already has.
+  observability:
+  - >
+    One additive `EventKind::LspStarted { server, backend_root, ready_ms }`, emitted once per
+    configured server per run when its handshake completes, carrying the id the operator wrote so a
+    trace can say which server answered. A server that fails to start is already an `Error::Refused`
+    or a typed run failure and is not reported twice.
+  - >
+    The `Act::Exec` decision for each server's argv is a `PolicyEvent` row through `authorize_spawn`,
+    identical in shape to the one an `[[mcp]]` stdio server already writes, so an auditor reads one
+    kind of row for "this run spawned a configured child".
+  - >
+    Every `lsp_*` call is a step with its own observation like any other tool, and a filtered
+    location is visible as the omission count in that observation rather than as a shorter list.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.52.1 and `cargo yank --version
+    0.52.0` is the escape hatch, leaving 0.51.0 as what `cargo install` resolves. Reverting the
+    behaviour needs no downgrade, no flag and no migration: deleting the `[[lsp]]` table returns the
+    crate to 0.51.0's behaviour exactly, which is what F10 asserts on bytes. There is no durable
+    state, so a downgrade after a run is a downgrade rather than a migration.
+
+dependencies:
+  products: []
+  services:
+  - >
+    crates.io and GitHub Actions for the release itself, as every version.
+  - >
+    **No live provider call is required.** Every claim is about this crate's client, its policy and
+    its workspace, proven against a scripted provider and a fixture server in the same process. N5's
+    measurement is a call, gate and byte count against those fixtures, not a vendor's counter.
+  - >
+    **`rust-analyzer` for O3 only**, opt-in and outside the default gate. Its absence skips that test
+    and fails no criterion.
+  human_approvals:
+  - >
+    **No new dependency: the protocol is written in this crate.** Decided at specification time,
+    2026-08-13. `lsp-types` and every client crate bring a tree this crate has refused since 0.1.0,
+    and the six requests this release sends are a few hundred lines of `serde_json`.
+  - >
+    **`lsp_rename` returns a patch series and writes nothing.** Decided at specification time,
+    2026-08-13. 0.51.0 excluded a multi-file write in one call and built `patch_file`; a rename that
+    wrote files would be that excluded thing with the additional property that the crate did not
+    compute the change.
+  - >
+    **Diagnostics add no tool and are pull-only.** Decided at specification time, 2026-08-13. They
+    are appended to `check` and to the automatic post-edit observation, which is what "augment the
+    compiler stream" means in code; push diagnostics have no completion signal, which
+    `src/tools/diagnostics.rs` already wrote down.
+  - >
+    **`[[lsp]]` is allowed in the project scope, gated at the spawn.** Decided at specification time,
+    2026-08-13, for the reason `[[mcp]]` is allowed there and stated at `src/config.rs:103`.
+  - >
+    **Locations are filtered through `Act::Read` and the omission is named.** Decided at
+    specification time, 2026-08-13. The crate cannot stop a server indexing the root and does not
+    pretend to; it can refuse to carry denied bytes into context, and a silently shorter list would
+    be a wrong answer rather than a bounded one.
+  - >
+    **`delivery.target_mode` is `published`.** Decided at specification time, 2026-08-13.
+  - >
+    The PR, both merges, the Release and the publish are pre-authorised for this version under the
+    standing flow.
+
+resource_profile:
+  complexity: large
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    **The framing and the correlation are small and are where a hand-written client is wrong.**
+    Partial reads, a frame split mid-header, a byte length counted in characters, a `Content-Type`
+    header a server sends and this client must skip, and a notification arriving between a request
+    and its answer are five separate cases that each produce a client that works against the fixture
+    that was written for it. F1 and F2 exist because of this, and the fixture server is written to
+    misbehave deliberately.
+  - >
+    **The fixture server itself is real work.** It must speak the protocol well enough to be wrong on
+    purpose: answer out of order, interleave notifications, omit a capability, hang the handshake,
+    record the document text it was last sent. It is the test infrastructure for the whole release
+    and it is written before the client.
+  - >
+    **Wiring the session into nine run entry points without changing their shape.** `McpSession` is
+    threaded through `Tree`, `run_with_extras` and the step loop; a second session follows the same
+    path, and the risk is a call site that connects and does not shut down — a child process that
+    outlives its run.
+  - >
+    **Rendering a `WorkspaceEdit` as a patch series means computing hunks from ranges.** The server
+    returns per-file text edits with ranges; the patch must be 0.51.0's format, applying cleanly
+    through `patch_file`. F7 asserts the round trip rather than the shape, because a patch that looks
+    right and does not apply is the likely defect.
+  - >
+    **Conditional tool registration touches the composed prompt, which is asserted byte-identical
+    across several suites.** Getting the schemas to appear only for a configured run, and to appear
+    in a stable order when they do, is where the prompt suites will fail first.
+  preferred_tools:
+  - >
+    A new `tests/lsp.rs` for the protocol, the tools and the two bounds; `tests/config.rs` for the
+    `[[lsp]]` table and its scope rules; `tests/policy.rs` for the spawn refusal; `tests/prompt.rs`
+    for F10's byte-identity, which is where the catalogue is already asserted.
+  - >
+    `src/lsp.rs`'s own `#[cfg(test)]` module for the framing and the position conversion, which are
+    pure functions and are cheapest to pin there; `cargo test --doc` for the new public item's worked
+    example, which `tests/public_api.rs` requires.
+  constraints:
+  - >
+    **No new runtime dependency.** `cargo tree` flat at 402.
+  - >
+    **MSRV 1.95, edition 2021, Apache-2.0.** Unchanged.
+  - >
+    **Every version stays 0.x.x.** No 1.0.0 is planned or implied by this release.
+  - >
+    **An `EventKind` variant may not carry a field named like the envelope's** — the kind is
+    `#[serde(flatten)]`ed into `RunEvent`, which carries `run_id`, `step` and `depth`. `LspStarted`
+    names its fields `server`, `backend_root` and `ready_ms` for that reason, decided while writing
+    this contract rather than while implementing it.
+  - >
+    **No durable state.** Nothing this release produces is written to the store beyond the events and
+    observations every tool already writes.
+  - >
+    **`docs/CONTRACT.md`, the README, the changelog, the guide pages and the crate-root prose are
+    checked-in surfaces.** They change in this release, not in the next one.
+
+risks:
+- >
+  **A cached document buffer answers from the text as it was before the agent's own edit, and the
+  answer looks correct.** This is the defect most likely to ship, because opening each document once
+  is the obvious spelling and every test that does not edit first passes under it. Mitigation: F4
+  edits and then asks, asserts on the text the server was last sent, and names the cache as its
+  sabotage.
+- >
+  **A client that treats the next message as its answer works against every fixture until a server
+  logs.** Real servers send `window/logMessage`, `$/progress` and `textDocument/publishDiagnostics`
+  unprompted from the first request. Mitigation: F2's fixture interleaves both and answers in
+  reverse order.
+- >
+  **The `deny_read` filter is the kind of check that is written and then bypassed by one code path.**
+  Definition, references, symbols and rename all return locations, and a filter applied in four
+  places is a filter missing from one. Mitigation: every path returns through one function that
+  performs the check, and F6 asserts the absence rather than the count.
+- >
+  **A server that never finishes indexing turns a bounded tool call into a hung run.** Mitigation:
+  every request is bounded by the server's configured timeout, F9 asserts all three unready arms
+  structurally, and O2 forbids asserting on the clock.
+- >
+  **Five new tool schemas are prompt bytes on every request of every run.** Mitigation: they are
+  registered only for a run that configured a server, `lsp_symbols` is one schema rather than two,
+  and N7 asserts the difference is exactly those five schemas.
+- >
+  **Shipping an LSP client while `src/tools/diagnostics.rs` says an LSP client was rejected.** The
+  module's four reasons are correct for the question it asks and read as a rejection of this release.
+  Mitigation: O5 rewrites that section in this release, and the scope names it as work rather than
+  leaving it to a reader to notice.
+
+open_questions:
+- >
+  **Which requests a server must advertise before its tools are offered.** The client asks
+  `initialize` and reads the server's capabilities; whether a server that does not advertise
+  `referencesProvider` should make `lsp_references` absent from the catalogue for that run, or
+  present and answering `Failed` with the reason, is settled during implementation. The absence is
+  cheaper for the model and makes the catalogue depend on a handshake that has not completed when
+  the prompt is first composed, which is the argument against it.
+- >
+  **Whether one `[[lsp]]` server may claim more than one extension set across servers, and what
+  happens when two claim the same suffix.** The plan is first match in declaration order with the
+  ambiguity stated; whether it should instead be a config-time refusal is decided when the table is
+  written, and either answer is a documented rule rather than a discovery.
+
+released_at: 2026-08-13T03:01:36Z
+mode: published
+delivered: >
+  The agent asks the codebase the questions an editor answers instead of the questions a text
+  search answers. Five tools — `lsp_definition`, `lsp_references`, `lsp_symbols` (one schema, two
+  behaviours), `lsp_hover` and `lsp_rename` — answered by a language server named in `io.toml` or
+  on the contract with `TaskContract::with_lsp`, started once per run in the background so a cold
+  index is paid once rather than inside a tool call.
+
+  The client is written in this crate — `Content-Length` framing, JSON-RPC 2.0 correlated by
+  `id`, server requests answered rather than dropped, work-done progress tracked — over
+  `AsyncRead + AsyncWrite`, with the spawn as a thin wrapper. No new dependency: `cargo tree` is
+  flat at 402.
+
+  Two bounds ship with it and both are enforced rather than described. Starting a server is an
+  `Act::Exec` check on its program, through the same `authorize_spawn` an `[[mcp]]` stdio server
+  passes, and the refusal happens **before** any spawn is attempted. Every location handed back
+  passes the same `Act::Read` check `read_file` passes, and a location the policy denies reading
+  is dropped from the answer **with the omission counted in it** — because a quietly shorter list
+  is a wrong answer to "who calls this".
+
+  `lsp_rename` writes nothing: it renders the server's `WorkspaceEdit` as a patch series in
+  0.51.0's own format, which the model applies with `patch_file`, one `Act::Write` check per path.
+  Server diagnostics are appended to the project's own checker in `check` and in the automatic
+  post-edit note, never substituted for it, reusing `diagnostics::Outcome`'s four existing states.
+
+  A run that configures no server is offered none of the five schemas and is byte-identical, in
+  composed prompt and in trace, to the run it had on 0.51.0.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — **82 binaries, 1,684 passed, 0 failed, 428 doctests**,
+    process exit 0 read from the process rather than off a pipeline.
+  - >
+    `cargo test --all-features` on a **cleared target** — **82 binaries, 1,770 passed, 0 failed,
+    431 doctests**, exit 0. The target had to be cleared: this machine ran out of disk with both
+    builds present, twice, and the second time the shell could not create its own output file.
+  - >
+    `cargo test --test lsp` — 13 passed, 0 failed, against `examples/lsp_fixture_server.rs`
+    spawned as a real child over stdio: real framing, a real `initialize`, real `didOpen`.
+    `cargo test --lib lsp::` — 9 passed, the framing, correlation and position conversion pinned
+    where they are pure functions.
+  - >
+    **Ten sabotages, re-run in full against the final tree** because the readiness work landed
+    after the first pass and a sabotage against superseded code proves nothing. Each fails its
+    named test with the suite otherwise green: F3 positions unconverted, F4 cache the document,
+    F5 spawn before the gate, F6 return locations unfiltered, F7 apply the edit inside the tool,
+    F8 substitute the server's diagnostics for the compiler's, F9 map a failure to an empty
+    result — one test each; F10 register the schemas unconditionally — both arms of its own
+    claim; F1 (length in `chars` **and** headers split on `\n`) — 6 unit tests; F2 correlate by
+    arrival — exactly `answers_are_matched_by_id_through_interleaved_notifications`.
+  - >
+    Cross-version, including the ignored generator gate: `cargo build --manifest-path
+    tests/fixtures/gen-0.22.0` and `gen-0.29.0`, then `cargo test --test cross_version --test
+    cross_version_0_29_0 -- --ignored` — `a_current_store_is_read_by_a_0_29_0_binary` passed, so
+    a real 0.29.0 binary reads a store this build wrote.
+  builds:
+  - '`cargo fmt --check` — exit 0.'
+  - '`cargo clippy --all-targets --all-features -- -D warnings` — exit 0, zero warnings.'
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit
+    0, **after it caught two errors stable `cargo doc` does not report**: a public module doc
+    linking the crate-private `Client`, and a redundant explicit link target on
+    `[`Error::Lsp`](crate::Error::Lsp)`. Fifth time in six releases this gate has found
+    something.
+  - '`cargo package --locked` — exit 0, **1,745,960 bytes**.'
+  - >
+    `cargo tree` — **402** crates on the default feature set, unchanged. `git diff main --
+    src/state.rs` — **empty**; no `CREATE TABLE`, no `ALTER TABLE`, no `CREATE INDEX`, and
+    `CHECKPOINT_FORMAT` unmoved at 7.
+  reviews:
+  - >
+    **N5, the release's own number**, printed by
+    `n5_a_navigation_question_costs_fewer_calls_and_fewer_prompt_bytes`: the same question — where
+    is this defined and which call sites use it — costs the text-search arm **6 provider calls,
+    11,901 prompt bytes and 0 gate evaluations**, and the language-server arm **3 provider calls,
+    6,052 prompt bytes and 1 gate evaluation**. Half the calls, 1.97x less prompt read. The gate
+    count moves the other way and that is honest: `grep` and `read_file` are ungated by 0.3.0's
+    decision, and the one evaluation is the `Act::Exec` check on the server binary, paid once per
+    run rather than per question.
+  - >
+    **The live run against a real `rust-analyzer` 1.95.0**, `cargo run --example lsp_live`, twice
+    consecutively: `lsp_definition` from a use site resolves to `src/lib.rs:1:12`;
+    `lsp_references` returns four locations across two files; `lsp_symbols` returns the file's
+    tree and the workspace search finds the symbol; `lsp_hover` returns rust-analyzer's real type
+    block including `size = 8, align = 0x8, no Drop`; `lsp_rename` returns a two-file patch series
+    and the file still declares the old name afterwards.
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **The record is sealed before the crates.io upload.** `target_mode` is `published` and the
+  publish is the last step of the standing flow, after the feat merge, the release merge and the
+  GitHub Release. The record states the authorized target; the flow makes it true.
+- >
+  **THE LIVE RUN FOUND THREE DEFECTS THE FIXTURE COULD NOT, and that is the release's argument for
+  keeping it.** (1) The client never advertised `window.workDoneProgress`, so `rust-analyzer` sent
+  no `$/progress` at all and the crate had no way to tell "still indexing" from "no references".
+  (2) A semantic request answered during start-up comes back **empty, not as an error**:
+  `documentSymbol`, which needs only the syntax tree, answered correctly while `definition`,
+  `references` and `hover` all returned nothing — precisely the silent empty this release promises
+  never to produce. (3) `lsp_symbols` with a `query` and no path matched the empty string against
+  every server's `extensions` list and reported that no server answered, while five other tools
+  were being answered by one.
+- >
+  **An empty answer still cannot always be told from an unready one.** The protocol has no
+  readiness signal. The crate tracks the work a server announces and retries an empty answer until
+  that work settles, bounded by the server's own `timeout_secs`; a server that announces nothing
+  about a start-up phase can still answer "nothing" when it means "not yet". Stated in
+  `docs/CONTRACT.md` rather than left to be discovered.
+- >
+  **The settle window is a constant, not a knob.** `SETTLE` is 1.5 seconds in `src/lsp.rs` — the
+  width of the gap between two of a server's start-up jobs, measured against a real
+  `rust-analyzer` (`Fetching`, then `Building CrateGraph`, then `Roots Scanned`). A server that
+  reports its start-up in coarser pieces needs it larger and nothing configures it.
+- >
+  **A language server runs at the harness's own privilege.** Like an `[[mcp]]` stdio server, and
+  unlike a command run through `exec` or `shell`, it is not placed inside the run's execution
+  sandbox. The roadmap entry said the argv is checked "under the run's sandbox mode"; what shipped
+  is the `Act::Exec` check, which is the half that decides whether the process exists at all.
+- >
+  **A server indexes the whole root it is pointed at, including files a `deny_read` rule covers.**
+  What this crate does about that is refuse to carry those locations into the model's context and
+  say how many it dropped. What it cannot do is stop the server process reading them.
+- >
+  **`EventKind::LspStarted`'s middle field is `root`, not `backend_root`.** The contract named
+  `backend_root`; the value is the workspace root the server was told to index and there is no
+  backend to name. Renamed at implementation time rather than shipped under a misleading name. It
+  is also emitted the first time the run **observes** a server usable — the first navigation call
+  — rather than from the handshake task, because a `&Store` cannot cross a task boundary and
+  `ready_ms` must be the number that was measured.
+- >
+  **`authorize_spawn` was made `pub(crate)` in `src/mcp.rs` rather than moved to a new module.**
+  The contract said "moved to a shared location". One function does not earn a module, and moving
+  it into `src/run.rs` would put a policy-event writer in a 14,000-line file. The property the
+  contract wanted — one check, called by both sessions, unchanged — holds.
+- >
+  **The contract said nine run entry points; there are eight.** `McpSession::connect` appears at
+  eight sites in `src/run.rs`, and `LspSession` is wired at all eight through one `lsp_for`
+  helper. Counted from the source at implementation time.
+- >
+  **A sabotage that failed nothing, reported as a finding rather than propped up.** F5's first
+  form asserted only that the fixture had not written its marker file, and a build that spawns
+  first and checks second still passed it: the child is dropped with `kill_on_drop` on the way out
+  and can be killed before it is ever scheduled. An assertion that depends on winning a race is
+  not an assertion. Replaced by one no scheduling decision can change — for a command that does
+  not exist, the gate's answer is `Error::Refused` and the spawn's answer is `Error::Lsp`.
+- >
+  **The live path is proven by an example, not by a test.** `examples/lsp_live.rs` is run by hand,
+  following `documents_live` and `media_git_live`: a real server's index is minutes on a real
+  repository and a CI gate that waits minutes is a gate someone eventually deletes. Its output is
+  stored under `evidence/0.52.0/lsp-live-run.txt` rather than enforced by the suite.
+- >
+  **O1's three-platform matrix could not run locally.** These numbers are the macOS leg; the Linux
+  and Windows legs run on the release PR, and a hand-written wire protocol is exactly the code
+  that passes on the host that wrote the fixture.
+- >
+  **Completion, signature help, code lens, semantic tokens and call hierarchy are not offered**,
+  and neither are push diagnostics. Excluded at specification time and unchanged.
+supersedes: 0.51.0
+next_recommended_version: 0.53.0
+immutable: true

@@ -736,6 +736,26 @@ pub enum EventKind {
         /// `hooks`, `policy` — in that order.
         contributions: Vec<String>,
     },
+    /// A configured language server finished starting and is answering (0.52.0).
+    ///
+    /// Emitted once per server per run, the first time the run observes that
+    /// server usable — which is its first navigation call, because the handshake
+    /// runs in the background from run start and nothing before that call waits
+    /// for it. `ready_ms` is therefore how long the index actually took measured
+    /// from the spawn, not a number re-read afterwards.
+    ///
+    /// A server that never started is not reported here. It is an
+    /// [`Error::Lsp`](crate::Error::Lsp) or an observation naming the reason, and
+    /// reporting it twice would make a failure look like two events.
+    LspStarted {
+        /// The configured server's id.
+        server: String,
+        /// The root it was told to index. Worth carrying: a server indexes the
+        /// whole of it, including paths a `deny_read` rule covers.
+        root: String,
+        /// How long the handshake took, from spawn to first observed ready.
+        ready_ms: u64,
+    },
     /// A declared capability bundle was not loaded, and the run went on (0.35.0).
     ///
     /// The other half of "dropped and reported, never fatal": a bundle that fails
@@ -1142,6 +1162,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "routed",
     "plugin_loaded",
     "plugin_dropped",
+    "lsp_started",
     "dialed",
     "rewound",
     "reverted",
@@ -1670,6 +1691,11 @@ mod tests {
                 plugin: "broken".into(),
                 why: "no plugin.toml".into(),
             },
+            EventKind::LspStarted {
+                server: "rust".into(),
+                root: "/repo".into(),
+                ready_ms: 812,
+            },
             EventKind::Rewound {
                 files: 2,
                 memory: 1,
@@ -1822,6 +1848,8 @@ mod tests {
                 | EventKind::Routed { .. }
                 | EventKind::PluginLoaded { .. }
                 | EventKind::PluginDropped { .. }
+                // 0.52.0 — a language server that came up.
+                | EventKind::LspStarted { .. }
                 // 0.36.0 — a whole run put back.
                 | EventKind::Rewound { .. }
                 // 0.51.0 — one step's changes reverse-applied.

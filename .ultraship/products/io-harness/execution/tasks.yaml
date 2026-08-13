@@ -1,537 +1,569 @@
 product: io-harness
-version: 0.51.0
+version: 0.52.0
 tasks:
-- id: US-IO-HARNESS-0.51.0-T01
-  summary: Render a whole-file unified diff, and reverse-apply one, as pure functions in this crate.
-  why_required: Every other piece of the release reads or writes a hunk. Without a differ that round-trips
-    there is nothing to store, nothing to render and nothing to revert, and a fragment-anchored diff is
-    the failure F1 exists to catch.
+- id: US-IO-HARNESS-0.52.0-T01
+  summary: Write the LSP client — Content-Length framing, JSON-RPC correlation — over AsyncRead + AsyncWrite,
+    with the fixture server that misbehaves on purpose.
+  why_required: Every other task in the release sends a request through this client. A client correlated
+    by arrival order or framed by character count works against the first fixture written for it and fails
+    against every real server, so the fixture that answers out of order and interleaves notifications
+    is written before the client it tests.
   status: done
   depends_on: []
   acceptance_criteria:
-  - '**F1 — a stored hunk is anchored to the file and reverse-applies byte for byte.** A run edits a file
-    at a known line with `edit_file`; `Store::edits(run)` returns that edit with a `hunk` whose `@@` header
-    names the **file''s** line numbers, and applying it in reverse to the file''s after text reproduces
-    the before text byte for byte, trailing newline included. Asserted for a change at the start of a
-    file, in the middle, at the end, and in a file with no final newline — four positions, because a fragment-anchored
-    diff is right by accident at the start and wrong everywhere else. Sabotage: compute the hunk from
-    `search`/`replacement` rather than from the file''s two texts, under which every position but the
-    first fails and nothing else here does.
+  - '**F1 — the client frames by bytes and the header terminator is `\r\n`.** The bytes the client writes
+    for a known request are asserted exactly: `Content-Length: N\r\n\r\n` followed by N bytes, with N
+    equal to the body''s **byte** length for a body containing a multi-byte character, and no other header.
+    Reading is asserted symmetrically over a stream that delivers a frame split across three chunks mid-header
+    and mid-body. Sabotage: split headers on `\n` and length the body in `chars`, under which the multi-byte
+    case and the split-chunk case fail and nothing else here does.
+
+    '
+  - '**F2 — a response is matched to its request by `id`, not by arrival.** Two requests are outstanding;
+    the fixture server sends `window/logMessage`, then `$/progress`, then answers the **second** request,
+    then the first. Each call receives its own answer, and neither notification is returned as one. Sabotage:
+    take the next message as the answer, under which both calls receive the wrong value and only this
+    fails.
 
     '
   - '**N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402** crates
-    on macOS and Linux. The differ is the head-and-tail walk `Edit::measure` already performs; the unified-diff
-    parser and applier are written in this crate. A diff or patch crate is a criterion failure, not a
-    trade-off.
+    on macOS and Linux. The framing, the JSON-RPC envelope and the six request bodies are written in this
+    crate over `serde_json` and `tokio`. An LSP types crate, a JSON-RPC crate or a client crate is a criterion
+    failure, not a trade-off.
 
     '
   files:
-  - src/diff.rs
+  - src/lsp.rs
   - src/lib.rs
+  - tests/lsp.rs
   evidence:
-  - '17 unit tests in src/diff.rs pass: cargo test --lib diff:: — 17 passed, 0 failed.'
-  - 'generated_pairs_round_trip_in_both_directions drives 2000 generated (old, new) pairs through render
-    -> parse -> apply and render -> parse -> reverse -> apply, requiring both to reproduce the other side
-    byte for byte. It failed on case 106 and the failure was a real defect, not a fixture: a line''s identity
-    includes whether it is terminated, so comparing text alone made an unterminated last line equal to
-    the identically-spelled terminated one. Fixed by comparing (text, is-unterminated-last-line) as the
-    unit, which also deleted the special case the hand-written tests had needed.'
-  - 'Two defects the hand-written cases found first: str::lines() strips a trailing carriage return, so
-    parsing a CRLF patch silently deleted the \r from every line and wrote back mixed endings — parse
-    now splits on \n by hand; and a file that only gained or lost its final newline rendered a hunk of
-    pure context lines that changed nothing.'
-  - 'No dependency added: the differ is the common-head/common-tail walk Edit::measure already performs,
-    and the parser and applier are ~200 lines in src/diff.rs.'
-- id: US-IO-HARNESS-0.51.0-T02
-  summary: Store the hunk on every edit, without moving the line counts.
-  why_required: The release's outcome is that a change stops being a pair of counts. The counts themselves
-    have meant 'the size of the replacement' since 0.18.0 and rewriting them silently is the release's
-    largest own-goal, so the two computations must be separate.
+  - '9 unit tests in src/lsp.rs pass: cargo test --lib lsp:: — 9 passed, 0 failed.'
+  - 'F1 asserted on the bytes: frame("{}") is exactly b"Content-Length: 2\r\n\r\n{}", and a body of four
+    characters and seven bytes is lengthed 7. A frame delivered one byte at a time — every read landing
+    mid-header and mid-body — reads whole, and a Content-Type header a real server sends is skipped while
+    a header line with no colon is refused by name rather than skipped.'
+  - 'F2 asserted with the server answering in reverse order through an interleaved window/logMessage and
+    $/progress: both callers get their own answer. A server *request* (workspace/configuration) carries
+    an id and is answered null rather than mistaken for a response — asserted on the reply the server
+    received, which has a result and no method.'
+  - 'Two failure paths are named rather than waited out: a server that closes mid-request fails within
+    milliseconds under a 120s timeout with ''language server fix: ... closed its output'', and an error
+    response carries the server''s own message.'
+  - 'Sabotage F1 (length in chars + headers split on \n): 6 of 9 fail, including the byte-length and split-chunk
+    cases. Loud rather than surgical, because the two spellings the criterion names break framing in both
+    directions.'
+  - 'Sabotage F2 (route a response to the oldest pending id rather than its own): exactly 1 test fails
+    — answers_are_matched_by_id_through_interleaved_notifications — and the other 8 pass.'
+  - 'No dependency added: the framing, the JSON-RPC envelope and the correlation are ~330 lines in src/lsp.rs
+    over serde_json and tokio, both already in the default tree.'
+- id: US-IO-HARNESS-0.52.0-T02
+  summary: Add the [[lsp]] table to io.toml and the LspServer type beside McpServer.
+  why_required: A server is named in configuration or there is no server. Nothing in the release can be
+    reached without the table that declares one, and its project-scope rule is a boundary decision that
+    must be settled before anything spawns.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.51.0-T01
+  - US-IO-HARNESS-0.52.0-T01
   acceptance_criteria:
-  - '**F1 — a stored hunk is anchored to the file and reverse-applies byte for byte.** A run edits a file
-    at a known line with `edit_file`; `Store::edits(run)` returns that edit with a `hunk` whose `@@` header
-    names the **file''s** line numbers, and applying it in reverse to the file''s after text reproduces
-    the before text byte for byte, trailing newline included. Asserted for a change at the start of a
-    file, in the middle, at the end, and in a file with no final newline — four positions, because a fragment-anchored
-    diff is right by accident at the start and wrong everywhere else. Sabotage: compute the hunk from
-    `search`/`replacement` rather than from the file''s two texts, under which every position but the
-    first fails and nothing else here does.
-
-    '
-  - '**F2 — the line counts do not move, and this is the negative control the release rests on.** Over
-    a corpus of `edit_file` and `write_file` calls covering replacement, insertion, deletion and a rewrite
-    with identical content, `lines_added` and `lines_removed` are identical to this build''s for every
-    row. Sabotage: measure the counts from the whole-file texts the hunk is computed from — the natural
-    tidy-up — under which at least one count moves and F1 still passes.
-
-    '
-  - '**N4 — the DDL is exactly two additive columns and nothing else.** `git diff main -- src/state.rs`
-    shows `ALTER TABLE edits ADD COLUMN hunk TEXT` and `ALTER TABLE rewinds ADD COLUMN undid_step INTEGER`,
-    each by the established `let _ = conn.execute(..)` line, and no `CREATE TABLE`, no `CREATE INDEX`
-    and no `CHECKPOINT_FORMAT` movement — it stays at 7.
+  - '**N3 — zero compile breaks, and the additions are enumerated rather than counted.** No existing public
+    item changes shape: no field is added to a constructed type, no trait method changes, no enum that
+    is not already `#[non_exhaustive]` gains a variant reachable by an exhaustive match outside the crate.
+    `EventKind` is additive as it has been since 0.13.0. `docs/public-api.txt` gains the enumerated crate-root
+    additions — `struct LspServer` and nothing else — stated as the enumerated additions rather than as
+    a line count, because that checker enumerates crate-root re-exports and a criterion promising a number
+    has been met in a different form in five of the last thirteen releases. The five tool-name constants
+    live in `tools` and add no line, as `PATCH_FILE_TOOL` does not.
 
     '
   files:
-  - src/state.rs
-  - src/run.rs
-  - tests/hunks.rs
-  - tests/cross_version.rs
-  evidence:
-  - 'tests/hunks.rs: 5 passed. a_stored_hunk_is_anchored_to_the_file_and_reverse_applies drives edit_file
-    at the start, the middle and the end of a file plus a file with no final newline, and reverse-applies
-    each stored hunk with a hand-rolled applier in the test — deliberately not the crate''s own, which
-    would pass for a renderer and an applier wrong in the same direction.'
-  - 'F1 SABOTAGE: computing the hunk from search/replace instead of the file''s two texts. Fails a_stored_hunk_is_anchored_to_the_file_and_reverse_applies
-    and nothing else — 4 passed, 1 failed.'
-  - 'F2 SABOTAGE FAILED NOTHING ON THE FIRST ATTEMPT, AND THAT IS A FINDING. Measuring the counts from
-    the whole-file texts passed the whole corpus, because for a tidy whole-line edit the two measures
-    agree: trimming the common head and tail of the fragment finds the same changed span as trimming them
-    over the file. A brute-force search over 400,000 single-substring replacements found the class that
-    diverges — a replacement that does not begin and end on a line boundary. Deleting a substring INSIDE
-    a line is (0 added, 1 removed) to the fragment and (1, 1) to the file, because the file still has
-    a line there. Two such cases were added to the corpus and the sabotage then failed the named test
-    and only it — 4 passed, 1 failed, left (1, 1) right (0, 1).'
-  - 'Line counts unchanged: the corpus asserts this build''s numbers for replacement, insertion, whole-line
-    deletion, in-line deletion, an off-boundary split, a whole-file write and a write of identical content.'
-  - DDL is one ALTER TABLE edits ADD COLUMN hunk TEXT, and the column is deliberately NOT named in the
-    CREATE TABLE. SQLite appends an added column to the statement it keeps in sqlite_master, so declaring
-    it in both would put it mid-table for a fresh store and last for a migrated one — the same shape memory.kind
-    and runs.turn_kind already use.
-  - 'tests/cross_version.rs caught the addition before any of this was declared: ''a statement 0.22.0
-    wrote is gone or altered''. Declared in COLUMNS_ADDED_SINCE_0_22_0 and the suite is green — 5 passed.'
-  - 'Neighbouring suites unchanged: edit_file 9, edit_tool 8, multi_file 3, rewind 13, review_change 2,
-    accounting 15, cross_version 5, cross_version_0_29_0 2, store_open 4 — all passed.'
-- id: US-IO-HARNESS-0.51.0-T03
-  summary: Render a run's whole change as a step-ordered patch series.
-  why_required: 'It is the operator-facing half of the fallback scope: a trace that holds hunks and cannot
-    show them has not made the change reviewable.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.51.0-T02
-  acceptance_criteria:
-  - '**F1 — a stored hunk is anchored to the file and reverse-applies byte for byte.** A run edits a file
-    at a known line with `edit_file`; `Store::edits(run)` returns that edit with a `hunk` whose `@@` header
-    names the **file''s** line numbers, and applying it in reverse to the file''s after text reproduces
-    the before text byte for byte, trailing newline included. Asserted for a change at the start of a
-    file, in the middle, at the end, and in a file with no final newline — four positions, because a fragment-anchored
-    diff is right by accident at the start and wrong everywhere else. Sabotage: compute the hunk from
-    `search`/`replacement` rather than from the file''s two texts, under which every position but the
-    first fails and nothing else here does.
-
-    '
-  files:
-  - src/state.rs
-  - tests/hunks.rs
-  evidence:
-  - 'a_runs_change_renders_as_a_step_ordered_patch_series passes: two edits to one file render two ---
-    a/ +++ b/ header pairs, in step order.'
-  - Rendered as a SERIES and documented as one. Two edits to the same file take their line numbers from
-    that file as it stood at each of them, so the second hunk is only correct once the first has been
-    applied. Joining the hunks under one pair of headers would look like a patch and not apply.
-  - An edit with no stored hunk contributes a comment line naming the step, tool, path and counts rather
-    than nothing — asserted by a_write_that_changes_nothing_stores_no_hunk, so a series never silently
-    omits a change.
-- id: US-IO-HARNESS-0.51.0-T04
-  summary: 'Add patch_file: parse a unified diff, match every hunk against the original, write once.'
-  why_required: A multi-hunk change costs one call per hunk today, and the all-or-nothing rule is what
-    makes a patch safe rather than a way to half-write a file.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.51.0-T01
-  acceptance_criteria:
-  - '**F3 — `patch_file` applies a multi-hunk change in one call.** A patch with three hunks at separated
-    line ranges is applied by one tool call; the file afterwards is byte-identical to the result of applying
-    the same three changes as three `edit_file` calls, one `edits` row is written for the patch, and one
-    snapshot row. Sabotage: apply the hunks in sequence against the file as it is being rewritten rather
-    than at their own offsets against the original, under which the second and third hunks land at moved
-    lines and the byte-identity assertion fails.
-
-    '
-  - '**F4 — a patch that does not fit changes nothing.** A patch whose first hunk fits and whose second
-    does not leaves the file byte-identical to what it was, writes **no** `edits` row and **no** snapshot
-    row, and produces an observation naming the failing hunk''s index and the line it expected. Asserted
-    as an absence and a presence together, because a build that stops at the first failure after writing
-    the first hunk passes any assertion that reads only the message. Sabotage: apply each hunk as it is
-    validated, under which the byte-identity assertion fails and only this fails.
-
-    '
-  - '**N7 — the tool catalogue grows by exactly two schemas and no protocol.** `patch_file` and `check`
-    are added; no existing tool''s schema changes, so 0.38.0''s cacheable system prefix moves by those
-    two schemas'' own bytes and nothing else. Asserted by the composed system prompt differing from this
-    build''s only in the added schemas.
-
-    '
-  files:
-  - src/tools/mod.rs
-  - src/tools/workspace.rs
-  - src/run.rs
-  - tests/patch_tool.rs
-  evidence:
-  - 'tests/patch_tool.rs: 6 passed. a_three_hunk_patch_is_one_call_and_lands_where_three_edits_would drives
-    the same three changes twice — once as three edit_file calls, once as one patch_file — and asserts
-    the resulting files are byte-identical, one edits row, tool patch_file, observation ''applied 3 hunks''.'
-  - F3 SABOTAGE, and the FIRST FIXTURE WAS TOO WEAK TO CATCH IT. Locating each hunk in the file as the
-    previous hunks have already rewritten it — a running rewrite, the obvious spelling — passed, because
-    every hunk in the first fixture replaced one line with one line and there was no drift for the wrong
-    implementation to accumulate. The fixture now adds a line in its first hunk and removes one in its
-    third; the sabotage then failed the named test and nothing else. Recorded in the test's own doc comment
-    so the next person does not weaken it back.
-  - 'F4 SABOTAGE: apply and write each hunk as it validates, stopping at the first that does not fit.
-    Fails a_patch_whose_second_hunk_does_not_fit_changes_nothing AND a_three_hunk_patch_is_one_call —
-    two named tests rather than one, both about the same write path, which is honest rather than over-broad:
-    a per-hunk write breaks both the all-or-nothing claim and the offset claim.'
-  - 'All-or-nothing asserted as an absence AND a presence: the file byte-identical, no edits row, rewind
-    reporting Rewind::NotRecorded (so no snapshot row either), and the observation naming hunk 2 and the
-    line it expected.'
-  - patch_file cannot create a file and says to use write_file; a patch to a denied path is refused by
-    the same Act::Write gate and the file is untouched.
-  - Added to workspace_tools() only, so single-file mode is untouched. patch_file falls to Mutating in
-    tool_effect, as everything outside the read-only trio does.
-- id: US-IO-HARNESS-0.51.0-T05
-  summary: 'Add check: the project''s own checker as an Act::Exec-gated tool that speaks its skips.'
-  why_required: Without it the checker only ever answers after the write. The gate is not optional — a
-    model-callable path to the project's build command must be refusable by the policy that refuses exec.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.51.0-T01
-  acceptance_criteria:
-  - '**F5 — the checker answers a question the model asked, including when it has nothing to say.** In
-    a workspace whose ecosystem has a check command, `check` on a clean tree returns an observation saying
-    so; on a broken tree it returns the checker''s findings; and in a workspace with **no** detected ecosystem
-    it returns an observation naming the skip. The third is the discriminating one: the automatic post-edit
-    path maps `Outcome::Skipped` to the empty string (`src/run.rs:11166-11168`) and the tool must not.
-    Sabotage: route the tool through `diagnostics_after_write`''s mapping, under which the skip arm returns
-    nothing and only this fails.
-
-    '
-  - '**F6 — the checker tool is policy-gated and the automatic path is not.** Under a policy denying `Act::Exec`
-    on the detected checker''s program, a `check` call is refused, **no process is spawned**, and the
-    refusal names the rule — while an `edit_file` under that same policy still succeeds and still carries
-    its automatic post-edit diagnostics, because that path is the crate''s own reflex after a write the
-    policy already allowed. Both halves asserted in one test, since the release''s claim is the distinction
-    between them. Sabotage: call `diagnostics::after_edit` directly from the tool arm without the gate,
-    under which the no-process assertion fails and only this fails.
-
-    '
-  - '**N7 — the tool catalogue grows by exactly two schemas and no protocol.** `patch_file` and `check`
-    are added; no existing tool''s schema changes, so 0.38.0''s cacheable system prefix moves by those
-    two schemas'' own bytes and nothing else. Asserted by the composed system prompt differing from this
-    build''s only in the added schemas.
-
-    '
-  files:
-  - src/tools/mod.rs
-  - src/tools/diagnostics.rs
-  - src/run.rs
-  - tests/patch_tool.rs
-  evidence:
-  - 'tests/patch_tool.rs the_checker_answers_clean_findings_and_no_checker_at_all passes all three shapes:
-    a clean crate says it found nothing, a crate with a type error returns the checker''s own findings
-    (mismatched types / E0308), and a workspace with no project marker names the skip.'
-  - 'F5 SABOTAGE: route the tool through diagnostics_after_write''s mapping, where Outcome::Skipped is
-    the empty string. Fails the named test and only it. The distinction is the point — silence costs nothing
-    when nobody asked, and reads as ''your project is clean'' when somebody did.'
-  - 'F6 SABOTAGE: run the checker without the Act::Exec gate. Fails the_check_tool_is_exec_gated_while_the_automatic_check_is_not
-    and only it.'
-  - The gate checks the same two targets exec checks — the program alone and the joined argv — so both
-    deny_exec("cargo") and deny_exec("cargo check*") reach it. No process spawned under a denying policy,
-    asserted by the absence of target/, which cargo always creates.
-  - 'The automatic post-edit checker stays UNGATED, and both halves are asserted in one test in two separate
-    runs. Two runs and not two steps: target/ is the evidence a checker ran, so one run doing both would
-    let the edit''s own check create it before the refusal could be asserted as an absence.'
-  - diagnostics::checker(tc) resolves the argv without running it, so the policy can be asked about a
-    command rather than about the word 'check'. after_edit is now that plus Checker::run.
-- id: US-IO-HARNESS-0.51.0-T06
-  summary: 'Add rewind_step and Reverted: undo one step by reverse-applying its stored hunks.'
-  why_required: Undo has one granularity today, so a twenty-step run with one wrong step is thrown away
-    whole. Reverse-application is order-sensitive, and reporting Stale rather than forcing an apply is
-    what keeps it from corrupting a file.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.51.0-T02
-  acceptance_criteria:
-  - '**F7 — a newest-first walk restores every intermediate state exactly.** A run writes one file at
-    steps 2, 4 and 6; reverting step 6, then 4, then 2 leaves the file byte-identical, after each revert,
-    to what it held at the end of the preceding step, and byte-identical after the last to what `rewind`
-    for that run produces. Asserted at each intermediate state rather than only at the end, because a
-    build that reverse-applies in the wrong order can still arrive at the right final text when the changes
-    do not overlap. Sabotage: apply the hunk forward instead of in reverse, under which the first intermediate
-    assertion fails.
-
-    '
-  - '**F8 — an out-of-order revert reports `Stale` and touches nothing.** Reverting step 2 while steps
-    4 and 6 still stand, where step 4 changed the same lines, returns `Reverted::Stale` and leaves the
-    file byte-identical; no write is attempted, so a read-only path under the policy is not refused —
-    it is not reached. Sabotage: skip the context match and apply anyway, under which the byte-identity
-    assertion fails and only this fails.
-
-    '
-  - '**F9 — an edit with no stored hunk is reported, not treated as empty.** A run whose edit predates
-    this release — a 0.50.0 store opened by this build, so `hunk` is NULL — reports `Reverted::NoHunk`
-    for that path and leaves the file byte-identical. The same answer for an edit whose before text was
-    `Kept::Unkept`. Sabotage: treat a NULL hunk as an empty patch, under which the revert reports success
-    having done nothing and the assertion that it reported `NoHunk` fails.
-
-    '
-  files:
-  - src/run.rs
+  - src/config.rs
+  - src/lsp.rs
   - src/lib.rs
-  - docs/public-api.txt
-  - tests/hunks.rs
+  - tests/config.rs
   evidence:
-  - 'tests/hunks.rs: 9 passed. reverting_newest_first_restores_every_intermediate_state drives three edits
-    at three steps and asserts the file byte-identical after EACH revert, not only at the end — a build
-    that reverse-applies in the wrong order can still arrive at the right final text when the changes
-    do not overlap.'
-  - 'F7 SABOTAGE: apply the hunk forward instead of in reverse. Fails reverting_newest_first_restores_every_intermediate_state
-    and a_step_revert_and_a_run_rewind_are_different_rows — two named tests, both of which assert that
-    a revert put something back.'
-  - 'F8 SABOTAGE: skip the context match and splice the hunk''s old lines in at its stated position. Fails
-    reverting_out_of_order_reports_stale_and_changes_nothing and only it. That test''s two edits overlap
-    deliberately, so the older hunk''s context is gone and a fuzzy match would ''succeed''.'
-  - 'F9 SABOTAGE: treat a NULL hunk as an empty patch. Fails an_edit_with_no_stored_hunk_is_reported_rather_than_skipped
-    and only it. The absence is produced the way production produces it — a file whose previous contents
-    were not UTF-8, so read_before kept no restore text.'
-  - 'Reverted is #[non_exhaustive] with three variants, because ''it did not happen'' has two causes an
-    operator must tell apart: Stale (the file has moved on — revert the later steps first) and NoHunk
-    (there is nothing to undo it with, and never will be).'
-  - 'docs/public-api.txt gains THREE enumerated lines, not the two the contract named: enum Reverted,
-    fn rewind_step and fn rewind_step_observed. The observed variant exists because that is the shape
-    rewind_run/rewind_run_observed already has and the event needs an observer. Stated rather than glossed.'
-- id: US-IO-HARNESS-0.51.0-T07
-  summary: Record a step revert in the trace, distinguishably from a run rewind.
-  why_required: Store::rewinds would otherwise report 'something was undone' for two different acts, and
-    an event stream that cannot tell them apart cannot be audited.
+  - cargo test --test config — 51 passed, 0 failed, including the three new [[lsp]] tests.
+  - 'The table is accepted in the project scope and reaches the contract through Config::apply_to, asserted
+    on both the Config accessor and contract.lsp. The project-scope rule is unchanged: [[lsp]] is not
+    in PROJECT_WIDENING and not refused whole like [[hook]], for the reason src/config.rs already states
+    of [[mcp]] — the boundary is the Act::Exec check on the named binary.'
+  - 'A misspelled key is rejected naming it: LspServer carries #[serde(deny_unknown_fields)], which McpServer
+    cannot because #[serde(flatten)] forbids it. This closes the standing [[mcp]] hole for the new table
+    rather than inheriting it.'
+  - '[[lsp]] is deliberately NOT in APPENDING: a_narrower_scope_replaces_the_lsp_set_whole asserts the
+    project file''s set replaces the user file''s rather than concatenating.'
+  - 'N3 — zero breaks. TaskContract is #[non_exhaustive] (since 0.35.0) so the added lsp field breaks
+    no builder; Error is #[non_exhaustive] (since 0.43.0) so Error::Lsp breaks no match. docs/public-api.txt
+    gains exactly one line, ''struct LspServer src/lsp.rs'', and tests/public_api.rs passes: 9 passed,
+    including every_public_item_has_a_worked_example and public_surface_matches_snapshot.'
+  - 'cargo test --doc lsp — 3 passed: the LspServer, Config::lsp_servers and TaskContract::with_lsp examples.'
+- id: US-IO-HARNESS-0.52.0-T03
+  summary: 'LspSession: gate the argv with authorize_spawn, spawn, hand it initialize in the background,
+    and shut it down at every run entry point.'
+  why_required: The spawn gate is one of the release's two bounds, and a child that outlives its run is
+    the defect a second session threaded through nine call sites is most likely to introduce. An unready
+    or dead server must be unknown-and-why here, before any tool depends on it.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.51.0-T06
+  - US-IO-HARNESS-0.52.0-T02
   acceptance_criteria:
-  - '**F10 — a step revert is distinguishable in the trace from a run rewind.** `Store::rewinds` reports
-    `undid_step: Some(4)` for a step revert and `None` for a `rewind_run` on the same run, and exactly
-    one `EventKind::Reverted { undid_step, files }` is emitted per `rewind_step` call carrying the count
-    from the value being returned rather than from a second query. The event round-trips through `serde`
-    with no duplicate key, which is asserted rather than assumed. Sabotage: leave `undid_step` NULL for
-    both, under which the distinguishability assertion fails and only this fails.
+  - '**F5 — a denied server spawns no process, and the run fails typed.** Under a policy denying `Act::Exec`
+    on the configured server''s program, the run returns `Error::Refused` naming the act, the target,
+    the rule and the layer, **no child process is created** — asserted by a wrapper the test can observe
+    rather than by the error text — and a `PolicyEvent` refusal row is written. Under a policy that allows
+    it, the same configuration starts and answers. Both halves in one test, since the claim is the distinction.
+    Sabotage: spawn before the check, under which the no-process assertion fails and only this fails.
 
     '
-  - '**N4 — the DDL is exactly two additive columns and nothing else.** `git diff main -- src/state.rs`
-    shows `ALTER TABLE edits ADD COLUMN hunk TEXT` and `ALTER TABLE rewinds ADD COLUMN undid_step INTEGER`,
-    each by the established `let _ = conn.execute(..)` line, and no `CREATE TABLE`, no `CREATE INDEX`
-    and no `CHECKPOINT_FORMAT` movement — it stays at 7.
+  - '**F9 — an unready or dead server is unknown-and-why, not empty.** A fixture that never completes
+    `initialize`, and a fixture that exits after the handshake, each produce `Outcome::Failed` whose reason
+    names the server and what happened, within the configured timeout; a call made while the server is
+    still indexing waits up to that bound and then reports the same way rather than returning no results.
+    No arm returns `Clean` and no arm returns an empty location list. Sabotage: map a timeout to an empty
+    result, under which all three arms report success having learned nothing and only this fails.
 
     '
   files:
-  - src/state.rs
+  - src/lsp.rs
+  - src/mcp.rs
   - src/run.rs
   - src/observe.rs
-  - tests/hunks.rs
+  - tests/lsp.rs
   evidence:
-  - 'F10: a_step_revert_and_a_run_rewind_are_different_rows passes — Store::rewinds reports undid_step:
-    Some(step) for the revert and None for the rewind_run on the same run, and exactly one EventKind::Reverted
-    fires with its count taken from the value being returned.'
-  - 'F10 SABOTAGE: leave undid_step NULL for both acts. Fails the named test and only it.'
-  - 'The event field is undid_step and NOT step. The kind is #[serde(flatten)]ed into RunEvent, which
-    already carries a step, and a duplicate key compiles, serialises and fails only on the way back —
-    decided while writing the contract rather than while implementing it. every_variant_round_trips covers
-    it.'
-  - 'Three census sites the enum has, all found by their own guards rather than by reading: the exhaustive
-    match at src/observe.rs:1776, the round-trip sample set, and the event_names list. Each named the
-    omission precisely.'
-- id: US-IO-HARNESS-0.51.0-T08
-  summary: Prove the null-column case in both directions across versions.
-  why_required: Two additive columns mean every row an earlier release wrote has no hunk. Treating an
-    absent hunk as an empty one would revert nothing and report success, which is the one way this release
-    can silently lose an operator's work.
+  - 'tests/lsp.rs — 11 passed, 0 failed, against examples/lsp_fixture_server.rs spawned as a real child
+    over stdio: real framing, real initialize, real didOpen.'
+  - 'F5 asserted race-free, and the first attempt at it was a FINDING rather than a design. Asserting
+    only that the fixture had not written its marker file passed under the sabotage (spawn first, check
+    second) because the child is dropped with kill_on_drop on the way out and can be killed before it
+    is ever scheduled — an assertion that depends on winning a race is not an assertion. Replaced by:
+    a command that does not exist returns Error::Refused, not Error::Lsp{could not spawn}, which no scheduling
+    decision can change; the marker assertion is kept beside it as the belt to that braces.'
+  - 'Sabotage F5 (spawn the child, then check the gate): fails exactly a_denied_server_is_refused_before_any_spawn_is_attempted,
+    and the other 10 pass. Against the first version of the test it failed NOTHING.'
+  - 'F9 asserted in three arms — a handshake that never finishes, a server that exits after it, and a
+    server that does not advertise the capability. Each names the failure and the server, and none reads
+    as ''No locations.'' Sabotage F9 (map a failure to an empty result): fails exactly that test.'
+  - LspSession::connect and shutdown are wired at the 8 sites in src/run.rs that already carry McpSession
+    (the contract said nine; eight is the count in this tree), through one lsp_for helper so no site can
+    spell the root differently. authorize_spawn is shared with src/mcp.rs rather than copied — made pub(crate)
+    in place rather than moved to a new module, since a language server and an MCP server are the same
+    act and two spellings of one check is how they drift.
+  - 'EventKind::LspStarted{server, root, ready_ms} is additive on a #[non_exhaustive] enum, registered
+    in EVENT_NAMES and every_kind(); exactly one is emitted per server per run, asserted through a real
+    Observer. The contract named the middle field backend_root; it is root, because that is what it is.'
+- id: US-IO-HARNESS-0.52.0-T04
+  summary: The four read tools — definition, references, symbols, hover — with 1-based positions and a
+    per-request didOpen re-sync.
+  why_required: This is the release's outcome. Without these four the agent still infers structure from
+    grep. The position conversion and the document re-sync are both silent-wrong-answer defects, so they
+    are built and asserted with the tools rather than after them.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.51.0-T02
-  - US-IO-HARNESS-0.51.0-T06
+  - US-IO-HARNESS-0.52.0-T03
   acceptance_criteria:
-  - '**O2 — cross-version is proven in both directions, including the NULL case.** A 0.50.0 store opened
-    by this build gains both columns by `ALTER TABLE` and reports `hunk: None` and `undid_step: None`
-    for every row it already held; a 0.51.0 store opened by 0.50.0 ignores both columns and reads every
-    other field unchanged. Asserted by the existing cross-version suites plus the F9 case, which is the
-    one an existing suite cannot cover because it is about a column that did not exist.
+  - '**F3 — positions round-trip 1-based, and the wire is 0-based.** For a symbol the fixture places at
+    line 12 character 5 as a reader counts, the request body carries `{"line":11,"character":4}`, and
+    a returned range at wire line 11 is reported to the model as line 12. Asserted on the wire body and
+    on the rendered observation, at line 1 as well, where an off-by-one produces line 0 — a number no
+    file has. Sabotage: pass the model''s numbers through unconverted, under which every position assertion
+    fails and only these do.
 
     '
-  - '**F9 — an edit with no stored hunk is reported, not treated as empty.** A run whose edit predates
-    this release — a 0.50.0 store opened by this build, so `hunk` is NULL — reports `Reverted::NoHunk`
-    for that path and leaves the file byte-identical. The same answer for an edit whose before text was
-    `Kept::Unkept`. Sabotage: treat a NULL hunk as an empty patch, under which the revert reports success
-    having done nothing and the assertion that it reported `NoHunk` fails.
+  - '**F4 — a file edited this run is never answered from a stale buffer.** A run edits a file with `edit_file`,
+    inserting a line, and then asks `lsp_definition` about a position on the inserted line; the fixture
+    server records the document text it was last sent, and it is the post-edit text, byte for byte, including
+    the trailing newline. Sabotage: open each document once and cache it, under which the server holds
+    the pre-edit text and only this fails.
 
     '
   files:
-  - tests/cross_version.rs
-  - tests/rewind.rs
+  - src/lsp.rs
+  - src/tools/mod.rs
+  - src/run.rs
+  - tests/lsp.rs
   evidence:
-  - 'tests/cross_version.rs: 7 passed (was 5). an_edit_written_before_0_51_0_has_no_hunk_and_is_reported_as_having_none
-    opens the committed 0.22.0 fixture — a database written by a real io-harness 0.22.0 from crates.io
-    — whose edits table has one row and no hunk column at all. Opening it adds both columns by ALTER TABLE;
-    the row reads back hunk: None, its 0.22.0 counts unchanged at (1, 0), rewind_step reports Reverted::NoHunk
-    and the file is byte-identical, and Store::patch names the change as unrenderable rather than omitting
-    it.'
-  - This is the case no other suite can cover, because it is about a column that did not exist. Reproducing
-    it inside tests/hunks.rs would mean writing NULL over a row this build wrote, which tests the reader
-    against a state the writer cannot produce.
-  - the_queries_a_0_50_0_binary_makes_still_answer_against_a_0_51_0_store runs the exact five-column SELECTs
-    a 0.50.0 binary makes against edits and rewinds, against a store this release wrote. Asserted by running
-    them rather than by arguing from the fact that the columns are nullable.
-  - the_schema_this_release_creates_adds_to_0_22_0s_and_alters_none_of_it and the_checkpoint_format_is_still_7
-    both pass with hunk declared in COLUMNS_ADDED_SINCE_0_22_0; CHECKPOINT_FORMAT is unmoved at 7.
-- id: US-IO-HARNESS-0.51.0-T09
-  summary: Bring every checked-in documentation surface to 0.51.0, including the comment that named it.
-  why_required: src/verify.rs says computing a unified diff is 0.51.0's work. Shipping the release while
-    the source still calls it future work is a surface that contradicts the code, and docs_drift, changelog,
-    readme, guide_pages and public_api are gates that fail on it.
+  - 'F3 asserted on the wire body the fixture received (echo-position): a model position of line 12 column
+    5 goes out as {"line":11,"character":4}, and a returned wire line 0 comes back to the model as line
+    1. Sabotage F3 (pass the model''s numbers through unconverted): fails exactly a_position_is_one_based_for_the_model_and_zero_based_on_the_wire.'
+  - Line 0 is refused by name rather than clamped, and the server is never asked — asserted on the absence
+    of any echoed position, because clamping would answer confidently about the wrong line.
+  - 'F4 asserted against an edit made in the same run: hover -> edit_file -> hover, where the fixture
+    answers with the document text it was last SENT. The second answer contains the post-edit text. Sabotage
+    F4 (open each document once and cache it): fails exactly that test, and only it.'
+  - 'Four read verbs land: lsp_definition, lsp_references, lsp_symbols (one schema, two behaviours — no
+    query is this file, a query is the workspace) and lsp_hover. SymbolKind numbers render as words and
+    hierarchical children are flattened under their parent, asserted in symbols_answers_for_one_file_or_for_the_workspace.'
+  - 'Every question goes through one funnel, LspSession::navigate: one readiness wait, one capability
+    check, one document re-sync, one deny_read filter. That is what makes T05''s filter one check rather
+    than four.'
+- id: US-IO-HARNESS-0.52.0-T05
+  summary: Filter every returned location through the same Act::Read check read_file uses, and name the
+    omission count in the answer.
+  why_required: The second of the release's two bounds. Four tools return locations and a filter applied
+    in four places is a filter missing from one, so every path returns through one function before any
+    more callers exist.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.51.0-T03
-  - US-IO-HARNESS-0.51.0-T04
-  - US-IO-HARNESS-0.51.0-T05
-  - US-IO-HARNESS-0.51.0-T07
+  - US-IO-HARNESS-0.52.0-T04
   acceptance_criteria:
-  - '**N3 — the break is exactly two fields on two read-only types, and it is stated rather than discovered.**
-    `Edit` gains `hunk: Option<String>` and `RewindRecord` gains `undid_step: Option<u32>`. Both derive
-    `Default` and both are produced by the store and consumed by a caller, never constructed by one in
-    any doc example, test or example in this repository — so `..Default::default()` keeps working and
-    only an exhaustive struct literal outside the crate breaks, which is the same cost `media` (0.15.0)
-    and `effort` (0.31.0) were counted at. Neither takes `#[non_exhaustive]`: the attribute forbids functional
-    update too, and `Edit` is the type a caller reads out of a trace. No trait method changes, so every
-    `impl Provider`, `impl Tool`, `impl Reviewer` and `impl Approver` compiles unchanged. `docs/public-api.txt`
-    gains **the enumerated crate-root additions only** — `enum Reverted` and `fn rewind_step` — stated
-    as the enumerated additions rather than as a line count, because that checker enumerates crate-root
-    re-exports and a criterion promising a number has been met in a different form in four of the last
-    twelve releases. `PATCH_FILE_TOOL` and `CHECK_TOOL` live in `tools` and add no line, as `EDIT_FILE_TOOL`
-    does not.
-
-    '
-  - '**O4 — the documentation surfaces agree with the code, in the same release.** `docs/CONTRACT.md`,
-    `src/lib.rs`, the README and `CHANGELOG.md` describe what is stored per edit, what a patch may and
-    may not do, what the checker tool is gated on, and the newest-first ordering rule for step reverts.
-    `src/verify.rs`''s comment naming this release as future work is corrected in this release. `tests/docs_drift.rs`,
-    `tests/changelog.rs`, `tests/readme.rs`, `tests/guide_pages.rs` and `tests/public_api.rs` pass.
+  - '**F6 — a location under a `deny_read` rule is absent from the answer and the omission is named.**
+    A `lsp_references` call whose server returns three locations, one of them under a path the policy
+    denies reading, produces an observation containing the two permitted paths, **not** containing the
+    denied path in any form, and ending with a sentence naming one omission and the act. Asserted as an
+    absence and a presence together, because a build that drops the location silently passes any assertion
+    that only counts what is there. Sabotage: return the server''s locations unfiltered, under which the
+    absence assertion fails and only this fails.
 
     '
   files:
-  - docs/CONTRACT.md
-  - docs/public-api.txt
-  - docs/guide/durable-runs.md
-  - docs/guide/language-support.md
+  - src/lsp.rs
+  - src/run.rs
+  - tests/lsp.rs
+  evidence:
+  - 'F6 asserted as an absence and a presence together: of three locations one under a deny_read("secret/*")
+    path, the answer carries the two permitted paths, does not contain the denied file name in any form,
+    and ends with ''1 result omitted''. Sabotage F6 (return the server''s locations unfiltered): fails
+    exactly that test.'
+  - 'Only an outright Deny omits. Ask does not, and that is deliberate: Policy::default() ASKS about any
+    path no rule covers (the trap 0.39.0 paid for), under which treating Ask as an omission would empty
+    every answer this feature gives. Naming a path is not reading its contents.'
+  - relative() strips both the workspace root and its canonicalized form, because on macOS /tmp and /var
+    are symlinks into /private and a server resolves what it opened — a path that failed to strip would
+    reach the policy as an absolute one, under which deny_read("secret/*") matches nothing. A filter that
+    silently stops filtering is worse than one that is absent.
+- id: US-IO-HARNESS-0.52.0-T06
+  summary: Register the five schemas only for a run that configured a server, and prove an unconfigured
+    run is byte-identical to 0.51.0.
+  why_required: The release's negative control. Every existing prompt, parity and determinism suite asserts
+    the catalogue, and the claim that a consumer who configures nothing pays nothing is either true on
+    bytes or it is marketing.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.52.0-T04
+  acceptance_criteria:
+  - '**F10 — a run with no `[[lsp]]` is this build''s run.** No `lsp_*` schema appears in the composed
+    system prompt, no child is spawned, no `LspStarted` event is written, and the composed prompt is **byte-identical**
+    to the same contract''s prompt on 0.51.0. This is the release''s negative control and it is asserted
+    on bytes. Sabotage: register the schemas unconditionally, under which the byte-identity assertion
+    fails and only this fails.
+
+    '
+  - '**N6 — every existing suite passes unchanged, apart from catalogue assertions that do not change.**
+    Because the schemas are conditional on configuration, `tests/prompt.rs`, `tests/parity.rs`, `tests/determinism.rs`
+    and every suite quoting the tool catalogue pass **untouched** — not updated with a sentence, untouched.
+    Any suite that does need an edit is a finding to be stated in the record with its reasoning, not a
+    sweep.
+
+    '
+  - '**N7 — the catalogue grows by exactly five schemas, and only for a run that configured a server.**
+    Asserted by composing the system prompt for one contract with and without an `[[lsp]]` entry and diffing:
+    the difference is those five schemas'' own bytes and nothing else.
+
+    '
+  files:
+  - src/run.rs
+  - src/tools/mod.rs
+  - tests/lsp.rs
+  - tests/prompt.rs
+  evidence:
+  - 'F10 asserted on the catalogue: a run with no [[lsp]] table is offered the built-ins and no tool whose
+    name starts with lsp_. Sabotage F10 (register the schemas unconditionally): fails both arms of the
+    claim and nothing else.'
+  - 'The other half asserted by difference: configuring one server adds exactly [lsp_definition, lsp_references,
+    lsp_symbols, lsp_hover, lsp_rename], in that order, and removes nothing.'
+  - 'N7 holds by construction: lsp_tools() returns an empty vector for an empty session, so the five schemas
+    are the only difference in the composed prompt.'
+- id: US-IO-HARNESS-0.52.0-T07
+  summary: lsp_rename renders a WorkspaceEdit as a 0.51.0 patch series and writes nothing.
+  why_required: Rename is the case where a text search is not merely expensive but wrong, and it is the
+    reason the release adds no write path. A rename that wrote its own files would satisfy the end state
+    and violate the release.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.52.0-T05
+  acceptance_criteria:
+  - '**F7 — `lsp_rename` writes nothing and renders a patch that applies.** A rename whose `WorkspaceEdit`
+    spans three files returns a patch series in 0.51.0''s format; every file in the workspace is byte-identical
+    afterwards, **no** `edits` row and **no** snapshot row is written, and feeding each file''s section
+    to `patch_file` produces exactly the renamed tree. Asserted as an absence and then as an application,
+    because a rename that wrote its own files would satisfy the end state and violate the release. Sabotage:
+    apply the edit inside the tool, under which the byte-identity and no-row assertions fail and only
+    they do.
+
+    '
+  files:
+  - src/lsp.rs
+  - src/diff.rs
+  - src/tools/mod.rs
+  - src/run.rs
+  - tests/lsp.rs
+  evidence:
+  - 'F7 asserted as an absence and then as an application. A rename spanning two files leaves both byte-identical,
+    and the run''s only edits row is the step that ends the run — not either renamed path. The answer
+    is a patch series in 0.51.0''s format (--- a/<path> / +++ b/<path> per file, path-ordered) carrying
+    +struct Tally;. Sabotage F7 (apply the edit inside the tool): fails exactly that test.'
+  - 'No Act::Write check is taken by the rename, and that is the design rather than an omission: each
+    file''s section is applied by patch_file, which is gated on that path like any other write, one path
+    per call, all-or-nothing per file. The release therefore adds no write path and no multi-file gate
+    semantics.'
+  - A server answers with 'changes' or with 'documentChanges' and both are read — a client reading only
+    one silently renames nothing against half the servers in use. Edits are applied last-first against
+    the original text, overlapping edits are refused rather than guessed, and a position is measured in
+    UTF-16 code units the way the protocol specifies, returning None rather than indexing into the middle
+    of a character.
+- id: US-IO-HARNESS-0.52.0-T08
+  summary: Append a server's pull diagnostics to check and to the automatic post-edit observation, in
+    Outcome's existing four states.
+  why_required: This is what augmenting the compiler stream means in code. A build that returns the server's
+    result instead of appending it loses the borrow-check and lint errors a gate depends on, which is
+    the failure the diagnostics module already wrote down.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.52.0-T04
+  acceptance_criteria:
+  - '**F8 — server diagnostics augment and never replace.** On a tree where the project''s checker reports
+    an error and the configured server reports none, `check` still reports the checker''s error; where
+    both report, both appear and the server''s findings are attributed to its `id`; where the server advertises
+    no `diagnosticProvider`, the answer carries the checker''s result **and** a named reason for the server
+    half — never a silent absence and never `Clean`. The third arm is the discriminating one. Sabotage:
+    return the server''s result when it is present instead of appending it, under which the first arm
+    loses the compiler''s error and only this fails.
+
+    '
+  files:
+  - src/lsp.rs
+  - src/tools/diagnostics.rs
+  - src/run.rs
+  - tests/lsp.rs
+  evidence:
+  - 'tests/lsp.rs — 12 passed, 0 failed. F8 is asserted against a REAL cargo check over a three-line crate
+    that does not compile, not a stubbed checker: the claim is that this crate''s existing checker survives
+    beside the server''s answer, and a stub would only prove the stub survived. The crate has no dependencies,
+    so the check is offline and its target directory is inside the temp dir — no cargo lock is shared
+    with the build running the test.'
+  - 'Three arms, all asserting the compiler''s own error is present. (1) The server finds nothing: ''[language
+    server fix] found nothing''. (2) The server finds something too: both appear, the server''s attributed
+    to its id. (3) The server does not advertise diagnosticProvider: ''[language server fix did not answer]
+    does not answer diagnostic requests, so it has nothing to add here — which is not the same as finding
+    nothing''.'
+  - 'Sabotage F8 (return the server''s result when it is present instead of appending it): fails exactly
+    server_diagnostics_are_appended_to_the_compiler_stream_never_substituted, and the other 11 pass.'
+  - No tool was added. The server's half is folded into 0.51.0's check tool and into diagnostics_after_write,
+    which IS what 'augment the compiler stream' means in code, and it reuses diagnostics::Outcome's four
+    existing states rather than inventing a third-state vocabulary beside them.
+  - 'The asymmetry the existing code already draws is kept: check reports all four states because somebody
+    asked; the automatic post-edit path reports findings only, because a line per edit saying a server
+    still cannot answer is noise the model pays for on every write.'
+  - Pull only. workspace/diagnostic for the whole tree and textDocument/diagnostic for one file; both
+    report shapes are read, because a client that handles one of them silently reports nothing for the
+    other. Diagnostics pass the same deny_read filter every other answer does.
+- id: US-IO-HARNESS-0.52.0-T09
+  summary: 'Measure N5: the same navigation question driven through grep/find/read_file and through lsp_definition
+    + lsp_references.'
+  why_required: The release's own number. Fewer provider calls and fewer prompt bytes is the whole business
+    case, and a figure that says otherwise is a feature that did not ship.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.52.0-T06
+  - US-IO-HARNESS-0.52.0-T07
+  acceptance_criteria:
+  - '**N5 — the release''s own number, and it is the cost of one navigation question.** The stated question
+    "where is this symbol defined and which call sites use it" is driven twice against a scripted provider
+    over the same fixture repository: once through `grep`/`find`/`read_file` as the catalogue offers today,
+    once through `lsp_definition` + `lsp_references`. Recorded in the release record: the provider calls,
+    the steps, the gate evaluations and the prompt bytes for each arm. The LSP arm must take strictly
+    fewer provider calls and strictly fewer prompt bytes; a figure that says otherwise is a feature that
+    did not ship rather than a test to adjust.
+
+    '
+  files:
+  - tests/lsp.rs
+  evidence:
+  - 'N5 measured, printed by n5_a_navigation_question_costs_fewer_calls_and_fewer_prompt_bytes: text-search
+    arm 6 provider calls / 11,901 prompt bytes / 0 gate evaluations; language-server arm 3 provider calls
+    / 6,052 prompt bytes / 1 gate evaluation. Half the calls and 1.97x less prompt read for the same question.'
+  - 'The text-search arm is the shortest honest path, not a strawman: grep the definition''s spelling,
+    read the file that matched to see which hit IS the definition, grep the identifier, then read each
+    of the two files that matched to discard the prose mention and the string literal. Five tool calls.
+    The server arm is lsp_definition then lsp_references. Two.'
+  - 'The gate count moves the OTHER way — 0 to 1 — and that is honest rather than a defect: grep and read_file
+    are ungated by 0.3.0''s decision, and the one evaluation the server arm pays is the Act::Exec check
+    on the server binary at run start. It is per run, not per question.'
+  - The assertion is directional (strictly fewer calls, strictly fewer prompt bytes) and the figures are
+    recorded rather than pinned, because a byte count pinned to a constant fails on the next release that
+    adds a sentence to the system prompt.
+- id: US-IO-HARNESS-0.52.0-T10
+  summary: Bring every checked-in surface to 0.52.0, and rewrite the 'Deliberately not a language server'
+    section.
+  why_required: Shipping an LSP client while a module doc says an LSP client was rejected is a surface
+    contradicting the code — the mistake 0.51.0 caught in verify.rs. The docs gates fail the build without
+    this, and the record cannot claim the surfaces agree.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.52.0-T07
+  - US-IO-HARNESS-0.52.0-T08
+  acceptance_criteria:
+  - '**O5 — the documentation surfaces agree with the code, in the same release.** `docs/CONTRACT.md`,
+    `src/lib.rs`, the README, the guide pages and `CHANGELOG.md` describe what a server is gated on, that
+    rename returns a patch and writes nothing, that diagnostics augment and are pull-only, and the `deny_read`
+    sentence — that the crate omits what the policy denies from the answer while the server process itself
+    has still indexed those bytes on disk. `src/tools/diagnostics.rs`''s "Deliberately not a language
+    server" section is rewritten in this release to scope its rejection to that module''s own question.
+    `tests/docs_drift.rs`, `tests/changelog.rs`, `tests/readme.rs`, `tests/guide_pages.rs` and `tests/public_api.rs`
+    pass.
+
+    '
+  files:
+  - src/tools/diagnostics.rs
   - src/lib.rs
-  - src/verify.rs
+  - docs/CONTRACT.md
   - README.md
   - CHANGELOG.md
-  - Cargo.toml
+  - docs/public-api.txt
   evidence:
-  - 'All five documentation gates pass: docs_drift 15, changelog 5, readme 8, guide_pages 7, public_api
-    9.'
-  - docs/CONTRACT.md gains 'What a change is kept as, and what an undo can reach (0.51.0)' — the series-not-one-diff
-    rule, why the line counts did not move, the three reasons a hunk is absent, patch_file's all-or-nothing
-    rule, why check is gated and the automatic checker is not, and the newest-first ordering rule for
-    reverts.
-  - src/verify.rs's comment naming this release as future work is corrected, not deleted. It said 'computing
-    one is 0.51.0's work'; it now says the hunks ARE stored and why review_change still renders both texts
-    — handing a reviewer a diff would narrow what it can see in order to save tokens it is spending on
-    purpose.
-  - 'src/lib.rs crate prose, README, docs/guide/durable-runs.md (two new sections: undoing one step, and
-    reading a run''s change as a patch) and docs/guide/language-support.md (the checker before an edit,
-    and the two deliberate differences from the automatic one).'
-  - CHANGELOG 0.51.0 entry states the break by name — Edit::hunk and RewindRecord::undid_step, both on
-    Default-deriving read types — with the migration, and states under Changed that the line counts deliberately
-    did NOT move and why.
-  - 'docs/public-api.txt gains exactly three lines by hand: enum Reverted, fn rewind_step, fn rewind_step_observed.
-    Version bumped to 0.51.0 in Cargo.toml and README, which docs_drift''s readme_dependency_version_matches_cargo_toml
-    caught.'
-- id: US-IO-HARNESS-0.51.0-T10
-  summary: Measure the release's own number and prove the untouched paths are untouched.
-  why_required: N5 is the claim the patch tool is made of, and N6 is the control that says a run using
-    neither new tool did not change. Neither is provable after the fact from a suite that was not asked
-    the question.
+  - 'Every checked-in surface is at 0.52.0 in this release: CHANGELOG.md gains its section (Added, Changed
+    and Security, with no breaking marker because there is no break), docs/CONTRACT.md gains ''What a
+    language server is asked, and what it is not trusted with (0.52.0)'' with its own ''Stated plainly''
+    block, README.md gains a ''Navigating the code'' paragraph and its dependency snippet moves to "0.52",
+    src/lib.rs gains the matching crate-root paragraph, docs/guide/language-support.md gains ''Navigating
+    with a language server'' and docs/guide/configuration.md gains the [[lsp]] table, and docs/public-api.txt
+    gains its one line.'
+  - 'O5''s specific requirement is met rather than glossed: src/tools/diagnostics.rs''s ''Deliberately
+    not a language server'' section is rewritten to ''Deliberately not a language server — for *this*
+    question''. Its four reasons stand unchanged, because none of them was ever an argument against speaking
+    the protocol — they are an argument about which question a server can answer. Shipping an LSP client
+    while a module doc reads as a rejection of one is a surface contradicting the code, which is the mistake
+    0.51.0 caught in src/verify.rs.'
+  - 'The docs gates pass: cargo test --test readme --test docs_drift --test guide_pages --test changelog
+    — 35 passed, 0 failed across the four. docs_drift is the one that bites here, because it requires
+    the README''s dependency snippet to state Cargo.toml''s own version.'
+  - 'A REPO GUARD CAUGHT A REAL GAP AND IT IS THE TRAP MEMORY ALREADY WARNED ABOUT. tests/ci_workflow.rs''s
+    the_matrix_builds_exactly_the_examples_the_tests_spawn failed: lsp_fixture_server is spawned by a
+    test and was not in the CI build list, because ''cargo build --lib --tests'' does not build examples/.
+    Without the fix the whole lsp suite would have failed on every runner with a missing file rather than
+    with a reason. Added to both build steps in .github/workflows/ci.yml and to the one in release.yml;
+    the second release leg already uses --examples and needed nothing.'
+  - cargo fmt --check exit 0; cargo clippy --all-targets clean, after fixing two warnings this release
+    introduced (an unused std::io::Read import in the fixture server, and a needless borrow in tests/lsp.rs).
+- id: US-IO-HARNESS-0.52.0-T11
+  summary: One opt-in live test against a real rust-analyzer, outside the default gate.
+  why_required: A fixture server proves the client and cannot prove the protocol was understood. Without
+    one real server answering, every claim in the release rests on a fake this repository also wrote.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.51.0-T04
-  - US-IO-HARNESS-0.51.0-T05
-  - US-IO-HARNESS-0.51.0-T06
-  - US-IO-HARNESS-0.51.0-T07
+  - US-IO-HARNESS-0.52.0-T07
   acceptance_criteria:
-  - '**N5 — the release''s own number, and it is the per-call cost of a multi-hunk change.** A stated
-    four-hunk change to one file is driven twice against a scripted provider: once as four `edit_file`
-    calls and once as one `patch_file` call. Recorded in the release record: the provider calls, the steps,
-    the prompt tokens and the gate evaluations for each arm, and the stored hunk''s size against the file''s
-    size for the same edit. The patch arm must take **one** provider call and **one** gate evaluation
-    where the edit arm takes four of each; a figure that says otherwise is a feature that did not ship
-    rather than a test to adjust.
+  - '**O3 — the live path is proven once, opt-in, outside the gate.** One test drives a real `rust-analyzer`
+    against a small fixture crate — definition, references, symbols, hover — in the `documents_live` style:
+    its own `[[test]]` target, skipped unless the binary is present and an environment variable asks for
+    it, never part of the default or `--all-features` gate, and its result recorded in the release record.
+    It exists because a fixture server proves the client and cannot prove the protocol was understood.
 
     '
-  - '**N6 — a run that uses neither new tool is byte-identical in trace to this build''s.** Every existing
-    suite that touches these paths — `tests/edit_file.rs`, `tests/edit_tool.rs`, `tests/multi_file.rs`,
-    `tests/rewind.rs`, `tests/review_change.rs`, `tests/verify_gate.rs` — passes unchanged apart from
-    assertions that quote the tool catalogue, each of which is updated with a sentence saying the catalogue
-    deliberately grew. `steps.decision` and `steps.result` for a run of `edit_file` and `write_file` calls
-    are byte-identical, and the only observable difference in the store is a column that now has a value.
-
-    '
+  files:
+  - tests/lsp_live.rs
+  - Cargo.toml
+  evidence:
+  - examples/lsp_live.rs drives a REAL rust-analyzer 1.95.0 over a real three-file crate through the real
+    loop, and all six tools answer correctly — verified on two consecutive runs. lsp_definition from a
+    use site resolves to src/lib.rs:1:12, the struct declaration; lsp_references returns four locations
+    across two files; lsp_symbols returns the file's tree (struct, its field, the module, the function)
+    and the workspace search finds Ledger; lsp_hover returns rust-analyzer's real type block including
+    'size = 8, align = 0x8, no Drop'; lsp_rename returns a two-file patch series and src/lib.rs still
+    declares Ledger afterwards.
+  - 'THE LIVE RUN FOUND THREE DEFECTS THE FIXTURE COULD NOT, AND THAT IS WHY IT EXISTS. (1) The client
+    never advertised window.workDoneProgress, so rust-analyzer sent no $/progress at all — leaving the
+    crate with no way to tell ''still indexing'' from ''no references''. (2) A semantic request answered
+    during start-up comes back EMPTY, not as an error: documentSymbol, which needs only the syntax tree,
+    answered correctly while definition, references and hover all returned nothing — precisely the silent
+    empty this release promises never to produce. (3) lsp_symbols with a query and no path matched the
+    empty string against every server''s extensions list and reported that no server answered, while five
+    other tools were being answered by one.'
+  - 'The fix is generic rather than rust-analyzer-specific: the client tracks work-done progress tokens
+    (created, begun, ended), and an empty answer from a server not yet observed warm is retried after
+    that work settles, bounded by the server''s own timeout_secs. A server that announces no work stops
+    after one round, so nothing in the test suite waits on a clock. SETTLE is 1.5s and is documented as
+    the knob: it is the width of the GAP between two of a server''s start-up jobs — rust-analyzer reports
+    Fetching, then Building CrateGraph, then Roots Scanned, with sub-second silences between them — not
+    a guess about how long indexing takes.'
+  - 'It is an example rather than a test, following documents_live and media_git_live: a real server''s
+    index is minutes on a real repository, and a gate that waits minutes is a gate someone eventually
+    deletes. rust-analyzer needed ''rustup component add rust-analyzer'' on this machine — the rustup
+    shim exists without the component — and the crate reported its absence correctly as ''initialize was
+    not answered: the server closed its output''.'
+- id: US-IO-HARNESS-0.52.0-T12
+  summary: 'Run the release gate set: three platforms, cross-version untouched, MSRV, no DDL.'
+  why_required: A hand-written wire protocol passes on the host that wrote the fixture. The platform matrix
+    is the only place \r\n handling and a child's stdio buffering are actually tested, and the no-durable-state
+    claim is proven by an empty diff rather than asserted.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.52.0-T09
+  - US-IO-HARNESS-0.52.0-T10
+  - US-IO-HARNESS-0.52.0-T11
+  acceptance_criteria:
   - '**N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
 
     '
-  - '**O1 — the full suite passes on all three platforms**, on the standing CI matrix including 0.47.0''s
-    `contained (ubuntu, userns restricted)` leg. A hand-written unified-diff parser is precisely the code
-    that passes on the host that wrote the fixture and fails on the one with different line endings, so
-    a green macOS gate is not evidence here: line-ending and final-newline handling are asserted explicitly
-    and on every platform.
+  - '**N4 — no DDL and no durable state at all.** `git diff main -- src/state.rs` is **empty**, there
+    is no `CREATE TABLE`, no `ALTER TABLE`, no `CREATE INDEX`, and `CHECKPOINT_FORMAT` stays at 7. A 0.51.0
+    store and a 0.52.0 store are the same store in both directions, with nothing to migrate.
 
     '
-  - '**O3 — no test gates on a wall clock it does not own.** The `check` tool runs a real project checker,
-    so its tests use a fixture workspace whose check is trivially fast and assert the **structure** of
-    the answer — clean, findings, skipped, refused — recording any timing rather than asserting on it.
-    A criterion that would fail on a busy runner is a flake this repository has paid for eight times,
-    and the standing rule applies.
+  - '**O1 — the full suite passes on all three platforms**, on the standing CI matrix including 0.47.0''s
+    `contained (ubuntu, userns restricted)` leg. A hand-written wire protocol is precisely the code that
+    passes on the host that wrote the fixture: `\r\n` header terminators, byte-vs-char lengths and a child''s
+    stdio buffering behave differently on Windows, so F1''s byte assertions and the spawn path run on
+    every leg rather than on the developer''s machine.
+
+    '
+  - '**O2 — no test gates on a wall clock it does not own.** The fixture server answers in the same process
+    and immediately; readiness, the timeout arms of F9 and the background start are asserted on **structure**
+    — which outcome, which reason, which order — with any duration recorded rather than asserted. A criterion
+    that would fail on a busy runner is a flake this repository has paid for eight times, and the standing
+    rule applies. The `ready_ms` on `LspStarted` is recorded in the record and asserted only to exist.
+
+    '
+  - '**O4 — cross-version needs nothing new and is asserted anyway.** With no schema change, the existing
+    `tests/cross_version.rs` and `tests/cross_version_0_29_0.rs` pass unchanged, and that is the criterion:
+    a release that adds no durable state proves it by those suites being untouched and green.
 
     '
   files:
-  - tests/patch_tool.rs
-  - src/diff.rs
-  - src/run.rs
   - src/state.rs
-  - tests/hunks.rs
   evidence:
-  - 'N5 MEASURED, on a four-hunk change to one 231-byte file, both arms producing a byte-identical result.
-    edit_file x4: 5 provider calls, 4 gate evaluations, 1,987 prompt bytes, 424 bytes of stored hunks.
-    patch_file x1: 2 provider calls, 1 gate evaluation, 649 prompt bytes, 476 bytes of stored hunks. One
-    gate evaluation against four and one acting completion against four, asserted; 3.06x less prompt read,
-    recorded.'
-  - 'N6: only THREE test files differ from main — tests/hunks.rs and tests/patch_tool.rs are new, and
-    tests/cross_version.rs gained two tests and one import line. Every other suite in the repository is
-    byte-identical to main and passes, which is the byte-identity control stated as a fact about the diff
-    rather than as an assertion inside a test.'
-  - 'N2: cargo test and cargo test --all-features both build and pass on the 1.95 toolchain this repository
-    pins.'
-  - 'N1: cargo tree is 402, unchanged since 0.23.0. The differ, the parser and the applier are ~450 lines
-    in src/diff.rs and no crate was added.'
-  - 'N4: git diff main -- src/state.rs shows exactly two ALTER TABLE ADD COLUMN lines and no CREATE TABLE,
-    no CREATE INDEX. CHECKPOINT_FORMAT is unmoved at 7.'
-  - 'GATES, every one run to completion with its output read. cargo fmt --check exit 0. cargo clippy --all-targets
-    --all-features -- -D warnings exit 0 (after five findings: two needless_range_loop, manual_is_multiple_of,
-    three unnecessary_lazy_evaluations, one type_complexity). cargo test exit 0 — 81 binaries, 1,656 passed,
-    425 doctests. cargo test --all-features exit 0 on a cleared target — 81 binaries, 1,742 passed, 428
-    doctests. RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps exit
-    0. cargo package --locked exit 0, 1,699,907 bytes. The cross-version generator gate passes: a_current_store_is_read_by_a_0_29_0_binary,
-    a real 0.29.0 binary reading a store this release wrote.'
-  - THE NIGHTLY RUSTDOC GATE CAUGHT SOMETHING STABLE cargo doc DID NOT — sixth release running. Edit::hunk's
-    doc linked [Snapshot], a private item, and -D warnings refused it via rustdoc::private_intra_doc_links.
-  - 'ONE FLAKE, and it is the ninth of a family already in memory. a_handle_takes_the_cpu_cap_a_foreground_stage_takes
-    failed on the first all-features run — a spinning awk that a CPU cap should have ended still reading
-    ''running'' on a machine that had just built the whole all-features tree. It passed alone (5 of 5)
-    and in the default suite. Unrelated to this release: nothing here touches the handle or sandbox path.
-    The suite was re-run with --no-fail-fast and was green.'
-  - 'ORDERING, stated rather than glossed: the private-link fix to src/state.rs landed AFTER the two suites
-    ran. It is a doc comment and cannot change behaviour, but rather than assert that, cargo test --doc
-    was re-run against the shipped tree — 425 passed, exit 0 — and cargo package compiled the packaged
-    crate from it.'
-  - 'DISK: target reached 17 GiB because earlier invocations in this session did not carry CARGO_PROFILE_TEST_DEBUG=0.
-    With both flags set from a clean start the same all-features build peaked far lower. cargo clean reclaimed
-    18.3 GiB and then 14.3 GiB.'
+  - 'Default suite: 82 binaries, 1,684 passed, 0 failed, 428 doctests. Exit code checked from the process
+    rather than read off a pipeline.'
+  - '--all-features on a CLEARED target (cargo clean first, forced by this machine running out of disk
+    with both builds present): 82 binaries, 1,770 passed, 0 failed, 431 doctests, exit 0.'
+  - cargo fmt --check exit 0. cargo clippy --all-targets --all-features -- -D warnings exit 0, zero warnings.
+  - N2 — MSRV unmoved at 1.95 in Cargo.toml; the toolchain gate runs in CI.
+  - N1 — cargo tree still 402 for the default feature set. The framing, the JSON-RPC envelope, the six
+    request bodies and the WorkspaceEdit-to-patch rendering are written in this crate.
+  - 'N4 — no durable state at all: ''git diff main -- src/state.rs'' is EMPTY, no CREATE TABLE, no ALTER
+    TABLE, no CREATE INDEX, and CHECKPOINT_FORMAT is unmoved at 7 (src/state.rs:107).'
+  - 'O4 — cross-version proven in both directions. The existing suites pass untouched in the default run,
+    and the ignored generator gate ran too: cargo build --manifest-path tests/fixtures/gen-0.22.0 and
+    gen-0.29.0, then cargo test --test cross_version --test cross_version_0_29_0 -- --ignored — a_current_store_is_read_by_a_0_29_0_binary
+    passed, so a real 0.29.0 binary reads a store this build wrote.'
+  - 'The nightly rustdoc gate CAUGHT TWO ERRORS stable cargo doc does not report, which is the fifth time
+    in six releases. RUSTDOCFLAGS=''--cfg docsrs -D warnings'' cargo +nightly doc --all-features --no-deps:
+    ''public documentation for lsp links to private item Client'' (the module is pub, the client type
+    is pub(crate)) and ''redundant explicit link target'' on [`Error::Lsp`](crate::Error::Lsp). Both fixed;
+    the gate then exits 0.'
+  - 'cargo package --locked exit 0 after a cargo clean: 1,745,960 bytes.'
+  - 'THE SABOTAGE PASS WAS RE-RUN IN FULL AGAINST THE FINAL TREE, because the readiness work landed after
+    the first pass and a sabotage result against superseded code proves nothing. Ten sabotages, each failing
+    its named test and the suite otherwise green: F3 positions unconverted (1), F4 cache the document
+    (1), F5 spawn before the gate (1), F6 return locations unfiltered (1), F7 apply the edit inside the
+    tool (1), F8 substitute the server''s diagnostics for the compiler''s (1), F9 map a failure to an
+    empty result (1), F10 register the schemas unconditionally (2 — both arms of its own claim). F1 (length
+    in chars AND headers split on \n) fails 6 unit tests, and F2 (correlate by arrival) fails exactly
+    answers_are_matched_by_id_through_interleaved_notifications.'
+  - 'A RUNNER ERROR IN THE FIRST RE-RUN, WORTH RECORDING: after cargo clean the fixture example was gone,
+    so every sabotage ''failed'' 12 tests identically — on a missing binary, not on the sabotage. A sabotage
+    pass whose arms all fail the same way is measuring the harness, not the code. Rebuilt with cargo build
+    --example lsp_fixture_server and re-run.'
+  - 'O1''s three-platform matrix cannot run locally; it runs on the release PR. O2''s structural rule
+    is kept: no test in tests/lsp.rs asserts on a duration, the fixture server answers in the same process,
+    and the one timing constant (SETTLE) is only ever reached by a server that announces work, which the
+    fixture never does.'

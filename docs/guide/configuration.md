@@ -671,3 +671,28 @@ the **user-scope file** outright, ahead of `IO_CONFIG_HOME` and every platform
 convention — it names a scope rather than bypassing the merge, so a project file
 still wins the keys it names. A profile is a section of the same file that was
 already read, not a fifth scope and not a second read.
+
+## `[[lsp]]` — language servers (0.52.0)
+
+```toml
+[[lsp]]
+id = "rust"
+command = "rust-analyzer"
+args = []
+extensions = [".rs"]
+timeout_secs = 60
+```
+
+One table per server. `extensions` decides which files it answers for; an empty
+list answers for every file, and where two servers claim one suffix the first in
+declaration order wins. `timeout_secs` bounds every request to it, and it is also
+what bounds how long the run will wait for a slow start-up.
+
+Allowed in a project-scoped `io.toml`, for the reason `[[mcp]]` is: starting the
+server is an `Act::Exec` check on `command`, so the boundary is the policy the
+caller loaded rather than the scope of the file that named the binary. Unlike
+`[[mcp]]`, a misspelled key here **is** rejected by name — there is no
+`#[serde(flatten)]` in this table to forbid it.
+
+A narrower scope replaces the whole set rather than appending to it, the way
+`[[hook]]` and `[[provider]]` do: the servers that run are the servers of one file.
