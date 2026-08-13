@@ -705,6 +705,373 @@ impl Drop for Client {
     }
 }
 
+/// Which executable this run will drive, and why that one.
+///
+/// A configured binary is used or the launch fails naming it — there is
+/// deliberately **no** fallback to the resolution list when an operator named
+/// something that is not there. Falling back would silently drive a different
+/// browser than the one asked for, which is the kind of helpfulness that makes a
+/// trace a lie.
+pub(crate) fn resolve(config: &BrowserConfig) -> Result<std::path::PathBuf> {
+    if let Some(named) = &config.binary {
+        let path = std::path::Path::new(named);
+        if path.is_file() {
+            return Ok(path.to_path_buf());
+        }
+        return crate::sandbox::resolve_program(named).ok_or_else(|| {
+            fail(format!(
+                "the configured browser `{named}` was not found. Nothing is downloaded: \
+                 install it, or name one that exists in the [browser] table"
+            ))
+        });
+    }
+    for name in RESOLUTION_ORDER {
+        if let Some(found) = crate::sandbox::resolve_program(name) {
+            return Ok(found);
+        }
+    }
+    for path in WELL_KNOWN {
+        let path = std::path::Path::new(path);
+        if path.is_file() {
+            return Ok(path.to_path_buf());
+        }
+    }
+    Err(fail(format!(
+        "no browser was found. Nothing is downloaded — install one of {}, \
+         or name one in the [browser] table",
+        RESOLUTION_ORDER.join(", ")
+    )))
+}
+
+/// The arguments this crate requires, in the order it passes them.
+///
+/// Split out so a test reads the same list the launch uses rather than a copy of
+/// it that can drift.
+pub(crate) fn launch_args(
+    config: &BrowserConfig,
+    profile: &std::path::Path,
+    proxy: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
+        // The transport. No debugging port is opened, so nothing else on the
+        // machine can reach this browser.
+        "--remote-debugging-pipe".to_string(),
+        // A profile this run owns and removes: no cookies, extensions, history or
+        // logged-in sessions from the operator's own browser are visible to it.
+        format!("--user-data-dir={}", profile.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        format!("--window-size={},{}", config.width, config.height),
+    ];
+    if config.headless {
+        args.push("--headless=new".to_string());
+        args.push("--disable-gpu".to_string());
+    }
+    // Under containment the run owns a loopback proxy that asks this run's own
+    // policy about every host:port. Pointing the browser at it means its traffic
+    // takes the path every other contained command's traffic takes, rather than a
+    // second one beside it.
+    if let Some(proxy) = proxy {
+        args.push(format!("--proxy-server={proxy}"));
+    }
+    args.extend(config.args.iter().cloned());
+    args
+}
+
+/// A running browser: the child, the client speaking to it, and the page.
+pub(crate) struct Browser {
+    client: Client,
+    child: tokio::process::Child,
+    /// The flat-mode session every page message carries.
+    session: String,
+    gate: Arc<NavGate>,
+    config: BrowserConfig,
+    /// Removed when this is dropped, taking the profile with it.
+    _profile: tempfile::TempDir,
+    /// What was actually resolved, for the trace.
+    binary: String,
+    /// How long the handshake took, recorded rather than asserted.
+    ready_ms: u128,
+}
+
+impl Browser {
+    /// The resolved binary, for the event that names which browser answered.
+    pub(crate) fn binary(&self) -> &str {
+        &self.binary
+    }
+
+    /// How long the handshake took.
+    pub(crate) fn ready_ms(&self) -> u128 {
+        self.ready_ms
+    }
+
+    /// The gate, for draining the navigation decisions into events.
+    pub(crate) fn gate(&self) -> &Arc<NavGate> {
+        &self.gate
+    }
+
+    /// Send one command to the attached page.
+    pub(crate) async fn page(&self, method: &str, params: Value) -> Result<Value> {
+        self.client
+            .request(method, params, Some(&self.session), self.config.timeout())
+            .await
+    }
+
+    /// Send one command to the browser itself, outside any page.
+    pub(crate) async fn browser(&self, method: &str, params: Value) -> Result<Value> {
+        self.client
+            .request(method, params, None, self.config.timeout())
+            .await
+    }
+
+    /// Take everything the page has said since the last drain.
+    pub(crate) fn drain_console(&self) -> Vec<Line> {
+        self.client.drain_console()
+    }
+
+    /// Ask the browser to close, then make sure it did.
+    ///
+    /// The kill is not a fallback for politeness: `Browser::close` is the tidy
+    /// path and [`Drop`] is the one that runs when a run panics or is dropped
+    /// mid-action, which is the arm a test has to assert.
+    pub(crate) async fn close(mut self) {
+        let _ = self.browser("Browser.close", json!({})).await;
+        let _ = self.child.kill().await;
+    }
+}
+
+impl Drop for Browser {
+    fn drop(&mut self) {
+        // `start_kill` rather than `kill`: this is not an async context, and a
+        // browser that outlives its run holds a profile directory, a proxy
+        // connection and, unheadless, a window on someone's screen.
+        let _ = self.child.start_kill();
+    }
+}
+
+/// Start a browser and attach to one page.
+///
+/// On Windows this refuses: see [`launch`]'s Windows arm for why, and
+/// `docs/CONTRACT.md` for the platform row.
+#[cfg(windows)]
+pub(crate) async fn launch(
+    _config: &BrowserConfig,
+    _policy: &Policy,
+    _store: &crate::state::Store,
+    _run_id: i64,
+    _watch: &crate::run::Watch<'_>,
+    _proxy: Option<&str>,
+) -> Result<Browser> {
+    Err(fail(
+        "the browser feature is not available on Windows in this release. The pipe \
+         transport needs two inherited handles at fixed numbers, which the standard \
+         library does not expose; a debugging port would work and is not used because \
+         it is a listener any local process can drive. Tracked as its own release",
+    ))
+}
+
+/// Start a browser and attach to one page.
+#[cfg(unix)]
+pub(crate) async fn launch(
+    config: &BrowserConfig,
+    policy: &Policy,
+    store: &crate::state::Store,
+    run_id: i64,
+    watch: &crate::run::Watch<'_>,
+    proxy: Option<&str>,
+) -> Result<Browser> {
+    use std::os::fd::AsRawFd;
+
+    let started = std::time::Instant::now();
+    let binary = resolve(config)?;
+    let binary_name = binary.display().to_string();
+
+    // The spawn gate, before any process exists. Same call the MCP and language
+    // server children go through, so an auditor reads one kind of row for "this
+    // run spawned a configured child".
+    crate::mcp::authorize_spawn(&binary_name, policy, store, run_id, watch)?;
+
+    let profile = tempfile::Builder::new()
+        .prefix("io-harness-browser-")
+        .tempdir()
+        .map_err(|e| fail(format!("could not make a browser profile directory: {e}")))?;
+
+    // Two pipes: we write commands on one, read messages on the other. The child
+    // gets the opposite ends at descriptors 3 and 4, which is where it looks.
+    let (to_child_read, to_child_write) = raw_pipe()?;
+    let (from_child_read, from_child_write) = raw_pipe()?;
+
+    let mut command = tokio::process::Command::new(&binary);
+    command.args(launch_args(config, profile.path(), proxy));
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    command.kill_on_drop(true);
+
+    let child_read = to_child_read.as_raw_fd();
+    let child_write = from_child_write.as_raw_fd();
+    // SAFETY: this closure runs in the forked child between fork and exec, so it
+    // may call only async-signal-safe functions. `fcntl`, `dup2` and `close` all
+    // are. Nothing here allocates, locks or touches the runtime.
+    unsafe {
+        command.pre_exec(move || {
+            // Move both ends above the descriptors we are about to write to
+            // first. Duplicating straight onto 3 and 4 can clobber one of the
+            // pipe ends when the kernel already handed us those numbers — a
+            // collision that shows up as a browser that starts and never speaks.
+            let held_read = libc::fcntl(child_read, libc::F_DUPFD, 10);
+            let held_write = libc::fcntl(child_write, libc::F_DUPFD, 10);
+            if held_read < 0 || held_write < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(held_read, 3) < 0 || libc::dup2(held_write, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // `dup2` clears close-on-exec on the descriptor it creates, so 3 and
+            // 4 survive the exec while the holders do not need to.
+            libc::close(held_read);
+            libc::close(held_write);
+            Ok(())
+        });
+    }
+
+    let child = command
+        .spawn()
+        .map_err(|e| fail(format!("could not start `{binary_name}`: {e}")))?;
+
+    // The child's ends belong to the child now. Holding them open here would mean
+    // this process never sees the browser close its output.
+    drop(to_child_read);
+    drop(from_child_write);
+
+    let writer = pipe_writer(to_child_write)?;
+    let reader = pipe_reader(from_child_read)?;
+
+    let gate = Arc::new(NavGate::new(policy.clone()));
+    let client = Client::over(reader, writer, Arc::clone(&gate));
+
+    // SAFETY comment above covers the descriptors; from here it is protocol.
+    let session = attach(&client, config).await?;
+
+    Ok(Browser {
+        client,
+        child,
+        session,
+        gate,
+        config: config.clone(),
+        _profile: profile,
+        binary: binary_name,
+        ready_ms: started.elapsed().as_millis(),
+    })
+}
+
+/// One pipe, as two owned descriptors: `(read, write)`.
+#[cfg(unix)]
+fn raw_pipe() -> Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe` writes exactly two descriptors into the array it is given.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(fail(format!(
+            "could not make a pipe for the browser: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: both descriptors were just created by `pipe` and are owned here.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// The parent's write end, as something async.
+#[cfg(unix)]
+fn pipe_writer(fd: std::os::fd::OwnedFd) -> Result<tokio::net::unix::pipe::Sender> {
+    set_nonblocking(&fd)?;
+    tokio::net::unix::pipe::Sender::from_owned_fd(fd)
+        .map_err(|e| fail(format!("could not use the browser pipe: {e}")))
+}
+
+/// The parent's read end, as something async.
+#[cfg(unix)]
+fn pipe_reader(fd: std::os::fd::OwnedFd) -> Result<tokio::net::unix::pipe::Receiver> {
+    set_nonblocking(&fd)?;
+    tokio::net::unix::pipe::Receiver::from_owned_fd(fd)
+        .map_err(|e| fail(format!("could not use the browser pipe: {e}")))
+}
+
+/// Both parent ends must be non-blocking: tokio drives them through its reactor,
+/// and a blocking read here would park the whole runtime thread.
+#[cfg(unix)]
+fn set_nonblocking(fd: &std::os::fd::OwnedFd) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `fd` is owned and open for the duration of both calls.
+    unsafe {
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(fail(format!(
+                "could not set the browser pipe non-blocking: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Open one page, attach to it, and turn on the three things every action needs.
+///
+/// Interception is enabled **before** anything can navigate, which is the whole
+/// reason it is here rather than in the navigate tool: a gate switched on after
+/// the first page load is a gate the first page load went around.
+async fn attach(client: &Client, config: &BrowserConfig) -> Result<String> {
+    let bound = config.timeout();
+    let target = client
+        .request(
+            "Target.createTarget",
+            json!({"url": "about:blank"}),
+            None,
+            bound,
+        )
+        .await?;
+    let target_id = target
+        .get("targetId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("the browser opened no page"))?;
+
+    let attached = client
+        .request(
+            "Target.attachToTarget",
+            json!({"targetId": target_id, "flatten": true}),
+            None,
+            bound,
+        )
+        .await?;
+    let session = attached
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("the browser attached no session"))?
+        .to_string();
+
+    for (method, params) in [
+        ("Page.enable", json!({})),
+        ("Runtime.enable", json!({})),
+        // Document requests only, held at the request stage so the decision is
+        // made before anything leaves the process.
+        (
+            "Fetch.enable",
+            json!({"patterns": [{"urlPattern": "*", "requestStage": "Request",
+                                 "resourceType": "Document"}]}),
+        ),
+        (
+            "Emulation.setDeviceMetricsOverride",
+            json!({"width": config.width, "height": config.height,
+                   "deviceScaleFactor": 1, "mobile": false}),
+        ),
+    ] {
+        client
+            .request(method, params, Some(&session), bound)
+            .await?;
+    }
+    Ok(session)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -250,3 +250,16 @@ required-features = ["documents"]
 [[example]]
 name = "media_git_live"
 required-features = ["media", "barcode"]
+
+# The fake browser the suite spawns. Declared so `cargo build --all-targets` on
+# the default build skips it rather than compiling a fixture for a feature that
+# is off.
+[[example]]
+name = "browser_fixture"
+required-features = ["browser"]
+
+# 0.53.0's live run, against whatever browser is installed. Outside the default
+# gate, and the release is not sealed without having run it.
+[[example]]
+name = "browser_live"
+required-features = ["browser"]
