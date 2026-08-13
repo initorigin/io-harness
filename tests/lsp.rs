@@ -826,3 +826,153 @@ async fn server_diagnostics_are_appended_to_the_compiler_stream_never_substitute
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// N5 — the release's own number
+// ---------------------------------------------------------------------------
+
+/// A provider that counts what a run costs: completions, and the prompt bytes it
+/// was handed each time.
+struct Meter {
+    steps: Vec<Vec<ToolCall>>,
+    at: AtomicUsize,
+    calls: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+impl Meter {
+    fn new(steps: Vec<Vec<ToolCall>>) -> Self {
+        Self {
+            steps,
+            at: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Provider for Meter {
+    fn name(&self) -> &str {
+        "meter"
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.bytes
+            .fetch_add(request.system.len() + request.user.len(), Ordering::SeqCst);
+        let i = self.at.fetch_add(1, Ordering::SeqCst);
+        Ok(CompletionResponse {
+            tool_calls: self.steps.get(i).cloned().unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+}
+
+/// The same question — *where is `Ledger` defined, and which call sites use it* —
+/// asked twice over one repository: once with the catalogue as it stands, and once
+/// with the language server.
+///
+/// The text-search arm is the shortest honest path to a resolved answer, not a
+/// strawman: grep for the definition's spelling, read the file that matched to
+/// confirm which hit is the definition, grep the identifier, and read each file
+/// that matched to discard the comment and the string literal. Five calls. The
+/// server arm is `lsp_definition` then `lsp_references`. Three.
+///
+/// The assertion is directional — strictly fewer calls and strictly fewer prompt
+/// bytes — and the figures are recorded rather than pinned, because a byte count
+/// pinned to a constant fails on the next release that adds a sentence to the
+/// system prompt.
+#[tokio::test]
+async fn n5_a_navigation_question_costs_fewer_calls_and_fewer_prompt_bytes() {
+    let dir = workspace();
+    std::fs::write(
+        dir.path().join("src/uses.rs"),
+        "use crate::Ledger;\n// Ledger is mentioned here in prose\nfn a(l: &Ledger) {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/more.rs"),
+        "fn b() -> &'static str { \"Ledger\" }\nfn c(l: &crate::Ledger) {}\n",
+    )
+    .unwrap();
+
+    // The arm the catalogue offers today.
+    let by_text = Meter::new(vec![
+        vec![call("grep", json!({"pattern": "struct Ledger"}))],
+        vec![call("read_file", json!({"path": "src/lib.rs"}))],
+        vec![call("grep", json!({"pattern": "Ledger"}))],
+        vec![call("read_file", json!({"path": "src/uses.rs"}))],
+        vec![call("read_file", json!({"path": "src/more.rs"}))],
+        finish(),
+    ]);
+    let text_store = Store::memory().unwrap();
+    run_with(
+        &contract(dir.path(), 8),
+        &by_text,
+        &text_store,
+        &permitted(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    std::fs::remove_file(dir.path().join("done.txt")).unwrap();
+
+    // The arm this release adds.
+    let server = fixture(
+        dir.path(),
+        json!({"responses": {
+            "textDocument/definition": [location(dir.path(), "src/lib.rs", 0, 7)],
+            "textDocument/references": [
+                location(dir.path(), "src/uses.rs", 0, 11),
+                location(dir.path(), "src/uses.rs", 2, 9),
+                location(dir.path(), "src/more.rs", 1, 16),
+            ],
+        }}),
+    );
+    let by_server = Meter::new(vec![
+        vec![call(
+            "lsp_definition",
+            json!({"path": "src/uses.rs", "line": 3, "column": 10}),
+        )],
+        vec![call(
+            "lsp_references",
+            json!({"path": "src/uses.rs", "line": 3, "column": 10}),
+        )],
+        finish(),
+    ]);
+    let server_store = Store::memory().unwrap();
+    run_with(
+        &contract(dir.path(), 8).with_lsp([server]),
+        &by_server,
+        &server_store,
+        &permitted(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let text_calls = by_text.calls.load(Ordering::SeqCst);
+    let text_bytes = by_text.bytes.load(Ordering::SeqCst);
+    let text_gates = text_store.events(1).unwrap().len();
+    let server_calls = by_server.calls.load(Ordering::SeqCst);
+    let server_bytes = by_server.bytes.load(Ordering::SeqCst);
+    let server_gates = server_store.events(1).unwrap().len();
+
+    println!(
+        "N5 text-search arm: {text_calls} provider calls, {text_bytes} prompt bytes, \
+         {text_gates} gate evaluations"
+    );
+    println!(
+        "N5 language-server arm: {server_calls} provider calls, {server_bytes} prompt bytes, \
+         {server_gates} gate evaluations"
+    );
+
+    assert!(
+        server_calls < text_calls,
+        "{server_calls} calls against {text_calls}"
+    );
+    assert!(
+        server_bytes < text_bytes,
+        "{server_bytes} prompt bytes against {text_bytes}"
+    );
+}

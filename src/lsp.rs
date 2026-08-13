@@ -275,6 +275,10 @@ struct Started {
     /// Whether [`EventKind::LspStarted`](crate::EventKind::LspStarted) has been
     /// emitted for this server yet.
     announced: std::sync::atomic::AtomicBool,
+    /// Whether this server has been observed to finish its start-up work once.
+    /// After that it stays finished, so only the first empty answer of a run ever
+    /// pays for the wait.
+    warm: std::sync::atomic::AtomicBool,
 }
 
 /// Every language server a run configured, for the life of that run.
@@ -342,6 +346,7 @@ impl LspSession {
                 root: root.to_string_lossy().into_owned(),
                 spawned: std::time::Instant::now(),
                 announced: std::sync::atomic::AtomicBool::new(false),
+                warm: std::sync::atomic::AtomicBool::new(false),
             });
         }
         Ok(Self { servers: started })
@@ -360,8 +365,16 @@ impl LspSession {
     /// rule rather than a discovery: refusing the configuration would be the
     /// other defensible answer, and it turns a working setup into a startup
     /// failure over an ambiguity the operator can simply not create.
-    fn server_for(&self, path: &str) -> Option<&Started> {
-        self.servers.iter().find(|s| s.config.answers_for(path))
+    fn server_for(&self, path: Option<&str>) -> Option<&Started> {
+        match path {
+            Some(path) => self.servers.iter().find(|s| s.config.answers_for(path)),
+            // A workspace-wide question names no file, so no `extensions` list can
+            // match one. Asking the first configured server is the answer; matching
+            // the empty string against them was a bug the live run found, under
+            // which `lsp_symbols` with a query said no server answered while five
+            // other tools were being answered by one.
+            None => self.servers.first(),
+        }
     }
 
     /// Wait for a server's handshake and hand back its capabilities.
@@ -438,7 +451,7 @@ impl LspSession {
         watch: &crate::run::Watch<'_>,
     ) -> Result<String> {
         let path = ask.path();
-        let server = match self.server_for(path.unwrap_or("")) {
+        let server = match self.server_for(path) {
             Some(s) => s,
             None => {
                 return Err(Error::Lsp {
@@ -466,10 +479,64 @@ impl LspSession {
         if let Some(path) = path {
             self.sync(server, ws, path).await?;
         }
-        let result = server
+        let mut result = server
             .client
             .request(ask.method(), ask.params(ws.root()), server.config.timeout())
             .await?;
+
+        // **An empty answer from a server that has not finished starting up is
+        // indistinguishable from an empty answer from one that has**, because the
+        // protocol has no readiness signal and a busy server answers `[]` rather
+        // than erroring. This is the live run's central finding: against a real
+        // `rust-analyzer`, `documentSymbol` — which needs only the syntax tree —
+        // answered correctly while `definition`, `references` and `hover` all came
+        // back empty, and nothing in the response said why.
+        //
+        // So an empty answer is not believed the first time. The run waits for the
+        // work the server announced to finish, and asks once more. A server that
+        // announces nothing pays one grace period, once, and a server that has
+        // already settled pays nothing at all.
+        // Rounds rather than one retry, because a server reports its start-up as a
+        // *series* of jobs and the set of outstanding work empties in the gaps
+        // between them. Each round waits for the work announced so far to finish
+        // and asks again. A server that has announced nothing at all stops after
+        // one round — there is no reason to expect a different answer from a
+        // server that is not doing anything.
+        //
+        // The loop is bounded by the server's own configured timeout rather than
+        // by a round count: how long a start-up takes is a property of the
+        // repository, and a number picked here would be a guess about someone
+        // else's machine. `timeout_secs` is the knob, and it is already the knob
+        // for everything else this server does.
+        if !server.warm.load(std::sync::atomic::Ordering::Relaxed) {
+            let until = std::time::Instant::now() + server.config.timeout();
+            while std::time::Instant::now() < until {
+                if !is_empty(&result) {
+                    break;
+                }
+                let busy = server.client.announced_work();
+                if !server.client.quiet(server.config.timeout()).await {
+                    break;
+                }
+                if !busy && !server.client.announced_work() {
+                    break;
+                }
+                if let Some(path) = path {
+                    self.sync(server, ws, path).await?;
+                }
+                result = server
+                    .client
+                    .request(ask.method(), ask.params(ws.root()), server.config.timeout())
+                    .await?;
+            }
+            // Warm once an answer arrives, so only the first question of a run
+            // ever pays for a server's start-up.
+            if !is_empty(&result) {
+                server
+                    .warm
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         Ok(render(&ask, &result, ws))
     }
 
@@ -540,7 +607,7 @@ impl LspSession {
     ) -> Vec<(String, crate::tools::diagnostics::Outcome)> {
         use crate::tools::diagnostics::Outcome;
         let asked: Vec<&Started> = match path {
-            Some(path) => self.server_for(path).into_iter().collect(),
+            Some(path) => self.server_for(Some(path)).into_iter().collect(),
             None => self.servers.iter().collect(),
         };
         let mut out = Vec::new();
@@ -646,6 +713,12 @@ fn handshake(
                 "synchronization": {"didSave": false},
             },
             "workspace": {"symbol": {}, "workspaceFolders": true},
+            // Without this a server sends no `$/progress` at all, and the client
+            // has no way to tell "still indexing" from "no references" — which is
+            // the whole difference between an honest answer and a confident wrong
+            // one. Found by the live run: rust-analyzer is silent about its
+            // start-up unless asked to speak.
+            "window": {"workDoneProgress": true},
         },
     });
     let sender = client.handle();
@@ -1269,6 +1342,23 @@ pub(crate) struct Client {
 /// questions, which is exactly the defect correlation exists to prevent.
 #[derive(Clone)]
 pub(crate) struct Handle {
+    /// Work the server has told us it is doing and has not finished.
+    ///
+    /// This is the completion signal the protocol *does* have, and it is the one
+    /// thing standing between "there are no references" and "I have not indexed
+    /// yet". A server that is still building its index answers a semantic request
+    /// with an empty list — not an error — so a client that does not wait for
+    /// this reports "nobody calls this function" about a function with four
+    /// callers. Found by the live run against a real `rust-analyzer`, where
+    /// `documentSymbol` (syntax only) answered correctly while `definition`,
+    /// `references` and `hover` all came back empty.
+    working: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Woken whenever `working` changes, so a waiter does not poll.
+    settled: Arc<tokio::sync::Notify>,
+    /// Whether this server has ever announced work at all. A server that never
+    /// does is ready as soon as its handshake is, and waiting on it would be
+    /// waiting for something that is never coming.
+    announced_work: Arc<std::sync::atomic::AtomicBool>,
     /// The configured id, carried so every error names the server the operator wrote.
     id: String,
     writer: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
@@ -1289,6 +1379,9 @@ impl Client {
         let id = id.into();
         let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> = Arc::default();
         let gone: Arc<Mutex<Option<String>>> = Arc::default();
+        let working: Arc<Mutex<std::collections::HashSet<String>>> = Arc::default();
+        let settled: Arc<tokio::sync::Notify> = Arc::default();
+        let announced_work: Arc<std::sync::atomic::AtomicBool> = Arc::default();
         let writer: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
             Arc::new(tokio::sync::Mutex::new(Box::new(write)));
 
@@ -1297,6 +1390,9 @@ impl Client {
             Arc::clone(&pending),
             Arc::clone(&writer),
             Arc::clone(&gone),
+            Arc::clone(&working),
+            Arc::clone(&settled),
+            Arc::clone(&announced_work),
         ));
 
         Self {
@@ -1306,6 +1402,9 @@ impl Client {
                 pending,
                 next_id: Arc::new(AtomicI64::new(1)),
                 gone,
+                working,
+                settled,
+                announced_work: Arc::clone(&announced_work),
             },
             reader,
         }
@@ -1329,6 +1428,79 @@ impl Client {
     /// Send a notification, which by definition is never answered.
     pub(crate) async fn notify(&self, method: &str, params: Value) -> Result<()> {
         self.inner.notify(method, params).await
+    }
+
+    /// Whether this server has ever announced work at all.
+    pub(crate) fn announced_work(&self) -> bool {
+        self.inner.announced_work.load(Ordering::Relaxed)
+    }
+
+    /// Wait until the server has finished the work it announced, or the bound.
+    ///
+    /// Returns whether it settled. A server that has announced **no** work settles
+    /// at once — that is the fixture's case and every syntax-only server's case,
+    /// and it is why nothing in the test suite waits on a clock here.
+    ///
+    /// A server that has announced work must be *empty and stay empty*. Draining
+    /// to zero is not enough, and this is the live run's finding: `rust-analyzer`
+    /// reports its start-up as a series of separate jobs — `Fetching`, then
+    /// `Building CrateGraph`, then `Roots Scanned` — and the set is momentarily
+    /// empty in the gaps between them, which is exactly where a run's first
+    /// navigation call lands. A request answered in one of those gaps comes back
+    /// empty rather than wrong, which is the failure this whole surface exists to
+    /// prevent.
+    pub(crate) async fn quiet(&self, bound: Duration) -> bool {
+        /// How long the announced work must stay finished before it counts as
+        /// finished.
+        ///
+        /// Not a guess about how long indexing takes — that is bounded by the
+        /// server's own `timeout_secs`. This is the width of the *gap* between two
+        /// of its start-up jobs, measured against a real `rust-analyzer`, which
+        /// reports `Fetching`, then `Building CrateGraph`, then `Roots Scanned`,
+        /// then more, with sub-second silences between them. Too small and a gap
+        /// reads as "finished"; too large and every genuinely empty answer costs
+        /// it once. This is the knob to turn if a server's start-up is reported in
+        /// coarser pieces.
+        const SETTLE: Duration = Duration::from_millis(1_500);
+
+        tokio::time::timeout(bound, async {
+            loop {
+                // Registered before the check, so an `end` that lands between the
+                // two is not missed.
+                let woken = self.inner.settled.notified();
+                let (idle, ever) = {
+                    let set = self
+                        .inner
+                        .working
+                        .lock()
+                        .expect("progress set is not poisoned");
+                    (set.is_empty(), self.inner.announced_work.load(Ordering::Relaxed))
+                };
+                if idle && !ever {
+                    // Nothing announced yet. That is either a server that never
+                    // announces work — ready now — or one that has not got round
+                    // to saying so, a distinction only time can draw. Wait one
+                    // grace period for a first announcement and take silence as
+                    // the answer.
+                    if tokio::time::timeout(SETTLE, woken).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                if idle {
+                    // Quiet now. Quiet still, after the settle, means finished.
+                    match tokio::time::timeout(SETTLE, woken).await {
+                        // Nothing happened in the window: the work is done.
+                        Err(_) => return,
+                        // Something moved; look again.
+                        Ok(()) => continue,
+                    }
+                }
+                woken.await;
+            }
+        })
+        .await
+        .is_ok()
     }
 }
 
@@ -1435,6 +1607,9 @@ async fn read_loop<R: AsyncRead + Unpin>(
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
     writer: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
     gone: Arc<Mutex<Option<String>>>,
+    working: Arc<Mutex<std::collections::HashSet<String>>>,
+    settled: Arc<tokio::sync::Notify>,
+    announced_work: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let reason = loop {
         match read_frame(&mut reader).await {
@@ -1455,6 +1630,21 @@ async fn read_loop<R: AsyncRead + Unpin>(
                     // A server request. Answered `null` rather than dropped: a
                     // server blocked on a reply is a hang with no explanation.
                     (Some(id), true) => {
+                        // A created progress token means work is about to be
+                        // reported. Counting it here rather than at `begin`
+                        // closes the window between the handshake finishing and
+                        // the first `begin` arriving — which is exactly the
+                        // window a run's first navigation call lands in.
+                        if message["method"] == "window/workDoneProgress/create" {
+                            if let Some(token) = token_of(&message["params"]["token"]) {
+                                working
+                                    .lock()
+                                    .expect("progress set is not poisoned")
+                                    .insert(token);
+                                announced_work.store(true, Ordering::Relaxed);
+                                settled.notify_waiters();
+                            }
+                        }
                         let body = json!({"jsonrpc": "2.0", "id": id, "result": Value::Null});
                         if let Ok(text) = serde_json::to_string(&body) {
                             let mut w = writer.lock().await;
@@ -1462,8 +1652,30 @@ async fn read_loop<R: AsyncRead + Unpin>(
                             let _ = w.flush().await;
                         }
                     }
-                    // A notification. Nothing here subscribes to one.
-                    _ => {}
+                    // A notification. Only progress is subscribed to.
+                    _ => {
+                        if message["method"] == "$/progress" {
+                            let params = &message["params"];
+                            if let Some(token) = token_of(&params["token"]) {
+                                let kind = params["value"]["kind"].as_str().unwrap_or_default();
+                                let mut set =
+                                    working.lock().expect("progress set is not poisoned");
+                                match kind {
+                                    "begin" => {
+                                        set.insert(token);
+                                        announced_work.store(true, Ordering::Relaxed);
+                                    }
+                                    "end" => {
+                                        set.remove(&token);
+                                    }
+                                    // `report` is progress on work already counted.
+                                    _ => {}
+                                }
+                                drop(set);
+                                settled.notify_waiters();
+                            }
+                        }
+                    }
                 }
             }
             Ok(None) => break "the server closed its output".to_string(),
@@ -1471,11 +1683,39 @@ async fn read_loop<R: AsyncRead + Unpin>(
         }
     };
     *gone.lock().expect("reason is not poisoned") = Some(reason);
+    // A server that stopped is not still working, and a waiter must not be left
+    // waiting for an `end` that can no longer arrive.
+    working
+        .lock()
+        .expect("progress set is not poisoned")
+        .clear();
+    settled.notify_waiters();
     // Dropping the senders is what wakes every outstanding request.
     pending
         .lock()
         .expect("pending map is not poisoned")
         .clear();
+}
+
+
+/// Whether an answer carries nothing — which is not the same as carrying "no".
+fn is_empty(result: &Value) -> bool {
+    match result {
+        Value::Null => true,
+        Value::Array(items) => items.is_empty(),
+        Value::Object(o) => o.is_empty() || o.values().all(is_empty),
+        Value::String(s) => s.is_empty(),
+        _ => false,
+    }
+}
+
+/// A progress token, which the protocol allows to be a string or a number.
+fn token_of(token: &Value) -> Option<String> {
+    match token {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 /// A line or character number as a reader counts it, on the wire.

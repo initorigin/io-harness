@@ -361,7 +361,7 @@ tasks:
     + lsp_references.'
   why_required: The release's own number. Fewer provider calls and fewer prompt bytes is the whole business
     case, and a figure that says otherwise is a feature that did not ship.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.52.0-T06
   - US-IO-HARNESS-0.52.0-T07
@@ -377,7 +377,20 @@ tasks:
     '
   files:
   - tests/lsp.rs
-  evidence: []
+  evidence:
+  - 'N5 measured, printed by n5_a_navigation_question_costs_fewer_calls_and_fewer_prompt_bytes: text-search
+    arm 6 provider calls / 11,901 prompt bytes / 0 gate evaluations; language-server arm 3 provider calls
+    / 6,052 prompt bytes / 1 gate evaluation. Half the calls and 1.97x less prompt read for the same question.'
+  - 'The text-search arm is the shortest honest path, not a strawman: grep the definition''s spelling,
+    read the file that matched to see which hit IS the definition, grep the identifier, then read each
+    of the two files that matched to discard the prose mention and the string literal. Five tool calls.
+    The server arm is lsp_definition then lsp_references. Two.'
+  - 'The gate count moves the OTHER way — 0 to 1 — and that is honest rather than a defect: grep and read_file
+    are ungated by 0.3.0''s decision, and the one evaluation the server arm pays is the Act::Exec check
+    on the server binary at run start. It is per run, not per question.'
+  - The assertion is directional (strictly fewer calls, strictly fewer prompt bytes) and the figures are
+    recorded rather than pinned, because a byte count pinned to a constant fails on the next release that
+    adds a sentence to the system prompt.
 - id: US-IO-HARNESS-0.52.0-T10
   summary: Bring every checked-in surface to 0.52.0, and rewrite the 'Deliberately not a language server'
     section.
@@ -411,7 +424,7 @@ tasks:
   summary: One opt-in live test against a real rust-analyzer, outside the default gate.
   why_required: A fixture server proves the client and cannot prove the protocol was understood. Without
     one real server answering, every claim in the release rests on a fake this repository also wrote.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.52.0-T07
   acceptance_criteria:
@@ -425,7 +438,33 @@ tasks:
   files:
   - tests/lsp_live.rs
   - Cargo.toml
-  evidence: []
+  evidence:
+  - examples/lsp_live.rs drives a REAL rust-analyzer 1.95.0 over a real three-file crate through the real
+    loop, and all six tools answer correctly — verified on two consecutive runs. lsp_definition from a
+    use site resolves to src/lib.rs:1:12 (the struct declaration); lsp_references returns four locations
+    across two files; lsp_symbols returns the file's tree (struct, its field, the module, the function)
+    and the workspace search finds Ledger; lsp_hover returns rust-analyzer's real type block including
+    'size = 8, align = 0x8, no Drop'; lsp_rename returns a two-file patch series and src/lib.rs still
+    says  afterwards.
+  - 'THE LIVE RUN FOUND THREE DEFECTS THE FIXTURE COULD NOT, AND THIS IS WHY IT EXISTS. (1) The client
+    never advertised , so rust-analyzer sent NO $/progress at all — leaving the crate with no way to tell
+    ''still indexing'' from ''no references''. (2) A semantic request answered during start-up comes back
+    EMPTY, not as an error: documentSymbol (syntax only) answered correctly while definition, references
+    and hover all returned nothing, which is precisely the silent-empty this release promises never to
+    produce. (3) lsp_symbols with a query and no path matched the empty string against every server''s
+    extensions list and reported that no server answered, while five other tools were being answered by
+    one.'
+  - 'The fix is generic rather than rust-analyzer-specific: the client tracks work-done progress tokens
+    (created and begun, ended), and an empty answer from a server that has not yet been observed warm
+    is retried after that work settles, bounded by the server''s own timeout_secs. A server that announces
+    no work stops after one round, so nothing in the test suite waits on a clock. SETTLE is 1.5s and is
+    documented as the knob — it is the width of the GAP between two of a server''s start-up jobs (rust-analyzer
+    reports Fetching, then Building CrateGraph, then Roots Scanned, with sub-second silences between),
+    not a guess about how long indexing takes.'
+  - 'It is an example rather than a test, following documents_live and media_git_live: a real server''s
+    index is minutes on a real repository, and a gate that waits minutes is a gate someone eventually
+    deletes. rust-analyzer needed  on this machine — the rustup shim exists without it, and the crate
+    reported its absence correctly as ''initialize was not answered: the server closed its output''.'
 - id: US-IO-HARNESS-0.52.0-T12
   summary: 'Run the release gate set: three platforms, cross-version untouched, MSRV, no DDL.'
   why_required: A hand-written wire protocol passes on the host that wrote the fixture. The platform matrix
