@@ -1350,7 +1350,7 @@ versions:
       default so a caller who sets nothing gets today's behaviour. A read is then refused for one of
       two stated reasons — over the operator's ceiling, or over what this run's remaining budget can
       carry — and the error says which, because they call for different answers.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.56.0
     outcome: >
