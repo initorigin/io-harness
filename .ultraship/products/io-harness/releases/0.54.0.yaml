@@ -1,0 +1,556 @@
+product: io-harness
+version: 0.54.0
+status: planned
+release_type: minor
+
+outcome:
+  user_can: >
+    Ask a session for something that needs three files read, and the reads are already running while
+    the model is still finishing its sentence. A turn that reads then answers gets its reads back
+    sooner by the width of the rest of the completion — the tokens after the last tool call, which on
+    a model that narrates its plan is most of the message.
+
+    **Today the crate throws the early half away on purpose, and the comment saying so is in the
+    source.** Both provider wires reassemble tool-call arguments fragment by fragment as they arrive
+    (`src/provider/anthropic.rs:508` and `src/provider/openai_wire.rs:511`, each a
+    `BTreeMap<u64, (String, String)>` of index to name and joined JSON), and both refuse to hand a
+    fragment onward: `text_delta` at `src/provider/anthropic.rs:484-490` says an `input_json_delta`
+    "is not renderable and is not safe to act on half-parsed, and the accumulator owns reassembling
+    those." That is right about a *fragment*. It is not right about a *finished* call, and the
+    difference between the two is one successful `serde_json::from_str`. `Provider::complete_streaming`
+    (`src/provider/mod.rs:1303`) then has no way to say it either: its sink is
+    `&(dyn Fn(&str) + Send + Sync)` — assistant text, and nothing else. A tool call reaches the run
+    loop only inside the finished `CompletionResponse`.
+
+    **So the wait is real and it is nobody's fault.** 0.41.0 already overlaps read-only calls with
+    each other (`src/run.rs:9189`, `read_batch`); what it cannot do is start any of them before the
+    model has stopped talking. This release moves the starting line, and moves nothing else: the
+    calls that overlap are the same calls, run by the same `ReadWork::run` (`src/run.rs:8987`),
+    folded back through the same slot-by-index path, into the same trace.
+
+  business_value: >
+    **This is latency taken out of the wait a person actually experiences, without taking anything
+    out of the boundary.** Every earlier release that made a run faster made it do less or do it in
+    parallel; this one makes it do the same work at the same time as a wait that was already
+    happening. The provider's stream is dead time for the harness today — `stream_completion`
+    (`src/run.rs:13064`) exists solely to forward tokens to an observer and does no other work while
+    the socket is open.
+
+    **The correctness argument is the release, and it is a subtraction rather than an addition.**
+    Speculating a *write* off a stream that may still fail is unrecoverable, so no write is
+    speculated. Speculating a read that sits *after* an unstarted write in the same completion would
+    let it observe state the write had not yet produced, so only the completion's leading run of
+    read-only calls is speculated — a strict subset of the batches 0.41.0 already forms. Speculating
+    past a policy question would ask an approver about a completion that may never settle, so a call
+    the `Policy` does not allow outright is never speculated. What is left is provably invisible: a
+    read that runs early, whose result is used only if the settled completion asks for exactly that
+    call with exactly those arguments, and is otherwise dropped without a row, an event or a ledger
+    draw.
+
+    **A provider that says nothing keeps its silence.** The new capability is a third defaulted method
+    on `Provider`, and the default emits no tool call at all. `Record` and `Replay` do not override it
+    (they do not override `complete_streaming` either — `src/provider/record.rs:174`,
+    `src/provider/replay.rs:166`), so **a replayed run speculates nothing and is byte-identical to
+    0.53.0's replayed run by construction**. That is the determinism argument made structurally rather
+    than by test, and it is why the one extension point this crate has does not move under an
+    out-of-tree implementation.
+
+  evidence_of_value: >
+    Executed in the technique the last twenty-three releases used: a discriminating assertion per
+    claim, negative controls that must not move, one sabotage per arm of every two-armed claim, and a
+    sabotage that fails nothing reported as a finding rather than propped up.
+
+    **No criterion here is a duration, and that is a design constraint rather than a preference.** A
+    "it was faster" assertion on a CI runner is a flake, and this repository has paid for that lesson
+    eight times. Earliness is proven where it is either present or absent instead, with the technique
+    `tests/parallel_reads.rs` already established for 0.41.0: a tool that rendezvouses with the
+    provider's own stream completes only if it was started while the stream was still open, and
+    deadlocks — bounded, so the test fails rather than hanging the matrix — if it was not. The clock
+    appears once, in `docs/MEASUREMENTS.md`, as a recorded number with the machine named.
+
+    **The defect this release can actually ship is folding the wrong file's bytes**, and two criteria
+    exist for it alone. A speculated result keyed by call index and nothing else is correct on every
+    test where the settled completion matches what was streamed, which is every ordinary test. F5
+    makes the streamed and settled arguments differ on purpose, and its sabotage — key by index only —
+    folds one file's contents under another file's call. That is the one outcome from which a model
+    reasons forward from a state that never existed, and it is worth a criterion of its own.
+
+    **The premise was verified in the source before the contract was written, not assumed from the
+    roadmap.** The roadmap entry says "the provider's stream already yields tool calls
+    incrementally." At the wire and in both accumulators that is true. At the `Provider` trait it is
+    false — the sink is text-only — and at `Record`/`Replay` there is no incremental stream at all.
+    Those three facts are in the scope below rather than waiting to be discovered during
+    implementation, and the middle one is why this release contains a trait change.
+
+scope:
+  included:
+  - >
+    **A third defaulted `Provider` method that can report a finished tool call**, alongside
+    `complete` and `complete_streaming`. It takes the existing text sink plus a call sink —
+    `&(dyn Fn(usize, &ToolCall) + Send + Sync)`, the index being the call's position in the
+    completion, which is how every other part of this crate names a call (`ToolCall` has no `id`;
+    `ToolResult { call: usize }` at `src/provider/mod.rs:787`). **Its default delegates to
+    `complete_streaming` and emits no call**, so every out-of-tree `Provider`, `Record` and `Replay`
+    compile unchanged and speculate nothing. A defaulted third method is the compatible shape here
+    because the other two are already defaulted and the trait is the one extension point the crate
+    has.
+  - >
+    **The completeness edge is a successful parse, on both wires and by the same rule.** A tool
+    call's joined argument fragments are offered to `serde_json::from_str` as they grow; the first
+    parse that succeeds is the call, complete. This is sound because the arguments are exactly one
+    JSON object: every proper prefix of a JSON object fails to parse, so a parse cannot succeed early.
+    It is one rule rather than two, which matters because the two wires do not agree on what else is
+    available — Anthropic emits a `content_block_stop` edge that the crate currently discards
+    (`src/provider/anthropic.rs:465` handles only `message_stop`), and the OpenAI wire emits no
+    per-call edge at all, only `finish_reason` on the last chunk. Anthropic's edge is used as
+    corroboration where it exists and is never the sole signal.
+  - >
+    **Speculation covers the completion's leading run of read-only calls, and stops at the first call
+    that is not one.** `tool_effect` (`src/run.rs:8735`) is the classifier already: `grep`, `find` and
+    `read_file` are `ToolEffect::ReadOnly`, a registered tool answers for itself, and everything else
+    — including every MCP tool, `list_dir`, the git readers, `exec` and the shell tools — is
+    `Mutating`. This is a **prefix** rule rather than 0.41.0's maximal-run rule, and the difference is
+    the whole safety argument: a read after an unstarted write must not observe the state before it.
+  - >
+    **Nothing the `Policy` does not allow outright is ever speculated**, and the test is the same
+    `Policy` code path the serial gate uses rather than a second one written beside it. A call in the
+    grey tier is not started early — which means **no approver is ever asked about a completion that
+    has not settled**, and 0.41.0's "a pause collapses the batch" rule is untouched, because the pause
+    is still decided in the same serial place at the same point in the order.
+  - >
+    **`ReadWork` is the speculative unit, unchanged.** `src/run.rs:8963` and `ReadWork::run`
+    (`src/run.rs:8987`) already take no `Store`, no `Watch` and no run-scoped mutable state — the type
+    was built for exactly this in 0.41.0. Speculation spawns the same futures into the same
+    `JoinSet` shape, bounded by the same `TaskContract::max_parallel_reads`.
+  - >
+    **A speculated result is used only if the settled completion asks for that call, at that index,
+    with byte-identical arguments and the same name.** Anything else — a differing argument, a
+    reordered call, a shorter completion, a completion that arrived from a different provider after
+    a `Fallback` failover, a retried completion — drops every speculated result on the floor and the
+    calls run through the ordinary serial path exactly as they do in 0.53.0.
+  - >
+    **A discarded speculation leaves nothing behind: no observation, no step row, no `PolicyEvent`,
+    no ledger draw, no `EventKind::ToolCall`.** Speculation performs the work and holds it; every
+    durable and observable act stays where 0.41.0 put it — serial, on the loop's own task, in call
+    order, after the completion settled (`src/run.rs:9208-9230`). This is what makes "the trace and
+    the replay are identical either way" a structural claim rather than a hope.
+  - >
+    **One additive `EventKind::Speculated { started, used, discarded }`, emitted once per step in
+    which at least one call was speculated.** Unlike 0.41.0 — which deliberately emitted nothing,
+    because concurrency cost nothing when it did not help — a discard is *wasted work*, and an
+    operator who cannot see the discard rate cannot tell a provider that streams well from one that
+    does not. A step that speculated nothing emits nothing, so a run on a provider without the new
+    method has a byte-identical event stream to 0.53.0's. The field names avoid `run_id`, `step` and
+    `depth`, which the `#[serde(flatten)]`ed envelope already carries.
+  - >
+    **The gate is `max_parallel_reads > 1`, and there is no new knob.** The same setting that turns
+    0.41.0's batching off turns speculation off, for the same reason and with the same one-line
+    escape hatch: `with_max_parallel_reads(1)` is 0.40.0's execution shape, and now also 0.53.0's
+    starting line. A second switch would be a second thing to explain and a second thing to get wrong.
+  - >
+    **`Fallback` forwards the call sink to whichever provider it is currently driving**
+    (`src/provider/fallback.rs:137`), and a failover discards everything speculated from the failed
+    primary, because the secondary's completion is a different completion.
+  - >
+    **The reporting surfaces, updated in this release and not the next one.** `docs/CONTRACT.md`
+    carries the amendment named below under O3; `src/lib.rs`, the README, `docs/guide/providers.md`,
+    `docs/guide/tools-and-skills.md`, `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md` and
+    `CHANGELOG.md` agree; `tests/docs_drift.rs`, `tests/readme.rs`, `tests/guide_pages.rs`,
+    `tests/changelog.rs` and `tests/public_api.rs` pass.
+  excluded:
+  - >
+    **`run_with` and every other one-shot entry point.** Streaming is a session property: `stream:
+    bool` on `TurnExtras` (`src/run.rs:1227`) is set true only by the session layer and false at
+    `src/run.rs:5664`. A one-shot run calls `provider.complete` and has no stream to speculate off.
+    Making the one-shot loop stream is a real change to what a `run_with` emits — it would start
+    producing `EventKind::Token` — and it belongs to its own release with its own argument, not to
+    this one as a side effect.
+  - >
+    **`agent_loop` (`src/run.rs:6694`), the tree/child-agent loop.** It never took 0.41.0's batch
+    path either — it dispatches serially at `src/run.rs:7215` — so this release does not widen a
+    divergence it did not create, and does not close it under cover of a latency change. That the two
+    loops have diverged is recorded here as a known limitation rather than left to be rediscovered.
+  - >
+    **Speculating anything that is not read-only.** No write, no `exec`, no shell, no MCP call, no
+    git built-in, no `list_dir`, no `view_image`, no spawn. A write begun on a stream that then fails
+    is not recoverable, which is the reason the roadmap gave and the reason that still holds.
+  - >
+    **Speculating past a non-read-only call.** The maximal-run rule 0.41.0 uses for batching is
+    deliberately not the rule used here.
+  - >
+    **Cancelling speculative work early on an observer's `Flow::Cancel`.** Cancellation stays where
+    it has always been — the next step boundary (`src/observe.rs:132-137`) — and in-flight speculative
+    work is aborted by the `JoinSet`'s drop exactly as 0.41.0's batch work already is
+    (`src/run.rs:9184-9187`). No `CancellationToken` is introduced; the crate has none and this
+    release is not the argument for one.
+  - >
+    **Any durable state.** No table, column or index; `CHECKPOINT_FORMAT` unmoved at 7; `git diff
+    main -- src/state.rs` empty.
+  - >
+    **Changing what any existing tool does, or what `complete_streaming` means, by one byte.**
+    `complete_streaming`'s signature and behaviour are untouched; the new method sits beside it.
+  fallback_scope:
+  - >
+    **The Anthropic wire only, with the prefix rule, the outright-allow rule and the
+    discard-on-mismatch rule all intact.** That is a coherent release: a session on the crate's
+    default provider gets its reads started early, under a boundary that is argued and asserted, and
+    the OpenAI-wire providers behave exactly as they do in 0.53.0 because they take the trait default.
+    The wire override is the cheapest half to drop precisely because the default is silence rather
+    than an error.
+  - >
+    Dropped under pressure, in this order: **the OpenAI-wire override first**, then
+    **`EventKind::Speculated`** (an operator loses the discard rate; nothing becomes unsafe), then
+    **`Fallback`'s forwarding** (a fallback provider simply speculates nothing). The prefix rule, the
+    outright-allow rule, the discard-on-mismatch rule and the leaves-nothing-behind rule are never
+    dropped: they are what make the release responsible rather than merely fast, and a speculative
+    executor without them is the thing this contract exists to not ship.
+
+acceptance:
+  functional:
+  - >
+    **F1 — a read-only call runs while the stream is still open.** A scripted provider emits call 0's
+    name and complete arguments, then holds the stream open on a barrier it shares with the tool. The
+    tool completes only if it was started before the provider returned; the provider returns only
+    after the tool started. Under serial execution the pair cannot both proceed, and the test fails on
+    a bounded wait rather than hanging. **No duration is asserted.** Sabotage: emit the call sink only
+    at stream end, under which F1's rendezvous times out and only F1 fails.
+  - >
+    **F2 — speculation stops at the first call that is not read-only.** A completion of
+    `[read_file, write_file, read_file]` speculates the first call and neither of the others,
+    asserted on a probe that records which invocations happened before the provider returned. The
+    second `read_file` is executed after the write, and observes the written bytes. Sabotage: use
+    0.41.0's maximal-run rule instead of the prefix rule, under which the trailing `read_file` runs
+    early and returns the pre-write content — a wrong *value*, not merely a wrong order — and only
+    this fails.
+  - >
+    **F3 — the trace is the serial trace, exactly.** The same scripted case run with speculation
+    reachable and with `with_max_parallel_reads(1)` produces identical `steps` rows — including the
+    `" | "`-joined `tool_call` string built at `src/run.rs:5055` — identical observations in identical
+    ordinals, identical ledger draws, and an identical ordered sequence of `EventKind::ToolCall`,
+    with the sole permitted difference being the presence of `EventKind::Speculated`. Sabotage: fold
+    speculated results in the order they finished rather than by index, under which the ordinal and
+    `tool_call` assertions fail and only this fails.
+  - >
+    **F4 — a completion that never settles leaves no trace of the work it caused.** A stream that
+    emits two complete read-only calls and then fails, followed by a successful retry, produces
+    exactly one set of observations, one set of `PolicyEvent` rows and one set of ledger draws — the
+    retry's — and the reads are executed again through the ordinary path. Asserted on the counts and
+    on the tool's own invocation probe showing it ran twice while the run recorded once. Sabotage:
+    fold the first attempt's speculated results into the retry, under which the observation count and
+    the probe disagree and only this fails.
+  - >
+    **F5 — a settled call whose arguments differ from the streamed ones discards the speculation.**
+    The scripted provider streams `read_file{path: a}` at index 0 and settles a `CompletionResponse`
+    whose index 0 is `read_file{path: b}`. The observation carries **b's** contents; a's speculated
+    result is dropped; a's read is never folded anywhere. The same is asserted for a differing tool
+    *name* at the same index, and for a settled completion shorter than what was streamed. Sabotage:
+    key the speculated result by call index alone, under which a's contents are folded under b's call
+    — the worst defect this release can ship — and only this fails.
+  - >
+    **F6 — no approver is asked about an unsettled completion, and a grey-tier call is not
+    speculated.** Under a policy that asks on a read of one path, an approver that records the order
+    and the moment it was consulted is consulted exactly once, after the completion returned, at the
+    serial gate; the tool's invocation probe shows no early run. The permitted path in the same
+    completion, when it precedes the grey one, **is** speculated — both halves in one test, since the
+    claim is the distinction. Sabotage: speculate on any decision that is not an outright deny, under
+    which the grey call runs early and only this fails.
+  - >
+    **F7 — a denied read is never executed early.** A policy denying a path, with the file's contents
+    made observable by a probe, asserts the file was never opened during the stream, that the serial
+    gate produced the refusal observation it always produced, and that the refusal decision is
+    unchanged. Sabotage: skip the policy pre-test and speculate every read-only call, under which the
+    probe fires and only this fails.
+  - >
+    **F8 — a provider that does not implement the new method is 0.53.0's run, byte for byte.** A
+    provider implementing only `complete` and `complete_streaming` — which is what `Record`, `Replay`
+    and every out-of-tree implementation are — produces no `EventKind::Speculated`, no early
+    invocation, and a trace byte-identical to the same case on 0.53.0. This is the negative control
+    the compatibility claim rests on, and it is asserted on the bytes. Sabotage: make the default
+    method emit every call at stream end, under which `Speculated` appears on a replayed run and only
+    this fails.
+  - >
+    **F9 — `with_max_parallel_reads(1)` turns speculation off with the batch.** The same case, same
+    provider, produces no early invocation and no `Speculated` event, and its trace equals the
+    serial trace of F3. Sabotage: gate speculation on the provider's capability alone rather than on
+    the cap, under which the early invocation happens at a cap of 1 and only this fails.
+  - >
+    **F10 — the completeness edge is a parse, and it is right on the cases that break a guess.** Four
+    argument shapes are each started exactly once and with exactly the streamed bytes: one containing
+    a `}` inside a string value, one containing a nested object, one that is empty (`{}`, and the
+    Anthropic case where an empty-argument call streams no fragment at all —
+    `src/provider/anthropic.rs:786`), and one whose fragments split mid-multi-byte character.
+    Sabotage: treat the first `}` byte as the end of the arguments, under which the string and nested
+    cases start with truncated arguments and only these fail.
+  - >
+    **F11 — `Fallback` discards across a failover.** A primary that streams two complete read-only
+    calls and then fails, with a secondary that answers with a different completion, folds only the
+    secondary's calls; the primary's speculated results appear nowhere. Sabotage: keep the speculation
+    cache across the provider switch, under which the primary's results are folded under the
+    secondary's calls and only this fails.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` is 402 lines, unchanged. The whole release is
+    `serde_json` and `tokio`, both already present.
+  - >
+    **N2 — the public surface addition is stated in advance and met exactly.** `docs/public-api.txt`
+    tracks crate-root re-exports only, so a new defaulted method on `Provider` and a new `EventKind`
+    variant each add **no line**: the predicted change is **+0 lines**, and any difference is
+    explained in the record rather than absorbed.
+  - >
+    **N3 — no compile break for any `Provider` implementation.** The new method is defaulted; an
+    out-of-tree provider written against 0.20.0 compiles and runs unchanged, asserted by
+    `tests/public_api.rs` and by an in-suite provider that implements only `complete`.
+  - >
+    **N4 — no durable state.** `git diff main -- src/state.rs` is empty, `CHECKPOINT_FORMAT` is 7, and
+    a 0.53.0 store and a 0.54.0 store are the same store in both directions.
+  - >
+    **N5 — the release's own measurement, recorded and not asserted.** Against a scripted provider
+    whose stream carries a stated number of tokens after the last tool call: the wall-clock from the
+    first complete tool call to the completion's return — which is the window speculation can use —
+    and the observed end-to-end step time with and without it, on a named machine. The point of the
+    number is operator guidance on when the new method is worth implementing for a custom provider.
+    **No clock is a pass/fail gate**, per the standing rule.
+  operational:
+  - >
+    **O1 — the three-platform matrix is green.** Nothing here is platform-specific, which is itself
+    the claim: a concurrency change that behaves differently on one runner is the defect this gate
+    catches.
+  - >
+    **O2 — nothing in the suite gates on a wall clock.** Every earliness claim is a rendezvous that
+    completes or a bounded wait that fails, never an assertion that something happened within N
+    milliseconds. This release is a latency release and therefore the one most likely to be written
+    the wrong way; the standing rule is restated here on purpose. Bounds are sized for the Windows
+    runner, which is roughly three times slower than the development machine.
+  - >
+    **O3 — `docs/CONTRACT.md`'s streamed-delta rule is amended in this release, by name.** The
+    sentence at `docs/CONTRACT.md:1961-1965` — "A streamed delta is provisional until the completion
+    returns … Render it; do not act on it" — stays true for text and for a consumer, and gains the
+    exact carve-out the harness now takes for itself: a *finished* read-only tool call, in the
+    completion's leading read-only run, allowed outright by the `Policy`, may be started early, and
+    its result is used only if the settled completion asks for it. The 0.41.0 concurrency section
+    (`docs/CONTRACT.md:1243-1295`) gains the prefix rule and the statement that it is narrower than
+    the batching rule beside it. A release that changed this behaviour and left that sentence standing
+    would be shipping a documented lie.
+  - >
+    **O4 — the checked-in doc surfaces are updated in this release.** The README's feature list,
+    `docs/guide/providers.md` (what implementing the new method buys and what the default costs),
+    `docs/guide/tools-and-skills.md` (which tools can be speculated and why the list is three long),
+    `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md` and the changelog entry. Every new public item
+    carries a worked example. The four doc tests and `tests/public_api.rs` pass.
+  - >
+    **O5 — the nightly rustdoc gate passes with `-D warnings`.** Run before the release PR.
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`. It has
+    caught something in six of the last seven releases, and this release adds a trait method whose
+    doc block links private items by name.
+  - >
+    **O6 — the cross-version gate runs.** `cargo build --manifest-path
+    tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0 -- --ignored`.
+    It is the easy-to-forget gate whose generator is not built by default, and a store-compatibility
+    claim (N4) is exactly what it exists to check.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.54.0, GitHub at initorigin/io-harness with the tag `v0.54.0` and a
+    Release titled `io-harness 0.54.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.54.0` off `develop`, committed incrementally as it lands,
+    including the sealed UltraShip release record and the hand-appended lock pin. PR into `develop`,
+    merged with the PR button. `develop`'s head **and tree** checked against the tree the gates ran on
+    immediately before the release PR is opened — `git diff --quiet feat/0.54.0 develop` — because a
+    Dependabot merge has landed above the feature merge in two of the last eighteen releases. Release
+    PR `develop` into `main`, merged the same way. The GitHub Release is cut by `release.yml` from a
+    tag pushed alone, which takes its notes verbatim from the changelog. `cargo publish --locked` by
+    hand afterwards, always last, after both merges and the Release exist, with the registry token
+    sourced from the repo-local `.env` in the same shell invocation. `develop` synced to `main`
+    fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    **None, and that is a claim this release makes rather than an omission.** No table, column or
+    index; `CHECKPOINT_FORMAT` unmoved at 7; a 0.53.0 store and a 0.54.0 store are the same store in
+    both directions. An operator does nothing.
+  - >
+    **No compile break.** The `Provider` addition is a defaulted method and `EventKind` gains one
+    additive variant, the shape every addition since 0.13.0 has used. A consumer upgrading changes
+    nothing and, unless its provider implements the new method, behaves identically.
+  observability:
+  - >
+    `EventKind::Speculated { started, used, discarded }` once per step in which at least one call was
+    speculated. It is the row that makes the trade auditable: work started early, work that paid, and
+    work thrown away. A step that speculated nothing emits nothing.
+  - >
+    Everything else is unmoved on purpose. The same `EventKind::ToolCall` events in the same order,
+    the same steps, the same observations in the same ordinals, the same `PolicyEvent` rows and the
+    same ledger draws. An observer cannot tell from those whether a read started early. That is the
+    guarantee, not a gap — 0.41.0's own sentence, applied to the starting line instead of the overlap.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.54.1 and `cargo yank --version
+    0.54.0` is the escape hatch, leaving 0.53.0 as what `cargo install` resolves. Reverting the
+    behaviour needs no downgrade, no flag and no migration: `with_max_parallel_reads(1)` returns the
+    execution shape to 0.40.0's and the starting line to 0.53.0's, which is what F9 asserts, and a
+    provider that does not implement the new method never speculated in the first place, which is
+    what F8 asserts on bytes. There is no durable state, so a downgrade after a run is a downgrade
+    rather than a migration.
+
+dependencies:
+  products: []
+  services:
+  - >
+    crates.io and GitHub Actions for the release itself, as every version.
+  - >
+    **No live provider call is required.** Every claim is about this crate's stream consumption, its
+    policy and its fold, proven against scripted providers in the same process. The two wire
+    overrides are asserted against recorded SSE byte streams, which is how both accumulators are
+    already tested.
+  human_approvals:
+  - >
+    **The new capability is a third defaulted `Provider` method, not a change to
+    `complete_streaming`.** Decided at specification time, 2026-08-14. `complete_streaming`'s sink is
+    `&(dyn Fn(&str) + Send + Sync)` and widening it would break every out-of-tree implementation of
+    the one extension point this crate has. A defaulted method whose default is silence costs nobody
+    anything.
+  - >
+    **Speculation covers the leading read-only run, not every read-only run.** Decided at
+    specification time, 2026-08-14. It is narrower than 0.41.0's batching rule, deliberately, because
+    a read speculated after an unstarted write would return a value from before the write. F2's
+    sabotage is that exact rule and it fails on a wrong value rather than a wrong order.
+  - >
+    **A call the `Policy` does not allow outright is never speculated.** Decided at specification
+    time, 2026-08-14. It keeps every approver question inside a settled completion and leaves
+    0.41.0's collapse-on-pause rule exactly where it was.
+  - >
+    **The completeness edge is a successful JSON parse rather than a wire-specific signal.** Decided
+    at specification time, 2026-08-14. One rule for both wires, sound because a proper prefix of a
+    JSON object cannot parse; Anthropic's `content_block_stop` corroborates and is never the sole
+    signal, because the OpenAI wire has no equivalent.
+  - >
+    **Speculation is gated on `max_parallel_reads > 1` and adds no new setting.** Decided at
+    specification time, 2026-08-14.
+  - >
+    **`run_with` and `agent_loop` are out of scope, and the second is recorded as a known
+    divergence.** Decided at specification time, 2026-08-14.
+  - >
+    **`delivery.target_mode` is `published`.** Decided at specification time, 2026-08-14.
+  - >
+    The PR, both merges, the Release and the publish are pre-authorised for this version under the
+    standing flow.
+
+resource_profile:
+  complexity: medium
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    **The seam between the stream and the run loop is where this release will spend its debugging.**
+    `stream_completion` (`src/run.rs:13064`) currently bridges one `Send + Sync` sink into an
+    unbounded `mpsc` because `Watch` is `!Sync` and `Store` is `!Sync`; a second sink takes the same
+    route, and the work it starts must be spawned from the loop's own task rather than from inside
+    the provider's future — which is not `Send` (`src/provider/mod.rs:1297-1302`) and cannot be
+    spawned. Getting that shape right on the first attempt is the difference between a day and a week.
+  - >
+    **Building a `ReadWork` without `prepare_read` is a refactor with a trap in it.** `prepare_read`
+    (`src/run.rs:9092`) resolves the target *and* gates *and* records, and only the first of those
+    three may happen early. The pre-test must reach the same `Policy` decision the serial gate will
+    reach, through the same code, or the release ships a speculative path that is wider than its own
+    boundary. F7's sabotage exists because this is the plausible mistake.
+  - >
+    **The scripted providers are real work and are written before the feature.** A provider that
+    emits arguments in chosen fragments, holds the stream open on a barrier, fails after emitting
+    complete calls, and settles a response that deliberately disagrees with what it streamed, is the
+    test infrastructure for the whole release. Nothing here can be proven with the existing test
+    doubles.
+  - >
+    **Two wire accumulators, two shapes, one rule.** The Anthropic and OpenAI-wire accumulators are
+    separate types with separate event vocabularies, and the parse-based edge has to be threaded
+    through both without changing what either currently produces.
+  - >
+    **The byte-identity assertions are where the suite will fail first**, as they were in 0.53.0.
+    F3, F8 and F9 all compare traces, and any incidental event, ordering or string change shows up
+    there rather than where it was introduced.
+  preferred_tools:
+  - >
+    A new `tests/speculative_reads.rs` for F1–F11, built on the rendezvous technique
+    `tests/parallel_reads.rs` established for 0.41.0; `tests/session_streaming.rs` for the sink
+    plumbing, where streamed turns are already asserted.
+  - >
+    `src/provider/anthropic.rs` and `src/provider/openai_wire.rs` own `#[cfg(test)]` modules for the
+    parse-based completeness edge over recorded SSE bytes, which is where both accumulators are
+    already pinned and the cheapest place for F10.
+  - >
+    `cargo test --doc` for the new method's worked example, which `tests/public_api.rs` requires.
+  constraints:
+  - >
+    **No new runtime dependency.** `cargo tree` flat at 402.
+  - >
+    **MSRV 1.95, edition 2021, Apache-2.0.** Unchanged.
+  - >
+    **Every version stays 0.x.x.** No 1.0.0 is planned or implied by this release.
+  - >
+    **`Provider` is not dyn-compatible and its streaming future is not `Send`.** Both are standing
+    properties of the trait and neither may change here.
+  - >
+    **An `EventKind` variant may not carry a field named like the envelope's** — the kind is
+    `#[serde(flatten)]`ed into `RunEvent`, which carries `run_id`, `step` and `depth`.
+  - >
+    **No durable state.** Nothing this release produces reaches the store beyond the events and
+    observations every tool already writes.
+  - >
+    **`docs/CONTRACT.md`, the README, the changelog, the guide pages and the crate-root prose are
+    checked-in surfaces.** They change in this release, not in the next one.
+
+risks:
+- >
+  **A speculated result folded under a different call.** Keying by index alone is correct on every
+  test where the settled completion matches the streamed one, which is every ordinary test, and wrong
+  in exactly the case that matters: the model reads a file it never asked for and reasons forward
+  from a state that never existed. This is the most serious defect this release can ship. Mitigation:
+  F5 makes the streamed and settled arguments disagree on purpose, and its sabotage is the
+  index-only key.
+- >
+  **The speculative policy pre-test drifts wider than the serial gate**, so a read the boundary would
+  refuse happens anyway and is merely not recorded. A read that happened is a read that happened;
+  "not recorded" makes it worse rather than better. Mitigation: the pre-test calls the same `Policy`
+  method the gate does, F7 asserts on a probe over the file rather than on the refusal text, and its
+  sabotage is the skipped pre-test.
+- >
+  **A read speculated past an unstarted write returns pre-write bytes.** The prefix rule exists for
+  this and is easy to relax by accident into 0.41.0's maximal-run rule, which is sitting in the same
+  function. Mitigation: F2's sabotage is precisely that relaxation, and it fails on a value rather
+  than an order.
+- >
+  **Wasted work on a stream that fails late.** A completion that emits ten complete reads and then
+  fails does ten reads for nothing, twice if the retry succeeds. Bounded by `max_parallel_reads` and
+  by the reads being read-only, so the cost is I/O and latency rather than correctness. Mitigation:
+  `EventKind::Speculated`'s `discarded` count makes it visible to an operator instead of silent, and
+  N5 records what the window is actually worth.
+- >
+  **A parse-based completeness edge that fires on something that is not a complete argument object.**
+  The soundness argument depends on the arguments being exactly one JSON object; a provider that
+  streams something else — a bare string, a concatenation — would break it. Mitigation: the edge
+  requires a parse to a JSON *object*, not to any JSON value, and F10 covers the shapes that break a
+  naive scan.
+- >
+  **The two loops diverge further.** `agent_loop` has neither batching nor speculation, and each
+  release that adds to one loop and not the other makes the eventual reconciliation larger.
+  Mitigation: stated as a known limitation in the record rather than left implicit, and excluded by
+  name rather than by omission.
+
+open_questions:
+- >
+  **Whether `EventKind::Speculated` is per step or per run.** Per step is what the contract specifies
+  and is the shape every other tool-level event has; per run would be one row instead of many on a
+  long session and is what an operator watching a discard *rate* actually wants. Settled during
+  implementation against what the event stream reads like on a real session, and the alternative is
+  stated in the record either way.
+- >
+  **Whether Anthropic's `content_block_stop` should be used at all**, given the parse edge is
+  sufficient and uniform. Corroboration costs one match arm and would catch a provider whose
+  arguments parse early for a reason not yet imagined; it also creates a second path that the OpenAI
+  wire cannot have. The plan is to use it as corroboration only, and to drop it if it earns nothing.
+- >
+  **Whether a speculated call should be started before or after the tool hook fires.**
+  `tool_gate` (`src/run.rs:9211`) can refuse a call outright and runs serially today. Starting early
+  and discarding on a hook refusal wastes a read the operator asked to prevent; asking the hook early
+  gives it a call that may never settle, which is the same objection that keeps the approver out.
+  The plan is to treat a hook exactly as the approver is treated — never consulted early, and a call
+  under a configured tool hook is not speculated — and the cost of that conservatism is measured
+  rather than assumed.
