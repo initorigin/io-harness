@@ -404,7 +404,7 @@ tasks:
     why_required: The record is evidence-based, and a criterion whose sabotage kills nothing is a guard
       that protects nothing. The cross-version gate is what proves the new index left a 0.55.0 store
       readable.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.56.0-T05
     acceptance_criteria:
@@ -427,4 +427,30 @@ tasks:
         **O7 — clippy on all three feature polarities**, default, one feature on, and
         `--all-features`.
     files: []
-    evidence: []
+    evidence:
+      - >-
+        O2/O7 `cargo fmt --check` exit 0; `cargo clippy --all-targets -- -D warnings` exit 0 on all
+        three polarities — the default build, `--features media`, and `--all-features`. Two lints on
+        this release's own additions were fixed to get there: `nonminimal_bool` on the note-fitting
+        closure and `assertions_on_constants` on the reserved-key test's non-Windows arm.
+      - >-
+        O5 `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` —
+        exit 0, clean on the first attempt. Second release running that it has found nothing, after
+        catching something in six of the seven before 0.55.0.
+      - >-
+        O4 cross-version: `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` exit 0,
+        then `cargo test --test cross_version_0_29_0 -- --ignored` — 1 passed. This is the gate that
+        matters for a release adding an index to a shared table.
+      - >-
+        N1 `cargo tree` — **402 lines, unchanged**. No new dependency: the release is SQL, config
+        plumbing and two tool arms.
+      - >-
+        **Sabotage: 16 arms, and every one now kills a named test. Two survived the first pass and
+        both were findings.** S4 (remove the `keep` guard) compiled and failed nothing, because the
+        existing arm writes into a store with no recalls, where the new key sorts last among
+        candidates either way; the guard is load-bearing only when every OTHER entry carries
+        evidence, which the added test now constructs. S9 (report a removal for a key that was never
+        there) failed nothing because the test counted trace rows and neither arm writes one for an
+        absent key — and asserting the message instead exposed something real in the product: the
+        absent answer wore the same `[forget <key>]` prefix a removal wears. It now reads
+        `[forget: nothing to forget]`. Logs in `evidence/0.56.0/sab-*.log`.
