@@ -4741,6 +4741,9 @@ async fn run_workspace_from<P: Provider>(
             .context
             .effective_tokens(contract.max_tokens.map(|m| m.saturating_sub(tokens_used)));
         let entry_cap = entry_cap_chars(budget_tokens);
+        // 0.55.0 — the operator's own read ceiling, when they set one. Resolved
+        // here so it travels with `entry_cap`: a read is measured against both.
+        let max_read = contract.max_read_chars.map(|c| c as usize);
         // Re-read each turn rather than once at the start, so the notes the model
         // sees are the notes the store holds — including one written this run, and
         // not one the operator has since cleared.
@@ -4776,6 +4779,7 @@ async fn run_workspace_from<P: Provider>(
                 &contract.tools,
                 containment.clone(),
                 entry_cap,
+                max_read,
                 contract.max_parallel_reads,
                 run_id,
                 step,
@@ -5100,6 +5104,7 @@ async fn run_workspace_from<P: Provider>(
                         step,
                         &contract.tools,
                         entry_cap,
+                        max_read,
                         watch,
                         0,
                         contract.max_parallel_reads,
@@ -5139,6 +5144,7 @@ async fn run_workspace_from<P: Provider>(
                         &contract.tools,
                         skills,
                         entry_cap,
+                        max_read,
                         &mem_key,
                         watch,
                         0,
@@ -7008,6 +7014,7 @@ where
                 .context
                 .effective_tokens(Some(token_cap.saturating_sub(tokens_used)));
             let entry_cap = entry_cap_chars(budget_tokens);
+            let max_read = contract.max_read_chars.map(|c| c as usize);
             // 0.50.0 — the reports of children this agent stopped waiting for,
             // folded before the prompt is assembled so the model reads them on this
             // step rather than the next one. After `entry_cap` because a report is
@@ -7304,6 +7311,7 @@ where
                     tree.tools,
                     tree.skills,
                     entry_cap,
+                    max_read,
                     &mem_key,
                     tree.watch,
                     depth,
@@ -9044,6 +9052,10 @@ enum ReadWork {
     Read {
         target: String,
         remember: Vec<Rule>,
+        /// 0.55.0 — the first line to return, 1-based, as the model asked for it.
+        offset: Option<u64>,
+        /// 0.55.0 — how many lines to return from `offset`.
+        limit: Option<u64>,
     },
     Custom {
         name: String,
@@ -9053,11 +9065,105 @@ enum ReadWork {
     },
 }
 
+/// The line range a `read_file` call asked for, if it asked for one (0.55.0).
+fn read_range_of(arguments: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+    (
+        arguments.get("offset").and_then(|v| v.as_u64()),
+        arguments.get("limit").and_then(|v| v.as_u64()),
+    )
+}
+
+/// Take the 1-based line range the model asked for, returning the body and the
+/// header note that makes a slice legible as a slice (0.55.0).
+///
+/// A read with no range is the whole file and says nothing new. An `offset` past
+/// the end is an error naming the total rather than an empty success: an empty
+/// success is exactly the answer that reads like an empty file.
+fn line_slice(
+    text: &str,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> std::result::Result<(String, String), String> {
+    if offset.is_none() && limit.is_none() {
+        return Ok((text.to_string(), String::new()));
+    }
+    // A trailing newline terminates the last line rather than starting an empty
+    // one, so `a\nb\n` is two lines and an operator counting in an editor agrees.
+    let lines: Vec<&str> = text
+        .strip_suffix('\n')
+        .unwrap_or(text)
+        .split('\n')
+        .collect();
+    let total = lines.len();
+    let first = offset.unwrap_or(1).max(1) as usize;
+    if first > total {
+        return Err(format!(
+            "offset {first} is past the end — the file has {total} lines, so there is nothing \
+             at that line to read"
+        ));
+    }
+    let count = limit.map(|l| l as usize).unwrap_or(total);
+    let last = first.saturating_add(count).saturating_sub(1).min(total);
+    let mut body: String = lines[first - 1..last].join("\n");
+    body.push('\n');
+    Ok((body, format!(" lines {first}-{last} of {total}")))
+}
+
+/// The refusal for a read whose content will not fit (0.55.0).
+///
+/// It names the file, the size, the ceiling and both ways forward, because a
+/// refusal a model cannot act on turns a working run into a stuck one.
+///
+/// **It also names *which* ceiling.** A read can be over the operator's
+/// `[run] max_read_chars`, which is a fixed number somebody chose, or over what
+/// this turn's remaining budget can carry, which moves as the run spends. The
+/// two call for different answers — raise the key, or read a range now — so a
+/// message that covered both would tell the model to try the wrong one half the
+/// time.
+fn over_ceiling(
+    target: &str,
+    size: usize,
+    budget_cap: usize,
+    max_read: Option<usize>,
+    offset: Option<u64>,
+) -> String {
+    let suggestion = if offset.is_some() {
+        "ask for fewer lines".to_string()
+    } else {
+        format!(
+            "read a range instead — `{{\"path\": \"{target}\", \"offset\": 1, \"limit\": 200}}`"
+        )
+    };
+    // The operator's ceiling is reported whenever it is the one that bit, which
+    // includes the case where both would have: a number somebody set is the one
+    // they can act on.
+    match max_read {
+        Some(operator) if size > operator => format!(
+            "{target} is {size} chars, over the {operator}-char ceiling set by \
+             `[run] max_read_chars`, so nothing was read. A shortened read would look like the \
+             whole file. To proceed, {suggestion}, or raise that key."
+        ),
+        _ => format!(
+            "{target} is {size} chars, over the {budget_cap}-char ceiling this turn's remaining \
+             context budget allows, so nothing was read. A shortened read would look like the \
+             whole file. To proceed, {suggestion} — the ceiling this one is measured against \
+             moves as the run spends, so `[run] max_read_chars` is what makes it predictable."
+        ),
+    }
+}
+
 impl ReadWork {
     /// Perform it. The same code the serial path runs, so the two cannot drift:
     /// a batched read and a lone read are the same function called from two
     /// places.
-    async fn run(self, ws: &Workspace, cap: usize, run_id: i64, step: u32) -> Dispatched {
+    async fn run(
+        self,
+        ws: &Workspace,
+        cap: usize,
+        max_read: Option<usize>,
+        run_id: i64,
+        step: u32,
+    ) -> Dispatched {
         match self {
             ReadWork::Grep { pattern, path_glob } => {
                 match ws.grep(&pattern, path_glob.as_deref()) {
@@ -9094,15 +9200,66 @@ impl ReadWork {
                 ),
                 Err(e) => Dispatched::go("find error", format!("\n[find error] {e}\n")),
             },
-            ReadWork::Read { target, remember } => match ws.read_file(&target) {
-                Ok(c) => Dispatched::Continue {
-                    decision: format!("read {target}"),
-                    obs: format!("\n[read {target}]\n{}\n", bound(&c, cap, ObsKind::Read)),
-                    kind: ObsKind::Read,
-                    target: Some(target),
-                    changed: false,
-                    remember,
-                },
+            ReadWork::Read {
+                target,
+                remember,
+                offset,
+                limit,
+            } => match ws.read_typed(&target) {
+                // 0.55.0 — the read has a type. Text carries the encoding it was
+                // decoded from when that is not the ordinary one; everything else
+                // is named rather than decoded, because a binary read used to
+                // arrive here as an empty string and read like an empty file.
+                Ok(crate::tools::FileContent::Text { text, encoding }) => {
+                    let mut note = if encoding == crate::tools::TextEncoding::Utf8 {
+                        String::new()
+                    } else {
+                        format!(" ({})", encoding.as_str())
+                    };
+                    let body = match line_slice(&text, offset, limit) {
+                        Ok((body, range)) => {
+                            note.push_str(&range);
+                            body
+                        }
+                        Err(why) => {
+                            return Dispatched::go(
+                                format!("read {target} refused"),
+                                format!("\n[read {target} error] {why}\n"),
+                            )
+                        }
+                    };
+                    // 0.55.0 — whole, the range that was asked for, or nothing.
+                    // A truncated read has the shape of a successful one and
+                    // nothing downstream can tell the difference, so the read
+                    // that will not fit returns no content at all.
+                    let size = body.chars().count();
+                    if size > cap || max_read.is_some_and(|m| size > m) {
+                        return Dispatched::go(
+                            format!("read {target} refused"),
+                            format!(
+                                "\n[read {target} error] {}\n",
+                                over_ceiling(&target, size, cap, max_read, offset)
+                            ),
+                        );
+                    }
+                    Dispatched::Continue {
+                        decision: format!("read {target}"),
+                        obs: format!("\n[read {target}{note}]\n{body}\n"),
+                        kind: ObsKind::Read,
+                        target: Some(target),
+                        changed: false,
+                        remember,
+                    }
+                }
+                Ok(other) => {
+                    let why = other
+                        .refusal(&target)
+                        .unwrap_or_else(|| format!("{target} is not text"));
+                    Dispatched::go(
+                        format!("read {target} refused"),
+                        format!("\n[read {target} error] {why}\n"),
+                    )
+                }
                 Err(e) => Dispatched::go("read error", format!("\n[read error] {e}\n")),
             },
             ReadWork::Custom {
@@ -9178,9 +9335,12 @@ fn speculable(ws: &Workspace, call: &ToolCall, custom: &Toolbox) -> Option<ReadW
         }),
         READ_FILE_TOOL => {
             let path = s("path").unwrap_or_default();
+            let (offset, limit) = read_range_of(&call.arguments);
             allowed(Act::Read, path).then(|| ReadWork::Read {
                 target: path.to_string(),
                 remember: Vec::new(),
+                offset,
+                limit,
             })
         }
         name => {
@@ -9217,6 +9377,10 @@ struct Speculation<'a> {
     /// start a tool 0.53.0 refuses, and start it before the completion settled.
     sandbox: Option<std::sync::Arc<crate::sandbox::ExecContainment>>,
     cap: usize,
+    /// 0.55.0 — the operator's `[run] max_read_chars`, when one is set. Carried
+    /// beside `cap` because a read is measured against both and the refusal has
+    /// to say which one bound it.
+    max_read: Option<usize>,
     max_parallel: usize,
     run_id: i64,
     step: u32,
@@ -9238,11 +9402,13 @@ struct Speculation<'a> {
 }
 
 impl<'a> Speculation<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ws: Workspace,
         tools: &'a Toolbox,
         sandbox: Option<std::sync::Arc<crate::sandbox::ExecContainment>>,
         cap: usize,
+        max_read: Option<usize>,
         max_parallel: usize,
         run_id: i64,
         step: u32,
@@ -9252,6 +9418,7 @@ impl<'a> Speculation<'a> {
             tools,
             sandbox,
             cap,
+            max_read,
             max_parallel,
             run_id,
             step,
@@ -9309,9 +9476,9 @@ impl<'a> Speculation<'a> {
             return;
         };
         let ws = self.ws.clone();
-        let (cap, run_id, step) = (self.cap, self.run_id, self.step);
+        let (cap, max_read, run_id, step) = (self.cap, self.max_read, self.run_id, self.step);
         self.set
-            .spawn(async move { (at, work.run(&ws, cap, run_id, step).await) });
+            .spawn(async move { (at, work.run(&ws, cap, max_read, run_id, step).await) });
         self.started.push((at, call.clone()));
         self.started_total += 1;
     }
@@ -9451,7 +9618,15 @@ async fn prepare_read(
                 Gated::Paused { request_id } => Prepared::Stop(Dispatched::Pause { request_id }),
                 Gated::Go {
                     target, remember, ..
-                } => Prepared::Work(ReadWork::Read { target, remember }),
+                } => {
+                    let (offset, limit) = read_range_of(&call.arguments);
+                    Prepared::Work(ReadWork::Read {
+                        target,
+                        remember,
+                        offset,
+                        limit,
+                    })
+                }
             }
         }
         name => {
@@ -9508,6 +9683,7 @@ async fn read_batch(
     step: u32,
     custom: &Toolbox,
     cap: usize,
+    max_read: Option<usize>,
     watch: &Watch<'_>,
     depth: u32,
     max_parallel: usize,
@@ -9551,7 +9727,7 @@ async fn read_batch(
                 break;
             };
             let ws = owned.clone();
-            set.spawn(async move { (at, work.run(&ws, cap, run_id, step).await) });
+            set.spawn(async move { (at, work.run(&ws, cap, max_read, run_id, step).await) });
         }
     };
     fill(&mut set, &mut queued);
@@ -9807,6 +9983,7 @@ async fn dispatch(
     custom: &Toolbox,
     skills: &Skills,
     cap: usize,
+    max_read: Option<usize>,
     memory_key: &str,
     watch: &Watch<'_>,
     depth: u32,
@@ -9911,7 +10088,7 @@ async fn dispatch(
             )
             .await?
             {
-                Prepared::Work(work) => work.run(ws, cap, run_id, step).await,
+                Prepared::Work(work) => work.run(ws, cap, max_read, run_id, step).await,
                 Prepared::Done(done) | Prepared::Stop(done) => done,
             }
         }
@@ -10354,17 +10531,24 @@ async fn dispatch(
         #[cfg(feature = "media")]
         VIEW_IMAGE_TOOL => {
             let path = s("path").unwrap_or_default();
-            // The extension decides the media type, and an unknown one is
+            // The extension decides the source media type, and an unknown one is
             // reported rather than guessed. Checked before the gate only because
-            // it costs nothing: the gate still runs for every path that could
-            // actually be read, so this cannot be used to probe for a file's
-            // existence outside the policy.
-            let Some(media_type) = crate::provider::Media::media_type_for(path) else {
+            // it costs nothing and reads nothing: the gate still runs for every
+            // path that could actually be read, so this cannot be used to probe
+            // for a file's existence outside the policy — and 0.55.0's decode,
+            // which does look at bytes, is inside the gated branch below.
+            //
+            // 0.55.0 widens this from the four wire types to every format the
+            // crate recognises. A format it cannot decode is refused by name
+            // further down, by `Media::attach`, rather than here with a list of
+            // four types that is a fact about vendors instead of about the file.
+            let Some(media_type) = crate::provider::Media::source_type_for(path) else {
                 return Ok(Dispatched::go(
                     "view_image unsupported type",
                     format!(
-                        "\n[view_image error] {path} is not an image this crate can send. \
-                         Supported: {}\n",
+                        "\n[view_image error] {path} is not an image this crate recognises. \
+                         It sends {}, and converts BMP, TIFF, ICO, TGA and PNM to PNG on the \
+                         way.\n",
                         crate::provider::IMAGE_MEDIA_TYPES.join(", ")
                     ),
                 ));
@@ -10392,7 +10576,8 @@ async fn dispatch(
                     .read_bytes(&target)
                     .map_err(|e| e.to_string())
                     .and_then(|bytes| {
-                        crate::provider::Media::image(media_type, &bytes).map_err(|e| e.to_string())
+                        crate::provider::Media::attach(media_type, &bytes)
+                            .map_err(|e| e.to_string())
                     }) {
                     Ok(media) => {
                         // The observation records what was sent, not the image:
@@ -10401,7 +10586,16 @@ async fn dispatch(
                         // long unattended runs this crate exists for.
                         let obs = format!(
                             "\n[view_image {target}] attached to the next request \
-                             ({media_type}, {} bytes, digest {})\n",
+                             ({}, {} bytes, digest {})\n",
+                            // 0.55.0 — a transcode says so, so a trace shows that
+                            // the bytes on the wire are not the bytes on disk. A
+                            // pass-through says nothing new, because nothing
+                            // happened to it.
+                            if media.media_type == media_type {
+                                media_type.to_string()
+                            } else {
+                                format!("{media_type} converted to {}", media.media_type)
+                            },
                             media.byte_len(),
                             media.digest()
                         );
@@ -12339,7 +12533,7 @@ async fn dispatch(
             )
             .await?
             {
-                Prepared::Work(work) => work.run(ws, cap, run_id, step).await,
+                Prepared::Work(work) => work.run(ws, cap, max_read, run_id, step).await,
                 Prepared::Done(done) | Prepared::Stop(done) => done,
             }
         }
@@ -14709,11 +14903,17 @@ fn workspace_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: READ_FILE_TOOL.to_string(),
-            description: "Read a file (path relative to the workspace root) into context.".to_string(),
+            description: "Read a file (path relative to the workspace root) into context. \
+                          A file too large to fit is refused rather than shortened — read it \
+                          in ranges with offset and limit. Images and documents are not text: \
+                          the refusal names the tool that opens them."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path relative to the workspace root." }
+                    "path": { "type": "string", "description": "File path relative to the workspace root." },
+                    "offset": { "type": "integer", "description": "First line to read, counting from 1. Omit to start at the beginning." },
+                    "limit": { "type": "integer", "description": "How many lines to read from offset. Omit to read to the end." }
                 },
                 "required": ["path"]
             }),

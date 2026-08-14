@@ -775,6 +775,14 @@ pub async fn assemble(
         let why = match (&shapes[i], superseded[i]) {
             (_, Some(at)) => format!("superseded by the {} at step {at}", e.kind.label()),
             (Some(Shape::Stub(why)), _) => why.clone(),
+            // 0.55.0 — a read says how to get the part that matters back, by
+            // name. Every other kind is re-run rather than re-read: a command's
+            // output and a search's matches have no line range to ask for.
+            _ if e.kind == ObsKind::Read && e.target.is_some() => format!(
+                "{} chars, older than the current context window — re-read it with `offset` and \
+                 `limit` if you need it",
+                commas(e.text.chars().count())
+            ),
             _ => format!(
                 "{} chars, older than the current context window — re-run if you need it",
                 commas(e.text.chars().count())
@@ -958,7 +966,16 @@ fn refresh(
         // `read_file` reads a missing path as empty rather than failing, so an
         // empty result is reported as what it is: nothing left to carry.
         Ok(body) if body.is_empty() => Err("it is now empty, or gone".into()),
-        Ok(body) => Ok(bound(&body, cap, ObsKind::Read)),
+        // 0.55.0 — whole or a stub, never a tail. A re-read that no longer fits
+        // used to be bounded like any other observation, which put the end of a
+        // file into the prompt under a header saying the file had been re-read.
+        // The stub says what happened and how to get the part that matters.
+        Ok(body) if body.chars().count() > cap => Err(format!(
+            "it is now {} chars, over this turn's {cap}-char ceiling — re-read it with `offset` \
+             and `limit`",
+            commas(body.chars().count())
+        )),
+        Ok(body) => Ok(body),
         Err(e) => Err(format!("the re-read failed: {e}")),
     }
 }

@@ -1358,6 +1358,93 @@ taken through `Session::turn`, `Session::turn_bounded` or
 is 0.20.0's rule about where `EventKind::Token` comes from, unchanged; it is
 restated here because it now decides a second thing.
 
+## What a read returns, and what it will not return instead (0.55.0)
+
+**A read is whole, a range you asked for, or a refusal.** It is never a shortened
+version of the file. Until 0.55.0 a `read_file` whose text exceeded the
+per-observation cap was cut, with a visible marker in the text saying so. That is
+honest and it was not enough: what the model then held had the *shape* of a
+successful read, and nothing downstream — no event, no row, no field — could tell
+a whole file from the tail of one. A model that saw twelve thousand characters of
+a four-hundred-thousand-character file goes on to reason as though it saw the
+file.
+
+So a read that will not fit returns **no content at all**: an error naming the
+path, the size in characters, the ceiling it exceeded, **which** ceiling that
+was, and the two ways to proceed.
+
+**There are two ceilings and they are different in kind.** One is
+`[run] max_read_chars` (`TaskContract::with_max_read_chars`) — a number an
+operator chose, which does not move. The other is derived from the run's
+[context budget](guide/context-and-memory.md) and is a share of what is still
+*unspent*, so it falls as the run spends: the same file is readable at step three
+and refused at step forty. A read is refused when it exceeds either. The refusal
+names the one that bit, because the answers differ — raise the key, or ask for a
+range now. Setting the key is what makes the boundary predictable; leaving it
+unset is what every version before 0.55.0 did.
+
+**The remedy exists, which is why the refusal is allowed to be one.** `read_file`
+takes `offset` (1-based) and `limit`, in lines, and the observation header states
+the range and the file's total line count. A partial read the model asked for by
+number is a partial read the model knows about, which is the whole difference
+from one it was handed.
+
+**A stored read is whole in the prompt or a stub.** A read that fitted when it
+happened can be squeezed later by a narrower budget share; it is then replaced by
+a one-line stub naming the file and the range to re-read, never served as a
+fragment. This holds for the re-read of a file a write invalidated too.
+
+**Bounding is unchanged for everything else.** A command's output, a search's
+matches, a skill body, a registered tool's result and an MCP server's reply are
+still cut at the per-observation cap with the marker they have always had. A
+prefix of a `grep` is not a lie about a document, because a `grep` was never one.
+Document tools (`xlsx_read`, `pdf_read` and the rest) are still bounded the same
+way: what they return is a rendering of a file rather than the file.
+
+**A file that is not text is named, not decoded.** `read_file` classifies before
+it reads: UTF-8, UTF-16 by byte-order mark with the encoding named, an image
+routed to `view_image`, a known document routed to its own tool, and anything
+else named as binary with its size and what its leading bytes look like.
+Detection stops at the byte-order mark — no statistical charset guess, because a
+guessed Latin-1 is the same class of confident wrong answer this whole section
+exists to remove. `Workspace::read_typed` returns that classification;
+`Workspace::read_file` returns the text or the typed error.
+
+**One case is deliberately still "nothing":** a file that does not exist reads as
+empty, which is what lets an agent create a file by reading it first. What
+changed is that a file which *does* exist and is not text no longer answers the
+same way.
+
+## What the image door accepts, and what the wire still refuses (0.55.0)
+
+**The set on the wire is four, and did not move.** `IMAGE_MEDIA_TYPES` is
+`image/jpeg`, `image/png`, `image/gif`, `image/webp` — the intersection every
+provider documents — and `Media::image` enforces it exactly as before.
+
+**The set at the door is wider.** `Media::attach` passes those four through
+**byte-identically** and decodes BMP, TIFF, ICO, TGA and PNM, re-encoding them to
+PNG. A JPEG is never re-encoded: a decode-and-re-encode of the commonest format
+would be a silent quality loss on the commonest path, and it is asserted on the
+bytes rather than assumed. `view_image` uses the door, and its observation says
+when a conversion happened, so a trace shows that the bytes on the wire are not
+the bytes on disk.
+
+**What cannot be decoded is refused by its own name.** SVG, HEIC and AVIF each
+get the format's name, the reason, and a one-line conversion that produces a PNG.
+The reasons genuinely differ and the message says which: HEIC and AVIF need a
+system C library this crate does not depend on, so that it builds anywhere with a
+Rust toolchain and nothing else; SVG needs a renderer, which is a dependency tree
+rather than a C library. A PDF handed to `view_image` is routed to `pdf_read`.
+
+**A declared size is checked before a decode.** A small file can declare an
+enormous image, and a decoder that believes it allocates before anything checks
+the result. Dimensions are read from the header and refused against
+`MAX_IMAGE_PIXELS` first; `MAX_IMAGE_BYTES` still applies to the encoded result.
+
+**No decoder is on the default path.** All of this is behind the `media` feature,
+which now compiles `image` — already an optional dependency of this crate, and
+still absent from a default build.
+
 ## What a model approving an action can and cannot decide (0.42.0)
 
 `ModelApprover` installs a model where a human would stand. This is the boundary

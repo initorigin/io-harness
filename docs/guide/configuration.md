@@ -190,6 +190,7 @@ max_duration_secs = 900
 max_tokens = 400000
 max_retries = 2
 exec_timeout_secs = 120
+max_read_chars = 40000   # the largest file one read may carry (0.55.0)
 skills = ".io/skills"
 
 [run.retry]
@@ -208,6 +209,19 @@ share = 0.5
 name = "io-harness agent"
 email = "agent@io-harness.invalid"
 ```
+
+`max_read_chars` is the one key here whose absence is not simply a default. Left
+unset, the ceiling a read is measured against is derived from `[run.context]` —
+a share of the token budget still *unspent*, so it falls as the run spends and
+the same file is readable at step three and refused at step forty. Setting this
+makes it a number that does not move, which is what a refusal a run's behaviour
+turns on has to be. Both ceilings apply to every read, and the refusal names the
+one that bit.
+
+It is also the one `[run]` key a project-scoped `io.toml` may only **lower**. The
+four keys a cloned repository may not widen are refused by their widening value
+(`exec = "allow"`); a number has no such value, so the smaller of the two wins
+instead. `io.local.toml` and the user-scope file set it outright.
 
 What the file does **not** set is the task: `goal`, `file`, `root` and `verify`
 are what the caller is asking for now, not a property of the project.

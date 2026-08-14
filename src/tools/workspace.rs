@@ -31,6 +31,249 @@ pub struct Workspace {
     policy: Policy,
 }
 
+/// How a file's bytes were decoded into text (0.55.0).
+///
+/// Named in the observation whenever it is not [`TextEncoding::Utf8`], because a
+/// model that cannot see which encoding produced a string cannot tell a decode
+/// from a guess. Detection stops at the byte-order mark on purpose: a
+/// statistical detector is a dependency this crate does not carry, and a guessed
+/// Latin-1 is the same class of confident wrong answer as the empty string this
+/// release removes.
+///
+/// ```
+/// use io_harness::tools::TextEncoding;
+///
+/// assert_eq!(TextEncoding::Utf16Le.as_str(), "UTF-16LE");
+/// // The ordinary case has a name too, so a trace never has to infer one.
+/// assert_eq!(TextEncoding::Utf8.as_str(), "UTF-8");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextEncoding {
+    /// Valid UTF-8 with no byte-order mark. The overwhelmingly common case.
+    Utf8,
+    /// Valid UTF-8 behind a byte-order mark, which is stripped from the text.
+    Utf8Bom,
+    /// UTF-16 little-endian, identified by its byte-order mark.
+    Utf16Le,
+    /// UTF-16 big-endian, identified by its byte-order mark.
+    Utf16Be,
+}
+
+impl TextEncoding {
+    /// The name written into the observation and the trace.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TextEncoding::Utf8 => "UTF-8",
+            TextEncoding::Utf8Bom => "UTF-8 with a byte-order mark",
+            TextEncoding::Utf16Le => "UTF-16LE",
+            TextEncoding::Utf16Be => "UTF-16BE",
+        }
+    }
+}
+
+/// What a path turned out to be when the harness looked at it (0.55.0).
+///
+/// The read path used to have exactly one answer — a `String` — so a file that
+/// was not text arrived at the model as an empty document, indistinguishable
+/// from a file that does not exist. This type is that missing distinction: text
+/// carries the encoding it was decoded from, and everything else is named rather
+/// than decoded, with the tool that *can* open it where there is one.
+///
+/// ```
+/// use io_harness::tools::{FileContent, TextEncoding, Workspace};
+///
+/// # fn demo() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// std::fs::write(dir.path().join("notes.md"), "hello\n")?;
+/// // A lone 0x80 is not valid UTF-8 in any position, and the bytes before it
+/// // say what the file is.
+/// std::fs::write(dir.path().join("blob.bin"), [0x7f, b'E', b'L', b'F', 0x80])?;
+/// let ws = Workspace::new(dir.path());
+///
+/// assert_eq!(
+///     ws.read_typed("notes.md")?,
+///     FileContent::Text { text: "hello\n".into(), encoding: TextEncoding::Utf8 },
+/// );
+/// // Not decoded, and not empty either: named, with its size.
+/// assert!(matches!(
+///     ws.read_typed("blob.bin")?,
+///     FileContent::Binary { bytes: 5, kind: "an ELF executable" },
+/// ));
+/// # Ok(()) }
+/// # demo().unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileContent {
+    /// Text, and the encoding it was decoded from.
+    Text {
+        /// The decoded text. A missing file reads as empty, which is deliberate
+        /// and unchanged from 0.1.0: it is what lets an agent create a file by
+        /// reading it first.
+        text: String,
+        /// How those bytes became this string.
+        encoding: TextEncoding,
+    },
+    /// An image, named rather than decoded. `view_image` is what looks at one.
+    Image {
+        /// A human-readable format name, e.g. `a PNG image`.
+        format: &'static str,
+    },
+    /// A document with a decoder of its own behind a cargo feature.
+    Document {
+        /// A human-readable format name, e.g. `a spreadsheet`.
+        format: &'static str,
+        /// The tool that reads it, e.g. `xlsx_read`.
+        tool: &'static str,
+    },
+    /// Bytes that are not text in any encoding this crate detects.
+    Binary {
+        /// The file's size on disk.
+        bytes: u64,
+        /// What the leading bytes look like, e.g. `a ZIP archive`. Falls back to
+        /// `binary data` rather than guessing.
+        kind: &'static str,
+    },
+}
+
+impl FileContent {
+    /// Why this is not text, phrased for the model that asked to read it, or
+    /// `None` when it is text (0.55.0).
+    ///
+    /// One sentence, naming the file, what it is, and the tool that opens it
+    /// where there is one — and saying so when that tool's cargo feature is not
+    /// compiled into this build, because a model told nothing simply calls the
+    /// same tool again.
+    ///
+    /// ```
+    /// use io_harness::tools::FileContent;
+    ///
+    /// let png = FileContent::Image { format: "a PNG image" };
+    /// let why = png.refusal("logo.png").unwrap();
+    /// assert!(why.contains("logo.png") && why.contains("a PNG image"));
+    ///
+    /// // Text has no refusal, which is what makes this an `Option`.
+    /// assert!(FileContent::Text {
+    ///     text: "hi".into(),
+    ///     encoding: io_harness::tools::TextEncoding::Utf8,
+    /// }
+    /// .refusal("notes.md")
+    /// .is_none());
+    /// ```
+    pub fn refusal(&self, rel: &str) -> Option<String> {
+        match self {
+            FileContent::Text { .. } => None,
+            FileContent::Image { format } => Some(if cfg!(feature = "media") {
+                format!(
+                    "{rel} is {format}, so nothing was decoded — call `{}` to look at it",
+                    crate::tools::VIEW_IMAGE_TOOL
+                )
+            } else {
+                format!(
+                    "{rel} is {format}, so nothing was decoded, and this build cannot send \
+                     images (the `media` cargo feature is off)"
+                )
+            }),
+            FileContent::Document { format, tool } => {
+                let compiled = match *tool {
+                    crate::tools::XLSX_READ_TOOL => cfg!(feature = "xlsx"),
+                    crate::tools::DOCX_READ_TOOL => cfg!(feature = "docx"),
+                    crate::tools::PPTX_READ_TOOL => cfg!(feature = "pptx"),
+                    _ => cfg!(feature = "pdf"),
+                };
+                Some(if compiled {
+                    format!(
+                        "{rel} is {format}, so nothing was decoded — `{tool}` is what reads one"
+                    )
+                } else {
+                    format!(
+                        "{rel} is {format}, so nothing was decoded; `{tool}` reads one and is \
+                         not compiled into this build"
+                    )
+                })
+            }
+            FileContent::Binary { bytes, kind } => Some(format!(
+                "{rel} is not text: {kind}, {bytes} bytes. Nothing was decoded — reading it as \
+                 text would produce a document that is not what is in the file."
+            )),
+        }
+    }
+}
+
+/// The format name for a path's extension, for the formats that are images
+/// rather than text.
+///
+/// SVG is deliberately absent: it is XML, a model reading one wants the markup,
+/// and calling it an image would make a readable file unreadable. HEIC and AVIF
+/// are here because naming them is the point — refusing them as "not one of
+/// image/jpeg, image/png, image/gif, image/webp" is the refusal 0.55.0 exists to
+/// stop giving.
+fn image_format_for(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "png" => "a PNG image",
+        "jpg" | "jpeg" => "a JPEG image",
+        "gif" => "a GIF image",
+        "webp" => "a WebP image",
+        "bmp" => "a BMP image",
+        "tif" | "tiff" => "a TIFF image",
+        "ico" => "an ICO image",
+        "tga" => "a TGA image",
+        "pnm" | "pbm" | "pgm" | "ppm" => "a PNM image",
+        "heic" | "heif" => "a HEIC image",
+        "avif" => "an AVIF image",
+        _ => return None,
+    })
+}
+
+/// The format name and the tool for a path's extension, for the documents this
+/// crate decodes behind a cargo feature.
+fn document_for(ext: &str) -> Option<(&'static str, &'static str)> {
+    Some(match ext {
+        "xlsx" => ("a spreadsheet", crate::tools::XLSX_READ_TOOL),
+        "docx" => ("a Word document", crate::tools::DOCX_READ_TOOL),
+        "pptx" => ("a slide deck", crate::tools::PPTX_READ_TOOL),
+        "pdf" => ("a PDF", crate::tools::PDF_READ_TOOL),
+        _ => return None,
+    })
+}
+
+/// What the leading bytes look like. Named for an operator reading a trace, and
+/// `binary data` when nothing matches — a wrong guess would be worse than none.
+fn sniff_binary(bytes: &[u8]) -> &'static str {
+    match bytes {
+        [0x7f, b'E', b'L', b'F', ..] => "an ELF executable",
+        [0xfe, 0xed, 0xfa, ..] | [0xce | 0xcf, 0xfa, 0xed, 0xfe, ..] => "a Mach-O binary",
+        [0xca, 0xfe, 0xba, 0xbe, ..] => "a Mach-O universal binary",
+        [b'M', b'Z', ..] => "a Windows executable",
+        [b'P', b'K', 0x03 | 0x05, ..] => "a ZIP archive",
+        [0x1f, 0x8b, ..] => "a gzip stream",
+        [b'%', b'P', b'D', b'F', ..] => "a PDF",
+        [0x00, b'a', b's', b'm', ..] => "a WebAssembly module",
+        [b'S', b'Q', b'L', b'i', b't', b'e', ..] => "a SQLite database",
+        _ => "binary data",
+    }
+}
+
+/// Decode UTF-16 from bytes that have already had their byte-order mark
+/// removed. `None` for an odd byte count or an unpaired surrogate, both of which
+/// mean the mark was a coincidence rather than a declaration.
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Option<String> {
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = [pair[0], pair[1]];
+            if little_endian {
+                u16::from_le_bytes(pair)
+            } else {
+                u16::from_be_bytes(pair)
+            }
+        })
+        .collect();
+    String::from_utf16(&units).ok()
+}
+
 /// What a write did to the file it targeted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wrote {
@@ -410,13 +653,101 @@ impl Workspace {
         Ok(out)
     }
 
-    /// Read a file under the root. A missing file reads as empty, so the agent
-    /// can create it (matching the 0.1/0.2 `FsTool` behaviour). A path the
+    /// Read a file under the root as text. A missing file reads as empty, so the
+    /// agent can create it (matching the 0.1/0.2 `FsTool` behaviour). A path the
     /// policy denies is refused before anything is read.
+    ///
+    /// **A file that is not text is an error (0.55.0).** It used to be an empty
+    /// string: the body of this method was
+    /// `std::fs::read_to_string(abs).unwrap_or_default()`, so a JPEG, an
+    /// executable and a UTF-16 log all arrived at the caller as `Ok("")` —
+    /// indistinguishable from the missing file whose empty read is deliberate. A
+    /// caller that wants the classification rather than the error wants
+    /// [`Workspace::read_typed`]; a caller that wants the bytes wants
+    /// [`Workspace::read_bytes`].
     pub fn read_file(&self, rel: &str) -> Result<String> {
+        match self.read_typed(rel)? {
+            FileContent::Text { text, .. } => Ok(text),
+            other => Err(Error::Config(
+                other
+                    .refusal(rel)
+                    .unwrap_or_else(|| format!("{rel} is not text")),
+            )),
+        }
+    }
+
+    /// Read a file under the root and say what it turned out to be (0.55.0).
+    ///
+    /// The classification order is extension first, then bytes: an extension the
+    /// crate knows names the format without decoding anything, and everything
+    /// else is decided by a byte-order mark, a UTF-8 check, and a look at the
+    /// leading bytes. A missing file is [`FileContent::Text`] and empty, which is
+    /// 0.1.0's deliberate behaviour and the one case where "nothing" is an
+    /// answer rather than a failure.
+    ///
+    /// The policy gate runs before any byte is read, so nothing here can be used
+    /// to learn what a file the policy denies contains — or whether it exists.
+    pub fn read_typed(&self, rel: &str) -> Result<FileContent> {
         let abs = self.resolve(rel)?;
         self.enforce(Act::Read, rel)?;
-        Ok(std::fs::read_to_string(abs).unwrap_or_default())
+
+        // Existence first, and only then the extension: a `.png` that is not
+        // there is a file to create, not an image. That ordering is what keeps
+        // 0.1.0's empty-on-missing behaviour exactly as it was for every path.
+        match std::fs::metadata(&abs) {
+            Ok(_) => {}
+            // The one case where nothing is an answer: reading a file that is not
+            // there yet is how an agent decides to create it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(FileContent::Text {
+                    text: String::new(),
+                    encoding: TextEncoding::Utf8,
+                })
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+
+        let ext = Path::new(rel)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if let Some(format) = image_format_for(&ext) {
+            return Ok(FileContent::Image { format });
+        }
+        if let Some((format, tool)) = document_for(&ext) {
+            return Ok(FileContent::Document { format, tool });
+        }
+
+        let bytes = std::fs::read(&abs).map_err(Error::Io)?;
+
+        let text = |text: String, encoding| Ok(FileContent::Text { text, encoding });
+        match bytes.as_slice() {
+            [0xef, 0xbb, 0xbf, rest @ ..] => match std::str::from_utf8(rest) {
+                Ok(s) => text(s.to_string(), TextEncoding::Utf8Bom),
+                Err(_) => Ok(FileContent::Binary {
+                    bytes: bytes.len() as u64,
+                    kind: sniff_binary(&bytes),
+                }),
+            },
+            [0xff, 0xfe, rest @ ..] if decode_utf16(rest, true).is_some() => text(
+                decode_utf16(rest, true).unwrap_or_default(),
+                TextEncoding::Utf16Le,
+            ),
+            [0xfe, 0xff, rest @ ..] if decode_utf16(rest, false).is_some() => text(
+                decode_utf16(rest, false).unwrap_or_default(),
+                TextEncoding::Utf16Be,
+            ),
+            _ => match String::from_utf8(bytes) {
+                Ok(s) => text(s, TextEncoding::Utf8),
+                Err(e) => {
+                    let bytes = e.into_bytes();
+                    Ok(FileContent::Binary {
+                        bytes: bytes.len() as u64,
+                        kind: sniff_binary(&bytes),
+                    })
+                }
+            },
+        }
     }
 
     /// Write a file under the root, creating parent directories, reporting
@@ -1039,10 +1370,13 @@ mod tests {
 
         ws.write_bytes("blob.bin", payload).unwrap();
         assert_eq!(ws.read_bytes("blob.bin").unwrap(), payload);
-        assert_ne!(
-            ws.read_file("blob.bin").unwrap().as_bytes(),
-            payload,
-            "the text reader cannot represent these bytes — that is what this pair is for"
+        // 0.55.0 — the text reader used to answer `Ok("")` here, which is what
+        // made this pair necessary and also what made a binary read look like an
+        // empty file. It now says what the file is instead.
+        let err = ws.read_file("blob.bin").unwrap_err().to_string();
+        assert!(
+            err.contains("blob.bin") && err.contains("5 bytes"),
+            "the text reader names what it will not decode, got {err}"
         );
     }
 

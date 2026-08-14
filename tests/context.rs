@@ -549,10 +549,19 @@ async fn every_observation_kind_is_bounded_where_it_enters_the_context() {
         entry.to_string()
     };
 
-    let read = cut(1, "[read big.txt]");
+    // 0.55.0 — the read is the one kind that is no longer bounded here. It used
+    // to keep its tail, on the reasoning that the end of a file is what a writer
+    // needs; what the model then held had the shape of a whole file. It is now
+    // refused whole, which is what the rest of this test's kinds are the control
+    // for: a command's output and a search's matches are still cut.
+    let read = provider.observations(1);
     assert!(
-        read.contains("TAIL-OF-FILE"),
-        "a read keeps its tail — the end of a file is what a writer needs:\n{read}"
+        !read.contains("TAIL-OF-FILE"),
+        "a read that will not fit carries none of the file:\n{read}"
+    );
+    assert!(
+        read.contains("[read big.txt error]") && read.contains("nothing was read"),
+        "and says so, with the size and the ceiling:\n{read}"
     );
     let grep = cut(2, "[grep \"needle\"]");
     assert!(
@@ -582,7 +591,7 @@ async fn every_observation_kind_is_bounded_where_it_enters_the_context() {
         .map(|s| s.result.as_str())
         .collect();
     for header in [
-        "[read big.txt]",
+        "[read big.txt error]",
         "[grep \"needle\"]",
         "[find \"*.dat\"]",
         "[wrote out.txt]",
@@ -939,10 +948,15 @@ async fn a_sub_agent_loops_prompt_stays_inside_the_ceiling() {
     use io_harness::{run_tree, Containment};
 
     let dir = ws();
+    // 0.55.0 — sized to fit under the per-read ceiling (`entry_cap_chars` floors
+    // at 2,000) rather than over it. What this test is about is a log that
+    // outgrows the assembled ceiling across eight turns while the trace keeps all
+    // of it; a file no single read could carry would now be refused, which is a
+    // different claim and F9's.
     for i in 0..6 {
         std::fs::write(
             dir.path().join(format!("f{i}.txt")),
-            "z".repeat(6_000) + "\nneedle\n",
+            "z".repeat(1_500) + "\nneedle\n",
         )
         .unwrap();
     }
@@ -1509,6 +1523,89 @@ async fn parallel_calls_are_one_turn_and_one_batch_in_call_order() {
             result.content.contains(&format!("CONTENT-{name}")),
             "result {i} must answer call {i} ({path}), got: {}",
             result.content
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F12 (0.55.0) — a stored read is whole in the prompt or a stub, never a
+// fragment; every other kind is still bounded
+// ---------------------------------------------------------------------------
+
+/// A stored read squeezed out by a narrower budget is replaced by a stub that
+/// says how to get the part that matters, and carries none of the file.
+///
+/// The three sentinels are the assertion: "no content" has to mean the middle
+/// and the tail too, and the tail is the half that used to survive — `bound`
+/// keeps the *end* of a read, on the reasoning that the end of a file is what a
+/// writer needs. A tail under a header saying the file was read is the fragment
+/// this release stops serving.
+#[tokio::test]
+async fn a_read_that_no_longer_fits_is_a_stub_and_not_a_tail() {
+    let store = Store::memory().unwrap();
+    let policy = Policy::permissive();
+    let filler = "x".repeat(4_000);
+    let mut ledger = Ledger::default();
+    ledger.push(Observation::new(
+        1,
+        ObsKind::Read,
+        Some("src/lib.rs".into()),
+        format!("\n[read src/lib.rs]\nHEAD-SENTINEL\n{filler}\nMIDDLE-SENTINEL\n{filler}\nTAIL-SENTINEL\n"),
+    ));
+    // Something newer, so the older read is the one that loses the fit.
+    ledger.push(Observation::new(
+        2,
+        ObsKind::Grep,
+        Some("needle".into()),
+        "\n[grep \"needle\"]\nsrc/other.rs:4: needle\n",
+    ));
+
+    let out = assemble(
+        &ledger,
+        // A ceiling too small to carry the read whole, and large enough to carry
+        // the newer entry — which is exactly the squeeze the rule is about.
+        200,
+        &[],
+        Assembly {
+            ws: None,
+            policy: &policy,
+            store: &store,
+            run_id: 1,
+            step: 3,
+        },
+    )
+    .await
+    .unwrap();
+
+    for sentinel in ["HEAD-SENTINEL", "MIDDLE-SENTINEL", "TAIL-SENTINEL"] {
+        assert!(
+            !out.text.contains(sentinel),
+            "a stubbed read carries none of the file, and {sentinel} is in it:\n{}",
+            out.text
+        );
+    }
+    assert!(
+        out.text.contains("read src/lib.rs") && out.text.contains("offset"),
+        "the stub names the file and the way to get part of it back:\n{}",
+        out.text
+    );
+}
+
+/// The negative half, and the reason the rule is not general: a command's output
+/// and a search's matches were never documents, and a prefix of one is not a
+/// lie. They are still bounded with the marker they have always had.
+#[test]
+fn a_search_and_a_command_are_still_bounded_rather_than_refused() {
+    let long = "m".repeat(500);
+    for kind in [ObsKind::Grep, ObsKind::Tool] {
+        let bounded = io_harness::context::bound(&long, 100, kind);
+        assert!(
+            bounded.contains("truncated") && bounded.len() < long.len() + 200,
+            "{kind:?} is still cut with its marker, got {bounded}"
+        );
+        assert!(
+            bounded.starts_with("mmm"),
+            "and it is the head that survives for these kinds: {bounded}"
         );
     }
 }

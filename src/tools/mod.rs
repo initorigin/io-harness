@@ -27,7 +27,7 @@ pub mod workspace;
 pub use custom::{Tool, ToolEffect, ToolFuture, Toolbox};
 pub use exec::DEFAULT_EXEC_TIMEOUT;
 pub use fs::FsTool;
-pub use workspace::{Entry, EntryKind, Match, Workspace, Wrote};
+pub use workspace::{Entry, EntryKind, FileContent, Match, TextEncoding, Workspace, Wrote};
 
 /// The name the model uses to write a file (single-file 0.1/0.2 form: content only).
 pub const WRITE_FILE_TOOL: &str = "write_file";
