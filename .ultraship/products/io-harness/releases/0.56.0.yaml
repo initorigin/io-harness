@@ -1,0 +1,508 @@
+product: io-harness
+version: 0.56.0
+status: planned
+release_type: minor
+
+outcome:
+  user_can: >
+    What a run learns is kept for what it is worth rather than for how recently it was written, is
+    reachable from every workspace when it is true of every workspace, and can be taken back.
+
+    Eviction stops being a clock. At the entry cap a write today drops the oldest entry
+    (`Store::enforce_memory_caps`, `src/state.rs:6656`, `ORDER BY created_at ASC, id ASC`), so the
+    build command learned on the first run and carried by every run since is exactly the entry
+    most likely to go, and this morning's triviality survives. After this release the candidate
+    order is evidence first: the number of **distinct runs** that carried the entry, then how
+    recently one did, and only then the write clock — so the unproven cohort behaves exactly as it
+    does today and the proven entries are simply not in it. A pinned entry is still never a
+    candidate and the dropped keys are still returned, both unchanged since 0.30.0 and 0.10.0.
+
+    The three caps stop being the crate's private opinion. `MEMORY_MAX_ENTRIES` (64),
+    `MEMORY_MAX_CHARS` (16,000) and `MEMORY_MAX_ENTRY_CHARS` (an eighth of that) become a
+    `[memory]` table in `io.toml` and a `MemoryLimits` on `TaskContract`, defaults unchanged, and
+    the guide states the coupling those numbers encode rather than leaving an operator to raise
+    them into a worse place: the memory block gets a quarter of the turn's effective tokens
+    (`src/context.rs:651`), the whole store fits inside that share at the current caps, and past
+    that point selection begins deciding what the model sees — which is why the caps only become
+    safe to raise once selection is by evidence, in this same release.
+
+    A run can unlearn. `remember` writes by key and rewriting replaces, so an agent that learns
+    the same wrong thing under two names has two disagreeing notes and no way to withdraw either.
+    A `forget` tool removes one entry, refused on a pinned one for the same reason a write is,
+    recorded in the trace and in the run's restore points, so a `rewind_run` puts back what a
+    forget took.
+
+    And memory stops being workspace-scoped only. `memory_key(root)` (`src/run.rs:13071`) is the
+    whole of scoping today, so a fact true of every repository an operator owns is learned again
+    per workspace or written by hand into each one's instructions. A second scope sits above the
+    workspace: `remember` and `forget` take a `scope`, the workspace is the default, every run
+    recalls both, and **the workspace entry wins a key collision**, because the specific place
+    always knows better than the general one.
+  business_value: >
+    Durable memory is the one feature of this crate whose value compounds across runs, and today
+    it is bounded by a policy that actively works against compounding: the longer an entry has
+    been useful, the sooner it is dropped. That is not a slow leak, it is a reliable one — a
+    workspace busy enough to reach 64 entries loses exactly the entries a busy workspace earned.
+
+    The scope limit is the other half of the same waste. An operator running the harness over
+    twenty repositories pays twenty times to teach it one fact about themselves, and pays again
+    every time a workspace's store turns over.
+
+    And a memory that cannot be corrected downwards is a memory an operator learns not to trust.
+    Pinning exists for the case where a person knows better; `forget` is the case where the agent
+    itself does, which is the far more common one and today has no answer at all.
+  evidence_of_value: >
+    A workspace driven past the entry cap keeps the notes its runs actually carried and drops the
+    ones no run ever did — asserted directly, by writing a note recalled by many runs and a note
+    recalled by none, filling the store past the cap, and reading back which survived. On 0.55.0
+    the same sequence drops the recalled one, because it is the older.
+
+    A second workspace over the same store recalls the global entries without being taught them,
+    and a global note contradicted locally is overridden by the local one rather than shadowing
+    it. An agent that learns something wrong removes it in one call and the removal is in the
+    trace, in the restore points, and gone from the next turn's prompt.
+
+scope:
+  included:
+  - >
+    **Eviction ordered by evidence.** `enforce_memory_caps` selects candidates ordered by the
+    number of **distinct `run_id`s** in `memory_recalls` for that `(workspace, key)` ascending,
+    then by the most recent recall time ascending with never-recalled first, then by today's
+    `created_at ASC, id ASC`. Pinned entries and the key just written stay out of the candidate
+    set, unchanged. `MemoryWrite::evicted` still returns the dropped keys in eviction order —
+    already true since 0.10.0 and stated here so the release is not credited with it.
+  - >
+    **The count is of runs, not of rows, and that is a correction to the roadmap entry.**
+    `record_memory_recall` (`src/run.rs:4907`, `src/run.rs:7167`) writes one row per key per
+    **step** for every entry the block carried, and at the current caps the block carries
+    everything. Rows therefore measure steps elapsed since the write, which one long run inflates
+    over fifty short ones and which is monotone in age — the very thing this release replaces.
+    `COUNT(DISTINCT run_id)` is the honest reading of the same table and needs no new writer.
+  - >
+    **One new index and no other schema change.** `CREATE INDEX IF NOT EXISTS memory_recalls_entry
+    ON memory_recalls (workspace, key)`, additive like every index this crate has added, with the
+    query plan asserted rather than assumed. `CHECKPOINT_FORMAT` does not move: no checkpoint
+    layout changes, and bumping it would refuse a database that is in fact readable.
+  - >
+    **The caps become the operator's.** `MemoryLimits { max_entries, max_chars, max_entry_chars }`
+    with a `Default` equal to today's three constants, which stay public and stay the defaults'
+    source. A `[memory]` table in `io.toml`, projected onto `TaskContract::with_memory_limits`
+    through the ordinary `Config::apply_to` path, and threaded to the dispatch site beside
+    `memory_key` — the shape `max_read` already has.
+  - >
+    **The caps narrow at project scope and never widen.** All three keys join `NARROWING`
+    (`src/config.rs:2022`), so a repository's own `io.toml` may lower an operator's ceiling and may
+    not raise it, exactly as `run.max_read_chars` does since 0.55.0.
+  - >
+    **A `forget` tool.** One key, an optional `scope`, refused on a pinned entry with the same
+    shape of refusal `remember` gives, refused while a plan is unapproved for the same reason
+    `remember` is (`src/run.rs:10101`), and recorded as a context event and a run event. Forgetting
+    a key that is not there is reported as such rather than as a success.
+  - >
+    **A forget is undoable by the mechanism that already exists.** `Store::memory_forget` writes
+    the 0.36.0 restore point before it deletes, so `rewind_run` puts the entry back with its value,
+    kind and pin state. A forget also deletes that key's `memory_recalls` rows — the agent said the
+    fact is wrong, so the evidence it accrued goes with it — while an **eviction leaves them**,
+    because a cap is the store's decision and rewriting the trace is not the store's to do.
+  - >
+    **A scope above the workspace.** A reserved workspace key that no canonicalised path can equal,
+    holding entries every run over every workspace recalls. `remember` and `forget` take
+    `scope: "workspace" | "global"`, defaulting to `workspace`, so an agent may promote a fact it
+    believes is universal and may take it back the same way.
+  - >
+    **The workspace wins a collision.** Recall reads both scopes; where a key exists in both, the
+    workspace entry is the one carried, and the global one is not rendered at all. The memory block
+    renders the two groups under their own headings, so a global note is never presented as
+    something learned about this workspace.
+  - >
+    **Each scope holds its own caps.** The global bucket is a workspace key, so
+    `enforce_memory_caps` bounds it by the same limits, independently. The consequence — a prompt
+    may carry up to twice the per-scope character cap — is stated in the guide and bounded by the
+    block's own unchanged quarter-share ceiling.
+  - >
+    Documentation for all of it in the checked-in surfaces, and the changelog entry.
+  excluded:
+  - >
+    **A recall signal that means "the model used it".** Nothing observable says whether the model
+    read a line of the memory block. This release reads the table that exists more honestly; it
+    does not invent a usage signal, and the guide says plainly that a recall is a carriage.
+  - >
+    **Decay, half-lives or scores stored on the entry.** The order is computed from
+    `memory_recalls` at eviction time. A stored score is a second source of truth that drifts, and
+    a decay constant is a number nobody can tune without data this crate does not collect.
+  - >
+    **Rewriting what a recall row means.** `memory_recalls` keeps its per-step shape. Changing it
+    to one row per run would lose the step attribution 0.30.0 added deliberately, and the
+    aggregate this release needs is a `DISTINCT` away.
+  - >
+    **A third scope, or per-user/per-organisation scoping.** Two scopes, one collision rule.
+  - >
+    **Seeding global memory from `io.toml`.** A config-declared note is a fourth writer with its
+    own precedence question against the store, the pin and the workspace override. Global entries
+    are written through the store, by an operator or by a run.
+  - >
+    **Automatic promotion.** Nothing infers that a workspace fact is universal. A global entry is
+    written as global, deliberately, by whoever writes it.
+  - >
+    **Raising any default.** All three caps ship at today's numbers. This release makes them
+    movable and says what moving them costs; it does not move them.
+  fallback_scope:
+  - >
+    Eviction ordered by evidence, plus `forget`. "What a run learns is kept for its value and can
+    be taken back" is a coherent release on its own, and it carries the defect the version exists
+    for — a policy that drops the entries a workspace earned. The operator caps and the global
+    scope move to 0.57.0, which is where the caps belong anyway if selection has to land first.
+
+acceptance:
+  functional:
+  - >
+    **F1 — the entry many runs carried survives, and the entry no run carried goes.** A store is
+    filled to `max_entries`. One key is recalled by ten separate runs and is the **oldest** entry in
+    the workspace; another is recalled by none and is newer. One further write forces an eviction.
+    The recalled key survives, the unrecalled one is in `MemoryWrite::evicted`, and the assertion is
+    on both halves. The control is the same sequence asserted to behave the other way round on
+    0.55.0's ordering, written out in the test so the fix cannot silently revert. Sabotage: restore
+    `ORDER BY created_at ASC, id ASC`, under which the recalled key is evicted and only F1 fails.
+  - >
+    **F2 — one long run does not outvote many short ones.** Two entries: one recalled at 200 steps
+    of a single run, one recalled at one step of each of three runs. The 200-row entry is evicted
+    first, because three distinct runs beat one. This is the criterion that fails if the
+    implementation counts rows, which is what the roadmap entry's prose asked for. Sabotage:
+    `COUNT(*)` in place of `COUNT(DISTINCT run_id)`, under which the three-run entry is evicted and
+    only F2 fails.
+  - >
+    **F3 — the unproven cohort keeps 0.10.0's order.** With no recall rows at all for any entry,
+    eviction order is byte-for-byte what 0.55.0 produced: oldest `created_at` first, `id` breaking a
+    tie. Asserted by evicting five entries from a store with no recalls and comparing the evicted
+    list to the literal expected order. Sabotage: drop the `created_at, id` tail of the ORDER BY,
+    under which the order becomes unstable and only F3 fails.
+  - >
+    **F4 — pinned is still not a candidate and the written key is still kept.** A pinned entry with
+    zero recalls and the oldest `created_at` — the worst possible score on every term — survives an
+    eviction that drops three other entries, and the key just written is never among the evicted
+    even when it is the only zero-recall entry. Both halves asserted; both are 0.30.0 and 0.10.0
+    behaviour and this release must not move them. Sabotage: remove the `keep` guard, under which
+    the write becomes a silent no-op and only F4 fails.
+  - >
+    **F5 — the eviction query is answered from an index.** `EXPLAIN QUERY PLAN` over the exact
+    statement the crate runs, on a store holding 64 entries and 10,000 recall rows, names
+    `memory_recalls_entry` and contains no `SCAN memory_recalls`. Asserted on the plan text, and the
+    measured time for one capped write at that size is recorded, never asserted. Sabotage: drop the
+    index creation, under which the plan shows a scan and only F5 fails.
+  - >
+    **F6 — the caps travel the ordinary configuration path.** `[memory] max_entries = 8` in an
+    `io.toml` reaches `TaskContract` through `Config::apply_to`; a misspelled key beside it is still
+    refused by `deny_unknown_fields`; a run with nothing set evicts at exactly 64, 16,000 and 2,000
+    as 0.55.0 did. Asserted with a set run and an unset run over the same workspace. Sabotage: read
+    the table directly in the run loop rather than projecting it onto the contract, under which the
+    typed-API assertion fails and only F6 fails.
+  - >
+    **F7 — a project-scoped file may lower a cap and may not raise it.** A user-scope `io.toml`
+    setting `max_entries = 64` and a project-scope one setting `128` yields 64; the project file
+    setting `16` yields 16. All three keys asserted, not one representative. Sabotage: omit the
+    three new `NARROWING` entries, under which the 128 wins and only F7 fails.
+  - >
+    **F8 — the entry cap bounds a single value and the total cap bounds the store.** With
+    `max_entry_chars = 100` a longer value is stored truncated with the existing marker; with
+    `max_chars = 500` and a large `max_entries`, writes evict until the character total holds. The
+    two caps are asserted independently, because a single implementation that only honours the
+    entry count would pass a test that sets both. Sabotage: hold only the entry count, under which
+    the character assertion fails and only F8 fails.
+  - >
+    **F9 — `forget` removes one entry and says so.** A run calls `forget` on a key it wrote. The
+    entry is gone from `Store::memory_list`, absent from the next turn's assembled prompt, and the
+    observation names the key. `forget` on a key that was never written reports that nothing was
+    there, and is not an error. Sabotage: report success unconditionally, under which the
+    not-there assertion fails and only F9 fails.
+  - >
+    **F10 — `forget` is refused on a pinned entry and while a plan is unapproved.** A pinned entry
+    survives a `forget` with a refusal naming the key, and the entry is still there afterwards. With
+    an unapproved plan active, `forget` is refused before it reaches the store, with the same shape
+    of message `remember` gives — asserted by the store still holding the entry, not only by the
+    text. Sabotage: gate `forget` on the plan but not on the pin, under which the pinned assertion
+    fails and only F10 fails.
+  - >
+    **F11 — a forget is undone by a rewind, and an eviction's evidence survives.** After a
+    `forget`, `rewind_run` restores the entry with its value, kind and pin state intact. Separately,
+    a key removed by **eviction** keeps its `memory_recalls` rows, while a key removed by `forget`
+    has none afterwards — the two are asserted in one test, because the whole point is that they
+    differ. Sabotage: delete recall rows on eviction too, under which the eviction half fails and
+    only F11 fails.
+  - >
+    **F12 — a global note is recalled from a workspace that never wrote it.** A run over workspace A
+    writes a note with `scope: "global"`. A run over workspace B, which has no entries of its own,
+    carries it in its memory block and `Assembled::recalled_keys` names it. A second global note
+    written by B is carried by A. Sabotage: recall only the run's own workspace, under which B's
+    block is empty and only F12 fails.
+  - >
+    **F13 — the workspace wins a key collision, and the global entry is not also rendered.** With
+    the same key in both scopes, the assembled prompt contains the workspace value and **does not
+    contain the global value** — asserted on the global value's text being absent, not merely on the
+    workspace value being present, because rendering both would pass the weaker assertion. Sabotage:
+    concatenate the two lists without deduplicating, under which the global text appears and only
+    F13 fails.
+  - >
+    **F14 — the block says which notes are global.** The memory block renders the two groups under
+    separate headings, and a global note is not described as learned over this workspace. Asserted
+    on the rendered text of a prompt holding one note of each. Sabotage: render one undifferentiated
+    list, under which the heading assertion fails and only F14 fails.
+  - >
+    **F15 — the reserved global key cannot be a real workspace.** `memory_key` over a directory
+    whose name is the reserved string still yields that directory's canonical path, which is not
+    equal to the reserved key. Asserted on a real temporary directory, so the claim is about
+    canonicalisation rather than about a string comparison written twice.
+  - >
+    **F16 — each scope holds its own caps.** Filling the global bucket past `max_entries` evicts
+    global entries and touches no workspace entry, and the reverse. Asserted in both directions,
+    because a single shared counter passes the first direction alone.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` stays at **402** lines on the default build. This
+    release is SQL, config plumbing and two tool arms.
+  - >
+    **N2 — the public surface addition is stated in advance.** `docs/public-api.txt` tracks
+    crate-root re-exports. The prediction is **+2 lines**: `MemoryLimits` and the reserved global
+    workspace constant. `TaskContract::with_memory_limits`, `Store::memory_forget`, the new
+    `Store` write method and the tool parameters add no line. Any difference is explained in the
+    record rather than absorbed.
+  - >
+    **N3 — the schema change is one index and nothing else.** `git diff main -- src/state.rs` shows
+    the new index, the limits plumbing and `memory_forget`, and **no new table, no new column and no
+    `CHECKPOINT_FORMAT` change**. A 0.55.0 store and a 0.56.0 store are the same store in both
+    directions, which O4's cross-version gate is what proves.
+  - >
+    **N4 — zero compile breaks.** `TaskContract` is `#[non_exhaustive]` since 0.35.0, so a new field
+    costs nobody anything; `MemoryLimits` is a new type; the existing `Store::memory_write` and
+    `Store::memory_put` keep their signatures and delegate with `MemoryLimits::default()`. No
+    existing method changes shape. Asserted by the crate's own examples and tests compiling
+    unmodified except where a test asserts the behaviour this release deliberately changes.
+  - >
+    **N5 — eviction stays cheap at the caps an operator may now set.** The time for one capped write
+    is measured at three sizes — the default 64 entries, 512 entries, and 4,096 entries — each with
+    a recall table proportional to the store, on a named machine, and recorded in
+    `docs/MEASUREMENTS.md`. Recorded, never asserted. The number that matters is that the aggregate
+    is answered from `memory_recalls_entry` at every size, which is F5's claim.
+  operational:
+  - >
+    **O1 — the three-platform matrix is green**, `--all-features` included.
+  - >
+    **O2 — nothing in the suite gates on a wall clock.** N5's timings are recorded, never asserted.
+    The recall-table fixtures are built by inserting rows directly rather than by driving runs, so
+    no test's cost scales with a provider.
+  - >
+    **O3 — `docs/CONTRACT.md` is amended in this release, by name.** The memory section states
+    oldest-first eviction and workspace-only scope as the crate's behaviour. Both change. The new
+    rules — evidence-ordered candidates, the two scopes, the collision rule, `forget`, and the caps
+    as operator keys — are written where the old sentences stood.
+  - >
+    **O4 — the cross-version gate runs.** `cargo build --manifest-path
+    tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0 -- --ignored`.
+    A release that adds an index to a shared table is exactly the release that gate exists for.
+  - >
+    **O5 — the nightly rustdoc gate passes with `-D warnings`.**
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`, run before
+    the release PR. It found nothing in 0.55.0 and something in six of the seven before it.
+  - >
+    **O6 — the checked-in doc surfaces are updated in this release.** The README's memory
+    description, `docs/guide/tools-and-skills.md` (`remember`'s `scope`, the new `forget`),
+    `docs/guide/configuration.md` (the `[memory]` table **and the coupling paragraph**:
+    the block's quarter-share, what raising a cap costs per turn, and why raising it was unwise
+    before this release), `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md` and the changelog. Every
+    new public item carries a worked example; `cargo test --doc` and `tests/public_api.rs` pass.
+  - >
+    **O7 — clippy on all three feature polarities**, default, one feature on, and `--all-features`.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.56.0, GitHub at initorigin/io-harness with the tag `v0.56.0` and a
+    Release titled `io-harness 0.56.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.56.0` off `develop`, committed incrementally as it lands,
+    including the sealed UltraShip release record and the hand-appended lock pin. PR into `develop`,
+    merged with the PR button. `develop`'s head and tree checked against the tree the gates ran on
+    immediately before the release PR is opened — `git diff --quiet feat/0.56.0 develop` — because a
+    Dependabot merge has landed above the feature merge twice in the last twenty releases. Release PR
+    `develop` into `main`, merged the same way. The GitHub Release is cut by `release.yml` from a tag
+    pushed alone, taking its notes verbatim from the changelog. `cargo publish --locked` by hand
+    afterwards, always last, after both merges and the Release exist, with the registry token sourced
+    from the repo-local `.env` in the same shell invocation. `develop` synced to `main`
+    fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    **One additive index, applied on open.** `memory_recalls_entry` is created by the same
+    `CREATE INDEX IF NOT EXISTS` path every other index uses, so a 0.55.0 store gains it on the first
+    open by a 0.56.0 binary and a 0.55.0 binary reads the same database afterwards unchanged.
+    `CHECKPOINT_FORMAT` does not move. An operator does nothing.
+  - >
+    **One behaviour change an operator may notice.** Which entry is dropped at the cap changes. A
+    store already at the cap will, on its next write, drop a different key than 0.55.0 would have —
+    by design, and the dropped keys are returned and recorded as they always were.
+  - >
+    **No change for a caller who sets nothing.** The three defaults are the three constants. A
+    contract with no `[memory]` table and no `with_memory_limits` call behaves exactly as 0.55.0 did,
+    apart from the candidate order above.
+  observability:
+  - >
+    A forget is a context event and a run event of its own, so a trace distinguishes "the agent
+    withdrew this" from "the cap dropped it" — two different facts that the existing eviction event
+    would otherwise have to carry together.
+  - >
+    A write and a forget name their scope, so a trace reader can see that a run wrote outside its
+    own workspace. This is the observability half of the decision to let a run write globally at
+    all.
+  - >
+    No new table and no new row type beyond those events. The eviction event keeps its shape.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.56.1 and `cargo yank --version
+    0.56.0` is the escape hatch, leaving 0.55.0 as what `cargo install` resolves. Downgrading needs
+    no migration: the added index is inert to an older binary, the global bucket is a workspace key
+    an older binary simply never queries, and the caps default to the constants an older binary
+    compiles in. A 0.55.0 binary reading a 0.56.0 store sees its own workspace's entries exactly as
+    before. An operator who dislikes the new eviction order has no switch for it — that is the
+    release — and the honest answer is 0.55.0 or a pin.
+
+dependencies:
+  products: []
+  services:
+  - >
+    crates.io and GitHub Actions for the release itself, as every version.
+  - >
+    **No live provider call is required.** Every claim is about this crate's store, its assembler and
+    its two tool arms, and is proven in-process against real SQLite stores and scripted providers.
+  human_approvals:
+  - >
+    **A run may write global memory, not only an operator.** Decided by the owner at specification
+    time, 2026-08-14, against the alternative of an operator-only scope. `remember` and `forget`
+    take `scope`, defaulting to the workspace. The cost is accepted and mitigated rather than
+    denied: the workspace override, the pin, `forget`, per-scope caps and the scope named in the
+    trace are the five things that make a bad global note recoverable.
+  - >
+    **All four halves ship in this version.** Decided by the owner at specification time,
+    2026-08-14. `scope.fallback_scope` records evidence-ordered eviction plus `forget` as the
+    smaller release if the plan stops fitting.
+  - >
+    **Eviction is ordered by distinct runs, not by recall rows.** Decided at specification time,
+    2026-08-14, after reading `record_memory_recall`'s call sites. This is a stated correction to the
+    roadmap entry's prose, recorded rather than reworded to fit.
+  - >
+    **`delivery.target_mode` is `published`.** Decided at specification time, 2026-08-14.
+  - >
+    The PR, both merges, the Release and the publish are pre-authorised for this version under the
+    standing flow.
+
+resource_profile:
+  complexity: medium
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    **The eviction order is one SQL statement that has to be right on five terms at once**, and the
+    plausible mistakes — counting rows, dropping the stable tail, letting a NULL recall time sort
+    last instead of first — each produce a policy that looks reasonable and is wrong on exactly the
+    case the release exists for. F1, F2 and F3 exist to separate them.
+  - >
+    **Two recall call sites, and a third path through the sub-agent loop.** `src/run.rs:4750` and
+    `src/run.rs:7032` both read `memory_list`; both must read both scopes, and a release that fixes
+    the workspace loop and not the sub-agent one delivers a scope that works until an agent spawns a
+    child.
+  - >
+    **The caps must reach every enforcement site.** `enforce_memory_caps` is called from
+    `memory_write`, which is called from `memory_put` and from the `remember` arm. A limit that
+    reaches two of the three is a cap that depends on which door the write came through.
+  - >
+    **Test fixtures need recall history**, which a real run produces one step at a time. The tests
+    insert `memory_recalls` rows directly against a real store, which is both cheaper and the only
+    way to build a 10,000-row table for F5 without a clock.
+  - >
+    **`docs/CONTRACT.md` and the guide describe today's policy in prose**, in more than one place.
+    The eviction sentence, the scope sentence and the caps table all move.
+  preferred_tools:
+  - >
+    `src/state.rs`'s existing memory tests for F1–F5, F8, F11 and F16, where the store-level
+    assertions already live.
+  - >
+    A new `tests/memory_scope.rs` for F9, F10, F12, F13, F14 and F15 — the tool arms and the
+    assembled prompt, which need the loop rather than the store.
+  - >
+    `tests/config.rs` for F6 and F7, which already owns the projection and the project-scope
+    narrowing rule.
+  - >
+    `EXPLAIN QUERY PLAN` through the same `Store` connection for F5, asserting on the plan of the
+    literal statement the crate runs rather than a copy of it.
+  constraints:
+  - >
+    **No new runtime dependency.** `cargo tree` flat at 402 on the default build.
+  - >
+    **MSRV 1.95, edition 2021, Apache-2.0.** Unchanged.
+  - >
+    **Every version stays 0.x.x.** No 1.0.0 is planned or implied.
+  - >
+    **The trust rule extends and never weakens.** All three caps narrow at project scope and never
+    widen, like every other budget key.
+  - >
+    **No `CHECKPOINT_FORMAT` bump and no new table.** An index is the whole schema change this
+    release is permitted.
+  - >
+    **`docs/CONTRACT.md`, the README, the changelog, the guide pages and the crate-root prose are
+    checked-in surfaces.** They change in this release, not the next one.
+
+risks:
+- >
+  **A run poisons the global scope.** An agent that mislearns can now write a wrong fact into every
+  future run over every workspace, which is precisely the reach the workspace scope denied it.
+  Mitigation, and it is five things rather than one: the workspace entry overrides a global one on
+  the same key, so the specific place can always correct the general one; `forget` reaches global,
+  so the same agent can withdraw it; an operator's pin is unwritable by any run; the global bucket
+  has its own caps, so a run cannot flood it past a bounded size; and the scope is named in the
+  trace and in the rendered block, so a wrong global note is visible rather than inferred. Accepted
+  deliberately by the owner at specification time.
+- >
+  **Evidence-ordered eviction starves a genuinely new fact.** A note written this morning has no
+  runs behind it and is, correctly, the first candidate. That is the intended behaviour for a
+  triviality and the wrong one for a discovery that has not yet had a second run. Mitigation: the
+  entry just written is never a candidate, the caps are now raisable by an operator who sees this
+  happening, and the tie-break for the whole zero-run cohort is today's order rather than something
+  new — so the failure mode is 0.55.0's failure mode, not a worse one.
+- >
+  **A recall count that measures the wrong thing.** This is the roadmap entry's own premise, checked
+  and found wrong before any code was written: rows count steps, not usefulness. Mitigation:
+  `COUNT(DISTINCT run_id)` and F2, whose sabotage is exactly the row count the prose asked for. The
+  residual — that a distinct-run count is still a count of carriages and not of uses — is stated in
+  the guide rather than papered over.
+- >
+  **The aggregate turns a cheap write into a scan.** `memory_recalls` grows without bound: 64 keys
+  times every step of every run over a workspace. An eviction that aggregates it without an index is
+  a full scan on the hot write path. Mitigation: `memory_recalls_entry`, and F5 asserting the plan
+  over a 10,000-row table rather than trusting that an index exists.
+- >
+  **Two scopes double the block.** Both buckets carry their own caps, so the memory block may hold
+  twice the characters it can today, inside a share that has not grown. Mitigation: the block's
+  quarter-share ceiling is unchanged and already elides, the workspace group is rendered with
+  priority, and the coupling paragraph in the guide says what raising a cap costs per turn.
+- >
+  **A cap raised into the place the caps were chosen to avoid.** An operator who sets
+  `max_chars = 200_000` gets a store that cannot fit the block, and selection — now by evidence, but
+  still selection — decides what the model sees. Mitigation: this is the release's own stated
+  coupling; the guide states it, and the defaults do not move.
+
+open_questions:
+- >
+  **Whether `MemoryLimits` is re-exported at the crate root.** N2 predicts +2 lines in
+  `docs/public-api.txt` on the assumption that it and the reserved global constant are, beside the
+  three existing `MEMORY_MAX_*` constants they default from. Settled during implementation by
+  whether a caller can construct a `TaskContract` without it, and stated in the record either way.
+- >
+  **What the reserved global workspace key literally is.** It must be something
+  `std::fs::canonicalize` can never produce on any supported platform. The plan is a bracketed
+  sentinel rather than a path-like string, with F15 asserting the property rather than the spelling.
+- >
+  **Whether `forget` should be refused for a global key written by a different workspace's run.** The
+  plan is no — a global fact is global, and requiring provenance to withdraw one would make a wrong
+  note permanent for every run but one. Revisit if a live run shows agents withdrawing each other's
+  notes.
+- >
+  **Whether the recall aggregate should be bounded to a recent window** — the last N runs rather than
+  all of history — so an entry that was useful a year ago and useless since is not permanently
+  protected. The plan is unbounded, because this crate has no notion of a run's age beyond its row
+  id and a window would be a second untunable constant. Recorded as the first thing to revisit if
+  the order proves sticky.

@@ -1388,7 +1388,17 @@ versions:
       written by hand into each one's instructions. A second scope sits above the workspace: written
       deliberately, recalled by every run, and narrower than it sounds — the workspace entry wins on
       a key collision, because the specific place always knows better than the general one.
-    detail: outline
+
+      **Two corrections made at specification time, 2026-08-14, from reading the source.** (1) A
+      recall row is written once per **step** for every entry the block carried
+      (`src/run.rs:4907`), and at the current caps the block carries everything — so a recall
+      *count* measures steps elapsed since the write, which is monotone in age and is the very
+      thing this release replaces. The eviction order counts **distinct runs** instead. (2) The
+      dropped keys are **already** returned to the caller (`MemoryWrite::evicted`, 0.10.0); that
+      half of the outcome is existing behaviour this release preserves rather than adds. And the
+      owner decided the second scope is writable by a run as well as by an operator: `remember` and
+      `forget` take a `scope`, defaulting to the workspace.
+    detail: specified
     status: planned
   - version: 0.57.0
     outcome: >
