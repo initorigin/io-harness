@@ -709,6 +709,32 @@ async fn a_run_withdraws_a_note_and_a_key_that_was_never_there_says_so() {
         1,
         "one withdrawal, and the key that was never there is not a second: {kinds:?}"
     );
+
+    // S9's finding. Counting trace rows alone leaves the *message* unasserted,
+    // and the message is what the model acts on: reporting a removal that did
+    // not happen tells an agent it has corrected something it has not. Neither
+    // arm writes a `memory_forget` row for an absent key, so a sabotage that
+    // reported success to the model survived the assertion above.
+    let said: Vec<String> = store
+        .observations(run)
+        .unwrap()
+        .into_iter()
+        .map(|o| o.text)
+        .collect();
+    let all = said.join("\n");
+    assert!(
+        all.contains("[forget retries]"),
+        "the withdrawal names the key it took: {all}"
+    );
+    assert!(
+        all.contains("[forget: nothing to forget]"),
+        "and the key that was never there is told so, not told it was removed: {all}"
+    );
+    assert!(
+        !all.contains("[forget never-written]"),
+        "the absent answer must not wear the prefix a real removal wears, or a \
+         model skimming the head of the observation reads them as the same: {all}"
+    );
 }
 
 /// F10. A pinned entry is not a run's to withdraw, and nothing is withdrawn

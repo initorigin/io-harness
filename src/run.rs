@@ -10254,11 +10254,16 @@ async fn dispatch(
                 // Not an error, and not reported as a removal either: a model
                 // told it withdrew something it never wrote will believe a
                 // correction happened.
+                // Deliberately NOT the `[forget {key}]` prefix a real removal
+                // wears. A model skimming the head of an observation would read
+                // the two as the same outcome, which is the failure the three
+                // answers exist to prevent — found by a sabotage that reported
+                // success here and survived a test asserting only on the trace.
                 MemoryForget::Absent => Dispatched::go(
                     format!("forget {key} (nothing to forget)"),
                     format!(
-                        "\n[forget {key}] there was no such note over this workspace, so \
-                         nothing was removed.\n"
+                        "\n[forget: nothing to forget] there was no note `{key}` over this \
+                         workspace, so nothing was removed.\n"
                     ),
                 ),
                 MemoryForget::Removed => {

@@ -2230,7 +2230,10 @@ a projection onto the typed API and never a second path into the run loop:
   release later, and a hook that appends is a write to a path a stranger chose, which
   is the same hazard by a shorter route. Each is accepted unchanged in
   `io.local.toml` and in the user scope, and the narrowing value of each of the four
-  keys stays legal in `io.toml`. **This does not claim that a cloned repository is
+  keys stays legal in `io.toml`. **A number has no widening value, so four keys are
+  held to the lower of the two instead** — `run.max_read_chars` (0.55.0) and the
+  three `[memory]` caps (0.56.0): a project file may tighten an operator's ceiling
+  and may not loosen it, while `io.local.toml` and the user scope set it outright. **This does not claim that a cloned repository is
   safe** — `[[mcp]]` still names a command, `[toolchain]` still names an argv, and a
   policy layer can still allow what the defaults did not. It is a specific narrowing
   of a specific hazard: the keys whose effect is to remove containment from a file

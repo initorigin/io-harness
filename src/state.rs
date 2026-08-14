@@ -8951,6 +8951,34 @@ mod tests {
     }
 
     #[test]
+    fn the_key_just_written_is_not_a_candidate_even_when_it_is_the_only_unproven_one() {
+        // S4's finding, and the reason this test exists beside the one above.
+        // The `keep` guard is load-bearing exactly when the new key sorts FIRST
+        // among candidates, which needs every OTHER entry to carry evidence. The
+        // pinned-entry arm writes `new` into a store where nothing has been
+        // recalled, so `new` is the *newest* zero-recall entry and sorts last —
+        // removing the guard changed nothing there and the sabotage survived.
+        // Here, without the guard, the write evicts itself and `remember`
+        // becomes a silent no-op.
+        let store = Store::memory().unwrap();
+        fill_to_the_cap(&store, "ws");
+        for i in 0..MEMORY_MAX_ENTRIES {
+            carried_by_runs(&store, "ws", &format!("k{i}"), &[7, 8, 9]);
+        }
+
+        let evicted = store.memory_put("ws", "new", "v", 2, 2).unwrap();
+        assert_eq!(
+            evicted,
+            vec!["k0"],
+            "the least-proven existing entry goes, never the one just written"
+        );
+        assert!(
+            store.memory_get("ws", "new").unwrap().is_some(),
+            "a write that evicts itself is a write that did not happen"
+        );
+    }
+
+    #[test]
     fn a_character_cap_too_large_for_an_i64_is_a_ceiling_and_not_a_purge() {
         // Found by running the N5 measurement, which set `max_chars` out of the
         // way and got a store holding one entry. The comparison was
