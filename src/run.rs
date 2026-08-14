@@ -4774,6 +4774,7 @@ async fn run_workspace_from<P: Provider>(
             Speculation::new(
                 ws.clone(),
                 &contract.tools,
+                containment.clone(),
                 entry_cap,
                 contract.max_parallel_reads,
                 run_id,
@@ -9209,6 +9210,12 @@ struct Speculation<'a> {
     /// The clone is the same one `read_batch` already makes per spawned task.
     ws: Workspace,
     tools: &'a Toolbox,
+    /// 0.48.0's containment for this run, so a registered tool needing more than
+    /// the run grants is refused here rather than started here. `dispatch` makes
+    /// that decision before any tool arm (`resolve_call_mode`), and a speculated
+    /// call never reaches `dispatch` — so without this, the single-call case would
+    /// start a tool 0.53.0 refuses, and start it before the completion settled.
+    sandbox: Option<std::sync::Arc<crate::sandbox::ExecContainment>>,
     cap: usize,
     max_parallel: usize,
     run_id: i64,
@@ -9234,6 +9241,7 @@ impl<'a> Speculation<'a> {
     fn new(
         ws: Workspace,
         tools: &'a Toolbox,
+        sandbox: Option<std::sync::Arc<crate::sandbox::ExecContainment>>,
         cap: usize,
         max_parallel: usize,
         run_id: i64,
@@ -9242,6 +9250,7 @@ impl<'a> Speculation<'a> {
         Self {
             ws,
             tools,
+            sandbox,
             cap,
             max_parallel,
             run_id,
@@ -9281,6 +9290,17 @@ impl<'a> Speculation<'a> {
             || self.started.len() >= self.max_parallel
             || tool_effect(&call.name, self.tools) != ToolEffect::ReadOnly
         {
+            self.closed = true;
+            return;
+        }
+        // What this call may do is decided before it starts, exactly as `dispatch`
+        // decides it: a tool needing more containment than the run grants leaves
+        // with nothing started. Speculation skipping this would start it — and
+        // start it before the completion that asked for it had settled.
+        if matches!(
+            resolve_call_mode(&call.name, self.tools, self.sandbox.as_ref()),
+            CallMode::Refused { .. }
+        ) {
             self.closed = true;
             return;
         }
