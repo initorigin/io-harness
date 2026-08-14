@@ -555,10 +555,10 @@ pub use skills::{Skill, Skills};
 pub use agent::{AgentDef, Agents};
 pub use state::{
     AgentEvent, CheckpointEvent, ContextEvent, Edit, FirstTry, GateAttempt, GateOutcome, McpEvent,
-    MemoryEntry, MemoryKind, MemoryLimits, MemoryRecall, MemoryWrite, Pending, PendingPlan,
-    PendingQuestion, PolicyEvent, ProcessHandle, ProviderCall, Recovery, RewindRecord, RunStatus,
-    RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, Summary, Tally, TodoItem, TodoState,
-    Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES,
+    MemoryEntry, MemoryForget, MemoryKind, MemoryLimits, MemoryRecall, MemoryWrite, Pending,
+    PendingPlan, PendingQuestion, PolicyEvent, ProcessHandle, ProviderCall, Recovery, RewindRecord,
+    RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, Summary, Tally, TodoItem,
+    TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES,
     MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP, UNKNOWN_MODEL,
 };
 pub use template::{Template, Templates};

@@ -667,3 +667,129 @@ async fn a_contracts_memory_caps_bound_what_a_run_may_remember() {
     run_under(dir.path(), &store, notes, None).await;
     assert_eq!(store.memory_list(&ws_key(dir.path())).unwrap().len(), 4);
 }
+
+// ---------------------------------------------------------------------------
+// 0.56.0 F9–F11 — a run can unlearn
+// ---------------------------------------------------------------------------
+
+fn forget(key: &str) -> ToolCall {
+    ToolCall {
+        name: "forget".into(),
+        arguments: json!({ "key": key }),
+    }
+}
+
+/// F9. The note is gone from the store, gone from the next turn's prompt, and
+/// the observation names it. Withdrawing a key that was never there says so
+/// rather than reporting a removal that did not happen.
+#[tokio::test]
+async fn a_run_withdraws_a_note_and_a_key_that_was_never_there_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let ws = ws_key(dir.path());
+    store.memory_put(&ws, "retries", "three", 1, 1).unwrap();
+
+    let run = run_under(
+        dir.path(),
+        &store,
+        vec![vec![forget("retries")], vec![forget("never-written")]],
+        None,
+    )
+    .await;
+
+    assert!(store.memory_get(&ws, "retries").unwrap().is_none());
+    let kinds: Vec<String> = store
+        .context_events(run)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "memory_forget").count(),
+        1,
+        "one withdrawal, and the key that was never there is not a second: {kinds:?}"
+    );
+}
+
+/// F10. A pinned entry is not a run's to withdraw, and nothing is withdrawn
+/// while a plan is unapproved. Both halves asserted on the store rather than on
+/// the message, because a refusal that says the right thing and removes the
+/// entry anyway would pass a text assertion.
+#[tokio::test]
+async fn a_pinned_note_survives_a_forget_and_the_refusal_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let ws = ws_key(dir.path());
+    store
+        .memory_write(
+            &ws,
+            "owner",
+            "the platform team",
+            1,
+            1,
+            MemoryKind::Decision,
+        )
+        .unwrap();
+    assert!(store.memory_pin(&ws, "owner", true).unwrap());
+
+    let run = run_under(dir.path(), &store, vec![vec![forget("owner")]], None).await;
+
+    let entry = store.memory_get(&ws, "owner").unwrap().unwrap();
+    assert_eq!(entry.value, "the platform team");
+    assert_eq!(entry.kind, MemoryKind::Decision);
+    assert!(entry.pinned);
+
+    let kinds: Vec<String> = store
+        .context_events(run)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k == "memory_refused"),
+        "the refusal is in the trace: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "memory_forget"),
+        "and a withdrawal that did not happen is not recorded as one: {kinds:?}"
+    );
+}
+
+/// F11, half one. A rewind puts back what a forget took. `memory_restore` had
+/// been an `UPDATE` since 0.36.0, which restores an entry a run *edited* and
+/// silently does nothing for one a run *removed*.
+#[test]
+fn a_rewind_puts_back_the_note_a_forget_took() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("runs.db")).unwrap();
+    let ws = ws_key(dir.path());
+    let first = store.start_run("learn it", &ws).unwrap();
+    store
+        .memory_write(&ws, "retries", "three", first, 1, MemoryKind::Decision)
+        .unwrap();
+
+    // A LATER run withdraws it, so the restore point says "there was a value
+    // here" rather than "this run created it".
+    let second = store.start_run("unlearn it", &ws).unwrap();
+    assert_eq!(
+        store.memory_forget(&ws, "retries", second, 3).unwrap(),
+        io_harness::MemoryForget::Removed
+    );
+    assert!(store.memory_get(&ws, "retries").unwrap().is_none());
+
+    let workspace = io_harness::tools::Workspace::new(dir.path());
+    let done = io_harness::rewind_run(&workspace, &store, second).unwrap();
+    assert_eq!(done.memory_restored, ["retries"]);
+
+    let back = store
+        .memory_get(&ws, "retries")
+        .unwrap()
+        .expect("the withdrawal is undone by the mechanism every other write uses");
+    assert_eq!(back.value, "three");
+    assert_eq!(
+        back.kind,
+        MemoryKind::Decision,
+        "and its kind came back too"
+    );
+    assert!(!back.pinned, "a pinned entry could not have been forgotten");
+}

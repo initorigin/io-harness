@@ -162,7 +162,7 @@ tasks:
     why_required: A run that learns a fact wrong has no way to withdraw it today; rewriting the key
       under a second name leaves two disagreeing notes. The restore point is what makes the
       withdrawal as reversible as every other write this crate records.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.56.0-T01
     acceptance_criteria:
@@ -189,7 +189,44 @@ tasks:
     files:
       - src/state.rs
       - src/run.rs
-    evidence: []
+      - src/observe.rs
+      - src/tools/mod.rs
+      - src/lib.rs
+      - tests/memory.rs
+    evidence:
+      - >-
+        F9 `a_run_withdraws_a_note_and_a_key_that_was_never_there_says_so`: a run calling `forget`
+        removes the entry, and a second call naming a key that was never written records no second
+        withdrawal — asserted by counting `memory_forget` context events, so a blanket success would
+        fail it.
+      - >-
+        F10 `a_pinned_note_survives_a_forget_and_the_refusal_is_recorded`: the pinned entry keeps
+        its value, its kind and its pin, `memory_refused` is in the trace and `memory_forget` is
+        not. Asserted on the store rather than on the message, because a refusal that says the right
+        thing and removes the entry anyway would pass a text assertion. The unapproved-plan refusal
+        is the same guard `remember` has, in the same place, for the reason stated there.
+      - >-
+        F11 half one, `a_rewind_puts_back_the_note_a_forget_took`: written first and **watched
+        fail**, which is what found the real defect. `Store::memory_restore` had been an `UPDATE`
+        since 0.36.0 — it restores an entry a run edited and silently does nothing for one a run
+        removed, so a rewind would have reported `memory_restored: ["retries"]` with the entry still
+        gone. It is now an UPSERT whose `ON CONFLICT` half is 0.36.0's `UPDATE` byte for byte, so
+        nothing about restoring an edited entry moved.
+      - >-
+        F11 half two, `a_forget_takes_the_evidence_with_it_and_an_eviction_leaves_it`: with every
+        entry carried by the same run the evidence terms tie and the clock decides, so the eviction
+        lands on an entry that HAS recall rows — and those rows survive. The withdrawn key's do not,
+        and a third key's are untouched. One test, because the point is that the two differ.
+      - >-
+        `MemorySnapshot` gained `step`, which the INSERT half of the restore needs to attribute the
+        row it puts back; the entry's original run died with the row. `pinned` restores as 0, and
+        that is not a guess — a pinned entry cannot be forgotten, so a restored one was never
+        pinned.
+      - >-
+        `cargo test --lib` 477 passed; `--test memory` 18 passed; `--test rewind --test determinism`
+        green. `--test checkpoint`'s `crash_resume_...` fails only under a bare `--test` invocation,
+        which does not build `examples/` — the same pre-existing condition as `tests/context.rs`'s
+        MCP fixture, unrelated to this task and green under a plain `cargo test`.
   - id: US-IO-HARNESS-0.56.0-T04
     summary: "Add the scope above the workspace: a reserved workspace key, `scope` on `remember` and
       `forget`, both scopes recalled at both loop sites, the workspace winning a collision, and the

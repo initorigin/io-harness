@@ -1343,6 +1343,24 @@ pub struct MemoryRecall {
     pub at: String,
 }
 
+/// What a run's `forget` did (0.56.0).
+///
+/// Three answers rather than a `bool`, for the reason [`MemoryWrite::refused`]
+/// exists: "there was nothing there" and "an operator pinned it" are different
+/// facts, and a model told only that nothing was removed cannot tell which of
+/// them it is looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryForget {
+    /// The entry was there and is gone.
+    Removed,
+    /// An operator pinned it, so it is not a run's to withdraw. The entry
+    /// stands.
+    Pinned,
+    /// There was no such key in this workspace. Not an error — a run that
+    /// withdraws a fact twice has still withdrawn it.
+    Absent,
+}
+
 /// What a write to memory did (0.30.0).
 ///
 /// Returned by [`Store::memory_write`]. The `refused` flag is the half that
@@ -2269,6 +2287,12 @@ impl ContextEvent {
     pub fn memory_refused(step: u32, detail: impl Into<String>) -> Self {
         Self::of("memory_refused", step, detail)
     }
+    /// A run withdrew a note (0.56.0). Its own kind rather than an eviction, so
+    /// a trace tells "the agent decided this was wrong" apart from "the cap
+    /// dropped it" — two different facts about the same disappearance.
+    pub fn memory_forget(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("memory_forget", step, detail)
+    }
 
     /// The agent wrote down its plan at this step (0.21.0). The detail is the shape
     /// of the plan — how many items and how many done — rather than its text, which
@@ -2634,6 +2658,10 @@ pub(crate) struct MemorySnapshot {
     pub before: Option<String>,
     /// The kind it had, or `None` when there was no entry.
     pub kind: Option<String>,
+    /// The step the run was on when it took this restore point (0.56.0). Carried
+    /// so a restore that has to INSERT — the entry the run *removed* rather than
+    /// edited — has a step to attribute the row to.
+    pub step: u32,
     /// True when the run *created* this entry, so putting it back means removing
     /// it. Kept apart from `before.is_none()` for the reason `snapshots.state`
     /// is: the two ways to be wrong are refusing to restore and deleting an entry
@@ -4583,7 +4611,7 @@ impl Store {
     /// `EXPLAIN` the statement the crate actually runs. Re-typing the SQL in the
     /// test leaves it passing after someone tidies the real one.
     pub(crate) const MEMORY_SNAPSHOTS_SQL: &'static str =
-        "SELECT workspace, key, before, kind, state FROM memory_snapshots
+        "SELECT workspace, key, before, kind, state, step FROM memory_snapshots
          WHERE run_id = ?1 ORDER BY id";
 
     /// What every memory entry this run wrote looked like before it wrote it
@@ -4603,6 +4631,7 @@ impl Store {
                 // restore is recoverable where deleting an entry the run only
                 // edited is not.
                 created: state == "absent",
+                step: r.get::<_, i64>(5)? as u32,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -4620,11 +4649,27 @@ impl Store {
         key: &str,
         value: &str,
         kind: Option<&str>,
+        run_id: i64,
+        step: u32,
     ) -> Result<()> {
+        // An UPSERT since 0.56.0, where a run can REMOVE an entry as well as
+        // edit one: an `UPDATE` puts back what a run overwrote and silently does
+        // nothing for what a run forgot, which would leave `rewind_run` naming a
+        // key in `memory_restored` that is not in the store.
+        //
+        // The `ON CONFLICT` half is 0.36.0's `UPDATE` exactly — `run_id`, `step`
+        // and `pinned` are left alone for an entry that still exists. The INSERT
+        // half attributes the row to the run being rewound, because the run that
+        // originally wrote it died with the row; `pinned` is 0, which is not a
+        // guess: a pinned entry cannot be forgotten, so a restored one was never
+        // pinned.
         self.conn.execute(
-            "UPDATE memory SET value = ?1, kind = COALESCE(?2, kind)
-             WHERE workspace = ?3 AND key = ?4",
-            (value, kind, workspace, key),
+            "INSERT INTO memory (workspace, key, value, run_id, step, created_at, kind, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?6, 0)
+             ON CONFLICT(workspace, key) DO UPDATE SET
+                 value = excluded.value,
+                 kind  = COALESCE(excluded.kind, memory.kind)",
+            (workspace, key, value, run_id, step, kind),
         )?;
         Ok(())
     }
@@ -6997,6 +7042,85 @@ impl Store {
             .ok())
     }
 
+    /// Withdraw one entry on a run's behalf, as the `forget` tool does (0.56.0).
+    ///
+    /// The counterpart to [`Store::memory_write`], and it answers with the same
+    /// honesty: a pinned entry is [`MemoryForget::Pinned`] and a key that was
+    /// never there is [`MemoryForget::Absent`], because an agent told a removal
+    /// happened when it did not will act on a correction it never made.
+    ///
+    /// Two things separate it from [`Store::memory_delete`], which is the
+    /// embedder's own blunt removal and is unchanged. It takes the 0.36.0
+    /// restore point first, so a [`rewind_run`](crate::rewind_run) puts the
+    /// entry back. And it deletes the key's recall rows: the run said the fact
+    /// is wrong, so the evidence it accrued goes with it. An **eviction** leaves
+    /// those rows alone — a cap is the store's decision, and rewriting a trace
+    /// is not the store's to do.
+    ///
+    /// ```
+    /// use io_harness::{MemoryForget, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("fix the flake", "/repo")?;
+    /// store.memory_put("/repo", "retries", "three", run, 1)?;
+    ///
+    /// assert_eq!(store.memory_forget("/repo", "retries", run, 4)?, MemoryForget::Removed);
+    /// assert!(store.memory_get("/repo", "retries")?.is_none());
+    ///
+    /// // Saying it twice is not an error, and is not a second removal either.
+    /// assert_eq!(store.memory_forget("/repo", "retries", run, 5)?, MemoryForget::Absent);
+    ///
+    /// // What an operator pinned is not a run's to withdraw, for the same
+    /// // reason it is not a run's to overwrite.
+    /// store.memory_put("/repo", "owner", "the platform team", run, 6)?;
+    /// store.memory_pin("/repo", "owner", true)?;
+    /// assert_eq!(store.memory_forget("/repo", "owner", run, 7)?, MemoryForget::Pinned);
+    /// assert!(store.memory_get("/repo", "owner")?.is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn memory_forget(
+        &self,
+        workspace: &str,
+        key: &str,
+        run_id: i64,
+        step: u32,
+    ) -> Result<MemoryForget> {
+        let Some(entry) = self.memory_get(workspace, key)? else {
+            return Ok(MemoryForget::Absent);
+        };
+        if entry.pinned {
+            return Ok(MemoryForget::Pinned);
+        }
+        // The restore point before the removal, `INSERT OR IGNORE` for the same
+        // reason `memory_write` uses it: if this run already touched the key, the
+        // row that is there records what was there BEFORE the run started, and
+        // that is the one a rewind must put back.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO memory_snapshots
+                 (run_id, workspace, key, step, before, kind, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'text')",
+            (
+                run_id,
+                workspace,
+                key,
+                step,
+                &entry.value,
+                entry.kind.as_str(),
+            ),
+        )?;
+        self.conn.execute(
+            "DELETE FROM memory WHERE workspace = ?1 AND key = ?2",
+            (workspace, key),
+        )?;
+        self.conn.execute(
+            "DELETE FROM memory_recalls WHERE workspace = ?1 AND key = ?2",
+            (workspace, key),
+        )?;
+        Ok(MemoryForget::Removed)
+    }
+
     /// Forget one entry of `workspace`. True when an entry was removed.
     pub fn memory_delete(&self, workspace: &str, key: &str) -> Result<bool> {
         let n = self.conn.execute(
@@ -8698,6 +8822,47 @@ mod tests {
             "the pin outranks every term of the order"
         );
         assert!(store.memory_get("ws", "k0").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_forget_takes_the_evidence_with_it_and_an_eviction_leaves_it() {
+        let store = Store::memory().unwrap();
+        fill_to_the_cap(&store, "ws");
+        // Every entry carried by the same one run, so all the evidence terms tie
+        // and the order falls through to the write clock: `k0` is what the next
+        // write evicts, and it is an entry that HAS recall rows.
+        for i in 0..MEMORY_MAX_ENTRIES {
+            carried_by_runs(&store, "ws", &format!("k{i}"), &[42]);
+        }
+
+        let evicted = store.memory_put("ws", "new", "v", 2, 2).unwrap();
+        assert_eq!(evicted, vec!["k0"]);
+
+        let rows = |key: &str| -> usize {
+            store
+                .memory_recalls(42)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.key == key)
+                .count()
+        };
+        assert_eq!(
+            rows("k0"),
+            1,
+            "a cap dropped the entry; the trace of what it was worth is not the cap's to rewrite"
+        );
+
+        // The other direction, on an entry the run itself withdrew.
+        assert_eq!(
+            store.memory_forget("ws", "k1", 2, 3).unwrap(),
+            MemoryForget::Removed
+        );
+        assert_eq!(
+            rows("k1"),
+            0,
+            "the run said the fact was wrong, so the evidence it accrued goes with it"
+        );
+        assert_eq!(rows("k2"), 1, "and nobody else's rows moved");
     }
 
     #[test]

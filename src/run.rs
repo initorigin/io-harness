@@ -69,8 +69,8 @@ use crate::sandbox::{Sandbox, SandboxConfig};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{
-    AgentEvent, ContextEvent, GateOutcome, Kept, MemoryKind, MemoryLimits, RunStatus, Snapshot,
-    StepRecord, Store, TodoItem, TodoState, MAX_SNAPSHOT_BYTES,
+    AgentEvent, ContextEvent, GateOutcome, Kept, MemoryForget, MemoryKind, MemoryLimits, RunStatus,
+    Snapshot, StepRecord, Store, TodoItem, TodoState, MAX_SNAPSHOT_BYTES,
 };
 use crate::toolchain::Toolchain;
 use crate::tools::exec::{Exec, ExecOutcome};
@@ -91,10 +91,10 @@ const GIT_DIR: &str = ".git";
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
     Entry, FsTool, ToolEffect, Toolbox, Workspace, ASK_QUESTION_TOOL, CHECK_TOOL, EDIT_FILE_TOOL,
-    EXEC_TOOL, FIND_TOOL, GREP_TOOL, LIST_DIR_TOOL, LSP_DEFINITION_TOOL, LSP_HOVER_TOOL,
-    LSP_REFERENCES_TOOL, LSP_RENAME_TOOL, LSP_SYMBOLS_TOOL, PATCH_FILE_TOOL, PROPOSE_PLAN_TOOL,
-    READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_KILL_TOOL, SHELL_POLL_TOOL,
-    SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
+    EXEC_TOOL, FIND_TOOL, FORGET_TOOL, GREP_TOOL, LIST_DIR_TOOL, LSP_DEFINITION_TOOL,
+    LSP_HOVER_TOOL, LSP_REFERENCES_TOOL, LSP_RENAME_TOOL, LSP_SYMBOLS_TOOL, PATCH_FILE_TOOL,
+    PROPOSE_PLAN_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_KILL_TOOL,
+    SHELL_POLL_TOOL, SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
@@ -737,6 +737,8 @@ pub fn rewind_run_observed(
                     &note.key,
                     note.before.as_deref().unwrap_or_default(),
                     note.kind.as_deref(),
+                    run_id,
+                    note.step,
                 )?;
                 memory_restored.push(note.key);
             }
@@ -10192,6 +10194,79 @@ async fn dispatch(
                 None,
             )
         }
+        FORGET_TOOL => {
+            // 0.56.0 — the counterpart to `remember`, and refused in the same
+            // place for the same reason: it writes into the harness's own store,
+            // so the `plan-gate` layer cannot cover it and "nothing is written
+            // before the approval" has to include a withdrawal.
+            if plan.active {
+                return Ok(Dispatched::go(
+                    "forget refused (planning)",
+                    format!(
+                        "\n[forget refused] the plan has not been approved yet, so nothing \
+                         is being changed — including notes. Call `{PROPOSE_PLAN_TOOL}` \
+                         first.\n"
+                    ),
+                ));
+            }
+            let key = s("key").unwrap_or_default();
+            if key.is_empty() {
+                return Ok(Dispatched::go(
+                    "forget error",
+                    "\n[forget error] key is required\n",
+                ));
+            }
+            match store.memory_forget(memory_key, key, run_id, step)? {
+                MemoryForget::Pinned => {
+                    store.record_context_event(
+                        run_id,
+                        &ContextEvent::memory_refused(
+                            step,
+                            format!("{key} (pinned; not withdrawn)"),
+                        ),
+                    )?;
+                    info!(run_id, step, key, "forget refused: pinned");
+                    Dispatched::go(
+                        format!("forget refused {key}"),
+                        format!(
+                            "\n[forget refused] `{key}` is pinned by the operator and was not \
+                             removed. The existing note stands.\n"
+                        ),
+                    )
+                }
+                // Not an error, and not reported as a removal either: a model
+                // told it withdrew something it never wrote will believe a
+                // correction happened.
+                MemoryForget::Absent => Dispatched::go(
+                    format!("forget {key} (nothing to forget)"),
+                    format!(
+                        "\n[forget {key}] there was no such note over this workspace, so \
+                         nothing was removed.\n"
+                    ),
+                ),
+                MemoryForget::Removed => {
+                    store.record_context_event(
+                        run_id,
+                        &ContextEvent::memory_forget(step, format!("{key} (withdrawn by the run)")),
+                    )?;
+                    watch.emit(RunEvent::at_depth(
+                        run_id,
+                        step,
+                        depth,
+                        EventKind::MemoryForgot {
+                            key: key.to_string(),
+                        },
+                    ));
+                    info!(run_id, step, key, "forgot");
+                    Dispatched::seen(
+                        format!("forgot {key}"),
+                        format!("\n[forget {key}]\n"),
+                        ObsKind::Tool,
+                        None,
+                    )
+                }
+            }
+        }
         TODO_WRITE_TOOL => {
             // Not gated, and deliberately so: this writes into the harness's own
             // store, not into the workspace, the network or a binary, so there is no
@@ -15056,6 +15131,21 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     "value": { "type": "string", "description": "The fact, in one or two sentences." }
                 },
                 "required": ["key", "value"]
+            }),
+        },
+        ToolSpec {
+            name: FORGET_TOOL.to_string(),
+            description: "Withdraw a note you recorded earlier over this workspace, when you have \
+                          learned it was wrong. Writing the same key again only replaces it, so \
+                          this is the only way to take one back rather than leave two notes \
+                          disagreeing. A note the operator pinned is not yours to remove."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "The key of the note to withdraw, exactly as it appears in your notes." }
+                },
+                "required": ["key"]
             }),
         },
         ToolSpec {
