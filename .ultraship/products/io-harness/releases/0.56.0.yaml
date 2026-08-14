@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.56.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -506,3 +506,180 @@ open_questions:
   protected. The plan is unbounded, because this crate has no notion of a run's age beyond its row
   id and a window would be a second untunable constant. Recorded as the first thing to revisit if
   the order proves sticky.
+released_at: 2026-08-15T00:00:00Z
+mode: published
+delivered: >
+  What a run learns is kept for what it is worth rather than for how recently it was written. At a
+  cap the store now drops the entry the fewest separate runs have carried, then the one least
+  recently carried, and only then the oldest — which is 0.10.0's order kept as the tie-break, so an
+  entry with no evidence yet behaves exactly as it did and only the proven entries move. The count
+  is of **distinct runs** and not of recall rows: a row is written once per carried key per step, so
+  rows measure steps elapsed since the write, which one long run would dominate and which is
+  monotone in age — the very policy being replaced.
+
+  The three caps became an operator's numbers — `[memory]` in `io.toml` and
+  `TaskContract::with_memory_limits`, defaults unchanged, all three narrowing at project scope and
+  never widening. A `forget` tool lets a run withdraw a note it learned was wrong: refused on a
+  pinned entry, refused while a plan is unapproved, undone by `rewind_run`, and taking the key's
+  recall rows with it where an eviction leaves them. And a scope above the workspace holds what is
+  true of every repository, recalled by every run, with the workspace's own note winning a key
+  collision and the two rendered under separate headings so a general note is never presented as
+  something learned about this place.
+evidence:
+  tests:
+  - >
+    **Default suite: 85 binaries, 1,317 tests, 439 doctests, 0 real failures.** `cargo test
+    --no-fail-fast` on the shipped tree. 0.55.0 was 85 / 1,290 non-doctest and 437 doctests, so this
+    release adds one binary (`tests/memory_scope.rs`) and 27 tests.
+  - >
+    **Three tests failed under full-suite parallelism and all nineteen pass serially** — `cargo test
+    --test contained_handles --test handles -- --test-threads=1`, 5 passed and 14 passed.
+    `a_handle_takes_the_cpu_cap_a_foreground_stage_takes` asserts `RLIMIT_CPU` ends a spinning stage
+    within another step's sleep, which is a race against the CPU clock on a machine running 85 test
+    binaries at once. None of the three touches anything this release changed; they are recorded
+    here rather than glossed, and named again in `known_limitations`.
+  - >
+    **`tests/memory_scope.rs` — 6 passed.** F12 (`a_global_note_is_recalled_from_a_workspace_that_never_wrote_it`,
+    both directions), F13 (`the_workspace_wins_a_key_collision_and_the_global_note_is_not_carried`,
+    asserted on the global value being ABSENT), F14
+    (`the_block_renders_the_two_scopes_under_their_own_headings`, by byte offset), F15
+    (`a_directory_named_like_the_reserved_key_is_still_its_own_workspace`, on a real directory), F16
+    (`each_scope_is_bounded_on_its_own`, both directions), plus
+    `a_run_withdraws_a_global_note_and_an_unknown_scope_is_refused`.
+  - >
+    **`tests/memory.rs` — 18 passed.** F6's end-to-end half
+    (`a_contracts_memory_caps_bound_what_a_run_may_remember`), F9
+    (`a_run_withdraws_a_note_and_a_key_that_was_never_there_says_so`), F10
+    (`a_pinned_note_survives_a_forget_and_the_refusal_is_recorded`), F11 half one
+    (`a_rewind_puts_back_the_note_a_forget_took`).
+  - >
+    **`tests/config.rs` — 57 passed.** F6 (`the_memory_caps_reach_the_contract_through_the_ordinary_projection`),
+    its misspelling guard, and F7 (`a_project_scoped_file_may_lower_a_memory_cap_and_may_not_raise_it`,
+    all three keys in both directions).
+  - >
+    **`cargo test --lib` — 481 passed.** F1–F5, F8, F11 half two, the two guards the sabotage pass
+    added, and `an_empty_global_scope_takes_no_room_from_the_workspaces_own_notes`.
+  - >
+    **Doctests: 439 passed, 0 failed.** Every new public item carries a worked example:
+    `MemoryLimits`, `MemoryForget`, `GLOBAL_MEMORY_WORKSPACE`, `Store::memory_write_with`,
+    `Store::memory_forget`, `TaskContract::with_memory_limits`.
+  - >
+    **Cross-version gate: 1 passed.** `cargo build --manifest-path
+    tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0 -- --ignored`
+    — the gate that matters for a release adding an index to a shared table.
+  - >
+    **Sabotage: 16 arms, and every one kills a named test.** Two survived the first pass and both
+    were findings rather than props, described in `known_limitations`. Logs in
+    `evidence/0.56.0/sab-*.log`.
+  builds:
+  - >
+    **`cargo fmt --check` — exit 0** against the shipped tree.
+  - >
+    **`cargo clippy --all-targets -- -D warnings` — exit 0 on all three polarities** (O7): the
+    default build, `--features media`, and `--all-features`. Two lints on this release's own
+    additions were fixed to reach it: `nonminimal_bool` on the note-fitting closure and
+    `assertions_on_constants` on the reserved-key test's non-Windows arm.
+  - >
+    **`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit
+    0** (O5), clean on the first attempt. Second release running that it has found nothing.
+  - >
+    **`cargo tree` — 402 lines, unchanged** (N1). No new dependency.
+  - >
+    **`cargo package --locked` — 1,868,619 bytes**, 253 files (0.55.0: 1,844,963).
+  - >
+    **The schema change is one index** (N3): `memory_recalls_entry` on `memory_recalls (workspace,
+    key)`. No table, no column, `CHECKPOINT_FORMAT` unmoved at 7.
+  - >
+    **`docs/public-api.txt` +3 lines** where N2 predicted +2 — `GLOBAL_MEMORY_WORKSPACE`,
+    `MemoryLimits` and `MemoryForget`. Explained in `known_limitations` rather than absorbed.
+    `cargo test --test public_api` — 9 passed.
+  - >
+    **Doc gates: `docs_drift` 5 passed, `guide_pages` 15 passed, `changelog` 7 passed.**
+  - >
+    **Measurement (N5), recorded and not asserted.** A capped write is 0.965 ms at 64 entries, 9.042
+    ms at 512 and 73.175 ms at 4,096, median of 20, Apple M1, release profile. In
+    `docs/MEASUREMENTS.md` with the method.
+  reviews:
+  - >
+    **Every premise the roadmap entry stated was checked against the source before the contract was
+    written, and two were wrong — third release running that this has changed what shipped.** (1)
+    The entry proposed weighting eviction by recall *count*. `record_memory_recall` fires once per
+    step for every entry the block carried, and at the default caps the block carries everything, so
+    a count of rows measures steps elapsed since the write: monotone in age, and one long run
+    outvotes fifty short ones. The order counts distinct runs instead, and F2 is the criterion whose
+    sabotage is exactly the row count the prose asked for. (2) The entry credited this release with
+    returning the dropped keys to the caller; `MemoryWrite::evicted` has done that since 0.10.0, so
+    the release preserves it rather than adding it. Both corrections are recorded in `roadmap.yaml`.
+  - >
+    **`memory_recalls` was indexed on `run_id` only**, and the eviction aggregate reads it by
+    `(workspace, key)` on the write path. Found by reading the DDL before writing the contract,
+    which is why F5 asserts the query plan of the statement the crate runs rather than trusting that
+    an index exists.
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **A recall is a carriage, not a use.** Nothing observable says whether the model read a line of
+  the memory block, so the evidence eviction ranks by is "this entry was in the prompt of a run",
+  which is the strongest signal this crate can see. The guide says so plainly rather than letting
+  the word "recall" imply more.
+- >
+  **The recall aggregate is unbounded in time.** An entry carried heavily a year ago and useless
+  since is protected by history it can no longer earn. A window would be a second untunable
+  constant; it is recorded in `open_questions` as the first thing to revisit if the order proves
+  sticky.
+- >
+  **`docs/public-api.txt` gained three lines where N2 predicted two.** The third is `MemoryForget`,
+  the `forget` return type, which the contract described in prose without counting it as a public
+  item.
+- >
+  **A capped write is linear in `max_entries`** — about 73 ms at 4,096 entries. Flat in the size of
+  the recall table, which is what the index buys, but not free, and the guide says so where an
+  operator is deciding whether to raise the cap.
+- >
+  **A restored-after-`forget` entry carries the withdrawing run's attribution.** `memory_snapshots`
+  holds the value, the kind and the step, not the id of the run that originally wrote the entry, and
+  that row died with it. `pinned` restores as 0, which is not a guess: a pinned entry cannot be
+  forgotten.
+- >
+  **Two sabotage arms survived their first run, and both were the test being wrong rather than the
+  guard being unnecessary.** S4 removed the guard keeping the just-written key out of the candidate
+  set and failed nothing, because the existing arm writes into a store where nothing has been
+  recalled — the new key is then the newest zero-recall entry and sorts last either way. The guard
+  is load-bearing only when every other entry carries evidence, which the added test constructs. S9
+  made a `forget` of an absent key report a removal and failed nothing, because the test counted
+  trace rows and neither arm writes one for an absent key; asserting the message instead exposed
+  something real in the product, not the test — the absent answer wore the same `[forget <key>]`
+  prefix a removal wears, and now reads `[forget: nothing to forget]`.
+- >
+  **The N5 measurement found a defect that review did not.** Its first run reported 0.069, 0.143 and
+  0.068 ms — flat across an eightfold growth in input, which is a bug report. The cap comparison was
+  `chars <= limits.max_chars as i64`, and the measurement's `max_chars: usize::MAX` wraps to `-1`
+  there, so the loop's exit condition could never hold and every write evicted the whole workspace
+  down to the key it had just written. Exact for this crate's own 16,000 and catastrophic for the
+  first large number an operator writes — reachable only because this release makes the caps
+  settable. The comparison is `u128` now, with a guard and a 3-character control.
+- >
+  **One defect was found by re-reading new code rather than by any gate.** The memory block charged
+  for both scope headings unconditionally, so a caller with no global notes — every caller until one
+  is written — would have had its own block shrunk by a heading the prompt never contains. Its test
+  carries a control that fails if the ceiling is generous enough for the assertion to hold for the
+  wrong reason.
+- >
+  **Three tests fail under full-suite parallelism on this machine and pass serially**:
+  `a_handle_takes_the_cpu_cap_a_foreground_stage_takes`,
+  `a_handle_that_exits_on_its_own_stops_reading_as_running` and
+  `killing_a_handle_kills_a_grandchild_whose_parent_already_exited`. All three race a clock or a
+  process reaper, none touches anything this release changed, and the serial re-run is recorded
+  above. This is the ninth instance of the standing "never gate a test on a clock" trap.
+- >
+  **Nothing promotes a workspace fact to the global scope automatically, and nothing seeds the
+  global scope from `io.toml`.** Both were excluded deliberately; a config-declared note would be a
+  fourth writer with its own precedence question against the store, the pin and the workspace
+  override.
+- >
+  **The record was sealed before the crates.io upload**, which follows the two merges and the GitHub
+  Release under the standing flow.
+supersedes: 0.55.0
+next_recommended_version: 0.57.0
+immutable: true
