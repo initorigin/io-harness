@@ -1,327 +1,262 @@
 product: io-harness
-version: 0.54.0
+version: 0.55.0
 tasks:
-- id: US-IO-HARNESS-0.54.0-T01
-  summary: Give `Provider` a third defaulted method that reports a finished tool call, and derive completeness
-    from a successful JSON-object parse in both wire accumulators.
-  why_required: 'Nothing else in the release can start: a tool call reaches the run loop only inside the
-    finished `CompletionResponse` today, because `complete_streaming`''s sink is `&(dyn Fn(&str) + Send
-    + Sync)`. The default has to be silence, or every out-of-tree `Provider`, `Record` and `Replay` changes
-    behaviour without being recompiled.'
-  status: done
+- id: US-IO-HARNESS-0.55.0-T01
+  summary: 'Give the read path a type: classify a file before decoding it, and stop swallowing the UTF-8
+    failure in `Workspace::read_file`.'
+  why_required: 'It is the release''s first defect: `std::fs::read_to_string(abs).unwrap_or_default()`
+    (`src/tools/workspace.rs:419`) hands a model an empty string for any file that is not valid UTF-8,
+    which reads exactly like a file that does not exist. Every other read change in this release sits
+    on top of the classification this task introduces.'
+  status: todo
   depends_on: []
   acceptance_criteria:
-  - '**F10 — the completeness edge is a parse, and it is right on the cases that break a guess.** Four
-    argument shapes are each started exactly once and with exactly the streamed bytes: one containing
-    a `}` inside a string value, one containing a nested object, one that is empty (`{}`, and the Anthropic
-    case where an empty-argument call streams no fragment at all — `src/provider/anthropic.rs:786`), and
-    one whose fragments split mid-multi-byte character. Sabotage: treat the first `}` byte as the end
-    of the arguments, under which the string and nested cases start with truncated arguments and only
-    these fail.
+  - '**F6 — a binary file is named as binary, not read as empty.** A file of bytes that are not valid
+    UTF-8 produces an observation naming the path, the byte size and the sniffed kind, and containing
+    **no file content**. `Workspace::read_file` on the same path returns `Err`. The control is the same
+    file on 0.54.0, where the observation is an empty read — asserted here as a regression test with the
+    old behaviour written out, so the fix cannot silently revert. Sabotage: restore `unwrap_or_default()`,
+    under which the observation is empty and only F6 fails.
 
     '
-  - '**N3 — no compile break for any `Provider` implementation.** The new method is defaulted; an out-of-tree
-    provider written against 0.20.0 compiles and runs unchanged, asserted by `tests/public_api.rs` and
-    by an in-suite provider that implements only `complete`.
+  - '**F7 — UTF-16 is decoded and named; UTF-16 without a BOM is binary.** A UTF-16LE file and a UTF-16BE
+    file, each with a byte-order mark, read as their exact text with the encoding named in the observation
+    header. The same content with the BOM removed is refused as binary, by name. Sabotage: decode UTF-16
+    by pairing bytes without checking the mark, under which the BOM-less case reads as text and only F7
+    fails.
 
     '
-  - '**N1 — no new dependency.** `cargo tree` is 402 lines, unchanged. The whole release is `serde_json`
-    and `tokio`, both already present.
+  - '**F8 — an image or a document read by `read_file` is routed, not decoded.** `read_file` on a PNG
+    names `view_image`; on an `.xlsx`, `.docx`, `.pptx` or `.pdf` it names that format''s tool. The observation
+    carries no content in either case. Under a build without the `documents` feature the document message
+    still names the tool and says the feature is not compiled in, because a model told nothing retries
+    the same call. Sabotage: fall through to the binary message for these extensions, under which the
+    tool names are absent and only F8 fails.
+
+    '
+  files:
+  - src/tools/workspace.rs
+  - src/run.rs
+  - tests/read_typing.rs
+  - tests/fixtures/read_typing
+  evidence: []
+- id: US-IO-HARNESS-0.55.0-T02
+  summary: Refuse an oversized read whole instead of truncating it, and give `read_file` an `offset`/`limit`
+    line range so the refusal has somewhere to point.
+  why_required: 'The refusal is the release''s reason for existing — a truncated read has the shape of
+    a whole one and nothing downstream can tell them apart — and it is only usable because the range exists.
+    Neither half ships alone: a refusal with no remedy is a stuck run.'
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.55.0-T01
+  acceptance_criteria:
+  - '**F9 — a read that will not fit returns no content.** A file whose text exceeds the effective ceiling
+    produces an error observation containing the path, the size in chars, the ceiling, and both remedies
+    — and containing **none of the file''s bytes**, asserted by searching the whole observation for a
+    sentinel string placed at the file''s head, its middle and its tail. Sabotage: keep `bound`''s tail-preserving
+    behaviour for `ObsKind::Read`, under which the tail sentinel appears and only F9 fails.
+
+    '
+  - '**F11 — a range read is served and legible as a range.** `read_file` with `offset` 10 and `limit`
+    5 on a 100-line file returns exactly lines 10 to 14, and the observation header states the range and
+    the total line count. An `offset` past the end is an error naming the total, not an empty success.
+    A range that still exceeds the ceiling is refused by F9''s rule. Sabotage: treat `offset` as 0-based,
+    under which the returned lines are off by one and only F11 fails.
+
+    '
+  files:
+  - src/run.rs
+  - src/context.rs
+  - tests/read_typing.rs
+  - tests/context.rs
+  evidence: []
+- id: US-IO-HARNESS-0.55.0-T03
+  summary: 'Make the read ceiling an operator key: `[run] max_read_chars` in `io.toml`, projected onto
+    `Contract`, defaulting to the budget-derived value.'
+  why_required: A refusal a run's behaviour turns on has to be predictable, and today's limit is a share
+    of what budget is left — the same file is readable at step three and refused at step forty. The refusal
+    must also be able to say which of the two ceilings bound it, which requires both to exist as distinct
+    numbers.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.55.0-T02
+  acceptance_criteria:
+  - '**F10 — the refusal names which ceiling it hit.** The same file is refused under a small `max_read_chars`
+    with a run budget that would have allowed it, and refused again under the budget-derived ceiling with
+    no `max_read_chars` set. The two texts differ and each names its own limit. Sabotage: report one message
+    for both, under which the two assertions collide and only F10 fails.
+
+    '
+  - '**F13 — the ceiling is an operator key that travels the ordinary path.** `[run] max_read_chars` in
+    an `io.toml` reaches `Contract` through `Config`, an unknown key beside it is still refused by `deny_unknown_fields`,
+    a project-scoped file may narrow it and may not widen it, and a contract with nothing set behaves
+    exactly as 0.54.0 did — asserted by an unset run and a set run over the same file. Sabotage: read
+    the key straight from the config in the run loop instead of projecting it onto the contract, under
+    which the typed-API assertion fails and only F13 fails.
+
+    '
+  files:
+  - src/config.rs
+  - src/contract.rs
+  - src/run.rs
+  - src/session.rs
+  - src/context.rs
+  - tests/config.rs
+  - tests/context.rs
+  evidence: []
+- id: US-IO-HARNESS-0.55.0-T04
+  summary: Replace a no-longer-fitting stored read with a stub in assembly, and leave every other observation
+    kind bounded exactly as it is.
+  why_required: A read that fitted when it happened can be squeezed later by a narrower budget share,
+    and serving the model a fragment then is the same lie the truncation was. The negative half — grep,
+    find and exec still bounded — is what keeps the change from becoming a general rule that hides a command's
+    output.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.55.0-T03
+  acceptance_criteria:
+  - '**F12 — a stored read is whole in the prompt or a stub, never a fragment.** An assembled prompt under
+    a share too narrow for a read that fitted when it happened contains the stub — path, size, and the
+    range to re-read — and **no** content from that read, asserted on the same three sentinels as F9.
+    In the same assembly a `Grep` and an `Exec` entry are still bounded with their existing marker, which
+    is the negative half of the claim. Sabotage: apply the stub rule to every `ObsKind`, under which the
+    grep assertion fails and only F12 fails.
+
+    '
+  files:
+  - src/context.rs
+  - tests/context.rs
+  - tests/compaction.rs
+  evidence: []
+- id: US-IO-HARNESS-0.55.0-T05
+  summary: 'Add the wide door for images: a `Media` constructor that passes the four wire types through
+    byte-identically and decodes BMP, TIFF, ICO, TGA and PNM to PNG, with `image` moved under the `media`
+    feature.'
+  why_required: It is the whole image half of the outcome. It has to be a second constructor rather than
+    a widened `Media::image`, because the four-type set is a fact about vendors that the wire gate must
+    keep enforcing, and the byte-identity of the pass-through is what stops a JPEG being silently re-encoded.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.55.0-T04
+  acceptance_criteria:
+  - '**F1 — a format the wire refuses is accepted at the door and arrives as a PNG.** For each of BMP,
+    TIFF, ICO, TGA and PNM, a fixture image of known dimensions goes through the new `Media` constructor
+    and yields a `Media` whose media type is `image/png`, whose bytes decode as a PNG of those same dimensions,
+    and whose first eight bytes are the PNG signature. Asserted per format, not on one representative.
+    Sabotage: pass the source bytes through with the media type rewritten to `image/png`, under which
+    the signature and the decode assertions fail and only F1 fails.
+
+    '
+  - '**F2 — the four wire types are passed through byte-identically.** A PNG, a JPEG, a GIF and a WebP
+    through the same constructor come out with their own media type and **byte-identical** bytes — no
+    decode, no re-encode, no digest change. A JPEG that survived a round trip through the decoder would
+    be a silent quality loss on the common path. Sabotage: re-encode every input to PNG unconditionally,
+    under which the JPEG and WebP byte-identity assertions fail and only F2 fails.
+
+    '
+  - '**F4 — `Media::image` is unchanged.** Its four-type set, its refusal text and its doctest are byte-identical
+    to 0.54.0, asserted by `git diff` over the function in review and by the existing `tests/media.rs`
+    cases passing unmodified. The new door is a second constructor, not a widened one.
+
+    '
+  - '**N5 — transcoding is bounded before it is attempted.** A decode is refused before it allocates when
+    the source''s declared dimensions would exceed a stated pixel bound, and the re-encoded PNG is checked
+    against `MAX_IMAGE_BYTES` with the same message the four-type path gives. A 40,000 × 40,000 BMP header
+    is a refusal, not an out-of-memory. Measured and recorded, not clock-gated: the decode-and-re-encode
+    time for each format''s fixture on a named machine.
+
+    '
+  - '**N1 — no new dependency, and the default tree is unmoved.** `cargo tree` is **402** lines. No new
+    entry in `[dependencies]`. `cargo tree --features media` gains only `image` and its pure-Rust format
+    crates; the exact added list is recorded in the record, and it contains no `-sys` crate and nothing
+    requiring a C toolchain — asserted by the three-platform matrix building `--all-features` without
+    a system package.
+
+    '
+  files:
+  - Cargo.toml
+  - src/provider/mod.rs
+  - tests/media.rs
+  - tests/fixtures/images
+  evidence: []
+- id: US-IO-HARNESS-0.55.0-T06
+  summary: Refuse SVG, HEIC and AVIF by name with a reason and a conversion, route a PDF to `pdf_read`,
+    and make `view_image` use the wide door after the policy gate.
+  why_required: A refusal that recites the vendor's four-type list is the failure the release is fixing
+    at the doorstep; naming the format and the fix is the deliverable. The sniff has to sit inside the
+    gated branch, or a classification becomes a way to probe for a file outside the policy boundary.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.55.0-T05
+  acceptance_criteria:
+  - '**F3 — an undecodable format is refused by its own name, with a remedy.** SVG, HEIC and AVIF inputs
+    — each recognised both by extension and, where it has one, by magic bytes with a misleading extension
+    — are refused with an `Error::Config` whose text contains the format''s name, the reason, and a conversion
+    command producing a PNG. The text does **not** consist of the four-type list alone. A PDF is refused
+    with a message naming `pdf_read`. Asserted on substrings for each of the four. Sabotage: fall back
+    to `Media::image`''s existing message for anything not decodable, under which the name-and-remedy
+    assertions fail and only F3 fails.
+
+    '
+  - '**F5 — `view_image` accepts what the constructor accepts and says what it did.** A `view_image` call
+    on a BMP under a permitting policy attaches one `Media` of type `image/png` to the next request, and
+    its observation names the source type, the PNG byte count and the digest. A `view_image` on an SVG
+    produces F3''s refusal through the tool, and attaches nothing. Sabotage: keep `view_image`''s extension
+    pre-check as the only gate, under which the BMP is refused before the gate and only F5 fails.
 
     '
   files:
   - src/provider/mod.rs
-  - src/provider/anthropic.rs
-  - src/provider/openai_wire.rs
-  - src/provider/openai.rs
-  - src/provider/openrouter.rs
-  - src/provider/compatible.rs
-  - tests/speculative_reads.rs
-  evidence:
-  - '`Provider::complete_streaming_calls` added as a third DEFAULTED method (`src/provider/mod.rs`), default
-    reports no call and delegates to `complete_streaming`. `Record` and `Replay` override neither streaming
-    method, so a replayed run speculates nothing by construction — proved by `a_provider_without_the_new_method_speculates_nothing`.'
-  - 'The completeness edge is one rule for both wires: `ready_call` parses the joined fragments and requires
-    a JSON *object*. `announce_ready` reports strictly in position order, never past a gap, and counts
-    only the calls `finish` will keep (both accumulators drop unnamed entries).'
-  - '4 unit tests over synthetic SSE, 2 per wire. F10''s four argument shapes covered: a brace inside
-    a string, a nested object, fragments split mid-multi-byte character, and an empty-argument call (never
-    reported — it cannot parse, and `finish` still maps it to `{}`).'
-  - 'FINDING: the Anthropic arm originally used arguments with no interior brace, so sabotage S8 (scan
-    for the first `}`) killed only the OpenAI-wire test. The Anthropic case was changed to carry a brace
-    inside a string value; S8 re-run then killed BOTH arms.'
-  - '`cargo tree` unchanged — the whole task is `serde_json` and `tokio`, both already present.'
-- id: US-IO-HARNESS-0.54.0-T02
-  summary: Start the completion's leading read-only run from `stream_completion`, bounded by `max_parallel_reads`
-    and by the `Policy` allowing the call outright.
-  why_required: This is the release's outcome. The prefix rule and the outright-allow rule are the two
-    halves of its safety argument, and both are decided here rather than at the fold.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.54.0-T01
-  acceptance_criteria:
-  - '**F1 — a read-only call runs while the stream is still open.** A scripted provider emits call 0''s
-    name and complete arguments, then holds the stream open on a barrier it shares with the tool. The
-    tool completes only if it was started before the provider returned; the provider returns only after
-    the tool started. Under serial execution the pair cannot both proceed, and the test fails on a bounded
-    wait rather than hanging. **No duration is asserted.** Sabotage: emit the call sink only at stream
-    end, under which F1''s rendezvous times out and only F1 fails.
-
-    '
-  - '**F2 — speculation stops at the first call that is not read-only.** A completion of `[read_file,
-    write_file, read_file]` speculates the first call and neither of the others, asserted on a probe that
-    records which invocations happened before the provider returned. The second `read_file` is executed
-    after the write, and observes the written bytes. Sabotage: use 0.41.0''s maximal-run rule instead
-    of the prefix rule, under which the trailing `read_file` runs early and returns the pre-write content
-    — a wrong *value*, not merely a wrong order — and only this fails.
-
-    '
-  - '**F6 — no approver is asked about an unsettled completion, and a grey-tier call is not speculated.**
-    Under a policy that asks on a read of one path, an approver that records the order and the moment
-    it was consulted is consulted exactly once, after the completion returned, at the serial gate; the
-    tool''s invocation probe shows no early run. The permitted path in the same completion, when it precedes
-    the grey one, **is** speculated — both halves in one test, since the claim is the distinction. Sabotage:
-    speculate on any decision that is not an outright deny, under which the grey call runs early and only
-    this fails.
-
-    '
-  - '**F7 — a denied read is never executed early.** A policy denying a path, with the file''s contents
-    made observable by a probe, asserts the file was never opened during the stream, that the serial gate
-    produced the refusal observation it always produced, and that the refusal decision is unchanged. Sabotage:
-    skip the policy pre-test and speculate every read-only call, under which the probe fires and only
-    this fails.
-
-    '
-  - '**F9 — `with_max_parallel_reads(1)` turns speculation off with the batch.** The same case, same provider,
-    produces no early invocation and no `Speculated` event, and its trace equals the serial trace of F3.
-    Sabotage: gate speculation on the provider''s capability alone rather than on the cap, under which
-    the early invocation happens at a cap of 1 and only this fails.
-
-    '
-  files:
   - src/run.rs
-  - tests/speculative_reads.rs
-  evidence:
-  - '`Speculation` (`src/run.rs`) starts the completion''s LEADING read-only run from `stream_completion`,
-    spawning the same `ReadWork` futures 0.41.0 built, bounded by the same `max_parallel_reads`.'
-  - 'F1 proved without a clock: the provider and the tool wait on a shared barrier, so the turn completes
-    only if the tool was started while the stream was open. F9 is its negative control — at a cap of 1
-    the same turn cannot finish.'
-  - '`policy_verdict` was HOISTED out of `gate` rather than copied, so the speculative pre-test and the
-    serial gate are literally the same expression. Two copies would have been two boundaries and the speculative
-    one would have been the copy that drifted.'
-  - 'F6: the approver is consulted exactly once and only after the completion returned; the grey-tier
-    call is not speculated while its permitted sibling is. F7: a denied call''s tool counter is 0, asserted
-    on the tool rather than on the refusal text.'
-  - Sabotages S1 (never speculate), S2 (maximal-run rule), S5 (Ask is good enough), S6 (no policy pre-test)
-    each compiled and each was killed by a named test.
-- id: US-IO-HARNESS-0.54.0-T03
-  summary: Use a speculated result only when the settled completion asks for that call, at that index,
-    with the same name and byte-identical arguments; discard everything otherwise, including across a
-    retry and a `Fallback` failover.
-  why_required: Without this the release folds one file's bytes under another file's call, which is the
-    one outcome from which a model reasons forward from a state that never existed. A discard must also
-    leave no observation, no `PolicyEvent` and no ledger draw, or the trace stops matching the serial
-    trace.
-  status: done
+  - tests/media.rs
+  - tests/attach.rs
+  evidence: []
+- id: US-IO-HARNESS-0.55.0-T07
+  summary: Update the checked-in documentation surfaces and the changelog for both halves, including the
+    two behaviour changes an embedder can see.
+  why_required: '`docs/CONTRACT.md` currently states truncation as what happens to an oversized read and
+    states the four-type set as the whole story about images. Shipping the new behaviour with those sentences
+    standing would be shipping a documented lie, and the two behaviour changes are only discoverable if
+    the changelog names them.'
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.54.0-T02
+  - US-IO-HARNESS-0.55.0-T06
   acceptance_criteria:
-  - '**F4 — a completion that never settles leaves no trace of the work it caused.** A stream that emits
-    two complete read-only calls and then fails, followed by a successful retry, produces exactly one
-    set of observations, one set of `PolicyEvent` rows and one set of ledger draws — the retry''s — and
-    the reads are executed again through the ordinary path. Asserted on the counts and on the tool''s
-    own invocation probe showing it ran twice while the run recorded once. Sabotage: fold the first attempt''s
-    speculated results into the retry, under which the observation count and the probe disagree and only
-    this fails.
+  - '**O3 — `docs/CONTRACT.md` is amended in this release, by name.** The read-tool section and the observation-bounding
+    section both describe truncation as what happens to an oversized read; both change, and the new rule
+    — whole, asked-for range, or refusal, with the stub in assembly — is written where the old one stood.
+    The media section gains the door-versus-wire distinction and the refused-by-name list. A release that
+    changed this behaviour and left those sentences standing would be shipping a documented lie.
 
     '
-  - '**F5 — a settled call whose arguments differ from the streamed ones discards the speculation.** The
-    scripted provider streams `read_file{path: a}` at index 0 and settles a `CompletionResponse` whose
-    index 0 is `read_file{path: b}`. The observation carries **b''s** contents; a''s speculated result
-    is dropped; a''s read is never folded anywhere. The same is asserted for a differing tool *name* at
-    the same index, and for a settled completion shorter than what was streamed. Sabotage: key the speculated
-    result by call index alone, under which a''s contents are folded under b''s call — the worst defect
-    this release can ship — and only this fails.
-
-    '
-  - '**F11 — `Fallback` discards across a failover.** A primary that streams two complete read-only calls
-    and then fails, with a secondary that answers with a different completion, folds only the secondary''s
-    calls; the primary''s speculated results appear nowhere. Sabotage: keep the speculation cache across
-    the provider switch, under which the primary''s results are folded under the secondary''s calls and
-    only this fails.
-
-    '
-  - '**F3 — the trace is the serial trace, exactly.** The same scripted case run with speculation reachable
-    and with `with_max_parallel_reads(1)` produces identical `steps` rows — including the `" | "`-joined
-    `tool_call` string built at `src/run.rs:5055` — identical observations in identical ordinals, identical
-    ledger draws, and an identical ordered sequence of `EventKind::ToolCall`, with the sole permitted
-    difference being the presence of `EventKind::Speculated`. Sabotage: fold speculated results in the
-    order they finished rather than by index, under which the ordinal and `tool_call` assertions fail
-    and only this fails.
-
-    '
-  files:
-  - src/run.rs
-  - src/provider/fallback.rs
-  - tests/speculative_reads.rs
-  evidence:
-  - A speculated result is used only when the settled completion carries the same call, name and byte-identical
-    arguments, at the same position — and what survives is kept as a CONTIGUOUS PREFIX, so the batch that
-    forms for the first unspeculated call cannot overlap a later speculated one.
-  - 'F5 asserts the observation carries the settled file''s bytes and NOT the speculated file''s; second
-    arm covers a differing name and a completion shorter than what was streamed. F4: the tool really ran
-    4 times across a retry while the run recorded 2 observations. F11: a Fallback failover folds nothing
-    the primary speculated.'
-  - Sabotage S4 (key by index alone) killed exactly the three discard tests — the defect this task exists
-    to prevent.
-  - Sabotage S7 (no reset between attempts) killed F4 alone.
-- id: US-IO-HARNESS-0.54.0-T04
-  summary: Emit `EventKind::Speculated { started, used, discarded }` once per step that speculated, and
-    prove a provider without the new method is 0.53.0's run byte for byte.
-  why_required: 'A discard is wasted work, and an operator who cannot see the rate cannot tell a provider
-    that streams well from one that does not. The negative control is the other half: the compatibility
-    claim rests on a replayed run emitting nothing at all.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.54.0-T03
-  acceptance_criteria:
-  - '**F8 — a provider that does not implement the new method is 0.53.0''s run, byte for byte.** A provider
-    implementing only `complete` and `complete_streaming` — which is what `Record`, `Replay` and every
-    out-of-tree implementation are — produces no `EventKind::Speculated`, no early invocation, and a trace
-    byte-identical to the same case on 0.53.0. This is the negative control the compatibility claim rests
-    on, and it is asserted on the bytes. Sabotage: make the default method emit every call at stream end,
-    under which `Speculated` appears on a replayed run and only this fails.
-
-    '
-  - '**F3 — the trace is the serial trace, exactly.** The same scripted case run with speculation reachable
-    and with `with_max_parallel_reads(1)` produces identical `steps` rows — including the `" | "`-joined
-    `tool_call` string built at `src/run.rs:5055` — identical observations in identical ordinals, identical
-    ledger draws, and an identical ordered sequence of `EventKind::ToolCall`, with the sole permitted
-    difference being the presence of `EventKind::Speculated`. Sabotage: fold speculated results in the
-    order they finished rather than by index, under which the ordinal and `tool_call` assertions fail
-    and only this fails.
-
-    '
-  files:
-  - src/run.rs
-  - src/observe.rs
-  - tests/speculative_reads.rs
-  - tests/session_streaming.rs
-  evidence:
-  - '`EventKind::Speculated { started, used, discarded }`, emitted once per step that started something,
-    registered in `EVENT_NAMES`, the census sample and the exhaustiveness guard.'
-  - 'Emitted as soon as the counts are final rather than beside the step''s commit: a completion that
-    stops on text ends the run BEFORE the fold, and its reads were still done. Found because F5''s shorter-completion
-    arm reported no event at all.'
-  - 'F3 compares a speculating run against a non-speculating one AT THE SAME CAP: identical step rows,
-    observations and ordered ToolCall events, with `Speculated` the only permitted difference. Sabotage
-    S3 (drop the announce for a speculated call) killed F3 alone.'
-  - 'FINDING: the first F3 control compared cap 10 against cap 1 and failed — `dispatch` emits an `EventKind::Contained`
-    per call where 0.41.0''s `read_batch` does not. That is a PRE-EXISTING discrepancy in 0.41.0''s "an
-    observer cannot tell whether a batch ran concurrently", not something this release caused.'
-- id: US-IO-HARNESS-0.54.0-T05
-  summary: Amend `docs/CONTRACT.md`'s streamed-delta rule and 0.41.0 concurrency section, and update every
-    other checked-in doc surface in this release.
-  why_required: '`docs/CONTRACT.md:1961-1965` currently says a streamed delta is not safe to act on. This
-    release acts on one. Shipping the change and leaving that sentence standing would publish a documented
-    lie.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.54.0-T04
-  acceptance_criteria:
-  - '**O3 — `docs/CONTRACT.md`''s streamed-delta rule is amended in this release, by name.** The sentence
-    at `docs/CONTRACT.md:1961-1965` — "A streamed delta is provisional until the completion returns …
-    Render it; do not act on it" — stays true for text and for a consumer, and gains the exact carve-out
-    the harness now takes for itself: a *finished* read-only tool call, in the completion''s leading read-only
-    run, allowed outright by the `Policy`, may be started early, and its result is used only if the settled
-    completion asks for it. The 0.41.0 concurrency section (`docs/CONTRACT.md:1243-1295`) gains the prefix
-    rule and the statement that it is narrower than the batching rule beside it. A release that changed
-    this behaviour and left that sentence standing would be shipping a documented lie.
-
-    '
-  - '**O4 — the checked-in doc surfaces are updated in this release.** The README''s feature list, `docs/guide/providers.md`
-    (what implementing the new method buys and what the default costs), `docs/guide/tools-and-skills.md`
-    (which tools can be speculated and why the list is three long), `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md`
-    and the changelog entry. Every new public item carries a worked example. The four doc tests and `tests/public_api.rs`
+  - '**O4 — the checked-in doc surfaces are updated in this release.** The README''s feature list, `docs/guide/tools-and-skills.md`
+    (`read_file`''s type, its range, and the two ceilings), `docs/guide/configuration.md` (`max_read_chars`),
+    `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md` (the transcode timings and the added-crate list) and
+    the changelog entry. Every new public item carries a worked example. The doc tests and `tests/public_api.rs`
     pass.
 
     '
   - '**N2 — the public surface addition is stated in advance and met exactly.** `docs/public-api.txt`
-    tracks crate-root re-exports only, so a new defaulted method on `Provider` and a new `EventKind` variant
-    each add **no line**: the predicted change is **+0 lines**, and any difference is explained in the
-    record rather than absorbed.
+    tracks crate-root re-exports. The prediction is **+1 line** for the new read-classification type if
+    it is re-exported at the root, and **+0** otherwise; the new `Media` constructor, `Contract::with_max_read_chars`
+    and the new `read_file` parameters add no line. Any difference is explained in the record rather than
+    absorbed.
+
+    '
+  - '**N3 — the read behaviour change is a break, and it is named.** `Workspace::read_file` returns `Err`
+    where it returned `Ok("")`, and a read over the ceiling returns an error observation where it returned
+    a truncated one. No signature changes and nothing fails to compile; what changes is behaviour, which
+    is stated in `migrations` and in the changelog rather than left to be discovered.
 
     '
   files:
+  - README.md
   - docs/CONTRACT.md
   - docs/CAPABILITIES.md
   - docs/MEASUREMENTS.md
-  - docs/guide/providers.md
-  - docs/guide/tools-and-skills.md
   - docs/public-api.txt
-  - README.md
+  - docs/guide/tools-and-skills.md
+  - docs/guide/configuration.md
   - CHANGELOG.md
   - src/lib.rs
-  evidence:
-  - '`docs/CONTRACT.md:1961` amended: the streamed-delta rule stays true for text and for a consumer,
-    and now carries the one exception the harness takes, with its three bounds. A new section states the
-    rules, the switch and where they do not apply.'
-  - '`docs/MEASUREMENTS.md` CREATED — it had never existed although 0.53.0''s contract already named it.
-    Carries N5 with the machine named and states that nothing in it is a gate.'
-  - '`examples/speculation_window.rs` measured on an Apple M1 / macOS 26.5.2, release profile: a 400ms
-    window absorbed a 300ms read entirely — 416.8ms with speculation (`Speculated { started: 1, used:
-    1, discarded: 0 }`) against 720.6ms at a cap of 1. Saved 303.8ms.'
-  - 'FINDING: the example''s first result showed NO saving, because `Session::turn_bounded` passes `TurnExtras::default()`
-    — only the `_observed` and `_steered` turns stream, and speculation follows streaming. Now stated
-    in CONTRACT.md, the providers guide and the example.'
-  - README, `src/lib.rs`, `docs/CAPABILITIES.md`, the two guide pages and `CHANGELOG.md` agree. `docs_drift`,
-    `readme`, `guide_pages`, `changelog` and `public_api` all pass; `docs/public-api.txt` is UNCHANGED,
-    which is the +0 lines N2 predicted in advance.
-- id: US-IO-HARNESS-0.54.0-T06
-  summary: 'Run the release''s gate set: the three-platform matrix, the clock-free audit, the nightly
-    rustdoc gate, the cross-version store gate, and record N5''s measurement.'
-  why_required: The store-compatibility and no-durable-state claims are only claims until the cross-version
-    gate runs, and the nightly rustdoc gate has caught something in six of the last seven releases. N5's
-    number is the operator guidance the release exists to give.
-  status: todo
-  depends_on:
-  - US-IO-HARNESS-0.54.0-T05
-  acceptance_criteria:
-  - '**O1 — the three-platform matrix is green.** Nothing here is platform-specific, which is itself the
-    claim: a concurrency change that behaves differently on one runner is the defect this gate catches.
-
-    '
-  - '**O2 — nothing in the suite gates on a wall clock.** Every earliness claim is a rendezvous that completes
-    or a bounded wait that fails, never an assertion that something happened within N milliseconds. This
-    release is a latency release and therefore the one most likely to be written the wrong way; the standing
-    rule is restated here on purpose. Bounds are sized for the Windows runner, which is roughly three
-    times slower than the development machine.
-
-    '
-  - '**O5 — the nightly rustdoc gate passes with `-D warnings`.** Run before the release PR. `RUSTDOCFLAGS="--cfg
-    docsrs -D warnings" cargo +nightly doc --all-features --no-deps`. It has caught something in six of
-    the last seven releases, and this release adds a trait method whose doc block links private items
-    by name.
-
-    '
-  - '**O6 — the cross-version gate runs.** `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml`
-    then `cargo test --test cross_version_0_29_0 -- --ignored`. It is the easy-to-forget gate whose generator
-    is not built by default, and a store-compatibility claim (N4) is exactly what it exists to check.
-
-    '
-  - '**N4 — no durable state.** `git diff main -- src/state.rs` is empty, `CHECKPOINT_FORMAT` is 7, and
-    a 0.53.0 store and a 0.54.0 store are the same store in both directions.
-
-    '
-  - '**N5 — the release''s own measurement, recorded and not asserted.** Against a scripted provider whose
-    stream carries a stated number of tokens after the last tool call: the wall-clock from the first complete
-    tool call to the completion''s return — which is the window speculation can use — and the observed
-    end-to-end step time with and without it, on a named machine. The point of the number is operator
-    guidance on when the new method is worth implementing for a custom provider. **No clock is a pass/fail
-    gate**, per the standing rule.
-
-    '
-  files:
-  - docs/MEASUREMENTS.md
   evidence: []
