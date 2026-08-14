@@ -45,6 +45,9 @@ const READ: Duration = Duration::from_millis(300);
 /// One delta every this often, so the tail is a stream rather than one sleep.
 const TICK: Duration = Duration::from_millis(20);
 
+/// The sink a provider hands finished tool calls to.
+type CallSink<'a> = &'a (dyn Fn(usize, &ToolCall) + Send + Sync);
+
 struct Narrating {
     served: AtomicUsize,
     /// When the tool call was reported, and when the completion returned.
@@ -64,7 +67,7 @@ impl Narrating {
     async fn answer(
         &self,
         on_token: &(dyn Fn(&str) + Send + Sync),
-        on_call: Option<&(dyn Fn(usize, &ToolCall) + Send + Sync)>,
+        on_call: Option<CallSink<'_>>,
     ) -> io_harness::Result<CompletionResponse> {
         let step = self.served.fetch_add(1, Ordering::SeqCst);
         if step > 0 {

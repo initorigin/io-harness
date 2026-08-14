@@ -12666,7 +12666,6 @@ fn approval_context(goal: &str, verdict: &crate::policy::Verdict) -> ApprovalCon
     ApprovalContext::new(goal).flagged_by(verdict.rule.clone(), verdict.layer.clone())
 }
 
-#[allow(clippy::too_many_arguments)]
 /// What the policy says about one act on one target, and nothing else.
 ///
 /// Read and write targets are workspace paths, and are resolved so a symlink
@@ -12696,6 +12695,7 @@ fn policy_verdict(ws: &Workspace, act: Act, target: &str) -> crate::policy::Verd
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn gate(
     ws: &Workspace,
     approver: &dyn Approver,

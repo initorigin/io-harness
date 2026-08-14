@@ -33,6 +33,10 @@ use serde_json::json;
 
 // ---------------------------------------------------------------- the provider
 
+/// The sink a provider hands finished tool calls to, named so it can be spoken
+/// about in one word rather than spelled out at every use.
+type CallSink<'a> = &'a (dyn Fn(usize, &ToolCall) + Send + Sync);
+
 /// One scripted completion: what it reports while streaming, and what it settles
 /// on. The two are deliberately separate — a provider whose settled answer always
 /// matches what it streamed cannot exercise the rule that decides whether a
@@ -118,7 +122,7 @@ impl Script {
 
     async fn answer(
         &self,
-        on_call: Option<&(dyn Fn(usize, &ToolCall) + Send + Sync)>,
+        on_call: Option<CallSink<'_>>,
     ) -> io_harness::Result<CompletionResponse> {
         let i = self.served.load(Ordering::SeqCst);
         let turn = self.turns.get(i).cloned().unwrap_or_else(Turn::done);
@@ -1122,4 +1126,79 @@ async fn a_fallover_folds_nothing_the_primary_speculated() {
         !all.contains("ALPHA"),
         "a result speculated off the failed primary was folded under the secondary's call: {all}"
     );
+}
+
+/// F3, second arm — the same identity for a completion carrying exactly ONE
+/// read-only call.
+///
+/// This is the case the first arm cannot reach. 0.41.0's batch path needs a run
+/// of more than one call to be entered at all, so a lone read is served by
+/// `dispatch` on the serial path and by the speculated `ReadWork` here — two
+/// different call sites for the same work. They agree because `dispatch`'s own
+/// read arm ends in `ReadWork::run` too, and this pins that rather than trusting
+/// it.
+#[tokio::test]
+async fn the_trace_is_identical_for_a_single_read_which_never_batches() {
+    async fn once(speculating: bool) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let ws = workspace();
+        let store = Store::memory().unwrap();
+        let turns = vec![Turn::calls(vec![read("a.txt")]), Turn::done()];
+        let listener = Listener::default();
+        let mut session = Session::open(&store, ws.path()).unwrap();
+        let contract = contract(ws.path(), Toolbox::new());
+
+        let turn = if speculating {
+            session
+                .turn_bounded_observed(
+                    &contract,
+                    &Script::new(turns),
+                    &store,
+                    &policy(),
+                    &ApproveAll,
+                    &listener,
+                )
+                .await
+                .unwrap()
+        } else {
+            session
+                .turn_bounded_observed(
+                    &contract,
+                    &Deaf::new(turns),
+                    &store,
+                    &policy(),
+                    &ApproveAll,
+                    &listener,
+                )
+                .await
+                .unwrap()
+        };
+
+        let steps = store
+            .steps(turn.run_id)
+            .unwrap()
+            .into_iter()
+            .map(|s| format!("{}|{}|{}", s.step, s.decision, s.tool_call))
+            .collect();
+        let observations = store
+            .observations(turn.run_id)
+            .unwrap()
+            .into_iter()
+            .map(|o| format!("{}|{:?}|{}", o.step, o.target, o.text))
+            .collect();
+        let calls = listener.tool_calls.lock().unwrap().clone();
+        (steps, observations, calls)
+    }
+
+    let (fast_steps, fast_obs, fast_calls) = once(true).await;
+    let (slow_steps, slow_obs, slow_calls) = once(false).await;
+
+    assert_eq!(
+        fast_steps, slow_steps,
+        "a lone speculated read produced a different step row than the serial one"
+    );
+    assert_eq!(
+        fast_obs, slow_obs,
+        "a lone speculated read produced a different observation than the serial one"
+    );
+    assert_eq!(fast_calls, slow_calls, "the announcement differs");
 }

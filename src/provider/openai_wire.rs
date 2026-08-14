@@ -777,17 +777,13 @@ mod tests {
     use super::*;
     use crate::provider::ToolSpec;
 
-    /// A sink that records what was reported, for the 0.54.0 completeness edge.
-    fn recorder() -> (
-        std::sync::Arc<std::sync::Mutex<Vec<(usize, ToolCall)>>>,
-        impl Fn(usize, &ToolCall) + Send + Sync,
-    ) {
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = {
-            let seen = std::sync::Arc::clone(&seen);
-            move |at: usize, call: &ToolCall| seen.lock().unwrap().push((at, call.clone()))
-        };
-        (seen, sink)
+    /// What the 0.54.0 completeness edge reported, in the order it reported it.
+    type Reported = std::sync::Arc<std::sync::Mutex<Vec<(usize, ToolCall)>>>;
+
+    /// A sink that appends to `seen`.
+    fn recorder(seen: &Reported) -> impl Fn(usize, &ToolCall) + Send + Sync {
+        let seen = std::sync::Arc::clone(seen);
+        move |at: usize, call: &ToolCall| seen.lock().unwrap().push((at, call.clone()))
     }
 
     /// F10 — a call is reported exactly once, when its fragments first parse as a
@@ -816,7 +812,8 @@ mod tests {
                 json!({"pattern": "café—bar"}),
             ),
         ] {
-            let (seen, sink) = recorder();
+            let seen = Reported::default();
+            let sink = recorder(&seen);
             let mut acc = Accumulator::default();
             acc.ingest(&json!({"choices":[{"delta":{"tool_calls":[
                 {"index":0,"function":{"name":"grep","arguments":""}}]}}]}));
@@ -862,7 +859,8 @@ mod tests {
     /// somebody else's call.
     #[test]
     fn an_incomplete_call_blocks_the_ones_after_it_until_it_is_whole() {
-        let (seen, sink) = recorder();
+        let seen = Reported::default();
+        let sink = recorder(&seen);
         let mut acc = Accumulator::default();
         // Index 0 has arguments but no name yet; index 1 is whole.
         acc.ingest(&json!({"choices":[{"delta":{"tool_calls":[
