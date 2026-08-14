@@ -8,7 +8,7 @@ tasks:
     (`src/tools/workspace.rs:419`) hands a model an empty string for any file that is not valid UTF-8,
     which reads exactly like a file that does not exist. Every other read change in this release sits
     on top of the classification this task introduces.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F6 — a binary file is named as binary, not read as empty.** A file of bytes that are not valid
@@ -36,17 +36,26 @@ tasks:
     '
   files:
   - src/tools/workspace.rs
+  - src/tools/mod.rs
   - src/run.rs
   - tests/read_typing.rs
-  - tests/fixtures/read_typing
-  evidence: []
+  evidence:
+  - '`cargo test --test read_typing` — 15 passed, 0 failed. F6: `a_binary_file_is_named_with_its_size_and_kind`,
+    `the_text_reader_now_fails_where_it_used_to_return_an_empty_string` (the old `Ok("")` behaviour written
+    out as the thing that must fail), `through_the_loop_a_binary_read_carries_no_content`.'
+  - 'F7: `utf16_is_decoded_and_the_encoding_is_named`, `utf16_without_a_byte_order_mark_is_binary_rather_than_guessed`,
+    `through_the_loop_a_utf16_read_says_which_encoding_it_was`.'
+  - 'F8: `an_image_is_routed_to_the_tool_that_can_look_at_it`, `a_document_names_the_tool_that_reads_it`,
+    `an_svg_is_text_because_it_is_text`, `through_the_loop_an_image_read_carries_no_content_and_names_the_route`.'
+  - Existence is checked before the extension table, so a missing `.xlsx` still reads as empty — the pre-existing
+    `a_missing_byte_read_is_an_error_not_an_empty_document` unit test passes unchanged.
 - id: US-IO-HARNESS-0.55.0-T02
   summary: Refuse an oversized read whole instead of truncating it, and give `read_file` an `offset`/`limit`
     line range so the refusal has somewhere to point.
   why_required: 'The refusal is the release''s reason for existing — a truncated read has the shape of
     a whole one and nothing downstream can tell them apart — and it is only usable because the range exists.
     Neither half ships alone: a refusal with no remedy is a stuck run.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.55.0-T01
   acceptance_criteria:
@@ -66,10 +75,15 @@ tasks:
     '
   files:
   - src/run.rs
-  - src/context.rs
   - tests/read_typing.rs
-  - tests/context.rs
-  evidence: []
+  evidence:
+  - 'F9: `a_read_that_will_not_fit_returns_none_of_the_file` — a 14,046-char file against the default
+    12,000-char ceiling; all three sentinels (head, middle, tail) absent from the observation; the refusal
+    names the size, the ceiling, `offset`/`limit` and `max_read_chars`.'
+  - 'F9''s remedy proven usable rather than merely offered: `the_offered_range_actually_works_on_the_file_that_was_refused`
+    refuses the whole file and then serves `offset: 1, limit: 1` from the same file in the next step.'
+  - 'F11: `a_range_read_returns_exactly_the_lines_asked_for` (lines 10-14 of 100, one-based, nothing on
+    either side, header states `lines 10-14 of 100`) and `a_range_beyond_the_end_is_an_error_naming_the_total`.'
 - id: US-IO-HARNESS-0.55.0-T03
   summary: 'Make the read ceiling an operator key: `[run] max_read_chars` in `io.toml`, projected onto
     `Contract`, defaulting to the budget-derived value.'

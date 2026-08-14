@@ -9044,6 +9044,10 @@ enum ReadWork {
     Read {
         target: String,
         remember: Vec<Rule>,
+        /// 0.55.0 — the first line to return, 1-based, as the model asked for it.
+        offset: Option<u64>,
+        /// 0.55.0 — how many lines to return from `offset`.
+        limit: Option<u64>,
     },
     Custom {
         name: String,
@@ -9051,6 +9055,66 @@ enum ReadWork {
         arguments: serde_json::Value,
         remember: Vec<Rule>,
     },
+}
+
+/// The line range a `read_file` call asked for, if it asked for one (0.55.0).
+fn read_range_of(arguments: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+    (
+        arguments.get("offset").and_then(|v| v.as_u64()),
+        arguments.get("limit").and_then(|v| v.as_u64()),
+    )
+}
+
+/// Take the 1-based line range the model asked for, returning the body and the
+/// header note that makes a slice legible as a slice (0.55.0).
+///
+/// A read with no range is the whole file and says nothing new. An `offset` past
+/// the end is an error naming the total rather than an empty success: an empty
+/// success is exactly the answer that reads like an empty file.
+fn line_slice(
+    text: &str,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> std::result::Result<(String, String), String> {
+    if offset.is_none() && limit.is_none() {
+        return Ok((text.to_string(), String::new()));
+    }
+    // A trailing newline terminates the last line rather than starting an empty
+    // one, so `a\nb\n` is two lines and an operator counting in an editor agrees.
+    let lines: Vec<&str> = text.strip_suffix('\n').unwrap_or(text).split('\n').collect();
+    let total = lines.len();
+    let first = offset.unwrap_or(1).max(1) as usize;
+    if first > total {
+        return Err(format!(
+            "offset {first} is past the end — the file has {total} lines, so there is nothing \
+             at that line to read"
+        ));
+    }
+    let count = limit.map(|l| l as usize).unwrap_or(total);
+    let last = first.saturating_add(count).saturating_sub(1).min(total);
+    let mut body: String = lines[first - 1..last].join("\n");
+    body.push('\n');
+    Ok((body, format!(" lines {first}-{last} of {total}")))
+}
+
+/// The refusal for a read whose content will not fit (0.55.0).
+///
+/// It names the file, the size, the ceiling and both ways forward, because a
+/// refusal a model cannot act on turns a working run into a stuck one.
+fn over_ceiling(target: &str, size: usize, cap: usize, offset: Option<u64>) -> String {
+    let already_a_range = offset.is_some();
+    let suggestion = if already_a_range {
+        "ask for fewer lines".to_string()
+    } else {
+        format!(
+            "read a range instead — `{{\"path\": \"{target}\", \"offset\": 1, \"limit\": 200}}`"
+        )
+    };
+    format!(
+        "{target} is {size} chars, over the {cap}-char ceiling this run's context budget allows, \
+         so nothing was read. A shortened read would look like the whole file. To proceed, \
+         {suggestion}, or raise `[run] max_read_chars` in io.toml."
+    )
 }
 
 impl ReadWork {
@@ -9094,15 +9158,66 @@ impl ReadWork {
                 ),
                 Err(e) => Dispatched::go("find error", format!("\n[find error] {e}\n")),
             },
-            ReadWork::Read { target, remember } => match ws.read_file(&target) {
-                Ok(c) => Dispatched::Continue {
-                    decision: format!("read {target}"),
-                    obs: format!("\n[read {target}]\n{}\n", bound(&c, cap, ObsKind::Read)),
-                    kind: ObsKind::Read,
-                    target: Some(target),
-                    changed: false,
-                    remember,
-                },
+            ReadWork::Read {
+                target,
+                remember,
+                offset,
+                limit,
+            } => match ws.read_typed(&target) {
+                // 0.55.0 — the read has a type. Text carries the encoding it was
+                // decoded from when that is not the ordinary one; everything else
+                // is named rather than decoded, because a binary read used to
+                // arrive here as an empty string and read like an empty file.
+                Ok(crate::tools::FileContent::Text { text, encoding }) => {
+                    let mut note = if encoding == crate::tools::TextEncoding::Utf8 {
+                        String::new()
+                    } else {
+                        format!(" ({})", encoding.as_str())
+                    };
+                    let body = match line_slice(&text, offset, limit) {
+                        Ok((body, range)) => {
+                            note.push_str(&range);
+                            body
+                        }
+                        Err(why) => {
+                            return Dispatched::go(
+                                format!("read {target} refused"),
+                                format!("\n[read {target} error] {why}\n"),
+                            )
+                        }
+                    };
+                    // 0.55.0 — whole, the range that was asked for, or nothing.
+                    // A truncated read has the shape of a successful one and
+                    // nothing downstream can tell the difference, so the read
+                    // that will not fit returns no content at all.
+                    let size = body.chars().count();
+                    if size > cap {
+                        return Dispatched::go(
+                            format!("read {target} refused"),
+                            format!(
+                                "\n[read {target} error] {}\n",
+                                over_ceiling(&target, size, cap, offset)
+                            ),
+                        );
+                    }
+                    Dispatched::Continue {
+                        decision: format!("read {target}"),
+                        obs: format!("\n[read {target}{note}]\n{body}\n"),
+                        kind: ObsKind::Read,
+                        target: Some(target),
+                        changed: false,
+                        remember,
+                    }
+                }
+                Ok(other) => {
+                    let why = other
+                        .refusal(&target)
+                        .unwrap_or_else(|| format!("{target} is not text"));
+                    Dispatched::go(
+                        format!("read {target} refused"),
+                        format!("\n[read {target} error] {why}\n"),
+                    )
+                }
                 Err(e) => Dispatched::go("read error", format!("\n[read error] {e}\n")),
             },
             ReadWork::Custom {
@@ -9178,9 +9293,12 @@ fn speculable(ws: &Workspace, call: &ToolCall, custom: &Toolbox) -> Option<ReadW
         }),
         READ_FILE_TOOL => {
             let path = s("path").unwrap_or_default();
+            let (offset, limit) = read_range_of(&call.arguments);
             allowed(Act::Read, path).then(|| ReadWork::Read {
                 target: path.to_string(),
                 remember: Vec::new(),
+                offset,
+                limit,
             })
         }
         name => {
@@ -9451,7 +9569,15 @@ async fn prepare_read(
                 Gated::Paused { request_id } => Prepared::Stop(Dispatched::Pause { request_id }),
                 Gated::Go {
                     target, remember, ..
-                } => Prepared::Work(ReadWork::Read { target, remember }),
+                } => {
+                    let (offset, limit) = read_range_of(&call.arguments);
+                    Prepared::Work(ReadWork::Read {
+                        target,
+                        remember,
+                        offset,
+                        limit,
+                    })
+                }
             }
         }
         name => {
@@ -14709,11 +14835,17 @@ fn workspace_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: READ_FILE_TOOL.to_string(),
-            description: "Read a file (path relative to the workspace root) into context.".to_string(),
+            description: "Read a file (path relative to the workspace root) into context. \
+                          A file too large to fit is refused rather than shortened — read it \
+                          in ranges with offset and limit. Images and documents are not text: \
+                          the refusal names the tool that opens them."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path relative to the workspace root." }
+                    "path": { "type": "string", "description": "File path relative to the workspace root." },
+                    "offset": { "type": "integer", "description": "First line to read, counting from 1. Omit to start at the beginning." },
+                    "limit": { "type": "integer", "description": "How many lines to read from offset. Omit to read to the end." }
                 },
                 "required": ["path"]
             }),
