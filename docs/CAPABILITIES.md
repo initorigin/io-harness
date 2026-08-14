@@ -5,6 +5,8 @@ The index of the guide pages, and the map of what the harness holds.
 If you arrived here from docs.rs rather than from the README, this is the way in.
 [README.md](../README.md) is the landing page and
 [CONTRACT.md](CONTRACT.md) is what you may depend on.
+[MEASUREMENTS.md](MEASUREMENTS.md) holds the numbers this repository has actually
+measured, with the machine named — none of them a gate.
 
 ## Guides
 
@@ -22,7 +24,7 @@ the limits that capability actually has.
 | [Execution sandbox](guide/sandbox.md) | Backends per platform, resource caps, the portable floor |
 | [Durable runs](guide/durable-runs.md) | Checkpoints, resume, the stored-policy entry points, approvals that survive a restart |
 | [MCP and network egress](guide/mcp-and-network.md) | Stdio and HTTP servers, `Act::Net`, what the policy stops governing |
-| [Tools and skills](guide/tools-and-skills.md) | The `Tool` trait, the toolbox, skill discovery, and the boundary |
+| [Tools and skills](guide/tools-and-skills.md) | The `Tool` trait, the toolbox, skill discovery, the boundary, and what declaring a tool read-only opts it into — running beside its siblings, and starting before the model has finished asking for it |
 | [Context and memory](guide/context-and-memory.md) | Per-turn assembly, compaction, invalidation, durable cross-run memory |
 | [Resilience](guide/resilience.md) | Failure classification, kind-aware retry, provider fallback, stall detection |
 | [Observability and replay](guide/observability.md) | Observers, event kinds, outcome records, deterministic replay |
@@ -34,7 +36,7 @@ the limits that capability actually has.
 | [Documents](guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut, with the reasoning |
 | [Images and git](guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
 | [Hooks](guide/hooks.md) | Reacting to a run from `io.toml`: an audit log, a notification, a formatter, a check that stops the run — and why the whole array is refused in the project scope |
-| [Providers](guide/providers.md) | One `Compatible` provider over any OpenAI-shaped endpoint, the 21 vendor presets, the local runtimes, what `Provider::models()` reports, and the routing rules that change which model answers mid-run |
+| [Providers](guide/providers.md) | One `Compatible` provider over any OpenAI-shaped endpoint, the 21 vendor presets, the local runtimes, what `Provider::models()` reports, the routing rules that change which model answers mid-run, and the optional method that reports a finished tool call while the completion is still streaming |
 | [Capability bundles](guide/plugins.md) | A directory that contributes skills, templates, agents, MCP servers, hooks and deny-only policy at once; what a project-scoped declaration may not hand you; how a contribution names the bundle it came from; and why a broken bundle is dropped rather than fatal |
 
 ## The twelve pillars

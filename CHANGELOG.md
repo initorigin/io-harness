@@ -26,6 +26,68 @@ notes are produced from it.
 
 ### Security
 
+## [0.54.0] - 2026-08-14
+
+### Added
+
+- **A read starts before the model has finished speaking.** When a provider
+  reports a finished tool call while its completion is still streaming, the
+  harness starts the read-only ones then rather than waiting for the rest of the
+  message. On a model that narrates its plan before it stops, that is most of the
+  message. 0.41.0 already ran read-only calls concurrently with each other; this
+  moves when the first of them begins, and moves nothing else — the same
+  `ReadWork` runs the same way under the same `TaskContract::max_parallel_reads`.
+- **`Provider::complete_streaming_calls`, a third defaulted method.** It takes the
+  existing text sink plus one for finished tool calls, carrying a call's position
+  in the completion and the call itself. **Its default reports no call at all**, so
+  every implementation written before 0.54.0 compiles and behaves exactly as it
+  did — including `Record` and `Replay`, which override neither streaming method,
+  so a recorded or replayed run starts nothing early by construction rather than
+  by anyone remembering to suppress it. The four built-in providers and `Fallback`
+  override it.
+- **`EventKind::Speculated { started, used, discarded }`**, once per step that
+  started something early. 0.41.0 deliberately emitted nothing, because
+  overlapping two reads costs nothing when it does not help; starting a read
+  before the model has finished asking for it costs a whole read when the
+  completion turns out not to want it. `discarded` is the number that makes that
+  trade visible — a provider that streams its calls late, a model that revises its
+  arguments, or a step whose completion had to be retried all show up here and
+  nowhere else. A step that started nothing emits nothing.
+
+### Changed
+
+- **Nothing an embedder can observe, and that is the guarantee rather than an
+  omission.** The same `EventKind::ToolCall` events in the same order, the same
+  observations in the same ordinals, the same steps, the same `PolicyEvent` rows
+  and the same ledger draws, whether a read started early or not. Every durable
+  and observable act still happens serially, in the order the model asked, after
+  the completion settled; only the work moved.
+- `docs/CONTRACT.md` gains the rules that bound it, and its 0.20.0 statement that
+  a streamed delta is not safe to act on now says what the harness itself does
+  with one and why a consumer's rule is unchanged.
+
+### Notes
+
+Three rules bound what may start early, and each is a refusal to *speculate*
+rather than a refusal to run — every call still runs, in order, exactly as it did
+on 0.53.0:
+
+- **Only the completion's leading run of read-only calls**, which is narrower than
+  the maximal run 0.41.0 batches. A read started after a write that has not run
+  yet would answer from before the write.
+- **Only what the `Policy` allows outright.** A grey-tier call is never started
+  early, so no approver is asked about a completion that may never settle, and a
+  run with a tool hook configured starts nothing early at all.
+- **A result is used only if the settled completion asks for that same call**, with
+  the same name and byte-identical arguments, at that same position. A completion
+  that fails, is retried, or falls over to another provider discards everything
+  speculated against it, leaving no observation, no row and no ledger draw behind.
+
+`with_max_parallel_reads(1)` turns starting early off along with the batching, so
+there is one switch rather than two. `run_with` and the other one-shot entry
+points do not stream and are unchanged, as is the tree loop that drives child
+agents, which never took 0.41.0's batch path either.
+
 ## [0.53.0] - 2026-08-13
 
 ### Added

@@ -1294,6 +1294,63 @@ in the same order, with the same steps and the same ledger draws. An observer
 cannot tell from the event stream whether a batch ran concurrently. That is the
 guarantee, not a gap.
 
+## When a read starts, and why it is earlier than the completion (0.54.0)
+
+0.41.0 decided which read-only calls overlap. This decides when the first of them
+begins, and it is the only thing that moves: the same `ReadWork` runs the same
+way under the same `max_parallel_reads`, and everything above still holds.
+
+**A read starts as soon as its arguments are complete, not when the model stops
+talking.** A provider that implements `Provider::complete_streaming_calls` reports
+each finished tool call while the completion is still streaming; the harness
+starts the read-only ones then. The default implementation of that method reports
+nothing, so a provider that has not opted in — including `Record` and `Replay`,
+and every implementation written before 0.54.0 — behaves exactly as it did.
+
+**Only the completion's LEADING run of read-only calls, which is narrower than
+what 0.41.0 batches.** A batch is any maximal run of read-only calls; speculation
+stops at the first call that is not one, and never resumes for that completion. A
+read started after a write that has not run yet would answer from before the
+write, which is a wrong value rather than a wrong order.
+
+**Only what the `Policy` allows outright.** A call in the grey tier is not started
+early, so no approver is ever asked about a completion that may never settle, and
+0.41.0's collapse-on-pause rule stays exactly where the model put it. A run with a
+tool hook configured speculates nothing at all, for the same reason: a hook can
+refuse a call, and asking it early would hand it a call that may not exist.
+
+**A result is used only if the settled completion asks for it** — same position,
+same name, byte-identical arguments — and what survives is kept as a contiguous
+run from position zero. A completion that fails, is retried, or falls over to
+another provider discards everything speculated against it. A discarded
+speculation leaves nothing behind at all: the read happened, and the run recorded
+none of it.
+
+**`max_parallel_reads` is the whole switch.** `with_max_parallel_reads(1)` turns
+starting early off with the batching, so there is one escape hatch rather than
+two.
+
+**One event is new, and the reason is that this trade can lose.** 0.41.0 emitted
+nothing because overlapping two reads costs nothing when it does not help;
+starting a read before the model has finished asking for it costs a whole read
+when the completion turns out not to want it. `EventKind::Speculated { started,
+used, discarded }` is emitted once per step that started something, and never for
+a step that did not. Nothing else moves: the same `ToolCall` events in the same
+order, the same observations in the same ordinals, the same rows.
+
+**Where it does not apply.** `run_with` and the other one-shot entry points do not
+stream, and the tree loop that drives child agents dispatches serially — it never
+took 0.41.0's batch path either. Both are unchanged by this release.
+
+**Speculation follows streaming, and streaming follows the turn entry point.**
+Only the `_observed` and `_steered` session turns stream —
+`Session::turn_observed`, `Session::turn_steered`,
+`Session::turn_bounded_observed` and `Session::turn_contained_observed`. A turn
+taken through `Session::turn`, `Session::turn_bounded` or
+`Session::turn_contained` does not stream and therefore starts nothing early. That
+is 0.20.0's rule about where `EventKind::Token` comes from, unchanged; it is
+restated here because it now decides a second thing.
+
 ## What a model approving an action can and cannot decide (0.42.0)
 
 `ModelApprover` installs a model where a human would stand. This is the boundary
@@ -1963,6 +2020,18 @@ the runs, not a second execution path:
   made: the turn may still fall over to another provider, be retried, or be
   interrupted, and text already emitted is not withdrawn. Render it; do not act on
   it. The committed step is the settled fact.
+- **The harness itself acts on one thing before the completion returns, and only
+  one (0.54.0).** A *finished* read-only tool call — in the completion's leading
+  run of read-only calls, allowed outright by the `Policy` — is started as soon as
+  its arguments are complete. That is a narrow exception to the rule above and it
+  does not weaken it, because the result is used **only** if the settled
+  completion carries that same call, with the same name and byte-identical
+  arguments, at that same position. Anything else is discarded unused: no
+  observation, no step row, no `PolicyEvent`, no ledger draw, no
+  `EventKind::ToolCall`. A consumer's rule is unchanged — render a delta, do not
+  act on it — because a consumer cannot tell a finished call from a half-received
+  one, and the harness can: the arguments parse as a JSON object, and every proper
+  prefix of one does not.
 - **A `Provider` that does not override `complete_streaming` streams nothing.**
   The default emits the finished text as one delta, which keeps a consumer
   rendering, and is not incremental. The four built-in providers and `Fallback`

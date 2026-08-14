@@ -416,6 +416,22 @@ file may not contribute a hook or an MCP server, because both name a program thi
 machine would run, and a bundle that fails to load is dropped and reported rather
 than taking the run with it. See the [bundles guide](docs/guide/plugins.md).
 
+**Reads that start before the model stops talking.** A completion arrives in
+pieces, and a tool call inside it is complete long before the message is. When a
+provider reports a finished call while it is still streaming, the harness starts
+the read-only ones then — so a turn that reads three files and then answers gets
+those reads back sooner by the width of everything the model said afterwards. It
+is bounded by what can be undone: only the completion's *leading* run of read-only
+calls, so a read never sees the state before a write that has not run yet; only
+what the policy allows outright, so no approver is ever asked about a turn the
+model may still abandon; and a result is used only if the finished completion asks
+for that same call with the same arguments — otherwise the work is thrown away
+with nothing recorded. The trace, the observations and the events are identical
+either way; `EventKind::Speculated` reports what was started and what was
+discarded, because unlike ordinary concurrency this trade can lose. Providers that
+do not implement the new method — including replay — start nothing early and
+behave exactly as before.
+
 **Undo.** Every write records what was there before the run first touched that
 file, in the store rather than in memory, so `rewind(&workspace, &store, run_id,
 path)` puts a file back — including deleting one the run created — after a crash

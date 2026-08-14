@@ -133,6 +133,21 @@ Three things are worth knowing before you change it:
   bounds how many are in flight; it defaults to 10, and `1` puts the run back on
   the pre-0.41.0 path exactly, which is the way to rule the concurrency out while
   you are debugging something else.
+- **Since 0.54.0 a read-only call may also start *early*** — while the model is
+  still producing the completion that asks for it, rather than after. Declaring
+  `ReadOnly` is what opts your tool into that as well, and the same promise is what
+  makes it safe: a call that observes and changes nothing can be run against a
+  completion that turns out never to settle, and the result simply thrown away.
+  Two consequences worth knowing:
+  - Your tool may be invoked and its result discarded, with nothing recorded about
+    it. That happens when the completion fails and is retried, falls over to
+    another provider, or settles on different arguments than it streamed. Write
+    `invoke` so a wasted call costs only its own work — which a genuinely read-only
+    call already does.
+  - It only applies to a *leading* run of read-only calls, and only in a session
+    turn served by a provider that reports its finished calls. Anything after the
+    first mutating call in a completion waits, so a read cannot observe the state
+    before a write that has not run yet.
 
 ## Skills: instructions, not code
 

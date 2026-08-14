@@ -885,8 +885,11 @@ mod tests {
         acc.announce(&sink);
         assert!(seen.lock().unwrap().is_empty(), "reported before any arguments");
 
+        // The argument value carries a brace of its own, so a scan for the first
+        // `}` would cut here and report truncated arguments. Only a parse gets
+        // this right, which is the whole reason the edge is a parse.
         acc.ingest(&json!({"type":"content_block_delta","index":1,
-            "delta":{"type":"input_json_delta","partial_json":"{\"path\":\"sr"}}));
+            "delta":{"type":"input_json_delta","partial_json":"{\"path\":\"src/a{b}"}}));
         acc.announce(&sink);
         assert!(
             seen.lock().unwrap().is_empty(),
@@ -894,7 +897,7 @@ mod tests {
         );
 
         acc.ingest(&json!({"type":"content_block_delta","index":1,
-            "delta":{"type":"input_json_delta","partial_json":"c/lib.rs\"}"}}));
+            "delta":{"type":"input_json_delta","partial_json":"c.rs\"}"}}));
         acc.announce(&sink);
         acc.announce(&sink);
 
@@ -902,7 +905,7 @@ mod tests {
         assert_eq!(reported.len(), 1, "a call must be reported exactly once");
         assert_eq!(reported[0].0, 0, "the text block must not occupy a position");
         assert_eq!(reported[0].1.name, "read_file");
-        assert_eq!(reported[0].1.arguments, json!({"path": "src/lib.rs"}));
+        assert_eq!(reported[0].1.arguments, json!({"path": "src/a{b}c.rs"}));
         assert_eq!(acc.finish().tool_calls[0], reported[0].1);
     }
 
