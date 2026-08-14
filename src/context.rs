@@ -921,7 +921,20 @@ fn render_notes(
 
     // Newest first while deciding what fits; at least one note always survives, so
     // a workspace with memory never renders an empty block.
-    let mut used = estimate_tokens(head) + estimate_tokens(global_head);
+    // Each heading is charged only when its own list will actually render one.
+    // Charging for both unconditionally would quietly shrink the workspace block
+    // by the size of a heading the prompt never contains — a behaviour change for
+    // every caller that has no global notes, which is all of them until one is
+    // written.
+    let mut used = if notes.is_empty() {
+        0
+    } else {
+        estimate_tokens(head)
+    } + if global.is_empty() {
+        0
+    } else {
+        estimate_tokens(global_head)
+    };
     let fit = |from: &[MemoryEntry], used: &mut u64, allow_empty: bool| {
         let mut keep: Vec<MemoryEntry> = Vec::new();
         for e in from.iter().rev() {
@@ -1034,6 +1047,47 @@ fn refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0.56.0 — a scope nobody has written to costs the block nothing.
+    ///
+    /// The second heading is real text in the prompt, so charging for it when no
+    /// global note will render would shrink every existing caller's memory block
+    /// by a heading they never see. Found by reading the first draft of this
+    /// function rather than by a failing test, which is why the test exists.
+    #[test]
+    fn an_empty_global_scope_takes_no_room_from_the_workspaces_own_notes() {
+        let note = |k: &str| MemoryEntry {
+            key: k.to_string(),
+            value: "x".repeat(40),
+            run_id: 1,
+            step: 1,
+            created_at: "2026-08-14T00:00:00Z".into(),
+            kind: crate::MemoryKind::Fact,
+            pinned: false,
+        };
+        let notes: Vec<MemoryEntry> = (0..8).map(|i| note(&format!("k{i}"))).collect();
+
+        // A ceiling that fits every workspace note with the one heading and
+        // cannot fit them all with two. Tighter than this and both arms fall to
+        // the "at least one note always survives" floor, where the assertion
+        // would hold for the wrong reason.
+        let ceiling = 160;
+        let (text, carried) = render_notes(&notes, &[], ceiling);
+        assert!(
+            !text.contains("[memory: every workspace]"),
+            "no global notes, no global heading: {text}"
+        );
+
+        // The control: the same call once a global note exists carries FEWER of
+        // the workspace's own, which is what proves the assertion above is about
+        // the heading rather than about the ceiling being generous.
+        let (with_global, carried_with) = render_notes(&notes, &[note("g")], ceiling);
+        assert!(with_global.contains("[memory: every workspace]"));
+        assert!(
+            carried.len() > carried_with.iter().filter(|k| *k != "g").count(),
+            "the second scope costs room only when it renders: {carried:?} vs {carried_with:?}"
+        );
+    }
 
     #[test]
     fn estimate_tokens_is_four_chars_per_token_rounded_up() {
