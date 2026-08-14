@@ -302,6 +302,20 @@ pub const BARCODE_DECODE_TOOL: &str = "barcode_decode";
 /// to the run and step that wrote it, and readable and clearable by the embedding
 /// program through [`Store`](crate::state::Store).
 pub const REMEMBER_TOOL: &str = "remember";
+
+/// The name the model uses to withdraw a note it wrote (0.56.0).
+///
+/// The counterpart to [`REMEMBER_TOOL`], and narrow in the same way: it removes
+/// one keyed note from the harness's own store, not from the workspace, so it is
+/// not a path act. It exists because writing a key again only *replaces* it — an
+/// agent that learned the same wrong thing under two names could correct neither
+/// without recalling the exact key it used, and both notes would go on
+/// disagreeing.
+///
+/// What an operator pinned is refused, for the same reason a write to it is, and
+/// the removal is reversible: the run's restore point is taken before the entry
+/// goes, so [`rewind_run`](crate::rewind_run) puts it back.
+pub const FORGET_TOOL: &str = "forget";
 /// The name the model uses to write down its plan (0.21.0).
 ///
 /// Narrow for the same reason [`REMEMBER_TOOL`] is: it writes into the harness's own

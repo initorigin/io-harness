@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::context::{Compaction, ContextBudget};
 use crate::resilience::{RetryPolicy, StallPolicy};
+use crate::state::MemoryLimits;
 use crate::verify::Verification;
 
 /// What the caller wants the system prompt to say (0.45.0).
@@ -312,6 +313,16 @@ pub struct TaskContract {
     /// A read is refused when it exceeds *either* ceiling, and the refusal says
     /// which — the two call for different answers.
     pub max_read_chars: Option<u64>,
+    /// How much this workspace's durable memory may hold (0.56.0).
+    ///
+    /// Defaults to [`MemoryLimits::default`], which is the crate's three
+    /// constants, so a caller who sets nothing keeps 0.10.0's numbers. Set it
+    /// with [`TaskContract::with_memory_limits`] or `[memory]` in `io.toml`.
+    ///
+    /// Raising a cap is coupled to what the prompt can carry — see
+    /// [`MemoryLimits`] — and each scope holds its own, so a run recalling both
+    /// the workspace and the global scope may carry up to twice these numbers.
+    pub memory: MemoryLimits,
     /// When the run's history is folded into a written summary (0.43.0).
     ///
     /// Defaults to [`Compaction::default`], which folds — the failure it replaces
@@ -542,6 +553,7 @@ impl TaskContract {
             tools: crate::tools::Toolbox::new(),
             context: ContextBudget::default(),
             max_read_chars: None,
+            memory: MemoryLimits::default(),
             compaction: Compaction::default(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
@@ -615,6 +627,7 @@ impl TaskContract {
             tools: crate::tools::Toolbox::new(),
             context: ContextBudget::default(),
             max_read_chars: None,
+            memory: MemoryLimits::default(),
             compaction: Compaction::default(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
@@ -1375,6 +1388,39 @@ impl TaskContract {
     #[must_use]
     pub fn with_max_read_chars(mut self, chars: u64) -> Self {
         self.max_read_chars = Some(chars);
+        self
+    }
+
+    /// Set how much this workspace's durable memory may hold (0.56.0).
+    ///
+    /// The three caps were the crate's own constants until this release, chosen
+    /// so a whole store fits the quarter-share of a turn the memory block gets.
+    /// That is why raising one is not the free win it looks like, and why the
+    /// same release that makes them movable is the one that made selection go by
+    /// evidence rather than by recency — see [`MemoryLimits`].
+    ///
+    /// ```
+    /// use io_harness::{MemoryLimits, TaskContract, MEMORY_MAX_CHARS};
+    ///
+    /// let contract = TaskContract::workspace("port the parser", "/repo")
+    ///     .with_memory_limits(MemoryLimits {
+    ///         max_entries: 256,
+    ///         ..MemoryLimits::default()
+    ///     });
+    ///
+    /// assert_eq!(contract.memory.max_entries, 256);
+    /// // The two caps that were not named keep the crate's numbers.
+    /// assert_eq!(contract.memory.max_chars, MEMORY_MAX_CHARS);
+    /// // Unset is the three constants, which is what every version before
+    /// // 0.56.0 enforced.
+    /// assert_eq!(
+    ///     TaskContract::workspace("port the parser", "/repo").memory,
+    ///     MemoryLimits::default(),
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_memory_limits(mut self, limits: MemoryLimits) -> Self {
+        self.memory = limits;
         self
     }
 

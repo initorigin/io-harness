@@ -218,10 +218,45 @@ makes it a number that does not move, which is what a refusal a run's behaviour
 turns on has to be. Both ceilings apply to every read, and the refusal names the
 one that bit.
 
-It is also the one `[run]` key a project-scoped `io.toml` may only **lower**. The
-four keys a cloned repository may not widen are refused by their widening value
-(`exec = "allow"`); a number has no such value, so the smaller of the two wins
-instead. `io.local.toml` and the user-scope file set it outright.
+It is one of four keys a project-scoped `io.toml` may only **lower** — the other
+three are the `[memory]` caps below. The keys a cloned repository may not widen
+are otherwise refused by their widening value (`exec = "allow"`); a number has no
+such value, so the smaller of the two wins instead. `io.local.toml` and the
+user-scope file set them outright.
+
+## `[memory]` — what a workspace's durable notes may hold
+
+```toml
+[memory]
+max_entries = 64       # notes one workspace may hold
+max_chars = 16000      # characters across all of them
+max_entry_chars = 2000 # characters in any one note
+```
+
+These were the crate's own constants until 0.56.0 and they are still the
+defaults, so a file that omits the table changes nothing. Each key is applied on
+its own: naming one leaves the other two where they were.
+
+**Read this before raising one.** The numbers are not a guess at what fits in a
+database — they are chosen against what fits in a *prompt*. The memory block gets
+a quarter of a turn's effective tokens, and at these caps the whole store fits
+inside that share, so recall carries everything and nothing has to be selected.
+Past that point selection begins, and what the model sees stops being "your
+notes" and becomes "the notes that fit". That is survivable now — since 0.56.0
+selection is by which entries separate runs have actually carried, rather than by
+which were written most recently — but it is a real change in behaviour, and the
+thing that grows with the store is the per-turn bill. Raise them because you
+measured the block being short, not on principle.
+
+The write pays for it too. A capped write ranks every entry in the workspace, so
+its cost is linear in `max_entries`: about 1 ms at the default 64 and about 73 ms
+at 4,096 on the machine named in
+[docs/MEASUREMENTS.md](../MEASUREMENTS.md). That is per `remember` that evicts,
+not per turn.
+
+The table bounds one *scope*. The scope above the workspace holds its own, so a
+run recalling both can carry up to twice `max_chars` — inside the same block
+ceiling, with the workspace's own notes taking the space first.
 
 What the file does **not** set is the task: `goal`, `file`, `root` and `verify`
 are what the caller is asking for now, not a property of the project.

@@ -55,7 +55,7 @@ it, not when a release merely touched it.
 | **Human approval layer** — review before sensitive or irreversible actions | 0.4.0, durable 0.7.0 |
 | **Tool layer** — narrow, typed actions the agent invokes | 0.3.0, 0.8.0, completed 0.9.0 |
 | **Context construction** — feed the model only relevant, current, trusted info | 0.10.0 |
-| **State and memory** — progress within a run, durable recall across runs | 0.2.0, completed 0.10.0 |
+| **State and memory** — progress within a run, durable recall across runs | 0.2.0, completed 0.10.0, kept by evidence and scoped above the workspace 0.56.0 |
 | **Recovery and retry** — retries, fallbacks, replanning, escalation | 0.2.0, completed 0.11.0 |
 | **Observability and tracing** — prompts, decisions, tool calls, cost, outcomes | 0.2.0, completed 0.12.0 |
 | **Evaluation layer** — success, reliability, safety, latency, cost across cases | 0.12.0 |
