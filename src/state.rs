@@ -8701,6 +8701,61 @@ mod tests {
     }
 
     #[test]
+    fn an_operators_caps_bound_a_single_value_and_the_store_independently() {
+        // The entry cap alone, with room to spare on the other two. A single
+        // implementation that only honoured the count would pass a test that set
+        // both, which is why they are asserted apart.
+        let store = Store::memory().unwrap();
+        let entry_only = MemoryLimits {
+            max_entry_chars: 100,
+            ..MemoryLimits::default()
+        };
+        store
+            .memory_write_with(
+                "ws",
+                "k",
+                &"x".repeat(400),
+                1,
+                1,
+                MemoryKind::Fact,
+                entry_only,
+            )
+            .unwrap();
+        let stored = store.memory_get("ws", "k").unwrap().unwrap().value;
+        assert_eq!(stored.chars().count(), 100);
+        assert!(stored.ends_with(MEMORY_TRUNCATED), "the cut is visible");
+
+        // The total cap alone, with the entry count nowhere near its limit: ten
+        // values of 200 chars is 2,000 against a 500-char store.
+        let store = Store::memory().unwrap();
+        let chars_only = MemoryLimits {
+            max_chars: 500,
+            max_entries: 10_000,
+            ..MemoryLimits::default()
+        };
+        for i in 0..10 {
+            store
+                .memory_write_with(
+                    "ws",
+                    &format!("k{i}"),
+                    &"y".repeat(200),
+                    1,
+                    1,
+                    MemoryKind::Fact,
+                    chars_only,
+                )
+                .unwrap();
+        }
+        let entries = store.memory_list("ws").unwrap();
+        let total: usize = entries.iter().map(|e| e.value.chars().count()).sum();
+        assert!(total <= 500, "{total} chars is over the operator's cap");
+        assert!(
+            entries.len() < 10,
+            "the character cap evicted while the count cap was untouched"
+        );
+    }
+
+    #[test]
     fn ranking_eviction_candidates_seeks_the_recalls_rather_than_scanning_them() {
         let store = Store::memory().unwrap();
         fill_to_the_cap(&store, "ws");

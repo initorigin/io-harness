@@ -69,8 +69,8 @@ use crate::sandbox::{Sandbox, SandboxConfig};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{
-    AgentEvent, ContextEvent, GateOutcome, Kept, MemoryKind, RunStatus, Snapshot, StepRecord,
-    Store, TodoItem, TodoState, MAX_SNAPSHOT_BYTES,
+    AgentEvent, ContextEvent, GateOutcome, Kept, MemoryKind, MemoryLimits, RunStatus, Snapshot,
+    StepRecord, Store, TodoItem, TodoState, MAX_SNAPSHOT_BYTES,
 };
 use crate::toolchain::Toolchain;
 use crate::tools::exec::{Exec, ExecOutcome};
@@ -5146,6 +5146,7 @@ async fn run_workspace_from<P: Provider>(
                         entry_cap,
                         max_read,
                         &mem_key,
+                        contract.memory,
                         watch,
                         0,
                         pending_media,
@@ -7313,6 +7314,7 @@ where
                     entry_cap,
                     max_read,
                     &mem_key,
+                    contract.memory,
                     tree.watch,
                     depth,
                     pending_media,
@@ -9985,6 +9987,11 @@ async fn dispatch(
     cap: usize,
     max_read: Option<usize>,
     memory_key: &str,
+    // 0.56.0 — the caps this run's contract holds its workspace memory inside,
+    // carried beside the key they bound rather than read from a constant, so a
+    // `remember` is capped by the operator's numbers whichever door it came
+    // through.
+    memory_limits: MemoryLimits,
     watch: &Watch<'_>,
     depth: u32,
     pending_media: &mut PendingMedia,
@@ -10125,8 +10132,15 @@ async fn dispatch(
             // recorded and handed back to the model: an agent that believes it
             // corrected something and did not will act on the correction it
             // thinks it made.
-            let wrote =
-                store.memory_write(memory_key, key, value, run_id, step, MemoryKind::Fact)?;
+            let wrote = store.memory_write_with(
+                memory_key,
+                key,
+                value,
+                run_id,
+                step,
+                MemoryKind::Fact,
+                memory_limits,
+            )?;
             if wrote.refused {
                 store.record_context_event(
                     run_id,

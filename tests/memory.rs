@@ -597,3 +597,73 @@ async fn the_recall_record_names_which_entries_a_run_actually_used() {
         "a run that never happened recalled nothing"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 0.56.0 F6 — the operator's caps reach the write the model actually makes
+// ---------------------------------------------------------------------------
+
+async fn run_under(
+    root: &std::path::Path,
+    store: &Store,
+    script: Vec<Vec<ToolCall>>,
+    limits: Option<io_harness::MemoryLimits>,
+) -> i64 {
+    let mut contract = TaskContract::workspace("write some notes", root)
+        .with_max_steps(2)
+        .with_context_budget(ContextBudget {
+            max_tokens: 2_000,
+            share: 0.5,
+        });
+    if let Some(limits) = limits {
+        contract = contract.with_memory_limits(limits);
+    }
+    run_with(
+        &contract,
+        &Script(script, std::sync::atomic::AtomicUsize::new(0)),
+        store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .expect("the run itself must not error")
+    .run_id
+}
+
+/// The set run and the unset run, over the same workspace and the same script.
+/// The contract's caps have to reach the store through the tool arm, or the
+/// projection tested in `tests/config.rs` is a number nothing reads.
+#[tokio::test]
+async fn a_contracts_memory_caps_bound_what_a_run_may_remember() {
+    let notes = vec![vec![
+        remember("a", "first"),
+        remember("b", "second"),
+        remember("c", "third"),
+        remember("d", "fourth"),
+    ]];
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    run_under(
+        dir.path(),
+        &store,
+        notes.clone(),
+        Some(io_harness::MemoryLimits {
+            max_entries: 2,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let kept = store.memory_list(&ws_key(dir.path())).unwrap();
+    assert_eq!(kept.len(), 2, "the operator's cap bounds the store");
+    // The newest survive: nothing has been recalled, so the tie-break is the
+    // write clock and the two oldest are the candidates.
+    let keys: Vec<String> = kept.into_iter().map(|e| e.key).collect();
+    assert_eq!(keys, vec!["c".to_string(), "d".to_string()]);
+
+    // The control: the same four notes with nothing set are all kept, because
+    // the default cap is sixty-four.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    run_under(dir.path(), &store, notes, None).await;
+    assert_eq!(store.memory_list(&ws_key(dir.path())).unwrap().len(), 4);
+}

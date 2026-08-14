@@ -88,7 +88,7 @@ tasks:
     why_required: The contract requires the caps to be movable and the guide to state what moving them
       costs. The limits must reach `enforce_memory_caps` through every door a write can come
       through, or the cap depends on which call site wrote the entry.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.56.0-T01
     acceptance_criteria:
@@ -123,7 +123,38 @@ tasks:
       - src/config.rs
       - src/contract.rs
       - src/run.rs
-    evidence: []
+      - tests/config.rs
+      - tests/memory.rs
+    evidence:
+      - >-
+        F6 `the_memory_caps_reach_the_contract_through_the_ordinary_projection` (tests/config.rs):
+        `[memory] max_entries = 8` reaches `TaskContract` through `Config::apply_to`, the two caps
+        the file did not name keep the crate's constants rather than being reset by a whole-struct
+        projection, and an empty config yields `MemoryLimits::default()` — 64 / 16,000 / 2,000,
+        asserted as literals so a moved default is a failing test.
+      - >-
+        F6's end-to-end half, `a_contracts_memory_caps_bound_what_a_run_may_remember`
+        (tests/memory.rs): a run whose contract sets `max_entries: 2` and whose model calls
+        `remember` four times leaves two entries; the same script with nothing set leaves four. This
+        is what proves the projection is a number something reads — `contract.memory` is threaded to
+        `dispatch` beside `memory_key` and the `remember` arm writes through `memory_write_with`.
+      - >-
+        F6's misspelling guard, `a_memory_key_misspelled_is_still_refused_by_name`: `max_entrys` is
+        refused by name under `deny_unknown_fields`.
+      - >-
+        F7 `a_project_scoped_file_may_lower_a_memory_cap_and_may_not_raise_it`: all three keys in
+        both directions — a project file lowering 64/16,000/2,000 to 16/4,000/500 wins, the same
+        file raising them to 128/900,000/90,000 loses to the user scope, and the control shows
+        `io.local.toml` setting one outright because it is the operator's own file.
+      - >-
+        F8 `an_operators_caps_bound_a_single_value_and_the_store_independently` (src/state.rs): the
+        entry cap truncates one value with the existing marker while the other two caps have room,
+        and the character cap evicts while the entry count is nowhere near its limit. Asserted
+        apart, because an implementation honouring only the count passes a test that sets both.
+      - >-
+        `cargo test --lib` 476 passed, `--test config` 57 passed, `--test memory` 15 passed. N4:
+        zero compile breaks — `TaskContract` is `#[non_exhaustive]`, `memory_write` and `memory_put`
+        keep their signatures, and nothing in the suite needed an edit to go on compiling.
   - id: US-IO-HARNESS-0.56.0-T03
     summary: "Add the `forget` tool and `Store::memory_forget`: refused on a pinned entry and on an
       unapproved plan, restorable by `rewind_run`, and taking the key's recall rows with it where an
