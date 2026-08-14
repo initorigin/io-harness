@@ -559,6 +559,10 @@ struct RunSection {
     retry: Option<RetryPolicy>,
     stall: Option<StallPolicy>,
     context: Option<ContextBudget>,
+    // 0.55.0 — the ceiling a read is refused against, in characters. Beside the
+    // other budgets because it is one: what a run may spend, what one request may
+    // carry, and what one read may be.
+    max_read_chars: Option<u64>,
     commit_identity: Option<Identity>,
 }
 
@@ -691,7 +695,12 @@ impl Config {
                 },
                 &mut origins,
             );
-            merge(&mut merged, table, &mut Vec::new());
+            merge(
+                &mut merged,
+                table,
+                &mut Vec::new(),
+                scope == Scope::Project,
+            );
             sources.push((scope, path));
         }
 
@@ -813,7 +822,10 @@ impl Config {
 
         let mut merged = self.raw.clone();
         merged.remove("profile");
-        merge(&mut merged, overlay.clone(), &mut Vec::new());
+        // A profile overlay is applied after every scope has been folded
+        // together, so the scope its keys came from is no longer knowable here.
+        // Narrowing is therefore not re-applied; see the release record.
+        merge(&mut merged, overlay.clone(), &mut Vec::new(), false);
 
         // A profile key's origin is the file the *profile* was written in, which is
         // recorded under `profile.<name>.<key>`. Move each one onto the key it now
@@ -1586,6 +1598,9 @@ impl Config {
         if let Some(v) = run.context {
             out = out.with_context_budget(v);
         }
+        if let Some(v) = run.max_read_chars {
+            out = out.with_max_read_chars(v);
+        }
         if let Some(v) = &run.commit_identity {
             out = out.with_commit_identity(v.name.clone(), v.email.clone());
         }
@@ -1996,6 +2011,21 @@ fn bad_key(path: &Path, key: &[String], why: impl std::fmt::Display) -> Error {
 /// replaces, because a half-merged MCP server definition is not a server.
 const APPENDING: &[&[&str]] = &[&["policy", "layers"], &["agent"], &["plugin"]];
 
+/// Keys a project-scoped file may only *lower* (0.55.0).
+///
+/// The scope rule stated in the module doc — a project file may narrow and may
+/// never widen — has until now been enforced by refusing the widening *value* of
+/// a key that has one (`exec = "allow"`, `force_floor = false`). A number has no
+/// such value: whether `max_read_chars = 400000` widens depends on what the
+/// scope below it said. So for these keys the lower number wins instead of the
+/// later scope, and `io.toml` can tighten an operator's ceiling without being
+/// able to loosen it.
+///
+/// Only the project scope is held to this. `io.local.toml` and the user scope
+/// are the operator's own files and set the key outright, which is the same
+/// distinction [`refuse_widening`] already draws.
+const NARROWING: &[&[&str]] = &[&["run", "max_read_chars"]];
+
 /// Record `origin` against every leaf key of `table`, walking it the way
 /// [`merge`] walks it so the two cannot disagree about what a leaf is (0.30.0).
 ///
@@ -2034,15 +2064,28 @@ fn record_origins(
 }
 
 /// Deep-merge `over` onto `base`, later winning key by key.
-fn merge(base: &mut toml::value::Table, over: toml::value::Table, at: &mut Vec<String>) {
+///
+/// `narrowing` is set when `over` is the project scope, where a [`NARROWING`]
+/// key takes the lower of the two numbers instead of the later one (0.55.0).
+fn merge(
+    base: &mut toml::value::Table,
+    over: toml::value::Table,
+    at: &mut Vec<String>,
+    narrowing: bool,
+) {
     for (key, value) in over {
         at.push(key.clone());
         match (base.get_mut(&key), value) {
-            (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge(b, o, at),
+            (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge(b, o, at, narrowing),
             (Some(toml::Value::Array(b)), toml::Value::Array(o))
                 if APPENDING.iter().any(|p| p == &at.as_slice()) =>
             {
                 b.extend(o);
+            }
+            (Some(toml::Value::Integer(b)), toml::Value::Integer(o))
+                if narrowing && NARROWING.iter().any(|p| p == &at.as_slice()) =>
+            {
+                *b = (*b).min(o);
             }
             (_, value) => {
                 base.insert(key.clone(), value);
@@ -2067,6 +2110,7 @@ mod tests {
             &mut base,
             table("[sandbox.limits]\nmax_wall_secs = 5\n"),
             &mut Vec::new(),
+            false,
         );
         let limits = base["sandbox"]["limits"].as_table().unwrap();
         assert_eq!(limits["max_wall_secs"].as_integer(), Some(5));
@@ -2090,6 +2134,7 @@ mod tests {
                  [toolchain.cargo]\ntest = [\"cargo\", \"nextest\", \"run\"]\n",
             ),
             &mut Vec::new(),
+            false,
         );
         let layers = base["policy"]["layers"].as_array().unwrap();
         assert_eq!(layers.len(), 2, "layers append");

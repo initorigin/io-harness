@@ -2363,3 +2363,89 @@ fn a_narrower_scope_replaces_the_lsp_set_whole() {
     let ids: Vec<_> = config.lsp_servers().iter().map(|s| s.id.as_str()).collect();
     assert_eq!(ids, ["theirs"], "the project scope replaces, never appends");
 }
+
+// ---------------------------------------------------------------------------
+// F13 (0.55.0) — the read ceiling is an operator key that travels the ordinary
+// path
+// ---------------------------------------------------------------------------
+
+/// The key reaches the typed API, which is the whole claim: the run loop reads
+/// `TaskContract`, never the configuration, so a key that stopped at `Config`
+/// would be a setting an operator can write and nothing obeys.
+#[test]
+fn max_read_chars_reaches_the_contract_through_the_ordinary_projection() {
+    let config = Config::from_toml("[run]\nmax_read_chars = 40000\n").unwrap();
+    let contract = config.apply_to(TaskContract::workspace("read things", "/repo"));
+
+    assert_eq!(contract.max_read_chars, Some(40_000));
+    // And unset is 0.54.0's behaviour exactly: the ceiling stays the one derived
+    // from the context budget, and nothing new applies.
+    let plain = Config::from_toml("").unwrap();
+    assert_eq!(
+        plain
+            .apply_to(TaskContract::workspace("read things", "/repo"))
+            .max_read_chars,
+        None,
+    );
+}
+
+#[test]
+fn a_key_misspelled_beside_it_is_still_refused_by_name() {
+    // The guard that makes the section worth trusting: `deny_unknown_fields` is
+    // what stops a narrowing key from silently doing nothing because it was
+    // typed wrong.
+    let err = Config::from_toml("[run]\nmax_read_char = 40000\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("max_read_char"), "{err}");
+}
+
+#[test]
+fn a_project_scoped_file_may_lower_the_read_ceiling_and_may_not_raise_it() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(user_dir.path(), "io.toml", "[run]\nmax_read_chars = 50000\n");
+
+    // Narrowing: the cloned repository knows its files are small and says so.
+    write(project.path(), "io.toml", "[run]\nmax_read_chars = 8000\n");
+    let narrowed = Config::discover(project.path()).unwrap();
+    assert_eq!(
+        narrowed
+            .apply_to(TaskContract::workspace("read things", project.path()))
+            .max_read_chars,
+        Some(8_000),
+        "a project file may tighten the operator's ceiling",
+    );
+
+    // Widening: the same key, the other direction, from the same file — and the
+    // operator's number survives. This is a number, so there is no single
+    // widening *value* to refuse the way `exec = \"allow\"` is refused; the lower
+    // one wins instead.
+    write(
+        project.path(),
+        "io.toml",
+        "[run]\nmax_read_chars = 900000\n",
+    );
+    let widened = Config::discover(project.path()).unwrap();
+    assert_eq!(
+        widened
+            .apply_to(TaskContract::workspace("read things", project.path()))
+            .max_read_chars,
+        Some(50_000),
+        "a project file may not loosen it",
+    );
+
+    // Control: the operator's own local file is not held to that rule, because
+    // it is the operator's file — the same distinction the four boundary keys
+    // already draw.
+    write(project.path(), "io.local.toml", "[run]\nmax_read_chars = 900000\n");
+    let local = Config::discover(project.path()).unwrap();
+    assert_eq!(
+        local
+            .apply_to(TaskContract::workspace("read things", project.path()))
+            .max_read_chars,
+        Some(900_000),
+    );
+}

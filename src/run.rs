@@ -4741,6 +4741,9 @@ async fn run_workspace_from<P: Provider>(
             .context
             .effective_tokens(contract.max_tokens.map(|m| m.saturating_sub(tokens_used)));
         let entry_cap = entry_cap_chars(budget_tokens);
+        // 0.55.0 — the operator's own read ceiling, when they set one. Resolved
+        // here so it travels with `entry_cap`: a read is measured against both.
+        let max_read = contract.max_read_chars.map(|c| c as usize);
         // Re-read each turn rather than once at the start, so the notes the model
         // sees are the notes the store holds — including one written this run, and
         // not one the operator has since cleared.
@@ -4776,6 +4779,7 @@ async fn run_workspace_from<P: Provider>(
                 &contract.tools,
                 containment.clone(),
                 entry_cap,
+                max_read,
                 contract.max_parallel_reads,
                 run_id,
                 step,
@@ -5100,6 +5104,7 @@ async fn run_workspace_from<P: Provider>(
                         step,
                         &contract.tools,
                         entry_cap,
+                        max_read,
                         watch,
                         0,
                         contract.max_parallel_reads,
@@ -5139,6 +5144,7 @@ async fn run_workspace_from<P: Provider>(
                         &contract.tools,
                         skills,
                         entry_cap,
+                        max_read,
                         &mem_key,
                         watch,
                         0,
@@ -7008,6 +7014,7 @@ where
                 .context
                 .effective_tokens(Some(token_cap.saturating_sub(tokens_used)));
             let entry_cap = entry_cap_chars(budget_tokens);
+            let max_read = contract.max_read_chars.map(|c| c as usize);
             // 0.50.0 — the reports of children this agent stopped waiting for,
             // folded before the prompt is assembled so the model reads them on this
             // step rather than the next one. After `entry_cap` because a report is
@@ -7304,6 +7311,7 @@ where
                     tree.tools,
                     tree.skills,
                     entry_cap,
+                    max_read,
                     &mem_key,
                     tree.watch,
                     depth,
@@ -9101,27 +9109,55 @@ fn line_slice(
 ///
 /// It names the file, the size, the ceiling and both ways forward, because a
 /// refusal a model cannot act on turns a working run into a stuck one.
-fn over_ceiling(target: &str, size: usize, cap: usize, offset: Option<u64>) -> String {
-    let already_a_range = offset.is_some();
-    let suggestion = if already_a_range {
+///
+/// **It also names *which* ceiling.** A read can be over the operator's
+/// `[run] max_read_chars`, which is a fixed number somebody chose, or over what
+/// this turn's remaining budget can carry, which moves as the run spends. The
+/// two call for different answers — raise the key, or read a range now — so a
+/// message that covered both would tell the model to try the wrong one half the
+/// time.
+fn over_ceiling(
+    target: &str,
+    size: usize,
+    budget_cap: usize,
+    max_read: Option<usize>,
+    offset: Option<u64>,
+) -> String {
+    let suggestion = if offset.is_some() {
         "ask for fewer lines".to_string()
     } else {
-        format!(
-            "read a range instead — `{{\"path\": \"{target}\", \"offset\": 1, \"limit\": 200}}`"
-        )
+        format!("read a range instead — `{{\"path\": \"{target}\", \"offset\": 1, \"limit\": 200}}`")
     };
-    format!(
-        "{target} is {size} chars, over the {cap}-char ceiling this run's context budget allows, \
-         so nothing was read. A shortened read would look like the whole file. To proceed, \
-         {suggestion}, or raise `[run] max_read_chars` in io.toml."
-    )
+    // The operator's ceiling is reported whenever it is the one that bit, which
+    // includes the case where both would have: a number somebody set is the one
+    // they can act on.
+    match max_read {
+        Some(operator) if size > operator => format!(
+            "{target} is {size} chars, over the {operator}-char ceiling set by \
+             `[run] max_read_chars`, so nothing was read. A shortened read would look like the \
+             whole file. To proceed, {suggestion}, or raise that key."
+        ),
+        _ => format!(
+            "{target} is {size} chars, over the {budget_cap}-char ceiling this turn's remaining \
+             context budget allows, so nothing was read. A shortened read would look like the \
+             whole file. To proceed, {suggestion} — the ceiling this one is measured against \
+             moves as the run spends, so `[run] max_read_chars` is what makes it predictable."
+        ),
+    }
 }
 
 impl ReadWork {
     /// Perform it. The same code the serial path runs, so the two cannot drift:
     /// a batched read and a lone read are the same function called from two
     /// places.
-    async fn run(self, ws: &Workspace, cap: usize, run_id: i64, step: u32) -> Dispatched {
+    async fn run(
+        self,
+        ws: &Workspace,
+        cap: usize,
+        max_read: Option<usize>,
+        run_id: i64,
+        step: u32,
+    ) -> Dispatched {
         match self {
             ReadWork::Grep { pattern, path_glob } => {
                 match ws.grep(&pattern, path_glob.as_deref()) {
@@ -9191,12 +9227,12 @@ impl ReadWork {
                     // nothing downstream can tell the difference, so the read
                     // that will not fit returns no content at all.
                     let size = body.chars().count();
-                    if size > cap {
+                    if size > cap || max_read.is_some_and(|m| size > m) {
                         return Dispatched::go(
                             format!("read {target} refused"),
                             format!(
                                 "\n[read {target} error] {}\n",
-                                over_ceiling(&target, size, cap, offset)
+                                over_ceiling(&target, size, cap, max_read, offset)
                             ),
                         );
                     }
@@ -9335,6 +9371,10 @@ struct Speculation<'a> {
     /// start a tool 0.53.0 refuses, and start it before the completion settled.
     sandbox: Option<std::sync::Arc<crate::sandbox::ExecContainment>>,
     cap: usize,
+    /// 0.55.0 — the operator's `[run] max_read_chars`, when one is set. Carried
+    /// beside `cap` because a read is measured against both and the refusal has
+    /// to say which one bound it.
+    max_read: Option<usize>,
     max_parallel: usize,
     run_id: i64,
     step: u32,
@@ -9361,6 +9401,7 @@ impl<'a> Speculation<'a> {
         tools: &'a Toolbox,
         sandbox: Option<std::sync::Arc<crate::sandbox::ExecContainment>>,
         cap: usize,
+        max_read: Option<usize>,
         max_parallel: usize,
         run_id: i64,
         step: u32,
@@ -9370,6 +9411,7 @@ impl<'a> Speculation<'a> {
             tools,
             sandbox,
             cap,
+            max_read,
             max_parallel,
             run_id,
             step,
@@ -9427,9 +9469,9 @@ impl<'a> Speculation<'a> {
             return;
         };
         let ws = self.ws.clone();
-        let (cap, run_id, step) = (self.cap, self.run_id, self.step);
+        let (cap, max_read, run_id, step) = (self.cap, self.max_read, self.run_id, self.step);
         self.set
-            .spawn(async move { (at, work.run(&ws, cap, run_id, step).await) });
+            .spawn(async move { (at, work.run(&ws, cap, max_read, run_id, step).await) });
         self.started.push((at, call.clone()));
         self.started_total += 1;
     }
@@ -9634,6 +9676,7 @@ async fn read_batch(
     step: u32,
     custom: &Toolbox,
     cap: usize,
+    max_read: Option<usize>,
     watch: &Watch<'_>,
     depth: u32,
     max_parallel: usize,
@@ -9677,7 +9720,7 @@ async fn read_batch(
                 break;
             };
             let ws = owned.clone();
-            set.spawn(async move { (at, work.run(&ws, cap, run_id, step).await) });
+            set.spawn(async move { (at, work.run(&ws, cap, max_read, run_id, step).await) });
         }
     };
     fill(&mut set, &mut queued);
@@ -9933,6 +9976,7 @@ async fn dispatch(
     custom: &Toolbox,
     skills: &Skills,
     cap: usize,
+    max_read: Option<usize>,
     memory_key: &str,
     watch: &Watch<'_>,
     depth: u32,
@@ -10037,7 +10081,7 @@ async fn dispatch(
             )
             .await?
             {
-                Prepared::Work(work) => work.run(ws, cap, run_id, step).await,
+                Prepared::Work(work) => work.run(ws, cap, max_read, run_id, step).await,
                 Prepared::Done(done) | Prepared::Stop(done) => done,
             }
         }
@@ -12465,7 +12509,7 @@ async fn dispatch(
             )
             .await?
             {
-                Prepared::Work(work) => work.run(ws, cap, run_id, step).await,
+                Prepared::Work(work) => work.run(ws, cap, max_read, run_id, step).await,
                 Prepared::Done(done) | Prepared::Stop(done) => done,
             }
         }

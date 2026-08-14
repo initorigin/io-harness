@@ -434,6 +434,62 @@ async fn the_offered_range_actually_works_on_the_file_that_was_refused() {
 }
 
 // ---------------------------------------------------------------------------
+// F10 — the refusal names which ceiling it hit
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_two_ceilings_produce_two_different_refusals() {
+    // Same file, same call, two reasons. The operator's ceiling is a number
+    // somebody chose and can raise; the budget's moves as the run spends. A
+    // model told the wrong one tries the wrong remedy.
+    let dir = hundred_lines();
+    let operator_store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![read("long.txt")]]);
+    let result = run_with(
+        &contract(dir.path()).with_max_read_chars(50),
+        &provider,
+        &operator_store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    let by_operator = observation(&operator_store, result.run_id, 1);
+    assert!(
+        by_operator.contains("50-char ceiling set by `[run] max_read_chars`"),
+        "the operator's own key is what it names: {by_operator}"
+    );
+    assert!(
+        !by_operator.contains("line 1\n"),
+        "and no content came with it: {by_operator}"
+    );
+
+    // The other one, on a file the operator set no ceiling for at all.
+    let big = too_big();
+    let budget_store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![read("huge.txt")]]);
+    let result = run_with(
+        &contract(big.path()),
+        &provider,
+        &budget_store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    let by_budget = observation(&budget_store, result.run_id, 1);
+    assert!(
+        by_budget.contains("remaining \ncontext budget allows")
+            || by_budget.contains("remaining context budget allows"),
+        "the budget ceiling names itself: {by_budget}"
+    );
+    assert!(
+        !by_budget.contains("ceiling set by"),
+        "the two texts are different, which is the point: {by_budget}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // F11 — a range read is served and legible as a range
 // ---------------------------------------------------------------------------
 
