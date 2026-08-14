@@ -220,7 +220,13 @@ fn a_directory_named_like_the_reserved_key_is_still_its_own_workspace() {
     // Windows forbids `<` and `>` in a path at all, which is itself the property
     // under test — there, no directory can carry this name.
     let Ok(()) = std::fs::create_dir(&awkward) else {
-        assert!(cfg!(windows), "only Windows may refuse this name");
+        // Only Windows may refuse the name, and there refusing it IS the
+        // property under test: no directory can carry it, so nothing can
+        // collide with the reserved key. `cfg!` rather than a runtime assert,
+        // which clippy reads as a constant assertion because it is one.
+        #[cfg(not(windows))]
+        panic!("only Windows may refuse `{GLOBAL_MEMORY_WORKSPACE}` as a directory name");
+        #[cfg(windows)]
         return;
     };
     let key = ws_key(&awkward);

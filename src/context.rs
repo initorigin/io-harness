@@ -939,7 +939,11 @@ fn render_notes(
         let mut keep: Vec<MemoryEntry> = Vec::new();
         for e in from.iter().rev() {
             let t = estimate_tokens(&line(e));
-            if *used + t > ceiling_tokens && !(keep.is_empty() && !allow_empty) {
+            // The workspace's list always renders at least one note, so it may
+            // only stop once it has kept one. The global list may render none at
+            // all: the workspace's own notes have first claim on the room.
+            let may_stop = allow_empty || !keep.is_empty();
+            if may_stop && *used + t > ceiling_tokens {
                 break;
             }
             *used += t;
