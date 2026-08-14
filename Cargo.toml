@@ -125,7 +125,7 @@ quick-xml = { version = "0.41", optional = true }
 lopdf = { version = "0.44", optional = true }
 pdf-extract = { version = "0.12", optional = true }
 rxing = { version = "0.9", optional = true }
-image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "bmp", "tiff", "ico", "tga", "pnm"] }
 calamine = { version = "0.36", optional = true }
 rust_xlsxwriter = { version = "0.97", optional = true }
 umya-spreadsheet = { version = "3.0", optional = true }
@@ -221,7 +221,12 @@ optional = true
 # who wants spreadsheets does not compile a PDF stack, and an umbrella so the
 # common case is one word.
 default = []
-media = ["dep:base64"]
+# 0.55.0 — `image` joins it. Not a new dependency: the crate has declared it as
+# an optional one since 0.14.0 (reached through `barcode`), and this enables the
+# formats an operator actually hands over. Every one is pure Rust — no C library,
+# no `-sys` crate — and the default build is untouched, which is what the
+# no-new-dependency constraint is about.
+media = ["dep:base64", "dep:image"]
 # Driving a real browser (0.53.0), off by default like documents. It implies
 # `media` rather than duplicating it: a screenshot is only worth taking because
 # the model looks at it, and 0.15.0 already built the path that puts an image in

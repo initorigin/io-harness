@@ -176,7 +176,7 @@ tasks:
   why_required: It is the whole image half of the outcome. It has to be a second constructor rather than
     a widened `Media::image`, because the four-type set is a fact about vendors that the wire gate must
     keep enforcing, and the byte-identity of the pass-through is what stops a JPEG being silently re-encoded.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.55.0-T04
   acceptance_criteria:
@@ -217,16 +217,34 @@ tasks:
   files:
   - Cargo.toml
   - src/provider/mod.rs
-  - tests/media.rs
-  - tests/fixtures/images
-  evidence: []
+  evidence:
+  - 'F1: `a_format_the_wire_refuses_is_accepted_at_the_door_and_arrives_as_a_png` — BMP, TIFF, ICO, TGA
+    and PNM each asserted separately: media type `image/png`, the eight-byte PNG signature, and a 3x2
+    round trip.'
+  - 'F2: `the_four_wire_types_are_passed_through_byte_identically` — PNG and JPEG round-tripped through
+    real fixtures, GIF and WebP asserted on opaque bytes (the stronger claim: the door does not look at
+    them).'
+  - 'F4: `the_wire_gate_still_refuses_everything_but_the_four` — `Media::image` unchanged, its four-type
+    refusal intact; the pre-existing `tests/media.rs` cases pass unmodified.'
+  - 'N5: `a_declared_size_over_the_pixel_bound_is_refused_before_decoding` — a BMP header rewritten to
+    40000x40000 is refused from the header parse, naming the dimensions and the pixel bound; `MAX_IMAGE_PIXELS`
+    is 50,000,000.'
+  - 'N1: `cargo tree` on the default build is **402**, unchanged. `cargo tree --features media` is 438
+    — 21 crates added (image, png, tiff, zune-jpeg, weezl, fax, flate2, miniz_oxide, fdeflate, adler2,
+    simd-adler32, crc32fast, bytemuck, byteorder-lite, half, moxcms, pxfm, quick-error, zerocopy, zerocopy-derive,
+    zune-core), none of them a `-sys` crate and none needing a C toolchain.'
+  - '`image` gained the `bmp`, `tiff`, `ico`, `tga` and `pnm` features and moved under `media`; no new
+    entry in `[dependencies]`.'
+  - 'Fixture finding: `image` writes an ICO as an embedded PNG and its own ICO decoder refuses one that
+    is not RGBA, so the fixture is encoded RGBA. A property of encoding a fixture with this library, not
+    of ICO files an operator has.'
 - id: US-IO-HARNESS-0.55.0-T06
   summary: Refuse SVG, HEIC and AVIF by name with a reason and a conversion, route a PDF to `pdf_read`,
     and make `view_image` use the wide door after the policy gate.
   why_required: A refusal that recites the vendor's four-type list is the failure the release is fixing
     at the doorstep; naming the format and the fix is the deliverable. The sniff has to sit inside the
     gated branch, or a classification becomes a way to probe for a file outside the policy boundary.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.55.0-T05
   acceptance_criteria:
@@ -250,8 +268,19 @@ tasks:
   - src/provider/mod.rs
   - src/run.rs
   - tests/media.rs
-  - tests/attach.rs
-  evidence: []
+  evidence:
+  - 'F3: `an_undecodable_format_is_refused_by_name_with_a_remedy` — SVG/HEIC/AVIF/PDF each refused with
+    the format''s name and a conversion (`resvg`, `heif-convert`, `avifdec`, `pdf_read`), and asserted
+    NOT to contain `expected one of`.'
+  - 'F5: `a_bmp_reaches_the_provider_as_a_png_and_the_trace_says_it_was_converted` — one `Media` of type
+    `image/png` on the request, and the trace carries `image/bmp converted to image/png`; `an_svg_is_refused_by_name_through_the_tool_and_attaches_nothing`
+    — zero images on every request and the refusal names SVG and resvg.'
+  - '`cargo test --test media --features media` — 9 passed, 0 failed.'
+  - 'The sniff/decode is inside the gated branch: `view_image`''s pre-gate check is still extension-only
+    and reads nothing, so it cannot probe for a file outside the policy.'
+  - The transcode note carries source type, wire type, PNG bytes and digest — not the decoded dimensions
+    the scope prose mentioned, which would have meant changing what `Media::attach` returns. Recorded
+    rather than glossed.
 - id: US-IO-HARNESS-0.55.0-T07
   summary: Update the checked-in documentation surfaces and the changelog for both halves, including the
     two behaviour changes an embedder can see.

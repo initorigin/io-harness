@@ -10524,17 +10524,24 @@ async fn dispatch(
         #[cfg(feature = "media")]
         VIEW_IMAGE_TOOL => {
             let path = s("path").unwrap_or_default();
-            // The extension decides the media type, and an unknown one is
+            // The extension decides the source media type, and an unknown one is
             // reported rather than guessed. Checked before the gate only because
-            // it costs nothing: the gate still runs for every path that could
-            // actually be read, so this cannot be used to probe for a file's
-            // existence outside the policy.
-            let Some(media_type) = crate::provider::Media::media_type_for(path) else {
+            // it costs nothing and reads nothing: the gate still runs for every
+            // path that could actually be read, so this cannot be used to probe
+            // for a file's existence outside the policy — and 0.55.0's decode,
+            // which does look at bytes, is inside the gated branch below.
+            //
+            // 0.55.0 widens this from the four wire types to every format the
+            // crate recognises. A format it cannot decode is refused by name
+            // further down, by `Media::attach`, rather than here with a list of
+            // four types that is a fact about vendors instead of about the file.
+            let Some(media_type) = crate::provider::Media::source_type_for(path) else {
                 return Ok(Dispatched::go(
                     "view_image unsupported type",
                     format!(
-                        "\n[view_image error] {path} is not an image this crate can send. \
-                         Supported: {}\n",
+                        "\n[view_image error] {path} is not an image this crate recognises. \
+                         It sends {}, and converts BMP, TIFF, ICO, TGA and PNM to PNG on the \
+                         way.\n",
                         crate::provider::IMAGE_MEDIA_TYPES.join(", ")
                     ),
                 ));
@@ -10562,7 +10569,8 @@ async fn dispatch(
                     .read_bytes(&target)
                     .map_err(|e| e.to_string())
                     .and_then(|bytes| {
-                        crate::provider::Media::image(media_type, &bytes).map_err(|e| e.to_string())
+                        crate::provider::Media::attach(media_type, &bytes)
+                            .map_err(|e| e.to_string())
                     }) {
                     Ok(media) => {
                         // The observation records what was sent, not the image:
@@ -10571,7 +10579,16 @@ async fn dispatch(
                         // long unattended runs this crate exists for.
                         let obs = format!(
                             "\n[view_image {target}] attached to the next request \
-                             ({media_type}, {} bytes, digest {})\n",
+                             ({}, {} bytes, digest {})\n",
+                            // 0.55.0 — a transcode says so, so a trace shows that
+                            // the bytes on the wire are not the bytes on disk. A
+                            // pass-through says nothing new, because nothing
+                            // happened to it.
+                            if media.media_type == media_type {
+                                media_type.to_string()
+                            } else {
+                                format!("{media_type} converted to {}", media.media_type)
+                            },
                             media.byte_len(),
                             media.digest()
                         );

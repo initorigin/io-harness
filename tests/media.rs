@@ -297,3 +297,90 @@ async fn a_file_that_is_not_an_image_is_reported_rather_than_guessed_at() {
     let second = &provider.requests()[1].user;
     assert!(second.contains("not an image"), "{second}");
 }
+
+// ---------------------------------------------------------------------------
+// F5 (0.55.0) — the tool accepts what the door accepts, and says what it did
+// ---------------------------------------------------------------------------
+
+/// A 2×2 24-bit BMP, header and all. Written out rather than generated, because
+/// this test crate has no image encoder — and a real file is what the claim is
+/// about anyway.
+const BMP: &[u8] = &[
+    0x42, 0x4d, 0x46, 0, 0, 0, 0, 0, 0, 0, 0x36, 0, 0, 0, 0x28, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 1,
+    0, 0x18, 0, 0, 0, 0, 0, 0x10, 0, 0, 0, 0x13, 0x0b, 0, 0, 0x13, 0x0b, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0xff, 0, 0, 0xff, 0, 0, 0, 0, 0, 0xff, 0, 0, 0xff, 0, 0, 0, 0,
+];
+
+#[tokio::test]
+async fn a_bmp_reaches_the_provider_as_a_png_and_the_trace_says_it_was_converted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("scan.bmp"), BMP).unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "not an image").unwrap();
+    let provider = Spy::new(vec![vec![view("scan.bmp")], vec![]]);
+    let store = store(&dir);
+
+    let result = run_with(
+        &contract(&dir),
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &io_harness::approve::ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    // Before 0.55.0 this was refused at the doorstep with the vendors' list of
+    // four types, and nothing was attached.
+    let attached: Vec<_> = provider
+        .requests()
+        .iter()
+        .flat_map(|r| r.media.clone())
+        .collect();
+    assert_eq!(attached.len(), 1, "the BMP reached a request");
+    assert_eq!(
+        attached[0].media_type, "image/png",
+        "and reached it as a PNG, because the wire set is still four"
+    );
+
+    let steps = store.steps(result.run_id).unwrap();
+    let obs: String = steps.iter().map(|s| s.result.as_str()).collect();
+    assert!(
+        obs.contains("image/bmp converted to image/png"),
+        "the trace shows the bytes on the wire are not the bytes on disk: {obs}"
+    );
+}
+
+#[tokio::test]
+async fn an_svg_is_refused_by_name_through_the_tool_and_attaches_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("diagram.svg"), b"<svg/>").unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "not an image").unwrap();
+    let provider = Spy::new(vec![vec![view("diagram.svg")], vec![]]);
+    let store = store(&dir);
+
+    let result = run_with(
+        &contract(&dir),
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &io_harness::approve::ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        provider.images_per_request().iter().all(|n| *n == 0),
+        "nothing was attached: {:?}",
+        provider.images_per_request()
+    );
+    let obs: String = store
+        .steps(result.run_id)
+        .unwrap()
+        .iter()
+        .map(|s| s.result.as_str())
+        .collect();
+    assert!(
+        obs.contains("SVG") && obs.contains("resvg"),
+        "the refusal names the format and the fix, not the vendors' list: {obs}"
+    );
+}
