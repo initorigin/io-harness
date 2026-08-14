@@ -8,7 +8,7 @@ tasks:
       orders by `created_at ASC, id ASC`, so the entry a workspace has leaned on longest is the
       first one dropped. Nothing else in the release matters if the store still curates by clock,
       and the aggregate is unaffordable on the write path without the index.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -53,7 +53,34 @@ tasks:
         store in both directions, which O4's cross-version gate is what proves.
     files:
       - src/state.rs
-    evidence: []
+      - src/lib.rs
+    evidence:
+      - >-
+        F1 `the_entry_many_runs_carried_survives_and_the_one_no_run_carried_goes`, F2
+        `one_long_run_does_not_outvote_three_short_ones`: both written first and both watched fail
+        against the old order, each evicting `k0` — the clock's pick — where the new order evicts
+        `k1` and `k5`. Both pass after the change.
+      - >-
+        F3 `with_no_recalls_at_all_the_order_is_exactly_the_write_clock` and F4
+        `a_pinned_entry_with_the_worst_score_is_still_never_a_candidate` passed before the change as
+        well as after, which is the point of them: they are the guards on the behaviour this
+        release must NOT move, and 0.10.0's `the_entry_count_cap_evicts_oldest_first_and_never_the_new_entry`
+        still passes unmodified beside them.
+      - >-
+        F5 `ranking_eviction_candidates_seeks_the_recalls_rather_than_scanning_them`: `EXPLAIN QUERY
+        PLAN` over `Store::MEMORY_CANDIDATES_SQL` itself — not a re-typed copy — on 64 entries and
+        9,984 recall rows names `memory_recalls_entry` and contains no `SCAN memory_recalls`. The
+        control asserts `step`, which is in no index, cannot be served from one.
+      - >-
+        `cargo test --lib` — 475 passed, 0 failed, 1 ignored. `cargo test --test memory --test
+        rewind --test determinism` — all green.
+      - >-
+        N3: the schema change is one `CREATE INDEX IF NOT EXISTS memory_recalls_entry ON
+        memory_recalls (workspace, key)`. No table, no column, `CHECKPOINT_FORMAT` unmoved.
+      - >-
+        `MemoryLimits` and `Store::memory_write_with` landed here rather than in T02, because
+        `enforce_memory_caps` needed the type to take its caps from. T02 adds the config and
+        contract plumbing that carries an operator's numbers into it.
   - id: US-IO-HARNESS-0.56.0-T02
     summary: "Make the three caps an operator key: `MemoryLimits` defaulting to the existing constants,
       a `[memory]` table in `io.toml`, project-scope narrowing, and the limits threaded to the
