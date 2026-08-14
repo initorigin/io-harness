@@ -115,7 +115,7 @@ impl Provider for OpenRouter {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
-        self.stream(request, &|_| {}).await
+        self.stream(request, &|_| {}, &|_, _| {}).await
     }
 
     async fn complete_streaming(
@@ -123,7 +123,16 @@ impl Provider for OpenRouter {
         request: CompletionRequest,
         on_token: &(dyn Fn(&str) + Send + Sync),
     ) -> Result<CompletionResponse> {
-        self.stream(request, on_token).await
+        self.stream(request, on_token, &|_, _| {}).await
+    }
+
+    async fn complete_streaming_calls(
+        &self,
+        request: CompletionRequest,
+        on_token: &(dyn Fn(&str) + Send + Sync),
+        on_call: &(dyn Fn(usize, &super::ToolCall) + Send + Sync),
+    ) -> Result<CompletionResponse> {
+        self.stream(request, on_token, on_call).await
     }
 }
 
@@ -135,6 +144,7 @@ impl OpenRouter {
         &self,
         request: CompletionRequest,
         on_token: &(dyn Fn(&str) + Send + Sync),
+        on_call: &(dyn Fn(usize, &super::ToolCall) + Send + Sync),
     ) -> Result<CompletionResponse> {
         #[cfg(feature = "media")]
         super::ensure_media_accepted(self.name(), self.accepts_images(), &request)?;
@@ -161,6 +171,7 @@ impl OpenRouter {
             sent,
             self.name(),
             on_token,
+            on_call,
         )
         .await
     }

@@ -295,6 +295,20 @@
 //! [`AgentDef`] can ask for its own worktree, so concurrent children stop
 //! overwriting each other's files.
 //!
+//! **Reads that start before the model stops talking.** A tool call inside a
+//! completion is complete long before the message is. When a provider implements
+//! [`Provider::complete_streaming_calls`] and reports a finished call while it is
+//! still streaming, a streaming session turn starts the read-only ones then
+//! rather than after — so the reads land in the time the model spends narrating
+//! what it is about to do. It is bounded by what can be taken back: only the
+//! completion's leading run of read-only calls, so a read never answers from
+//! before a write that has not run; only what the [`Policy`] allows outright, so
+//! no approver is asked about a turn that may be abandoned; and the result is used
+//! only if the finished completion carries that same call with the same
+//! arguments, otherwise it is discarded with nothing recorded. The trace and the
+//! observations are identical either way, and a provider that does not implement
+//! the method — including [`provider::Replay`] — starts nothing early.
+//!
 //! What none of it governs: a stdio MCP server and a registered [`Tool`] both
 //! run outside the sandbox with the privileges of whoever started them, and a
 //! provider-executed search or fetch is dialled by the provider, so no
