@@ -166,6 +166,52 @@ impl<A: Provider + Sync, B: Provider + Sync> Provider for Fallback<A, B> {
         }
     }
 
+    /// The same forwarding for the tool-call sink (0.54.0).
+    ///
+    /// Both providers are handed the same sink, and a failover therefore reports
+    /// the secondary's calls at indices the primary may already have reported.
+    /// Nothing here has to detect that: a speculated call is used only when the
+    /// **settled** completion carries the same name and byte-identical arguments
+    /// at that index, and after a failover the settled completion is the
+    /// secondary's. A call the two providers happen to agree on is the same call,
+    /// so reusing its result is right; one they disagree on fails the match and
+    /// is discarded. The cost of a fallover is a wasted read, never a wrong one.
+    async fn complete_streaming_calls(
+        &self,
+        request: CompletionRequest,
+        on_token: &(dyn Fn(&str) + Send + Sync),
+        on_call: &(dyn Fn(usize, &super::ToolCall) + Send + Sync),
+    ) -> Result<CompletionResponse> {
+        match self
+            .primary
+            .complete_streaming_calls(request.clone(), on_token, on_call)
+            .await
+        {
+            Ok(response) => {
+                self.note(1);
+                Ok(response)
+            }
+            Err(e) if worth_another_provider(&e) => {
+                tracing::warn!(
+                    primary = self.primary.name(),
+                    secondary = self.secondary.name(),
+                    error = %e,
+                    "provider failed mid-stream; falling over"
+                );
+                let out = self
+                    .secondary
+                    .complete_streaming_calls(request, on_token, on_call)
+                    .await;
+                self.note(if out.is_ok() { 2 } else { 0 });
+                out
+            }
+            Err(e) => {
+                self.note(0);
+                Err(e)
+            }
+        }
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

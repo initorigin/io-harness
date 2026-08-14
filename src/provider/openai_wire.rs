@@ -470,6 +470,7 @@ pub(crate) async fn parse_stream_with(
     sent: std::time::Instant,
     vendor: &str,
     on_token: &(dyn Fn(&str) + Send + Sync),
+    on_call: &(dyn Fn(usize, &ToolCall) + Send + Sync),
 ) -> Result<CompletionResponse> {
     let mut acc = Accumulator::since(sent).from(vendor);
     read_sse(resp, |data| {
@@ -481,6 +482,10 @@ pub(crate) async fn parse_stream_with(
                 on_token(delta);
             }
             acc.ingest(&value);
+            // 0.54.0 — after the ingest, never inside it: a call is complete
+            // when the accumulator says its fragments parse, which is a fact
+            // about the accumulated state rather than about this chunk.
+            acc.announce(on_call);
         }
         false
     })
@@ -510,6 +515,9 @@ struct Accumulator {
     reasoning: String,
     /// index -> (name, argument fragments joined)
     tool_calls: BTreeMap<u64, (String, String)>,
+    /// 0.54.0 — the calls already handed to `on_call`, so a call is reported
+    /// once however many more chunks arrive carrying its index.
+    announced: std::collections::BTreeSet<u64>,
     usage: Option<Usage>,
     /// 0.18.0 — the model that answered and why it stopped, both reported on
     /// chunks this accumulator already reads.
@@ -722,6 +730,17 @@ impl Accumulator {
         }
     }
 
+    /// Report the calls whose arguments are now complete (0.54.0).
+    ///
+    /// This wire sends no per-call end event — only a `finish_reason` on the
+    /// last chunk of the whole completion — which is exactly why the edge is the
+    /// parse in [`ready_call`](super::ready_call) rather than a signal from the
+    /// vendor. A rule built on Anthropic's `content_block_stop` would leave this
+    /// wire with nothing to speculate on at all.
+    fn announce(&mut self, on_call: &(dyn Fn(usize, &ToolCall) + Send + Sync)) {
+        super::announce_ready(&self.tool_calls, &mut self.announced, on_call);
+    }
+
     fn finish(self) -> CompletionResponse {
         let tool_calls = self
             .tool_calls
@@ -757,6 +776,129 @@ impl Accumulator {
 mod tests {
     use super::*;
     use crate::provider::ToolSpec;
+
+    /// A sink that records what was reported, for the 0.54.0 completeness edge.
+    fn recorder() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<(usize, ToolCall)>>>,
+        impl Fn(usize, &ToolCall) + Send + Sync,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = {
+            let seen = std::sync::Arc::clone(&seen);
+            move |at: usize, call: &ToolCall| seen.lock().unwrap().push((at, call.clone()))
+        };
+        (seen, sink)
+    }
+
+    /// F10 — a call is reported exactly once, when its fragments first parse as a
+    /// JSON object, and never on a prefix of one.
+    ///
+    /// The three shapes that break a scan for the first `}`: a brace inside a
+    /// string value, a nested object, and fragments split mid-multi-byte
+    /// character. Sabotage: treat the first `}` byte as the end of the arguments,
+    /// under which the first two report truncated arguments.
+    #[test]
+    fn a_call_is_reported_once_its_fragments_parse_and_never_before() {
+        for (label, fragments, expected) in [
+            (
+                "a brace inside a string",
+                vec![r#"{"pattern":"fn main() {"#, r#"}","path":"src"}"#],
+                json!({"pattern": "fn main() {}", "path": "src"}),
+            ),
+            (
+                "a nested object",
+                vec![r#"{"where":{"path":"#, r#""src"}}"#],
+                json!({"where": {"path": "src"}}),
+            ),
+            (
+                "split mid-multi-byte character",
+                vec![
+                    "{\"pattern\":\"caf\u{00e9}",
+                    "\u{2014}bar\"}",
+                ],
+                json!({"pattern": "café—bar"}),
+            ),
+        ] {
+            let (seen, sink) = recorder();
+            let mut acc = Accumulator::default();
+            acc.ingest(&json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"name":"grep","arguments":""}}]}}]}));
+            acc.announce(&sink);
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "{label}: a call with no arguments yet was reported"
+            );
+
+            for (i, fragment) in fragments.iter().enumerate() {
+                acc.ingest(&json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"function":{"arguments":fragment}}]}}]}));
+                acc.announce(&sink);
+                let reported = seen.lock().unwrap().len();
+                let last = i + 1 == fragments.len();
+                assert_eq!(
+                    reported,
+                    usize::from(last),
+                    "{label}: reported {reported} times after fragment {i}"
+                );
+            }
+
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[0].0, 0, "{label}: wrong position");
+            assert_eq!(seen[0].1.name, "grep", "{label}: wrong name");
+            assert_eq!(seen[0].1.arguments, expected, "{label}: wrong arguments");
+            assert_eq!(
+                seen[0].1.arguments,
+                acc.finish().tool_calls[0].arguments,
+                "{label}: what was reported early differs from what the completion settled on"
+            );
+        }
+    }
+
+    /// F10, second arm — an incomplete call blocks the ones after it, and the
+    /// positions handed out are the positions the response agrees with.
+    ///
+    /// A call whose name has not arrived yet is not "skippable": whether it will
+    /// become a real call decides what position every later call holds, and while
+    /// the stream is open that is not knowable. So nothing past it is reported.
+    /// The cost is a missed opportunity; the alternative is a position that the
+    /// settled completion disagrees with, which is a wrong file's bytes under
+    /// somebody else's call.
+    #[test]
+    fn an_incomplete_call_blocks_the_ones_after_it_until_it_is_whole() {
+        let (seen, sink) = recorder();
+        let mut acc = Accumulator::default();
+        // Index 0 has arguments but no name yet; index 1 is whole.
+        acc.ingest(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":"{}"}}]}}]}));
+        acc.ingest(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":1,"function":{"name":"find","arguments":"{\"glob\":\"*.rs\"}"}}]}}]}));
+        acc.announce(&sink);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a later call was reported over the top of an unfinished earlier one"
+        );
+
+        // The name arrives, and now both positions are decidable.
+        acc.ingest(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"function":{"name":"grep"}}]}}]}));
+        acc.announce(&sink);
+
+        let reported = seen.lock().unwrap().clone();
+        assert_eq!(reported.len(), 2, "both calls should now be reported");
+        assert_eq!(
+            reported.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+            vec![0, 1],
+            "reported out of position order"
+        );
+        let out = acc.finish();
+        assert_eq!(out.tool_calls.len(), 2);
+        for (at, call) in reported {
+            assert_eq!(
+                out.tool_calls[at], call,
+                "what was reported at {at} is not what the completion settled on"
+            );
+        }
+    }
 
     #[test]
     fn accumulates_tool_call_fragments_across_deltas() {

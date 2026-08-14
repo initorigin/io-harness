@@ -707,6 +707,85 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// The tool call accumulating at `key`, and the position it will hold in the
+/// finished completion — but only once its arguments are complete (0.54.0).
+///
+/// Both built-in wire accumulators join a call's argument fragments into a
+/// `String` as they arrive, keyed by the vendor's own block or call index. This
+/// is the one rule that decides when such a string has become a whole call, and
+/// it is deliberately the same rule for both: **the fragments parse as a JSON
+/// object.** Every proper prefix of a JSON object fails to parse — a truncated
+/// object is missing its closing brace, a truncated string its closing quote —
+/// so a successful parse cannot fire on half a call. That is what makes acting
+/// on the answer safe, and it needs nothing vendor-specific: the Anthropic wire
+/// has a per-block end event and the OpenAI wire has none, so a rule built on
+/// one of them would only ever work on one of them.
+///
+/// A call whose arguments never parse is never reported, which is the honest
+/// answer for the empty-argument case: Anthropic streams no `partial_json` at
+/// all for one, and an empty string is not an object. `finish` maps that to
+/// `{}` when it builds the response, and nothing is speculated on it.
+///
+/// The position counts only the calls `finish` will keep. Both accumulators drop
+/// every entry whose name never arrived, so counting raw keys would hand out a
+/// position the finished completion does not agree with — and a position the
+/// caller cannot trust is worse than no report at all.
+pub(crate) fn ready_call(
+    calls: &std::collections::BTreeMap<u64, (String, String)>,
+    key: u64,
+) -> Option<(usize, ToolCall)> {
+    let (name, args) = calls.get(&key)?;
+    if name.is_empty() {
+        return None;
+    }
+    let arguments = serde_json::from_str::<serde_json::Value>(args).ok()?;
+    if !arguments.is_object() {
+        return None;
+    }
+    let at = calls
+        .range(..key)
+        .filter(|(_, (name, _))| !name.is_empty())
+        .count();
+    Some((
+        at,
+        ToolCall {
+            name: name.clone(),
+            arguments,
+        },
+    ))
+}
+
+/// Hand every newly-complete tool call to `on_call`, in position order, once
+/// each (0.54.0).
+///
+/// **It stops at the first call that is not complete rather than skipping it.**
+/// A caller that received position 1 before position 0 could not use either: it
+/// has no way to know whether the gap will be filled by a call that simply has
+/// not finished arriving or by one that never had a name, and both are possible
+/// while the stream is open. Reporting strictly in order costs nothing on either
+/// built-in wire — both number their calls in the order they send them — and
+/// makes an out-of-order report a thing the harness never has to reason about.
+///
+/// Shared by both wire accumulators because the rule is theirs jointly. Each
+/// owns only the `announced` set that keeps it from reporting a call twice as
+/// further events land on the same block.
+pub(crate) fn announce_ready(
+    calls: &std::collections::BTreeMap<u64, (String, String)>,
+    announced: &mut std::collections::BTreeSet<u64>,
+    on_call: &(dyn Fn(usize, &ToolCall) + Send + Sync),
+) {
+    for key in calls.keys().copied() {
+        if announced.contains(&key) {
+            continue;
+        }
+        let Some((at, call)) = ready_call(calls, key) else {
+            return;
+        };
+        announced.insert(key);
+        on_call(at, &call);
+    }
+}
+
 /// (0.49.0) One turn of the conversation a request carries.
 ///
 /// Before 0.49.0 a request held one `system` string and one `user` string, so a
@@ -1313,6 +1392,95 @@ pub trait Provider {
             }
             Ok(response)
         }
+    }
+
+    /// Perform one completion, reporting each **finished** tool call as soon as
+    /// its arguments are complete rather than only when the whole completion is
+    /// (0.54.0).
+    ///
+    /// `on_token` behaves exactly as it does in
+    /// [`complete_streaming`](Provider::complete_streaming). `on_call` receives a
+    /// call's position in the finished completion together with the call itself,
+    /// once per call, in ascending position order and never past a gap — a call
+    /// is reported only when every call before it already has been, so the
+    /// position handed out is the position the returned [`CompletionResponse`]
+    /// agrees with.
+    ///
+    /// **The default reports no call at all** and delegates to
+    /// `complete_streaming`. That is what keeps every implementation written
+    /// before 0.54.0 compiling *and* behaving exactly as it did — including
+    /// `Record` and `Replay`, which override neither streaming method, so a
+    /// recorded or replayed run receives no early call by construction rather
+    /// than by anyone remembering to suppress one.
+    ///
+    /// A call is reported only once its accumulated arguments parse as a JSON
+    /// object; every proper prefix of one fails to parse, so a report cannot
+    /// fire on half a call. An implementation that reports a call it has not
+    /// finished receiving breaks that promise and nothing else checks it.
+    ///
+    /// The harness uses this to start read-only tool calls while the model is
+    /// still speaking. It acts on a reported call only if the finished response
+    /// carries that same call, with the same name and byte-identical arguments,
+    /// at that same position; anything else is discarded unused. Reporting a
+    /// call early therefore cannot make a run do something the completion did
+    /// not ask for — the worst an eager implementation costs is wasted work.
+    ///
+    /// ```
+    /// use io_harness::{CompletionRequest, CompletionResponse, Provider, ToolCall};
+    /// use std::sync::Mutex;
+    ///
+    /// /// A provider that answers with one tool call and reports it early.
+    /// struct Eager;
+    ///
+    /// impl Provider for Eager {
+    ///     async fn complete(&self, _request: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+    ///         Ok(CompletionResponse {
+    ///             tool_calls: vec![ToolCall {
+    ///                 name: "read_file".into(),
+    ///                 arguments: serde_json::json!({ "path": "README.md" }),
+    ///             }],
+    ///             ..Default::default()
+    ///         })
+    ///     }
+    ///
+    ///     async fn complete_streaming_calls(
+    ///         &self,
+    ///         request: CompletionRequest,
+    ///         _on_token: &(dyn Fn(&str) + Send + Sync),
+    ///         on_call: &(dyn Fn(usize, &ToolCall) + Send + Sync),
+    ///     ) -> io_harness::Result<CompletionResponse> {
+    ///         let response = self.complete(request).await?;
+    ///         for (at, call) in response.tool_calls.iter().enumerate() {
+    ///             on_call(at, call);
+    ///         }
+    ///         Ok(response)
+    ///     }
+    /// }
+    ///
+    /// # async fn demo() -> io_harness::Result<()> {
+    /// let seen = Mutex::new(Vec::new());
+    /// let response = Eager
+    ///     .complete_streaming_calls(
+    ///         CompletionRequest::default(),
+    ///         &|_| {},
+    ///         &|at, call: &ToolCall| seen.lock().unwrap().push((at, call.name.clone())),
+    ///     )
+    ///     .await?;
+    ///
+    /// // What was reported early is what the completion settled on. A harness
+    /// // acting on anything else would be acting on a call the model never made.
+    /// assert_eq!(*seen.lock().unwrap(), vec![(0, "read_file".to_string())]);
+    /// assert_eq!(response.tool_calls[0].name, "read_file");
+    /// # Ok(()) }
+    /// ```
+    fn complete_streaming_calls(
+        &self,
+        request: CompletionRequest,
+        on_token: &(dyn Fn(&str) + Send + Sync),
+        on_call: &(dyn Fn(usize, &ToolCall) + Send + Sync),
+    ) -> impl std::future::Future<Output = Result<CompletionResponse>> {
+        let _ = on_call;
+        self.complete_streaming(request, on_token)
     }
 
     /// What this provider can run, as its own catalogue describes it (0.29.0).
