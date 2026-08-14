@@ -13,9 +13,9 @@ release_fit:
       classification in front of `Workspace::read_file`, whose whole body today is
       `std::fs::read_to_string(abs).unwrap_or_default()`.
     - >
-      The premises were checked against the source before the contract was written rather than
-      taken from the roadmap, and one was wrong: a binary read does not return mojibake, it returns
-      an empty string, which is worse and changes what F6 has to assert. The other check found that
+      The premises were checked against the source before the contract was written rather than taken
+      from the roadmap, and one was wrong: a binary read does not return mojibake, it returns an
+      empty string, which is worse and changes what F6 has to assert. The other check found that
       `image` is already an optional dependency reached through `barcode`, which is what makes the
       whole image half satisfy the no-new-dependency constraint by construction instead of by
       argument.

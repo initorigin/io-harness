@@ -1351,7 +1351,7 @@ versions:
       two stated reasons — over the operator's ceiling, or over what this run's remaining budget can
       carry — and the error says which, because they call for different answers.
     detail: specified
-    status: planned
+    status: released
   - version: 0.56.0
     outcome: >
       What a run learns is kept for its value rather than for its age, is reachable from more than

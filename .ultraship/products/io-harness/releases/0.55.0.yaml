@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.55.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -495,3 +495,183 @@ open_questions:
   names and the ones an operator actually hands over; the other three are three lines of match arm
   each and one fixture each. They are included because the marginal cost is a fixture, and they are
   the first thing dropped if the fixtures prove awkward.
+released_at: 2026-08-14T00:00:00Z
+mode: published
+delivered: >
+  An operator hands the harness a file and gets one of three honest answers instead of a silent
+  wrong one. `read_file` classifies before it decodes — text with the encoding it was decoded
+  from, an image or a document named and routed to the tool that opens it, and anything else named
+  as binary with its size and its sniffed kind. A read that will not fit returns no content at all,
+  naming the path, the size, the ceiling, which of the two ceilings that was, and both ways
+  forward; `offset` and `limit` in lines make the offered remedy real, and a stored read that is
+  later squeezed becomes a stub rather than a fragment. `[run] max_read_chars` makes the ceiling a
+  number an operator chose instead of one that moves as the run spends.
+
+  On the image side the accepted set at the door widened while the set on the wire stayed exactly
+  the four every provider documents. `Media::attach` passes those four through byte-identically and
+  converts BMP, TIFF, ICO, TGA and PNM to PNG; SVG, HEIC and AVIF are refused by name, with the
+  reason and a one-line conversion, and a PDF is routed to `pdf_read`.
+
+  Two silent-wrong-answer defects are closed by it. A binary read used to return `Ok("")` — the
+  same answer a file that does not exist gives — and an oversized read used to return a tail
+  wearing the shape of a whole file.
+evidence:
+  tests:
+  - >
+    **Default suite: 85 binaries, 1,727 passed, 0 failed.** `cargo test --no-fail-fast`, exit 0.
+    0.54.0 was 84 / 1,702 — one new binary (`tests/read_typing.rs`) and 25 new tests.
+  - >
+    **`tests/read_typing.rs` — 16 passed, 0 failed.** F6 (`a_binary_file_is_named_with_its_size_and_kind`,
+    `the_text_reader_now_fails_where_it_used_to_return_an_empty_string`,
+    `through_the_loop_a_binary_read_carries_no_content`), F7
+    (`utf16_is_decoded_and_the_encoding_is_named`,
+    `utf16_without_a_byte_order_mark_is_binary_rather_than_guessed`,
+    `through_the_loop_a_utf16_read_says_which_encoding_it_was`), F8
+    (`an_image_is_routed_to_the_tool_that_can_look_at_it`, `a_document_names_the_tool_that_reads_it`,
+    `an_svg_is_text_because_it_is_text`,
+    `through_the_loop_an_image_read_carries_no_content_and_names_the_route`), F9
+    (`a_read_that_will_not_fit_returns_none_of_the_file`,
+    `the_offered_range_actually_works_on_the_file_that_was_refused`), F10
+    (`the_two_ceilings_produce_two_different_refusals`) and F11
+    (`a_range_read_returns_exactly_the_lines_asked_for`,
+    `a_range_beyond_the_end_is_an_error_naming_the_total`).
+  - >
+    **`tests/context.rs` — 24 passed, 0 failed** under a full `cargo test`. F12's two halves:
+    `a_read_that_no_longer_fits_is_a_stub_and_not_a_tail` (all three sentinels absent) and
+    `a_search_and_a_command_are_still_bounded_rather_than_refused` (the negative half).
+  - >
+    **`tests/config.rs` — 54 passed, 0 failed.** F13:
+    `max_read_chars_reaches_the_contract_through_the_ordinary_projection`,
+    `a_key_misspelled_beside_it_is_still_refused_by_name`,
+    `a_project_scoped_file_may_lower_the_read_ceiling_and_may_not_raise_it`.
+  - >
+    **`cargo test --lib --features media media_tests` — 14 passed, 0 failed.** F1 (five formats, each
+    asserted separately: PNG signature and a 3x2 round trip), F2 (four wire types byte-identical), F3
+    (SVG/HEIC/AVIF/PDF named with a remedy and asserted NOT to contain `expected one of`), F4 (the
+    wire gate unchanged), N5 (a 40000x40000 BMP header refused from the header parse).
+  - >
+    **`cargo test --test media --features media` — 9 passed, 0 failed.** F5's two halves through the
+    loop: a BMP arrives as one `image/png` on the request with `image/bmp converted to image/png` in
+    the trace, and an SVG attaches nothing and is refused naming SVG and `resvg`.
+  - >
+    **Doctests: 437 passed, 0 failed** (`cargo test --doc --features media`). Every new public item
+    carries a worked example: `TextEncoding`, `FileContent`, `FileContent::refusal`,
+    `TaskContract::with_max_read_chars`, `Media::attach`, `Media::source_type_for`.
+  - >
+    **Cross-version gate (O6): 1 passed.** `cargo build --manifest-path
+    tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0 -- --ignored`.
+  - >
+    **Sabotage pass: 11 arms, every one killed at least one test. None failed nothing.** S1 (relabel
+    the source bytes `image/png` without decoding) killed 2; S2 (re-encode the four wire types too)
+    killed exactly `the_four_wire_types_are_passed_through_byte_identically`; S3 (fall back to the
+    vendors' list) killed exactly `an_undecodable_format_is_refused_by_name_with_a_remedy`; S5 (keep
+    the narrow wire table as the doorstep check) killed both `tests/media.rs` 0.55.0 tests; S6
+    (restore `unwrap_or_default`) killed 4; S7 (decode UTF-16 with no byte-order mark) killed 10; S8
+    (no routing for image/document extensions) killed 3; S9 (truncate instead of refusing) killed 3;
+    S10 (one message for both ceilings) killed exactly
+    `the_two_ceilings_produce_two_different_refusals`; S11 (`offset` off by one) killed 2; S12 (the
+    stub rule applied to every `ObsKind`) killed the negative half exactly as F12 predicted; S13
+    (drop the project-scope narrowing) killed exactly
+    `a_project_scoped_file_may_lower_the_read_ceiling_and_may_not_raise_it`. Logs in
+    `evidence/0.55.0/sab-*.log`.
+  builds:
+  - >
+    **`cargo fmt --check` — exit 0**, run against the shipped tree after the last source edit.
+  - >
+    **`cargo clippy --all-targets -- -D warnings` — exit 0 on all three polarities** (O7): the
+    default build, `--features media`, and `--all-features`. Two lints were fixed to get there:
+    `manual_is_multiple_of` in the UTF-16 length check, and `too_many_arguments` on
+    `Speculation::new`, which gained the `#[allow]` the other 26-argument functions in `run.rs`
+    already carry.
+  - >
+    **`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0**
+    (O5), clean on the first attempt. It has caught something in six of the last seven releases; this
+    is the seventh and it found nothing.
+  - >
+    **`cargo package --locked` — 1,844,963 bytes** (0.54.0: 1,817,509).
+  - >
+    **`cargo tree` — 402 lines, unchanged** (N1). `cargo tree --features media` is 438: 21 crates
+    added — `image`, `png`, `tiff`, `zune-jpeg`, `zune-core`, `weezl`, `fax`, `flate2`,
+    `miniz_oxide`, `fdeflate`, `adler2`, `simd-adler32`, `crc32fast`, `bytemuck`, `byteorder-lite`,
+    `half`, `moxcms`, `pxfm`, `quick-error`, `zerocopy`, `zerocopy-derive` — none of them a `-sys`
+    crate and none needing a C toolchain.
+  - >
+    **No durable state (N4).** `git diff main -- src/state.rs` is empty and `CHECKPOINT_FORMAT` is
+    unmoved at 7.
+  - >
+    **`docs/public-api.txt` unchanged (N2), which is the `+0` branch the criterion predicted.** The
+    two new types are re-exported from `tools`, not from the crate root, and the file tracks
+    crate-root re-exports only. `cargo test --test public_api` — 9 passed.
+  - >
+    **Doc gates: `docs_drift` 15 passed, `guide_pages` 7 passed, `changelog` 5 passed.**
+  - >
+    **Measurement (N5), recorded and not asserted.** `cargo run --release --features media --example
+    transcode_cost` on an Apple M1, macOS 26.5.2, 512x512: pass-through 0.01 ms (JPEG) and 0.14 ms
+    (PNG); BMP 2.55 ms, TIFF 1.75 ms, TGA 2.18 ms, PNM 2.06 ms. An uncompressed BMP of 1,048,698
+    bytes leaves as a 295,476-byte PNG. In `docs/MEASUREMENTS.md`.
+  reviews:
+  - >
+    Every premise the roadmap entry stated was checked against the source before the contract was
+    written, and one was wrong: a binary read does not return mojibake, it returns an empty string
+    (`std::fs::read_to_string(abs).unwrap_or_default()`), which is indistinguishable from a file
+    that does not exist. F6 was written against the real defect rather than the described one.
+  - >
+    A second premise check changed the whole dependency argument: `image` was already an optional
+    dependency of this crate, reached through `barcode`, so widening the accepted set adds no entry
+    to `[dependencies]` and leaves the default tree at 402 by construction rather than by argument.
+  - >
+    Two pre-existing tests asserted the behaviour this release replaces and were changed in meaning
+    rather than in wording: `every_observation_kind_is_bounded_where_it_enters_the_context` now
+    asserts the read is refused whole, with the other five kinds as its control, and
+    `a_sub_agent_loops_prompt_stays_inside_the_ceiling` uses files that fit a single read, because a
+    file no read could carry is F9's claim rather than that test's.
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **The all-features suite did not complete locally, and ran on CI instead.** `cargo test
+  --all-features --no-fail-fast` reached 39 of its binaries — 995 passed, 0 failed — and then died
+  with `no space left on device`: an all-features target for this crate is ~20 GB and this machine
+  had 14 GiB after a clean, with a sibling repository's `target/` holding 37 GB. Nothing was failing
+  when it stopped. The gate therefore runs on the release PR's three-platform matrix, which is the
+  0.53.0 rule — a record may honestly say a gate ran on CI rather than locally, provided it says so.
+  This entry says so.
+- >
+  **Document reads are still bounded to a tail.** `xlsx_read`, `docx_read`, `pptx_read` and
+  `pdf_read` return a rendering of a file rather than the file, they were not in this release's
+  `scope.included`, and they keep `bound`'s tail-preserving behaviour. The same argument that makes
+  a truncated `read_file` a lie applies to them more weakly and not not at all; it is a candidate
+  for a later version rather than an oversight.
+- >
+  **A `[profile]` block can still set `max_read_chars` outright at project scope.** The narrowing
+  rule is applied where a scope's own table is merged, and `with_profile` overlays a profile after
+  every scope has been folded together, so the scope its keys came from is no longer knowable there.
+  A project-scoped profile therefore sets the key rather than only lowering it. The budget-derived
+  ceiling still applies to every read regardless, so this cannot widen the effective boundary past
+  what the run's budget allows — it is a gap in the narrowing rule, not in the ceiling.
+- >
+  **`view_image`'s transcode note carries the source type, the wire type, the PNG byte count and the
+  digest — not the decoded dimensions** that `scope.included` mentioned. Reporting dimensions would
+  have meant changing what `Media::attach` returns for one line of prose. Stated rather than
+  glossed; F5, which is the criterion, asks for the source type, the byte count and the digest, and
+  all three are there.
+- >
+  **S7's sabotage failed far more than the criterion predicted, and that is a finding.** Decoding
+  UTF-16 without requiring a byte-order mark killed 10 tests rather than F7's one, because any
+  even-length ASCII file then decodes into UTF-16 nonsense. The byte-order-mark check is load-bearing
+  for every text read in the crate, not only for the UTF-16 ones.
+- >
+  **A sabotage script must assert its own edit applied.** S13's first attempt silently matched
+  nothing — `cargo fmt` had joined the `merge(...)` call onto one line after the pattern was written
+  — and the suite passed. A sabotage that did not apply is indistinguishable from a guard that
+  protects nothing. The rerun asserted the pattern first and killed the named test.
+- >
+  **The record was sealed before the crates.io upload**, which follows the two merges and the GitHub
+  Release under the standing flow.
+- >
+  **A charset detector is deliberately absent.** UTF-16 without a byte-order mark, and every
+  single-byte legacy encoding, is `Binary` — named, with its size, rather than guessed at. Adding a
+  detector is a new dependency and a new class of confident wrong answer.
+supersedes: 0.54.0
+next_recommended_version: 0.56.0
+immutable: true
