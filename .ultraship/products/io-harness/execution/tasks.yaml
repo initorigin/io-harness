@@ -288,7 +288,7 @@ tasks:
     states the four-type set as the whole story about images. Shipping the new behaviour with those sentences
     standing would be shipping a documented lie, and the two behaviour changes are only discoverable if
     the changelog names them.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.55.0-T06
   acceptance_criteria:
@@ -324,9 +324,36 @@ tasks:
   - docs/CONTRACT.md
   - docs/CAPABILITIES.md
   - docs/MEASUREMENTS.md
-  - docs/public-api.txt
   - docs/guide/tools-and-skills.md
   - docs/guide/configuration.md
+  - docs/guide/images-and-git.md
   - CHANGELOG.md
+  - Cargo.toml
   - src/lib.rs
-  evidence: []
+  - examples/transcode_cost.rs
+  evidence:
+  - 'O3: `docs/CONTRACT.md` gains two 0.55.0 sections — ''What a read returns, and what it will not return
+    instead'' and ''What the image door accepts, and what the wire still refuses''. Both state the rule
+    where the old one stood, including the two ceilings, the stub rule, and the explicit carve-out that
+    every other observation kind is still bounded.'
+  - 'O4: README (feature table + the loop paragraph), `src/lib.rs` crate prose and feature table, `docs/CAPABILITIES.md`
+    (built-in tools and images bullets), `docs/guide/tools-and-skills.md` (a new ''What read_file gives
+    back'' section), `docs/guide/configuration.md` (`max_read_chars` in the `[run]` block plus why its
+    absence is not simply a default and why it is the one key a project file may only lower), `docs/guide/images-and-git.md`
+    (door vs wire, the refused-by-name list, the pixel bound), `docs/MEASUREMENTS.md` (the transcode table),
+    and the CHANGELOG entry with Added/Changed/Fixed and both behaviour changes named under Changed and
+    Fixed rather than left in a bullet list.'
+  - 'N2: `docs/public-api.txt` is **unchanged**, which is the `+0` branch the criterion predicted. `FileContent`
+    and `TextEncoding` are re-exported from `tools`, not from the crate root, and the file tracks crate-root
+    re-exports only; `MAX_IMAGE_PIXELS` sits beside `MAX_IMAGE_BYTES`, which is likewise not a root re-export.
+    `cargo test --test public_api` — 9 passed.'
+  - 'N3: no signature changed and nothing fails to compile; the two behaviour changes are named in the
+    changelog under headings and in `docs/CONTRACT.md`.'
+  - 'Measurement: `examples/transcode_cost.rs`, new, `required-features = ["media"]`. On an Apple M1,
+    release, 512x512: pass-through 0.01-0.14 ms; BMP 2.55, TIFF 1.75, TGA 2.18, PNM 2.06 ms. Recorded,
+    never asserted.'
+  - '`examples/media_git_live` dropped its `barcode` requirement, which existed only to pull `image` in;
+    `media` now carries it.'
+  - 'Gates: `cargo test --test docs_drift --test guide_pages --test changelog` — 15 + 7 + 5 passed. `cargo
+    test --doc --features media` — 437 passed after fixing one new doctest whose ''binary'' fixture was
+    accidentally valid UTF-8.'

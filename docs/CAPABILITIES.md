@@ -74,10 +74,15 @@ it, not when a release merely touched it.
 - **Long-running autonomous tasks** — unattended and crash-resumable
 - **Extensibility** — an MCP client over stdio and streamable HTTP, in-process
   `Tool` implementations, and markdown skills
-- **Built-in tools** — filesystem, grep and find over a policy-scoped workspace
+- **Built-in tools** — filesystem, grep and find over a policy-scoped workspace,
+  where a read returns the file, the line range it asked for, or a refusal naming
+  the size and the ceiling — never a shortened file that looks like a whole one
 - **Documents** — spreadsheets, Word, PowerPoint text, PDF and barcode decoding,
   each behind its own cargo feature, all off by default
-- **Images** — passthrough to any provider whose model accepts one
+- **Images** — passthrough to any provider whose model accepts one, with BMP,
+  TIFF, ICO, TGA and PNM converted to PNG at the door, and the formats needing a
+  decoder this crate does not carry refused by name with the conversion that
+  fixes them
 - **Git** — status, diff, log, add, commit, branch and worktree as fixed-argv
   built-ins, so a run ends as a reviewable commit on a branch of its own
 

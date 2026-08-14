@@ -85,7 +85,9 @@ impl TextEncoding {
 /// # fn demo() -> io_harness::Result<()> {
 /// let dir = tempfile::tempdir()?;
 /// std::fs::write(dir.path().join("notes.md"), "hello\n")?;
-/// std::fs::write(dir.path().join("blob.bin"), [0x7f, b'E', b'L', b'F', 0x02])?;
+/// // A lone 0x80 is not valid UTF-8 in any position, and the bytes before it
+/// // say what the file is.
+/// std::fs::write(dir.path().join("blob.bin"), [0x7f, b'E', b'L', b'F', 0x80])?;
 /// let ws = Workspace::new(dir.path());
 ///
 /// assert_eq!(

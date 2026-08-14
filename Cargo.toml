@@ -249,16 +249,23 @@ xlsx = ["dep:calamine", "dep:rust_xlsxwriter", "dep:umya-spreadsheet"]
 name = "documents_live"
 required-features = ["documents"]
 
-# 0.15.0's live run. `barcode` is here only for the `image` crate, which the
-# example uses to write its PNG fixture — the image capability itself never
-# decodes an image, it encodes and forwards one.
+# 0.15.0's live run. It uses the `image` crate to write its PNG fixture. Until
+# 0.55.0 that meant declaring `barcode` here, which was the only feature pulling
+# `image` in; `media` now carries it, so the second feature is gone and the
+# declaration says what the example actually needs.
 [[example]]
 name = "media_git_live"
-required-features = ["media", "barcode"]
+required-features = ["media"]
 
 # The fake browser the suite spawns. Declared so `cargo build --all-targets` on
 # the default build skips it rather than compiling a fixture for a feature that
 # is off.
+# 0.55.0's measurement. `media` alone now carries the image decoders, so this
+# needs no second feature to have one.
+[[example]]
+name = "transcode_cost"
+required-features = ["media"]
+
 [[example]]
 name = "browser_fixture"
 required-features = ["browser"]

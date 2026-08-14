@@ -123,7 +123,10 @@ dependency tree is held deliberately small.
 
 **The loop.** A [`TaskContract`] names the goal, the subject, and — optionally —
 the criterion. Workspace mode gives the agent `grep`, `find`, `read_file`,
-`write_file`, `edit_file` and `patch_file` across a repository root. Single-file
+`write_file`, `edit_file` and `patch_file` across a repository root. A read
+returns the file, the range of lines it asked for, or a refusal saying why —
+never a shortened file wearing the shape of a whole one, and never an empty
+string for a binary. Single-file
 mode edits one file. A change touching four places in one file is one
 `patch_file` call taking a unified diff — applied as a unit or not at all, so a
 patch that no longer fits is refused with the hunk named rather than half
@@ -479,7 +482,7 @@ dependency at all.
 
 | Feature | What it adds |
 | --- | --- |
-| `media` | Image passthrough to providers that accept images |
+| `media` | Images to providers that accept them: the four types they document, plus BMP/TIFF/ICO/TGA/PNM converted to PNG on the way |
 | `documents` | Umbrella over the five below |
 | `xlsx` | Spreadsheet read, generate, and preserving single-cell edit |
 | `docx` | Word read and generate (no in-place edit, deliberately) |
