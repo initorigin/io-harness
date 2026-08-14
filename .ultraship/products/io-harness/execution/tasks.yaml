@@ -1,348 +1,266 @@
 product: io-harness
-version: 0.53.0
+version: 0.54.0
 tasks:
-- id: US-IO-HARNESS-0.53.0-T01
-  summary: Write the CDP client — NUL framing, id correlation, an event route that stays live while a
-    request is outstanding — over AsyncRead + AsyncWrite, with the fixture browser that misbehaves on
-    purpose.
-  why_required: Every other task in the release sends a request through this client. A client that correlates
-    by arrival order deadlocks the moment a page emits events mid-request, which every real page does,
-    so the fixture that floods events and answers out of order is written before the client it tests.
-  status: done
+- id: US-IO-HARNESS-0.54.0-T01
+  summary: Give `Provider` a third defaulted method that reports a finished tool call, and derive completeness
+    from a successful JSON-object parse in both wire accumulators.
+  why_required: 'Nothing else in the release can start: a tool call reaches the run loop only inside the
+    finished `CompletionResponse` today, because `complete_streaming`''s sink is `&(dyn Fn(&str) + Send
+    + Sync)`. The default has to be silence, or every out-of-tree `Provider`, `Record` and `Replay` changes
+    behaviour without being recompiled.'
+  status: todo
   depends_on: []
   acceptance_criteria:
-  - '**F1 — the client frames on NUL and survives arbitrary chunking.** The bytes the client writes for
-    a known request are asserted exactly: one JSON object followed by a single `0x00`, with no length
-    header and no newline framing. Reading is asserted symmetrically over a stream that delivers three
-    messages in chunks split mid-object and mid-multi-byte-character, and over one message arriving in
-    a single chunk with two others. Sabotage: frame on newline instead of NUL, under which the chunked
-    cases and a message whose payload contains a newline fail, and nothing else here does.
+  - '**F10 — the completeness edge is a parse, and it is right on the cases that break a guess.** Four
+    argument shapes are each started exactly once and with exactly the streamed bytes: one containing
+    a `}` inside a string value, one containing a nested object, one that is empty (`{}`, and the Anthropic
+    case where an empty-argument call streams no fragment at all — `src/provider/anthropic.rs:786`), and
+    one whose fragments split mid-multi-byte character. Sabotage: treat the first `}` byte as the end
+    of the arguments, under which the string and nested cases start with truncated arguments and only
+    these fail.
 
     '
-  - '**F2 — a response is matched to its request by `id` while events flood in.** Two requests are outstanding;
-    the fixture sends a burst of unsolicited events, answers the **second** request, more events, then
-    the first. Each call receives its own answer, neither event is returned as one, and the events still
-    reach the console drain. Sabotage: take the next message as the answer, under which both calls receive
-    the wrong value and only this fails.
+  - '**N3 — no compile break for any `Provider` implementation.** The new method is defaulted; an out-of-tree
+    provider written against 0.20.0 compiles and runs unchanged, asserted by `tests/public_api.rs` and
+    by an in-suite provider that implements only `complete`.
+
+    '
+  - '**N1 — no new dependency.** `cargo tree` is 402 lines, unchanged. The whole release is `serde_json`
+    and `tokio`, both already present.
 
     '
   files:
-  - src/browser.rs
-  - tests/browser.rs
-  - examples/browser_fixture.rs
-  evidence:
-  - 'src/browser.rs — the CDP client over AsyncRead + AsyncWrite: NUL framing, id correlation, an event
-    route that stays live while a request is outstanding.'
-  - 10 unit tests over tokio::io::duplex pass, including a message split mid-object and mid-multi-byte-character,
-    two messages in one chunk, a payload containing a newline, and answers returned in reverse order through
-    a flood of events.
-  - The framing, the startup failure mode and the `Uncaught` field were measured against the installed
-    browser in a spike BEFORE the contract was written, not discovered here.
-- id: US-IO-HARNESS-0.53.0-T02
-  summary: 'Launch the browser over a pipe pair on descriptors 3 and 4: binary resolution, the Act::Exec
-    spawn gate, kill-on-drop, the temporary profile, and the typed Windows refusal.'
-  why_required: The client is useless without a child to speak to, and the ways a child goes wrong — never
-    started, started and denied, outliving its run — are the release's safety claims rather than its plumbing.
-  status: done
+  - src/provider/mod.rs
+  - src/provider/anthropic.rs
+  - src/provider/openai_wire.rs
+  - src/provider/openai.rs
+  - src/provider/openrouter.rs
+  - src/provider/compatible.rs
+  - tests/speculative_reads.rs
+  evidence: []
+- id: US-IO-HARNESS-0.54.0-T02
+  summary: Start the completion's leading read-only run from `stream_completion`, bounded by `max_parallel_reads`
+    and by the `Policy` allowing the call outright.
+  why_required: This is the release's outcome. The prefix rule and the outright-allow rule are the two
+    halves of its safety argument, and both are decided here rather than at the fold.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.53.0-T01
+  - US-IO-HARNESS-0.54.0-T01
   acceptance_criteria:
-  - '**F8 — no browser process survives the run.** After a run that started a browser ends — normally,
-    and by being dropped mid-action — the child process is gone, asserted on the process rather than on
-    a shutdown call having been issued, and the temporary user-data directory is removed. Sabotage: remove
-    the kill-on-drop, under which the dropped-run arm fails and only this fails.
+  - '**F1 — a read-only call runs while the stream is still open.** A scripted provider emits call 0''s
+    name and complete arguments, then holds the stream open on a barrier it shares with the tool. The
+    tool completes only if it was started before the provider returned; the provider returns only after
+    the tool started. Under serial execution the pair cannot both proceed, and the test fails on a bounded
+    wait rather than hanging. **No duration is asserted.** Sabotage: emit the call sink only at stream
+    end, under which F1''s rendezvous times out and only F1 fails.
 
     '
-  - '**F9 — a browser that is not installed is a refusal naming it, never a download.** A configured binary
-    that does not exist produces a typed configuration error naming the binary, no process is spawned,
-    and no network request of any kind is made by the crate. Sabotage: fall back to the first name on
-    the PATH list when the configured binary is missing, under which the naming assertion fails and only
+  - '**F2 — speculation stops at the first call that is not read-only.** A completion of `[read_file,
+    write_file, read_file]` speculates the first call and neither of the others, asserted on a probe that
+    records which invocations happened before the provider returned. The second `read_file` is executed
+    after the write, and observes the written bytes. Sabotage: use 0.41.0''s maximal-run rule instead
+    of the prefix rule, under which the trailing `read_file` runs early and returns the pre-write content
+    — a wrong *value*, not merely a wrong order — and only this fails.
+
+    '
+  - '**F6 — no approver is asked about an unsettled completion, and a grey-tier call is not speculated.**
+    Under a policy that asks on a read of one path, an approver that records the order and the moment
+    it was consulted is consulted exactly once, after the completion returned, at the serial gate; the
+    tool''s invocation probe shows no early run. The permitted path in the same completion, when it precedes
+    the grey one, **is** speculated — both halves in one test, since the claim is the distinction. Sabotage:
+    speculate on any decision that is not an outright deny, under which the grey call runs early and only
     this fails.
 
     '
-  - '**F11 — on Windows the feature refuses cleanly.** Every entry point returns a typed configuration
-    error naming the platform, no process is spawned, and the rest of the crate is unaffected. Asserted
-    on the Windows leg of the matrix, which is the only place it can be.
+  - '**F7 — a denied read is never executed early.** A policy denying a path, with the file''s contents
+    made observable by a probe, asserts the file was never opened during the stream, that the serial gate
+    produced the refusal observation it always produced, and that the refusal decision is unchanged. Sabotage:
+    skip the policy pre-test and speculate every read-only call, under which the probe fires and only
+    this fails.
+
+    '
+  - '**F9 — `with_max_parallel_reads(1)` turns speculation off with the batch.** The same case, same provider,
+    produces no early invocation and no `Speculated` event, and its trace equals the serial trace of F3.
+    Sabotage: gate speculation on the provider''s capability alone rather than on the cap, under which
+    the early invocation happens at a cap of 1 and only this fails.
 
     '
   files:
-  - src/browser.rs
-  - src/error.rs
-  - tests/browser.rs
-  evidence:
-  - 'src/browser.rs — launch over descriptors 3 and 4: both ends moved above 3/4 with F_DUPFD before dup2,
-    because duplicating straight onto them can clobber a pipe end.'
-  - Resolution, the shared Act::Exec spawn gate, a temporary profile the run removes, kill-on-drop, and
-    a typed Windows refusal.
-  - tests/browser.rs::a_missing_browser_is_a_refusal_naming_it and ::a_denied_browser_binary_starts_no_process
-    pass; the second asserts on the fixture never recording a start, not on the error text.
-- id: US-IO-HARNESS-0.53.0-T03
-  summary: Gate every document navigation at the paused request against the run's own Policy, and wire
-    browser_navigate on top of it.
-  why_required: This is the release's central claim. A browser that reaches any host the policy denies
-    is not a bounded capability, and the gate has to sit at the request for the claim to survive a navigation
-    the model did not type.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.53.0-T02
-  acceptance_criteria:
-  - '**F3 — a navigation to a denied host is stopped at the request and the run is told why.** Under a
-    policy permitting one host and denying another, `browser_navigate` at the denied host produces a refusal
-    observation naming the act, the target and the rule, the fixture records that the request was **failed
-    rather than continued**, and a `BrowserNavigated { permitted: false }` event is written. The permitted
-    host in the same run continues and loads. Both halves in one test, since the claim is the distinction.
-    Sabotage: continue every paused request, under which the denied half fails and only this fails.
-
-    '
-  - '**F4 — a navigation the model did not type is gated by the same mechanism.** A click on a link whose
-    target is a denied host, and a script-initiated navigation to one, are both stopped at the request
-    with the same event and the same refusal, with no `browser_navigate` call anywhere in the run. Sabotage:
-    gate the `browser_navigate` argument instead of the paused request — under which **F4 fails and F3
-    still passes**, which is the point of having both.
-
-    '
-  files:
-  - src/browser.rs
-  - src/tools/browser.rs
   - src/run.rs
-  - tests/browser.rs
-  evidence:
-  - Every document navigation is paused and answered from the run's own Policy, from inside the message
-    loop — the only place that sees a navigation the model did not type.
-  - tests/browser.rs::a_navigation_to_a_denied_host_is_failed_at_the_request_and_a_permitted_one_continues
-    asserts on the fixture's own record of `continue R1` and `fail R2 BlockedByClient`.
-  - tests/browser.rs::a_navigation_a_click_causes_is_refused_by_the_same_gate makes NO browser_navigate
-    call at all and still records the refusal.
-- id: US-IO-HARNESS-0.53.0-T04
-  summary: browser_read, and the console and page-error capture that rides every action's observation.
-  why_required: Reading the rendered page is the outcome's first half, and an action whose console output
-    is discarded tells the model nothing about why the page did not change.
-  status: done
+  - tests/speculative_reads.rs
+  evidence: []
+- id: US-IO-HARNESS-0.54.0-T03
+  summary: Use a speculated result only when the settled completion asks for that call, at that index,
+    with the same name and byte-identical arguments; discard everything otherwise, including across a
+    retry and a `Fallback` failover.
+  why_required: Without this the release folds one file's bytes under another file's call, which is the
+    one outcome from which a model reasons forward from a state that never existed. A discard must also
+    leave no observation, no `PolicyEvent` and no ledger draw, or the trace stops matching the serial
+    trace.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.53.0-T03
+  - US-IO-HARNESS-0.54.0-T02
   acceptance_criteria:
-  - '**F6 — console output and uncaught page errors reach the observation of the action that produced
-    them.** An action that causes a console message and an uncaught error produces an observation containing
-    both, labelled by kind, with the error''s readable description rather than the bare word `Uncaught`;
-    an action that causes neither says so rather than omitting the section. Sabotage: drop the exception
-    route and keep the console route, under which the error arm fails and the console arm passes — the
-    two arms are separately asserted for exactly this reason.
+  - '**F4 — a completion that never settles leaves no trace of the work it caused.** A stream that emits
+    two complete read-only calls and then fails, followed by a successful retry, produces exactly one
+    set of observations, one set of `PolicyEvent` rows and one set of ledger draws — the retry''s — and
+    the reads are executed again through the ordinary path. Asserted on the counts and on the tool''s
+    own invocation probe showing it ran twice while the run recorded once. Sabotage: fold the first attempt''s
+    speculated results into the retry, under which the observation count and the probe disagree and only
+    this fails.
+
+    '
+  - '**F5 — a settled call whose arguments differ from the streamed ones discards the speculation.** The
+    scripted provider streams `read_file{path: a}` at index 0 and settles a `CompletionResponse` whose
+    index 0 is `read_file{path: b}`. The observation carries **b''s** contents; a''s speculated result
+    is dropped; a''s read is never folded anywhere. The same is asserted for a differing tool *name* at
+    the same index, and for a settled completion shorter than what was streamed. Sabotage: key the speculated
+    result by call index alone, under which a''s contents are folded under b''s call — the worst defect
+    this release can ship — and only this fails.
+
+    '
+  - '**F11 — `Fallback` discards across a failover.** A primary that streams two complete read-only calls
+    and then fails, with a secondary that answers with a different completion, folds only the secondary''s
+    calls; the primary''s speculated results appear nowhere. Sabotage: keep the speculation cache across
+    the provider switch, under which the primary''s results are folded under the secondary''s calls and
+    only this fails.
+
+    '
+  - '**F3 — the trace is the serial trace, exactly.** The same scripted case run with speculation reachable
+    and with `with_max_parallel_reads(1)` produces identical `steps` rows — including the `" | "`-joined
+    `tool_call` string built at `src/run.rs:5055` — identical observations in identical ordinals, identical
+    ledger draws, and an identical ordered sequence of `EventKind::ToolCall`, with the sole permitted
+    difference being the presence of `EventKind::Speculated`. Sabotage: fold speculated results in the
+    order they finished rather than by index, under which the ordinal and `tool_call` assertions fail
+    and only this fails.
 
     '
   files:
-  - src/browser.rs
-  - src/tools/browser.rs
-  - tests/browser.rs
-  evidence:
-  - browser_read returns the text the page renders; console output and uncaught page errors ride the observation
-    of the action that produced them and add no tool.
-  - tests/browser.rs::console_output_and_page_errors_ride_the_action_that_produced_them asserts the two
-    arms separately, and ::an_action_that_produced_no_console_output_says_so asserts the empty case is
-    stated rather than omitted.
-  - The uncaught error is read from the exception's description, not from the `text` field the real browser
-    fills with the bare word `Uncaught`.
-- id: US-IO-HARNESS-0.53.0-T05
-  summary: browser_screenshot, staged through the existing media path so the model actually looks at the
-    image.
-  why_required: The screenshot is the evidence the text cannot give, and an image that is recorded but
-    never reaches the provider is the failure that looks like success.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.53.0-T04
-  acceptance_criteria:
-  - '**F7 — a screenshot reaches the model as an image.** `browser_screenshot` stages a PNG through the
-    existing media path and the next request carries it as image content, asserted on the outbound request
-    rather than on a stored row, because staging and sending are different bugs and only the first leaves
-    a row. The observation names the viewport. Sabotage: return the base64 as observation text instead
-    of staging it, under which the outbound-request assertion fails and only this fails.
-
-    '
-  files:
-  - src/browser.rs
-  - src/tools/browser.rs
   - src/run.rs
-  - tests/browser.rs
-  evidence:
-  - browser_screenshot stages a PNG through 0.15.0's existing media path.
-  - tests/browser.rs::a_screenshot_is_sent_to_the_model_as_an_image asserts on the OUTBOUND request carrying
-    the image, not on a stored row — staging and sending are different bugs and only the first leaves
-    a row.
-- id: US-IO-HARNESS-0.53.0-T06
-  summary: browser_click, browser_type and browser_scroll — trusted input events at a resolved element,
-    and a typed failure when the selector matches nothing.
-  why_required: 'Without these the agent can look at a page and not use it. The no-match case is the one
-    that must fail loudly: a model that believes it clicked reasons forward from a state that never happened.'
-  status: done
+  - src/provider/fallback.rs
+  - tests/speculative_reads.rs
+  evidence: []
+- id: US-IO-HARNESS-0.54.0-T04
+  summary: Emit `EventKind::Speculated { started, used, discarded }` once per step that speculated, and
+    prove a provider without the new method is 0.53.0's run byte for byte.
+  why_required: 'A discard is wasted work, and an operator who cannot see the rate cannot tell a provider
+    that streams well from one that does not. The negative control is the other half: the compatibility
+    claim rests on a replayed run emitting nothing at all.'
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.53.0-T05
+  - US-IO-HARNESS-0.54.0-T03
   acceptance_criteria:
-  - '**F5 — a selector that matches nothing fails and names itself.** `browser_click` and `browser_type`
-    against a selector matching no element each return a typed failure naming the selector, no input event
-    is dispatched — asserted on the fixture never being asked to dispatch one — and the run continues.
-    A selector that matches produces a dispatched input event at the resolved box. Sabotage: treat a missing
-    element as a no-op success, under which both no-match assertions fail and only these do.
+  - '**F8 — a provider that does not implement the new method is 0.53.0''s run, byte for byte.** A provider
+    implementing only `complete` and `complete_streaming` — which is what `Record`, `Replay` and every
+    out-of-tree implementation are — produces no `EventKind::Speculated`, no early invocation, and a trace
+    byte-identical to the same case on 0.53.0. This is the negative control the compatibility claim rests
+    on, and it is asserted on the bytes. Sabotage: make the default method emit every call at stream end,
+    under which `Speculated` appears on a replayed run and only this fails.
+
+    '
+  - '**F3 — the trace is the serial trace, exactly.** The same scripted case run with speculation reachable
+    and with `with_max_parallel_reads(1)` produces identical `steps` rows — including the `" | "`-joined
+    `tool_call` string built at `src/run.rs:5055` — identical observations in identical ordinals, identical
+    ledger draws, and an identical ordered sequence of `EventKind::ToolCall`, with the sole permitted
+    difference being the presence of `EventKind::Speculated`. Sabotage: fold speculated results in the
+    order they finished rather than by index, under which the ordinal and `tool_call` assertions fail
+    and only this fails.
 
     '
   files:
-  - src/browser.rs
-  - src/tools/browser.rs
-  - tests/browser.rs
-  evidence:
-  - browser_click, browser_type and browser_scroll dispatch trusted input at an element resolved through
-    DOM.querySelector and DOM.getBoxModel.
-  - tests/browser.rs::a_selector_that_matches_nothing_fails_and_dispatches_no_input asserts both the named
-    failure and the ABSENCE of a dispatched event.
-  - 'The live run proves the click is trusted: it changed the page''s title, which a synthetic event a
-    page can ignore would not have done and the fixture cannot tell apart.'
-- id: US-IO-HARNESS-0.53.0-T07
-  summary: The [browser] config table with its project-scope refusal, the cargo feature, and tool registration
-    conditional on a configured browser.
-  why_required: The release is off by default twice over, and the negative control — a run that configures
-    nothing is byte-identical to the previous release — is what protects every existing consumer's cached
-    prompt prefix and trace.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.53.0-T06
-  acceptance_criteria:
-  - '**F10 — a run with no browser configured is this build''s run, byte for byte.** No tool schema in
-    the catalogue, no child process, no event, and a composed prompt byte-identical to the same run on
-    0.52.0. Asserted on the bytes, since this is the negative control the whole release rests on. Sabotage:
-    register the schemas unconditionally, under which the byte-identity assertion fails and only this
-    fails.
-
-    '
-  - '**N2 — the default build is unchanged.** With no features, the compiled tool catalogue, the composed
-    prompt and the dependency tree are byte-identical to 0.52.0''s, and `src/browser.rs` is not compiled
-    at all.
-
-    '
-  - '**N6 — the six schemas are the only prompt-byte change, and only for a configured run.** The difference
-    between a configured and an unconfigured run''s composed prompt is exactly those six schemas, asserted
-    as a diff rather than as a size.
-
-    '
-  files:
-  - src/config.rs
-  - Cargo.toml
-  - src/lib.rs
   - src/run.rs
-  - tests/config.rs
-  - tests/prompt.rs
-  evidence:
-  - The `browser` cargo feature is not in `default` and implies `media`; the [browser] table is refused
-    at project scope by refuse_widening, like [[hook]].
-  - tests/browser.rs::a_run_with_no_browser_configured_is_offered_no_browser_tools and ::a_configured_run_is_offered_exactly_the_six
-    are the two halves of the negative control.
-  - Config::browser()'s doctest asserts the project-scope refusal names the key.
-- id: US-IO-HARNESS-0.53.0-T08
-  summary: The two events, the checked-in doc surfaces, the public-API snapshot, and the no-durable-state
-    assertion.
-  why_required: A boundary nobody can audit is not a boundary, and this repository's doc surfaces are
-    gated by tests that fail the build when a release changes behaviour without changing what the docs
-    claim.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.53.0-T07
-  acceptance_criteria:
-  - '**N3 — no durable state.** `git diff main -- src/state.rs` is empty, `CHECKPOINT_FORMAT` is 7, and
-    a 0.52.0 store and a 0.53.0 store are the same store in both directions.
-
-    '
-  - '**N4 — the public surface addition is stated in advance and met exactly.** `docs/public-api.txt`
-    gains the crate-root re-exports this release adds and no others; the number is named in the record
-    and any difference is explained rather than absorbed. The file tracks crate-root re-exports only,
-    so methods on existing types add no line — a fact this criterion states rather than rediscovers.
-
-    '
-  - '**O4 — the checked-in doc surfaces are updated in this release.** `docs/CONTRACT.md` gains the gate,
-    the interception boundary and the platform row; the README''s feature list and platform table move;
-    a `docs/guide/` page exists and `docs/CAPABILITIES.md` names it; the changelog entry exists; every
-    new public item carries a worked example. The four doc tests and `tests/public_api.rs` pass.
-
-    '
-  files:
   - src/observe.rs
+  - tests/speculative_reads.rs
+  - tests/session_streaming.rs
+  evidence: []
+- id: US-IO-HARNESS-0.54.0-T05
+  summary: Amend `docs/CONTRACT.md`'s streamed-delta rule and 0.41.0 concurrency section, and update every
+    other checked-in doc surface in this release.
+  why_required: '`docs/CONTRACT.md:1961-1965` currently says a streamed delta is not safe to act on. This
+    release acts on one. Shipping the change and leaving that sentence standing would publish a documented
+    lie.'
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.54.0-T04
+  acceptance_criteria:
+  - '**O3 — `docs/CONTRACT.md`''s streamed-delta rule is amended in this release, by name.** The sentence
+    at `docs/CONTRACT.md:1961-1965` — "A streamed delta is provisional until the completion returns …
+    Render it; do not act on it" — stays true for text and for a consumer, and gains the exact carve-out
+    the harness now takes for itself: a *finished* read-only tool call, in the completion''s leading read-only
+    run, allowed outright by the `Policy`, may be started early, and its result is used only if the settled
+    completion asks for it. The 0.41.0 concurrency section (`docs/CONTRACT.md:1243-1295`) gains the prefix
+    rule and the statement that it is narrower than the batching rule beside it. A release that changed
+    this behaviour and left that sentence standing would be shipping a documented lie.
+
+    '
+  - '**O4 — the checked-in doc surfaces are updated in this release.** The README''s feature list, `docs/guide/providers.md`
+    (what implementing the new method buys and what the default costs), `docs/guide/tools-and-skills.md`
+    (which tools can be speculated and why the list is three long), `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md`
+    and the changelog entry. Every new public item carries a worked example. The four doc tests and `tests/public_api.rs`
+    pass.
+
+    '
+  - '**N2 — the public surface addition is stated in advance and met exactly.** `docs/public-api.txt`
+    tracks crate-root re-exports only, so a new defaulted method on `Provider` and a new `EventKind` variant
+    each add **no line**: the predicted change is **+0 lines**, and any difference is explained in the
+    record rather than absorbed.
+
+    '
+  files:
   - docs/CONTRACT.md
   - docs/CAPABILITIES.md
-  - docs/guide/browser.md
+  - docs/MEASUREMENTS.md
+  - docs/guide/providers.md
+  - docs/guide/tools-and-skills.md
   - docs/public-api.txt
   - README.md
   - CHANGELOG.md
   - src/lib.rs
-  evidence:
-  - EventKind::BrowserStarted and EventKind::BrowserNavigated, additive, with EVENT_NAMES, the census
-    fixture and the exhaustive match all updated.
-  - docs/CONTRACT.md, docs/guide/browser.md, docs/CAPABILITIES.md, README.md, CHANGELOG.md, src/lib.rs
-    and docs/public-api.txt updated; tests/docs_drift.rs (15), tests/readme.rs (5), tests/guide_pages.rs
-    (7), tests/changelog.rs (5) and tests/public_api.rs (9) all pass.
-  - docs/public-api.txt gains exactly ONE line — struct BrowserConfig — which is the number the contract
-    named in advance under N4.
-- id: US-IO-HARNESS-0.53.0-T09
-  summary: examples/browser_live.rs against the real installed browser, and the release's own measurement.
-  why_required: A fixture proves the client and cannot prove the protocol was understood — the previous
-    release found three defects this way, every one invisible to a green suite.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.53.0-T08
-  acceptance_criteria:
-  - '**N5 — the release''s own measurement, recorded and not asserted.** For one real page: its text through
-    `browser_read` in bytes, the same page''s screenshot in base64 bytes, the browser''s launch time,
-    and the per-action round-trip time. The point of the number is operator guidance on when a screenshot
-    is worth its bytes, and it is recorded in the release record and `docs/MEASUREMENTS.md` with the machine
-    named. **No clock is a pass/fail gate**, per the standing rule.
-
-    '
-  - '**O3 — `examples/browser_live.rs` is run against the real installed browser before the record is
-    sealed**, driving navigation, a click, typing, a scroll, a read, a screenshot and the console capture,
-    and what it found is written into the record. This is a gate of this release, not an optional extra:
-    0.52.0''s three live-run defects were all invisible to a green fixture suite.
-
-    '
-  files:
-  - examples/browser_live.rs
-  - Cargo.toml
-  - docs/MEASUREMENTS.md
-  evidence:
-  - examples/browser_live.rs drives the installed browser through the whole surface against a page it
-    serves on loopback, so the host gate is exercised against a real host:port.
-  - 'All six live claims held against Google Chrome 151: rendered text, console output, an uncaught error
-    read as its description, a click that actually changed the page, a screenshot delivered as an image,
-    and a navigation to an unnamed host refused.'
-  - The live run found NO defects — recorded as a fact rather than passed over, because the point of running
-    it is that it can find them.
-  - 'Measured: cold start 2,426 ms; the page as text 44 bytes against 13,166 bytes as a PNG.'
-- id: US-IO-HARNESS-0.53.0-T10
-  summary: 'The gate set: both suites, the dependency count, the nightly rustdoc gate, the three-platform
-    matrix and the sabotage pass.'
-  why_required: The release's claims are only worth what the gates that checked them are worth, and a
-    sabotage that fails nothing is a finding this release has to report rather than discover later.
+  evidence: []
+- id: US-IO-HARNESS-0.54.0-T06
+  summary: 'Run the release''s gate set: the three-platform matrix, the clock-free audit, the nightly
+    rustdoc gate, the cross-version store gate, and record N5''s measurement.'
+  why_required: The store-compatibility and no-durable-state claims are only claims until the cross-version
+    gate runs, and the nightly rustdoc gate has caught something in six of the last seven releases. N5's
+    number is the operator guidance the release exists to give.
   status: todo
   depends_on:
-  - US-IO-HARNESS-0.53.0-T09
+  - US-IO-HARNESS-0.54.0-T05
   acceptance_criteria:
-  - '**N1 — no new dependency.** `cargo tree` is 402 lines on macOS and Linux with the feature off and
-    with it on, because the feature adds only `base64` through `media`, which the count already carries
-    when that feature is enabled. Asserted by the existing dependency test and stated with the number
-    in the record.
+  - '**O1 — the three-platform matrix is green.** Nothing here is platform-specific, which is itself the
+    claim: a concurrency change that behaves differently on one runner is the defect this gate catches.
 
     '
-  - '**O1 — the three-platform matrix is green**, with the browser suite running its fixture-driven tests
-    on macOS and Linux and its refusal test on Windows. A green macOS gate alone is not evidence for this
-    release: the transport is the platform-specific half.
+  - '**O2 — nothing in the suite gates on a wall clock.** Every earliness claim is a rendezvous that completes
+    or a bounded wait that fails, never an assertion that something happened within N milliseconds. This
+    release is a latency release and therefore the one most likely to be written the wrong way; the standing
+    rule is restated here on purpose. Bounds are sized for the Windows runner, which is roughly three
+    times slower than the development machine.
 
     '
-  - '**O2 — nothing in the suite gates on a wall clock.** Every settle is on a protocol signal or a bounded
-    timeout whose expiry is a typed outcome, never an assertion that something happened within N milliseconds.
-    This release adds a process spawn and a page load, which are the two slowest things the suite will
-    contain, on the runner that is roughly three times slower than the development machine.
+  - '**O5 — the nightly rustdoc gate passes with `-D warnings`.** Run before the release PR. `RUSTDOCFLAGS="--cfg
+    docsrs -D warnings" cargo +nightly doc --all-features --no-deps`. It has caught something in six of
+    the last seven releases, and this release adds a trait method whose doc block links private items
+    by name.
 
     '
-  - '**O5 — the nightly rustdoc gate passes with `-D warnings`.** Run before the release PR. A brand-new
-    `pub mod` is the shape that trips the private-intra-doc-links rule, which this release adds and which
-    caught something in five of the last six releases.
+  - '**O6 — the cross-version gate runs.** `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml`
+    then `cargo test --test cross_version_0_29_0 -- --ignored`. It is the easy-to-forget gate whose generator
+    is not built by default, and a store-compatibility claim (N4) is exactly what it exists to check.
+
+    '
+  - '**N4 — no durable state.** `git diff main -- src/state.rs` is empty, `CHECKPOINT_FORMAT` is 7, and
+    a 0.53.0 store and a 0.54.0 store are the same store in both directions.
+
+    '
+  - '**N5 — the release''s own measurement, recorded and not asserted.** Against a scripted provider whose
+    stream carries a stated number of tokens after the last tool call: the wall-clock from the first complete
+    tool call to the completion''s return — which is the window speculation can use — and the observed
+    end-to-end step time with and without it, on a named machine. The point of the number is operator
+    guidance on when the new method is worth implementing for a custom provider. **No clock is a pass/fail
+    gate**, per the standing rule.
 
     '
   files:
-  - tests/browser.rs
-  - src/browser.rs
+  - docs/MEASUREMENTS.md
   evidence: []
