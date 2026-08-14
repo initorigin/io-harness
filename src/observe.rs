@@ -801,6 +801,13 @@ pub enum EventKind {
     /// Nothing else about the step moves. The same [`ToolCall`](EventKind::ToolCall)
     /// events arrive in the same order, with the same observations and the same
     /// ledger draws, whether a read started early or not.
+    ///
+    /// **A run with any tool hook configured never emits this**, because such a
+    /// run never speculates: a hook can refuse a call outright, and asking it
+    /// about a completion that may never settle is the same objection that keeps
+    /// an approver out. The gate is the presence of a `Hooks` object rather than
+    /// the presence of a `before_tool` entry in it, so a run carrying only event
+    /// hooks also starts nothing early.
     Speculated {
         /// How many read-only calls were started early, across every attempt at
         /// this step.

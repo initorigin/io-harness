@@ -1321,10 +1321,17 @@ refuse a call, and asking it early would hand it a call that may not exist.
 
 **A result is used only if the settled completion asks for it** — same position,
 same name, byte-identical arguments — and what survives is kept as a contiguous
-run from position zero. A completion that fails, is retried, or falls over to
-another provider discards everything speculated against it. A discarded
-speculation leaves nothing behind at all: the read happened, and the run recorded
-none of it.
+run from position zero. That one rule is what a failed attempt, a retry and a
+`Fallback` fallover all reduce to: the settled completion is a different
+completion, so nothing speculated against the abandoned one matches it and
+nothing is kept. The exception is exact agreement — where the two completions ask
+for the *same* call with the *same* arguments, the speculated result is that
+call's result and is used. A discarded speculation leaves nothing behind at all:
+the read happened, and the run recorded none of it.
+
+**A registered tool needing more containment than the run grants is never started
+early**, for the same reason `dispatch` refuses it before the arm that would run
+it: the refusal says nothing was started, and that has to stay true.
 
 **`max_parallel_reads` is the whole switch.** `with_max_parallel_reads(1)` turns
 starting early off with the batching, so there is one escape hatch rather than

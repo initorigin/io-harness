@@ -24,6 +24,7 @@ use io_harness::approve::DecisionFuture;
 use io_harness::policy::{Act, Effect};
 use io_harness::provider::Fallback;
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
+use io_harness::sandbox::ExecMode;
 use io_harness::tools::{Tool, ToolEffect, ToolFuture, Toolbox};
 use io_harness::{
     ApproveAll, Approver, Decision, Error, EventKind, Flow, Observer, Policy, Provider,
@@ -1201,4 +1202,103 @@ async fn the_trace_is_identical_for_a_single_read_which_never_batches() {
         "a lone speculated read produced a different observation than the serial one"
     );
     assert_eq!(fast_calls, slow_calls, "the announcement differs");
+}
+
+// ------------------------------------------- the containment refusal (0.48.0)
+
+/// A read-only tool that needs more containment than an ordinary run grants.
+///
+/// `ToolEffect::ReadOnly` and `ExecMode::FullAccess` are not a contradiction: the
+/// first says the call changes nothing, the second says it needs the embedding
+/// program's own privileges to do it. `dispatch` refuses such a call before any
+/// tool arm and says "Nothing was started", so speculation must not start it.
+struct Greedy {
+    runs: Arc<AtomicUsize>,
+}
+
+impl Tool for Greedy {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "greedy".into(),
+            description: "Observes nothing, but needs full access to do it.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    fn invoke<'a>(&'a self, _arguments: &'a serde_json::Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok("greedy ran".to_string())
+        })
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
+    fn exec_mode(&self) -> Option<ExecMode> {
+        Some(ExecMode::FullAccess)
+    }
+}
+
+/// A tool needing more containment than the run grants is not started early.
+///
+/// `dispatch` decides this before the arm that would run the tool
+/// (`resolve_call_mode`), and returns a refusal saying nothing was started. A
+/// speculated call never reaches `dispatch`, so without the same check in
+/// `Speculation::offer` this call would run — and run *before the completion
+/// asking for it had settled*, which is strictly worse than running it late.
+///
+/// The default `TaskContract` already grants `ExecMode::WorkspaceWrite`, so this
+/// needs no special sandbox setup: the ordinary run is the contained one.
+#[tokio::test]
+async fn a_tool_needing_more_containment_than_the_run_grants_is_not_started_early() {
+    let ws = workspace();
+    let store = Store::memory().unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let provider = Script::new(vec![Turn::calls(vec![tool("greedy")]), Turn::done()]);
+    let tools = Toolbox::new().with(Greedy {
+        runs: Arc::clone(&runs),
+    });
+    let listener = Listener::default();
+    let mut session = Session::open(&store, ws.path()).unwrap();
+
+    let turn = tokio::time::timeout(
+        MUST_FINISH,
+        session.turn_bounded_observed(
+            &contract(ws.path(), tools),
+            &provider,
+            &store,
+            &policy(),
+            &ApproveAll,
+            &listener,
+        ),
+    )
+    .await
+    .expect("the turn should finish")
+    .unwrap();
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "a tool the run's containment refuses was started anyway, off the stream"
+    );
+    assert_eq!(
+        listener.counts(),
+        None,
+        "nothing should have been speculated, so no event should have been emitted"
+    );
+
+    let all = store
+        .observations(turn.run_id)
+        .unwrap()
+        .into_iter()
+        .map(|o| o.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        all.contains("greedy refused"),
+        "the run should still carry the containment refusal it always did: {all}"
+    );
 }

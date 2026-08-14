@@ -79,9 +79,15 @@ on 0.53.0:
   early, so no approver is asked about a completion that may never settle, and a
   run with a tool hook configured starts nothing early at all.
 - **A result is used only if the settled completion asks for that same call**, with
-  the same name and byte-identical arguments, at that same position. A completion
-  that fails, is retried, or falls over to another provider discards everything
-  speculated against it, leaving no observation, no row and no ledger draw behind.
+  the same name and byte-identical arguments, at that same position. A failed
+  attempt, a retry and a `Fallback` fallover all reduce to that one rule: the
+  settled completion is a different completion, so nothing speculated against the
+  abandoned one matches it, and a discarded speculation leaves no observation, no
+  row and no ledger draw behind.
+- **A registered tool needing more containment than the run grants is never
+  started early**, matching the refusal `dispatch` already makes before the arm
+  that would run it. That refusal says nothing was started, and speculation must
+  not make it a lie.
 
 `with_max_parallel_reads(1)` turns starting early off along with the batching, so
 there is one switch rather than two. `run_with` and the other one-shot entry
