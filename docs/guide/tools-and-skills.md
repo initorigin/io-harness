@@ -149,6 +149,41 @@ Three things are worth knowing before you change it:
     first mutating call in a completion waits, so a read cannot observe the state
     before a write that has not run yet.
 
+## What `read_file` gives back (0.55.0)
+
+Three answers, and only three: the file, the range of lines you asked for, or a
+refusal that says why.
+
+```json
+{ "path": "src/run.rs", "offset": 4200, "limit": 200 }
+```
+
+`offset` counts from 1 and the observation header states the range and the
+file's total line count — `[read src/run.rs lines 4200-4399 of 15012]` — so a
+slice reads as a slice. An `offset` past the end is an error naming the total,
+not an empty success.
+
+**A file too large to carry is refused rather than shortened.** It used to be
+cut, with a marker saying so; what the model then held had the shape of a whole
+file. The refusal names the path, the size, the ceiling and both remedies. There
+are two ceilings: `[run] max_read_chars`, which an operator sets and which does
+not move, and one derived from the [context budget](context-and-memory.md),
+which falls as the run spends. The message names the one that bit, because
+raising a key and asking for a range are different answers.
+
+**A file that is not text is named, not decoded.** An image says to call
+`view_image`; a spreadsheet, a Word document, a slide deck or a PDF names the
+tool that reads it, and says so plainly when that tool's feature is not compiled
+into the build. Anything else is named as binary with its size and what its
+leading bytes look like. UTF-16 with a byte-order mark is decoded and the
+encoding is named; without the mark it is binary, because a guessed encoding is
+a confident wrong answer rather than a read. An SVG is text — a model reading one
+wants the markup.
+
+Every other tool's output is still bounded rather than refused. A command's
+output and a search's matches were never documents, and a prefix of one is not a
+lie.
+
 ## Skills: instructions, not code
 
 Point the contract at a directory of markdown. Both conventions in common use

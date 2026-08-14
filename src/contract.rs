@@ -299,6 +299,19 @@ pub struct TaskContract {
     /// though the two are related, since the share is taken of what the spend
     /// budget has left.
     pub context: ContextBudget,
+    /// The largest file the agent may read in one call, in characters (0.55.0).
+    ///
+    /// `None` — the default — means the ceiling is derived from
+    /// [`TaskContract::context`], which is what every version before 0.55.0 did
+    /// and is therefore what a caller who sets nothing keeps. That derived value
+    /// is a share of the budget still *unspent*, so it moves during a run: the
+    /// same file is readable at step three and refused at step forty. Setting
+    /// this makes the ceiling a number an operator chose, which is what a
+    /// refusal a run's behaviour turns on has to be.
+    ///
+    /// A read is refused when it exceeds *either* ceiling, and the refusal says
+    /// which — the two call for different answers.
+    pub max_read_chars: Option<u64>,
     /// When the run's history is folded into a written summary (0.43.0).
     ///
     /// Defaults to [`Compaction::default`], which folds — the failure it replaces
@@ -528,6 +541,7 @@ impl TaskContract {
             images: Vec::new(),
             tools: crate::tools::Toolbox::new(),
             context: ContextBudget::default(),
+            max_read_chars: None,
             compaction: Compaction::default(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
@@ -600,6 +614,7 @@ impl TaskContract {
             images: Vec::new(),
             tools: crate::tools::Toolbox::new(),
             context: ContextBudget::default(),
+            max_read_chars: None,
             compaction: Compaction::default(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
@@ -1332,6 +1347,34 @@ impl TaskContract {
     /// any one request carries of what it has already observed.
     pub fn with_context_budget(mut self, context: ContextBudget) -> Self {
         self.context = context;
+        self
+    }
+
+    /// Set the largest file the agent may read in one call, in characters
+    /// (0.55.0).
+    ///
+    /// The companion to [`TaskContract::with_context_budget`], and the answer to
+    /// the one thing that budget cannot give: predictability. The derived
+    /// ceiling is a share of what is *left*, so which files an agent can read
+    /// depends on how far into the run it is. This one does not move.
+    ///
+    /// ```
+    /// use io_harness::TaskContract;
+    ///
+    /// let contract = TaskContract::workspace("audit the parser", "/repo")
+    ///     .with_max_read_chars(40_000);
+    ///
+    /// assert_eq!(contract.max_read_chars, Some(40_000));
+    /// // Unset is the default, and means "whatever this turn's budget allows" —
+    /// // which is exactly what every version before 0.55.0 did.
+    /// assert_eq!(
+    ///     TaskContract::workspace("audit the parser", "/repo").max_read_chars,
+    ///     None,
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_max_read_chars(mut self, chars: u64) -> Self {
+        self.max_read_chars = Some(chars);
         self
     }
 

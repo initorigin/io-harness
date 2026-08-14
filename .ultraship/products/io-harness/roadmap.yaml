@@ -1350,8 +1350,8 @@ versions:
       default so a caller who sets nothing gets today's behaviour. A read is then refused for one of
       two stated reasons — over the operator's ceiling, or over what this run's remaining budget can
       carry — and the error says which, because they call for different answers.
-    detail: outline
-    status: planned
+    detail: specified
+    status: released
   - version: 0.56.0
     outcome: >
       What a run learns is kept for its value rather than for its age, is reachable from more than

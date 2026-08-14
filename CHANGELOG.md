@@ -26,6 +26,77 @@ notes are produced from it.
 
 ### Security
 
+## [0.55.0] - 2026-08-14
+
+### Added
+
+- **`read_file` has a type.** A UTF-8 file reads as it always did. A UTF-16 file
+  with a byte-order mark is decoded and the encoding is named in the observation.
+  An image is named as an image and routed to `view_image`; a known document is
+  named and routed to its own tool; anything else is named as binary with its
+  size and what its leading bytes look like. `Workspace::read_typed` returns that
+  classification as `FileContent`, and `FileContent::refusal` is the sentence the
+  model is shown.
+- **`read_file` takes `offset` and `limit`, in lines.** `offset` is 1-based and
+  the observation header states the range and the file's total line count, so a
+  slice the model asked for reads as a slice rather than as a whole file. An
+  `offset` past the end is an error naming the total, not an empty success.
+- **`[run] max_read_chars`, and `TaskContract::with_max_read_chars`.** The
+  largest file a single read may carry, in characters. Unset, the ceiling stays
+  the one derived from the context budget, which is what every earlier version
+  did — and which moves during a run, because it is a share of what is left. A
+  read is refused when it exceeds either ceiling and the refusal says which: they
+  call for different answers. A project-scoped `io.toml` may lower this key and
+  may not raise it.
+- **`Media::attach`, a wide door in front of a narrow wire.** The four types in
+  `IMAGE_MEDIA_TYPES` pass through byte-identically; BMP, TIFF, ICO, TGA and PNM
+  are decoded and re-encoded to PNG. `view_image` accepts everything the door
+  accepts, and its observation says when bytes were converted. `Media::image` is
+  unchanged: the four-type set is a fact about vendors, and it stays the wire.
+- **`Media::source_type_for`**, the extension table for every image format the
+  crate recognises — including the three it can only name — beside
+  `Media::media_type_for`, which still answers the narrower "may this go on the
+  wire".
+- **`MAX_IMAGE_PIXELS`.** A decompression bomb is refused from its header before
+  the decode it would otherwise pay for: a two-kilobyte TIFF header can declare a
+  forty-thousand-square canvas.
+
+### Changed
+
+- **A read too large to fit is refused, not shortened.** It used to be cut to the
+  per-observation cap with a marker in the text. What the model then held had the
+  shape of a whole file, and nothing downstream could tell a whole file from the
+  tail of one. It now returns **no content at all** — an error naming the path,
+  the size, the ceiling, which ceiling, and both ways to proceed. **If your run
+  depended on getting the tail of a large file, ask for a range.** Bounding is
+  unchanged for every other kind: a command's output and a search's matches were
+  never documents, and a prefix of one is not a lie.
+- **A stored read is whole in the prompt or a stub, never a fragment.** A read
+  that fitted when it happened and is later squeezed by a narrower budget share
+  is replaced by a stub naming the file and the range to re-read. The same rule
+  now covers the re-read of a file a write invalidated, which used to be bounded
+  to its tail under a header saying the file had been re-read.
+- **An image `view_image` cannot decode is refused by name.** The message used to
+  be the vendors' four-type list, which is a true statement about three APIs and
+  reads, at the doorstep, as this crate being unable to open a photograph. SVG,
+  HEIC and AVIF are now named, with the reason and a one-line conversion.
+- **The `media` feature compiles `image`.** It was already an optional dependency
+  of this crate, reached through `barcode`; it now carries the extra formats and
+  sits under `media`, which `browser` implies. Nothing is added to the default
+  build and `cargo tree` on it is unchanged. A `--features media` build compiles
+  more, all of it pure Rust — no C library and no `-sys` crate.
+
+### Fixed
+
+- **A binary file no longer reads as an empty file.** `Workspace::read_file` was
+  `std::fs::read_to_string(path).unwrap_or_default()`, so an executable, an image
+  or a UTF-16 log arrived as `Ok("")` — the same answer a file that does not
+  exist gives, and a model told a file is empty writes over it. It is now an
+  error naming the file, what it is and how big it is. **A caller that treated
+  the empty string as "empty file" now sees the error it should have seen.** The
+  one case where nothing really is the answer is untouched: a missing file still
+  reads as empty, which is what lets an agent create one.
+
 ## [0.54.0] - 2026-08-14
 
 ### Added

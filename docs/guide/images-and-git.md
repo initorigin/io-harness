@@ -33,9 +33,36 @@ let contract = TaskContract::workspace(
 .with_images([Media::image("image/png", png_bytes)?]);
 ```
 
-Accepted media types are `image/jpeg`, `image/png`, `image/gif` and `image/webp`
-(`IMAGE_MEDIA_TYPES`). Anything else is a typed error at construction, not a
-request the provider rejects later.
+Accepted media types **on the wire** are `image/jpeg`, `image/png`, `image/gif`
+and `image/webp` (`IMAGE_MEDIA_TYPES`) — the intersection every provider
+documents. Anything else is a typed error at construction, not a request the
+provider rejects later.
+
+**The door is wider than the wire (0.55.0).** `Media::attach` takes an image in
+whatever format it arrived in and produces one a provider will accept: those four
+pass through **byte-identically**, and BMP, TIFF, ICO, TGA and PNM are decoded
+and re-encoded to PNG. A JPEG is never re-encoded — a round trip through a
+decoder on the commonest path would be a silent quality loss.
+
+```rust
+// A BMP from a scanner, a TIFF from a camera: accepted at the door, PNG on the wire.
+let media = Media::attach("image/bmp", scanner_bytes)?;
+assert_eq!(media.media_type, "image/png");
+```
+
+What the crate cannot decode is refused **by name**, with the reason and a
+one-line conversion — not with the vendors' four-type list, which is a true
+statement about three APIs and reads, at the doorstep, as this crate being unable
+to open a photograph. HEIC and AVIF need a system C library this crate does not
+depend on, so that it builds anywhere with a Rust toolchain and nothing else; SVG
+needs a renderer, which is a dependency tree rather than a C library; a PDF is
+routed to `pdf_read`. `Media::source_type_for` is the extension table that names
+all of them, beside `Media::media_type_for`, which still answers the narrower
+"may this go on the wire".
+
+A declared size is checked before a decode: a small file can declare an enormous
+image, and a decoder that believes it allocates before anything checks the
+result. `MAX_IMAGE_PIXELS` bounds what will be decoded from the header alone.
 
 Two size bounds are enforced here rather than by the vendor. `MAX_IMAGE_BYTES` is
 5MB per image — Anthropic's documented limit, and the smaller of the two vendor
@@ -43,11 +70,15 @@ limits, because an image one vendor would refuse and another accept is worse
 refused here than refused there as an HTTP 400 that reads like a transport
 failure. `MAX_REQUEST_IMAGE_BYTES` is 20MB across all images on one request,
 because the per-image bound does not compose: sixteen images each under the
-single-image limit is a request no budget anticipated. The bytes themselves are
-not parsed — whether they are a valid PNG is the vendor's judgement, and guessing
-would mean adding an image decoder to the default path.
+single-image limit is a request no budget anticipated. The bytes of one of the
+four wire types are **not** parsed — whether they are a valid PNG is the vendor's
+judgement, and there is still no image decoder on the default path. A format the
+door converts is necessarily decoded, which is why that path is behind the
+`media` feature and its pixel bound is checked from the header first.
 
-The agent looks at one itself with `view_image`, which is gated on `Act::Read`
+The agent looks at one itself with `view_image`, which accepts everything the
+door accepts and says in its observation when a conversion happened, and which is
+gated on `Act::Read`
 against the path the model named — this is the model choosing which of the user's
 files to send to a third party, so it is authorised per call on the real path
 rather than once by tool name. A viewed image rides one request and is then

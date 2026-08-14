@@ -236,6 +236,111 @@ pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 #[cfg(feature = "media")]
 pub const MAX_REQUEST_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
+/// The largest image this crate will decode, in pixels (0.55.0).
+///
+/// A decompression bomb is a small file that declares an enormous image: a
+/// two-kilobyte TIFF header can ask for a forty-thousand-square canvas, and a
+/// decoder that believes it allocates gigabytes before anything checks the
+/// result. The dimensions are read from the header and refused *before* the
+/// decode, so the bound costs a header parse rather than the allocation it
+/// prevents.
+///
+/// 50 megapixels is roughly a 7000×7000 image — larger than anything a provider
+/// will look at, since every one of them downsamples first.
+#[cfg(feature = "media")]
+pub const MAX_IMAGE_PIXELS: u64 = 50_000_000;
+
+/// The `image` format for a source media type this crate can decode, or `None`.
+#[cfg(feature = "media")]
+fn decodable(media_type: &str) -> Option<image::ImageFormat> {
+    Some(match media_type {
+        "image/bmp" => image::ImageFormat::Bmp,
+        "image/tiff" => image::ImageFormat::Tiff,
+        "image/x-icon" => image::ImageFormat::Ico,
+        "image/x-tga" => image::ImageFormat::Tga,
+        "image/x-portable-anymap" => image::ImageFormat::Pnm,
+        _ => return None,
+    })
+}
+
+/// The refusal for an image this crate will not decode — by name, with the
+/// reason and the conversion that fixes it (0.55.0).
+///
+/// The sentence it replaces was "unsupported image media type "image/heic":
+/// expected one of image/jpeg, image/png, image/gif, image/webp", which is a
+/// true statement about three vendors' APIs and reads, at the doorstep, as this
+/// crate being unable to open a photograph.
+#[cfg(feature = "media")]
+fn refusal(media_type: &str) -> String {
+    let (name, why, fix) = match media_type {
+        "image/svg+xml" => (
+            "SVG",
+            "an SVG is a drawing to be rendered rather than an image to be \
+             decoded, and rendering one needs a renderer this crate does not carry",
+            "`resvg in.svg -o out.png`, or any exporter",
+        ),
+        "image/heic" => (
+            "HEIC",
+            "decoding HEIC needs a system C library, which this crate does not \
+             depend on so that it builds anywhere with a Rust toolchain and nothing else",
+            "`heif-convert in.heic out.png`, or Preview's Export",
+        ),
+        "image/avif" => (
+            "AVIF",
+            "decoding AVIF needs a system C library, which this crate does not \
+             depend on so that it builds anywhere with a Rust toolchain and nothing else",
+            "`avifdec in.avif out.png`",
+        ),
+        "application/pdf" => (
+            "PDF",
+            "a PDF is a document rather than an image",
+            "`pdf_read` reads one, or export the page you want as a PNG",
+        ),
+        other => {
+            return format!(
+                "{other:?} is not an image this crate can read. It sends {}, and converts \
+                 BMP, TIFF, ICO, TGA and PNM to PNG on the way.",
+                IMAGE_MEDIA_TYPES.join(", ")
+            )
+        }
+    };
+    format!(
+        "{name} is not a format this crate can decode: {why}. Convert it to PNG first — {fix} — \
+         and attach that."
+    )
+}
+
+/// Decode and re-encode to PNG, refusing a bomb before it allocates (0.55.0).
+#[cfg(feature = "media")]
+fn transcode(format: image::ImageFormat, media_type: &str, bytes: &[u8]) -> Result<Media> {
+    let reader = |bytes: &[u8]| {
+        image::ImageReader::with_format(std::io::Cursor::new(bytes.to_vec()), format)
+    };
+    // The header first, and the whole point of doing it separately: this is the
+    // one check that has to happen before the allocation it is guarding against.
+    let (width, height) = reader(bytes)
+        .into_dimensions()
+        .map_err(|e| Error::Config(format!("{media_type} could not be read: {e}")))?;
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_IMAGE_PIXELS {
+        return Err(Error::Config(format!(
+            "{media_type} declares {width}×{height} — {pixels} pixels, over the \
+             {MAX_IMAGE_PIXELS}-pixel bound this crate will decode. Resize it before attaching \
+             rather than decoding it here."
+        )));
+    }
+    let decoded = reader(bytes)
+        .decode()
+        .map_err(|e| Error::Config(format!("{media_type} could not be decoded: {e}")))?;
+    let mut png = Vec::new();
+    decoded
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| Error::Config(format!("{media_type} could not be re-encoded as PNG: {e}")))?;
+    // Through the wire gate like everything else, so the per-image byte bound is
+    // enforced once and in one place — a re-encode can grow a file.
+    Media::image("image/png", &png)
+}
+
 #[cfg(feature = "media")]
 impl Media {
     /// Encode image bytes for the provider boundary.
@@ -266,10 +371,91 @@ impl Media {
         })
     }
 
+    /// Take an image in whatever format it arrived in, and produce one a
+    /// provider will accept (0.55.0).
+    ///
+    /// This is the **door**; [`Media::image`] is the **wire**. The four types in
+    /// [`IMAGE_MEDIA_TYPES`] pass through byte-identically — a JPEG that went
+    /// through a decoder and came back would be a silent quality loss on the
+    /// common path — and the formats this crate can decode in pure Rust are
+    /// decoded and re-encoded to PNG. What it cannot decode is refused **by its
+    /// own name**, with the reason and a conversion that fixes it, rather than
+    /// with a list of four types that is a fact about vendors and not about the
+    /// file the operator has.
+    ///
+    /// ```
+    /// use io_harness::{Media, IMAGE_MEDIA_TYPES};
+    ///
+    /// // A 2×2 BMP, header and all. It is not a type any provider takes.
+    /// let bmp = [
+    ///     0x42, 0x4d, 0x46, 0, 0, 0, 0, 0, 0, 0, 0x36, 0, 0, 0, 0x28, 0, 0, 0,
+    ///     2, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0x18, 0, 0, 0, 0, 0, 0x10, 0, 0, 0,
+    ///     0x13, 0x0b, 0, 0, 0x13, 0x0b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ///     0xff, 0, 0, 0xff, 0, 0, 0, 0, 0, 0xff, 0, 0, 0xff, 0, 0, 0, 0,
+    /// ];
+    /// let attached = Media::attach("image/bmp", &bmp)?;
+    /// assert_eq!(attached.media_type, "image/png");
+    /// assert!(IMAGE_MEDIA_TYPES.contains(&attached.media_type.as_str()));
+    ///
+    /// // And what cannot be decoded says so by name.
+    /// let err = Media::attach("image/svg+xml", b"<svg/>").unwrap_err().to_string();
+    /// assert!(err.contains("SVG"), "{err}");
+    /// # Ok::<(), io_harness::Error>(())
+    /// ```
+    pub fn attach(media_type: &str, bytes: &[u8]) -> Result<Self> {
+        if IMAGE_MEDIA_TYPES.contains(&media_type) {
+            return Self::image(media_type, bytes);
+        }
+        let Some(format) = decodable(media_type) else {
+            return Err(Error::Config(refusal(media_type)));
+        };
+        transcode(format, media_type, bytes)
+    }
+
+    /// The source media type inferred from a path's extension — every image
+    /// format this crate recognises, not only the four it can send (0.55.0).
+    ///
+    /// The companion to [`Media::media_type_for`], and deliberately a separate
+    /// function rather than a widening of it: that one answers "may this go on
+    /// the wire", which is still a four-way question. This one answers "what is
+    /// this file", which is what a doorstep has to know before it can either
+    /// convert the file or refuse it by name.
+    ///
+    /// The formats it names but cannot decode — SVG, HEIC, AVIF — are here on
+    /// purpose: naming them is what makes the refusal actionable.
+    ///
+    /// ```
+    /// use io_harness::Media;
+    ///
+    /// assert_eq!(Media::source_type_for("scan.tiff"), Some("image/tiff"));
+    /// assert_eq!(Media::source_type_for("photo.HEIC"), Some("image/heic"));
+    /// assert_eq!(Media::source_type_for("notes.md"), None);
+    /// ```
+    pub fn source_type_for(path: &str) -> Option<&'static str> {
+        let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+        Some(match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            "tif" | "tiff" => "image/tiff",
+            "ico" => "image/x-icon",
+            "tga" => "image/x-tga",
+            "pnm" | "pbm" | "pgm" | "ppm" => "image/x-portable-anymap",
+            "svg" => "image/svg+xml",
+            "heic" | "heif" => "image/heic",
+            "avif" => "image/avif",
+            _ => return None,
+        })
+    }
+
     /// The media type inferred from a path's extension, for the built-in that
     /// takes a path from the model. `None` when the extension is not an image
     /// type every provider accepts — which the caller reports as a refusal the
     /// model can act on, rather than sending bytes no vendor will read.
+    ///
+    /// Unchanged in 0.55.0. [`Media::source_type_for`] is the wider question.
     pub fn media_type_for(path: &str) -> Option<&'static str> {
         let ext = path.rsplit('.').next()?.to_ascii_lowercase();
         Some(match ext.as_str() {
@@ -2212,6 +2398,7 @@ mod transcript_tests {
 #[cfg(all(test, feature = "media"))]
 mod media_tests {
     use super::*;
+    use base64::Engine as _;
 
     /// A one-pixel PNG. Small enough to inline, real enough that the encoding
     /// under test is encoding an image rather than a string.
@@ -2332,5 +2519,168 @@ mod media_tests {
         assert_eq!(Media::media_type_for("report.pdf"), None);
         assert_eq!(Media::media_type_for("clip.mp4"), None);
         assert_eq!(Media::media_type_for("noextension"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // 0.55.0 — the door is wide and the wire is narrow
+    // -----------------------------------------------------------------------
+
+    /// A real image of known dimensions, encoded in `format` by the same library
+    /// that will be asked to decode it. Not a hand-written stub: a stub that
+    /// fails to decode would prove nothing about the format.
+    fn fixture(format: image::ImageFormat) -> Vec<u8> {
+        let mut img = image::RgbaImage::new(3, 2);
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        img.put_pixel(2, 1, image::Rgba([0, 0, 255, 255]));
+        let source = image::DynamicImage::ImageRgba8(img);
+        // PNM has no alpha channel, so it is written from the RGB view. ICO is
+        // the opposite: `image` writes an ICO as an embedded PNG and its own ICO
+        // decoder refuses one that is not RGBA — a property of encoding a fixture
+        // with this library, not of the ICO files an operator actually has.
+        let source = match format {
+            image::ImageFormat::Pnm => image::DynamicImage::ImageRgb8(source.to_rgb8()),
+            _ => source,
+        };
+        let mut out = Vec::new();
+        source
+            .write_to(&mut std::io::Cursor::new(&mut out), format)
+            .unwrap();
+        out
+    }
+
+    /// F1 — every format the door accepts arrives at the wire as a PNG of the
+    /// same image. Asserted per format, because "we support these five" is five
+    /// claims.
+    #[test]
+    fn a_format_the_wire_refuses_is_accepted_at_the_door_and_arrives_as_a_png() {
+        for (media_type, format) in [
+            ("image/bmp", image::ImageFormat::Bmp),
+            ("image/tiff", image::ImageFormat::Tiff),
+            ("image/x-icon", image::ImageFormat::Ico),
+            ("image/x-tga", image::ImageFormat::Tga),
+            ("image/x-portable-anymap", image::ImageFormat::Pnm),
+        ] {
+            let source = fixture(format);
+            let attached = Media::attach(media_type, &source)
+                .unwrap_or_else(|e| panic!("{media_type} was refused: {e}"));
+
+            assert_eq!(attached.media_type, "image/png", "{media_type}");
+            let png = base64::engine::general_purpose::STANDARD
+                .decode(&attached.base64)
+                .unwrap();
+            assert_eq!(
+                &png[..8],
+                &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+                "{media_type} produced something that is not a PNG"
+            );
+            let back = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
+            assert_eq!(
+                (back.width(), back.height()),
+                (3, 2),
+                "{media_type} did not survive the round trip as the same image"
+            );
+        }
+    }
+
+    /// F2 — the four wire types are passed through byte-identically. A JPEG that
+    /// went through the decoder and came back would be a silent quality loss on
+    /// the commonest path there is.
+    #[test]
+    fn the_four_wire_types_are_passed_through_byte_identically() {
+        for (media_type, format) in [
+            ("image/png", Some(image::ImageFormat::Png)),
+            ("image/jpeg", Some(image::ImageFormat::Jpeg)),
+            // GIF and WebP are not compiled into `image` here, so their bytes
+            // are asserted as opaque — which is the stronger claim anyway: the
+            // door does not look at them at all.
+            ("image/gif", None),
+            ("image/webp", None),
+        ] {
+            let source = match format {
+                Some(format) => fixture(format),
+                None => b"not really an image, and never decoded".to_vec(),
+            };
+            let attached = Media::attach(media_type, &source).unwrap();
+
+            assert_eq!(attached.media_type, media_type, "the type is kept");
+            let out = base64::engine::general_purpose::STANDARD
+                .decode(&attached.base64)
+                .unwrap();
+            assert_eq!(out, source, "{media_type} was re-encoded rather than sent");
+        }
+    }
+
+    /// F3 — a format the crate cannot decode is refused by its own name, with
+    /// the reason and a conversion, rather than by reciting the vendors' list.
+    #[test]
+    fn an_undecodable_format_is_refused_by_name_with_a_remedy() {
+        for (media_type, name, remedy) in [
+            ("image/svg+xml", "SVG", "resvg"),
+            ("image/heic", "HEIC", "heif-convert"),
+            ("image/avif", "AVIF", "avifdec"),
+            ("application/pdf", "PDF", "pdf_read"),
+        ] {
+            let err = Media::attach(media_type, b"whatever these bytes are")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(name), "{media_type}: {err}");
+            assert!(err.contains(remedy), "{media_type}: {err}");
+            assert!(
+                !err.contains("expected one of"),
+                "{media_type} still gets the vendor list: {err}"
+            );
+        }
+    }
+
+    /// F4 — `Media::image` is the wire and did not move. The door is a second
+    /// constructor, not a widened one.
+    #[test]
+    fn the_wire_gate_still_refuses_everything_but_the_four() {
+        let err = Media::image("image/bmp", &fixture(image::ImageFormat::Bmp))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported image media type"), "{err}");
+        for media_type in IMAGE_MEDIA_TYPES {
+            assert!(Media::image(media_type, PNG).is_ok(), "{media_type}");
+        }
+    }
+
+    /// N5 — a decompression bomb is refused from its header, before the decode
+    /// it would otherwise pay for.
+    #[test]
+    fn a_declared_size_over_the_pixel_bound_is_refused_before_decoding() {
+        // A BMP header claiming 40,000 × 40,000 with no pixel data behind it. If
+        // the bound were checked after the decode this would either allocate 6 GB
+        // or fail with a decoder error instead of the message an operator can act
+        // on.
+        let mut bmp = fixture(image::ImageFormat::Bmp);
+        bmp[18..22].copy_from_slice(&40_000i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&40_000i32.to_le_bytes());
+
+        let err = Media::attach("image/bmp", &bmp).unwrap_err().to_string();
+        assert!(err.contains("40000×40000"), "{err}");
+        assert!(err.contains("pixel bound"), "{err}");
+    }
+
+    /// The extension table the doorstep reads, which is wider than the wire's on
+    /// purpose — including the three it can only name.
+    #[test]
+    fn the_source_table_names_every_format_the_doorstep_recognises() {
+        for (path, expected) in [
+            ("scan.BMP", "image/bmp"),
+            ("scan.tif", "image/tiff"),
+            ("scan.tiff", "image/tiff"),
+            ("favicon.ico", "image/x-icon"),
+            ("art.tga", "image/x-tga"),
+            ("frame.ppm", "image/x-portable-anymap"),
+            ("diagram.svg", "image/svg+xml"),
+            ("photo.HEIC", "image/heic"),
+            ("photo.avif", "image/avif"),
+        ] {
+            assert_eq!(Media::source_type_for(path), Some(expected), "{path}");
+        }
+        assert_eq!(Media::source_type_for("notes.md"), None);
+        // And the wire table did not widen with it.
+        assert_eq!(Media::media_type_for("scan.bmp"), None);
     }
 }
