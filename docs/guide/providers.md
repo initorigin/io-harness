@@ -618,6 +618,47 @@ Escalation wins over downshifting, is one-way, and counts *consecutive* failed
 gates. A run whose gate keeps refusing is not one to save money on, and a run that
 oscillates between two models is a behaviour nobody asked for.
 
+## Reporting a tool call before the completion ends (0.54.0)
+
+`Provider` has three completion methods, and two of them are defaulted:
+
+| Method | What it reports as it goes | Default |
+| --- | --- | --- |
+| `complete` | nothing | required |
+| `complete_streaming` | assistant text | delegates to `complete`, one delta |
+| `complete_streaming_calls` | text **and finished tool calls** | delegates to `complete_streaming`, no calls |
+
+The third is what lets a session turn start a read-only tool call while the model
+is still speaking — in a turn that streams, which means one of the `_observed` or
+`_steered` entry points; `Session::turn_bounded` and its siblings do not stream and
+so start nothing early. **Implementing it is optional and the default costs
+nothing**:
+a provider that does not override it reports no call, the harness starts nothing
+early, and the run behaves exactly as it did on 0.53.0. `Record` and `Replay`
+override neither streaming method, which is why a replayed run never starts
+anything early — a useful property rather than a gap, since it makes a replayed
+run identical to the serial one by construction.
+
+If you are writing a provider against a wire that streams tool-call arguments in
+fragments, the rule the built-in wires use is worth copying:
+
+- **Report a call when its accumulated arguments parse as a JSON object.** Every
+  proper prefix of a JSON object fails to parse — a truncated object is missing
+  its brace, a truncated string its quote — so a report cannot fire on half a
+  call. You do not need a per-call end event from the vendor, which is just as
+  well: Anthropic sends one and the OpenAI wire does not.
+- **Report in position order and never past a gap.** The `usize` you pass is the
+  call's position in the `CompletionResponse` you will return, counting only the
+  calls that response will actually carry. If an earlier call is not finished yet,
+  say nothing rather than reporting a later one — its position is not decidable
+  until the earlier one is.
+- **Reporting eagerly cannot make a run do the wrong thing.** The harness uses a
+  reported call only if the completion it finally returns carries that same call,
+  with the same name and byte-identical arguments, at that same position. Anything
+  else is discarded with nothing recorded. The worst an over-eager implementation
+  costs is a wasted read — which `EventKind::Speculated`'s `discarded` count will
+  show you.
+
 ## See also
 
 - [The public contract](../CONTRACT.md) — the per-vendor divergences, stated

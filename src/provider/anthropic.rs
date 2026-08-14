@@ -414,7 +414,7 @@ impl Provider for Anthropic {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
-        self.stream(request, &|_| {}).await
+        self.stream(request, &|_| {}, &|_, _| {}).await
     }
 
     async fn complete_streaming(
@@ -422,7 +422,16 @@ impl Provider for Anthropic {
         request: CompletionRequest,
         on_token: &(dyn Fn(&str) + Send + Sync),
     ) -> Result<CompletionResponse> {
-        self.stream(request, on_token).await
+        self.stream(request, on_token, &|_, _| {}).await
+    }
+
+    async fn complete_streaming_calls(
+        &self,
+        request: CompletionRequest,
+        on_token: &(dyn Fn(&str) + Send + Sync),
+        on_call: &(dyn Fn(usize, &ToolCall) + Send + Sync),
+    ) -> Result<CompletionResponse> {
+        self.stream(request, on_token, on_call).await
     }
 }
 
@@ -437,6 +446,7 @@ impl Anthropic {
         &self,
         request: CompletionRequest,
         on_token: &(dyn Fn(&str) + Send + Sync),
+        on_call: &(dyn Fn(usize, &ToolCall) + Send + Sync),
     ) -> Result<CompletionResponse> {
         #[cfg(feature = "media")]
         super::ensure_media_accepted(self.name(), self.accepts_images(), &request)?;
@@ -472,6 +482,10 @@ impl Anthropic {
                     on_token(delta);
                 }
                 acc.ingest(&value);
+                // 0.54.0 — after the ingest, never inside it: a call is complete
+                // when the accumulator says its fragments parse, which is a fact
+                // about the accumulated state rather than about this event.
+                acc.announce(on_call);
             }
             false
         })
@@ -506,6 +520,9 @@ struct Accumulator {
     reasoning: String,
     /// block index -> (tool name, input-json fragments joined)
     tool_calls: BTreeMap<u64, (String, String)>,
+    /// 0.54.0 — the blocks already handed to `on_call`, so a call is reported
+    /// once however many more events arrive on its block.
+    announced: std::collections::BTreeSet<u64>,
     input_tokens: u64,
     output_tokens: u64,
     /// 0.18.0 — the cache breakdown of `input_tokens`, the model that answered,
@@ -776,6 +793,16 @@ impl Accumulator {
         }
     }
 
+    /// Report the calls whose arguments are now complete (0.54.0).
+    ///
+    /// Anthropic sends a `content_block_stop` for each block, which is not read
+    /// here and is not needed: the parse in [`ready_call`](super::ready_call) is
+    /// the edge on both wires, and a rule that used this vendor's end event
+    /// would have no counterpart on the OpenAI wire, which sends none.
+    fn announce(&mut self, on_call: &(dyn Fn(usize, &ToolCall) + Send + Sync)) {
+        super::announce_ready(&self.tool_calls, &mut self.announced, on_call);
+    }
+
     fn finish(self) -> CompletionResponse {
         let tool_calls = self
             .tool_calls
@@ -833,6 +860,88 @@ impl Accumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F10 — the Anthropic wire reaches the same edge by the same rule.
+    ///
+    /// `content_block_stop` is deliberately not read: the parse is the signal on
+    /// both wires, and this vendor's per-block end event has no counterpart on the
+    /// OpenAI wire.
+    #[test]
+    fn a_call_is_reported_once_its_input_json_parses() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = {
+            let seen = std::sync::Arc::clone(&seen);
+            move |at: usize, call: &ToolCall| seen.lock().unwrap().push((at, call.clone()))
+        };
+        let mut acc = Accumulator::default();
+
+        // A text block first, so the block index and the call's position differ —
+        // a position taken from the block index would be wrong here and nowhere
+        // else, which is exactly the bug worth a test.
+        acc.ingest(&json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"text","text":""}}));
+        acc.ingest(&json!({"type":"content_block_start","index":1,
+            "content_block":{"type":"tool_use","name":"read_file"}}));
+        acc.announce(&sink);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "reported before any arguments"
+        );
+
+        // The argument value carries a brace of its own, so a scan for the first
+        // `}` would cut here and report truncated arguments. Only a parse gets
+        // this right, which is the whole reason the edge is a parse.
+        acc.ingest(&json!({"type":"content_block_delta","index":1,
+            "delta":{"type":"input_json_delta","partial_json":"{\"path\":\"src/a{b}"}}));
+        acc.announce(&sink);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "reported on a prefix that cannot parse"
+        );
+
+        acc.ingest(&json!({"type":"content_block_delta","index":1,
+            "delta":{"type":"input_json_delta","partial_json":"c.rs\"}"}}));
+        acc.announce(&sink);
+        acc.announce(&sink);
+
+        let reported = seen.lock().unwrap().clone();
+        assert_eq!(reported.len(), 1, "a call must be reported exactly once");
+        assert_eq!(
+            reported[0].0, 0,
+            "the text block must not occupy a position"
+        );
+        assert_eq!(reported[0].1.name, "read_file");
+        assert_eq!(reported[0].1.arguments, json!({"path": "src/a{b}c.rs"}));
+        assert_eq!(acc.finish().tool_calls[0], reported[0].1);
+    }
+
+    /// F10, second arm — an empty-argument call streams no `partial_json` at all,
+    /// so it never parses and is never reported. `finish` still maps it to `{}`;
+    /// it simply is not something to start early.
+    #[test]
+    fn an_empty_argument_call_is_never_reported_but_still_settles() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = {
+            let seen = std::sync::Arc::clone(&seen);
+            move |at: usize, call: &ToolCall| seen.lock().unwrap().push((at, call.clone()))
+        };
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"tool_use","name":"git_status"}}));
+        acc.announce(&sink);
+        acc.ingest(&json!({"type":"content_block_stop","index":0}));
+        acc.announce(&sink);
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a call with no argument fragments must not be reported"
+        );
+        let out = acc.finish();
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].name, "git_status");
+        assert_eq!(out.tool_calls[0].arguments, json!({}));
+    }
+
     use crate::provider::ToolSpec;
 
     #[test]

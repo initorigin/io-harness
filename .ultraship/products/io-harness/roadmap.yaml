@@ -1289,8 +1289,21 @@ versions:
       wait for the rest of the completion before running it. Read-only only, because a write begun
       on a stream that then fails is not recoverable, and the ordered fold from 0.41.0 keeps the
       trace and the replay identical either way.
-    detail: outline
-    status: planned
+
+      **Specified 2026-08-14, and the specification corrected the entry's premise.** At the wire and
+      in both accumulators the stream does yield tool calls incrementally
+      (`src/provider/anthropic.rs:508`, `src/provider/openai_wire.rs:511`). At the `Provider` trait
+      it does not: `complete_streaming`'s sink is `&(dyn Fn(&str) + Send + Sync)` — assistant text
+      and nothing else — so this release contains a third defaulted trait method whose default emits
+      no call at all. Three further facts moved into the contract rather than waiting to be
+      discovered: `Record` and `Replay` override neither streaming method, so a replayed run
+      speculates nothing by construction; streaming is a session property (`stream: bool`,
+      `src/run.rs:1227`), so `run_with` is out of scope; and `agent_loop` never took 0.41.0's batch
+      path either, so it is excluded by name rather than by omission. The rule is narrower than
+      0.41.0's: the completion's **leading** read-only run, not every read-only run, because a read
+      speculated past an unstarted write would return the bytes from before it.
+    detail: specified
+    status: released
   - version: 0.55.0
     outcome: >
       Whatever a person hands the harness, the harness takes — or says exactly why not. Today an
