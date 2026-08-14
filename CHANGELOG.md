@@ -26,6 +26,78 @@ notes are produced from it.
 
 ### Security
 
+## [0.56.0] - 2026-08-14
+
+### Added
+
+- **A `forget` tool.** A run can withdraw a note it learned was wrong. Writing a
+  key again only replaces it, so an agent that learned the same wrong thing under
+  two names previously had two disagreeing notes and no way to take either back.
+  A note the operator pinned is refused, exactly as a write to one is; a key that
+  was never there is reported as absent rather than as a removal; and nothing is
+  withdrawn while a plan is unapproved, which is where `remember` is refused for
+  the same reason. `Store::memory_forget` is the typed form and returns
+  `MemoryForget::{Removed, Pinned, Absent}`.
+- **A memory scope above the workspace.** `remember` and `forget` take
+  `scope`, `"workspace"` (the default) or `"global"`. A global note is recalled
+  by every run over every workspace — for a fact true wherever you run, such as
+  the package manager an operator uses. `GLOBAL_MEMORY_WORKSPACE` is the key it
+  is stored under, and it is an ordinary bucket: its own caps, its own pins, its
+  own eviction. **A workspace's own note of the same key wins**, and the global
+  one is not rendered beside it. The memory block renders the two scopes under
+  separate headings, so a note kept for every workspace is never presented as
+  something learned about this one.
+- **`[memory]` in `io.toml`, and `TaskContract::with_memory_limits`.** The three
+  caps — `max_entries` (64), `max_chars` (16,000) and `max_entry_chars` (2,000) —
+  are now an operator's numbers rather than the crate's constants. The defaults
+  are those constants, so a caller who sets nothing keeps today's behaviour. Each
+  key applies on its own, and all three may only be **lowered** by a
+  project-scoped file. `MemoryLimits` carries them; `Store::memory_write_with` is
+  `memory_write` under caller-chosen caps.
+
+### Changed
+
+- **Eviction is ordered by evidence rather than by the write clock.** At a cap
+  the store used to drop the oldest entry, which meant the build command learned
+  on the first run and carried by every run since was the first thing to go while
+  this morning's triviality survived. Candidates are now ordered by how many
+  **distinct runs** carried the entry, then by how recently one did, then by the
+  write clock. That last term is 0.10.0's order kept as the tie-break, so an entry
+  with no recalls yet is treated exactly as it was before. The entry just written
+  is still never a candidate and a pinned entry still never is.
+
+  The count is of runs, not of recall rows: a row is written once per carried key
+  per *step*, so rows measure steps elapsed since the write — one long run would
+  outvote fifty short ones, and the order would be monotone in age again. A recall
+  means the entry was carried into a prompt, which is the strongest signal this
+  crate can observe; nothing claims the model read it.
+
+  **What this changes for you:** a store already at its cap will, on its next
+  write, drop a different key than 0.55.0 would have. Which keys are dropped is
+  returned by the write and recorded in the trace, as it always was.
+- **A rewind can undo a removal, not only an overwrite.** `Store::memory_restore`
+  was an `UPDATE`, which put back an entry a run had edited and silently did
+  nothing for one a run had removed. It is now an upsert, so `rewind_run` puts
+  back what a `forget` took. Restoring an edited entry is byte-for-byte what it
+  was.
+
+### Fixed
+
+- **A memory character cap larger than an `i64` no longer empties the
+  workspace.** The cap was compared as `limits.max_chars as i64`, which is exact
+  for this crate's own 16,000 and wraps *negative* for a large number — at which
+  point the eviction loop's exit condition can never hold and a single write
+  drops every entry but the one it just wrote. Reachable only once the caps
+  became settable, which is this release, and found by running the measurement
+  rather than by reading the code. The comparison is `u128` now.
+
+### Migrations
+
+- **One additive index.** `memory_recalls_entry` on `memory_recalls (workspace,
+  key)`, created on the first open by a 0.56.0 binary. `CHECKPOINT_FORMAT` does
+  not move, no table or column is added, and a 0.55.0 binary reads the same
+  database afterwards unchanged. An operator does nothing.
+
 ## [0.55.0] - 2026-08-14
 
 ### Added

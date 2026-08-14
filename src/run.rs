@@ -69,8 +69,9 @@ use crate::sandbox::{Sandbox, SandboxConfig};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{
-    AgentEvent, ContextEvent, GateOutcome, Kept, MemoryForget, MemoryKind, MemoryLimits, RunStatus,
-    Snapshot, StepRecord, Store, TodoItem, TodoState, MAX_SNAPSHOT_BYTES,
+    AgentEvent, ContextEvent, GateOutcome, Kept, MemoryEntry, MemoryForget, MemoryKind,
+    MemoryLimits, RunStatus, Snapshot, StepRecord, Store, TodoItem, TodoState,
+    GLOBAL_MEMORY_WORKSPACE, MAX_SNAPSHOT_BYTES,
 };
 use crate::toolchain::Toolchain;
 use crate::tools::exec::{Exec, ExecOutcome};
@@ -4749,7 +4750,7 @@ async fn run_workspace_from<P: Provider>(
         // Re-read each turn rather than once at the start, so the notes the model
         // sees are the notes the store holds — including one written this run, and
         // not one the operator has since cleared.
-        let notes = store.memory_list(&mem_key)?;
+        let (notes, global_notes) = recall_scopes(store, &mem_key)?;
         // 0.43.0 — before assembly, never inside it. Over the threshold, the older
         // observations become one written paragraph and the assembler bounds a
         // shorter ledger; under it, nothing happens and no provider is called.
@@ -4806,6 +4807,7 @@ async fn run_workspace_from<P: Provider>(
                 &ledger,
                 budget_tokens,
                 &notes,
+                &global_notes,
                 Assembly {
                     ws: Some(&ws),
                     policy: &effective,
@@ -4906,7 +4908,7 @@ async fn run_workspace_from<P: Provider>(
         // count cannot tell a load-bearing entry from a passenger. Recorded once,
         // after the attempt that succeeded, so a recovered step does not write the
         // recall twice.
-        store.record_memory_recall(run_id, step, &mem_key, &assembled.recalled_keys)?;
+        record_recalls(store, run_id, step, &mem_key, &global_notes, &assembled)?;
 
         // Which provider answered, when that is not a foregone conclusion. A
         // `Fallback` that fell over served this step from its secondary, and a trace
@@ -7032,7 +7034,7 @@ where
                 &mut collected,
                 &mut ledger,
             )?;
-            let notes = tree.store.memory_list(&mem_key)?;
+            let (notes, global_notes) = recall_scopes(tree.store, &mem_key)?;
             // 0.43.0 — the tree loop's own call to the one fold helper, in the same
             // place for the same reason. A child folds its own ledger at its own
             // depth: the summary is of the work that agent did, not of the tree.
@@ -7058,6 +7060,7 @@ where
                     &ledger,
                     budget_tokens,
                     &notes,
+                    &global_notes,
                     Assembly {
                         ws: Some(&ws),
                         policy,
@@ -7166,8 +7169,14 @@ where
             // Same record on the tree path: a sub-agent's run is a run, and its
             // recalls belong to it rather than to whoever spawned it. Recorded once,
             // after the attempt that succeeded.
-            tree.store
-                .record_memory_recall(run_id, step, &mem_key, &assembled.recalled_keys)?;
+            record_recalls(
+                tree.store,
+                run_id,
+                step,
+                &mem_key,
+                &global_notes,
+                &assembled,
+            )?;
 
             // Which provider answered, when that is not a foregone conclusion. A
             // `Fallback` that fell over served this step from its secondary, and a
@@ -10125,6 +10134,10 @@ async fn dispatch(
                     "\n[remember error] both key and value are required\n",
                 ));
             }
+            let scope = match memory_scope(s("scope"), memory_key) {
+                Ok(scope) => scope,
+                Err(refusal) => return Ok(refusal),
+            };
             // The store bounds the entry and evicts oldest-first to hold the caps;
             // it writes no trace rows of its own, so the write and every eviction
             // are recorded here, where the run_id and step are known.
@@ -10135,7 +10148,7 @@ async fn dispatch(
             // corrected something and did not will act on the correction it
             // thinks it made.
             let wrote = store.memory_write_with(
-                memory_key,
+                scope,
                 key,
                 value,
                 run_id,
@@ -10216,7 +10229,11 @@ async fn dispatch(
                     "\n[forget error] key is required\n",
                 ));
             }
-            match store.memory_forget(memory_key, key, run_id, step)? {
+            let scope = match memory_scope(s("scope"), memory_key) {
+                Ok(scope) => scope,
+                Err(refusal) => return Ok(refusal),
+            };
+            match store.memory_forget(scope, key, run_id, step)? {
                 MemoryForget::Pinned => {
                     store.record_context_event(
                         run_id,
@@ -13164,6 +13181,87 @@ fn memory_key(root: &Path) -> String {
         .into_owned()
 }
 
+/// Which bucket a `remember` or a `forget` names (0.56.0).
+///
+/// Absent is the workspace, which is what every version before this one did and
+/// therefore what a model that says nothing gets. An unrecognised value is
+/// refused by name rather than quietly treated as the workspace: a model that
+/// meant to write a note for every workspace and silently wrote one here would
+/// go on believing the fact is known everywhere.
+fn memory_scope<'a>(
+    named: Option<&str>,
+    workspace: &'a str,
+) -> std::result::Result<&'a str, Dispatched> {
+    match named {
+        None | Some("") | Some("workspace") => Ok(workspace),
+        Some("global") => Ok(GLOBAL_MEMORY_WORKSPACE),
+        Some(other) => Err(Dispatched::go(
+            format!("memory scope error ({other})"),
+            format!(
+                "\n[memory error] `scope` must be \"workspace\" (the default) or \"global\"; \
+                 got {other:?}. Nothing was written.\n"
+            ),
+        )),
+    }
+}
+
+/// Both scopes a run recalls from, with every collision already resolved
+/// (0.56.0).
+///
+/// The workspace's own notes, then the notes kept for every workspace **minus
+/// anything the workspace already has a key for**. Resolving here rather than at
+/// render time is what makes the two lists disjoint, which is what lets
+/// [`record_recalls`] tell one scope's carried key from the other's by lookup.
+///
+/// The specific place always knows better than the general one: a global note an
+/// agent got wrong is corrected by writing the same key in the workspace that
+/// disagrees with it, which is a thing a run can do for itself.
+fn recall_scopes(store: &Store, mem_key: &str) -> Result<(Vec<MemoryEntry>, Vec<MemoryEntry>)> {
+    let notes = store.memory_list(mem_key)?;
+    // A run over the global bucket itself — which nothing in this crate creates,
+    // but an embedder could name — would otherwise see its own notes twice.
+    if mem_key == GLOBAL_MEMORY_WORKSPACE {
+        return Ok((notes, Vec::new()));
+    }
+    let own: std::collections::HashSet<&str> = notes.iter().map(|e| e.key.as_str()).collect();
+    let global = store
+        .memory_list(GLOBAL_MEMORY_WORKSPACE)?
+        .into_iter()
+        .filter(|e| !own.contains(e.key.as_str()))
+        .collect();
+    Ok((notes, global))
+}
+
+/// Record what this step's prompt actually carried, each key against the bucket
+/// that holds it (0.56.0).
+///
+/// A recall row is the evidence eviction ranks by, so a global note carried into
+/// a workspace's run has to be credited to the global bucket. Writing every
+/// carried key under the run's own workspace would credit a *different* entry
+/// that happens to share the key, and starve the global one of the evidence it
+/// earned.
+fn record_recalls(
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    mem_key: &str,
+    global: &[MemoryEntry],
+    assembled: &crate::context::Assembled,
+) -> Result<()> {
+    let from_global: std::collections::HashSet<&str> =
+        global.iter().map(|e| e.key.as_str()).collect();
+    let (global_keys, own_keys): (Vec<String>, Vec<String>) = assembled
+        .recalled_keys
+        .iter()
+        .cloned()
+        .partition(|k| from_global.contains(k.as_str()));
+    store.record_memory_recall(run_id, step, mem_key, &own_keys)?;
+    if !global_keys.is_empty() {
+        store.record_memory_recall(run_id, step, GLOBAL_MEMORY_WORKSPACE, &global_keys)?;
+    }
+    Ok(())
+}
+
 /// Whether a failure is a request that did not fit the model's window.
 ///
 /// One place, so the loop's recovery and `complete_with_retry`'s escape hatch
@@ -15128,7 +15226,12 @@ fn workspace_tools() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "key": { "type": "string", "description": "Short name to recall it by; writing the same key again replaces it." },
-                    "value": { "type": "string", "description": "The fact, in one or two sentences." }
+                    "value": { "type": "string", "description": "The fact, in one or two sentences." },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["workspace", "global"],
+                        "description": "\"workspace\" (the default) keeps the note for this repository. \"global\" keeps it for every workspace — only for something true wherever you run, and a workspace's own note of the same key overrides it."
+                    }
                 },
                 "required": ["key", "value"]
             }),
@@ -15143,7 +15246,12 @@ fn workspace_tools() -> Vec<ToolSpec> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "The key of the note to withdraw, exactly as it appears in your notes." }
+                    "key": { "type": "string", "description": "The key of the note to withdraw, exactly as it appears in your notes." },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["workspace", "global"],
+                        "description": "Which of the two lists the note is in: \"workspace\" (the default) or \"global\"."
+                    }
                 },
                 "required": ["key"]
             }),

@@ -46,6 +46,7 @@ const ASK_QUESTION_TOOL src/tools/mod.rs
 const BUSY_TIMEOUT src/state.rs
 const CHECKPOINT_FORMAT src/state.rs
 const DEFAULT_EXEC_TIMEOUT src/tools/exec.rs
+const GLOBAL_MEMORY_WORKSPACE src/state.rs
 const IMAGE_MEDIA_TYPES src/provider/mod.rs (feature = "media")
 const MAX_ID src/plugin.rs
 const MCP_TOOL_PREFIX src/mcp.rs
@@ -78,6 +79,7 @@ enum EventKind src/observe.rs
 enum Flow src/observe.rs
 enum GateOutcome src/state.rs
 enum McpTransport src/mcp.rs
+enum MemoryForget src/state.rs
 enum MemoryKind src/state.rs
 enum Message src/provider/mod.rs
 enum PlanVerdict src/approve.rs
@@ -146,6 +148,7 @@ struct McpEvent src/state.rs
 struct McpServer src/mcp.rs
 struct Media src/provider/mod.rs (feature = "media")
 struct MemoryEntry src/state.rs
+struct MemoryLimits src/state.rs
 struct MemoryRecall src/state.rs
 struct MemoryWrite src/state.rs
 struct ModelApprover src/approve.rs

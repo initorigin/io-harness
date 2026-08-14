@@ -557,10 +557,11 @@ the rest are untouched. `Act::Net` is untouched too, for a blunter reason: the
 provider is reached over the network, and denying it would stop the run asking
 for the plan in the first place.
 
-**`remember` is the one write the policy cannot see**, because it lands in this
-crate's own store rather than in the workspace. It is refused explicitly for the
-duration of the phase. `todo_write` and `ask_question` are not: neither changes
-anything outside the run's own record of itself.
+**`remember` and `forget` are the two writes the policy cannot see**, because
+they land in this crate's own store rather than in the workspace. Both are
+refused explicitly for the duration of the phase — a withdrawal changes what
+later runs know exactly as a write does. `todo_write` and `ask_question` are not:
+neither changes anything outside the run's own record of itself.
 
 **What the phase is not:** it is not a sandbox, and it does not undo. A tool that
 reads a file and has a side effect the crate cannot see — a registered `Tool`
@@ -1930,9 +1931,45 @@ debug build over an in-memory store, at 20,000 finished runs: 1.8ms, 2.5ms,
 refreshing a panel every second over a very large trace should cache the answer;
 this crate does not cache it for them.
 
+**Eviction is ordered by evidence, not by the write clock (0.56.0).** At a cap
+the store drops the entry with the fewest **distinct runs** behind it in
+`memory_recalls`, then the one least recently carried, then — for everything with
+no recalls at all — the oldest, which is 0.10.0's order kept as the tie-break so
+the unproven cohort behaves exactly as it did. The count is of runs and not of
+rows: a recall row is written once per carried key per *step*, so rows measure
+steps elapsed since the write and would make the order monotone in age again. A
+recall means the entry was **carried into a prompt**, which is the strongest
+signal this crate can observe; nothing here claims the model read it.
+
+**The three caps are the operator's (0.56.0).** `MEMORY_MAX_ENTRIES` (64),
+`MEMORY_MAX_CHARS` (16,000) and `MEMORY_MAX_ENTRY_CHARS` (an eighth of that)
+remain the defaults and are now movable, through `[memory]` in `io.toml` or
+`TaskContract::with_memory_limits`. All three narrow at project scope and never
+widen. Raising one is coupled to what a prompt can carry: the memory block gets a
+quarter of a turn's effective tokens, and the defaults were chosen so a whole
+store fits inside that share — past it, selection begins deciding what the model
+sees, which is only safe because selection is now by evidence.
+
+**Memory has two scopes, and the specific one wins (0.56.0).** A workspace's
+canonical path, and `GLOBAL_MEMORY_WORKSPACE` above it, which every run over
+every workspace recalls. `remember` and `forget` take `scope`, defaulting to the
+workspace, so a run may promote a fact it believes is universal and withdraw it
+the same way. Where a key exists in both, **the workspace's entry is carried and
+the global one is not rendered at all**. Each scope holds its own caps, its own
+pins and its own eviction, so a run recalling both may carry up to twice one
+scope's characters inside a block ceiling that has not grown.
+
+**A run can unlearn (0.56.0).** `forget` removes one entry. A pinned entry is
+refused, exactly as a write to one is; a key that was never there is reported as
+absent rather than as a removal. The restore point is taken before the entry
+goes, so `rewind_run` puts it back — and a forget takes the key's recall rows
+with it where an eviction leaves them, because the run said the fact was wrong
+while a cap said only that the store was full.
+
 **A pin binds a run, not a person, and not another process's caller (0.30.0).**
 `MemoryEntry::pinned` stops the *agent* overwriting an entry through the
-`remember` tool, and stops the caps evicting it. It is not access control:
+`remember` tool, stops it withdrawing one through `forget`, and stops the caps
+evicting it. It is not access control:
 `Store::memory_write` from the embedding program is refused the same way, but
 `Store::memory_pin(.., false)`, `memory_delete` and `memory_clear` are the
 caller's and are not refused — the pin is a statement about what a run may

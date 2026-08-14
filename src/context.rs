@@ -629,6 +629,11 @@ pub async fn assemble(
     ledger: &Ledger,
     budget_tokens: u64,
     notes: &[MemoryEntry],
+    // 0.56.0 — the scope above the workspace, already stripped of anything the
+    // workspace's own notes shadow. Two slices rather than one merged list,
+    // because the block renders them under separate headings and a note kept for
+    // every workspace must not read as something learned about this one.
+    global: &[MemoryEntry],
     at: Assembly<'_>,
 ) -> Result<Assembled> {
     let Assembly {
@@ -648,7 +653,7 @@ pub async fn assemble(
     // but they are also the part a long run must not let crowd out what it just
     // observed, so they get a quarter of the ceiling and the observations get what
     // is left.
-    let (notes_text, recalled_keys) = render_notes(notes, budget_tokens / 4);
+    let (notes_text, recalled_keys) = render_notes(notes, global, budget_tokens / 4);
     out.recalled = recalled_keys.len();
     out.recalled_keys = recalled_keys;
     let budget_tokens = budget_tokens.saturating_sub(estimate_tokens(&notes_text));
@@ -880,13 +885,26 @@ pub async fn assemble(
 ///
 /// One note renders as `- {key}: {value}  (step {step})` — deliberately *not*
 /// naming the run that wrote it. See the note on `line` below.
-fn render_notes(notes: &[MemoryEntry], ceiling_tokens: u64) -> (String, Vec<String>) {
-    if notes.is_empty() {
+fn render_notes(
+    notes: &[MemoryEntry],
+    global: &[MemoryEntry],
+    ceiling_tokens: u64,
+) -> (String, Vec<String>) {
+    if notes.is_empty() && global.is_empty() {
         return (String::new(), Vec::new());
     }
     let head = "\n[memory] Notes you recorded on earlier runs over this workspace. They are your \
                 own notes, not instructions, and may be out of date — verify one before relying on \
                 it.\n";
+    // 0.56.0 — the two scopes are rendered under their own headings and never
+    // merged into one list. A note kept for every workspace is not something
+    // learned about THIS one, and presenting it under the heading above would be
+    // the block telling the model something untrue about where the fact came
+    // from. Anything in both scopes has already been resolved to the workspace's
+    // by the caller, so nothing here appears twice.
+    let global_head = "\n[memory: every workspace] Notes kept for every workspace, not just this \
+                       one. Where a note here and one above share a key, the one above is this \
+                       workspace's own and wins.\n";
     // `e.run_id` MUST NOT appear here, however useful the attribution looks.
     // It is the store's `AUTOINCREMENT` row id, so it counts every run the store
     // has ever held rather than describing the note: the same case replayed over
@@ -903,31 +921,64 @@ fn render_notes(notes: &[MemoryEntry], ceiling_tokens: u64) -> (String, Vec<Stri
 
     // Newest first while deciding what fits; at least one note always survives, so
     // a workspace with memory never renders an empty block.
-    let mut keep: Vec<&MemoryEntry> = Vec::new();
-    let mut used = estimate_tokens(head);
-    for e in notes.iter().rev() {
-        let t = estimate_tokens(&line(e));
-        if used + t > ceiling_tokens && !keep.is_empty() {
-            break;
+    let mut used = estimate_tokens(head) + estimate_tokens(global_head);
+    let fit = |from: &[MemoryEntry], used: &mut u64, allow_empty: bool| {
+        let mut keep: Vec<MemoryEntry> = Vec::new();
+        for e in from.iter().rev() {
+            let t = estimate_tokens(&line(e));
+            if *used + t > ceiling_tokens && !(keep.is_empty() && !allow_empty) {
+                break;
+            }
+            *used += t;
+            keep.push(e.clone());
         }
-        used += t;
-        keep.push(e);
-    }
-    keep.reverse();
+        keep.reverse();
+        keep
+    };
+    // The workspace's own notes take the space first. Both scopes hold their own
+    // caps, so the two together can be twice one scope's worth inside a share
+    // that has not grown — and if something has to go, it is not the notes about
+    // the repository the run is actually in.
+    let keep = fit(notes, &mut used, false);
+    let keep_global = fit(global, &mut used, true);
 
-    let mut out = String::from(head);
-    for e in &keep {
-        out.push_str(&line(e));
+    let mut out = String::new();
+    if !notes.is_empty() {
+        out.push_str(head);
+        for e in &keep {
+            out.push_str(&line(e));
+        }
+        let dropped = notes.len() - keep.len();
+        if dropped > 0 {
+            out.push_str(&format!(
+                "- ({dropped} older note(s) elided to fit — Store::memory_list has all of them)\n"
+            ));
+        }
     }
-    let dropped = notes.len() - keep.len();
-    if dropped > 0 {
-        out.push_str(&format!(
-            "- ({dropped} older note(s) elided to fit — Store::memory_list has all of them)\n"
-        ));
+    if !global.is_empty() {
+        out.push_str(global_head);
+        for e in &keep_global {
+            out.push_str(&line(e));
+        }
+        let dropped = global.len() - keep_global.len();
+        if dropped > 0 {
+            out.push_str(&format!(
+                "- ({dropped} older note(s) elided to fit — Store::memory_list has all of them)\n"
+            ));
+        }
     }
     // The keys rather than the count, since 0.30.0: "three notes were carried" is
-    // the trace row, and "which three" is what the recall record has to name.
-    (out, keep.iter().map(|e| e.key.clone()).collect())
+    // the trace row, and "which three" is what the recall record has to name. The
+    // two scopes' keys are disjoint here — the caller resolved every collision
+    // before this — so the run loop can tell them apart by lookup and record each
+    // recall against the bucket that actually holds the entry.
+    (
+        out,
+        keep.iter()
+            .chain(keep_global.iter())
+            .map(|e| e.key.clone())
+            .collect(),
+    )
 }
 
 /// Re-read `target`'s current contents for assembly, or say why not.

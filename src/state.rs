@@ -1349,6 +1349,25 @@ pub struct MemoryRecall {
 /// exists: "there was nothing there" and "an operator pinned it" are different
 /// facts, and a model told only that nothing was removed cannot tell which of
 /// them it is looking at.
+///
+/// ```
+/// use io_harness::{MemoryForget, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("fix the flake", "/repo")?;
+/// store.memory_put("/repo", "retries", "three", run, 1)?;
+///
+/// // Each of the three is reachable, and they are not interchangeable.
+/// assert_eq!(store.memory_forget("/repo", "retries", run, 2)?, MemoryForget::Removed);
+/// assert_eq!(store.memory_forget("/repo", "retries", run, 3)?, MemoryForget::Absent);
+///
+/// store.memory_put("/repo", "owner", "the platform team", run, 4)?;
+/// store.memory_pin("/repo", "owner", true)?;
+/// assert_eq!(store.memory_forget("/repo", "owner", run, 5)?, MemoryForget::Pinned);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryForget {
     /// The entry was there and is gone.
@@ -2115,6 +2134,40 @@ fn truncate_memory_value(value: &str, cap: usize) -> String {
     out.push_str(MEMORY_TRUNCATED);
     out
 }
+
+/// The workspace key the scope above every workspace is stored under (0.56.0).
+///
+/// Durable memory is keyed by a workspace's canonical path. A fact true of every
+/// repository an operator owns — the package manager they use, a convention they
+/// never want broken — had to be learned again per workspace or written by hand
+/// into each one's instructions. Entries under this key are recalled by every
+/// run over every workspace.
+///
+/// **A key in both scopes resolves to the workspace's**, and the global entry is
+/// not carried at all: the specific place always knows better than the general
+/// one, which is also what makes a wrong global note locally correctable.
+///
+/// Not a path, and it cannot collide with one: `std::fs::canonicalize` returns
+/// an absolute path on every platform this crate supports, and `<` and `>` are
+/// not legal in a Windows path at all. A directory *named* `<global>` still
+/// keys on its own canonical path.
+///
+/// ```
+/// use io_harness::{Store, GLOBAL_MEMORY_WORKSPACE};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("port the parser", "/repo")?;
+/// store.memory_put(GLOBAL_MEMORY_WORKSPACE, "package-manager", "pnpm", run, 1)?;
+///
+/// // It is an ordinary workspace bucket, so it holds its own caps, its own
+/// // pins and its own eviction — everything a workspace's memory does.
+/// assert_eq!(store.memory_list(GLOBAL_MEMORY_WORKSPACE)?.len(), 1);
+/// assert!(store.memory_list("/repo")?.is_empty(), "and it is not /repo's");
+/// # Ok(())
+/// # }
+/// ```
+pub const GLOBAL_MEMORY_WORKSPACE: &str = "<global>";
 
 /// The three caps a workspace's memory is held inside (0.56.0).
 ///
@@ -6877,10 +6930,18 @@ impl Store {
         };
 
         let mut count = rows.len();
-        let mut chars: i64 = rows.iter().map(|(_, n, _)| *n).sum();
+        // `u128`, and not the `i64` this was until 0.56.0. `LENGTH()` returns
+        // `i64` and the cap was compared as `limits.max_chars as i64` — which is
+        // exact for the crate's own constant and **wraps negative** for a large
+        // one an operator may now set, at which point `chars <= cap` is false
+        // forever, the break never fires, and a single write evicts the whole
+        // workspace down to the entry it just wrote. Widening the comparison
+        // rather than validating the input: a cap is a ceiling, and there is no
+        // number an operator can write that should mean "discard everything".
+        let mut chars: u128 = rows.iter().map(|(_, n, _)| (*n).max(0) as u128).sum();
         let mut evicted = Vec::new();
         for (key, n, pinned) in &rows {
-            if count <= limits.max_entries && chars <= limits.max_chars as i64 {
+            if count <= limits.max_entries && chars <= limits.max_chars as u128 {
                 break;
             }
             if key == keep || *pinned {
@@ -6891,7 +6952,7 @@ impl Store {
                 (workspace, key),
             )?;
             count -= 1;
-            chars -= n;
+            chars -= (*n).max(0) as u128;
             evicted.push(key.clone());
         }
         Ok(evicted)
@@ -8822,6 +8883,108 @@ mod tests {
             "the pin outranks every term of the order"
         );
         assert!(store.memory_get("ws", "k0").unwrap().is_some());
+    }
+
+    /// What a capped write costs at three store sizes (0.56.0, N5).
+    ///
+    /// `#[ignore]`d and printing rather than asserting: a duration asserted
+    /// anywhere in this suite is a flake waiting to be written, and this one
+    /// would be worst of all on a runner busy with five parallel jobs. What IS
+    /// asserted, above, is the query plan — the aggregate is answered from
+    /// `memory_recalls_entry` at every size, which is the claim that actually
+    /// bounds the cost. Here to be RUN by a human before a release, with the
+    /// numbers going into `docs/MEASUREMENTS.md` beside the machine's name:
+    ///
+    /// ```text
+    /// cargo test --release --lib memory_eviction_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a measurement, not a gate: prints timings, asserts none of them"]
+    fn memory_eviction_cost() {
+        println!("entries  recall rows  ms/write (median of 20)");
+        for entries in [64usize, 512, 4_096] {
+            let store = Store::memory().unwrap();
+            let limits = MemoryLimits {
+                max_entries: entries,
+                // Out of the way: this measures the entry cap's ranking, and a
+                // character cap biting first would measure something else.
+                max_chars: usize::MAX,
+                ..MemoryLimits::default()
+            };
+            for i in 0..entries {
+                store
+                    .memory_write_with("/ws", &format!("k{i}"), "v", 1, 1, MemoryKind::Fact, limits)
+                    .unwrap();
+            }
+            // One row per entry per run, which is what the loop writes once per
+            // step for every note the block carried.
+            let runs = 20i64;
+            for run in 100..(100 + runs) {
+                let keys: Vec<String> = (0..entries).map(|i| format!("k{i}")).collect();
+                store.record_memory_recall(run, 1, "/ws", &keys).unwrap();
+            }
+
+            let mut times = Vec::new();
+            for n in 0..20 {
+                let at = std::time::Instant::now();
+                let wrote = store
+                    .memory_write_with(
+                        "/ws",
+                        &format!("new{n}"),
+                        "v",
+                        2,
+                        2,
+                        MemoryKind::Fact,
+                        limits,
+                    )
+                    .unwrap();
+                times.push(at.elapsed());
+                assert_eq!(wrote.evicted.len(), 1, "every write at the cap evicts one");
+            }
+            times.sort();
+            println!(
+                "{entries:>7}  {:>11}  {:.3}",
+                entries as i64 * runs,
+                times[times.len() / 2].as_secs_f64() * 1_000.0
+            );
+        }
+    }
+
+    #[test]
+    fn a_character_cap_too_large_for_an_i64_is_a_ceiling_and_not_a_purge() {
+        // Found by running the N5 measurement, which set `max_chars` out of the
+        // way and got a store holding one entry. The comparison was
+        // `chars <= limits.max_chars as i64`, and a `usize` past `i64::MAX`
+        // wraps negative there — so the break never fires and one write evicts
+        // everything but the key it just wrote. Silent, and the opposite of what
+        // the number says.
+        let store = Store::memory().unwrap();
+        let limits = MemoryLimits {
+            max_entries: 1_000,
+            max_chars: usize::MAX,
+            max_entry_chars: 2_000,
+        };
+        for i in 0..10 {
+            store
+                .memory_write_with("ws", &format!("k{i}"), "v", 1, 1, MemoryKind::Fact, limits)
+                .unwrap();
+        }
+        assert_eq!(
+            store.memory_list("ws").unwrap().len(),
+            10,
+            "a cap nothing can exceed evicts nothing"
+        );
+
+        // The control, so the assertion above is about the cast and not about
+        // the cap being ignored: the same store under a cap of 3 characters.
+        let tight = MemoryLimits {
+            max_chars: 3,
+            ..limits
+        };
+        store
+            .memory_write_with("ws", "k10", "v", 1, 1, MemoryKind::Fact, tight)
+            .unwrap();
+        assert!(store.memory_list("ws").unwrap().len() <= 3);
     }
 
     #[test]

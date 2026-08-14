@@ -234,7 +234,7 @@ tasks:
     why_required: A fact true of every repository is learned again per workspace today. The collision
       rule and the separate headings are what stop a general note being read as something learned
       about this workspace.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.56.0-T03
     acceptance_criteria:
@@ -269,7 +269,53 @@ tasks:
       - src/state.rs
       - src/run.rs
       - src/context.rs
-    evidence: []
+      - src/lib.rs
+      - tests/memory_scope.rs
+      - tests/context.rs
+    evidence:
+      - >-
+        F12 `a_global_note_is_recalled_from_a_workspace_that_never_wrote_it`: a run over workspace A
+        writes with `scope: "global"`; a run over workspace B, which has no entries of its own,
+        carries it in its block. Asserted in both directions, so the claim is about the scope rather
+        than the order two workspaces happened to run in. It also asserts the global write is NOT
+        also A's own entry.
+      - >-
+        F13 `the_workspace_wins_a_key_collision_and_the_global_note_is_not_carried`: with the same
+        key in both scopes the prompt holds the workspace value and **does not contain** the global
+        one. Asserted on the global value's absence, because rendering both would satisfy the
+        weaker "the workspace value is present".
+      - >-
+        F14 `the_block_renders_the_two_scopes_under_their_own_headings`: `[memory]` and `[memory:
+        every workspace]` both appear, and the two notes are asserted to fall inside their own
+        heading's span by byte offset rather than merely to be present.
+      - >-
+        F15 `a_directory_named_like_the_reserved_key_is_still_its_own_workspace`: a real temporary
+        directory actually named `<global>` keys on its own canonical path, which is absolute — so
+        the claim is about canonicalisation and not about a string spelled twice. Windows, where
+        `<` and `>` cannot appear in a path at all, is handled as the same property.
+      - >-
+        F16 `each_scope_is_bounded_on_its_own`: filling the global bucket past the cap evicts global
+        entries and touches no workspace entry, and the reverse. Both directions, because a single
+        shared counter passes the first alone.
+      - >-
+        Plus `a_run_withdraws_a_global_note_and_an_unknown_scope_is_refused`: `forget` reaches the
+        global scope, and an unrecognised `scope` writes nothing to either bucket rather than
+        quietly falling back to the workspace — a model that meant "every workspace" and silently
+        got "this one" would go on believing the fact is known everywhere.
+      - >-
+        The recall record is written against the bucket that holds the entry (`record_recalls`).
+        Crediting every carried key to the run's own workspace would have given the evidence for a
+        global note to a *different* entry that happened to share the key, and starved the global
+        one — the two lists are disjoint by construction because `recall_scopes` resolves every
+        collision before assembly sees them.
+      - >-
+        No public struct changed shape. `Assembled` keeps its fields — the loop partitions
+        `recalled_keys` by lookup instead — and `MemoryEntry` gained nothing, so N4's zero-break
+        claim still holds. The two new public items are `GLOBAL_MEMORY_WORKSPACE` and, from T01,
+        `MemoryLimits`; `MemoryForget` from T03 is a third, which N2 predicted as two.
+      - >-
+        `cargo test --test memory_scope` — 6 passed, 0 failed, first run. `tests/context.rs`'s eight
+        `assemble` call sites take the new empty global slice.
   - id: US-IO-HARNESS-0.56.0-T05
     summary: "Update every checked-in surface: `docs/CONTRACT.md`, the README, the two guide pages
       including the coupling paragraph, `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md` and the
@@ -277,7 +323,7 @@ tasks:
     why_required: "`docs/CONTRACT.md` states oldest-first eviction and workspace-only scope as this
       crate's behaviour. Shipping the release with those sentences standing would be shipping a
       documented lie."
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.56.0-T02
       - US-IO-HARNESS-0.56.0-T04
@@ -319,7 +365,39 @@ tasks:
       - docs/MEASUREMENTS.md
       - CHANGELOG.md
       - docs/public-api.txt
-    evidence: []
+      - src/state.rs
+    evidence:
+      - >-
+        O3: `docs/CONTRACT.md`'s memory section now states evidence-ordered eviction, the operator
+        caps and their coupling, the two scopes and the collision rule, and `forget` — where the
+        oldest-first and workspace-only sentences stood. The plan-gate paragraph covers `forget`
+        beside `remember`, and the pin paragraph names all three things a pin now stops.
+      - >-
+        O6: `docs/guide/context-and-memory.md` gained three sections (what goes when the store is
+        full, the caps and what raising one costs, unlearning and the scope above the workspace);
+        `docs/guide/configuration.md` gained the `[memory]` table and the coupling paragraph;
+        README, `docs/CAPABILITIES.md` and `docs/guide/tools-and-skills.md` updated; the 0.56.0
+        changelog entry is written. Gates: `docs_drift` 5 passed, `guide_pages` 15 passed,
+        `changelog` 7 passed, `public_api` 9 passed.
+      - >-
+        N2 was **wrong by one, and it is stated rather than absorbed**: the prediction was +2 lines
+        in `docs/public-api.txt` and the surface added **three** — `GLOBAL_MEMORY_WORKSPACE`,
+        `MemoryLimits` and `MemoryForget`. The third is the `forget` return type, which the contract
+        described in prose without counting as a public item.
+      - >-
+        N5 measured and recorded in `docs/MEASUREMENTS.md`: 0.965 ms at 64 entries, 9.042 ms at 512,
+        73.175 ms at 4,096, median of 20 capped writes on an Apple M1, release profile. The shape is
+        the finding — cost is linear in ENTRIES and flat in the size of the recall table, which is
+        what the index buys and what the query-plan test asserts.
+      - >-
+        **The measurement found a real defect, and it was reachable only because this release makes
+        the caps settable.** The first run reported a flat 0.069/0.143/0.068 ms, which was too fast:
+        the cap comparison was `chars <= limits.max_chars as i64`, and the measurement's
+        `max_chars: usize::MAX` wraps to `-1` there, so the loop's exit condition could never hold
+        and every write evicted the whole workspace down to the key it had just written. Exact for
+        the crate's own 16,000 and catastrophic for a large operator number. The comparison is
+        `u128` now, and `a_character_cap_too_large_for_an_i64_is_a_ceiling_and_not_a_purge` is the
+        guard, with a 3-character control so it cannot pass by the cap being ignored.
   - id: US-IO-HARNESS-0.56.0-T06
     summary: "Run the release gates: the full suite, clippy on three feature polarities, the nightly
       rustdoc gate, the cross-version gate, and a sabotage arm for every criterion that names one."

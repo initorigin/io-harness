@@ -60,15 +60,78 @@ store.memory_clear(&workspace)?;
 ```
 
 Entries are attributed to the run and step that wrote them, capped in count and
-in total size with oldest-first eviction, and every write, eviction and recall is
-in the trace. The caps are public: `MEMORY_MAX_ENTRIES` (64),
-`MEMORY_MAX_CHARS` (16,000 across the workspace) and `MEMORY_MAX_ENTRY_CHARS`
-(an eighth of that for any one value, truncated with a visible marker rather than
-refused). Eviction never removes the entry just written, because that would make
-a write a silent no-op. `Store` also exposes `memory_get` for a single key.
+in total size, and every write, eviction, withdrawal and recall is in the trace.
+`Store` also exposes `memory_get` for a single key.
 
-`remember` is deliberately narrow: it writes one keyed note into the harness's
-own store, not into the workspace, so it is not a path act.
+### What goes when the store is full
+
+Until 0.56.0 a cap dropped the oldest entry, which is curation by clock: the
+build command learned on the first run and drawn on by every run since was the
+first thing to go, and this morning's triviality survived it. Since 0.56.0 the
+candidate order is evidence first — the number of **distinct runs** that carried
+the entry, then how recently one did, and only then the write clock.
+
+Two things about that number are worth knowing before you rely on it. It counts
+*runs*, not recall rows: a row is written once per carried key per step, so rows
+would measure how long the entry has existed and one long run would outvote fifty
+short ones. And a recall means the entry was **carried into a prompt**, which is
+the strongest signal available — nothing observes whether the model read the
+line. An entry with no recalls yet is ordered exactly as it was before 0.56.0,
+so a note written this morning is a candidate, and the entry just written is
+never one, because evicting it would make a write a silent no-op. A pinned entry
+is never a candidate at all.
+
+### The caps, and what raising one costs
+
+`MEMORY_MAX_ENTRIES` (64), `MEMORY_MAX_CHARS` (16,000 across the workspace) and
+`MEMORY_MAX_ENTRY_CHARS` (an eighth of that for any one value, truncated with a
+visible marker rather than refused) are the defaults. Since 0.56.0 they are an
+operator's numbers — `[memory]` in `io.toml`, or
+`TaskContract::with_memory_limits`:
+
+```rust
+let contract = contract.with_memory_limits(MemoryLimits {
+    max_entries: 256,
+    ..MemoryLimits::default()
+});
+```
+
+Those three numbers were not arbitrary. The memory block gets a quarter of a
+turn's effective tokens, and the defaults were chosen so the *whole* store fits
+inside that share — which is why raising them is not the free win it looks like.
+Past that point recall can no longer carry everything, selection starts deciding
+what the model sees, and what grows with the store is the per-turn bill. A bigger
+store is worth having with evidence-ordered selection under it, which is what the
+same release put there; it was not worth having before.
+
+The write pays too: ranking candidates reads every entry in the workspace, so a
+capped write costs about 1 ms at 64 entries and about 73 ms at 4,096 — see
+[docs/MEASUREMENTS.md](../MEASUREMENTS.md) for the machine and the method.
+
+### Unlearning, and a scope above the workspace
+
+`remember` writes by key and rewriting a key replaces it, so an agent that
+learned the same wrong thing under two names had two disagreeing notes and no way
+to withdraw either. `forget` removes one entry. A note an operator pinned is
+refused, exactly as a write to it is, and the removal is undone by `rewind_run`
+like every other write a run makes.
+
+Both tools take a `scope`. `"workspace"` is the default and is what every version
+before 0.56.0 did. `"global"` writes into `GLOBAL_MEMORY_WORKSPACE`, the scope
+every run over every workspace recalls — for a fact true wherever you run, such
+as the package manager an operator uses. The scope is narrower than it sounds:
+**a workspace's own note of the same key wins**, and the global one is not
+rendered beside it, because the specific place always knows better than the
+general one. That is also what makes a wrong global note locally correctable. The
+block renders the two under separate headings, so a note kept for every workspace
+is never presented as something learned about this one.
+
+Each scope holds its own caps, its own pins and its own eviction, so a run
+recalling both may carry up to twice one scope's characters — inside a block
+ceiling that has not grown, and the workspace's own notes take that space first.
+
+`remember` and `forget` are deliberately narrow: they write one keyed note into
+the harness's own store, not into the workspace, so neither is a path act.
 
 ## A correction that sticks
 
