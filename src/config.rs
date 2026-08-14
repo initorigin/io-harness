@@ -230,6 +230,11 @@ struct File {
     sandbox: Option<SandboxSection>,
     #[serde(default)]
     run: Option<RunSection>,
+    // 0.56.0 — the three durable-memory caps. Its own table rather than three
+    // more keys under `[run]`: these bound a workspace's store, which outlives
+    // every run over it, where everything in `[run]` bounds one run.
+    #[serde(default)]
+    memory: Option<MemorySection>,
     #[serde(default)]
     toolchain: BTreeMap<String, ToolchainSection>,
     #[serde(default)]
@@ -564,6 +569,20 @@ struct RunSection {
     // carry, and what one read may be.
     max_read_chars: Option<u64>,
     commit_identity: Option<Identity>,
+}
+
+/// What a workspace's durable memory may hold (0.56.0).
+///
+/// Every cap optional and applied one key at a time, like [`LimitsSection`]: a
+/// file that wants a bigger store should not have to restate the other two
+/// numbers, and a section-wide default would silently reset the ones it did not
+/// mention.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemorySection {
+    max_entries: Option<u64>,
+    max_chars: Option<u64>,
+    max_entry_chars: Option<u64>,
 }
 
 /// An operator's override for one ecosystem, applied onto what
@@ -1563,6 +1582,25 @@ impl Config {
             out = out.with_instruction(instruction.clone());
         }
 
+        // 0.56.0 — `[memory]` is top-level and applied before the `[run]` guard,
+        // for the reason `[[agent]]` is: a file that sets a cap and nothing else
+        // must still get its cap. Key by key onto whatever the contract already
+        // carries, so naming one cap leaves the other two where they were rather
+        // than resetting them to the defaults of a section nobody wrote.
+        if let Some(memory) = &self.file.memory {
+            let mut limits = out.memory;
+            if let Some(v) = memory.max_entries {
+                limits.max_entries = v as usize;
+            }
+            if let Some(v) = memory.max_chars {
+                limits.max_chars = v as usize;
+            }
+            if let Some(v) = memory.max_entry_chars {
+                limits.max_entry_chars = v as usize;
+            }
+            out = out.with_memory_limits(limits);
+        }
+
         let Some(run) = &self.file.run else {
             return out;
         };
@@ -2019,7 +2057,15 @@ const APPENDING: &[&[&str]] = &[&["policy", "layers"], &["agent"], &["plugin"]];
 /// Only the project scope is held to this. `io.local.toml` and the user scope
 /// are the operator's own files and set the key outright, which is the same
 /// distinction [`refuse_widening`] already draws.
-const NARROWING: &[&[&str]] = &[&["run", "max_read_chars"]];
+const NARROWING: &[&[&str]] = &[
+    &["run", "max_read_chars"],
+    // 0.56.0 — the three memory caps. All three, not one representative: a rule
+    // that covered two of them would be a boundary that depends on which cap a
+    // repository chose to argue about.
+    &["memory", "max_entries"],
+    &["memory", "max_chars"],
+    &["memory", "max_entry_chars"],
+];
 
 /// Record `origin` against every leaf key of `table`, walking it the way
 /// [`merge`] walks it so the two cannot disagree about what a leaf is (0.30.0).

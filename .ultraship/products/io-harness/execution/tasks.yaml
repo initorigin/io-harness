@@ -1,359 +1,456 @@
 product: io-harness
-version: 0.55.0
+version: 0.56.0
 tasks:
-- id: US-IO-HARNESS-0.55.0-T01
-  summary: 'Give the read path a type: classify a file before decoding it, and stop swallowing the UTF-8
-    failure in `Workspace::read_file`.'
-  why_required: 'It is the release''s first defect: `std::fs::read_to_string(abs).unwrap_or_default()`
-    (`src/tools/workspace.rs:419`) hands a model an empty string for any file that is not valid UTF-8,
-    which reads exactly like a file that does not exist. Every other read change in this release sits
-    on top of the classification this task introduces.'
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - '**F6 — a binary file is named as binary, not read as empty.** A file of bytes that are not valid
-    UTF-8 produces an observation naming the path, the byte size and the sniffed kind, and containing
-    **no file content**. `Workspace::read_file` on the same path returns `Err`. The control is the same
-    file on 0.54.0, where the observation is an empty read — asserted here as a regression test with the
-    old behaviour written out, so the fix cannot silently revert. Sabotage: restore `unwrap_or_default()`,
-    under which the observation is empty and only F6 fails.
-
-    '
-  - '**F7 — UTF-16 is decoded and named; UTF-16 without a BOM is binary.** A UTF-16LE file and a UTF-16BE
-    file, each with a byte-order mark, read as their exact text with the encoding named in the observation
-    header. The same content with the BOM removed is refused as binary, by name. Sabotage: decode UTF-16
-    by pairing bytes without checking the mark, under which the BOM-less case reads as text and only F7
-    fails.
-
-    '
-  - '**F8 — an image or a document read by `read_file` is routed, not decoded.** `read_file` on a PNG
-    names `view_image`; on an `.xlsx`, `.docx`, `.pptx` or `.pdf` it names that format''s tool. The observation
-    carries no content in either case. Under a build without the `documents` feature the document message
-    still names the tool and says the feature is not compiled in, because a model told nothing retries
-    the same call. Sabotage: fall through to the binary message for these extensions, under which the
-    tool names are absent and only F8 fails.
-
-    '
-  files:
-  - src/tools/workspace.rs
-  - src/tools/mod.rs
-  - src/run.rs
-  - tests/read_typing.rs
-  evidence:
-  - '`cargo test --test read_typing` — 15 passed, 0 failed. F6: `a_binary_file_is_named_with_its_size_and_kind`,
-    `the_text_reader_now_fails_where_it_used_to_return_an_empty_string` (the old `Ok("")` behaviour written
-    out as the thing that must fail), `through_the_loop_a_binary_read_carries_no_content`.'
-  - 'F7: `utf16_is_decoded_and_the_encoding_is_named`, `utf16_without_a_byte_order_mark_is_binary_rather_than_guessed`,
-    `through_the_loop_a_utf16_read_says_which_encoding_it_was`.'
-  - 'F8: `an_image_is_routed_to_the_tool_that_can_look_at_it`, `a_document_names_the_tool_that_reads_it`,
-    `an_svg_is_text_because_it_is_text`, `through_the_loop_an_image_read_carries_no_content_and_names_the_route`.'
-  - Existence is checked before the extension table, so a missing `.xlsx` still reads as empty — the pre-existing
-    `a_missing_byte_read_is_an_error_not_an_empty_document` unit test passes unchanged.
-- id: US-IO-HARNESS-0.55.0-T02
-  summary: Refuse an oversized read whole instead of truncating it, and give `read_file` an `offset`/`limit`
-    line range so the refusal has somewhere to point.
-  why_required: 'The refusal is the release''s reason for existing — a truncated read has the shape of
-    a whole one and nothing downstream can tell them apart — and it is only usable because the range exists.
-    Neither half ships alone: a refusal with no remedy is a stuck run.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.55.0-T01
-  acceptance_criteria:
-  - '**F9 — a read that will not fit returns no content.** A file whose text exceeds the effective ceiling
-    produces an error observation containing the path, the size in chars, the ceiling, and both remedies
-    — and containing **none of the file''s bytes**, asserted by searching the whole observation for a
-    sentinel string placed at the file''s head, its middle and its tail. Sabotage: keep `bound`''s tail-preserving
-    behaviour for `ObsKind::Read`, under which the tail sentinel appears and only F9 fails.
-
-    '
-  - '**F11 — a range read is served and legible as a range.** `read_file` with `offset` 10 and `limit`
-    5 on a 100-line file returns exactly lines 10 to 14, and the observation header states the range and
-    the total line count. An `offset` past the end is an error naming the total, not an empty success.
-    A range that still exceeds the ceiling is refused by F9''s rule. Sabotage: treat `offset` as 0-based,
-    under which the returned lines are off by one and only F11 fails.
-
-    '
-  files:
-  - src/run.rs
-  - tests/read_typing.rs
-  evidence:
-  - 'F9: `a_read_that_will_not_fit_returns_none_of_the_file` — a 14,046-char file against the default
-    12,000-char ceiling; all three sentinels (head, middle, tail) absent from the observation; the refusal
-    names the size, the ceiling, `offset`/`limit` and `max_read_chars`.'
-  - 'F9''s remedy proven usable rather than merely offered: `the_offered_range_actually_works_on_the_file_that_was_refused`
-    refuses the whole file and then serves `offset: 1, limit: 1` from the same file in the next step.'
-  - 'F11: `a_range_read_returns_exactly_the_lines_asked_for` (lines 10-14 of 100, one-based, nothing on
-    either side, header states `lines 10-14 of 100`) and `a_range_beyond_the_end_is_an_error_naming_the_total`.'
-- id: US-IO-HARNESS-0.55.0-T03
-  summary: 'Make the read ceiling an operator key: `[run] max_read_chars` in `io.toml`, projected onto
-    `Contract`, defaulting to the budget-derived value.'
-  why_required: A refusal a run's behaviour turns on has to be predictable, and today's limit is a share
-    of what budget is left — the same file is readable at step three and refused at step forty. The refusal
-    must also be able to say which of the two ceilings bound it, which requires both to exist as distinct
-    numbers.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.55.0-T02
-  acceptance_criteria:
-  - '**F10 — the refusal names which ceiling it hit.** The same file is refused under a small `max_read_chars`
-    with a run budget that would have allowed it, and refused again under the budget-derived ceiling with
-    no `max_read_chars` set. The two texts differ and each names its own limit. Sabotage: report one message
-    for both, under which the two assertions collide and only F10 fails.
-
-    '
-  - '**F13 — the ceiling is an operator key that travels the ordinary path.** `[run] max_read_chars` in
-    an `io.toml` reaches `Contract` through `Config`, an unknown key beside it is still refused by `deny_unknown_fields`,
-    a project-scoped file may narrow it and may not widen it, and a contract with nothing set behaves
-    exactly as 0.54.0 did — asserted by an unset run and a set run over the same file. Sabotage: read
-    the key straight from the config in the run loop instead of projecting it onto the contract, under
-    which the typed-API assertion fails and only F13 fails.
-
-    '
-  files:
-  - src/config.rs
-  - src/contract.rs
-  - src/run.rs
-  - tests/config.rs
-  - tests/read_typing.rs
-  evidence:
-  - 'F13: `cargo test --test config` — 54 passed, 0 failed. `max_read_chars_reaches_the_contract_through_the_ordinary_projection`
-    (the key reaches `TaskContract` through `Config::apply_to`, and unset stays `None` = 0.54.0 behaviour),
-    `a_key_misspelled_beside_it_is_still_refused_by_name` (`deny_unknown_fields` still bites), `a_project_scoped_file_may_lower_the_read_ceiling_and_may_not_raise_it`.'
-  - 'The narrowing rule needed a mechanism the crate did not have: the four existing project-scope refusals
-    reject a widening *value* (`exec = "allow"`), and a number has none. Added `NARROWING` in `src/config.rs`
-    — for `run.max_read_chars` the lower number wins over the later scope, but only when the incoming
-    scope is `Project`; `io.local.toml` and the user scope set it outright, asserted as the control in
-    the same test.'
-  - 'F10: `the_two_ceilings_produce_two_different_refusals` — one file refused under `with_max_read_chars(50)`
-    names "50-char ceiling set by `[run] max_read_chars`", the other under no operator key names the turn''s
-    remaining context budget, and neither observation carries content.'
-  - 'Widening beyond the derived ceiling is structurally impossible whatever the config says: the read
-    is refused when it exceeds *either* ceiling, so the budget-derived one always still applies.'
-- id: US-IO-HARNESS-0.55.0-T04
-  summary: Replace a no-longer-fitting stored read with a stub in assembly, and leave every other observation
-    kind bounded exactly as it is.
-  why_required: A read that fitted when it happened can be squeezed later by a narrower budget share,
-    and serving the model a fragment then is the same lie the truncation was. The negative half — grep,
-    find and exec still bounded — is what keeps the change from becoming a general rule that hides a command's
-    output.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.55.0-T03
-  acceptance_criteria:
-  - '**F12 — a stored read is whole in the prompt or a stub, never a fragment.** An assembled prompt under
-    a share too narrow for a read that fitted when it happened contains the stub — path, size, and the
-    range to re-read — and **no** content from that read, asserted on the same three sentinels as F9.
-    In the same assembly a `Grep` and an `Exec` entry are still bounded with their existing marker, which
-    is the negative half of the claim. Sabotage: apply the stub rule to every `ObsKind`, under which the
-    grep assertion fails and only F12 fails.
-
-    '
-  files:
-  - src/context.rs
-  - tests/context.rs
-  evidence:
-  - 'F12: `cargo test --test context` — 23 passed, 1 failed, and the failure is `an_mcp_result_is_bounded_where_it_enters_the_context`,
-    which panics with `fixture server not built ... cargo test builds examples` — an invocation artefact
-    of `--test context`, not a regression. `a_read_that_no_longer_fits_is_a_stub_and_not_a_tail` asserts
-    all three sentinels absent and the stub naming the file and `offset`.'
-  - 'Negative half: `a_search_and_a_command_are_still_bounded_rather_than_refused` — `Grep` and `Tool`
-    keep the head plus the `truncated` marker.'
-  - Assembly already replaced a non-fitting entry with a stub; the fragment came from two other places.
-    `refresh` (`src/context.rs`) bounded a re-read to its tail under a header saying the file had been
-    re-read — it now returns a stub reason naming the size and the range remedy. And the stub text for
-    `ObsKind::Read` now says to re-read with `offset`/`limit` instead of `re-run`, because only a read
-    has a range to ask for.
-  - 'Two pre-existing tests asserted the old behaviour and changed meaning rather than wording: `every_observation_kind_is_bounded_where_it_enters_the_context`
-    now asserts the read is refused whole (the other five kinds are unchanged and are the control), and
-    `a_sub_agent_loops_prompt_stays_inside_the_ceiling` uses files that fit a single read, since a file
-    no read could carry is F9''s claim rather than that test''s.'
-  - Document reads (`xlsx_read`, `pdf_read`, ...) are still bounded with the tail rule; they were not
-    in the release's included scope and are recorded as a known limitation.
-- id: US-IO-HARNESS-0.55.0-T05
-  summary: 'Add the wide door for images: a `Media` constructor that passes the four wire types through
-    byte-identically and decodes BMP, TIFF, ICO, TGA and PNM to PNG, with `image` moved under the `media`
-    feature.'
-  why_required: It is the whole image half of the outcome. It has to be a second constructor rather than
-    a widened `Media::image`, because the four-type set is a fact about vendors that the wire gate must
-    keep enforcing, and the byte-identity of the pass-through is what stops a JPEG being silently re-encoded.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.55.0-T04
-  acceptance_criteria:
-  - '**F1 — a format the wire refuses is accepted at the door and arrives as a PNG.** For each of BMP,
-    TIFF, ICO, TGA and PNM, a fixture image of known dimensions goes through the new `Media` constructor
-    and yields a `Media` whose media type is `image/png`, whose bytes decode as a PNG of those same dimensions,
-    and whose first eight bytes are the PNG signature. Asserted per format, not on one representative.
-    Sabotage: pass the source bytes through with the media type rewritten to `image/png`, under which
-    the signature and the decode assertions fail and only F1 fails.
-
-    '
-  - '**F2 — the four wire types are passed through byte-identically.** A PNG, a JPEG, a GIF and a WebP
-    through the same constructor come out with their own media type and **byte-identical** bytes — no
-    decode, no re-encode, no digest change. A JPEG that survived a round trip through the decoder would
-    be a silent quality loss on the common path. Sabotage: re-encode every input to PNG unconditionally,
-    under which the JPEG and WebP byte-identity assertions fail and only F2 fails.
-
-    '
-  - '**F4 — `Media::image` is unchanged.** Its four-type set, its refusal text and its doctest are byte-identical
-    to 0.54.0, asserted by `git diff` over the function in review and by the existing `tests/media.rs`
-    cases passing unmodified. The new door is a second constructor, not a widened one.
-
-    '
-  - '**N5 — transcoding is bounded before it is attempted.** A decode is refused before it allocates when
-    the source''s declared dimensions would exceed a stated pixel bound, and the re-encoded PNG is checked
-    against `MAX_IMAGE_BYTES` with the same message the four-type path gives. A 40,000 × 40,000 BMP header
-    is a refusal, not an out-of-memory. Measured and recorded, not clock-gated: the decode-and-re-encode
-    time for each format''s fixture on a named machine.
-
-    '
-  - '**N1 — no new dependency, and the default tree is unmoved.** `cargo tree` is **402** lines. No new
-    entry in `[dependencies]`. `cargo tree --features media` gains only `image` and its pure-Rust format
-    crates; the exact added list is recorded in the record, and it contains no `-sys` crate and nothing
-    requiring a C toolchain — asserted by the three-platform matrix building `--all-features` without
-    a system package.
-
-    '
-  files:
-  - Cargo.toml
-  - src/provider/mod.rs
-  evidence:
-  - 'F1: `a_format_the_wire_refuses_is_accepted_at_the_door_and_arrives_as_a_png` — BMP, TIFF, ICO, TGA
-    and PNM each asserted separately: media type `image/png`, the eight-byte PNG signature, and a 3x2
-    round trip.'
-  - 'F2: `the_four_wire_types_are_passed_through_byte_identically` — PNG and JPEG round-tripped through
-    real fixtures, GIF and WebP asserted on opaque bytes (the stronger claim: the door does not look at
-    them).'
-  - 'F4: `the_wire_gate_still_refuses_everything_but_the_four` — `Media::image` unchanged, its four-type
-    refusal intact; the pre-existing `tests/media.rs` cases pass unmodified.'
-  - 'N5: `a_declared_size_over_the_pixel_bound_is_refused_before_decoding` — a BMP header rewritten to
-    40000x40000 is refused from the header parse, naming the dimensions and the pixel bound; `MAX_IMAGE_PIXELS`
-    is 50,000,000.'
-  - 'N1: `cargo tree` on the default build is **402**, unchanged. `cargo tree --features media` is 438
-    — 21 crates added (image, png, tiff, zune-jpeg, weezl, fax, flate2, miniz_oxide, fdeflate, adler2,
-    simd-adler32, crc32fast, bytemuck, byteorder-lite, half, moxcms, pxfm, quick-error, zerocopy, zerocopy-derive,
-    zune-core), none of them a `-sys` crate and none needing a C toolchain.'
-  - '`image` gained the `bmp`, `tiff`, `ico`, `tga` and `pnm` features and moved under `media`; no new
-    entry in `[dependencies]`.'
-  - 'Fixture finding: `image` writes an ICO as an embedded PNG and its own ICO decoder refuses one that
-    is not RGBA, so the fixture is encoded RGBA. A property of encoding a fixture with this library, not
-    of ICO files an operator has.'
-- id: US-IO-HARNESS-0.55.0-T06
-  summary: Refuse SVG, HEIC and AVIF by name with a reason and a conversion, route a PDF to `pdf_read`,
-    and make `view_image` use the wide door after the policy gate.
-  why_required: A refusal that recites the vendor's four-type list is the failure the release is fixing
-    at the doorstep; naming the format and the fix is the deliverable. The sniff has to sit inside the
-    gated branch, or a classification becomes a way to probe for a file outside the policy boundary.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.55.0-T05
-  acceptance_criteria:
-  - '**F3 — an undecodable format is refused by its own name, with a remedy.** SVG, HEIC and AVIF inputs
-    — each recognised both by extension and, where it has one, by magic bytes with a misleading extension
-    — are refused with an `Error::Config` whose text contains the format''s name, the reason, and a conversion
-    command producing a PNG. The text does **not** consist of the four-type list alone. A PDF is refused
-    with a message naming `pdf_read`. Asserted on substrings for each of the four. Sabotage: fall back
-    to `Media::image`''s existing message for anything not decodable, under which the name-and-remedy
-    assertions fail and only F3 fails.
-
-    '
-  - '**F5 — `view_image` accepts what the constructor accepts and says what it did.** A `view_image` call
-    on a BMP under a permitting policy attaches one `Media` of type `image/png` to the next request, and
-    its observation names the source type, the PNG byte count and the digest. A `view_image` on an SVG
-    produces F3''s refusal through the tool, and attaches nothing. Sabotage: keep `view_image`''s extension
-    pre-check as the only gate, under which the BMP is refused before the gate and only F5 fails.
-
-    '
-  files:
-  - src/provider/mod.rs
-  - src/run.rs
-  - tests/media.rs
-  evidence:
-  - 'F3: `an_undecodable_format_is_refused_by_name_with_a_remedy` — SVG/HEIC/AVIF/PDF each refused with
-    the format''s name and a conversion (`resvg`, `heif-convert`, `avifdec`, `pdf_read`), and asserted
-    NOT to contain `expected one of`.'
-  - 'F5: `a_bmp_reaches_the_provider_as_a_png_and_the_trace_says_it_was_converted` — one `Media` of type
-    `image/png` on the request, and the trace carries `image/bmp converted to image/png`; `an_svg_is_refused_by_name_through_the_tool_and_attaches_nothing`
-    — zero images on every request and the refusal names SVG and resvg.'
-  - '`cargo test --test media --features media` — 9 passed, 0 failed.'
-  - 'The sniff/decode is inside the gated branch: `view_image`''s pre-gate check is still extension-only
-    and reads nothing, so it cannot probe for a file outside the policy.'
-  - The transcode note carries source type, wire type, PNG bytes and digest — not the decoded dimensions
-    the scope prose mentioned, which would have meant changing what `Media::attach` returns. Recorded
-    rather than glossed.
-- id: US-IO-HARNESS-0.55.0-T07
-  summary: Update the checked-in documentation surfaces and the changelog for both halves, including the
-    two behaviour changes an embedder can see.
-  why_required: '`docs/CONTRACT.md` currently states truncation as what happens to an oversized read and
-    states the four-type set as the whole story about images. Shipping the new behaviour with those sentences
-    standing would be shipping a documented lie, and the two behaviour changes are only discoverable if
-    the changelog names them.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.55.0-T06
-  acceptance_criteria:
-  - '**O3 — `docs/CONTRACT.md` is amended in this release, by name.** The read-tool section and the observation-bounding
-    section both describe truncation as what happens to an oversized read; both change, and the new rule
-    — whole, asked-for range, or refusal, with the stub in assembly — is written where the old one stood.
-    The media section gains the door-versus-wire distinction and the refused-by-name list. A release that
-    changed this behaviour and left those sentences standing would be shipping a documented lie.
-
-    '
-  - '**O4 — the checked-in doc surfaces are updated in this release.** The README''s feature list, `docs/guide/tools-and-skills.md`
-    (`read_file`''s type, its range, and the two ceilings), `docs/guide/configuration.md` (`max_read_chars`),
-    `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md` (the transcode timings and the added-crate list) and
-    the changelog entry. Every new public item carries a worked example. The doc tests and `tests/public_api.rs`
-    pass.
-
-    '
-  - '**N2 — the public surface addition is stated in advance and met exactly.** `docs/public-api.txt`
-    tracks crate-root re-exports. The prediction is **+1 line** for the new read-classification type if
-    it is re-exported at the root, and **+0** otherwise; the new `Media` constructor, `Contract::with_max_read_chars`
-    and the new `read_file` parameters add no line. Any difference is explained in the record rather than
-    absorbed.
-
-    '
-  - '**N3 — the read behaviour change is a break, and it is named.** `Workspace::read_file` returns `Err`
-    where it returned `Ok("")`, and a read over the ceiling returns an error observation where it returned
-    a truncated one. No signature changes and nothing fails to compile; what changes is behaviour, which
-    is stated in `migrations` and in the changelog rather than left to be discovered.
-
-    '
-  files:
-  - README.md
-  - docs/CONTRACT.md
-  - docs/CAPABILITIES.md
-  - docs/MEASUREMENTS.md
-  - docs/guide/tools-and-skills.md
-  - docs/guide/configuration.md
-  - docs/guide/images-and-git.md
-  - CHANGELOG.md
-  - Cargo.toml
-  - src/lib.rs
-  - examples/transcode_cost.rs
-  evidence:
-  - 'O3: `docs/CONTRACT.md` gains two 0.55.0 sections — ''What a read returns, and what it will not return
-    instead'' and ''What the image door accepts, and what the wire still refuses''. Both state the rule
-    where the old one stood, including the two ceilings, the stub rule, and the explicit carve-out that
-    every other observation kind is still bounded.'
-  - 'O4: README (feature table + the loop paragraph), `src/lib.rs` crate prose and feature table, `docs/CAPABILITIES.md`
-    (built-in tools and images bullets), `docs/guide/tools-and-skills.md` (a new ''What read_file gives
-    back'' section), `docs/guide/configuration.md` (`max_read_chars` in the `[run]` block plus why its
-    absence is not simply a default and why it is the one key a project file may only lower), `docs/guide/images-and-git.md`
-    (door vs wire, the refused-by-name list, the pixel bound), `docs/MEASUREMENTS.md` (the transcode table),
-    and the CHANGELOG entry with Added/Changed/Fixed and both behaviour changes named under Changed and
-    Fixed rather than left in a bullet list.'
-  - 'N2: `docs/public-api.txt` is **unchanged**, which is the `+0` branch the criterion predicted. `FileContent`
-    and `TextEncoding` are re-exported from `tools`, not from the crate root, and the file tracks crate-root
-    re-exports only; `MAX_IMAGE_PIXELS` sits beside `MAX_IMAGE_BYTES`, which is likewise not a root re-export.
-    `cargo test --test public_api` — 9 passed.'
-  - 'N3: no signature changed and nothing fails to compile; the two behaviour changes are named in the
-    changelog under headings and in `docs/CONTRACT.md`.'
-  - 'Measurement: `examples/transcode_cost.rs`, new, `required-features = ["media"]`. On an Apple M1,
-    release, 512x512: pass-through 0.01-0.14 ms; BMP 2.55, TIFF 1.75, TGA 2.18, PNM 2.06 ms. Recorded,
-    never asserted.'
-  - '`examples/media_git_live` dropped its `barcode` requirement, which existed only to pull `image` in;
-    `media` now carries it.'
-  - 'Gates: `cargo test --test docs_drift --test guide_pages --test changelog` — 15 + 7 + 5 passed. `cargo
-    test --doc --features media` — 437 passed after fixing one new doctest whose ''binary'' fixture was
-    accidentally valid UTF-8.'
+  - id: US-IO-HARNESS-0.56.0-T01
+    summary: "Order eviction candidates by evidence: distinct runs that recalled the entry, then last
+      recall, then the write clock. Add the (workspace, key) index the aggregate needs."
+    why_required: It is the defect the version exists for. `enforce_memory_caps` (`src/state.rs:6656`)
+      orders by `created_at ASC, id ASC`, so the entry a workspace has leaned on longest is the
+      first one dropped. Nothing else in the release matters if the store still curates by clock,
+      and the aggregate is unaffordable on the write path without the index.
+    status: done
+    depends_on: []
+    acceptance_criteria:
+      - >
+        **F1 — the entry many runs carried survives, and the entry no run carried goes.** A store is
+        filled to `max_entries`. One key is recalled by ten separate runs and is the **oldest**
+        entry in the workspace; another is recalled by none and is newer. One further write forces
+        an eviction. The recalled key survives, the unrecalled one is in `MemoryWrite::evicted`, and
+        the assertion is on both halves. The control is the same sequence asserted to behave the
+        other way round on 0.55.0's ordering, written out in the test so the fix cannot silently
+        revert. Sabotage: restore `ORDER BY created_at ASC, id ASC`, under which the recalled key is
+        evicted and only F1 fails.
+      - >
+        **F2 — one long run does not outvote many short ones.** Two entries: one recalled at 200
+        steps of a single run, one recalled at one step of each of three runs. The 200-row entry is
+        evicted first, because three distinct runs beat one. This is the criterion that fails if the
+        implementation counts rows, which is what the roadmap entry's prose asked for. Sabotage:
+        `COUNT(*)` in place of `COUNT(DISTINCT run_id)`, under which the three-run entry is evicted
+        and only F2 fails.
+      - >
+        **F3 — the unproven cohort keeps 0.10.0's order.** With no recall rows at all for any entry,
+        eviction order is byte-for-byte what 0.55.0 produced: oldest `created_at` first, `id`
+        breaking a tie. Asserted by evicting five entries from a store with no recalls and comparing
+        the evicted list to the literal expected order. Sabotage: drop the `created_at, id` tail of
+        the ORDER BY, under which the order becomes unstable and only F3 fails.
+      - >
+        **F4 — pinned is still not a candidate and the written key is still kept.** A pinned entry
+        with zero recalls and the oldest `created_at` — the worst possible score on every term —
+        survives an eviction that drops three other entries, and the key just written is never among
+        the evicted even when it is the only zero-recall entry. Both halves asserted; both are
+        0.30.0 and 0.10.0 behaviour and this release must not move them. Sabotage: remove the `keep`
+        guard, under which the write becomes a silent no-op and only F4 fails.
+      - >
+        **F5 — the eviction query is answered from an index.** `EXPLAIN QUERY PLAN` over the exact
+        statement the crate runs, on a store holding 64 entries and 10,000 recall rows, names
+        `memory_recalls_entry` and contains no `SCAN memory_recalls`. Asserted on the plan text, and
+        the measured time for one capped write at that size is recorded, never asserted. Sabotage:
+        drop the index creation, under which the plan shows a scan and only F5 fails.
+      - >
+        **N3 — the schema change is one index and nothing else.** `git diff main -- src/state.rs`
+        shows the new index, the limits plumbing and `memory_forget`, and **no new table, no new
+        column and no `CHECKPOINT_FORMAT` change**. A 0.55.0 store and a 0.56.0 store are the same
+        store in both directions, which O4's cross-version gate is what proves.
+    files:
+      - src/state.rs
+      - src/lib.rs
+    evidence:
+      - >-
+        F1 `the_entry_many_runs_carried_survives_and_the_one_no_run_carried_goes`, F2
+        `one_long_run_does_not_outvote_three_short_ones`: both written first and both watched fail
+        against the old order, each evicting `k0` — the clock's pick — where the new order evicts
+        `k1` and `k5`. Both pass after the change.
+      - >-
+        F3 `with_no_recalls_at_all_the_order_is_exactly_the_write_clock` and F4
+        `a_pinned_entry_with_the_worst_score_is_still_never_a_candidate` passed before the change as
+        well as after, which is the point of them: they are the guards on the behaviour this
+        release must NOT move, and 0.10.0's `the_entry_count_cap_evicts_oldest_first_and_never_the_new_entry`
+        still passes unmodified beside them.
+      - >-
+        F5 `ranking_eviction_candidates_seeks_the_recalls_rather_than_scanning_them`: `EXPLAIN QUERY
+        PLAN` over `Store::MEMORY_CANDIDATES_SQL` itself — not a re-typed copy — on 64 entries and
+        9,984 recall rows names `memory_recalls_entry` and contains no `SCAN memory_recalls`. The
+        control asserts `step`, which is in no index, cannot be served from one.
+      - >-
+        `cargo test --lib` — 475 passed, 0 failed, 1 ignored. `cargo test --test memory --test
+        rewind --test determinism` — all green.
+      - >-
+        N3: the schema change is one `CREATE INDEX IF NOT EXISTS memory_recalls_entry ON
+        memory_recalls (workspace, key)`. No table, no column, `CHECKPOINT_FORMAT` unmoved.
+      - >-
+        `MemoryLimits` and `Store::memory_write_with` landed here rather than in T02, because
+        `enforce_memory_caps` needed the type to take its caps from. T02 adds the config and
+        contract plumbing that carries an operator's numbers into it.
+  - id: US-IO-HARNESS-0.56.0-T02
+    summary: "Make the three caps an operator key: `MemoryLimits` defaulting to the existing constants,
+      a `[memory]` table in `io.toml`, project-scope narrowing, and the limits threaded to the
+      write."
+    why_required: The contract requires the caps to be movable and the guide to state what moving them
+      costs. The limits must reach `enforce_memory_caps` through every door a write can come
+      through, or the cap depends on which call site wrote the entry.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.56.0-T01
+    acceptance_criteria:
+      - >
+        **F6 — the caps travel the ordinary configuration path.** `[memory] max_entries = 8` in an
+        `io.toml` reaches `TaskContract` through `Config::apply_to`; a misspelled key beside it is
+        still refused by `deny_unknown_fields`; a run with nothing set evicts at exactly 64, 16,000
+        and 2,000 as 0.55.0 did. Asserted with a set run and an unset run over the same workspace.
+        Sabotage: read the table directly in the run loop rather than projecting it onto the
+        contract, under which the typed-API assertion fails and only F6 fails.
+      - >
+        **F7 — a project-scoped file may lower a cap and may not raise it.** A user-scope `io.toml`
+        setting `max_entries = 64` and a project-scope one setting `128` yields 64; the project file
+        setting `16` yields 16. All three keys asserted, not one representative. Sabotage: omit the
+        three new `NARROWING` entries, under which the 128 wins and only F7 fails.
+      - >
+        **F8 — the entry cap bounds a single value and the total cap bounds the store.** With
+        `max_entry_chars = 100` a longer value is stored truncated with the existing marker; with
+        `max_chars = 500` and a large `max_entries`, writes evict until the character total holds.
+        The two caps are asserted independently, because a single implementation that only honours
+        the entry count would pass a test that sets both. Sabotage: hold only the entry count, under
+        which the character assertion fails and only F8 fails.
+      - >
+        **N4 — zero compile breaks.** `TaskContract` is `#[non_exhaustive]` since 0.35.0, so a new
+        field costs nobody anything; `MemoryLimits` is a new type; the existing
+        `Store::memory_write` and `Store::memory_put` keep their signatures and delegate with
+        `MemoryLimits::default()`. No existing method changes shape. Asserted by the crate's own
+        examples and tests compiling unmodified except where a test asserts the behaviour this
+        release deliberately changes.
+    files:
+      - src/state.rs
+      - src/config.rs
+      - src/contract.rs
+      - src/run.rs
+      - tests/config.rs
+      - tests/memory.rs
+    evidence:
+      - >-
+        F6 `the_memory_caps_reach_the_contract_through_the_ordinary_projection` (tests/config.rs):
+        `[memory] max_entries = 8` reaches `TaskContract` through `Config::apply_to`, the two caps
+        the file did not name keep the crate's constants rather than being reset by a whole-struct
+        projection, and an empty config yields `MemoryLimits::default()` — 64 / 16,000 / 2,000,
+        asserted as literals so a moved default is a failing test.
+      - >-
+        F6's end-to-end half, `a_contracts_memory_caps_bound_what_a_run_may_remember`
+        (tests/memory.rs): a run whose contract sets `max_entries: 2` and whose model calls
+        `remember` four times leaves two entries; the same script with nothing set leaves four. This
+        is what proves the projection is a number something reads — `contract.memory` is threaded to
+        `dispatch` beside `memory_key` and the `remember` arm writes through `memory_write_with`.
+      - >-
+        F6's misspelling guard, `a_memory_key_misspelled_is_still_refused_by_name`: `max_entrys` is
+        refused by name under `deny_unknown_fields`.
+      - >-
+        F7 `a_project_scoped_file_may_lower_a_memory_cap_and_may_not_raise_it`: all three keys in
+        both directions — a project file lowering 64/16,000/2,000 to 16/4,000/500 wins, the same
+        file raising them to 128/900,000/90,000 loses to the user scope, and the control shows
+        `io.local.toml` setting one outright because it is the operator's own file.
+      - >-
+        F8 `an_operators_caps_bound_a_single_value_and_the_store_independently` (src/state.rs): the
+        entry cap truncates one value with the existing marker while the other two caps have room,
+        and the character cap evicts while the entry count is nowhere near its limit. Asserted
+        apart, because an implementation honouring only the count passes a test that sets both.
+      - >-
+        `cargo test --lib` 476 passed, `--test config` 57 passed, `--test memory` 15 passed. N4:
+        zero compile breaks — `TaskContract` is `#[non_exhaustive]`, `memory_write` and `memory_put`
+        keep their signatures, and nothing in the suite needed an edit to go on compiling.
+  - id: US-IO-HARNESS-0.56.0-T03
+    summary: "Add the `forget` tool and `Store::memory_forget`: refused on a pinned entry and on an
+      unapproved plan, restorable by `rewind_run`, and taking the key's recall rows with it where an
+      eviction leaves them."
+    why_required: A run that learns a fact wrong has no way to withdraw it today; rewriting the key
+      under a second name leaves two disagreeing notes. The restore point is what makes the
+      withdrawal as reversible as every other write this crate records.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.56.0-T01
+    acceptance_criteria:
+      - >
+        **F9 — `forget` removes one entry and says so.** A run calls `forget` on a key it wrote. The
+        entry is gone from `Store::memory_list`, absent from the next turn's assembled prompt, and
+        the observation names the key. `forget` on a key that was never written reports that nothing
+        was there, and is not an error. Sabotage: report success unconditionally, under which the
+        not-there assertion fails and only F9 fails.
+      - >
+        **F10 — `forget` is refused on a pinned entry and while a plan is unapproved.** A pinned
+        entry survives a `forget` with a refusal naming the key, and the entry is still there
+        afterwards. With an unapproved plan active, `forget` is refused before it reaches the store,
+        with the same shape of message `remember` gives — asserted by the store still holding the
+        entry, not only by the text. Sabotage: gate `forget` on the plan but not on the pin, under
+        which the pinned assertion fails and only F10 fails.
+      - >
+        **F11 — a forget is undone by a rewind, and an eviction's evidence survives.** After a
+        `forget`, `rewind_run` restores the entry with its value, kind and pin state intact.
+        Separately, a key removed by **eviction** keeps its `memory_recalls` rows, while a key
+        removed by `forget` has none afterwards — the two are asserted in one test, because the
+        whole point is that they differ. Sabotage: delete recall rows on eviction too, under which
+        the eviction half fails and only F11 fails.
+    files:
+      - src/state.rs
+      - src/run.rs
+      - src/observe.rs
+      - src/tools/mod.rs
+      - src/lib.rs
+      - tests/memory.rs
+    evidence:
+      - >-
+        F9 `a_run_withdraws_a_note_and_a_key_that_was_never_there_says_so`: a run calling `forget`
+        removes the entry, and a second call naming a key that was never written records no second
+        withdrawal — asserted by counting `memory_forget` context events, so a blanket success would
+        fail it.
+      - >-
+        F10 `a_pinned_note_survives_a_forget_and_the_refusal_is_recorded`: the pinned entry keeps
+        its value, its kind and its pin, `memory_refused` is in the trace and `memory_forget` is
+        not. Asserted on the store rather than on the message, because a refusal that says the right
+        thing and removes the entry anyway would pass a text assertion. The unapproved-plan refusal
+        is the same guard `remember` has, in the same place, for the reason stated there.
+      - >-
+        F11 half one, `a_rewind_puts_back_the_note_a_forget_took`: written first and **watched
+        fail**, which is what found the real defect. `Store::memory_restore` had been an `UPDATE`
+        since 0.36.0 — it restores an entry a run edited and silently does nothing for one a run
+        removed, so a rewind would have reported `memory_restored: ["retries"]` with the entry still
+        gone. It is now an UPSERT whose `ON CONFLICT` half is 0.36.0's `UPDATE` byte for byte, so
+        nothing about restoring an edited entry moved.
+      - >-
+        F11 half two, `a_forget_takes_the_evidence_with_it_and_an_eviction_leaves_it`: with every
+        entry carried by the same run the evidence terms tie and the clock decides, so the eviction
+        lands on an entry that HAS recall rows — and those rows survive. The withdrawn key's do not,
+        and a third key's are untouched. One test, because the point is that the two differ.
+      - >-
+        `MemorySnapshot` gained `step`, which the INSERT half of the restore needs to attribute the
+        row it puts back; the entry's original run died with the row. `pinned` restores as 0, and
+        that is not a guess — a pinned entry cannot be forgotten, so a restored one was never
+        pinned.
+      - >-
+        `cargo test --lib` 477 passed; `--test memory` 18 passed; `--test rewind --test determinism`
+        green. `--test checkpoint`'s `crash_resume_...` fails only under a bare `--test` invocation,
+        which does not build `examples/` — the same pre-existing condition as `tests/context.rs`'s
+        MCP fixture, unrelated to this task and green under a plain `cargo test`.
+  - id: US-IO-HARNESS-0.56.0-T04
+    summary: "Add the scope above the workspace: a reserved workspace key, `scope` on `remember` and
+      `forget`, both scopes recalled at both loop sites, the workspace winning a collision, and the
+      two groups rendered under their own headings."
+    why_required: A fact true of every repository is learned again per workspace today. The collision
+      rule and the separate headings are what stop a general note being read as something learned
+      about this workspace.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.56.0-T03
+    acceptance_criteria:
+      - >
+        **F12 — a global note is recalled from a workspace that never wrote it.** A run over
+        workspace A writes a note with `scope: "global"`. A run over workspace B, which has no
+        entries of its own, carries it in its memory block and `Assembled::recalled_keys` names it.
+        A second global note written by B is carried by A. Sabotage: recall only the run's own
+        workspace, under which B's block is empty and only F12 fails.
+      - >
+        **F13 — the workspace wins a key collision, and the global entry is not also rendered.**
+        With the same key in both scopes, the assembled prompt contains the workspace value and
+        **does not contain the global value** — asserted on the global value's text being absent,
+        not merely on the workspace value being present, because rendering both would pass the
+        weaker assertion. Sabotage: concatenate the two lists without deduplicating, under which the
+        global text appears and only F13 fails.
+      - >
+        **F14 — the block says which notes are global.** The memory block renders the two groups
+        under separate headings, and a global note is not described as learned over this workspace.
+        Asserted on the rendered text of a prompt holding one note of each. Sabotage: render one
+        undifferentiated list, under which the heading assertion fails and only F14 fails.
+      - >
+        **F15 — the reserved global key cannot be a real workspace.** `memory_key` over a directory
+        whose name is the reserved string still yields that directory's canonical path, which is not
+        equal to the reserved key. Asserted on a real temporary directory, so the claim is about
+        canonicalisation rather than about a string comparison written twice.
+      - >
+        **F16 — each scope holds its own caps.** Filling the global bucket past `max_entries` evicts
+        global entries and touches no workspace entry, and the reverse. Asserted in both directions,
+        because a single shared counter passes the first direction alone.
+    files:
+      - src/state.rs
+      - src/run.rs
+      - src/context.rs
+      - src/lib.rs
+      - tests/memory_scope.rs
+      - tests/context.rs
+    evidence:
+      - >-
+        F12 `a_global_note_is_recalled_from_a_workspace_that_never_wrote_it`: a run over workspace A
+        writes with `scope: "global"`; a run over workspace B, which has no entries of its own,
+        carries it in its block. Asserted in both directions, so the claim is about the scope rather
+        than the order two workspaces happened to run in. It also asserts the global write is NOT
+        also A's own entry.
+      - >-
+        F13 `the_workspace_wins_a_key_collision_and_the_global_note_is_not_carried`: with the same
+        key in both scopes the prompt holds the workspace value and **does not contain** the global
+        one. Asserted on the global value's absence, because rendering both would satisfy the
+        weaker "the workspace value is present".
+      - >-
+        F14 `the_block_renders_the_two_scopes_under_their_own_headings`: `[memory]` and `[memory:
+        every workspace]` both appear, and the two notes are asserted to fall inside their own
+        heading's span by byte offset rather than merely to be present.
+      - >-
+        F15 `a_directory_named_like_the_reserved_key_is_still_its_own_workspace`: a real temporary
+        directory actually named `<global>` keys on its own canonical path, which is absolute — so
+        the claim is about canonicalisation and not about a string spelled twice. Windows, where
+        `<` and `>` cannot appear in a path at all, is handled as the same property.
+      - >-
+        F16 `each_scope_is_bounded_on_its_own`: filling the global bucket past the cap evicts global
+        entries and touches no workspace entry, and the reverse. Both directions, because a single
+        shared counter passes the first alone.
+      - >-
+        Plus `a_run_withdraws_a_global_note_and_an_unknown_scope_is_refused`: `forget` reaches the
+        global scope, and an unrecognised `scope` writes nothing to either bucket rather than
+        quietly falling back to the workspace — a model that meant "every workspace" and silently
+        got "this one" would go on believing the fact is known everywhere.
+      - >-
+        The recall record is written against the bucket that holds the entry (`record_recalls`).
+        Crediting every carried key to the run's own workspace would have given the evidence for a
+        global note to a *different* entry that happened to share the key, and starved the global
+        one — the two lists are disjoint by construction because `recall_scopes` resolves every
+        collision before assembly sees them.
+      - >-
+        No public struct changed shape. `Assembled` keeps its fields — the loop partitions
+        `recalled_keys` by lookup instead — and `MemoryEntry` gained nothing, so N4's zero-break
+        claim still holds. The two new public items are `GLOBAL_MEMORY_WORKSPACE` and, from T01,
+        `MemoryLimits`; `MemoryForget` from T03 is a third, which N2 predicted as two.
+      - >-
+        `cargo test --test memory_scope` — 6 passed, 0 failed, first run. `tests/context.rs`'s eight
+        `assemble` call sites take the new empty global slice.
+  - id: US-IO-HARNESS-0.56.0-T05
+    summary: "Update every checked-in surface: `docs/CONTRACT.md`, the README, the two guide pages
+      including the coupling paragraph, `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md` and the
+      changelog."
+    why_required: "`docs/CONTRACT.md` states oldest-first eviction and workspace-only scope as this
+      crate's behaviour. Shipping the release with those sentences standing would be shipping a
+      documented lie."
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.56.0-T02
+      - US-IO-HARNESS-0.56.0-T04
+    acceptance_criteria:
+      - >
+        **N1 — no new dependency.** `cargo tree` stays at **402** lines on the default build. This
+        release is SQL, config plumbing and two tool arms.
+      - >
+        **N2 — the public surface addition is stated in advance.** `docs/public-api.txt` tracks
+        crate-root re-exports. The prediction is **+2 lines**: `MemoryLimits` and the reserved
+        global workspace constant. `TaskContract::with_memory_limits`, `Store::memory_forget`, the
+        new `Store` write method and the tool parameters add no line. Any difference is explained in
+        the record rather than absorbed.
+      - >
+        **N5 — eviction stays cheap at the caps an operator may now set.** The time for one capped
+        write is measured at three sizes — the default 64 entries, 512 entries, and 4,096 entries —
+        each with a recall table proportional to the store, on a named machine, and recorded in
+        `docs/MEASUREMENTS.md`. Recorded, never asserted. The number that matters is that the
+        aggregate is answered from `memory_recalls_entry` at every size, which is F5's claim.
+      - >
+        **O3 — `docs/CONTRACT.md` is amended in this release, by name.** The memory section states
+        oldest-first eviction and workspace-only scope as the crate's behaviour. Both change. The
+        new rules — evidence-ordered candidates, the two scopes, the collision rule, `forget`, and
+        the caps as operator keys — are written where the old sentences stood.
+      - >
+        **O6 — the checked-in doc surfaces are updated in this release.** The README's memory
+        description, `docs/guide/tools-and-skills.md` (`remember`'s `scope`, the new `forget`),
+        `docs/guide/configuration.md` (the `[memory]` table **and the coupling paragraph**: the
+        block's quarter-share, what raising a cap costs per turn, and why raising it was unwise
+        before this release), `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md` and the changelog.
+        Every new public item carries a worked example; `cargo test --doc` and `tests/public_api.rs`
+        pass.
+    files:
+      - docs/CONTRACT.md
+      - README.md
+      - docs/guide/tools-and-skills.md
+      - docs/guide/configuration.md
+      - docs/CAPABILITIES.md
+      - docs/MEASUREMENTS.md
+      - CHANGELOG.md
+      - docs/public-api.txt
+      - src/state.rs
+    evidence:
+      - >-
+        O3: `docs/CONTRACT.md`'s memory section now states evidence-ordered eviction, the operator
+        caps and their coupling, the two scopes and the collision rule, and `forget` — where the
+        oldest-first and workspace-only sentences stood. The plan-gate paragraph covers `forget`
+        beside `remember`, and the pin paragraph names all three things a pin now stops.
+      - >-
+        O6: `docs/guide/context-and-memory.md` gained three sections (what goes when the store is
+        full, the caps and what raising one costs, unlearning and the scope above the workspace);
+        `docs/guide/configuration.md` gained the `[memory]` table and the coupling paragraph;
+        README, `docs/CAPABILITIES.md` and `docs/guide/tools-and-skills.md` updated; the 0.56.0
+        changelog entry is written. Gates: `docs_drift` 5 passed, `guide_pages` 15 passed,
+        `changelog` 7 passed, `public_api` 9 passed.
+      - >-
+        N2 was **wrong by one, and it is stated rather than absorbed**: the prediction was +2 lines
+        in `docs/public-api.txt` and the surface added **three** — `GLOBAL_MEMORY_WORKSPACE`,
+        `MemoryLimits` and `MemoryForget`. The third is the `forget` return type, which the contract
+        described in prose without counting as a public item.
+      - >-
+        N5 measured and recorded in `docs/MEASUREMENTS.md`: 0.965 ms at 64 entries, 9.042 ms at 512,
+        73.175 ms at 4,096, median of 20 capped writes on an Apple M1, release profile. The shape is
+        the finding — cost is linear in ENTRIES and flat in the size of the recall table, which is
+        what the index buys and what the query-plan test asserts.
+      - >-
+        **The measurement found a real defect, and it was reachable only because this release makes
+        the caps settable.** The first run reported a flat 0.069/0.143/0.068 ms, which was too fast:
+        the cap comparison was `chars <= limits.max_chars as i64`, and the measurement's
+        `max_chars: usize::MAX` wraps to `-1` there, so the loop's exit condition could never hold
+        and every write evicted the whole workspace down to the key it had just written. Exact for
+        the crate's own 16,000 and catastrophic for a large operator number. The comparison is
+        `u128` now, and `a_character_cap_too_large_for_an_i64_is_a_ceiling_and_not_a_purge` is the
+        guard, with a 3-character control so it cannot pass by the cap being ignored.
+  - id: US-IO-HARNESS-0.56.0-T06
+    summary: "Run the release gates: the full suite, clippy on three feature polarities, the nightly
+      rustdoc gate, the cross-version gate, and a sabotage arm for every criterion that names one."
+    why_required: The record is evidence-based, and a criterion whose sabotage kills nothing is a guard
+      that protects nothing. The cross-version gate is what proves the new index left a 0.55.0 store
+      readable.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.56.0-T05
+    acceptance_criteria:
+      - |
+        **O1 — the three-platform matrix is green**, `--all-features` included.
+      - >
+        **O2 — nothing in the suite gates on a wall clock.** N5's timings are recorded, never
+        asserted. The recall-table fixtures are built by inserting rows directly rather than by
+        driving runs, so no test's cost scales with a provider.
+      - >
+        **O4 — the cross-version gate runs.** `cargo build --manifest-path
+        tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0 --
+        --ignored`. A release that adds an index to a shared table is exactly the release that gate
+        exists for.
+      - >
+        **O5 — the nightly rustdoc gate passes with `-D warnings`.** `RUSTDOCFLAGS="--cfg docsrs -D
+        warnings" cargo +nightly doc --all-features --no-deps`, run before the release PR. It found
+        nothing in 0.55.0 and something in six of the seven before it.
+      - >
+        **O7 — clippy on all three feature polarities**, default, one feature on, and
+        `--all-features`.
+    files: []
+    evidence:
+      - >-
+        O2/O7 `cargo fmt --check` exit 0; `cargo clippy --all-targets -- -D warnings` exit 0 on all
+        three polarities — the default build, `--features media`, and `--all-features`. Two lints on
+        this release's own additions were fixed to get there: `nonminimal_bool` on the note-fitting
+        closure and `assertions_on_constants` on the reserved-key test's non-Windows arm.
+      - >-
+        O5 `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` —
+        exit 0, clean on the first attempt. Second release running that it has found nothing, after
+        catching something in six of the seven before 0.55.0.
+      - >-
+        O4 cross-version: `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` exit 0,
+        then `cargo test --test cross_version_0_29_0 -- --ignored` — 1 passed. This is the gate that
+        matters for a release adding an index to a shared table.
+      - >-
+        N1 `cargo tree` — **402 lines, unchanged**. No new dependency: the release is SQL, config
+        plumbing and two tool arms.
+      - >-
+        **Sabotage: 16 arms, and every one now kills a named test. Two survived the first pass and
+        both were findings.** S4 (remove the `keep` guard) compiled and failed nothing, because the
+        existing arm writes into a store with no recalls, where the new key sorts last among
+        candidates either way; the guard is load-bearing only when every OTHER entry carries
+        evidence, which the added test now constructs. S9 (report a removal for a key that was never
+        there) failed nothing because the test counted trace rows and neither arm writes one for an
+        absent key — and asserting the message instead exposed something real in the product: the
+        absent answer wore the same `[forget <key>]` prefix a removal wears. It now reads
+        `[forget: nothing to forget]`. Logs in `evidence/0.56.0/sab-*.log`.

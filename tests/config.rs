@@ -2457,3 +2457,94 @@ fn a_project_scoped_file_may_lower_the_read_ceiling_and_may_not_raise_it() {
         Some(900_000),
     );
 }
+
+// ---------------------------------------------------------------------------
+// 0.56.0 — the three memory caps as operator keys
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_memory_caps_reach_the_contract_through_the_ordinary_projection() {
+    let config = Config::from_toml("[memory]\nmax_entries = 8\n").unwrap();
+    let contract = config.apply_to(TaskContract::workspace("learn things", "/repo"));
+
+    assert_eq!(contract.memory.max_entries, 8);
+    // One key set is one key moved. The other two stay the crate's numbers
+    // rather than being reset to a section-wide default, which is what a
+    // whole-struct projection would have done.
+    assert_eq!(contract.memory.max_chars, io_harness::MEMORY_MAX_CHARS);
+    assert_eq!(
+        contract.memory.max_entry_chars,
+        io_harness::MEMORY_MAX_ENTRY_CHARS
+    );
+
+    // And nothing set is 0.55.0's behaviour exactly.
+    let plain = Config::from_toml("")
+        .unwrap()
+        .apply_to(TaskContract::workspace("learn things", "/repo"));
+    assert_eq!(plain.memory, io_harness::MemoryLimits::default());
+    assert_eq!(plain.memory.max_entries, 64);
+    assert_eq!(plain.memory.max_chars, 16_000);
+    assert_eq!(plain.memory.max_entry_chars, 2_000);
+}
+
+#[test]
+fn a_memory_key_misspelled_is_still_refused_by_name() {
+    let err = Config::from_toml("[memory]\nmax_entrys = 8\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("max_entrys"), "{err}");
+}
+
+#[test]
+fn a_project_scoped_file_may_lower_a_memory_cap_and_may_not_raise_it() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(
+        user_dir.path(),
+        "io.toml",
+        "[memory]\nmax_entries = 64\nmax_chars = 16000\nmax_entry_chars = 2000\n",
+    );
+
+    // All three keys, in both directions — not one representative. A narrowing
+    // rule that covers two of three is a boundary that depends on which cap a
+    // repository chose to argue about.
+    write(
+        project.path(),
+        "io.toml",
+        "[memory]\nmax_entries = 16\nmax_chars = 4000\nmax_entry_chars = 500\n",
+    );
+    let narrowed = Config::discover(project.path())
+        .unwrap()
+        .apply_to(TaskContract::workspace("learn things", project.path()));
+    assert_eq!(narrowed.memory.max_entries, 16);
+    assert_eq!(narrowed.memory.max_chars, 4_000);
+    assert_eq!(narrowed.memory.max_entry_chars, 500);
+
+    write(
+        project.path(),
+        "io.toml",
+        "[memory]\nmax_entries = 128\nmax_chars = 900000\nmax_entry_chars = 90000\n",
+    );
+    let widened = Config::discover(project.path())
+        .unwrap()
+        .apply_to(TaskContract::workspace("learn things", project.path()));
+    assert_eq!(
+        widened.memory.max_entries, 64,
+        "a project file may not raise it"
+    );
+    assert_eq!(widened.memory.max_chars, 16_000);
+    assert_eq!(widened.memory.max_entry_chars, 2_000);
+
+    // The control: the operator's own local file is not held to the rule.
+    write(
+        project.path(),
+        "io.local.toml",
+        "[memory]\nmax_entries = 128\n",
+    );
+    let local = Config::discover(project.path())
+        .unwrap()
+        .apply_to(TaskContract::workspace("learn things", project.path()));
+    assert_eq!(local.memory.max_entries, 128);
+}

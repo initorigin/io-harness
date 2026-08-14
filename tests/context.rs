@@ -419,6 +419,7 @@ async fn a_policy_refused_reread_is_a_stub_naming_the_invalidating_step_and_the_
         &ledger,
         24_000,
         &[],
+        &[],
         Assembly {
             ws: Some(&ws),
             policy: &policy,
@@ -673,6 +674,7 @@ async fn assembling_one_turn_costs_a_bounded_amount_of_time() {
             &ledger,
             24_000,
             &[],
+            &[],
             Assembly {
                 ws: Some(&workspace),
                 policy: &policy,
@@ -753,6 +755,7 @@ async fn two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_colla
         &ledger,
         24_000,
         &[],
+        &[],
         Assembly {
             ws: Some(&workspace),
             policy: &policy,
@@ -816,6 +819,7 @@ async fn a_re_read_cannot_escape_the_workspace_root() {
     let out = assemble(
         &ledger,
         24_000,
+        &[],
         &[],
         Assembly {
             ws: Some(&workspace),
@@ -894,6 +898,7 @@ async fn the_rendered_note_block_is_byte_identical_whatever_run_id_the_notes_car
                 &Ledger::new(),
                 24_000,
                 &notes,
+                &[],
                 Assembly {
                     ws: None,
                     policy,
@@ -1046,6 +1051,7 @@ async fn a_long_runs_stubs_collapse_so_the_ceiling_still_holds() {
     let out = assemble(
         &ledger,
         CEILING,
+        &[],
         &[],
         Assembly {
             ws: Some(&workspace),
@@ -1235,6 +1241,7 @@ async fn emitted_for(ledger: &Ledger, budget: u64) -> Assembled {
     assemble(
         ledger,
         budget,
+        &[],
         &[],
         Assembly {
             ws: Some(&ws),
@@ -1565,6 +1572,7 @@ async fn a_read_that_no_longer_fits_is_a_stub_and_not_a_tail() {
         // A ceiling too small to carry the read whole, and large enough to carry
         // the newer entry — which is exactly the squeeze the rule is about.
         200,
+        &[],
         &[],
         Assembly {
             ws: None,

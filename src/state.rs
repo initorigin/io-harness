@@ -1343,6 +1343,43 @@ pub struct MemoryRecall {
     pub at: String,
 }
 
+/// What a run's `forget` did (0.56.0).
+///
+/// Three answers rather than a `bool`, for the reason [`MemoryWrite::refused`]
+/// exists: "there was nothing there" and "an operator pinned it" are different
+/// facts, and a model told only that nothing was removed cannot tell which of
+/// them it is looking at.
+///
+/// ```
+/// use io_harness::{MemoryForget, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("fix the flake", "/repo")?;
+/// store.memory_put("/repo", "retries", "three", run, 1)?;
+///
+/// // Each of the three is reachable, and they are not interchangeable.
+/// assert_eq!(store.memory_forget("/repo", "retries", run, 2)?, MemoryForget::Removed);
+/// assert_eq!(store.memory_forget("/repo", "retries", run, 3)?, MemoryForget::Absent);
+///
+/// store.memory_put("/repo", "owner", "the platform team", run, 4)?;
+/// store.memory_pin("/repo", "owner", true)?;
+/// assert_eq!(store.memory_forget("/repo", "owner", run, 5)?, MemoryForget::Pinned);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryForget {
+    /// The entry was there and is gone.
+    Removed,
+    /// An operator pinned it, so it is not a run's to withdraw. The entry
+    /// stands.
+    Pinned,
+    /// There was no such key in this workspace. Not an error — a run that
+    /// withdraws a fact twice has still withdrawn it.
+    Absent,
+}
+
 /// What a write to memory did (0.30.0).
 ///
 /// Returned by [`Store::memory_write`]. The `refused` flag is the half that
@@ -2085,14 +2122,108 @@ const MEMORY_TRUNCATED: &str = "…[truncated]";
 
 /// Cut `value` to [`MEMORY_MAX_ENTRY_CHARS`] on a char boundary, marking the
 /// cut. Returned unchanged when it already fits.
-fn truncate_memory_value(value: &str) -> String {
-    if value.chars().count() <= MEMORY_MAX_ENTRY_CHARS {
+fn truncate_memory_value(value: &str, cap: usize) -> String {
+    if value.chars().count() <= cap {
         return value.to_string();
     }
-    let keep = MEMORY_MAX_ENTRY_CHARS - MEMORY_TRUNCATED.chars().count();
+    // `saturating_sub` since 0.56.0, where the cap is an operator's number: a cap
+    // shorter than the marker would otherwise panic on the subtraction, and a
+    // marker alone is still an honest answer — it says the value did not fit.
+    let keep = cap.saturating_sub(MEMORY_TRUNCATED.chars().count());
     let mut out: String = value.chars().take(keep).collect();
     out.push_str(MEMORY_TRUNCATED);
     out
+}
+
+/// The workspace key the scope above every workspace is stored under (0.56.0).
+///
+/// Durable memory is keyed by a workspace's canonical path. A fact true of every
+/// repository an operator owns — the package manager they use, a convention they
+/// never want broken — had to be learned again per workspace or written by hand
+/// into each one's instructions. Entries under this key are recalled by every
+/// run over every workspace.
+///
+/// **A key in both scopes resolves to the workspace's**, and the global entry is
+/// not carried at all: the specific place always knows better than the general
+/// one, which is also what makes a wrong global note locally correctable.
+///
+/// Not a path, and it cannot collide with one: `std::fs::canonicalize` returns
+/// an absolute path on every platform this crate supports, and `<` and `>` are
+/// not legal in a Windows path at all. A directory *named* `<global>` still
+/// keys on its own canonical path.
+///
+/// ```
+/// use io_harness::{Store, GLOBAL_MEMORY_WORKSPACE};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("port the parser", "/repo")?;
+/// store.memory_put(GLOBAL_MEMORY_WORKSPACE, "package-manager", "pnpm", run, 1)?;
+///
+/// // It is an ordinary workspace bucket, so it holds its own caps, its own
+/// // pins and its own eviction — everything a workspace's memory does.
+/// assert_eq!(store.memory_list(GLOBAL_MEMORY_WORKSPACE)?.len(), 1);
+/// assert!(store.memory_list("/repo")?.is_empty(), "and it is not /repo's");
+/// # Ok(())
+/// # }
+/// ```
+pub const GLOBAL_MEMORY_WORKSPACE: &str = "<global>";
+
+/// The three caps a workspace's memory is held inside (0.56.0).
+///
+/// [`Default`] is the crate's own numbers — [`MEMORY_MAX_ENTRIES`],
+/// [`MEMORY_MAX_CHARS`] and [`MEMORY_MAX_ENTRY_CHARS`] — so a caller that sets
+/// nothing keeps 0.10.0's behaviour exactly. An operator moves them with
+/// `[memory]` in `io.toml` or [`TaskContract::with_memory_limits`].
+///
+/// Raising them is not free, and the coupling is worth stating where the type
+/// is: the memory block gets a quarter of a turn's effective tokens, and the
+/// defaults were chosen so a whole store fits inside that share. Past that
+/// point recall can no longer carry everything and selection begins deciding
+/// what the model sees — which is safe only because, since this release,
+/// selection is by evidence rather than by the clock.
+///
+/// [`TaskContract::with_memory_limits`]: crate::TaskContract::with_memory_limits
+///
+/// ```
+/// use io_harness::{MemoryLimits, Store, MEMORY_MAX_ENTRIES};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// assert_eq!(MemoryLimits::default().max_entries, MEMORY_MAX_ENTRIES);
+///
+/// let store = Store::memory()?;
+/// let run = store.start_run("goal", "/repo")?;
+/// let tight = MemoryLimits {
+///     max_entries: 2,
+///     ..MemoryLimits::default()
+/// };
+/// for key in ["a", "b", "c"] {
+///     store.memory_write_with("/repo", key, "v", run, 1, Default::default(), tight)?;
+/// }
+/// // Three writes under a cap of two, and the one nothing has drawn on goes.
+/// assert_eq!(store.memory_list("/repo")?.len(), 2);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryLimits {
+    /// How many entries one workspace may hold.
+    pub max_entries: usize,
+    /// How many characters one workspace's entries may total.
+    pub max_chars: usize,
+    /// How many characters a single entry may hold before it is truncated with
+    /// a visible marker.
+    pub max_entry_chars: usize,
+}
+
+impl Default for MemoryLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: MEMORY_MAX_ENTRIES,
+            max_chars: MEMORY_MAX_CHARS,
+            max_entry_chars: MEMORY_MAX_ENTRY_CHARS,
+        }
+    }
 }
 
 // ---- 0.10.0: what the context assembler decided ----
@@ -2208,6 +2339,12 @@ impl ContextEvent {
     /// after the run by somebody reading the store, not during it by an observer.
     pub fn memory_refused(step: u32, detail: impl Into<String>) -> Self {
         Self::of("memory_refused", step, detail)
+    }
+    /// A run withdrew a note (0.56.0). Its own kind rather than an eviction, so
+    /// a trace tells "the agent decided this was wrong" apart from "the cap
+    /// dropped it" — two different facts about the same disappearance.
+    pub fn memory_forget(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("memory_forget", step, detail)
     }
 
     /// The agent wrote down its plan at this step (0.21.0). The detail is the shape
@@ -2574,6 +2711,10 @@ pub(crate) struct MemorySnapshot {
     pub before: Option<String>,
     /// The kind it had, or `None` when there was no entry.
     pub kind: Option<String>,
+    /// The step the run was on when it took this restore point (0.56.0). Carried
+    /// so a restore that has to INSERT — the entry the run *removed* rather than
+    /// edited — has a step to attribute the row to.
+    pub step: u32,
     /// True when the run *created* this entry, so putting it back means removing
     /// it. Kept apart from `before.is_none()` for the reason `snapshots.state`
     /// is: the two ways to be wrong are refusing to restore and deleting an entry
@@ -2963,6 +3104,19 @@ impl Store {
                  at        TEXT NOT NULL DEFAULT (datetime('now'))
              );
              CREATE INDEX IF NOT EXISTS memory_recalls_run ON memory_recalls (run_id);",
+        )?;
+
+        // 0.56.0: eviction ranks an entry by the recalls it earned, which reads
+        // this table by `(workspace, key)` where 0.30.0 only ever read it by
+        // `run_id`. An index rather than a scan because the read is on the write
+        // path: `memory_recalls` grows by one row per carried key per step, so
+        // the busiest workspace is the one whose next write would pay most for a
+        // scan. Additive like every index above it, and deliberately NOT a
+        // `CHECKPOINT_FORMAT` bump: no checkpoint layout changed, and a 0.55.0
+        // binary opening this database reads the same rows it always did.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS memory_recalls_entry
+                 ON memory_recalls (workspace, key);",
         )?;
 
         // 0.10.0: what the context assembler decided each turn — one row per turn
@@ -4510,7 +4664,7 @@ impl Store {
     /// `EXPLAIN` the statement the crate actually runs. Re-typing the SQL in the
     /// test leaves it passing after someone tidies the real one.
     pub(crate) const MEMORY_SNAPSHOTS_SQL: &'static str =
-        "SELECT workspace, key, before, kind, state FROM memory_snapshots
+        "SELECT workspace, key, before, kind, state, step FROM memory_snapshots
          WHERE run_id = ?1 ORDER BY id";
 
     /// What every memory entry this run wrote looked like before it wrote it
@@ -4530,6 +4684,7 @@ impl Store {
                 // restore is recoverable where deleting an entry the run only
                 // edited is not.
                 created: state == "absent",
+                step: r.get::<_, i64>(5)? as u32,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -4547,11 +4702,27 @@ impl Store {
         key: &str,
         value: &str,
         kind: Option<&str>,
+        run_id: i64,
+        step: u32,
     ) -> Result<()> {
+        // An UPSERT since 0.56.0, where a run can REMOVE an entry as well as
+        // edit one: an `UPDATE` puts back what a run overwrote and silently does
+        // nothing for what a run forgot, which would leave `rewind_run` naming a
+        // key in `memory_restored` that is not in the store.
+        //
+        // The `ON CONFLICT` half is 0.36.0's `UPDATE` exactly — `run_id`, `step`
+        // and `pinned` are left alone for an entry that still exists. The INSERT
+        // half attributes the row to the run being rewound, because the run that
+        // originally wrote it died with the row; `pinned` is 0, which is not a
+        // guess: a pinned entry cannot be forgotten, so a restored one was never
+        // pinned.
         self.conn.execute(
-            "UPDATE memory SET value = ?1, kind = COALESCE(?2, kind)
-             WHERE workspace = ?3 AND key = ?4",
-            (value, kind, workspace, key),
+            "INSERT INTO memory (workspace, key, value, run_id, step, created_at, kind, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?6, 0)
+             ON CONFLICT(workspace, key) DO UPDATE SET
+                 value = excluded.value,
+                 kind  = COALESCE(excluded.kind, memory.kind)",
+            (workspace, key, value, run_id, step, kind),
         )?;
         Ok(())
     }
@@ -6487,7 +6658,57 @@ impl Store {
         step: u32,
         kind: MemoryKind,
     ) -> Result<MemoryWrite> {
-        let value = truncate_memory_value(value);
+        self.memory_write_with(
+            workspace,
+            key,
+            value,
+            run_id,
+            step,
+            kind,
+            MemoryLimits::default(),
+        )
+    }
+
+    /// [`Store::memory_write`] under caps the caller chose (0.56.0).
+    ///
+    /// The full form. `memory_write` is this with [`MemoryLimits::default`],
+    /// which is the three constants, so a caller that has no opinion about the
+    /// caps never has to express one.
+    ///
+    /// ```
+    /// use io_harness::{MemoryKind, MemoryLimits, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("make the tests pass", "/repo")?;
+    /// let limits = MemoryLimits {
+    ///     max_entry_chars: 12,
+    ///     ..MemoryLimits::default()
+    /// };
+    ///
+    /// let wrote = store.memory_write_with(
+    ///     "/repo", "test-command", "cargo test --features documents", run, 6,
+    ///     MemoryKind::Fact, limits,
+    /// )?;
+    /// assert!(!wrote.refused);
+    /// // The operator's cap bounds the value, and the cut is visible in it.
+    /// let stored = store.memory_get("/repo", "test-command")?.unwrap().value;
+    /// assert_eq!(stored.chars().count(), 12);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn memory_write_with(
+        &self,
+        workspace: &str,
+        key: &str,
+        value: &str,
+        run_id: i64,
+        step: u32,
+        kind: MemoryKind,
+        limits: MemoryLimits,
+    ) -> Result<MemoryWrite> {
+        let value = truncate_memory_value(value, limits.max_entry_chars);
         // 0.36.0 — the restore point, taken BEFORE the write, because after it
         // the previous value is gone. `INSERT OR IGNORE` against a unique
         // `(run_id, workspace, key)` index is the whole first-write guard: the
@@ -6552,7 +6773,7 @@ impl Store {
         }
         Ok(MemoryWrite {
             refused: false,
-            evicted: self.enforce_memory_caps(workspace, key)?,
+            evicted: self.enforce_memory_caps(workspace, key, limits)?,
         })
     }
 
@@ -6650,10 +6871,45 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Evict this workspace's oldest entries until both caps hold, never the
-    /// entry `keep` (the one just written — evicting it would make a write a
+    /// The order eviction considers candidates in (0.56.0). Extracted for the
+    /// same reason [`Store::MEMORY_SNAPSHOTS_SQL`] is: `EXPLAIN` the statement
+    /// the crate actually runs, because a re-typed copy in a test goes on
+    /// passing after someone tidies the real one.
+    ///
+    /// Four terms, and each one is load-bearing:
+    ///
+    /// - `COUNT(DISTINCT r.run_id)` — how many separate runs carried the entry.
+    ///   **Distinct runs, not rows.** A recall row is written once per carried
+    ///   key per *step*, so rows count steps elapsed since the write: one run of
+    ///   two hundred steps would outvote fifty runs that each leaned on the
+    ///   entry once, and the count would be monotone in age — which is the
+    ///   policy this release exists to replace.
+    /// - `MAX(r.at)` — how recently one did, so two entries with the same number
+    ///   of runs are separated by which is still in use. SQLite sorts NULL
+    ///   first, and that is wanted: never recalled at all is the weakest claim
+    ///   there is.
+    /// - `created_at, id` — 0.10.0's order, kept as the tail. Every entry with
+    ///   no evidence yet is ordered exactly as it was before this release, so
+    ///   the unproven cohort's behaviour is unchanged rather than newly
+    ///   invented.
+    pub(crate) const MEMORY_CANDIDATES_SQL: &'static str =
+        "SELECT m.key, LENGTH(m.value), m.pinned,
+                (SELECT COUNT(DISTINCT r.run_id) FROM memory_recalls r
+                  WHERE r.workspace = m.workspace AND r.key = m.key) AS runs,
+                (SELECT MAX(r.at) FROM memory_recalls r
+                  WHERE r.workspace = m.workspace AND r.key = m.key) AS last_recall
+           FROM memory m WHERE m.workspace = ?1
+          ORDER BY runs ASC, last_recall ASC, m.created_at ASC, m.id ASC";
+
+    /// Evict this workspace's least-proven entries until both caps hold, never
+    /// the entry `keep` (the one just written — evicting it would make a write a
     /// silent no-op). Returns the evicted keys in eviction order.
-    fn enforce_memory_caps(&self, workspace: &str, keep: &str) -> Result<Vec<String>> {
+    fn enforce_memory_caps(
+        &self,
+        workspace: &str,
+        keep: &str,
+        limits: MemoryLimits,
+    ) -> Result<Vec<String>> {
         // LENGTH() on TEXT counts characters, not bytes — the cap is in chars.
         let rows: Vec<(String, i64, bool)> = {
             // 0.30.0: a pinned entry is not a candidate. It is exempt from
@@ -6662,10 +6918,7 @@ impl Store {
             // twenty notes afterwards. It still counts towards the caps, so
             // pinning everything makes writes fail loudly rather than silently
             // raising the ceiling.
-            let mut stmt = self.conn.prepare(
-                "SELECT key, LENGTH(value), pinned FROM memory WHERE workspace = ?1
-                 ORDER BY created_at ASC, id ASC",
-            )?;
+            let mut stmt = self.conn.prepare(Self::MEMORY_CANDIDATES_SQL)?;
             let rows = stmt.query_map([workspace], |r| {
                 Ok((
                     r.get(0)?,
@@ -6677,10 +6930,18 @@ impl Store {
         };
 
         let mut count = rows.len();
-        let mut chars: i64 = rows.iter().map(|(_, n, _)| *n).sum();
+        // `u128`, and not the `i64` this was until 0.56.0. `LENGTH()` returns
+        // `i64` and the cap was compared as `limits.max_chars as i64` — which is
+        // exact for the crate's own constant and **wraps negative** for a large
+        // one an operator may now set, at which point `chars <= cap` is false
+        // forever, the break never fires, and a single write evicts the whole
+        // workspace down to the entry it just wrote. Widening the comparison
+        // rather than validating the input: a cap is a ceiling, and there is no
+        // number an operator can write that should mean "discard everything".
+        let mut chars: u128 = rows.iter().map(|(_, n, _)| (*n).max(0) as u128).sum();
         let mut evicted = Vec::new();
         for (key, n, pinned) in &rows {
-            if count <= MEMORY_MAX_ENTRIES && chars <= MEMORY_MAX_CHARS as i64 {
+            if count <= limits.max_entries && chars <= limits.max_chars as u128 {
                 break;
             }
             if key == keep || *pinned {
@@ -6691,7 +6952,7 @@ impl Store {
                 (workspace, key),
             )?;
             count -= 1;
-            chars -= n;
+            chars -= (*n).max(0) as u128;
             evicted.push(key.clone());
         }
         Ok(evicted)
@@ -6840,6 +7101,85 @@ impl Store {
                 memory_row,
             )
             .ok())
+    }
+
+    /// Withdraw one entry on a run's behalf, as the `forget` tool does (0.56.0).
+    ///
+    /// The counterpart to [`Store::memory_write`], and it answers with the same
+    /// honesty: a pinned entry is [`MemoryForget::Pinned`] and a key that was
+    /// never there is [`MemoryForget::Absent`], because an agent told a removal
+    /// happened when it did not will act on a correction it never made.
+    ///
+    /// Two things separate it from [`Store::memory_delete`], which is the
+    /// embedder's own blunt removal and is unchanged. It takes the 0.36.0
+    /// restore point first, so a [`rewind_run`](crate::rewind_run) puts the
+    /// entry back. And it deletes the key's recall rows: the run said the fact
+    /// is wrong, so the evidence it accrued goes with it. An **eviction** leaves
+    /// those rows alone — a cap is the store's decision, and rewriting a trace
+    /// is not the store's to do.
+    ///
+    /// ```
+    /// use io_harness::{MemoryForget, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("fix the flake", "/repo")?;
+    /// store.memory_put("/repo", "retries", "three", run, 1)?;
+    ///
+    /// assert_eq!(store.memory_forget("/repo", "retries", run, 4)?, MemoryForget::Removed);
+    /// assert!(store.memory_get("/repo", "retries")?.is_none());
+    ///
+    /// // Saying it twice is not an error, and is not a second removal either.
+    /// assert_eq!(store.memory_forget("/repo", "retries", run, 5)?, MemoryForget::Absent);
+    ///
+    /// // What an operator pinned is not a run's to withdraw, for the same
+    /// // reason it is not a run's to overwrite.
+    /// store.memory_put("/repo", "owner", "the platform team", run, 6)?;
+    /// store.memory_pin("/repo", "owner", true)?;
+    /// assert_eq!(store.memory_forget("/repo", "owner", run, 7)?, MemoryForget::Pinned);
+    /// assert!(store.memory_get("/repo", "owner")?.is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn memory_forget(
+        &self,
+        workspace: &str,
+        key: &str,
+        run_id: i64,
+        step: u32,
+    ) -> Result<MemoryForget> {
+        let Some(entry) = self.memory_get(workspace, key)? else {
+            return Ok(MemoryForget::Absent);
+        };
+        if entry.pinned {
+            return Ok(MemoryForget::Pinned);
+        }
+        // The restore point before the removal, `INSERT OR IGNORE` for the same
+        // reason `memory_write` uses it: if this run already touched the key, the
+        // row that is there records what was there BEFORE the run started, and
+        // that is the one a rewind must put back.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO memory_snapshots
+                 (run_id, workspace, key, step, before, kind, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'text')",
+            (
+                run_id,
+                workspace,
+                key,
+                step,
+                &entry.value,
+                entry.kind.as_str(),
+            ),
+        )?;
+        self.conn.execute(
+            "DELETE FROM memory WHERE workspace = ?1 AND key = ?2",
+            (workspace, key),
+        )?;
+        self.conn.execute(
+            "DELETE FROM memory_recalls WHERE workspace = ?1 AND key = ?2",
+            (workspace, key),
+        )?;
+        Ok(MemoryForget::Removed)
     }
 
     /// Forget one entry of `workspace`. True when an entry was removed.
@@ -8429,6 +8769,402 @@ mod tests {
         assert!(entries.len() < MEMORY_MAX_ENTRIES);
         let total: usize = entries.iter().map(|e| e.value.chars().count()).sum();
         assert!(total <= MEMORY_MAX_CHARS, "{total} chars is over the cap");
+    }
+
+    // ---- 0.56.0: eviction ordered by evidence rather than by the write clock ----
+
+    /// Fill a workspace to the entry cap, oldest first. `k0` is the oldest.
+    fn fill_to_the_cap(store: &Store, workspace: &str) {
+        for i in 0..MEMORY_MAX_ENTRIES {
+            store
+                .memory_put(workspace, &format!("k{i}"), "v", 1, 1)
+                .unwrap();
+        }
+    }
+
+    /// Say that each of `runs` separate runs carried `key` once.
+    fn carried_by_runs(store: &Store, workspace: &str, key: &str, runs: &[i64]) {
+        for run in runs {
+            store
+                .record_memory_recall(*run, 1, workspace, &[key.to_string()])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn the_entry_many_runs_carried_survives_and_the_one_no_run_carried_goes() {
+        let store = Store::memory().unwrap();
+        fill_to_the_cap(&store, "ws");
+
+        // The oldest entry in the workspace, and the one ten separate runs have
+        // leaned on. Under 0.55.0's clock it is the very first thing to go.
+        carried_by_runs(
+            &store,
+            "ws",
+            "k0",
+            &[10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+        );
+
+        let evicted = store.memory_put("ws", "new", "v", 2, 2).unwrap();
+        assert_eq!(
+            evicted,
+            vec!["k1"],
+            "the oldest UNRECALLED entry goes; the recalled one is not a candidate at all"
+        );
+        assert!(
+            store.memory_get("ws", "k0").unwrap().is_some(),
+            "the entry every run carried is exactly the one 0.55.0 would have dropped"
+        );
+        assert!(store.memory_get("ws", "new").unwrap().is_some());
+    }
+
+    #[test]
+    fn one_long_run_does_not_outvote_three_short_ones() {
+        let store = Store::memory().unwrap();
+        fill_to_the_cap(&store, "ws");
+
+        // Everything is proven, so the two entries under test are the ones the
+        // order has to separate rather than the oldest unrecalled one.
+        for i in 0..MEMORY_MAX_ENTRIES {
+            carried_by_runs(&store, "ws", &format!("k{i}"), &[100, 101, 102, 103, 104]);
+        }
+        store
+            .conn
+            .execute("DELETE FROM memory_recalls WHERE key IN ('k3', 'k5')", [])
+            .unwrap();
+
+        // `k5` is one run that ran for two hundred steps. `k3` is three separate
+        // runs that each carried it once. Rows say k5 is worth 200 and k3 is
+        // worth 3; runs say k3 is worth three times as much as k5.
+        for step in 1..=200 {
+            store
+                .record_memory_recall(200, step, "ws", &["k5".to_string()])
+                .unwrap();
+        }
+        carried_by_runs(&store, "ws", "k3", &[300, 301, 302]);
+
+        let evicted = store.memory_put("ws", "new", "v", 2, 2).unwrap();
+        assert_eq!(
+            evicted,
+            vec!["k5"],
+            "one run's two hundred steps are one run; counting rows would have dropped k3"
+        );
+    }
+
+    #[test]
+    fn with_no_recalls_at_all_the_order_is_exactly_the_write_clock() {
+        let store = Store::memory().unwrap();
+        fill_to_the_cap(&store, "ws");
+
+        // The unproven cohort is 0.10.0's behaviour unchanged: nothing has any
+        // evidence, so the tie-break tail is the whole order.
+        let mut evicted = Vec::new();
+        for i in 0..5 {
+            evicted.extend(
+                store
+                    .memory_put("ws", &format!("new{i}"), "v", 2, 2)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(evicted, vec!["k0", "k1", "k2", "k3", "k4"]);
+    }
+
+    #[test]
+    fn a_pinned_entry_with_the_worst_score_is_still_never_a_candidate() {
+        let store = Store::memory().unwrap();
+        fill_to_the_cap(&store, "ws");
+        // The oldest entry, carried by nobody: the worst score on every term.
+        assert!(store.memory_pin("ws", "k0", true).unwrap());
+
+        let evicted = store.memory_put("ws", "new", "v", 2, 2).unwrap();
+        assert_eq!(
+            evicted,
+            vec!["k1"],
+            "the pin outranks every term of the order"
+        );
+        assert!(store.memory_get("ws", "k0").unwrap().is_some());
+    }
+
+    /// What a capped write costs at three store sizes (0.56.0, N5).
+    ///
+    /// `#[ignore]`d and printing rather than asserting: a duration asserted
+    /// anywhere in this suite is a flake waiting to be written, and this one
+    /// would be worst of all on a runner busy with five parallel jobs. What IS
+    /// asserted, above, is the query plan — the aggregate is answered from
+    /// `memory_recalls_entry` at every size, which is the claim that actually
+    /// bounds the cost. Here to be RUN by a human before a release, with the
+    /// numbers going into `docs/MEASUREMENTS.md` beside the machine's name:
+    ///
+    /// ```text
+    /// cargo test --release --lib memory_eviction_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a measurement, not a gate: prints timings, asserts none of them"]
+    fn memory_eviction_cost() {
+        println!("entries  recall rows  ms/write (median of 20)");
+        for entries in [64usize, 512, 4_096] {
+            let store = Store::memory().unwrap();
+            let limits = MemoryLimits {
+                max_entries: entries,
+                // Out of the way: this measures the entry cap's ranking, and a
+                // character cap biting first would measure something else.
+                max_chars: usize::MAX,
+                ..MemoryLimits::default()
+            };
+            for i in 0..entries {
+                store
+                    .memory_write_with("/ws", &format!("k{i}"), "v", 1, 1, MemoryKind::Fact, limits)
+                    .unwrap();
+            }
+            // One row per entry per run, which is what the loop writes once per
+            // step for every note the block carried.
+            let runs = 20i64;
+            for run in 100..(100 + runs) {
+                let keys: Vec<String> = (0..entries).map(|i| format!("k{i}")).collect();
+                store.record_memory_recall(run, 1, "/ws", &keys).unwrap();
+            }
+
+            let mut times = Vec::new();
+            for n in 0..20 {
+                let at = std::time::Instant::now();
+                let wrote = store
+                    .memory_write_with(
+                        "/ws",
+                        &format!("new{n}"),
+                        "v",
+                        2,
+                        2,
+                        MemoryKind::Fact,
+                        limits,
+                    )
+                    .unwrap();
+                times.push(at.elapsed());
+                assert_eq!(wrote.evicted.len(), 1, "every write at the cap evicts one");
+            }
+            times.sort();
+            println!(
+                "{entries:>7}  {:>11}  {:.3}",
+                entries as i64 * runs,
+                times[times.len() / 2].as_secs_f64() * 1_000.0
+            );
+        }
+    }
+
+    #[test]
+    fn the_key_just_written_is_not_a_candidate_even_when_it_is_the_only_unproven_one() {
+        // S4's finding, and the reason this test exists beside the one above.
+        // The `keep` guard is load-bearing exactly when the new key sorts FIRST
+        // among candidates, which needs every OTHER entry to carry evidence. The
+        // pinned-entry arm writes `new` into a store where nothing has been
+        // recalled, so `new` is the *newest* zero-recall entry and sorts last —
+        // removing the guard changed nothing there and the sabotage survived.
+        // Here, without the guard, the write evicts itself and `remember`
+        // becomes a silent no-op.
+        let store = Store::memory().unwrap();
+        fill_to_the_cap(&store, "ws");
+        for i in 0..MEMORY_MAX_ENTRIES {
+            carried_by_runs(&store, "ws", &format!("k{i}"), &[7, 8, 9]);
+        }
+
+        let evicted = store.memory_put("ws", "new", "v", 2, 2).unwrap();
+        assert_eq!(
+            evicted,
+            vec!["k0"],
+            "the least-proven existing entry goes, never the one just written"
+        );
+        assert!(
+            store.memory_get("ws", "new").unwrap().is_some(),
+            "a write that evicts itself is a write that did not happen"
+        );
+    }
+
+    #[test]
+    fn a_character_cap_too_large_for_an_i64_is_a_ceiling_and_not_a_purge() {
+        // Found by running the N5 measurement, which set `max_chars` out of the
+        // way and got a store holding one entry. The comparison was
+        // `chars <= limits.max_chars as i64`, and a `usize` past `i64::MAX`
+        // wraps negative there — so the break never fires and one write evicts
+        // everything but the key it just wrote. Silent, and the opposite of what
+        // the number says.
+        let store = Store::memory().unwrap();
+        let limits = MemoryLimits {
+            max_entries: 1_000,
+            max_chars: usize::MAX,
+            max_entry_chars: 2_000,
+        };
+        for i in 0..10 {
+            store
+                .memory_write_with("ws", &format!("k{i}"), "v", 1, 1, MemoryKind::Fact, limits)
+                .unwrap();
+        }
+        assert_eq!(
+            store.memory_list("ws").unwrap().len(),
+            10,
+            "a cap nothing can exceed evicts nothing"
+        );
+
+        // The control, so the assertion above is about the cast and not about
+        // the cap being ignored: the same store under a cap of 3 characters.
+        let tight = MemoryLimits {
+            max_chars: 3,
+            ..limits
+        };
+        store
+            .memory_write_with("ws", "k10", "v", 1, 1, MemoryKind::Fact, tight)
+            .unwrap();
+        assert!(store.memory_list("ws").unwrap().len() <= 3);
+    }
+
+    #[test]
+    fn a_forget_takes_the_evidence_with_it_and_an_eviction_leaves_it() {
+        let store = Store::memory().unwrap();
+        fill_to_the_cap(&store, "ws");
+        // Every entry carried by the same one run, so all the evidence terms tie
+        // and the order falls through to the write clock: `k0` is what the next
+        // write evicts, and it is an entry that HAS recall rows.
+        for i in 0..MEMORY_MAX_ENTRIES {
+            carried_by_runs(&store, "ws", &format!("k{i}"), &[42]);
+        }
+
+        let evicted = store.memory_put("ws", "new", "v", 2, 2).unwrap();
+        assert_eq!(evicted, vec!["k0"]);
+
+        let rows = |key: &str| -> usize {
+            store
+                .memory_recalls(42)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.key == key)
+                .count()
+        };
+        assert_eq!(
+            rows("k0"),
+            1,
+            "a cap dropped the entry; the trace of what it was worth is not the cap's to rewrite"
+        );
+
+        // The other direction, on an entry the run itself withdrew.
+        assert_eq!(
+            store.memory_forget("ws", "k1", 2, 3).unwrap(),
+            MemoryForget::Removed
+        );
+        assert_eq!(
+            rows("k1"),
+            0,
+            "the run said the fact was wrong, so the evidence it accrued goes with it"
+        );
+        assert_eq!(rows("k2"), 1, "and nobody else's rows moved");
+    }
+
+    #[test]
+    fn an_operators_caps_bound_a_single_value_and_the_store_independently() {
+        // The entry cap alone, with room to spare on the other two. A single
+        // implementation that only honoured the count would pass a test that set
+        // both, which is why they are asserted apart.
+        let store = Store::memory().unwrap();
+        let entry_only = MemoryLimits {
+            max_entry_chars: 100,
+            ..MemoryLimits::default()
+        };
+        store
+            .memory_write_with(
+                "ws",
+                "k",
+                &"x".repeat(400),
+                1,
+                1,
+                MemoryKind::Fact,
+                entry_only,
+            )
+            .unwrap();
+        let stored = store.memory_get("ws", "k").unwrap().unwrap().value;
+        assert_eq!(stored.chars().count(), 100);
+        assert!(stored.ends_with(MEMORY_TRUNCATED), "the cut is visible");
+
+        // The total cap alone, with the entry count nowhere near its limit: ten
+        // values of 200 chars is 2,000 against a 500-char store.
+        let store = Store::memory().unwrap();
+        let chars_only = MemoryLimits {
+            max_chars: 500,
+            max_entries: 10_000,
+            ..MemoryLimits::default()
+        };
+        for i in 0..10 {
+            store
+                .memory_write_with(
+                    "ws",
+                    &format!("k{i}"),
+                    &"y".repeat(200),
+                    1,
+                    1,
+                    MemoryKind::Fact,
+                    chars_only,
+                )
+                .unwrap();
+        }
+        let entries = store.memory_list("ws").unwrap();
+        let total: usize = entries.iter().map(|e| e.value.chars().count()).sum();
+        assert!(total <= 500, "{total} chars is over the operator's cap");
+        assert!(
+            entries.len() < 10,
+            "the character cap evicted while the count cap was untouched"
+        );
+    }
+
+    #[test]
+    fn ranking_eviction_candidates_seeks_the_recalls_rather_than_scanning_them() {
+        let store = Store::memory().unwrap();
+        fill_to_the_cap(&store, "ws");
+        // A recall table the size a busy workspace really reaches: sixty-four
+        // keys carried at every step of a run that ran a hundred and fifty-six
+        // steps. The whole point of the index is that the next write does not
+        // read all of it.
+        for step in 1..=156u32 {
+            let keys: Vec<String> = (0..MEMORY_MAX_ENTRIES).map(|i| format!("k{i}")).collect();
+            store.record_memory_recall(7, step, "ws", &keys).unwrap();
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let mut stmt = store
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                Store::MEMORY_CANDIDATES_SQL
+            ))
+            .unwrap();
+        let plan = stmt
+            .query_map(["ws"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" | ");
+
+        assert!(
+            plan.contains("memory_recalls_entry"),
+            "the recall aggregate must seek on memory_recalls_entry, got {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN memory_recalls"),
+            "a write must not read every recall row in the store, got {plan}"
+        );
+
+        // The control: `step` is in no index at all, so it cannot be served from
+        // one — which is what makes the assertions above about this index rather
+        // than about a planner that never scans.
+        let mut stmt = store
+            .conn
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM memory_recalls WHERE step = 3")
+            .unwrap();
+        let control = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" | ");
+        assert!(
+            !control.contains("memory_recalls_entry"),
+            "a column in no index must not be servable from one, got {control}"
+        );
     }
 
     #[test]

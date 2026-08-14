@@ -9,6 +9,54 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What a capped memory write costs (0.56.0)
+
+**What is being measured.** 0.56.0 made eviction rank candidates by the evidence
+in `memory_recalls` instead of by the write clock, and made the three caps an
+operator's numbers. Those two changes meet on the write path, so the question an
+operator raising `max_entries` actually has is what the write starts to cost.
+
+**Method.** `memory_eviction_cost` in `src/state.rs`, `#[ignore]`d because it
+prints rather than asserts — a duration asserted anywhere in this suite is a
+flake waiting to be written. A store is filled to the cap, every entry is given a
+recall row from each of twenty separate runs (the shape a busy workspace reaches,
+where a note written early has been carried by every run since), and then twenty
+further writes are timed, each of which evicts.
+
+```text
+cargo test --release --lib memory_eviction_cost -- --ignored --nocapture
+```
+
+**Measured on an Apple M1, macOS 26.5.2, release profile, 2026-08-14:**
+
+| Entries | Recall rows | ms per capped write (median of 20) |
+| --- | --- | --- |
+| 64 (the default) | 1,280 | 0.965 |
+| 512 | 10,240 | 9.042 |
+| 4,096 | 81,920 | 73.175 |
+
+**What the shape says.** The cost is linear in the number of **entries**, not in
+the size of the recall table: eight times the entries costs roughly eight to nine
+times as long, while the recall table grows by the same factor and contributes
+nothing visible. That is what `memory_recalls_entry` buys, and it is the claim
+the suite actually asserts — `ranking_eviction_candidates_seeks_the_recalls_rather_than_scanning_them`
+checks the query plan of the statement the crate runs. Without the index the cost
+would be linear in entries times rows, and the bottom row would be seconds.
+
+The operator-facing number is the last one: a store of 4,096 notes makes each
+`remember` that evicts cost about 73 ms. That is a tool call, not a turn, and it
+is paid only by writes at the cap — but it is a real reason not to raise
+`max_entries` past what a workspace needs.
+
+**One defect this measurement found.** The first run of it reported 0.069, 0.143
+and 0.068 ms — flat, and too fast. The cap comparison was
+`chars <= limits.max_chars as i64`, and the measurement set `max_chars` out of
+the way with `usize::MAX`, which wraps to `-1` in that cast: the break could never
+fire, so every write evicted the entire workspace and no store ever held more
+than two entries. Exact for the crate's own 16,000 and catastrophic for a large
+number an operator may now write. The comparison is `u128` since, and
+`a_character_cap_too_large_for_an_i64_is_a_ceiling_and_not_a_purge` is the guard.
+
 ## What the image door costs (0.55.0)
 
 **What is being measured.** 0.55.0 widened what `Media` and `view_image` accept.

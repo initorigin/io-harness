@@ -444,6 +444,16 @@ pub enum EventKind {
         /// The note's key.
         key: String,
     },
+    /// The agent withdrew something from durable cross-run memory (0.56.0).
+    ///
+    /// Its own variant rather than a flag on `MemoryWrote`: a consumer watching
+    /// what an agent believes about a workspace needs to see a retraction as a
+    /// retraction, and an eviction — which is the store holding a cap, not the
+    /// agent changing its mind — is neither.
+    MemoryForgot {
+        /// The note's key.
+        key: String,
+    },
     /// The agent wrote down its plan (0.21.0).
     ///
     /// Carries the items rather than a count, so a UI renders the plan from the
@@ -1206,6 +1216,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "child_collected",
     "fleet",
     "memory_wrote",
+    "memory_forgot",
     "todo_wrote",
     "question_asked",
     "question_answered",
@@ -1726,6 +1737,7 @@ mod tests {
                 done: 0,
             },
             EventKind::MemoryWrote { key: "k".into() },
+            EventKind::MemoryForgot { key: "k".into() },
             EventKind::Sandbox {
                 kind: "create".into(),
                 backend: Some("b".into()),
@@ -1901,6 +1913,7 @@ mod tests {
                 | EventKind::SpawnRefused { .. }
                 | EventKind::Fleet { .. }
                 | EventKind::MemoryWrote { .. }
+                | EventKind::MemoryForgot { .. }
                 | EventKind::Sandbox { .. }
                 | EventKind::Mcp { .. }
                 // The five handle events sit with `Sandbox` and `Mcp` rather than

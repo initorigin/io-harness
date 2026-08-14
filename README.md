@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.55"
+io-harness = "0.56"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -341,10 +341,13 @@ policy's: that bound is stated in full in the [web guide](docs/guide/web.md).
 
 **Context that stays relevant.** Each turn is assembled to fit a stated share of
 the token budget: superseded observations are compacted, and an observation a
-later write invalidated is re-read rather than trusted. Durable memory keyed to
-the workspace survives between runs — as a fact or a decision, pinnable so a run
-cannot overwrite a correction, with a per-run record of which entries it actually
-drew on.
+later write invalidated is re-read rather than trusted. Durable memory survives between runs
+— as a fact or a decision, pinnable so a run cannot overwrite a correction, with
+a per-run record of which entries it actually drew on. It is kept for what it is
+worth rather than for how recently it was written: at a cap the store drops the
+entry the fewest separate runs have carried, not the oldest. An agent that learns
+something wrong can `forget` it, and a fact true of every repository can be kept
+once, above the workspace, where a workspace's own note still overrides it.
 
 **Observation and replay.** Register an observer and be called as the run
 happens — steps, tool calls, approvals, refusals, spend draws, retries,

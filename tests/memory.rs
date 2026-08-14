@@ -597,3 +597,225 @@ async fn the_recall_record_names_which_entries_a_run_actually_used() {
         "a run that never happened recalled nothing"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 0.56.0 F6 — the operator's caps reach the write the model actually makes
+// ---------------------------------------------------------------------------
+
+async fn run_under(
+    root: &std::path::Path,
+    store: &Store,
+    script: Vec<Vec<ToolCall>>,
+    limits: Option<io_harness::MemoryLimits>,
+) -> i64 {
+    let mut contract = TaskContract::workspace("write some notes", root)
+        .with_max_steps(2)
+        .with_context_budget(ContextBudget {
+            max_tokens: 2_000,
+            share: 0.5,
+        });
+    if let Some(limits) = limits {
+        contract = contract.with_memory_limits(limits);
+    }
+    run_with(
+        &contract,
+        &Script(script, std::sync::atomic::AtomicUsize::new(0)),
+        store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .expect("the run itself must not error")
+    .run_id
+}
+
+/// The set run and the unset run, over the same workspace and the same script.
+/// The contract's caps have to reach the store through the tool arm, or the
+/// projection tested in `tests/config.rs` is a number nothing reads.
+#[tokio::test]
+async fn a_contracts_memory_caps_bound_what_a_run_may_remember() {
+    let notes = vec![vec![
+        remember("a", "first"),
+        remember("b", "second"),
+        remember("c", "third"),
+        remember("d", "fourth"),
+    ]];
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    run_under(
+        dir.path(),
+        &store,
+        notes.clone(),
+        Some(io_harness::MemoryLimits {
+            max_entries: 2,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let kept = store.memory_list(&ws_key(dir.path())).unwrap();
+    assert_eq!(kept.len(), 2, "the operator's cap bounds the store");
+    // The newest survive: nothing has been recalled, so the tie-break is the
+    // write clock and the two oldest are the candidates.
+    let keys: Vec<String> = kept.into_iter().map(|e| e.key).collect();
+    assert_eq!(keys, vec!["c".to_string(), "d".to_string()]);
+
+    // The control: the same four notes with nothing set are all kept, because
+    // the default cap is sixty-four.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    run_under(dir.path(), &store, notes, None).await;
+    assert_eq!(store.memory_list(&ws_key(dir.path())).unwrap().len(), 4);
+}
+
+// ---------------------------------------------------------------------------
+// 0.56.0 F9–F11 — a run can unlearn
+// ---------------------------------------------------------------------------
+
+fn forget(key: &str) -> ToolCall {
+    ToolCall {
+        name: "forget".into(),
+        arguments: json!({ "key": key }),
+    }
+}
+
+/// F9. The note is gone from the store, gone from the next turn's prompt, and
+/// the observation names it. Withdrawing a key that was never there says so
+/// rather than reporting a removal that did not happen.
+#[tokio::test]
+async fn a_run_withdraws_a_note_and_a_key_that_was_never_there_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let ws = ws_key(dir.path());
+    store.memory_put(&ws, "retries", "three", 1, 1).unwrap();
+
+    let run = run_under(
+        dir.path(),
+        &store,
+        vec![vec![forget("retries")], vec![forget("never-written")]],
+        None,
+    )
+    .await;
+
+    assert!(store.memory_get(&ws, "retries").unwrap().is_none());
+    let kinds: Vec<String> = store
+        .context_events(run)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "memory_forget").count(),
+        1,
+        "one withdrawal, and the key that was never there is not a second: {kinds:?}"
+    );
+
+    // S9's finding. Counting trace rows alone leaves the *message* unasserted,
+    // and the message is what the model acts on: reporting a removal that did
+    // not happen tells an agent it has corrected something it has not. Neither
+    // arm writes a `memory_forget` row for an absent key, so a sabotage that
+    // reported success to the model survived the assertion above.
+    let said: Vec<String> = store
+        .observations(run)
+        .unwrap()
+        .into_iter()
+        .map(|o| o.text)
+        .collect();
+    let all = said.join("\n");
+    assert!(
+        all.contains("[forget retries]"),
+        "the withdrawal names the key it took: {all}"
+    );
+    assert!(
+        all.contains("[forget: nothing to forget]"),
+        "and the key that was never there is told so, not told it was removed: {all}"
+    );
+    assert!(
+        !all.contains("[forget never-written]"),
+        "the absent answer must not wear the prefix a real removal wears, or a \
+         model skimming the head of the observation reads them as the same: {all}"
+    );
+}
+
+/// F10. A pinned entry is not a run's to withdraw, and nothing is withdrawn
+/// while a plan is unapproved. Both halves asserted on the store rather than on
+/// the message, because a refusal that says the right thing and removes the
+/// entry anyway would pass a text assertion.
+#[tokio::test]
+async fn a_pinned_note_survives_a_forget_and_the_refusal_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let ws = ws_key(dir.path());
+    store
+        .memory_write(
+            &ws,
+            "owner",
+            "the platform team",
+            1,
+            1,
+            MemoryKind::Decision,
+        )
+        .unwrap();
+    assert!(store.memory_pin(&ws, "owner", true).unwrap());
+
+    let run = run_under(dir.path(), &store, vec![vec![forget("owner")]], None).await;
+
+    let entry = store.memory_get(&ws, "owner").unwrap().unwrap();
+    assert_eq!(entry.value, "the platform team");
+    assert_eq!(entry.kind, MemoryKind::Decision);
+    assert!(entry.pinned);
+
+    let kinds: Vec<String> = store
+        .context_events(run)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k == "memory_refused"),
+        "the refusal is in the trace: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "memory_forget"),
+        "and a withdrawal that did not happen is not recorded as one: {kinds:?}"
+    );
+}
+
+/// F11, half one. A rewind puts back what a forget took. `memory_restore` had
+/// been an `UPDATE` since 0.36.0, which restores an entry a run *edited* and
+/// silently does nothing for one a run *removed*.
+#[test]
+fn a_rewind_puts_back_the_note_a_forget_took() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("runs.db")).unwrap();
+    let ws = ws_key(dir.path());
+    let first = store.start_run("learn it", &ws).unwrap();
+    store
+        .memory_write(&ws, "retries", "three", first, 1, MemoryKind::Decision)
+        .unwrap();
+
+    // A LATER run withdraws it, so the restore point says "there was a value
+    // here" rather than "this run created it".
+    let second = store.start_run("unlearn it", &ws).unwrap();
+    assert_eq!(
+        store.memory_forget(&ws, "retries", second, 3).unwrap(),
+        io_harness::MemoryForget::Removed
+    );
+    assert!(store.memory_get(&ws, "retries").unwrap().is_none());
+
+    let workspace = io_harness::tools::Workspace::new(dir.path());
+    let done = io_harness::rewind_run(&workspace, &store, second).unwrap();
+    assert_eq!(done.memory_restored, ["retries"]);
+
+    let back = store
+        .memory_get(&ws, "retries")
+        .unwrap()
+        .expect("the withdrawal is undone by the mechanism every other write uses");
+    assert_eq!(back.value, "three");
+    assert_eq!(
+        back.kind,
+        MemoryKind::Decision,
+        "and its kind came back too"
+    );
+    assert!(!back.pinned, "a pinned entry could not have been forgotten");
+}
