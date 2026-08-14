@@ -812,10 +812,7 @@ mod tests {
             ),
             (
                 "split mid-multi-byte character",
-                vec![
-                    "{\"pattern\":\"caf\u{00e9}",
-                    "\u{2014}bar\"}",
-                ],
+                vec!["{\"pattern\":\"caf\u{00e9}", "\u{2014}bar\"}"],
                 json!({"pattern": "café—bar"}),
             ),
         ] {

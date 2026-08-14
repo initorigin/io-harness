@@ -20,11 +20,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
-use io_harness::tools::{Tool, ToolEffect, ToolFuture, Toolbox};
 use io_harness::approve::DecisionFuture;
 use io_harness::policy::{Act, Effect};
 use io_harness::provider::Fallback;
+use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
+use io_harness::tools::{Tool, ToolEffect, ToolFuture, Toolbox};
 use io_harness::{
     ApproveAll, Approver, Decision, Error, EventKind, Flow, Observer, Policy, Provider,
     ProviderErrorKind, Request, RetryPolicy, RunEvent, Session, Store, TaskContract, ToolSpec,
@@ -326,7 +326,8 @@ impl Observer for Listener {
                     .push((*started, *used, *discarded));
             }
             other => {
-                let tag = serde_json::to_value(RunEvent::new(1, 1, other.clone())).unwrap()["event"]
+                let tag = serde_json::to_value(RunEvent::new(1, 1, other.clone())).unwrap()
+                    ["event"]
                     .as_str()
                     .unwrap()
                     .to_string();
@@ -557,7 +558,11 @@ async fn speculation_stops_at_the_first_call_that_is_not_read_only() {
         .filter(|o| o.text.contains("[read a.txt]"))
         .map(|o| o.text)
         .collect();
-    assert_eq!(reads.len(), 2, "both reads should have produced an observation");
+    assert_eq!(
+        reads.len(),
+        2,
+        "both reads should have produced an observation"
+    );
     assert!(
         reads[0].contains("ALPHA"),
         "the first read happens before the write: {}",
@@ -674,7 +679,10 @@ async fn a_settled_call_with_a_different_name_or_a_shorter_completion_discards_i
             .counts()
             .unwrap_or_else(|| panic!("{label}: something should have been speculated"));
         assert_eq!(used, 0, "{label}: nothing speculated may be used");
-        assert!(discarded > 0, "{label}: the speculation should be discarded");
+        assert!(
+            discarded > 0,
+            "{label}: the speculation should be discarded"
+        );
 
         let all = store
             .observations(turn.run_id)
@@ -940,7 +948,12 @@ async fn a_provider_without_the_new_method_speculates_nothing() {
         "the trait default reported a call, so speculation reached a provider that never opted in"
     );
     assert!(
-        !listener.kinds.lock().unwrap().iter().any(|k| k == "speculated"),
+        !listener
+            .kinds
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|k| k == "speculated"),
         "no Speculated event may appear for a provider that reports no calls"
     );
     // The reads still happened, through the ordinary path.

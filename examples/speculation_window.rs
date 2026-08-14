@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::{Tool, ToolEffect, ToolFuture, Toolbox};
 use io_harness::{
-    ApproveAll, EventKind, Flow, Observer, Policy, Provider, RunEvent, Session, Store, TaskContract,
-    ToolSpec,
+    ApproveAll, EventKind, Flow, Observer, Policy, Provider, RunEvent, Session, Store,
+    TaskContract, ToolSpec,
 };
 use serde_json::json;
 
@@ -231,7 +231,9 @@ async fn main() {
     println!("  turn, cap of 1           : {without:?}   speculated: {none:?}");
     match without.checked_sub(with) {
         Some(saved) => println!("  saved                    : {saved:?}"),
-        None => println!("  saved                    : none — the window was shorter than the read"),
+        None => {
+            println!("  saved                    : none — the window was shorter than the read")
+        }
     }
     println!();
     println!("Read it as a shape, not a benchmark: what is saved is bounded above by");

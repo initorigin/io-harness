@@ -883,7 +883,10 @@ mod tests {
         acc.ingest(&json!({"type":"content_block_start","index":1,
             "content_block":{"type":"tool_use","name":"read_file"}}));
         acc.announce(&sink);
-        assert!(seen.lock().unwrap().is_empty(), "reported before any arguments");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "reported before any arguments"
+        );
 
         // The argument value carries a brace of its own, so a scan for the first
         // `}` would cut here and report truncated arguments. Only a parse gets
@@ -903,7 +906,10 @@ mod tests {
 
         let reported = seen.lock().unwrap().clone();
         assert_eq!(reported.len(), 1, "a call must be reported exactly once");
-        assert_eq!(reported[0].0, 0, "the text block must not occupy a position");
+        assert_eq!(
+            reported[0].0, 0,
+            "the text block must not occupy a position"
+        );
         assert_eq!(reported[0].1.name, "read_file");
         assert_eq!(reported[0].1.arguments, json!({"path": "src/a{b}c.rs"}));
         assert_eq!(acc.finish().tool_calls[0], reported[0].1);

@@ -4307,8 +4307,7 @@ async fn run_from<P: Provider>(
             provider, &request, contract, store, run_id, step, watch, 0, false,
             // The single-file loop has no ledger to fold, so an over-window
             // request there is terminal exactly as it was on 0.42.0.
-            false,
-            // Never streamed, so there is no stream to speculate off.
+            false, // Never streamed, so there is no stream to speculate off.
             None,
         )
         .await?;
@@ -13133,8 +13132,7 @@ async fn compact_ledger<P: Provider>(
                 // A summarising request cannot itself be answered by compacting:
                 // it is what compacting *is*, and a recursion here would be a fold
                 // trying to fold its own prompt.
-                false,
-                // No tools in the request at all, so nothing could be speculated.
+                false, // No tools in the request at all, so nothing could be speculated.
                 None,
             )
             .await?;

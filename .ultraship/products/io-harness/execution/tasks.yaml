@@ -8,7 +8,7 @@ tasks:
     finished `CompletionResponse` today, because `complete_streaming`''s sink is `&(dyn Fn(&str) + Send
     + Sync)`. The default has to be silence, or every out-of-tree `Provider`, `Record` and `Replay` changes
     behaviour without being recompiled.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F10 — the completeness edge is a parse, and it is right on the cases that break a guess.** Four
@@ -37,13 +37,26 @@ tasks:
   - src/provider/openrouter.rs
   - src/provider/compatible.rs
   - tests/speculative_reads.rs
-  evidence: []
+  evidence:
+  - '`Provider::complete_streaming_calls` added as a third DEFAULTED method (`src/provider/mod.rs`), default
+    reports no call and delegates to `complete_streaming`. `Record` and `Replay` override neither streaming
+    method, so a replayed run speculates nothing by construction — proved by `a_provider_without_the_new_method_speculates_nothing`.'
+  - 'The completeness edge is one rule for both wires: `ready_call` parses the joined fragments and requires
+    a JSON *object*. `announce_ready` reports strictly in position order, never past a gap, and counts
+    only the calls `finish` will keep (both accumulators drop unnamed entries).'
+  - '4 unit tests over synthetic SSE, 2 per wire. F10''s four argument shapes covered: a brace inside
+    a string, a nested object, fragments split mid-multi-byte character, and an empty-argument call (never
+    reported — it cannot parse, and `finish` still maps it to `{}`).'
+  - 'FINDING: the Anthropic arm originally used arguments with no interior brace, so sabotage S8 (scan
+    for the first `}`) killed only the OpenAI-wire test. The Anthropic case was changed to carry a brace
+    inside a string value; S8 re-run then killed BOTH arms.'
+  - '`cargo tree` unchanged — the whole task is `serde_json` and `tokio`, both already present.'
 - id: US-IO-HARNESS-0.54.0-T02
   summary: Start the completion's leading read-only run from `stream_completion`, bounded by `max_parallel_reads`
     and by the `Policy` allowing the call outright.
   why_required: This is the release's outcome. The prefix rule and the outright-allow rule are the two
     halves of its safety argument, and both are decided here rather than at the fold.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.54.0-T01
   acceptance_criteria:
@@ -88,7 +101,20 @@ tasks:
   files:
   - src/run.rs
   - tests/speculative_reads.rs
-  evidence: []
+  evidence:
+  - '`Speculation` (`src/run.rs`) starts the completion''s LEADING read-only run from `stream_completion`,
+    spawning the same `ReadWork` futures 0.41.0 built, bounded by the same `max_parallel_reads`.'
+  - 'F1 proved without a clock: the provider and the tool wait on a shared barrier, so the turn completes
+    only if the tool was started while the stream was open. F9 is its negative control — at a cap of 1
+    the same turn cannot finish.'
+  - '`policy_verdict` was HOISTED out of `gate` rather than copied, so the speculative pre-test and the
+    serial gate are literally the same expression. Two copies would have been two boundaries and the speculative
+    one would have been the copy that drifted.'
+  - 'F6: the approver is consulted exactly once and only after the completion returned; the grey-tier
+    call is not speculated while its permitted sibling is. F7: a denied call''s tool counter is 0, asserted
+    on the tool rather than on the refusal text.'
+  - Sabotages S1 (never speculate), S2 (maximal-run rule), S5 (Ask is good enough), S6 (no policy pre-test)
+    each compiled and each was killed by a named test.
 - id: US-IO-HARNESS-0.54.0-T03
   summary: Use a speculated result only when the settled completion asks for that call, at that index,
     with the same name and byte-identical arguments; discard everything otherwise, including across a
@@ -97,7 +123,7 @@ tasks:
     one outcome from which a model reasons forward from a state that never existed. A discard must also
     leave no observation, no `PolicyEvent` and no ledger draw, or the trace stops matching the serial
     trace.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.54.0-T02
   acceptance_criteria:
@@ -139,14 +165,24 @@ tasks:
   - src/run.rs
   - src/provider/fallback.rs
   - tests/speculative_reads.rs
-  evidence: []
+  evidence:
+  - A speculated result is used only when the settled completion carries the same call, name and byte-identical
+    arguments, at the same position — and what survives is kept as a CONTIGUOUS PREFIX, so the batch that
+    forms for the first unspeculated call cannot overlap a later speculated one.
+  - 'F5 asserts the observation carries the settled file''s bytes and NOT the speculated file''s; second
+    arm covers a differing name and a completion shorter than what was streamed. F4: the tool really ran
+    4 times across a retry while the run recorded 2 observations. F11: a Fallback failover folds nothing
+    the primary speculated.'
+  - Sabotage S4 (key by index alone) killed exactly the three discard tests — the defect this task exists
+    to prevent.
+  - Sabotage S7 (no reset between attempts) killed F4 alone.
 - id: US-IO-HARNESS-0.54.0-T04
   summary: Emit `EventKind::Speculated { started, used, discarded }` once per step that speculated, and
     prove a provider without the new method is 0.53.0's run byte for byte.
   why_required: 'A discard is wasted work, and an operator who cannot see the rate cannot tell a provider
     that streams well from one that does not. The negative control is the other half: the compatibility
     claim rests on a replayed run emitting nothing at all.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.54.0-T03
   acceptance_criteria:
@@ -172,14 +208,25 @@ tasks:
   - src/observe.rs
   - tests/speculative_reads.rs
   - tests/session_streaming.rs
-  evidence: []
+  evidence:
+  - '`EventKind::Speculated { started, used, discarded }`, emitted once per step that started something,
+    registered in `EVENT_NAMES`, the census sample and the exhaustiveness guard.'
+  - 'Emitted as soon as the counts are final rather than beside the step''s commit: a completion that
+    stops on text ends the run BEFORE the fold, and its reads were still done. Found because F5''s shorter-completion
+    arm reported no event at all.'
+  - 'F3 compares a speculating run against a non-speculating one AT THE SAME CAP: identical step rows,
+    observations and ordered ToolCall events, with `Speculated` the only permitted difference. Sabotage
+    S3 (drop the announce for a speculated call) killed F3 alone.'
+  - 'FINDING: the first F3 control compared cap 10 against cap 1 and failed — `dispatch` emits an `EventKind::Contained`
+    per call where 0.41.0''s `read_batch` does not. That is a PRE-EXISTING discrepancy in 0.41.0''s "an
+    observer cannot tell whether a batch ran concurrently", not something this release caused.'
 - id: US-IO-HARNESS-0.54.0-T05
   summary: Amend `docs/CONTRACT.md`'s streamed-delta rule and 0.41.0 concurrency section, and update every
     other checked-in doc surface in this release.
   why_required: '`docs/CONTRACT.md:1961-1965` currently says a streamed delta is not safe to act on. This
     release acts on one. Shipping the change and leaving that sentence standing would publish a documented
     lie.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.54.0-T04
   acceptance_criteria:
@@ -216,7 +263,21 @@ tasks:
   - README.md
   - CHANGELOG.md
   - src/lib.rs
-  evidence: []
+  evidence:
+  - '`docs/CONTRACT.md:1961` amended: the streamed-delta rule stays true for text and for a consumer,
+    and now carries the one exception the harness takes, with its three bounds. A new section states the
+    rules, the switch and where they do not apply.'
+  - '`docs/MEASUREMENTS.md` CREATED — it had never existed although 0.53.0''s contract already named it.
+    Carries N5 with the machine named and states that nothing in it is a gate.'
+  - '`examples/speculation_window.rs` measured on an Apple M1 / macOS 26.5.2, release profile: a 400ms
+    window absorbed a 300ms read entirely — 416.8ms with speculation (`Speculated { started: 1, used:
+    1, discarded: 0 }`) against 720.6ms at a cap of 1. Saved 303.8ms.'
+  - 'FINDING: the example''s first result showed NO saving, because `Session::turn_bounded` passes `TurnExtras::default()`
+    — only the `_observed` and `_steered` turns stream, and speculation follows streaming. Now stated
+    in CONTRACT.md, the providers guide and the example.'
+  - README, `src/lib.rs`, `docs/CAPABILITIES.md`, the two guide pages and `CHANGELOG.md` agree. `docs_drift`,
+    `readme`, `guide_pages`, `changelog` and `public_api` all pass; `docs/public-api.txt` is UNCHANGED,
+    which is the +0 lines N2 predicted in advance.
 - id: US-IO-HARNESS-0.54.0-T06
   summary: 'Run the release''s gate set: the three-platform matrix, the clock-free audit, the nightly
     rustdoc gate, the cross-version store gate, and record N5''s measurement.'
