@@ -2406,7 +2406,11 @@ fn a_project_scoped_file_may_lower_the_read_ceiling_and_may_not_raise_it() {
     let project = tempfile::tempdir().unwrap();
     let _guard = env(user_dir.path());
 
-    write(user_dir.path(), "io.toml", "[run]\nmax_read_chars = 50000\n");
+    write(
+        user_dir.path(),
+        "io.toml",
+        "[run]\nmax_read_chars = 50000\n",
+    );
 
     // Narrowing: the cloned repository knows its files are small and says so.
     write(project.path(), "io.toml", "[run]\nmax_read_chars = 8000\n");
@@ -2440,7 +2444,11 @@ fn a_project_scoped_file_may_lower_the_read_ceiling_and_may_not_raise_it() {
     // Control: the operator's own local file is not held to that rule, because
     // it is the operator's file — the same distinction the four boundary keys
     // already draw.
-    write(project.path(), "io.local.toml", "[run]\nmax_read_chars = 900000\n");
+    write(
+        project.path(),
+        "io.local.toml",
+        "[run]\nmax_read_chars = 900000\n",
+    );
     let local = Config::discover(project.path()).unwrap();
     assert_eq!(
         local

@@ -266,8 +266,15 @@ fn an_image_is_routed_to_the_tool_that_can_look_at_it() {
         FileContent::Image { format } => assert_eq!(format, "a PNG image"),
         other => panic!("an image classified as {other:?}"),
     }
-    let why = ws.read_typed("logo.png").unwrap().refusal("logo.png").unwrap();
-    assert!(why.contains("logo.png") && why.contains("a PNG image"), "{why}");
+    let why = ws
+        .read_typed("logo.png")
+        .unwrap()
+        .refusal("logo.png")
+        .unwrap();
+    assert!(
+        why.contains("logo.png") && why.contains("a PNG image"),
+        "{why}"
+    );
     // Whether `view_image` is compiled in decides which sentence, and both name
     // the tool or say plainly that this build has no image support.
     if cfg!(feature = "media") {

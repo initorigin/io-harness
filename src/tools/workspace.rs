@@ -181,7 +181,9 @@ impl FileContent {
                     _ => cfg!(feature = "pdf"),
                 };
                 Some(if compiled {
-                    format!("{rel} is {format}, so nothing was decoded — `{tool}` is what reads one")
+                    format!(
+                        "{rel} is {format}, so nothing was decoded — `{tool}` is what reads one"
+                    )
                 } else {
                     format!(
                         "{rel} is {format}, so nothing was decoded; `{tool}` reads one and is \
@@ -255,7 +257,7 @@ fn sniff_binary(bytes: &[u8]) -> &'static str {
 /// removed. `None` for an odd byte count or an unpaired surrogate, both of which
 /// mean the mark was a coincidence rather than a declaration.
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> Option<String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let units: Vec<u16> = bytes

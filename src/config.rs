@@ -695,12 +695,7 @@ impl Config {
                 },
                 &mut origins,
             );
-            merge(
-                &mut merged,
-                table,
-                &mut Vec::new(),
-                scope == Scope::Project,
-            );
+            merge(&mut merged, table, &mut Vec::new(), scope == Scope::Project);
             sources.push((scope, path));
         }
 

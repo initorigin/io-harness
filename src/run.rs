@@ -9089,7 +9089,11 @@ fn line_slice(
     }
     // A trailing newline terminates the last line rather than starting an empty
     // one, so `a\nb\n` is two lines and an operator counting in an editor agrees.
-    let lines: Vec<&str> = text.strip_suffix('\n').unwrap_or(text).split('\n').collect();
+    let lines: Vec<&str> = text
+        .strip_suffix('\n')
+        .unwrap_or(text)
+        .split('\n')
+        .collect();
     let total = lines.len();
     let first = offset.unwrap_or(1).max(1) as usize;
     if first > total {
@@ -9126,7 +9130,9 @@ fn over_ceiling(
     let suggestion = if offset.is_some() {
         "ask for fewer lines".to_string()
     } else {
-        format!("read a range instead — `{{\"path\": \"{target}\", \"offset\": 1, \"limit\": 200}}`")
+        format!(
+            "read a range instead — `{{\"path\": \"{target}\", \"offset\": 1, \"limit\": 200}}`"
+        )
     };
     // The operator's ceiling is reported whenever it is the one that bit, which
     // includes the case where both would have: a number somebody set is the one
@@ -9396,6 +9402,7 @@ struct Speculation<'a> {
 }
 
 impl<'a> Speculation<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ws: Workspace,
         tools: &'a Toolbox,
