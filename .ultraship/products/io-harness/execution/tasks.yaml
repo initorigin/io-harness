@@ -136,7 +136,7 @@ tasks:
     and serving the model a fragment then is the same lie the truncation was. The negative half — grep,
     find and exec still bounded — is what keeps the change from becoming a general rule that hides a command's
     output.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.55.0-T03
   acceptance_criteria:
@@ -151,8 +151,24 @@ tasks:
   files:
   - src/context.rs
   - tests/context.rs
-  - tests/compaction.rs
-  evidence: []
+  evidence:
+  - 'F12: `cargo test --test context` — 23 passed, 1 failed, and the failure is `an_mcp_result_is_bounded_where_it_enters_the_context`,
+    which panics with `fixture server not built ... cargo test builds examples` — an invocation artefact
+    of `--test context`, not a regression. `a_read_that_no_longer_fits_is_a_stub_and_not_a_tail` asserts
+    all three sentinels absent and the stub naming the file and `offset`.'
+  - 'Negative half: `a_search_and_a_command_are_still_bounded_rather_than_refused` — `Grep` and `Tool`
+    keep the head plus the `truncated` marker.'
+  - Assembly already replaced a non-fitting entry with a stub; the fragment came from two other places.
+    `refresh` (`src/context.rs`) bounded a re-read to its tail under a header saying the file had been
+    re-read — it now returns a stub reason naming the size and the range remedy. And the stub text for
+    `ObsKind::Read` now says to re-read with `offset`/`limit` instead of `re-run`, because only a read
+    has a range to ask for.
+  - 'Two pre-existing tests asserted the old behaviour and changed meaning rather than wording: `every_observation_kind_is_bounded_where_it_enters_the_context`
+    now asserts the read is refused whole (the other five kinds are unchanged and are the control), and
+    `a_sub_agent_loops_prompt_stays_inside_the_ceiling` uses files that fit a single read, since a file
+    no read could carry is F9''s claim rather than that test''s.'
+  - Document reads (`xlsx_read`, `pdf_read`, ...) are still bounded with the tail rule; they were not
+    in the release's included scope and are recorded as a known limitation.
 - id: US-IO-HARNESS-0.55.0-T05
   summary: 'Add the wide door for images: a `Media` constructor that passes the four wire types through
     byte-identically and decodes BMP, TIFF, ICO, TGA and PNM to PNG, with `image` moved under the `media`
