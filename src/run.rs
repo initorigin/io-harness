@@ -4308,6 +4308,8 @@ async fn run_from<P: Provider>(
             // The single-file loop has no ledger to fold, so an over-window
             // request there is terminal exactly as it was on 0.42.0.
             false,
+            // Never streamed, so there is no stream to speculate off.
+            None,
         )
         .await?;
 
@@ -4754,6 +4756,31 @@ async fn run_workspace_from<P: Provider>(
         // made to fit escalates rather than looping.
         let mut fold_tokens = 0;
         let mut recovered = false;
+        // 0.54.0 — read-only calls started off this step's stream. Declared out
+        // here rather than inside the loop so a compaction retry keeps the
+        // counters: the reads the abandoned attempt did were still done, and a
+        // discard rate that forgot them would flatter the feature.
+        //
+        // `max_parallel_reads > 1` is the whole switch, deliberately: the setting
+        // that turns 0.41.0's overlapping off turns starting early off with it,
+        // so `with_max_parallel_reads(1)` is one escape hatch rather than two.
+        let mut spec = (contract.max_parallel_reads > 1
+            && extras.stream
+            // A tool hook can refuse a call outright and runs serially. Asking it
+            // early would hand it a call that may never settle — the same
+            // objection that keeps an approver out — so a run with hooks
+            // configured does not speculate at all.
+            && contract.tool_hooks.is_none())
+        .then(|| {
+            Speculation::new(
+                ws.clone(),
+                &contract.tools,
+                entry_cap,
+                contract.max_parallel_reads,
+                run_id,
+                step,
+            )
+        });
         let (response, assembled, user) = loop {
             fold_tokens += compact_ledger(
                 provider,
@@ -4849,6 +4876,7 @@ async fn run_workspace_from<P: Provider>(
                 0,
                 extras.stream,
                 !recovered && contract.compaction.enabled(),
+                spec.as_mut(),
             )
             .await
             {
@@ -4974,6 +5002,32 @@ async fn run_workspace_from<P: Provider>(
         // on **from this same completion**, so the run's first step is the call
         // that was already paid for and nothing is asked twice.
         //
+        // 0.54.0 — what starting early bought this step and what it cost, emitted
+        // as soon as the completion has settled and the counts are final.
+        //
+        // Here rather than beside the step's commit because a step does not always
+        // reach its commit: the classification just below ends the run on a
+        // completion that stopped on text, and the reads that completion caused
+        // were still done. An event that appeared only on the paths that finished
+        // would under-report exactly the discards worth seeing.
+        //
+        // Only when something was started, so a step that speculated nothing — and
+        // every run whose provider does not report finished calls — leaves the
+        // event stream exactly as 0.53.0 left it.
+        if let Some((started, used, discarded)) = spec.as_ref().map(|s| s.counts()) {
+            if started > 0 {
+                watch.emit(RunEvent::new(
+                    run_id,
+                    step,
+                    EventKind::Speculated {
+                        started,
+                        used,
+                        discarded,
+                    },
+                ));
+            }
+        }
+
         // Only the first completion. A later one that stops on text is the loop
         // finishing a run, which is what it has always been and is left alone
         // below.
@@ -5025,6 +5079,11 @@ async fn run_workspace_from<P: Provider>(
             if batched.is_empty()
                 && contract.max_parallel_reads > 1
                 && effects[at] == ToolEffect::ReadOnly
+                // 0.54.0 — a call already run off the stream is not batched
+                // again. What survives speculation is a contiguous run from
+                // position zero, so the first call without a result is where
+                // batching starts and the two never overlap.
+                && spec.as_ref().is_none_or(|s| !s.has(at))
             {
                 let end = at
                     + effects[at..]
@@ -5051,9 +5110,19 @@ async fn run_workspace_from<P: Provider>(
                 }
             }
             let call = &response.tool_calls[at];
+            let position = at;
             at += 1;
             calls_json.push(format!("{}:{}", call.name, call.arguments));
-            let dispatched = match batched.pop_front() {
+            // 0.54.0 — a call whose read already happened, off the stream. The
+            // work is the only thing that moved: the announcement is made here,
+            // in call order, at exactly the point `read_batch` makes it, so an
+            // observer sees the same events in the same order whether the read
+            // started early or not.
+            let speculated = spec.as_mut().and_then(|s| s.take(position));
+            if speculated.is_some() {
+                announce(watch, run_id, step, 0, call);
+            }
+            let dispatched = match speculated.or_else(|| batched.pop_front()) {
                 Some(done) => done,
                 None => {
                     dispatch(
@@ -7062,6 +7131,10 @@ where
                         // not shown.
                         extras.stream,
                         !recovered && contract.compaction.enabled(),
+                        // 0.54.0 — the tree loop dispatches serially and never
+                        // took 0.41.0's batch path either. Widening it is its own
+                        // release, not a side effect of this one.
+                        None,
                     ),
                 )
                 .await
@@ -9066,6 +9139,227 @@ impl ReadWork {
                 }
             },
         }
+    }
+}
+
+/// 0.54.0 — the work a read-only call would do, if it can be started before the
+/// completion carrying it has settled.
+///
+/// `None` for every call that needs a decision this function is not allowed to
+/// make, and each of those is a refusal to *speculate* rather than a refusal to
+/// run: the call still runs, in order, through the serial path, exactly as it
+/// did on 0.53.0.
+///
+/// The policy must allow the call **outright**. An `Ask` verdict is never
+/// speculated, which is what keeps every approver question inside a completion
+/// that settled — asking a human about a turn the model may still abandon is a
+/// question nobody can answer honestly, and it would put 0.41.0's
+/// collapse-on-pause rule somewhere other than where the model asked for it.
+///
+/// `remember` is empty because an outright allow carries no remembered rule,
+/// which is exactly what [`gate`] returns on [`Effect::Allow`]. A call that is
+/// deferred and then approved *can* carry one, and that call is not speculated.
+fn speculable(ws: &Workspace, call: &ToolCall, custom: &Toolbox) -> Option<ReadWork> {
+    let a = &call.arguments;
+    let s = |k: &str| a.get(k).and_then(|v| v.as_str());
+    let allowed = |act: Act, target: &str| policy_verdict(ws, act, target).effect == Effect::Allow;
+    match call.name.as_str() {
+        // Neither search is gated at all — 0.3.0's decision, which `prepare_read`
+        // states — so there is no verdict here to be short of an allow.
+        GREP_TOOL => Some(ReadWork::Grep {
+            pattern: s("pattern").unwrap_or_default().to_string(),
+            path_glob: s("path_glob").map(str::to_string),
+        }),
+        FIND_TOOL => Some(ReadWork::Find {
+            glob: s("name_glob")
+                .or_else(|| s("glob"))
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        READ_FILE_TOOL => {
+            let path = s("path").unwrap_or_default();
+            allowed(Act::Read, path).then(|| ReadWork::Read {
+                target: path.to_string(),
+                remember: Vec::new(),
+            })
+        }
+        name => {
+            let tool = custom.get(name)?;
+            allowed(Act::Exec, name).then(|| ReadWork::Custom {
+                name: name.to_string(),
+                tool: std::sync::Arc::clone(tool),
+                arguments: call.arguments.clone(),
+                remember: Vec::new(),
+            })
+        }
+    }
+}
+
+/// 0.54.0 — read-only calls started off the provider's stream and held until the
+/// completion carrying them settles.
+///
+/// **Nothing observable happens here.** No event is emitted, no row is written,
+/// no approver is consulted and no ledger is drawn. All of that stays in the
+/// serial fold, in the order the model asked, after the completion returned —
+/// which is what lets this release claim the trace and the replay are identical
+/// either way, structurally rather than by inspection. The only thing that moves
+/// is when [`ReadWork::run`] starts.
+struct Speculation<'a> {
+    /// Owned, not borrowed: a step may rebuild its `Workspace` when an approver
+    /// remembers a rule, and speculation must not pin the one it started with.
+    /// The clone is the same one `read_batch` already makes per spawned task.
+    ws: Workspace,
+    tools: &'a Toolbox,
+    cap: usize,
+    max_parallel: usize,
+    run_id: i64,
+    step: u32,
+    /// The calls started for this attempt, in position order.
+    started: Vec<(usize, ToolCall)>,
+    set: tokio::task::JoinSet<(usize, Dispatched)>,
+    /// Set by the first call this run will not speculate, after which nothing is
+    /// speculated for the rest of the completion. The rule is the completion's
+    /// **leading** run of read-only calls, deliberately narrower than the maximal
+    /// run 0.41.0 batches: a read started after an unstarted write would answer
+    /// from before the write, which is a wrong value rather than a wrong order.
+    closed: bool,
+    /// What survived [`settle`](Speculation::settle), keyed by position.
+    done: std::collections::HashMap<usize, Dispatched>,
+    /// Across every attempt of this step, so a retry's wasted work is counted
+    /// rather than forgotten — the discard rate is the number an operator needs.
+    started_total: usize,
+    used_total: usize,
+}
+
+impl<'a> Speculation<'a> {
+    fn new(
+        ws: Workspace,
+        tools: &'a Toolbox,
+        cap: usize,
+        max_parallel: usize,
+        run_id: i64,
+        step: u32,
+    ) -> Self {
+        Self {
+            ws,
+            tools,
+            cap,
+            max_parallel,
+            run_id,
+            step,
+            started: Vec::new(),
+            set: tokio::task::JoinSet::new(),
+            closed: false,
+            done: std::collections::HashMap::new(),
+            started_total: 0,
+            used_total: 0,
+        }
+    }
+
+    /// Begin a fresh attempt, dropping everything the previous one started.
+    ///
+    /// A completion that failed is not the completion the next attempt will
+    /// return, so nothing speculated against it may be carried across. Replacing
+    /// the [`JoinSet`](tokio::task::JoinSet) aborts its children as it drops it,
+    /// which is the same guarantee `read_batch` relies on.
+    fn reset(&mut self) {
+        self.set = tokio::task::JoinSet::new();
+        self.started.clear();
+        self.done.clear();
+        self.closed = false;
+    }
+
+    /// Offer the call the provider has finished streaming at position `at`.
+    fn offer(&mut self, at: usize, call: &ToolCall) {
+        if self.closed {
+            return;
+        }
+        // Strictly the leading run and strictly in order: a report that skips a
+        // position closes speculation rather than guessing what fills the gap,
+        // and a cap already full closes it rather than queueing work whose whole
+        // value was starting early.
+        if at != self.started.len()
+            || self.started.len() >= self.max_parallel
+            || tool_effect(&call.name, self.tools) != ToolEffect::ReadOnly
+        {
+            self.closed = true;
+            return;
+        }
+        let Some(work) = speculable(&self.ws, call, self.tools) else {
+            self.closed = true;
+            return;
+        };
+        let ws = self.ws.clone();
+        let (cap, run_id, step) = (self.cap, self.run_id, self.step);
+        self.set
+            .spawn(async move { (at, work.run(&ws, cap, run_id, step).await) });
+        self.started.push((at, call.clone()));
+        self.started_total += 1;
+    }
+
+    /// Collect what was started, and keep only what the settled completion asked
+    /// for.
+    ///
+    /// The match is on the whole call at that position — same name, same
+    /// arguments — and not on the position alone. A model that streamed one path
+    /// and settled on another would otherwise have a different file's bytes
+    /// folded under its call, and nothing downstream could tell: the observation
+    /// has the shape of a successful read either way.
+    async fn settle(&mut self, response: &CompletionResponse) -> Result<()> {
+        while let Some(joined) = self.set.join_next().await {
+            match joined {
+                Ok((at, done)) => {
+                    self.done.insert(at, done);
+                }
+                // As `read_batch`: a tool that panics panicked before this
+                // release too, and the run died with it.
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => {
+                    return Err(Error::Config(format!(
+                        "a speculated read-only tool call was cancelled: {e}"
+                    )))
+                }
+            }
+        }
+        // Kept as a PREFIX, not as a set. The first call the settled completion
+        // disagrees with ends it, and everything after that is discarded even
+        // where it happens to match — because what survives here has to be a
+        // contiguous run from position zero for the fold to stay simple: the
+        // batch that forms for the first unspeculated call must not overlap a
+        // later speculated one, or one call's result is folded under another's.
+        let settled = &response.tool_calls;
+        let mut keep = std::collections::HashMap::new();
+        for (at, call) in &self.started {
+            if settled.get(*at) != Some(call) {
+                break;
+            }
+            match self.done.remove(at) {
+                Some(done) => keep.insert(*at, done),
+                None => break,
+            };
+        }
+        self.done = keep;
+        self.used_total += self.done.len();
+        Ok(())
+    }
+
+    /// Whether the call at `at` already has a result waiting.
+    fn has(&self, at: usize) -> bool {
+        self.done.contains_key(&at)
+    }
+
+    /// The result already computed for the call at `at`, if there is one.
+    fn take(&mut self, at: usize) -> Option<Dispatched> {
+        self.done.remove(&at)
+    }
+
+    /// Started, used, discarded — across every attempt of this step.
+    fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.started_total,
+            self.used_total,
+            self.started_total - self.used_total,
+        )
     }
 }
 
@@ -12374,6 +12668,35 @@ fn approval_context(goal: &str, verdict: &crate::policy::Verdict) -> ApprovalCon
 }
 
 #[allow(clippy::too_many_arguments)]
+/// What the policy says about one act on one target, and nothing else.
+///
+/// Read and write targets are workspace paths, and are resolved so a symlink
+/// cannot smuggle one outside the root. Exec and net targets are *names* — a
+/// binary, an MCP tool, a registered tool, a host — and must not be resolved
+/// against the root, or a file that happens to share a tool's name would change
+/// what the policy said about calling it.
+///
+/// An ABSOLUTE read/write target is not a workspace path at all — a skill file
+/// normally lives outside the root — so it is decided by the policy directly.
+/// `check_path` would resolve it against the root and deny it unconditionally,
+/// which would make `read_skill` refusable only by accident. This relaxes what
+/// the *gate* says, not what the workspace does: `Workspace::resolve` rejects
+/// absolute paths outright and both `read_file` and `write_file` go through it,
+/// so an absolute path still cannot leave the root (asserted in tests/skills.rs).
+///
+/// **A free function rather than a closure inside [`gate`] since 0.54.0**, because
+/// speculation asks this same question without answering it — a call the policy
+/// does not allow outright is never started early. Two copies of this expression
+/// would be two boundaries, and the speculative one would be the copy nobody
+/// noticed drifting wider.
+fn policy_verdict(ws: &Workspace, act: Act, target: &str) -> crate::policy::Verdict {
+    match act {
+        Act::Exec | Act::Net => ws.policy().check(act, target),
+        Act::Read | Act::Write if Path::new(target).is_absolute() => ws.policy().check(act, target),
+        Act::Read | Act::Write => ws.check_path(act, target),
+    }
+}
+
 async fn gate(
     ws: &Workspace,
     approver: &dyn Approver,
@@ -12388,26 +12711,7 @@ async fn gate(
     goal: &str,
 ) -> Result<Gated> {
     let kind = format!("{act:?}").to_lowercase();
-    // Read and write targets are workspace paths, and are resolved so a symlink
-    // cannot smuggle one outside the root. Exec and net targets are *names* — a
-    // binary, an MCP tool, a registered tool, a host — and must not be resolved
-    // against the root, or a file that happens to share a tool's name would
-    // change what the policy said about calling it.
-    //
-    // An ABSOLUTE read/write target is not a workspace path at all — a skill
-    // file normally lives outside the root — so it is decided by the policy
-    // directly. `check_path` would resolve it against the root and deny it
-    // unconditionally, which would make `read_skill` refusable only by accident.
-    // This relaxes what the *gate* says, not what the workspace does:
-    // `Workspace::resolve` rejects absolute paths outright and both `read_file`
-    // and `write_file` go through it, so an absolute path still cannot leave the
-    // root (asserted in tests/skills.rs).
-    let check = |act: Act, target: &str| match act {
-        Act::Exec | Act::Net => ws.policy().check(act, target),
-        Act::Read | Act::Write if Path::new(target).is_absolute() => ws.policy().check(act, target),
-        Act::Read | Act::Write => ws.check_path(act, target),
-    };
-    let verdict = check(act, target);
+    let verdict = policy_verdict(ws, act, target);
 
     match verdict.effect {
         Effect::Deny => {
@@ -12514,7 +12818,7 @@ async fn gate(
 
             let performed = modified.unwrap_or_else(|| request.clone());
             // The rewritten action gets the same scrutiny as the original.
-            let recheck = check(act, &performed.target);
+            let recheck = policy_verdict(ws, act, &performed.target);
             if recheck.effect == Effect::Deny {
                 let mut ev = PolicyEvent::refusal(step, &kind, &performed.target);
                 ev.rule = recheck.rule.clone();
@@ -12830,6 +13134,8 @@ async fn compact_ledger<P: Provider>(
                 // it is what compacting *is*, and a recursion here would be a fold
                 // trying to fold its own prompt.
                 false,
+                // No tools in the request at all, so nothing could be speculated.
+                None,
             )
             .await?;
             spent = response.usage.map(|u| u.total_tokens).unwrap_or(0);
@@ -12905,6 +13211,12 @@ async fn complete_with_retry<P: Provider>(
     // about to recover is not a run that has ended. Every other failure, and a
     // second overflow after the recovery, escalates exactly as it did on 0.42.0.
     may_compact: bool,
+    // 0.54.0 — where read-only calls started off the stream are held. `None` for
+    // every loop and every completion that does not speculate, which is all three
+    // of the other callers: the tree loop never took 0.41.0's batch path either,
+    // a single-file run does not stream, and a summarising request has no tools
+    // at all.
+    mut spec: Option<&mut Speculation<'_>>,
 ) -> Result<CompletionResponse> {
     // The general media boundary. Every completion in every loop goes through
     // here, so this covers an out-of-tree `Provider` as well as the three built
@@ -12934,7 +13246,24 @@ async fn complete_with_retry<P: Provider>(
         // difference is that the deltas of a streamed one reach the observer while
         // it is still in flight instead of being accumulated in silence.
         let outcome = if stream {
-            stream_completion(provider, request, watch, run_id, step, depth).await
+            // 0.54.0 — each attempt speculates for itself. A completion that
+            // failed is not the one the next attempt returns, so its work is
+            // dropped rather than carried across; the counters are not, because
+            // the reads it did were still done and an operator's discard rate
+            // must include them.
+            if let Some(s) = spec.as_deref_mut() {
+                s.reset();
+            }
+            stream_completion(
+                provider,
+                request,
+                watch,
+                run_id,
+                step,
+                depth,
+                spec.as_deref_mut(),
+            )
+            .await
         } else {
             provider.complete(request.clone()).await
         };
@@ -12953,7 +13282,16 @@ async fn complete_with_retry<P: Provider>(
         // failed inside an otherwise successful response.
         record_web_activity(store, watch, run_id, step, depth, &outcome);
         match outcome {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                // 0.54.0 — join what was started early and keep only what this
+                // completion actually asked for. Done here rather than in the
+                // fold so that every path out of a step, including the ones that
+                // never reach the fold, leaves nothing running.
+                if let Some(s) = spec.as_deref_mut() {
+                    s.settle(&response).await?;
+                }
+                return Ok(response);
+            }
             // Only ask again if asking again could answer differently. Before
             // 0.11.0 every error was retried identically — including a 401 and a
             // missing API key, which cost three calls each to learn nothing, while
@@ -13068,6 +13406,12 @@ async fn stream_completion<P: Provider>(
     run_id: i64,
     step: u32,
     depth: u32,
+    // 0.54.0 — where a finished read-only call goes while the stream is still
+    // open. `None` for a run that is not speculating, which is every run whose
+    // contract caps parallel reads at one and, whatever the contract says, every
+    // run whose provider does not implement `complete_streaming_calls`: the
+    // trait's default reports no call, so this stays empty by construction.
+    mut spec: Option<&mut Speculation<'_>>,
 ) -> Result<CompletionResponse> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     // Unbounded deliberately: a bounded sender would either block the provider's
@@ -13080,13 +13424,27 @@ async fn stream_completion<P: Provider>(
         // escalated: a completion must not fail because nobody was listening.
         let _ = tx.send(text.to_string());
     };
-    let completion = provider.complete_streaming(request.clone(), &sink);
+    // 0.54.0 — the same seam for the same reason. A finished tool call crosses on
+    // a channel rather than being acted on inside the provider's own future,
+    // where neither `Watch` nor a `JoinSet` owned by this task can be reached.
+    let (calls_tx, mut calls_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, ToolCall)>();
+    let call_sink = move |at: usize, call: &ToolCall| {
+        let _ = calls_tx.send((at, call.clone()));
+    };
+    let completion = provider.complete_streaming_calls(request.clone(), &sink, &call_sink);
     tokio::pin!(completion);
     let outcome = loop {
         tokio::select! {
-            // Deltas first, so a burst that lands with the final chunk is emitted
-            // in order rather than after the response it belongs to.
+            // A finished call first: starting its read is the entire point of
+            // hearing about it early, and it is rare where a delta is not.
+            // Deltas still reach the observer ahead of the response they belong
+            // to, which is what their own ordering guarantee is about.
             biased;
+            Some((at, call)) = calls_rx.recv() => {
+                if let Some(s) = spec.as_deref_mut() {
+                    s.offer(at, &call);
+                }
+            }
             Some(text) = rx.recv() => {
                 watch.emit(RunEvent::at_depth(run_id, step, depth, EventKind::Token { text }));
             }

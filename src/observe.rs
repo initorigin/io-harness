@@ -783,6 +783,35 @@ pub enum EventKind {
         /// Whether the navigation was allowed to proceed.
         permitted: bool,
     },
+    /// Read-only calls were started off the provider's stream (0.54.0).
+    ///
+    /// Emitted once per step in which at least one call was started before the
+    /// completion carrying it returned, so a step that speculated nothing — and
+    /// every run whose provider does not report finished calls, which includes
+    /// every replayed one — emits nothing at all.
+    ///
+    /// **This is the one thing 0.41.0's overlapping deliberately did not need.**
+    /// Running two reads at once costs nothing when it does not help; starting a
+    /// read before the model has finished asking for it costs a whole read when
+    /// the completion turns out not to want it. `discarded` is therefore the
+    /// number worth watching: a provider that streams its calls late, a model
+    /// that revises its arguments, or a run retrying its completions shows up
+    /// here as work paid for and thrown away, and nowhere else.
+    ///
+    /// Nothing else about the step moves. The same [`ToolCall`](EventKind::ToolCall)
+    /// events arrive in the same order, with the same observations and the same
+    /// ledger draws, whether a read started early or not.
+    Speculated {
+        /// How many read-only calls were started early, across every attempt at
+        /// this step.
+        started: usize,
+        /// How many of those the settled completion asked for, and whose results
+        /// were therefore folded into the run.
+        used: usize,
+        /// How many were thrown away — `started - used`, named rather than left
+        /// to be subtracted.
+        discarded: usize,
+    },
     /// A declared capability bundle was not loaded, and the run went on (0.35.0).
     ///
     /// The other half of "dropped and reported, never fatal": a bundle that fails
@@ -1192,6 +1221,8 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "lsp_started",
     "browser_started",
     "browser_navigated",
+    // 0.54.0
+    "speculated",
     "dialed",
     "rewound",
     "reverted",
@@ -1734,6 +1765,11 @@ mod tests {
                 host: "example.com:443".into(),
                 permitted: false,
             },
+            EventKind::Speculated {
+                started: 3,
+                used: 2,
+                discarded: 1,
+            },
             EventKind::Rewound {
                 files: 2,
                 memory: 1,
@@ -1892,6 +1928,9 @@ mod tests {
                 // attempted, including the ones the model never typed.
                 | EventKind::BrowserStarted { .. }
                 | EventKind::BrowserNavigated { .. }
+                // 0.54.0 — read-only calls started off the stream, and how many
+                // of them the completion turned out not to want.
+                | EventKind::Speculated { .. }
                 // 0.36.0 — a whole run put back.
                 | EventKind::Rewound { .. }
                 // 0.51.0 — one step's changes reverse-applied.
