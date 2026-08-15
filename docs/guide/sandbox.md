@@ -41,7 +41,8 @@ everywhere — so a task isolates the same way on mac, linux, and windows:
 | --- | --- |
 | **macOS `sandbox-exec`** | a generated profile confines writes to the workdir and **denies network**; rlimits cap CPU and open files; an RSS monitor caps memory (macOS does not enforce address-space rlimits) |
 | **Linux namespaces** | user/mount/pid/**net** namespaces via `unshare` — a *hard* network boundary and a private root — plus the same rlimits and RSS monitor *(cfg-gated; compiled + unit-tested, not live-run on the macOS build host)* |
-| **Windows Job Object** | a **resource** boundary and only that: caps committed memory, user-mode CPU and the active process count, and kills the whole process tree when the job handle closes. A Job Object has no path rule and no socket rule to set, so filesystem scoping is still the floor's ephemeral workdir and egress denial is still the proxy-env strip (see the note under this table) |
+| **Windows Job Object** (the default) | a **resource** boundary and only that: caps committed memory, user-mode CPU and the active process count, and kills the whole process tree when the job handle closes. A Job Object has no path rule and no socket rule to set, so filesystem scoping is still the floor's ephemeral workdir and egress denial is still the proxy-env strip (see the note under this table) |
+| **Windows AppContainer** (0.59.0, opt-in) | the **access** boundary that job has no facility for: a low-box token that is default-deny on every securable object and reaches only the paths this run resolved, with no capability granting it a socket unless the policy permits egress. Selected by `SandboxConfig::with_access_confinement()`, and it refuses rather than degrading |
 | **Portable floor** | the guaranteed minimum on every OS: fresh subprocess, ephemeral workdir, resource caps, network env stripped. Deliberately the **weakest** backend — filesystem-scoped and resource-capped, *not* a full syscall jail |
 
 **Windows, stated plainly.** Since 0.24.0 a Windows run is contained by a real
@@ -49,10 +50,33 @@ Job Object and reports `Backend::WindowsJobObject`. Memory, CPU and the active
 process count are real bounds there, and closing the job handle kills the whole
 process tree, so nothing the run spawned outlives it. What a Job Object has **no
 facility for** is the filesystem and the network — there is no path rule and no
-socket rule to set on one. macOS confines writes to the workdir and denies
-outbound network, Linux does the same through mount and network namespaces, and
-Windows does neither, so **"sandboxed" on Windows still means resource-capped
-rather than access-confined** and the two must not be read as the same claim.
+socket rule to set on one. So by default **"sandboxed" on Windows still means
+resource-capped rather than access-confined**, and the two must not be read as
+the same claim.
+
+**Since 0.59.0 a caller can ask for the other half.**
+`SandboxConfig::with_access_confinement()` selects the AppContainer, and a run
+that gets it reports `Backend::WindowsAppContainer`, has its writes confined to
+the paths the run resolved, and holds no capability to reach the network unless
+its policy permits egress. It stays opt-in because the grant set is derived from
+the run's own facts and derived is not complete — a toolchain reading a
+machine-wide file outside it is refused, and a default boundary that cannot run
+an arbitrary payload is worse than one a caller reaches for deliberately. And it
+is the one backend here that **does not degrade**: a boundary asked for by name
+that cannot be applied is an error naming the grant that failed, because a run
+that quietly took the Job Object instead would have no boundary at all while
+every assertion about it still passed.
+
+**One column it does not deliver, and 0.26.0 wrote down the reason without
+noticing it.** The note below has said since then that loopback is refused inside
+an AppContainer, "a stronger result than was asked for". It stopped being a
+bonus in 0.48.0, when per-host egress became a loopback proxy the run owns: a
+contained command that cannot reach loopback cannot be scoped by it. Measured
+again in 0.59.0 under every capability set, and against the host's own network
+address as well, with the same answer. So egress under Windows access
+confinement is the capability itself — all of the network or none of it — a
+contained command there is given no proxy at all, and the agent's own boundary
+section tells it so rather than claiming the per-host rules it cannot enforce.
 
 ### AppContainer — what 0.26.0 shipped, and what it is not yet
 
@@ -71,8 +95,9 @@ refused:
   and no socket the token may open. Outbound fails inside and succeeds outside.
   Loopback is refused as well, which is a stronger result than was asked for.
 
-**It is not what `Sandbox::select` chooses on Windows, and this guide will not
-imply otherwise.** A run still gets the Job Object. The reason is the grant set
+**It is what `Sandbox::select` chooses on Windows when the caller asks for it,
+and not otherwise** (0.59.0). Without `access_confinement` a run still gets the
+Job Object. The reason is the grant set
 rather than the mechanism: an AppContainer is default-deny for *reads*, so
 everything a payload legitimately needs has to be named — the workspace is easy,
 and the executed binary, the toolchain, the redirected temporary directory and

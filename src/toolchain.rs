@@ -207,12 +207,13 @@ impl Toolchain {
     /// The homes a toolchain **launcher** reads to find the binary it stands for,
     /// independent of any project.
     ///
-    /// **Nothing selects the backend that consumes this**, and that is a
-    /// scheduling fact: the Windows access half was taken out of 0.47.0 whole and
-    /// is 0.59.0's (`US-IO-HARNESS-0.47.0-I01`). The set is kept and tested here
-    /// because it is portable data — which environment variable each ecosystem's
-    /// launcher reads — and because re-deriving it later would mean re-deriving
-    /// the argument below with it.
+    /// **The backend that consumes this is selected since 0.59.0**, when a
+    /// Windows caller asks for access confinement: these are the read-execute
+    /// grants an AppContainer needs before a launcher can find the binary it
+    /// stands for. The set was written and tested here for two releases before
+    /// anything read it, because it is portable data — which environment variable
+    /// each ecosystem's launcher reads — and re-deriving it later would have
+    /// meant re-deriving the argument below with it.
     ///
     /// A cache directory is where a build writes; this is where a toolchain is
     /// *installed*, and the two are different questions with different answers.

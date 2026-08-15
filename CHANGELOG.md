@@ -26,6 +26,128 @@ notes are produced from it.
 
 ### Security
 
+## [0.59.0] - 2026-08-16
+
+### Added
+
+- **The browser runs on Windows.** `browser::launch` had a Windows arm that
+  refused outright, and its message said the work was tracked as its own release
+  — a promise no roadmap entry ever backed. Every supported platform now drives a
+  browser over the same pipe transport, in the same test suite, behind neither an
+  `#[ignore]` nor a platform gate.
+
+  The transport is **not** two inherited handles. Chromium turns the descriptors
+  it is handed into handles with `_get_osfhandle`, so what the child needs is
+  descriptors 3 and 4 open in the C runtime's own table, and the only structure
+  that populates one is `lpReserved2` on the `STARTUPINFO`. Established against a
+  real browser before any of it was written: the descriptor block alone speaks,
+  the block plus a handle list also speaks, and the two ends as the child's
+  standard handles fail with Chrome's own *"Remote debugging pipe file
+  descriptors are not open"*. The pipes are anonymous, so unlike a named pipe
+  there is no name another local process could open — the same argument that
+  rejected a debugging port in 0.53.0, kept rather than traded away.
+
+- **Windows can confine access, when the caller asks for it.**
+  `SandboxConfig::with_access_confinement()` selects an AppContainer inside the
+  Job Object, and `Backend::WindowsAppContainer` returns to the public enum with
+  a production path that can produce it. A run under it has its writes confined
+  to the paths the run resolved and holds no capability to reach the network
+  unless its policy permits egress; both `Backend::confines_writes` and
+  `Backend::denies_egress` answer true for it.
+
+  **The Windows default has not moved.** Without that call a run still gets the
+  Job Object, because the grant set is derived from the run's own facts and
+  derived is not complete: a toolchain reading a machine-wide file outside it is
+  refused, and a default boundary that cannot run an arbitrary payload is worse
+  than one a caller reaches for deliberately. The default moves when the derived
+  set has run a real cargo build, a real npm install and a real python payload on
+  the CI image without a decline.
+
+  **And it does not degrade.** Everywhere else in this crate an unavailable
+  primitive falls back to a weaker rung and reports it. A boundary asked for by
+  name that cannot be applied is an error naming the grant that failed, because a
+  run that quietly took the Job Object instead would have had no boundary at all
+  while every assertion about it still passed — which is how 0.47.0 twice read a
+  green run as proof the container had run `cargo`.
+
+- **`Backend::reaches_loopback_proxy`**, a third exhaustive predicate beside the
+  two that already say what a backend delivers. Since 0.48.0 per-host egress is a
+  loopback proxy the run owns, and that mechanism needs one thing from a backend
+  that no backend had ever failed: that a contained command can make the
+  connection at all. It is deliberately narrower than "does the proxy bind the
+  payload" — on the portable floor the answer to that is no and the proxy is
+  still reachable, and the agent's boundary line has to keep those two sentences
+  apart.
+
+### Changed
+
+- **Under Windows access confinement, egress is a capability rather than a
+  route.** A process inside an AppContainer cannot reach a loopback listener —
+  measured on `windows-latest` with no capability, with `internetClient`, with
+  `privateNetworkClientServer` and with both, four arms and one outcome, while
+  the same request succeeds immediately outside the container and an outbound
+  request to a real host succeeds inside it with `internetClient`. It cannot
+  reach the host's own network address either. So a contained Windows command is
+  given **no proxy at all** — pointing it at one it cannot reach would hang every
+  request it makes instead of scoping it — the policy's per-host rules are not
+  enforced there, and the agent's own boundary section says so rather than
+  claiming the sentence it cannot back. The record is
+  `US-IO-HARNESS-0.59.0-I03`.
+
+- Both platform tables, the README, `docs/CONTRACT.md`, the sandbox, browser and
+  command-execution guides and the crate's own module documentation now describe
+  a Windows row that has two backends, and say which one a run gets.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **The capability array never reached the child, so the network boundary this
+  module documents in both directions was only ever half applied.**
+  `Profile::create` built the array and `Spawned::start` passed
+  `CapabilityCount: 0` on every spawn, so `internetClient` was registered against
+  the profile name and absent from every token. The denying direction was right
+  for a reason that had nothing to do with the capability set and the permitting
+  direction had never once been applied. It was invisible because nothing
+  selected the backend and because the only network test asserted a denial, which
+  an ignored array and an empty one produce alike.
+
+- **A capability SID must be aligned.** The buffer holding it was a bare
+  `[u8; 68]`, which promises one-byte alignment; a `SID`'s sub-authority array is
+  `u32`. `CreateProcessW` handed a misaligned one answers `ERROR_NOACCESS` —
+  "Invalid access to memory location" — which reads like a bad pointer rather
+  than a bad offset.
+
+- **A grant to one container was read as a grant to another.** The memo that
+  stops a path being granted twice in one process was keyed by path, access and
+  reach but not by the container SID, so a second profile was told its grant was
+  already done and read back carrying no ACE of its own. Same shape as the
+  `GENERIC_ALL` defect 0.47.0 fixed: a grant that reports success and grants
+  nothing.
+
+- **A Windows host with Chrome installed answered "no browser was found".** The
+  well-known install locations were cfg'd macOS-or-everything-else, so a Windows
+  build carried `/usr/bin/chromium` — and nothing in `RESOLUTION_ORDER` is on
+  `PATH` there, because a Windows browser is installed under Program Files and
+  put on the Start menu. Machine-wide locations for Chrome, Chromium and Edge,
+  and the per-user install under `%LOCALAPPDATA%` after them.
+
+- **A test that could have passed against an open network.** The container's
+  egress probe wrote its body to `NUL`, which a container cannot open, so `curl`
+  exited 23 — "failed writing output" — whether or not the request succeeded,
+  and the denial arm asserted only a non-zero exit. Both arms now assert the
+  status the transfer actually produced.
+
+### Security
+
+- A run that asks for access confinement on Windows and cannot be given it is
+  refused rather than run unconfined. The failure this replaces is the one this
+  platform's history is made of: a decline was silent, the Job Object ran the
+  command with no access boundary, and every assertion about that command still
+  passed.
+
 ## [0.58.0] - 2026-08-15
 
 ### Added

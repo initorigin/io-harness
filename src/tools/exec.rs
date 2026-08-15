@@ -46,7 +46,10 @@
 //! its egress unless this run's [`Policy`](crate::Policy) would permit
 //! [`Act::Net`](crate::Act::Net) — so a build that must fetch needs a policy that
 //! allows it. What a Windows Job Object and the portable floor enforce is the
-//! resource caps alone: there the mode is reported and not applied.
+//! resource caps alone: there the mode is reported and not applied — on Windows
+//! unless the caller asked for access confinement, which selects an AppContainer
+//! that applies it (0.59.0), and whose egress answer is the capability rather
+//! than the per-host route.
 //! `docs/CONTRACT.md` carries the per-platform table.
 //!
 //! Two ceilings apply to what a started process may do to the *run*: a wall-clock

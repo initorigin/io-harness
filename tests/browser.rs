@@ -16,7 +16,12 @@
 //! text the run produced. A build that reported a refusal it never enforced would
 //! satisfy the second and fail the first.
 
-#![cfg(all(feature = "browser", unix))]
+// The `unix` half of this gate went with 0.59.0. The transport is the child's
+// C-runtime descriptor table on Windows and its file descriptors on unix, which
+// is one difference inside `browser::launch` and none out here — so these tests
+// run on every platform the crate supports rather than proving the boundary on
+// two of three.
+#![cfg(feature = "browser")]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -225,6 +230,68 @@ impl Events {
 /// that matters is on the fixture's record: `fail` means the browser was told to
 /// block the request, and a build that merely reported a refusal without enforcing
 /// it would show `continue` here.
+/// **The argument list arrives at the child intact, quoting and all.**
+///
+/// On unix the launch hands a vector to `Command` and the kernel carries it. On
+/// Windows there is no vector: `CreateProcessW` takes one string, and this crate
+/// quotes it by the runtime's documented rules — a backslash run is literal
+/// unless it precedes a quote, in which case it is doubled. A quoting defect
+/// there shows up on exactly one argument, and every path on that platform
+/// contains a space.
+///
+/// So the fixture records the argv it was really started with, and this asserts
+/// against that rather than against the list the launch built.
+#[tokio::test]
+async fn what_the_launch_passes_is_what_the_browser_receives() {
+    let dir = workspace();
+    let record = Record::new(dir.path());
+    // A space and an embedded quote, which are the two cases the quoting rules
+    // exist for and the two a copy of the list would never catch.
+    let awkward = "--io-fixture-text=a page \"with quotes\" and spaces";
+    let browser = fixture_config(&record, &[awkward]);
+
+    // The browser starts when a browser tool is first called, so the script has
+    // to reach for one; a run that never opens a page starts no process at all.
+    let script = Script::new(vec![
+        vec![call(
+            "browser_navigate",
+            json!({"url": "https://allowed.example.com/page"}),
+        )],
+        finish(),
+    ]);
+    let events = Events::default();
+    let store = Store::memory().unwrap();
+
+    io_harness::run_with_observed(
+        &contract(dir.path(), 6).with_browser(browser),
+        &script,
+        &store,
+        &permitted().allow_net("allowed.example.com"),
+        &ApproveAll,
+        &events,
+    )
+    .await
+    .unwrap();
+
+    let lines = record.lines();
+    let argv = lines
+        .iter()
+        .find(|l| l.starts_with("argv "))
+        .unwrap_or_else(|| panic!("the fixture recorded no argv: {lines:?}"));
+    assert!(
+        argv.contains("--remote-debugging-pipe"),
+        "the transport flag did not reach the child: {argv:?}"
+    );
+    assert!(
+        argv.contains("--user-data-dir="),
+        "the profile directory did not reach the child: {argv:?}"
+    );
+    assert!(
+        argv.contains("a page \"with quotes\" and spaces"),
+        "an argument with a space and a quote did not survive the launch: {argv:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_navigation_to_a_denied_host_is_failed_at_the_request_and_a_permitted_one_continues() {
     let dir = workspace();

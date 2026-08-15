@@ -25,37 +25,61 @@
 //! - `--io-fixture-console` — the page logs and throws while loading.
 //! - `--io-fixture-silent` — start, and never answer anything.
 
-// The transport is two inherited descriptors, which is a unix arrangement. On
-// Windows the browser feature refuses, so its fixture has nothing to do.
-#[cfg(windows)]
-fn main() {}
-
-#[cfg(unix)]
 use std::io::Write;
 
-#[cfg(unix)]
 use serde_json::{json, Value};
+
+/// The two descriptors the parent installed, opened the way each platform
+/// installs them.
+///
+/// **Both are descriptor numbers, and on Windows that is not the same as a
+/// handle.** A real browser asks its C runtime for `_get_osfhandle(3)`, so the
+/// parent writes the runtime's own descriptor table rather than passing handles,
+/// and this fixture reads the table back the same way a real browser does — which
+/// is the point of it being a child at all.
+fn transport() -> (std::fs::File, std::fs::File) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd;
+        // SAFETY: 3 and 4 are the ends the parent installed before exec.
+        unsafe { (std::fs::File::from_raw_fd(3), std::fs::File::from_raw_fd(4)) }
+    }
+    #[cfg(windows)]
+    {
+        // Declared rather than depended on: `libc` is a unix-only dependency of
+        // this crate, and this symbol is in the UCRT every Windows binary links.
+        extern "C" {
+            fn _get_osfhandle(fd: i32) -> isize;
+        }
+        use std::os::windows::io::FromRawHandle;
+        // SAFETY: the runtime's table holds 3 and 4 because the parent wrote
+        // them into `lpReserved2`; a descriptor the parent did not install
+        // answers -1, which fails loudly on first use rather than silently.
+        unsafe {
+            (
+                std::fs::File::from_raw_handle(_get_osfhandle(3) as _),
+                std::fs::File::from_raw_handle(_get_osfhandle(4) as _),
+            )
+        }
+    }
+}
 
 /// A 1×1 transparent PNG, so a screenshot returns real image bytes without this
 /// file carrying a picture.
-#[cfg(unix)]
 const PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
 /// One `--io-fixture-<name>=<value>` argument, if it was given.
-#[cfg(unix)]
 fn arg(name: &str) -> Option<String> {
     let prefix = format!("--io-fixture-{name}=");
     std::env::args().find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
 }
 
 /// Whether a bare `--io-fixture-<name>` flag was given.
-#[cfg(unix)]
 fn flag(name: &str) -> bool {
     let want = format!("--io-fixture-{name}");
     std::env::args().any(|a| a == want)
 }
 
-#[cfg(unix)]
 fn record(line: &str) {
     if let Some(path) = arg("record") {
         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -68,24 +92,21 @@ fn record(line: &str) {
     }
 }
 
-#[cfg(unix)]
 fn main() {
-    // The descriptors the parent installed. Reading 3 and writing 4 is the whole
-    // transport; nothing here opens a port.
-    let mut input = {
-        use std::os::fd::FromRawFd;
-        // SAFETY: descriptor 3 is the read end the parent installed before exec.
-        unsafe { std::fs::File::from_raw_fd(3) }
-    };
-    let mut output = {
-        use std::os::fd::FromRawFd;
-        // SAFETY: descriptor 4 is the write end the parent installed before exec.
-        unsafe { std::fs::File::from_raw_fd(4) }
-    };
+    // Reading 3 and writing 4 is the whole transport; nothing here opens a port.
+    let (mut input, mut output) = transport();
 
     // The pid, so a test can assert the process is gone after the run rather
     // than assert that a shutdown call was made.
     record(&format!("started {}", std::process::id()));
+    // And the argv it was actually started with, so a test can assert what the
+    // launch passed rather than what a copy of the argument list says. This is
+    // the only place the two could disagree, and on Windows the spawn builds one
+    // command line by hand rather than handing a vector to `Command`.
+    record(&format!(
+        "argv {}",
+        std::env::args().collect::<Vec<_>>().join(" ")
+    ));
     if flag("silent") {
         // Started and useless: the parent must bound its wait rather than hang.
         std::thread::sleep(std::time::Duration::from_secs(600));
@@ -286,7 +307,6 @@ fn main() {
 }
 
 /// Read one NUL-terminated message.
-#[cfg(unix)]
 fn read_message(input: &mut std::fs::File, buf: &mut Vec<u8>) -> Option<Value> {
     use std::io::Read;
     loop {

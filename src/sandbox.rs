@@ -109,6 +109,21 @@ pub enum Backend {
     /// seccomp filter; only the kernel's own defaults for an unprivileged user
     /// namespace apply on top.
     LinuxNamespaces,
+    /// Windows AppContainer **and** Job Object: a low-box security context whose
+    /// token reaches only what was granted to its own container SID, inside a
+    /// job that bounds its resources and takes its tree down on close.
+    ///
+    /// The access half and the resource half together, which is why this and
+    /// [`WindowsJobObject`](Backend::WindowsJobObject) are two backends rather
+    /// than one with a flag: a run reporting this one had its writes confined to
+    /// the paths the run resolved and, when its policy denied egress, no
+    /// capability granting it a socket.
+    ///
+    /// **Reachable only when the caller asked for it** (0.59.0). The grant set is
+    /// derived from the run's own facts and derived is not complete, so a default
+    /// boundary that cannot run an arbitrary payload would be worse than one a
+    /// caller reaches for deliberately.
+    WindowsAppContainer,
     /// Windows Job Object: memory, CPU and active-process limits, and a
     /// tree kill on close. A **resource** boundary and nothing else — a Job
     /// Object has no filesystem facility and no network facility, so a run
@@ -147,7 +162,10 @@ impl Backend {
             Backend::MacosSandboxExec
             | Backend::LinuxLandlock
             | Backend::LinuxBubblewrap
-            | Backend::LinuxNamespaces => true,
+            | Backend::LinuxNamespaces
+            // An AppContainer is default-deny for every securable object, so a
+            // path it can write is a path something granted by name.
+            | Backend::WindowsAppContainer => true,
             // A Job Object is a resource container: there is no path rule to set
             // on one. The floor is an ephemeral working directory and nothing.
             Backend::WindowsJobObject | Backend::PortableFloor => false,
@@ -176,8 +194,70 @@ impl Backend {
             Backend::MacosSandboxExec
             | Backend::LinuxLandlock
             | Backend::LinuxBubblewrap
-            | Backend::LinuxNamespaces => true,
+            | Backend::LinuxNamespaces
+            // The denial is an absent capability rather than an applied filter:
+            // without `internetClient` the token holds nothing that grants a
+            // socket to the outside. The same shape as an empty network
+            // namespace.
+            | Backend::WindowsAppContainer => true,
             Backend::WindowsJobObject | Backend::PortableFloor => false,
+        }
+    }
+
+    /// Can a command contained by this backend **reach** the loopback proxy the
+    /// run owns?
+    ///
+    /// Since 0.48.0 a run whose policy names hosts routes its contained commands
+    /// through a proxy on `127.0.0.1` that asks the policy about every
+    /// `host:port`. Whether the proxy *binds* the command is a separate question
+    /// — on the portable floor it is an environment variable a payload may
+    /// ignore, which is what [`denies_egress`](Backend::denies_egress) answers.
+    /// This one is narrower and comes first: can the connection be made at all.
+    ///
+    /// **[`WindowsAppContainer`](Backend::WindowsAppContainer) cannot**, and no
+    /// capability changes it — measured on `windows-latest` with none, with
+    /// `internetClient`, with `privateNetworkClientServer` and with both, while
+    /// the same request succeeds outside the container and an outbound request to
+    /// a real host succeeds inside it. So egress there is the capability itself:
+    /// all of the network, or none of it. A run that would have been proxied is
+    /// given no proxy on that backend rather than one it cannot reach, and the
+    /// agent's own boundary section says which of the two it has.
+    ///
+    /// **Only [`WindowsAppContainer`](Backend::WindowsAppContainer) cannot**, and
+    /// no capability changes it — measured on `windows-latest` with none, with
+    /// `internetClient`, with `privateNetworkClientServer` and with both, while
+    /// the same request succeeds outside the container and an outbound request to
+    /// a real host succeeds inside it. A run that would have been proxied is given
+    /// no proxy on that backend rather than one it cannot reach, because a
+    /// command pointed at an unreachable proxy waits out its own clock on every
+    /// request instead of being scoped.
+    ///
+    /// Third exhaustive `match` beside the two above, and for the same reason: the
+    /// next backend added is a compile error here rather than a claim it quietly
+    /// inherited.
+    ///
+    /// ```
+    /// use io_harness::Backend;
+    ///
+    /// assert!(Backend::MacosSandboxExec.reaches_loopback_proxy());
+    /// // The floor reaches it and does not bind the payload to it, which are two
+    /// // different sentences the prompt has to keep apart.
+    /// assert!(Backend::PortableFloor.reaches_loopback_proxy());
+    /// assert!(!Backend::PortableFloor.denies_egress());
+    /// // And the one that cannot make the connection at all.
+    /// assert!(!Backend::WindowsAppContainer.reaches_loopback_proxy());
+    /// ```
+    pub fn reaches_loopback_proxy(&self) -> bool {
+        match self {
+            Backend::MacosSandboxExec
+            | Backend::LinuxLandlock
+            | Backend::LinuxBubblewrap
+            | Backend::LinuxNamespaces
+            // Both of these run the command with no network boundary of their
+            // own, so loopback is as reachable as it is outside them.
+            | Backend::WindowsJobObject
+            | Backend::PortableFloor => true,
+            Backend::WindowsAppContainer => false,
         }
     }
 
@@ -188,6 +268,7 @@ impl Backend {
             Backend::LinuxLandlock => "linux-landlock",
             Backend::LinuxBubblewrap => "linux-bubblewrap",
             Backend::LinuxNamespaces => "linux-namespaces",
+            Backend::WindowsAppContainer => "windows-appcontainer",
             Backend::WindowsJobObject => "windows-job-object",
             Backend::PortableFloor => "portable-floor",
         }
@@ -612,12 +693,59 @@ pub struct SandboxConfig {
     /// mode named there needs no second path.
     #[serde(default)]
     pub mode: ExecMode,
+    /// Ask for an **access** boundary on a host where one is not the default
+    /// (0.59.0). Off by default, and today that means Windows and nothing else.
+    ///
+    /// macOS and Linux confine access under every native backend already, so on
+    /// those hosts this changes nothing and is not read. On Windows the default
+    /// is a Job Object, which contains resources and has no filesystem facility
+    /// and no network facility; setting this selects the AppContainer, whose
+    /// token is default-deny for every securable object and reaches only the
+    /// paths this run resolved.
+    ///
+    /// **It is opt-in because the grant set is derived and derived is not
+    /// complete.** The workspace, the writable cache roots the toolchain named,
+    /// the redirected temporary directory, the program's own directory and
+    /// `%SystemRoot%` are named from the run's own facts; a toolchain reading a
+    /// machine-wide file outside that set is refused. A default boundary that
+    /// cannot run an arbitrary payload is worse than one a caller reaches for
+    /// deliberately, so the caller reaches for it.
+    ///
+    /// **And it does not degrade.** Where an unavailable primitive falls back to
+    /// a weaker rung and reports it, a boundary the caller *asked* for and that
+    /// cannot be applied is an error instead: a run that quietly took the Job
+    /// Object here is a run whose every assertion still passes with no boundary
+    /// at all, which is the exact failure this release was written to end.
+    #[serde(default)]
+    pub access_confinement: bool,
 }
 
 impl SandboxConfig {
     /// A config with default caps and network denied — the recommended default.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Ask for an access boundary where one is not the default — see
+    /// [`access_confinement`](SandboxConfig::access_confinement).
+    ///
+    /// ```
+    /// use io_harness::sandbox::{select, Sandbox, SandboxConfig};
+    ///
+    /// let asked = SandboxConfig::new().with_access_confinement();
+    /// // On macOS and Linux the native backend already confines access, so this
+    /// // changes nothing; on Windows it is the difference between a resource
+    /// // boundary and an access one.
+    /// let backend = select(&asked).backend();
+    /// assert!(backend.confines_writes() || cfg!(not(any(
+    ///     target_os = "macos",
+    ///     target_os = "linux",
+    ///     target_os = "windows",
+    /// ))));
+    /// ```
+    pub fn with_access_confinement(mut self) -> Self {
+        self.access_confinement = true;
+        self
     }
 
     /// Force the portable floor backend (disable the native one).
@@ -894,9 +1022,13 @@ pub enum Selected {
     /// The Linux native backend.
     #[cfg(target_os = "linux")]
     Linux(linux::LinuxSandbox),
-    /// The Windows native backend.
+    /// The Windows native backend: a Job Object, which contains resources.
     #[cfg(target_os = "windows")]
     Windows(windows::WindowsSandbox),
+    /// The Windows access backend: an AppContainer inside a Job Object, chosen
+    /// only when the caller asked for [`access_confinement`](SandboxConfig::access_confinement).
+    #[cfg(target_os = "windows")]
+    WindowsContained(windows::WindowsAppContainerSandbox),
 }
 
 impl Sandbox for Selected {
@@ -909,6 +1041,8 @@ impl Sandbox for Selected {
             Selected::Linux(s) => s.run(spec).await,
             #[cfg(target_os = "windows")]
             Selected::Windows(s) => s.run(spec).await,
+            #[cfg(target_os = "windows")]
+            Selected::WindowsContained(s) => s.run(spec).await,
         }
     }
 
@@ -921,6 +1055,8 @@ impl Sandbox for Selected {
             Selected::Linux(s) => s.backend(),
             #[cfg(target_os = "windows")]
             Selected::Windows(s) => s.backend(),
+            #[cfg(target_os = "windows")]
+            Selected::WindowsContained(s) => s.backend(),
         }
     }
 }
@@ -968,7 +1104,16 @@ pub fn select(config: &SandboxConfig) -> Selected {
         #[cfg(target_os = "linux")]
         return Selected::Linux(linux::LinuxSandbox);
         #[cfg(target_os = "windows")]
-        return Selected::Windows(windows::WindowsSandbox);
+        {
+            // The access backend only when it was asked for, and only for a mode
+            // that wants a filesystem boundary at all: `FullAccess` says the
+            // payload may write anywhere, and putting that inside a default-deny
+            // container would refuse the very thing the mode grants.
+            if config.access_confinement && config.mode != ExecMode::FullAccess {
+                return Selected::WindowsContained(windows::WindowsAppContainerSandbox);
+            }
+            return Selected::Windows(windows::WindowsSandbox);
+        }
     }
     Selected::Floor(FloorSandbox)
 }
@@ -1992,6 +2137,56 @@ mod tests {
         assert!(!out.success());
         assert_eq!(out.exit_code, Some(3));
         assert_eq!(out.cap_hit, None);
+    }
+
+    /// **F8 — every backend claims exactly what it delivers.**
+    ///
+    /// One table, three predicates, every variant, and it is portable data so it
+    /// runs on all three hosts rather than on the one that has the backend. The
+    /// three `match`es this asserts are exhaustive on purpose — the next backend
+    /// added is a compile error there — but exhaustive does not mean *right*, and
+    /// nothing before this checked the answers against each other.
+    ///
+    /// The row that matters is the last one: a backend can deny egress outright
+    /// and still be unable to say which hosts to permit, which had never been a
+    /// distinction any backend forced until 0.59.0.
+    #[test]
+    fn each_backend_claims_exactly_what_it_delivers() {
+        // (backend, confines writes, denies egress, reaches the loopback proxy)
+        let table = [
+            (Backend::MacosSandboxExec, true, true, true),
+            (Backend::LinuxLandlock, true, true, true),
+            (Backend::LinuxBubblewrap, true, true, true),
+            (Backend::LinuxNamespaces, true, true, true),
+            (Backend::WindowsAppContainer, true, true, false),
+            (Backend::WindowsJobObject, false, false, true),
+            (Backend::PortableFloor, false, false, true),
+        ];
+        for (backend, writes, egress, reaches) in table {
+            assert_eq!(
+                (
+                    backend.confines_writes(),
+                    backend.denies_egress(),
+                    backend.reaches_loopback_proxy()
+                ),
+                (writes, egress, reaches),
+                "{} claims something other than what it delivers",
+                backend.as_str()
+            );
+        }
+        // And the rule that holds across the table: exactly one backend cannot
+        // reach the proxy, and it is the one whose boundary the proxy sits
+        // outside. Asserted as a count so a second such backend arriving without
+        // its own egress story fails here rather than silently inheriting this
+        // one's.
+        assert_eq!(
+            table
+                .iter()
+                .filter(|(b, _, _, _)| !b.reaches_loopback_proxy())
+                .count(),
+            1,
+            "the set of backends a loopback proxy cannot be reached from has changed"
+        );
     }
 
     #[tokio::test]
