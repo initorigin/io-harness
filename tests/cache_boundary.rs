@@ -689,7 +689,10 @@ async fn a_store_that_fits_its_share_keeps_the_marker_selection_only_costs_it_pa
         .await
         .unwrap();
         let working = provider.working();
-        let marked_steps = working.iter().filter(|r| r.cache_boundary.is_some()).count();
+        let marked_steps = working
+            .iter()
+            .filter(|r| r.cache_boundary.is_some())
+            .count();
         (working.len(), marked_steps)
     }
 
@@ -720,8 +723,14 @@ async fn a_store_that_fits_its_share_keeps_the_marker_selection_only_costs_it_pa
         .flat_map(|(i, name)| {
             let stem = name.trim_end_matches(".txt");
             [
-                (i * 2, format!("reading {stem} matters {}", "detail ".repeat(40))),
-                (i * 2 + 1, format!("{stem} padding is ordinary {}", "detail ".repeat(40))),
+                (
+                    i * 2,
+                    format!("reading {stem} matters {}", "detail ".repeat(40)),
+                ),
+                (
+                    i * 2 + 1,
+                    format!("{stem} padding is ordinary {}", "detail ".repeat(40)),
+                ),
             ]
         })
         .map(|(i, v)| (NOTE_KEYS[i], v))
