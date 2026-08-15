@@ -241,8 +241,24 @@ pub(crate) mod win {
         /// was empty on every spawn, so the permitting direction the module's own
         /// documentation describes was never applied — a denial that happened to
         /// be right for the denying case and silently wrong for the other.
-        capability: Option<[u8; 68]>,
+        ///
+        /// **Aligned, and that is load-bearing.** A `SID` is a struct whose
+        /// sub-authority array is `u32`, so the kernel reads it at four-byte
+        /// alignment; a bare `[u8; 68]` promises one-byte alignment, and as a
+        /// struct field rather than a stack local it lands wherever the layout
+        /// puts it. `CreateProcessW` handed a misaligned capability SID answers
+        /// `ERROR_NOACCESS` — "Invalid access to memory location" — which reads
+        /// like a bad pointer rather than like a bad offset.
+        capability: Option<SidBuf>,
     }
+
+    /// A SID buffer at the alignment the kernel reads one at.
+    ///
+    /// `SECURITY_MAX_SID_SIZE` is 68; rounding to 72 costs four bytes and buys
+    /// an alignment that cannot depend on where a struct field happened to land.
+    #[derive(Clone, Copy)]
+    #[repr(C, align(8))]
+    pub(crate) struct SidBuf([u8; 72]);
 
     // SAFETY: both members are plain data — an owned UTF-16 buffer and a SID,
     // which is a process-wide allocation addressed by pointer and not a
@@ -282,10 +298,10 @@ pub(crate) mod win {
             // alive across it. `SECURITY_MAX_SID_SIZE` is 68; a fixed buffer
             // avoids an allocation whose lifetime would be one more thing to get
             // right.
-            let mut cap_sid = [0u8; 68];
+            let mut cap_sid = SidBuf([0u8; 72]);
             let mut caps: [SID_AND_ATTRIBUTES; 1] = unsafe { std::mem::zeroed() };
             let cap_count = if allow_network {
-                let mut len = cap_sid.len() as u32;
+                let mut len = cap_sid.0.len() as u32;
                 // SAFETY: `cap_sid` is a live buffer of at least
                 // `SECURITY_MAX_SID_SIZE` bytes and `len` is its true length as a
                 // live in/out parameter. A null domain SID is what a
@@ -294,14 +310,14 @@ pub(crate) mod win {
                     CreateWellKnownSid(
                         WinCapabilityInternetClientSid,
                         std::ptr::null_mut(),
-                        cap_sid.as_mut_ptr().cast::<core::ffi::c_void>(),
+                        cap_sid.0.as_mut_ptr().cast::<core::ffi::c_void>(),
                         &mut len,
                     )
                 } == 0
                 {
                     return Err(io::Error::last_os_error());
                 }
-                caps[0].Sid = cap_sid.as_mut_ptr().cast::<core::ffi::c_void>();
+                caps[0].Sid = cap_sid.0.as_mut_ptr().cast::<core::ffi::c_void>();
                 // `SE_GROUP_ENABLED`. The attribute that makes the capability
                 // present rather than merely listed.
                 caps[0].Attributes = 0x0000_0004;
@@ -369,7 +385,7 @@ pub(crate) mod win {
         pub(crate) fn capability_sid(&self) -> Option<*mut core::ffi::c_void> {
             self.capability
                 .as_ref()
-                .map(|b| b.as_ptr().cast_mut().cast::<core::ffi::c_void>())
+                .map(|b| b.0.as_ptr().cast_mut().cast::<core::ffi::c_void>())
         }
     }
 
@@ -1138,24 +1154,40 @@ mod tests {
 
         // The same run, inside a container built with and without the capability,
         // so the difference is the capability and nothing else.
-        let mut run = |tag: &str, allow_network: bool, cmdline: &str| -> (Option<i32>, String) {
-            let profile = Profile::create(&name(tag), allow_network)
-                .unwrap_or_else(|e| panic!("could not create a profile: {e}"));
-            grant(work.path(), profile.sid(), Access::Full, Reach::Tree)
-                .unwrap_or_else(|e| panic!("could not grant the workspace: {e}"));
+        // **Every step reports rather than panicking.** The first run of this
+        // probe died on the first arm and took the other five with it, which is
+        // the same mistake in miniature that this whole release exists to stop
+        // making: a table is the result, and a panic is one row of it.
+        let mut run = |tag: &str, allow_network: bool, cmdline: &str| -> String {
+            let profile = match Profile::create(&name(tag), allow_network) {
+                Ok(p) => p,
+                Err(e) => return format!("no profile: {e}"),
+            };
+            if let Err(e) = grant(work.path(), profile.sid(), Access::Full, Reach::Tree) {
+                return format!("no workspace grant: {e}");
+            }
             let out_path = work.path().join(format!("out-{tag}.txt"));
-            let file = std::fs::File::create(&out_path).expect("capture file");
-            let mut child = Spawned::start(cmdline, work.path(), &profile, &file)
-                .unwrap_or_else(|e| panic!("spawn: {e}"));
-            child.resume().expect("resume");
+            let file = match std::fs::File::create(&out_path) {
+                Ok(f) => f,
+                Err(e) => return format!("no capture file: {e}"),
+            };
+            let mut child = match Spawned::start(cmdline, work.path(), &profile, &file) {
+                Ok(c) => c,
+                Err(e) => return format!("SPAWN FAILED os_error={:?} {e}", e.raw_os_error()),
+            };
+            if let Err(e) = child.resume() {
+                return format!("resume failed: {e}");
+            }
             drop(file);
-            let code = child.wait(40_000).expect("wait");
+            let code = match child.wait(40_000) {
+                Ok(c) => c,
+                Err(e) => return format!("wait failed: {e}"),
+            };
             let mut text = String::new();
             std::fs::File::open(&out_path)
-                .expect("reopen")
-                .read_to_string(&mut text)
+                .and_then(|mut f| f.read_to_string(&mut text))
                 .ok();
-            (code, text.trim().to_string())
+            format!("exit {code:?} out {:?}", text.trim())
         };
 
         let loopback = format!("curl.exe -s -m 10 http://127.0.0.1:{port}/");
@@ -1168,8 +1200,8 @@ mod tests {
             ("outward, internetClient", true, outward),
         ] {
             let tag = what.replace([' ', ','], "-");
-            let (code, out) = run(&tag, allow, &format!("cmd.exe /c {line}"));
-            report.push_str(&format!("\n    {what}: exit {code:?} out {out:?}"));
+            let outcome = run(&tag, allow, &format!("cmd.exe /c {line}"));
+            report.push_str(&format!("\n    {what}: {outcome}"));
         }
 
         // The controls, uncontained. A denial that would also have been a denial
