@@ -52,10 +52,23 @@ evidence:
     the profile on `Drop`, so processes resolving the same name deleted each other's container.
     The capability table's first row declined and every row after it passed, which is the
     signature exactly. Selecting the backend is what turned it from dormant into a race between
-    two agents on one machine. The name is now per process, all three previously-silent decline
-    paths record their reason — "no reason recorded" is the gap this release exists to close and
-    it appeared in its own release PR — and a test builds two live profiles and asserts the
-    survivor still spawns a process after the other is dropped.
+    two agents on one machine. All three previously-silent decline paths now record their reason —
+    "no reason recorded" is the gap this release exists to close and it appeared in its own release
+    PR — and a test builds two live profiles and asserts the survivor still spawns a process after
+    the other is dropped.
+  - >
+    **And the obvious fix for that defect was wrong, which the matrix said in one round.** Naming
+    the profile per process closes the deletion race and opens a worse one: the SID derives from
+    the name, so each process then writes a *different* ACE onto the paths they all share, and two
+    read-modify-write passes over one DACL lose each other's entry. The next round failed with a
+    container that could not read the toolchain home and a launcher reporting `could not create
+    home directory ... Cannot create a file when that file already exists` — the exact failure the
+    grant set's own comment predicts. **The shared SID was the feature and the deletion was the
+    bug**: one name, one SID, every process writing the identical ACE, so concurrent grants
+    converge. The name is deterministic again and is never deleted, at the cost of one profile
+    left on a machine that has ever run a contained command. There are two of them, keyed by the
+    capability set, because a profile registers its capabilities at creation and a shared one is
+    created once and re-entered forever after.
   - >
     **Sabotage: nine arms, every one kills its named test.** Seven on `windows-latest` (the
     backend reported, a silent decline, unconditional selection, the memo key, the capability
