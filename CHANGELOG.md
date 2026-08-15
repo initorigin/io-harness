@@ -16,6 +16,20 @@ notes are produced from it.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.59.0] - 2026-08-16
+
+### Added
+
 - **The browser runs on Windows.** `browser::launch` had a Windows arm that
   refused outright, and its message said the work was tracked as its own release
   — a promise no roadmap entry ever backed. Every supported platform now drives a
@@ -56,11 +70,14 @@ notes are produced from it.
   while every assertion about it still passed — which is how 0.47.0 twice read a
   green run as proof the container had run `cargo`.
 
-- **`Backend::scopes_egress_per_host`**, a third exhaustive predicate beside the
+- **`Backend::reaches_loopback_proxy`**, a third exhaustive predicate beside the
   two that already say what a backend delivers. Since 0.48.0 per-host egress is a
   loopback proxy the run owns, and that mechanism needs one thing from a backend
-  no backend had ever failed: that a contained command can reach a loopback
-  listener.
+  that no backend had ever failed: that a contained command can make the
+  connection at all. It is deliberately narrower than "does the proxy bind the
+  payload" — on the portable floor the answer to that is no and the proxy is
+  still reachable, and the agent's boundary line has to keep those two sentences
+  apart.
 
 ### Changed
 
