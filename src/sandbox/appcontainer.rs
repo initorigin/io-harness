@@ -230,6 +230,29 @@ pub(crate) mod win {
     pub(crate) struct Profile {
         name: Vec<u16>,
         sid: PSID,
+        /// Whether dropping this deletes the profile behind it.
+        ///
+        /// **False for the one every contained run shares, and that is two races
+        /// answered at once.** A profile is a registry-backed object named by a
+        /// string, so a deterministic name is shared between every process on the
+        /// machine — and deleting it on drop meant whichever process finished
+        /// first destroyed the container the others were still spawning into.
+        ///
+        /// Giving each process its own name fixes that and creates a worse one:
+        /// the SID derives from the name, soeach process then writes a *different*
+        /// ACE onto the same shared paths — the toolchain home, the temporary
+        /// directory — and two read-modify-write passes over one DACL lose each
+        /// other's entry. The symptom is a container that cannot read the
+        /// toolchain home and a launcher that reports it "could not create home
+        /// directory ... Cannot create a file when that file already exists".
+        ///
+        /// Sharing the name is therefore the *correct* half: every process writes
+        /// the identical ACE for the identical SID, so concurrent grants converge
+        /// instead of clobbering. What had to go is the deletion. The cost is one
+        /// profile left on a machine that has ever run a contained command, which
+        /// is re-entered rather than recreated; the tests keep unique names and
+        /// keep deleting theirs.
+        delete_on_drop: bool,
         /// The `internetClient` capability SID, when this profile was created
         /// with the network permitted.
         ///
@@ -364,8 +387,17 @@ pub(crate) mod win {
             Ok(Profile {
                 name,
                 sid,
-                capability: (cap_count == 1).then_some(cap_sid),
+                capability: (cap_count >= 1).then_some(cap_sid),
+                delete_on_drop: true,
             })
+        }
+
+        /// The profile every contained run on this machine shares, which outlives
+        /// the process that first created it. See `delete_on_drop`.
+        pub(crate) fn shared(name: &str, allow_network: bool) -> io::Result<Self> {
+            let mut p = Self::create(name, allow_network)?;
+            p.delete_on_drop = false;
+            Ok(p)
         }
 
         /// The container SID. Valid for as long as this `Profile` is.
@@ -392,7 +424,9 @@ pub(crate) mod win {
             // this type, and this is the only free. `self.name` is still live.
             unsafe {
                 FreeSid(self.sid);
-                DeleteAppContainerProfile(self.name.as_ptr());
+                if self.delete_on_drop {
+                    DeleteAppContainerProfile(self.name.as_ptr());
+                }
             }
         }
     }
