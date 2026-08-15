@@ -139,8 +139,13 @@ notes are produced from it.
   or a runner that gives each test its own process — resolved the same name and
   whichever finished first deleted the container the others were still spawning
   into. Dormant while nothing selected this backend; a race the moment something
-  did. The name is now per process, and every decline path records its reason:
-  three of them did not, so the one failure this release was least equipped to
+  did. The name stays deterministic — one name means one SID means every process
+  writes the identical ACE, and per-process names instead make concurrent grants
+  lose each other's entry on the DACLs they share — and it is no longer deleted
+  on drop, at the cost of one profile left on a machine that has ever run a
+  contained command. Two of them, keyed by the capability set, because a profile
+  registers its capabilities at creation. And every decline path records its
+  reason: three did not, so the one failure this release was least equipped to
   explain was the one that happened.
 
 - **A test that could have passed against an open network.** The container's
