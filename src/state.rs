@@ -2135,6 +2135,69 @@ fn truncate_memory_value(value: &str, cap: usize) -> String {
     out
 }
 
+/// The normalised words of a text (0.57.0): lowercased, split on anything that
+/// is not alphanumeric, and anything shorter than three characters dropped.
+///
+/// One normaliser, called by both halves of 0.57.0 — the recall ranking in
+/// [`crate::context`] and [`Store::memory_similar`] — because two answers to
+/// "what counts as a word here" is how the two come to disagree.
+///
+/// The three-character floor is a stopword list nobody has to maintain: it
+/// removes `a`, `of`, `is`, `to` and the rest of the closed class, and keeps
+/// every identifier a note or a goal is actually about. Splitting on
+/// non-alphanumerics is what makes `src/state.rs` in a note match the same path
+/// in a run's ledger — the two tokens are `src` and `state` either way, and `rs`
+/// falls under the floor.
+///
+/// A [`BTreeSet`](std::collections::BTreeSet) and not a `HashSet`: the iteration
+/// order of a `HashSet` is seeded per process, and 0.57.0's ranking must be a
+/// pure function of the store and the turn or a replayed run recalls differently
+/// than the run it replays.
+pub(crate) fn memory_tokens(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// How much two token sets have in common, as `(shared, total)` — the two halves
+/// of `|A ∩ B| / |A ∪ B|`, returned rather than divided (0.57.0).
+///
+/// Returned as a pair so the caller compares by cross-multiplication instead of
+/// by float division: `shared * 100 >= total * percent` is exact at the
+/// threshold, where `shared as f64 / total as f64 >= 0.6` is at the mercy of
+/// whichever way the division rounded.
+pub(crate) fn memory_overlap(
+    a: &std::collections::BTreeSet<String>,
+    b: &std::collections::BTreeSet<String>,
+) -> (usize, usize) {
+    let shared = a.intersection(b).count();
+    (shared, a.len() + b.len() - shared)
+}
+
+/// How much of two texts must overlap before one is reported as restating the
+/// other, in percent of their union (0.57.0).
+///
+/// High deliberately. A hit is handed to the model as "you already hold this
+/// under another key", and a threshold that fires on a neighbouring subject
+/// teaches the model to ignore the line — which costs more than the report is
+/// worth. At 60 the two texts share three words in five.
+const MEMORY_SIMILAR_PERCENT: usize = 60;
+
+/// Whether one text restates another: at least [`MEMORY_SIMILAR_PERCENT`] of the
+/// two token sets' union is shared (0.57.0).
+///
+/// Cross-multiplied rather than divided, so nothing rounds. Two texts with no
+/// words at all between them are not similar — an empty union would otherwise
+/// divide by zero, and "these two say nothing" is not a restatement.
+pub(crate) fn memory_is_similar(
+    a: &std::collections::BTreeSet<String>,
+    b: &std::collections::BTreeSet<String>,
+) -> bool {
+    let (shared, total) = memory_overlap(a, b);
+    total > 0 && shared * 100 >= total * MEMORY_SIMILAR_PERCENT
+}
+
 /// The workspace key the scope above every workspace is stored under (0.56.0).
 ///
 /// Durable memory is keyed by a workspace's canonical path. A fact true of every
@@ -7469,6 +7532,92 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0.57.0 F13. The measure both halves of the release rest on, asserted at
+    /// the unit rather than through a store, because everything above it is a
+    /// consumer of exactly these four properties.
+    ///
+    /// The criterion's parenthetical said a float comparison would flip the
+    /// boundary case. It does not, and that is recorded rather than quietly
+    /// dropped: an exactly-60% ratio divides to the same `f64` the literal `0.6`
+    /// parses to, because both round to the nearest double of the same real
+    /// number. What the integer comparison buys is that there is no rounding to
+    /// reason about at all — so the boundary is asserted in both directions
+    /// instead, which is what `>` in place of `>=` breaks.
+    #[test]
+    fn the_overlap_measure_is_symmetric_exact_and_immune_to_word_order() {
+        let a = memory_tokens("the release gate runs cargo clippy with all features");
+        let b = memory_tokens("features all with clippy cargo runs gate release the");
+        assert_eq!(
+            memory_overlap(&a, &b),
+            memory_overlap(&b, &a),
+            "the measure must not depend on which text is asked about first"
+        );
+        let (shared, total) = memory_overlap(&a, &b);
+        assert_eq!(shared, total, "the same words in another order are the same set");
+
+        // One word added is one word of disagreement, and the pair is no longer
+        // maximally similar. It is still well over the threshold, which is the
+        // point of a threshold rather than an equality.
+        let c = memory_tokens("the release gate runs cargo clippy with all features twice");
+        let (shared, total) = memory_overlap(&a, &c);
+        assert!(shared < total, "an added word must cost something");
+        assert!(memory_is_similar(&a, &c), "one word in nine is not a new fact");
+
+        // The boundary, in both directions, on a pair whose ratio is exactly the
+        // threshold: three shared words and two on each side that are not.
+        let left = memory_tokens("alpha bravo charlie delta echo");
+        let right = memory_tokens("alpha bravo charlie foxtrot golf");
+        assert_eq!(memory_overlap(&left, &right), (3, 7));
+        assert!(
+            !memory_is_similar(&left, &right),
+            "three in seven is 42 percent and must not report"
+        );
+        let right = memory_tokens("alpha bravo charlie delta foxtrot");
+        assert_eq!(memory_overlap(&left, &right), (4, 6));
+        assert!(
+            memory_is_similar(&left, &right),
+            "four in six is 66 percent and must report"
+        );
+        let left = memory_tokens("alpha bravo charlie delta echo");
+        let right = memory_tokens("alpha bravo charlie delta foxtrot golf hotel");
+        assert_eq!(memory_overlap(&left, &right), (4, 8));
+        assert!(
+            !memory_is_similar(&left, &right),
+            "exactly half is under the threshold, so the comparison is not merely non-zero"
+        );
+    }
+
+    /// 0.57.0 F13, the normaliser's own half. A path in a note and the same path
+    /// in a run's ledger have to reduce to the same tokens, or the signal the
+    /// ranking rests on never fires.
+    #[test]
+    fn the_normaliser_reduces_a_path_and_a_sentence_to_the_same_words() {
+        let from_note = memory_tokens("the eviction order lives in src/state.rs");
+        let from_ledger = memory_tokens("src/state.rs");
+        assert!(
+            from_note.contains("state") && from_note.contains("src"),
+            "a path in prose has to split into its components"
+        );
+        assert_eq!(
+            memory_overlap(&from_note, &from_ledger).0,
+            2,
+            "`src` and `state`; `rs` is under the floor"
+        );
+        assert!(
+            !from_note.contains("in") && !from_note.contains("rs"),
+            "anything shorter than three characters is dropped, which is the stopword list"
+        );
+        assert_eq!(
+            memory_tokens("CARGO Cargo cargo"),
+            memory_tokens("cargo"),
+            "case is not a distinction a note and a goal should differ on"
+        );
+        assert!(
+            memory_tokens("").is_empty() && memory_tokens("a of is").is_empty(),
+            "a text with nothing to say produces no signal rather than a false one"
+        );
+    }
 
     /// 0.30.0 F4, first half. [`MEMORY_KIND_NAMES`] is what
     /// [`MemoryKind::from_stored`] matches on, so a variant missing from it
