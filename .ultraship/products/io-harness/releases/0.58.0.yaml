@@ -1,0 +1,738 @@
+product: io-harness
+version: 0.58.0
+status: released
+release_type: minor
+
+outcome:
+  user_can: >
+    An operator can see what a store is holding and decide what it keeps.
+
+    Every `DELETE` this crate issues today serves one of its own purposes — a consumed spawn
+    (`src/state.rs:4813`), a replaced plan (`:6442`), a rewind (`:6827`), a forgotten note
+    (`:7127`, `:7361`). There are ten of them and not one removes a session, a run or a turn. A
+    program that wants to keep ninety days of history has to write SQL against thirty-three tables
+    this crate owns and versions, and the first release that moves one of them breaks that program
+    silently. Deferring the retention policy to the caller is right — the trace lives in the file
+    the caller opened, and how long an audit record survives is not a library's decision. Handing
+    them no instrument to carry the policy out is what makes it a hole.
+
+    After this release there are four instruments and they are all on `Store`. **Size** answers what
+    a session and a store are actually holding, so growth is visible before it is a problem.
+    **Deletion** removes a session whole — its turns, the runs those turns drove, every child run
+    those runs spawned, and every row the thirty-three tables hang off them — in one transaction,
+    reporting what went. **Sweeping** applies the same removal to every session older than a date,
+    because "keep ninety days" is the shape almost every retention decision takes. **Archiving**
+    keeps the session and empties it of words. And **compaction** returns the freed pages to the
+    filesystem, because SQLite frees them into the file rather than out of it and a prune that
+    leaves the file the size it was has not done what the operator asked.
+
+    **A session's size is reported in content bytes, and that is a deliberate correction to the
+    roadmap entry's "cost on disk".** `dbstat` is available — the bundled `libsqlite3-sys` compiles
+    with `-DSQLITE_ENABLE_DBSTAT_VTAB` — but it reports pages per b-tree, per table, and a page
+    cannot be attributed to a session. So `Store::session_size` reports the bytes of the session's
+    own rows and how many rows they are, which is exact and reconstructible, and
+    `Store::store_size` reports the file's real page arithmetic and a per-table breakdown from
+    `dbstat` beside it. An operator gets a true number for the file and a true number for the
+    session; neither is dressed up as the other.
+
+    **Archiving keeps every row and empties every column that holds words.** The roadmap entry says
+    the conversation text goes and the ledger and accounting rows stay, and taken table by table
+    that sentence does not hold: `provider_calls` is the only table in the schema that is pure
+    accounting. The user's own words are in `steps.prompt`, every tool's output is in
+    `ledger_observations.text`, whole file contents are in `snapshots.before`, and the change itself
+    is in `edits.hunk`. An archive that emptied only `session_turns` would leave the transcript
+    sitting in three other tables while telling an operator it had removed it. So the rows stay —
+    counts, timings, tokens, cost, paths, verdicts, statuses, every number the accounting and the
+    audit rest on — and every text-bearing column across the session's runs is emptied. The
+    criterion is a needle sweep: a phrase from the archived conversation appears in no column of the
+    database afterwards.
+
+    Two rules hold it together, and both exist because a deletion is the one operation this crate
+    cannot take back. **A resumable run is never swept by a date.** A crash-resumable tree that
+    vanished because it was old is the worst thing this release could ship, so a session holding a
+    run in `RunStatus::Running` or `RunStatus::Paused` is refused by the sweep and named in what it
+    returns; removing it is a decision made per session, through the call that takes one id. And
+    **what an undo depends on goes when the run does** — a restore point without its run is a
+    promise the store cannot keep, so the count of restore points removed is part of what a deletion
+    reports, and a restore path that reaches an archived snapshot says so at the time rather than
+    writing an empty file over a real one.
+  business_value: >
+    This is the release that makes the crate's own retention position honest. The position — history
+    has no expiry, the embedding program decides — has been right since 0.1.0 and is unchanged here.
+    What was missing is that the program could not act on it without reaching around the library
+    into a schema that has grown by twenty tables in the last thirty releases and carries no
+    `ON DELETE CASCADE` to lean on. Every one of those programs was one release away from breaking,
+    and the breakage would be a silent orphan rather than an error.
+
+    The archive half is the one that is not merely convenience. An audit obligation and a privacy
+    obligation pull in opposite directions on the same rows, and today the only instrument that
+    satisfies either is deleting the file, which satisfies exactly one. Keeping what a session cost
+    and what it touched while removing what was said in it is the shape almost every real
+    retention policy takes, and it cannot be assembled from outside the crate at all — it needs to
+    know which of a hundred and forty columns hold words.
+
+    Compaction is in scope rather than deferred for the same reason the size call is: an operator
+    who prunes and watches the file stay the same size concludes the prune did not work. It is a
+    separate call because `VACUUM` rewrites the database and wants room for a second copy of it,
+    which is a thing an operator does knowingly.
+  evidence_of_value: >
+    A store holding several sessions loses one of them by id and every row belonging to it is gone
+    from all thirty-three tables — asserted by enumerating `sqlite_master` at run time and checking
+    each table for surviving rows, not by checking the tables the author remembered. The sibling
+    sessions are untouched, row for row.
+
+    A sweep with a cutoff removes the sessions older than it, refuses the one holding a paused run,
+    names that session in what it returns, and leaves it byte-identical.
+
+    An archived session answers what it cost, how long it took and which files it touched exactly as
+    it did before, and a distinctive phrase from its conversation is found in no column of the
+    database — asserted by a sweep over every text column of every table, driven from
+    `sqlite_master` rather than a list.
+
+    A prune followed by a compaction leaves a file smaller than it was; the prune alone does not.
+    Both numbers are read from the same `Store::store_size`.
+
+scope:
+  included:
+  - >
+    **`Store::session_size(session_id) -> Result<Option<SessionSize>>`.** Content bytes and row
+    counts for one session: the number of turns, the number of runs in its tree, the total rows
+    across every table keyed to those runs, and the summed `length()` of their text and blob
+    columns. `None` for a session id that is not in the store. Stated in its own documentation as
+    the size of the content, not the pages it occupies.
+  - >
+    **`Store::store_size() -> Result<StoreSize>`.** The file's own arithmetic — `page_size ×
+    page_count` as the file's bytes and `page_size × freelist_count` as the bytes already free
+    inside it — plus a per-table breakdown of `SUM(pgsize)` from `dbstat`, and the counts of
+    sessions and runs the store holds. This is the call that answers "what is this store holding"
+    and the call an operator reads before and after a compaction.
+  - >
+    **`Store::delete_session(session_id) -> Result<Pruned>`.** One transaction. The run set is the
+    transitive closure of `session_turns.run_id` under `runs.parent_run_id` — the same recursive CTE
+    the tree resume already walks (`src/state.rs:5283`) — so a spawned child is removed with the
+    parent that spawned it. Every table keyed by `run_id`, `parent_run_id`, `child_run_id` or
+    `session_id` is cleared for that set, then the turns, then the session row. `Pruned` reports
+    sessions, turns, runs, total rows, the bytes those rows held, and the count of restore points
+    that went with them.
+  - >
+    **`Store::sweep_sessions(before: &str) -> Result<Pruned>`.** Every session whose `created_at` is
+    strictly before the cutoff, removed by the same code path, in one transaction. A session holding
+    any run whose `RunStatus` is `Running` or `Paused` is **refused, not deleted**, and its id is in
+    `Pruned::refused`. The run set for the whole sweep is collected once and every table is deleted
+    from once, so the cost is one pass over the schema for a sweep of any size rather than one pass
+    per session.
+  - >
+    **`Store::archive_session(session_id) -> Result<Archived>`.** Every row of the session's runs
+    stays. Every column holding text or a blob is emptied — `session_turns.prompt`/`reply`,
+    `steps.prompt`/`decision`/`result`/`tool_call`, `ledger_observations.text`, `summaries.text`,
+    `snapshots.before`, `handle_output`, `edits.hunk`, `citations`, `agent_events`, `mcp_events`,
+    `context_events`, `run_events`, `rewinds` and the rest — with the columns that carry a *kind*, a
+    *verdict*, a *path* or a *number* left alone, because those are what "what did this cost and
+    what did it touch" is made of. `Archived` reports the turns, the rows touched and the bytes
+    cleared. Archiving is idempotent: archiving twice clears nothing the second time and says so.
+  - >
+    **`Store::compact() -> Result<u64>`.** `VACUUM`, returning the bytes the file shrank by. Outside
+    any transaction, by construction, because SQLite refuses `VACUUM` inside one. Its documentation
+    states that the operation rewrites the database and needs free space of roughly the file's own
+    size while it runs, and that it is the only reclamation available here: every store this crate
+    has ever created was created without `auto_vacuum`, so `PRAGMA incremental_vacuum` does nothing
+    on any existing file.
+  - >
+    **An archived restore point says so rather than restoring nothing.** `snapshots.state` records
+    that the content was archived, and a restore path reaching such a row reports the existing
+    `Reverted::Stale` with a reason naming the archive rather than writing an empty file over a real
+    one. No new variant, no new signature.
+  - >
+    **One additive index, `session_turns(session_id)`.** It is the entry point of every call above
+    and the table has never carried one. Additive, and deliberately **not** a `CHECKPOINT_FORMAT`
+    bump, for the reason every addition since 0.13.0 has not been one: no checkpoint layout changes,
+    and bumping it would make `Store::check_resumable` refuse every 0.57.0 store over an index a
+    0.57.0 binary never names.
+  - >
+    Documentation for all of it in the checked-in surfaces — a retention section in the guide, the
+    `docs/CONTRACT.md` statement of what a deletion does and does not take, `docs/CAPABILITIES.md`,
+    the README and the changelog entry.
+  excluded:
+  - >
+    **Any automatic expiry, background job, or default retention window.** Nothing in this release
+    deletes anything unless a caller asks for it by name. The crate's position that history has no
+    expiry is unchanged; this release is the instrument, not a policy.
+  - >
+    **A new agent tool.** Every addition is a method on `Store`, reachable by the embedding program
+    and not by the model. A model that could delete its own trace is a model that can hide its work,
+    and no acceptance criterion in this crate's history would survive that.
+  - >
+    **`ON DELETE CASCADE`, `PRAGMA foreign_keys`, or any declared foreign key beyond the one that
+    exists.** Turning referential integrity on over a schema of thirty-three tables that was written
+    without it would change the failure mode of every existing insert path in the crate, on stores
+    written by every binary since 0.1.0. The cascade is written out, and the guard against a missed
+    table is a test driven from `sqlite_master` rather than a reviewer's attention.
+  - >
+    **Deleting a run without its session, or a turn without its subtree.** The unit is the session,
+    because a turn's run may have spawned children and a half-removed tree is the orphan state this
+    release exists to prevent. A run reachable from no session is out of scope and named in
+    `known_limitations`.
+  - >
+    **Deleting `memory` entries.** A note is a workspace asset that outlives the run that wrote it —
+    0.56.0 made that explicit by putting a scope above the workspace — so a session's removal never
+    takes a note. `memory_recalls` rows for removed runs **do** go, since they name a run that no
+    longer exists, and the consequence for 0.56.0's eviction ranking is stated rather than hidden.
+  - >
+    **Redacting a single turn, a single run, or a named string.** Archiving takes a session. A
+    targeted redaction is a different instrument with a different failure mode and it is not in this
+    release.
+  - >
+    **`auto_vacuum`, `incremental_vacuum`, or any change to how new stores are created.** Setting
+    `auto_vacuum` on a fresh store would split the crate's behaviour between old and new files and
+    would still do nothing for the stores an operator already has, which are the ones with the
+    problem.
+  - >
+    **Reporting a per-session number of pages.** Stated in `outcome.user_can` as a correction:
+    `dbstat` cannot attribute a page to a session and this release will not pretend otherwise.
+  fallback_scope:
+  - >
+    Size, deletion, sweeping and compaction, without archiving. "An operator can see what a store is
+    holding and decide what it keeps" is a coherent release without the middle option: the operator
+    can measure, remove whole sessions, apply a date policy, and get the space back. Archiving is
+    the half that has to be right about a hundred and forty columns rather than about thirty-three
+    tables, and it is the half that can move to 0.60.0 without stranding anything — nothing else in
+    this release depends on it.
+
+acceptance:
+  functional:
+  - >
+    **F1 — a deleted session leaves no row anywhere, and the check is driven from the schema.** A
+    store holding three sessions loses one. Every table named by
+    `SELECT name FROM sqlite_master WHERE type='table'` is then queried for rows belonging to that
+    session's runs, and every one is empty. The test enumerates the schema at run time, so a table
+    added by a later release fails this test until its deletion is written. Sabotage: drop any one
+    table from the cascade, under which only F1 fails — and it must fail for that table by name.
+  - >
+    **F2 — the sibling sessions are untouched, row for row.** Before and after the deletion, a
+    per-table row count for the surviving sessions is identical, and `Store::session_size` returns
+    the same numbers for them. Sabotage: delete by run id without constraining to the session's own
+    run set, under which the siblings lose rows and only F2 fails.
+  - >
+    **F3 — a spawned child goes with the parent that spawned it.** A session whose turn drove a run
+    that spawned two children, one of which spawned a third, loses all four runs and every row under
+    them. Asserted on the run ids from the tree rather than on a count. Sabotage: take the run set
+    from `session_turns.run_id` alone without the recursive walk, under which the three children
+    survive as orphans and only F3 fails.
+  - >
+    **F4 — the deletion is one transaction.** A failure injected partway through the cascade leaves
+    the store exactly as it was — every table's row count unchanged, the session still readable.
+    Asserted by driving the failure, not by reading the code for a `tx`. Sabotage: commit per table,
+    under which the store is left half-deleted and only F4 fails.
+  - >
+    **F5 — `Pruned` reports what actually went.** Its counts equal the row counts measured before
+    the deletion, and its `bytes` equals the `SessionSize::bytes` read immediately before. The
+    restore-point count equals the `snapshots` rows the session held. Sabotage: report the number of
+    tables touched rather than the rows removed, under which the equality fails and only F5 fails.
+  - >
+    **F6 — a sweep refuses a session holding a resumable run and names it.** Three sessions older
+    than the cutoff, one of which holds a run in `Paused` and another a run in `Running`. Both are
+    in `Pruned::refused`, both are still readable afterwards with identical row counts, and the third
+    is gone. A session holding only `Completed` and `Failed` runs is swept. Sabotage: filter on
+    `Running` alone, under which the paused session is deleted and only F6 fails.
+  - >
+    **F7 — a session newer than the cutoff is not swept, and the boundary is asserted exactly.** A
+    session whose `created_at` equals the cutoff string survives, because the comparison is strictly
+    before. Asserted with a pair of sessions one millisecond apart around the cutoff, not with a
+    pair a day apart. Sabotage: `<=`, under which the boundary session goes and only F7 fails.
+  - >
+    **F8 — a sweep of many sessions is one pass over the schema.** Asserted structurally, not on a
+    clock: the number of `DELETE` statements executed for a sweep of ten sessions equals the number
+    executed for a sweep of one, counted through the connection's own trace hook. This is the
+    criterion that forbids the natural implementation — loop over the sessions calling
+    `delete_session` — and it is the reason `Pruned` accumulates rather than being returned per
+    session. Sabotage: loop per session, under which the statement count scales with the sessions
+    and only F8 fails.
+  - >
+    **F9 — an archived session keeps every row and every number, and holds no words.** After
+    archiving: the per-table row counts are unchanged; `provider_calls` still answers the same token
+    and cost totals; `edits` still names the same paths with the same line counts; `run_outcomes`
+    still holds the same verdicts. Then a needle sweep — for every table and every `TEXT` or `BLOB`
+    column named by `PRAGMA table_info`, no value contains any of the fixture's distinctive phrases,
+    which are seeded into the prompt, the reply, a tool result, a summary, a snapshot's content and
+    an edit's hunk. Sabotage: empty `session_turns` only, under which the needles survive in
+    `steps.prompt` and only F9's second half fails.
+  - >
+    **F10 — archiving is idempotent and reports honestly the second time.** Archiving an
+    already-archived session clears zero rows and zero bytes and returns without error. Sabotage:
+    report the same counts on both calls, under which the second assertion fails and only F10 fails.
+  - >
+    **F11 — an archived restore point says so rather than restoring nothing.** A run whose snapshot
+    content was archived, reached by a restore path, reports `Reverted::Stale` with a reason naming
+    the archive, and the file on disk is byte-identical to what it was before the attempt. This is
+    the criterion that makes archiving safe to offer at all: writing an empty string over a real
+    file is the one way this release could destroy something outside the database. Sabotage: leave
+    `snapshots.state` unchanged on archive, under which the empty content is written and only F11
+    fails.
+  - >
+    **F12 — a prune alone does not shrink the file and a compaction does.** `Store::store_size`
+    read three times: before the deletion, after it, and after `Store::compact`. The file's bytes are
+    unchanged by the deletion and the free bytes rise; after the compaction the file's bytes have
+    fallen and the free bytes are near zero. `Store::compact` returns the difference. This is the
+    assertion that justifies compaction being in the release rather than a note in the guide.
+    Sabotage: return the freelist figure instead of the measured difference, under which the returned
+    value disagrees with the two reads and only F12 fails.
+  - >
+    **F13 — the size call is exact about what it counts.** For a store built with known content,
+    `SessionSize::bytes` equals the summed `length()` of the seeded values, computed independently in
+    the test, and `rows` equals the seeded row count. `StoreSize::file_bytes` equals
+    `page_size × page_count` read directly. Sabotage: count only the tables with an obvious text
+    column, under which the independent sum disagrees and only F13 fails.
+  - >
+    **F14 — a session that is not in the store is `None`, not an error and not a zero.** A size call
+    for an unknown id returns `None`; a deletion for an unknown id returns a `Pruned` whose counts
+    are all zero and does not fail. The two answers differ on purpose: asking the size of nothing has
+    no answer, and deleting nothing succeeds. Sabotage: return `Some` with zeroes, under which the
+    distinction collapses and only F14 fails.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` stays at **402** lines on the default build. This
+    release is SQL, one recursive CTE the crate already writes, and `dbstat`, which is compiled into
+    the bundled SQLite the crate already links.
+  - >
+    **N2 — the public surface addition is stated in advance.** `docs/public-api.txt` tracks
+    crate-root re-exports. The prediction is **+4 lines** — `SessionSize`, `StoreSize`, `Pruned`,
+    `Archived`. The six methods are on `Store`, which is already exported, and add nothing to the
+    snapshot. Any difference is explained in the record rather than absorbed.
+  - >
+    **N3 — the schema change is one index and nothing else.** `git diff main -- src/state.rs` shows
+    `CREATE INDEX IF NOT EXISTS session_turns_session ON session_turns (session_id)` and **no new
+    table, no new column, no dropped column and no `CHECKPOINT_FORMAT` movement**. A 0.57.0 binary
+    reads a 0.58.0 store and a 0.58.0 binary reads a 0.57.0 store.
+  - >
+    **N4 — zero compile breaks.** Four new types, six new methods, one new index, one new value in an
+    existing `TEXT` column. No existing signature changes shape and no enum gains a variant —
+    `Reverted::Stale` already carries a `String`, which is what F11 rests on.
+  - >
+    **N5 — the cost of a deletion is measured and recorded, never asserted.** The time to delete one
+    session is measured at three store sizes — a session of 10, 100 and 1,000 steps, in a store
+    holding ten such sessions — on a named machine, in `docs/MEASUREMENTS.md` with the method. The
+    shape to expect is stated in advance: **linear in the rows removed and linear in the number of
+    tables, with a full scan of each table that carries no `run_id` index**, which is most of them.
+    A timing that does not move when the rows grow tenfold is a defect report and not a pass — the
+    standing lesson of 0.56.0's N5. The sweep is measured at ten sessions beside it, and F8 is what
+    makes that number meaningful rather than accidental.
+  - >
+    **N6 — the compaction's cost and its space requirement are recorded.** The time to `VACUUM` a
+    store of a stated size, and the peak extra disk the operation takes, measured and written where
+    the operator decides whether to call it. This is a number an operator needs before running it on
+    a large file, and it is the reason the call is separate.
+  operational:
+  - >
+    **O1 — the three-platform matrix is green**, `--all-features` included.
+  - >
+    **O2 — nothing in the suite gates on a wall clock.** N5 and N6 are recorded, never asserted. F8
+    asserts a statement count rather than a duration, which is the whole reason it is written that
+    way. Stores are built by construction rather than by driving providers.
+  - >
+    **O3 — the cross-version gate runs, and it is the gate that matters most this release.**
+    `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` then
+    `cargo test --test cross_version_0_29_0 -- --ignored`. A release that deletes rows across
+    thirty-three tables and adds an index is exactly the shape that breaks a binary reading the same
+    file, and the gate is what proves it did not.
+  - >
+    **O4 — `docs/CONTRACT.md` gains a retention section, by name.** What a deletion takes, what it
+    leaves (notes, and anything reachable from no session), what an archive keeps, what refuses to
+    be swept, and the statement that nothing expires on its own. The contract has never spoken about
+    removal because there was nothing to say.
+  - >
+    **O5 — the nightly rustdoc gate passes with `-D warnings`.**
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`, run
+    **after** the version bump as well as before it. It has found something in seven of the last
+    nine releases.
+  - >
+    **O6 — the checked-in doc surfaces are updated in this release.** A retention page in
+    `docs/guide/`, `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md`, `docs/CONTRACT.md`, the README's
+    description of what the store holds, and the changelog. Every new public item carries a worked
+    example; `cargo test --doc` and `tests/public_api.rs` pass.
+  - >
+    **O7 — clippy on all three feature polarities**, default, one feature on, and `--all-features`.
+  - >
+    **O8 — the doc gates are re-run after the version bump.** 0.57.0 shipped a first CI round with
+    five red jobs because `readme_dependency_version_matches_cargo_toml` compares the README's pin to
+    `Cargo.toml` and the bump happens during `complete`, after the doc gates ran. The gates run
+    again on the bumped tree before the PR is opened.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.58.0, GitHub at initorigin/io-harness with the tag `v0.58.0` and a
+    Release titled `io-harness 0.58.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.58.0` off `develop`, committed incrementally as it lands,
+    including the sealed UltraShip release record and the hand-appended lock pin. PR into `develop`,
+    merged with the PR button. `develop`'s head and tree checked against the tree the gates ran on
+    immediately before the release PR is opened — `git diff --quiet feat/0.58.0 develop` — because a
+    Dependabot merge has landed above the feature merge twice in the last twenty releases. Release PR
+    `develop` into `main`, merged the same way. The GitHub Release is cut by `release.yml` from a tag
+    pushed alone, taking its notes verbatim from the changelog. `cargo publish --locked` by hand
+    afterwards, always last, after both merges and the Release exist, with the registry token sourced
+    from the repo-local `.env` in the same shell invocation. `develop` synced to `main`
+    fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    **One additive index, applied on open.** `session_turns(session_id)`. No table, no column, no
+    `CHECKPOINT_FORMAT` change. A 0.57.0 store gains the index when a 0.58.0 binary opens it, and a
+    0.57.0 binary reads a 0.58.0 store unchanged. An operator does nothing.
+  - >
+    **No behaviour changes for an operator who calls nothing new.** Every addition is a method that
+    must be called. A program upgraded to 0.58.0 and left alone behaves exactly as it did on 0.57.0.
+  - >
+    **One value appears in an existing column** — `snapshots.state` gains the value that records an
+    archived snapshot. A 0.57.0 binary reading it treats it as an unknown state, which is the case
+    F11 exists to make safe on this side.
+  observability:
+  - >
+    Every call returns what it did rather than logging it: `Pruned` names the sessions, turns, runs,
+    rows, bytes and restore points removed and the sessions refused; `Archived` names the turns, rows
+    and bytes cleared; `compact` returns the bytes reclaimed. No new event kind and no new row type
+    — a retention action is the embedding program's action, not a run's, so it has no `run_id` to
+    hang an event off and inventing one would put an operator's decision in an agent's trace. The
+    existing `Store::store_size` reading before and after is what an operator records if they want a
+    history of their own pruning.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.58.1 and `cargo yank --version
+    0.58.0` is the escape hatch, leaving 0.57.0 as what `cargo install` resolves. Downgrading needs
+    no migration: the added index is ignored by an older binary and the new `snapshots.state` value
+    is read as an unknown state. **What cannot be rolled back is a deletion that already happened** —
+    that is the nature of the instrument, it is why the resumable refusal exists, why the sweep names
+    what it refused instead of proceeding, and why every call reports what it did. An operator whose
+    recovery position is a file copy is told so in the guide, at the call.
+
+dependencies:
+  products: []
+  services:
+  - >
+    crates.io and GitHub Actions for the release itself, as every version.
+  - >
+    **No live provider call is required.** Every claim is about this crate's store, and is proven
+    in-process against real SQLite files on disk — not `Connection::open_in_memory`, since F12 is
+    about a file's size on a filesystem.
+  human_approvals:
+  - >
+    **Archiving empties every text-bearing column, not only the conversation table.** Decided at
+    specification time, 2026-08-15, by the owner, against the roadmap entry's "the ledger and the
+    accounting rows stay". The rows stay; their text does not. The reason is that `provider_calls` is
+    the only pure-accounting table in the schema, and an archive that left `steps.prompt`,
+    `ledger_observations.text` and `snapshots.before` intact would tell an operator it had removed
+    what it had not. Recorded as a correction rather than reworded to fit.
+  - >
+    **A session's size is content bytes, not pages.** Decided at specification time, 2026-08-15,
+    against the roadmap entry's "a session's cost on disk". `dbstat` is available but cannot
+    attribute a page to a session.
+  - >
+    **Everything is a `Store` method and nothing is an agent tool.** Decided at specification time.
+  - >
+    **`delivery.target_mode` is `published`.** Decided at specification time, 2026-08-15.
+  - >
+    The PR, both merges, the Release and the publish are pre-authorised for this version under the
+    standing flow.
+
+resource_profile:
+  complexity: large
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    **Thirty-three tables and one declared foreign key.** The schema carries exactly one
+    `REFERENCES` clause (`steps.run_id`) and never enables `PRAGMA foreign_keys`, so there is no
+    cascade to lean on and no error when a table is forgotten — the result is a silent orphan. This
+    is the release's central risk and F1's schema-driven enumeration is the only guard that scales
+    to the tables a later release will add.
+  - >
+    **The archive needs a column-level inventory, not a table-level one.** Roughly a hundred and
+    forty columns across the run-keyed tables, each one of which is either a word or a fact. Getting
+    it wrong in the safe direction empties a number an audit needed; in the unsafe direction it
+    leaves a transcript behind while reporting success. F9's needle sweep is driven from
+    `PRAGMA table_info` for that reason.
+  - >
+    **F8 forbids the obvious sweep implementation.** Looping over sessions calling `delete_session`
+    is the natural code and it makes the statement count scale with the sessions. The run set has to
+    be collected for the whole sweep first, which also means the resumable refusal has to be
+    evaluated before any deletion rather than per session.
+  - >
+    **`VACUUM` cannot run in a transaction and `rusqlite` will not warn.** It also fails on a
+    connection with an open statement. The call has to be the only thing happening on that
+    connection.
+  - >
+    **The recursive CTE cannot be seeked into**, which the crate has already paid for once — see the
+    standing rule that an `INDEXED BY` on a recursive term is not available. The tree walk is over
+    `runs`, which is small relative to the tables being deleted from, so the cost is in the deletes;
+    N5 states that shape rather than asserting a number.
+  - >
+    **A store built for these tests is large and on disk.** F12 needs a real file with real pages,
+    and N5 needs a thousand-step session. Both are slower to build than anything in the suite today.
+  preferred_tools:
+  - >
+    A new `tests/retention.rs` for F1–F14 — every criterion here is about a store, so the file needs
+    `tempfile` (already a dev-dependency) rather than the loop.
+  - >
+    `sqlite_master` and `PRAGMA table_info` read through the same `Store` connection, for F1's table
+    enumeration and F9's column enumeration.
+  - >
+    `rusqlite`'s trace hook for F8's statement count.
+  - >
+    `src/state.rs`'s existing unit tests for the size arithmetic.
+  constraints:
+  - >
+    **No new runtime dependency.** `cargo tree` flat at 402 on the default build.
+  - >
+    **MSRV 1.95, edition 2021, Apache-2.0.** Unchanged.
+  - >
+    **Every version stays 0.x.x.** No 1.0.0 is planned or implied.
+  - >
+    **One additive index and no other schema change**, and no `CHECKPOINT_FORMAT` bump.
+  - >
+    **No agent tool is added.** The retention surface is the embedding program's, not the model's.
+  - >
+    **`docs/CONTRACT.md`, the README, the changelog, the guide pages and `docs/CAPABILITIES.md` are
+    checked-in surfaces.** They change in this release, not the next one.
+
+risks:
+- >
+  **A table is missed and the store is left with orphans.** The failure is silent — no foreign key
+  fires, no error is returned, and the rows are simply unreachable and counted by nothing. This is
+  the release's worst outcome and it is worse than a crash because it is discovered months later as
+  a file that will not shrink. Mitigation: F1 enumerates `sqlite_master` at run time rather than
+  checking a list, so the test fails for any table the cascade does not name, including one a later
+  release adds; and `Pruned::rows` is asserted against the count measured before the deletion, so a
+  missed table shows up as an arithmetic disagreement as well as a surviving row.
+- >
+  **The archive leaves words behind and says it did not.** An operator running this to satisfy a
+  privacy obligation would be told the words are gone. Mitigation: F9's needle sweep is driven from
+  `PRAGMA table_info` over every table, so a column the author did not think of is still checked;
+  the needles are seeded into six different tables on purpose; and the release states in the guide
+  that the instrument removes what is in the database and can say nothing about what the operator's
+  own logs, provider account or filesystem hold.
+- >
+  **The archive empties something an audit needed.** The opposite error, and quieter. Mitigation:
+  the rule is stated as a rule — rows and numbers stay, words go — and F9 asserts the surviving side
+  explicitly, on tokens, cost, paths, line counts and verdicts, rather than only asserting the
+  absence of needles.
+- >
+  **A sweep deletes a run somebody was going to resume.** Mitigation: the refusal is on
+  `RunStatus::Running` and `Paused`, both of which F6 asserts; the refused ids are returned rather
+  than logged; and the per-session call is the only way past it, which makes it a decision somebody
+  made rather than a policy that ran.
+- >
+  **`VACUUM` fails or fills the disk on a large store.** It needs room for a second copy of the
+  file and it rewrites everything. Mitigation: it is a separate call an operator makes knowingly, its
+  documentation states the space requirement, N6 measures it, and a failure returns an error leaving
+  the original file intact — which is `VACUUM`'s own guarantee and not a claim this crate adds.
+- >
+  **Deleting a session shifts 0.56.0's memory eviction ranking.** Eviction ranks by
+  `COUNT(DISTINCT run_id)` over `memory_recalls`, and removing a session removes its recall rows, so
+  a note that had earned evidence from that session ranks lower afterwards. Mitigation: this is the
+  honest reading — evidence from a run that no longer exists is not evidence — and it is stated in
+  `known_limitations` and in the guide beside the eviction rules rather than discovered by an
+  operator whose notes started being evicted after a prune.
+- >
+  **The measured deletion cost is bad enough to be a design problem.** Most run-keyed tables carry no
+  index on `run_id`, so each delete is a full scan, and a store with a long history could make a
+  single session's removal expensive. Mitigation: N5 states the shape in advance and measures it; if
+  the number is bad, the upgrade path is indexes on the run-keyed tables in a later release, and that
+  conclusion belongs in the record with its number rather than in a guess made now.
+
+open_questions:
+- >
+  **Whether `sweep_sessions` should take a duration rather than a timestamp string.** The plan is the
+  string, because `sessions.created_at` is a `strftime` text column and a string comparison is what
+  the index and the storage actually do; a duration would need a clock inside the store, which is the
+  thing this crate's tests are forbidden from gating on. The guide shows how to build the string.
+- >
+  **Whether a session with no turns should be sweepable.** The plan is yes — it is a session row with
+  nothing under it, and leaving it is the orphan case in miniature.
+- >
+  **Whether `Pruned::refused` should carry the reason.** The plan is the ids alone: there is exactly
+  one reason a sweep refuses, it is stated in the method's documentation, and a reason string on a
+  single-cause refusal is a field that will be wrong the first time a second cause appears.
+- >
+  **Whether archiving should also refuse a session holding a resumable run.** The plan is no. The
+  sweep's refusal exists because a date is a policy applied to sessions nobody looked at; archiving
+  names one session, and a resumable run whose words are gone can still be resumed — it loses its
+  transcript, which is what the caller asked for. Recorded because it is the first asymmetry a reader
+  will question.
+- >
+  **What the per-table `dbstat` breakdown costs on a large store.** `dbstat` walks the b-tree pages,
+  so it is not free. The plan is to measure it in N6 alongside the compaction and, if it is
+  expensive, to make the breakdown a separate call rather than part of `store_size`.
+delivered: >
+  An operator can see what a store is holding and decide what it keeps. Six methods on `Store`, no
+  new dependency, no new table, no new column: `session_size` and `store_size` measure,
+  `delete_session` removes one session whole in one transaction, `sweep_sessions` applies that to a
+  date in one pass over the schema, `archive_session` keeps every row and empties every column that
+  holds words, and `compact` returns the freed pages to the filesystem. Nothing expires on its own —
+  the crate's position that retention is the embedding program's decision is unchanged, and this
+  release is the instrument that was missing rather than a policy.
+
+  **Two premises in the roadmap entry were wrong and both were corrected before any code was
+  written — the fifth release running that reading the source first changed what shipped.** A
+  session's cost on disk has no exact answer: `dbstat` is compiled into the bundled SQLite but
+  attributes a page to a table, and a page holds rows belonging to any number of sessions, so
+  `session_size` reports content bytes and `store_size` reports the file's page arithmetic beside
+  it. And "the ledger and the accounting rows stay" does not hold table by table: `provider_calls`
+  is the only pure-accounting table in the schema, while the user's own words are in `steps.prompt`,
+  every tool result is in `ledger_observations.text` and whole file contents are in
+  `snapshots.before`. Archiving therefore keeps every row and empties every word — the owner's
+  decision, taken against the entry's prose, because an archive that emptied only `session_turns`
+  would report a removal it had not performed.
+
+  A resumable run is never swept by a date. A restore point that can no longer restore says so at
+  the time rather than writing an empty file over a real one. And a note is never taken: a `memory`
+  entry outlives the run that wrote it, though its recall rows do not, and what that costs 0.56.0's
+  eviction ranking is stated in the guide rather than left to be discovered.
+released_at: 2026-08-15T00:00:00Z
+mode: published
+evidence:
+  tests:
+  - >
+    **Default suite: 88 binaries, 1,351 tests, 446 doctests, 0 failures.** `cargo test
+    --no-fail-fast`. 0.57.0 was 86 binaries and 1,334 / 440, so this release adds two binaries
+    (`tests/retention.rs` and the packaged verify target), 17 tests and 6 doctests. One binary
+    (`guide_pages`) failed the first full run because `docs/guide/retention.md` was not yet in
+    `GUIDES` — the gate refusing an unchecked page, fixed and re-run green (7 passed).
+  - >
+    **`tests/retention.rs` — 16 passed.** F1
+    (`a_deleted_session_leaves_no_row_in_any_table_the_schema_names`), F2
+    (`deleting_one_session_leaves_the_others_row_for_row`), F3
+    (`a_spawned_child_goes_with_the_parent_that_spawned_it`, two levels of real spawns), F4
+    (`a_deletion_that_fails_partway_leaves_the_store_exactly_as_it_was`, a RAISE trigger inside the
+    cascade), F5 (`the_pruned_report_equals_what_the_store_held_a_moment_earlier`), F6
+    (`a_sweep_refuses_a_session_holding_a_resumable_run_and_names_it`), F7
+    (`the_sweeps_cutoff_is_strictly_before_and_the_boundary_is_the_assertion`, one millisecond either
+    side), F9 (`an_archived_session_keeps_its_numbers_and_holds_none_of_its_words`), F10
+    (`archiving_twice_clears_nothing_the_second_time`), F11
+    (`an_archived_restore_point_reports_itself_rather_than_writing_an_empty_file`, through the real
+    `rewind_run`), F12 (`a_prune_frees_pages_into_the_file_and_a_compaction_returns_them`), F13
+    (`the_size_of_a_session_is_the_bytes_of_its_own_rows`,
+    `the_size_of_a_store_is_the_files_own_page_arithmetic`) and F14
+    (`the_size_of_a_session_that_is_not_there_is_none`,
+    `deleting_a_session_that_is_not_there_succeeds_and_reports_nothing`).
+  - >
+    **`cargo test --lib` — 490 passed.** F8
+    (`a_sweep_of_many_sessions_issues_the_same_statements_as_a_sweep_of_one`) and
+    `a_column_the_archive_has_never_heard_of_is_treated_as_words`.
+  - >
+    **Cross-version gate: all three halves pass, and it is the gate that earned its place this
+    release.** `cargo test --test cross_version` (7 passed) REFUSED the release until the new index
+    was declared in `ADDED_SINCE_0_22_0` — an index added over a table 0.22.0 created has to be a
+    stated addition rather than a surprise in a diff, and the failure named the fix. Then `cargo
+    build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml`, `cargo test --test
+    cross_version_0_29_0` (2 passed) and `-- --ignored` (1 passed): a 0.29.0 binary opens a 0.58.0
+    store and never names the index.
+  - >
+    **Sabotage: 14 arms, and every one now kills a named test.** Four survived their first run and
+    every one was a defect in this release's own tests rather than a superfluous guard; a fifth arm
+    was inert rather than a finding. All described in `known_limitations` and in the reviews below.
+    Logs in `evidence/0.58.0/sab-*.log`.
+  builds:
+  - "`cargo fmt --all --check` — exit 0 against the shipped tree."
+  - >
+    **`cargo clippy --all-targets -- -D warnings` — exit 0 on all three polarities** (O7): the
+    default build, `--features media`, and `--all-features`. Clean on the first attempt at every one.
+  - "**`cargo tree` — 402 lines, unchanged** (N1). No new dependency; `dbstat` is compiled into the
+    bundled SQLite this crate already links."
+  - "**`cargo package --locked` — 1,928,802 bytes, 256 files** (0.57.0: 1,893,318 and 254)."
+  - >
+    **The schema change is one index and nothing else** (N3): `git diff main -- src/state.rs` shows
+    a single `CREATE INDEX IF NOT EXISTS session_turns_session ON session_turns (session_id)` and no
+    new table, no new column, no dropped column and no `CHECKPOINT_FORMAT` movement.
+  - >
+    **`docs/public-api.txt` +4 lines — N2 predicted exactly +4 and got exactly that.** `Archived`,
+    `Pruned`, `SessionSize`, `StoreSize`. The six methods are on `Store`, which was already exported.
+  - "**Doc gates, re-run AFTER the version bump** (O8): `changelog` 5 passed, `docs_drift` 15 passed,
+    `public_api` 9 passed, `guide_pages` 7 passed. 0.57.0 shipped five red CI jobs by not doing this."
+  - >
+    **Measurement (N5, N6), recorded and not asserted.** Apple M1, release profile, stores on disk:
+    removing a session of 10 / 100 / 1,000 steps costs 1.140 / 1.564 / 5.832 ms for 23 / 203 / 2,003
+    rows — the two predicted terms adding up, thirty-two statements whatever the size plus the rows,
+    so 0.56.0's flat-timing defect shape did not recur. A sweep of ten sessions is 4.9× and 4.0×
+    cheaper than ten deletions. A compaction returned 652 KiB of a 1,560 KiB file in 6.292 ms and
+    needs a second copy of the file while it runs. In `docs/MEASUREMENTS.md` with the method.
+  reviews:
+  - >
+    **Both roadmap premises were wrong and the corrections were made before any code was written —
+    fifth release running.** Recorded in `roadmap.yaml` rather than reworded to fit. `dbstat` cannot
+    attribute a page to a session; `provider_calls` is the only pure-accounting table in the schema.
+  - >
+    **THE ARCHIVE'S NEEDLE SWEEP FOUND THREE DEFECTS REVIEW DID NOT, and every one would have
+    shipped an archive that reported a removal it had not performed.** (1) `runs.goal` was classified
+    as a fact, and for a run driving a session turn the goal IS the user's prompt, so the question
+    survived in the trace after the conversation lost it. (2) `decision` was in the universal fact
+    list because it is a verdict in `policy_events`; in `steps` it is the model's own words, which is
+    why the judgement had to become per-table rather than per-column-name. (3) Summing every text
+    column counted the kinds and paths the archive deliberately keeps, so a SECOND archive reported
+    clearing 148 bytes it never cleared — caught by F10's idempotence assertion, not by reading.
+  - >
+    **FOUR SABOTAGE ARMS SURVIVED THEIR FIRST RUN AND ALL FOUR WERE EMPTY TESTS.** (1) Enumerating
+    `sqlite_master` proves nothing about a table the fixture never wrote to: dropping `citations`
+    from the cascade failed nothing. (2) A `BEFORE DELETE` trigger on the LAST table in the cascade
+    never reaches the turns, the runs or the session, so F4's assertion on those three passed whether
+    or not the removal was atomic — removing the transaction entirely failed nothing. (3) F8 counted
+    statements through `prune_counted`, which a `sweep_sessions` that looped over sessions leaves
+    perfectly invariant. (4) F13's fixture wrote only `steps`, which is inside any prefix of the
+    table list, so counting the first four tables produced the same number.
+  - >
+    **A fifth arm was inert rather than a finding, and the distinction is worth keeping.** Moving one
+    delete from the transaction handle to `self.conn` changes nothing: both are the same connection,
+    and SQLite has one transaction per connection. An arm that cannot express the defect it is
+    testing for is not evidence that the guard is load-bearing — it is a sabotage that was never
+    applied. Re-run as S4b by removing the transaction altogether, which does kill F4.
+  - >
+    **The cross-version gate refused the release and named the fix**, which is the third release in
+    a row it has justified its cost. An additive index over a pre-existing table is exactly the shape
+    that reads as harmless in a diff.
+  - >
+    **The `Pruned`/`SessionSize` measures disagreed by one and F5's equality caught it** before
+    either number was documented: the deletion counted the session's own row and the size call did
+    not. They are one measure now, which is the only thing that makes F5 mean anything.
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **Nothing removes a run that no session reaches.** A run started by `run` or `run_with` rather
+  than by a session turn is named by nothing, so no retention call finds it. Stated in the guide.
+  Removing it needs an entry point keyed on a run, which is a different instrument with a different
+  failure mode and is not in this release.
+- >
+  **Pruning a session lowers the standing of the notes it drew on.** 0.56.0's eviction ranks by
+  `COUNT(DISTINCT run_id)` over `memory_recalls`, and a removal takes that session's recall rows. A
+  note that earned its place mostly through runs now removed can be evicted by a later write that
+  would previously have evicted something else. This is the honest reading — evidence from a run
+  that no longer exists is not evidence — and it is in the guide beside the eviction rules.
+- >
+  **A removal is linear in the rows AND in the number of tables, and most run-keyed tables carry no
+  index on `run_id`.** Each delete is therefore a full scan of its table. Measured rather than
+  guessed (N5): 1.140 ms for a 23-row session, where thirty-two statements are nearly all of the
+  cost. If a store's history makes this expensive, the upgrade path is indexes on the run-keyed
+  tables in a later release, and that conclusion belongs with a number rather than with this
+  sentence.
+- >
+  **F8 is met in a different form, and the form is stronger.** The criterion names `rusqlite`'s
+  trace hook; that needs the `trace` feature and a connection the test owns, and `Store::from_conn`
+  is private. The count is instead returned by `pub(crate)` `prune_counted` and `sweep_counted`, and
+  asserted both invariant across sweep sizes AND equal to `RUN_TABLES.len() + 3` — which pins it to
+  the schema rather than only to itself.
+- >
+  **The archive's fact list is a judgement, and its default is to clear.** A column a later release
+  adds and does not name in `is_fact_column` is treated as words. That is the safe direction — a
+  lost number the trace can live without, rather than a kept sentence the archive promised to
+  remove — and it is asserted rather than left to the reader.
+- >
+  **An archive removes what is in the database and can say nothing about anything else.** Not the
+  operator's own logs, not their provider account, not their filesystem. Stated in the guide at the
+  call.
+- >
+  **`compact` needs free disk of roughly the file's own size while it runs**, because `VACUUM`
+  rewrites the database. There is no incremental option: every store this crate has created was
+  created without `auto_vacuum`, so `PRAGMA incremental_vacuum` does nothing on any existing file.
+- >
+  **A deletion cannot be undone by this crate.** That is the nature of the instrument. It is why the
+  sweep refuses a resumable run, why it names what it refused rather than proceeding, and why every
+  call reports what it did while the information still exists.
+supersedes: 0.57.0
+next_recommended_version: 0.59.0
+immutable: true

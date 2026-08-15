@@ -9,6 +9,73 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What removing history costs (0.58.0)
+
+**What is being measured.** 0.58.0 gives an operator four instruments — a size,
+a deletion, a sweep and an archive — plus a compaction. Three questions matter
+before anyone runs them on a store that has been accumulating for a year: what a
+removal costs, whether a sweep is really one pass over the schema rather than a
+loop wearing a different name, and what a `VACUUM` costs and needs while it runs.
+
+**The shape to expect, stated before it was measured.** A removal is linear in
+the rows removed **and** linear in the number of tables, with a full scan of
+every table that carries no index on `run_id` — which is most of them. Both
+terms are visible below: at ten steps the per-table fixed cost dominates and the
+figure barely moves, and by a thousand steps the row term is what is being paid.
+
+**Method.** `retention_cost` in `src/state.rs`, `#[ignore]`d because it prints
+rather than asserts. Stores are built **on disk**, not in memory, because a
+compaction is about a file. Each store holds ten sessions of one turn and one run
+each, with the given number of steps and one ledger observation per step; one
+session is removed and timed.
+
+```text
+cargo test --release --lib retention_cost -- --ignored --nocapture
+```
+
+**Machine.** Apple M1, macOS 25.5.0, release profile, `rusqlite` 0.40.1 bundled.
+
+### Removing one session from a store of ten
+
+| Steps in the session | Rows removed | Bytes removed | Time |
+| --- | --- | --- | --- |
+| 10 | 23 | 1,473 | 1.140 ms |
+| 100 | 203 | 13,353 | 1.564 ms |
+| 1,000 | 2,003 | 132,153 | 5.832 ms |
+
+A hundredfold more rows costs about five times as much, which is the two terms
+adding up rather than a sublinear removal: thirty-two statements are issued
+whatever the size, and at ten steps they are nearly all of the cost.
+
+### A sweep against the loop it is not
+
+| Steps per session | `sweep_sessions`, 10 sessions | Ten `delete_session` calls | Ratio |
+| --- | --- | --- | --- |
+| 10 | 2.286 ms | 11.234 ms | 4.9× |
+| 100 | 3.681 ms | 14.690 ms | 4.0× |
+
+This is the timing beside the structural assertion, not instead of it: the
+statement count is what the suite asserts
+(`a_sweep_of_many_sessions_issues_the_same_statements_as_a_sweep_of_one`), and
+this is what that buys on one machine.
+
+### Compaction
+
+A store of twenty sessions of four hundred steps, half of them removed:
+
+| | |
+| --- | --- |
+| File before | 1,560 KiB |
+| Free inside it after the removals | 644 KiB |
+| File after `compact` | 908 KiB |
+| Returned to the filesystem | 652 KiB |
+| Time | 6.292 ms |
+
+**The peak extra disk a compaction needs is a second copy of the file** — about
+1,560 KiB here, and on a store of a gigabyte, a gigabyte. That requirement, not
+the duration, is why compaction is a call an operator makes knowingly rather than
+something a deletion does on their behalf.
+
 ## What ranking a turn's recall costs (0.57.0)
 
 **What is being measured.** 0.57.0 chooses which notes survive the memory block's

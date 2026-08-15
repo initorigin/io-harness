@@ -1,0 +1,33 @@
+product: io-harness
+version: 0.58.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      No recorded constraints exist for this release — `ultraship constraints` reports none, so this
+      assessment is made against the repository's own condition rather than against a user estimate,
+      and says so.
+    - >
+      The release adds no dependency, no table and no column. It is one index, four types, six
+      methods and a large amount of SQL against a schema that is already fully described in one
+      file.
+    - |
+      The deployment path is the standing flow and has carried the last twenty releases unchanged.
+    - >
+      Test coverage of the store is dense — 86 test binaries at 0.57.0 — and the new tests need
+      `tempfile`, which is already a dev-dependency.
+  major_cost_drivers:
+    - >
+      Thirty-three tables, one declared foreign key, and no `PRAGMA foreign_keys`. A missed table is
+      a silent orphan rather than an error, so the guard has to be schema-driven and the guard is
+      the hard part, not the deletes.
+    - >
+      The archive is a column-level inventory across roughly a hundred and forty columns, each of
+      which is either a word or a fact.
+    - >
+      F8 forbids the natural sweep implementation, so the run set and the resumable refusal both
+      have to be computed for the whole sweep before any deletion runs.
+  recommended_scope_change: null

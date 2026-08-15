@@ -1,285 +1,322 @@
 product: io-harness
-version: 0.57.0
+version: 0.58.0
 tasks:
-  - id: US-IO-HARNESS-0.57.0-T01
-    summary: One normaliser and one overlap measure, written once and called by both halves of the
-      release.
-    why_required: Both halves ask "how much do these two texts have in common", and two answers to
-      that question is how the ranking and the duplicate check come to disagree about what a word
-      is. The measure also has to be exact at its own threshold, which a float comparison is not.
+  - id: US-IO-HARNESS-0.58.0-T01
+    summary: The size half — `SessionSize`, `StoreSize`, and the one additive index every retention
+      call enters through.
+    why_required: >
+     Two later criteria are equalities against these numbers rather than assertions of their own —
+     `Pruned::bytes` is checked against the size read immediately before the deletion, and the
+     compaction is proved by three reads of the same store size. If the size call is wrong the
+     deletion and the compaction cannot be proved at all. It is also the half that delivers "an
+     operator can see what a store is holding" on its own.
     status: done
     depends_on: []
     acceptance_criteria:
       - >
-        **F13 — the overlap measure is symmetric, exact and immune to word order.** Unit-level: the
-        same two texts compared in either direction give the same answer; two texts with the same
-        words in a different order are maximally similar; a text and its own copy with one word
-        added is not; and the threshold comparison is made on integers, asserted by a pair whose
-        float ratio lands on the threshold exactly. Sabotage: compare with `as f64` division, under
-        which the exact-boundary case flips and only F13's last assertion fails.
-    files:
-      - src/context.rs
+        **F13 — the size call is exact about what it counts.** For a store built with known content,
+        `SessionSize::bytes` equals the summed `length()` of the seeded values, computed independently in
+        the test, and `rows` equals the seeded row count. `StoreSize::file_bytes` equals
+        `page_size × page_count` read directly. Sabotage: count only the tables with an obvious text
+        column, under which the independent sum disagrees and only F13 fails.
     evidence:
-    - "`the_overlap_measure_is_symmetric_exact_and_immune_to_word_order` and
-      `the_normaliser_reduces_a_path_and_a_sentence_to_the_same_words` in `src/state.rs` — 2 passed."
-    - "F13's parenthetical was wrong and is recorded rather than dropped: an exactly-60% ratio divides
-      to the same f64 the literal 0.6 parses to, so a float comparison does NOT flip the boundary. The
-      boundary is asserted in both directions instead, which `>` in place of `>=` breaks (arm S13)."
-
-  - id: US-IO-HARNESS-0.57.0-T02
-    summary: The draws aggregate — distinct runs per key — as a `pub(crate) const` beside
-      `MEMORY_CANDIDATES_SQL`, with its query plan asserted.
-    why_required: The ranking's second term needs it, and it runs once per scope per turn on a table
-      that grows by one row per carried key per step for the life of the store. Unindexed it is a
-      full scan on the turn's hot path, which is the failure 0.56.0 already paid to learn about.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        **F8 — the draws aggregate is answered from an index.** `EXPLAIN QUERY PLAN` over the exact
-        statement the crate runs, on a store holding 64 entries and 10,000 recall rows, names
-        `memory_recalls_entry` and contains no `SCAN memory_recalls`. Asserted on the plan text of
-        the `const` itself rather than a copy of it, as 0.56.0's F5 is. Sabotage: query by `run_id`
-        instead, under which the plan shows a scan and only F8 fails.
+    - "`the_size_of_a_session_is_the_bytes_of_its_own_rows`,
+      `the_size_of_a_store_is_the_files_own_page_arithmetic`,
+      `the_size_of_a_session_that_is_not_there_is_none` and
+      `a_seeded_run_can_be_put_into_every_status_the_sweep_reads` in `tests/retention.rs` — 4 passed."
+    - "The independence F13 claims is real on the dimension that can actually go wrong: the crate sums
+      over a static `RUN_TABLES` list, and the test sums over `sqlite_master`, so a table missing from
+      the crate's list makes the two disagree. Both read columns from `PRAGMA table_info`, which is
+      what keeps a column added by a later release counted without anyone remembering to."
+    - "`dbstat` answers on this build, as the premise check predicted — the per-table breakdown is
+      non-empty and sums to no more than the file's own bytes."
     files:
       - src/state.rs
-    evidence:
-    - "`ranking_recall_draws_seeks_the_recalls_rather_than_scanning_them` — the plan of
-      `Store::MEMORY_DRAWS_SQL` names `memory_recalls_entry` and contains no `SCAN memory_recalls`,
-      over 10,048 rows, with a column in no index as the control."
-    - "`the_draws_count_is_of_runs_and_not_of_rows` — 200 rows from one run rank below 3 rows from
-      three runs."
-    - "The row-count guard caught the fixture: 64 keys over 156 steps is 9,984 rows, not the 10,000
-      the criterion names. 0.56.0's sibling plan test has been sixteen short of its own claim since it
-      shipped; this one asserts the count rather than leaving it as arithmetic in a loop bound."
+      - src/lib.rs
+      - tests/retention.rs
 
-  - id: US-IO-HARNESS-0.57.0-T03
-    summary: Rank at `recall_scopes` from the turn's signals, and split `render_notes` into
-      best-first selection and chronological printing.
-    why_required: This is the release. Without it recall still curates by the write clock, which is
-      the policy 0.56.0's raisable caps made unsafe. The split is what makes a fitting store render
-      byte-identically, which is what keeps 0.44.0's cache boundary.
+  - id: US-IO-HARNESS-0.58.0-T02
+    summary: Deletion — the transitive run set, the cascade over every table, one transaction, and
+      the schema-driven guard that a table was not missed.
+    why_required: >
+     This is the instrument the release exists for, and the guard is the release's central risk:
+     the schema declares one foreign key and never enables `PRAGMA foreign_keys`, so a forgotten
+     table produces unreachable rows and no error at all.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.57.0-T01
-      - US-IO-HARNESS-0.57.0-T02
+      - US-IO-HARNESS-0.58.0-T01
     acceptance_criteria:
       - >
-        **F1 — a turn about one subject is handed the notes about that subject.** A store holds notes
-        on several subjects, sized so the block cannot fit them all. A turn whose goal names one
-        subject carries that subject's notes in `Assembled::recalled_keys`, and the notes of the
-        other subjects are the ones elided. The same store and the same turn on 0.56.0's ordering
-        carry the most recently written notes instead, and that control is written out in the test.
-        Sabotage: return the entries in `memory_list` order, under which the recency set is carried
-        and only F1 fails.
+        **F1 — a deleted session leaves no row anywhere, and the check is driven from the schema.** A
+        store holding three sessions loses one. Every table named by
+        `SELECT name FROM sqlite_master WHERE type='table'` is then queried for rows belonging to that
+        session's runs, and every one is empty. The test enumerates the schema at run time, so a table
+        added by a later release fails this test until its deletion is written. Sabotage: drop any one
+        table from the cascade, under which only F1 fails — and it must fail for that table by name.
       - >
-        **F2 — a path the run has already read counts as a signal.** With a goal that names nothing
-        in the store, a run whose ledger holds an `Observation` targeting `src/state.rs` carries the
-        note whose value mentions `src/state.rs` over a newer note that mentions nothing the run has
-        touched. Asserted on the carried keys, from a ledger built directly rather than by driving a
-        provider. Sabotage: build the signal set from the goal alone, under which the newer note is
-        carried and only F2 fails.
+        **F2 — the sibling sessions are untouched, row for row.** Before and after the deletion, a
+        per-table row count for the surviving sessions is identical, and `Store::session_size` returns
+        the same numbers for them. Sabotage: delete by run id without constraining to the session's own
+        run set, under which the siblings lose rows and only F2 fails.
       - >
-        **F3 — draws break a signal tie, and the write clock breaks a draw tie.** Two entries with an
-        identical overlap against the turn are separated by the number of distinct runs that carried
-        them; two entries equal on both are separated by `created_at, id`, which is the order
-        `memory_list` delivered. Both halves asserted in one test. Sabotage: drop the draws term,
-        under which the pair orders by clock alone and only F3's first half fails.
+        **F3 — a spawned child goes with the parent that spawned it.** A session whose turn drove a run
+        that spawned two children, one of which spawned a third, loses all four runs and every row under
+        them. Asserted on the run ids from the tree rather than on a count. Sabotage: take the run set
+        from `session_turns.run_id` alone without the recursive walk, under which the three children
+        survive as orphans and only F3 fails.
       - >
-        **F4 — one long run does not outvote many short ones.** The draws term is
-        `COUNT(DISTINCT run_id)`, so an entry carried at two hundred steps of one run ranks below one
-        carried at one step of each of three runs. This is 0.56.0's F2 asserted on the other side of
-        the same table, and it exists because the obvious spelling of "how often has this been drawn
-        on" is a row count. Sabotage: `COUNT(*)`, under which the 200-row entry wins and only F4
-        fails.
+        **F4 — the deletion is one transaction.** A failure injected partway through the cascade leaves
+        the store exactly as it was — every table's row count unchanged, the session still readable.
+        Asserted by driving the failure, not by reading the code for a `tx`. Sabotage: commit per table,
+        under which the store is left half-deleted and only F4 fails.
       - >
-        **F5 — a store that fits its share renders byte-for-byte what 0.56.0 rendered.** With every
-        note inside the block's quarter-share, the assembled text is identical to the text produced
-        with the ranking disabled — asserted as a string equality of the whole memory block, not on
-        the set of keys, because the caching claim in `outcome.user_can` is about bytes. Sabotage:
-        sort the kept set by rank before printing, under which the block's line order moves and only
-        F5 fails.
+        **F5 — `Pruned` reports what actually went.** Its counts equal the row counts measured before
+        the deletion, and its `bytes` equals the `SessionSize::bytes` read immediately before. The
+        restore-point count equals the `snapshots` rows the session held. Sabotage: report the number of
+        tables touched rather than the rows removed, under which the equality fails and only F5 fails.
       - >
-        **F6 — the same store and the same turn select the same notes twice.** Two consecutive
-        assemblies over one store with one goal and one ledger produce equal `recalled_keys` and
-        equal block text. A third assembly after one further note is written produces a selection
-        that is still a pure function of the new store — asserted by computing it twice. Sabotage:
-        seed the ranking with anything not derived from the store and the turn, under which the two
-        runs differ and only F6 fails.
-    files:
-      - src/context.rs
-      - src/run.rs
-      - tests/memory_recall.rs
+        **F14 — a session that is not in the store is `None`, not an error and not a zero.** A size call
+        for an unknown id returns `None`; a deletion for an unknown id returns a `Pruned` whose counts
+        are all zero and does not fail. The two answers differ on purpose: asking the size of nothing has
+        no answer, and deleting nothing succeeds. Sabotage: return `Some` with zeroes, under which the
+        distinction collapses and only F14 fails.
     evidence:
-    - "`tests/memory_recall.rs` — 6 passed: F1 (`a_turn_about_one_subject_carries_the_notes_about_that_subject`,
-      with the newest-cohort control asserted rather than described), F2
-      (`a_path_the_run_has_read_is_a_signal_the_next_turn_recalls_by`, two turns of one run), F3
-      (`draws_break_a_signal_tie_and_the_store_order_breaks_a_draw_tie`, evidence earned by real runs
-      rather than inserted rows), F5 (`the_block_is_printed_in_the_stores_order_however_the_turn_moves`),
-      F6 (`the_same_store_and_the_same_turn_select_the_same_notes_twice`)."
-    - "`Store::memory_list` tie-breaks on the key rather than the row id, which is what makes the
-      printed order reconstructible from an entry alone. `MemoryEntry` carries no `id`."
-    - "The elision line no longer says the dropped notes are `older`. They are dropped for being about
-      something else. This is a stated deviation from `scope.included`, which said the elision line was
-      unchanged: the substance of that line was kept and one word that had become false was not."
-
-  - id: US-IO-HARNESS-0.57.0-T04
-    summary: Build the turn's signals at the tree loop's recall site too, and prove a child agent
-      recalls under the same ordering.
-    why_required: A release that fixes the workspace loop and not the sub-agent one delivers a
-      feature that works until an agent spawns a child. `run_tree_with_extras` is a separate call
-      site and has been the place a rule lapses before.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.57.0-T03
-    acceptance_criteria:
-      - >
-        **F7 — the ranking reaches the sub-agent loop.** A child agent spawned by a tree run recalls
-        under the same ordering as the flat loop over the same store and the same goal — asserted by
-        driving a spawn and reading the child's assembled block, not by asserting that one function
-        has two callers. Sabotage: rank in `run_workspace_from` rather than in `recall_scopes`, under
-        which the child falls back to recency and only F7 fails.
-    files:
-      - src/run.rs
-      - tests/memory_recall.rs
-    evidence:
-    - "`a_spawned_child_recalls_under_the_same_ordering_as_the_flat_loop` — a real spawn, asserted on
-      the child's own prompt, with the parent as the control."
-    - "Sabotage run at the time of writing: replacing the tree loop's signals with an empty set failed
-      this test and nothing else across all 29 memory tests."
-    - "Found while sizing the fixture: a child's `TaskContract` is built fresh by the spawn and does
-      NOT inherit the root's `ContextBudget`, so a child always assembles under the default 24,000
-      tokens however tightly the root was bounded. Pre-existing and outside this release."
-
-  - id: US-IO-HARNESS-0.57.0-T05
-    summary: "`Store::memory_similar`, and the `remember` arm reporting the entry a new note
-      restates."
-    why_required: "`remember` writes by key, so the same fact under two names leaves two entries
-      that disagree and both are carried. The write is the only moment the writer's own intent is
-      still available to resolve it."
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.57.0-T01
-    acceptance_criteria:
-      - >
-        **F9 — a near-duplicate write names the key already held and what it holds.** A run writes
-        `build-command: "cargo test --all-features"` and then, under a different key, a value
-        restating it. The second call's tool result names the first key and contains its value; the
-        observation recorded in the ledger contains the same text. Sabotage: report only that a
-        duplicate exists without naming the key, under which the assertion on the key's presence
-        fails and only F9 fails.
-      - >
-        **F10 — an unrelated note is not flagged, and a rewrite of the same key is not flagged.** A
-        second note sharing no subject with anything stored produces the plain `[remember <key>]`
-        result with no second line; rewriting an existing key with a value nearly identical to its
-        own current value is a replacement and is not flagged either. Both halves asserted on the
-        absence of the flag text, because an implementation that flags everything passes any test
-        that only checks the positive case. Sabotage: drop the same-key exclusion, under which the
-        rewrite is flagged and only F10's second half fails.
-      - >
-        **F11 — the write still lands, and the entry is bounded and quoted with its cut marked.**
-        After a flagged write, `Store::memory_list` holds both entries: the harness reports and does
-        not refuse. A flagged entry whose value exceeds the quoting bound is quoted truncated with
-        the existing marker, so a 2,000-character note cannot push the turn's other observations out.
-        Sabotage: refuse the write on a hit, under which the two-entry assertion fails and only F11
-        fails.
-      - >
-        **F12 — the check is per scope.** A workspace write that restates a **global** note is not
-        flagged, because the workspace overriding a global note is 0.56.0's designed correction path;
-        a workspace write that restates another **workspace** note is. Both directions asserted, and
-        the global-write side asserted too, so the rule is "within the scope being written" rather
-        than "within the workspace bucket". Sabotage: compare against both scopes, under which the
-        override case is flagged and only F12's first half fails.
+    - "`a_deleted_session_leaves_no_row_in_any_table_the_schema_names` (F1),
+      `deleting_one_session_leaves_the_others_row_for_row` (F2),
+      `a_spawned_child_goes_with_the_parent_that_spawned_it` (F3),
+      `a_deletion_that_fails_partway_leaves_the_store_exactly_as_it_was` (F4),
+      `the_pruned_report_equals_what_the_store_held_a_moment_earlier` (F5) and
+      `deleting_a_session_that_is_not_there_succeeds_and_reports_nothing` (F14) in
+      `tests/retention.rs` — 10 passed with T01's four."
+    - "F4 injects its failure with a `BEFORE DELETE` trigger on `summaries` that RAISEs — a real abort
+      from inside the cascade rather than a mock, and the store is asserted whole afterwards."
+    - "F5 caught a real inconsistency before it shipped: `Pruned` counted the session row and
+      `SessionSize` did not, so the two figures for one session differed by one. They are now the same
+      measure, which is the only way F5's equality means anything."
+    - "F3 drives real spawned children through `start_child_run`, two levels deep, and asserts on the
+      run ids from the tree rather than on a count."
     files:
       - src/state.rs
-      - src/run.rs
-      - tests/memory_scope.rs
-    evidence:
-    - "`tests/memory_scope.rs` — 10 passed, 4 of them new: F9
-      (`a_note_that_restates_one_already_held_names_the_key_that_holds_it`), F10
-      (`an_unrelated_note_and_a_rewrite_of_one_key_are_not_flagged`, both halves on the ABSENCE of the
-      report), F11 (`a_flagged_write_still_lands_and_the_quote_is_bounded`), F12
-      (`the_duplicate_check_is_within_the_scope_being_written`, all three directions)."
-    - "F11's first fixture padded the held value with a new sentence and put the pair at exactly 50%
-      overlap — the measure working, not failing. Padding by repeating the same sentence is what a
-      restatement actually looks like."
+      - src/lib.rs
+      - tests/retention.rs
 
-  - id: US-IO-HARNESS-0.57.0-T06
-    summary: Measure the per-turn ranking cost and the added write-path cost at three store sizes,
-      and record them.
-    why_required: Both costs are paid on paths a turn runs every step, and both are bounded by caps
-      an operator sets. A release that hands an operator a knob without saying what pulling it costs
-      is the failure 0.56.0's own coupling paragraph exists to prevent — and its N5 is where that
-      release found a defect no review had.
+  - id: US-IO-HARNESS-0.58.0-T03
+    summary: The sweep — one cutoff, one pass over the schema, and a resumable run refused by name.
+    why_required: >
+     "Keep ninety days" is the shape the retention decision actually takes, and the refusal is the
+     rule that stops this release destroying a crash-resumable tree because it was old. The
+     one-pass requirement forbids the natural implementation, so it has to be built in rather than
+     optimised later.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.57.0-T03
-      - US-IO-HARNESS-0.57.0-T05
+      - US-IO-HARNESS-0.58.0-T02
     acceptance_criteria:
       - >
-        **N5 — the per-turn cost of ranking is measured and recorded, never asserted.** The time to
-        rank one scope is measured at three store sizes — 64, 512 and 4,096 entries, each with a
-        recall table proportional to the store and a ledger of 200 observations — on a named machine,
-        in `docs/MEASUREMENTS.md` with the method. The shape to expect is linear in entries × signal
-        tokens, stated as such; a timing that does not move when the input grows is a defect report
-        and not a pass, which is the standing lesson of 0.56.0's N5.
+        **F6 — a sweep refuses a session holding a resumable run and names it.** Three sessions older
+        than the cutoff, one of which holds a run in `Paused` and another a run in `Running`. Both are
+        in `Pruned::refused`, both are still readable afterwards with identical row counts, and the third
+        is gone. A session holding only `Completed` and `Failed` runs is swept. Sabotage: filter on
+        `Running` alone, under which the paused session is deleted and only F6 fails.
       - >
-        **N6 — the write path's added cost is measured at the caps an operator may set.** The time
-        for one `remember` call including `memory_similar` is measured at the same three sizes and
-        recorded beside N5. `memory_similar` reads at most `max_entries` rows, so the cost is bounded
-        by a cap the operator chose and is stated in the guide where that decision is made.
+        **F7 — a session newer than the cutoff is not swept, and the boundary is asserted exactly.** A
+        session whose `created_at` equals the cutoff string survives, because the comparison is strictly
+        before. Asserted with a pair of sessions one millisecond apart around the cutoff, not with a
+        pair a day apart. Sabotage: `<=`, under which the boundary session goes and only F7 fails.
+      - >
+        **F8 — a sweep of many sessions is one pass over the schema.** Asserted structurally, not on a
+        clock: the number of `DELETE` statements executed for a sweep of ten sessions equals the number
+        executed for a sweep of one, counted through the connection's own trace hook. This is the
+        criterion that forbids the natural implementation — loop over the sessions calling
+        `delete_session` — and it is the reason `Pruned` accumulates rather than being returned per
+        session. Sabotage: loop per session, under which the statement count scales with the sessions
+        and only F8 fails.
+    evidence:
+    - "`a_sweep_refuses_a_session_holding_a_resumable_run_and_names_it` (F6) and
+      `the_sweeps_cutoff_is_strictly_before_and_the_boundary_is_the_assertion` (F7) in
+      `tests/retention.rs`; `a_sweep_of_many_sessions_issues_the_same_statements_as_a_sweep_of_one`
+      (F8) in `src/state.rs`."
+    - "F8 IS MET IN A DIFFERENT FORM AND THIS IS RECORDED RATHER THAN ABSORBED. The criterion names
+      `rusqlite`'s trace hook; that needs the `trace` feature and a connection the test owns, and
+      `Store::from_conn` is private. The count is instead returned by a `pub(crate) prune_counted`,
+      asserted equal for a sweep of ten sessions and of one, AND asserted equal to
+      `RUN_TABLES.len() + 3` — which is a stronger claim than the criterion made, since it pins the
+      count to the schema rather than only to its own invariance."
+    - "F7 asserts one millisecond either side of the cutoff, not a day, and a session created at
+      exactly the cutoff survives."
+    - "F6 asserts a `failed` run is swept: finished is finished, and only `running`/`paused` refuse."
     files:
-      - src/run.rs
-      - docs/MEASUREMENTS.md
-    evidence:
-    - "`memory_recall_cost` in `src/run.rs`, ignored by default. Apple M1, release profile,
-      2026-08-15, medians of 20, over a 200-observation ledger (208 signal tokens): ranking one scope
-      is 1.106 / 11.088 / 119.171 ms at 64 / 512 / 4,096 entries; a `remember` including the duplicate
-      check is 1.946 / 21.172 / 201.369 ms."
-    - "Linear in entries and flat in the recall table — the timings moved by ~10x for an 8x input, so
-      0.56.0's flat-timing defect shape did not recur. Recorded in `docs/MEASUREMENTS.md` with the
-      method, the machine and the upgrade path if a store that large becomes ordinary."
+      - src/state.rs
+      - tests/retention.rs
 
-  - id: US-IO-HARNESS-0.57.0-T07
-    summary: Update every checked-in doc surface and the changelog to the behaviour this release
-      ships.
-    why_required: "`docs/CONTRACT.md`, the guide and the README all state that recall carries the
-      newest notes that fit, and 0.56.0 added a coupling paragraph whose conclusion this release
-      changes. A contract that describes the previous release is worse than no contract."
+  - id: US-IO-HARNESS-0.58.0-T04
+    summary: Archiving — every row kept, every column holding words emptied, and a restore point that
+      says so instead of writing an empty file.
+    why_required: >
+     This is the half that cannot be assembled from outside the crate, because it needs to know
+     which of a hundred and forty columns hold words. It is also the half with a way to destroy
+     something outside the database, which F11 is the guard against.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.57.0-T03
-      - US-IO-HARNESS-0.57.0-T05
-      - US-IO-HARNESS-0.57.0-T06
+      - US-IO-HARNESS-0.58.0-T02
     acceptance_criteria:
       - >
-        **O3 — `docs/CONTRACT.md` is amended in this release, by name.** Its memory section states
-        that recall carries the newest notes that fit. That changes. The new rules — selection by the
-        turn's signals then by draws then by the clock, the rendered order staying chronological and
-        why, and the near-duplicate report — are written where the old sentences stood.
+        **F9 — an archived session keeps every row and every number, and holds no words.** After
+        archiving: the per-table row counts are unchanged; `provider_calls` still answers the same token
+        and cost totals; `edits` still names the same paths with the same line counts; `run_outcomes`
+        still holds the same verdicts. Then a needle sweep — for every table and every `TEXT` or `BLOB`
+        column named by `PRAGMA table_info`, no value contains any of the fixture's distinctive phrases,
+        which are seeded into the prompt, the reply, a tool result, a summary, a snapshot's content and
+        an edit's hunk. Sabotage: empty `session_turns` only, under which the needles survive in
+        `steps.prompt` and only F9's second half fails.
       - >
-        **O6 — the checked-in doc surfaces are updated in this release.**
-        `docs/guide/context-and-memory.md` (what decides which notes are carried, and that the
-        printed order is chronological), `docs/guide/tools-and-skills.md` (`remember`'s duplicate
-        report), `docs/guide/configuration.md` (the coupling paragraph 0.56.0 added, which now says
-        what selection does past the share), `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md`, the
-        README's memory description and the changelog. Every new public item carries a worked
+        **F10 — archiving is idempotent and reports honestly the second time.** Archiving an
+        already-archived session clears zero rows and zero bytes and returns without error. Sabotage:
+        report the same counts on both calls, under which the second assertion fails and only F10 fails.
+      - >
+        **F11 — an archived restore point says so rather than restoring nothing.** A run whose snapshot
+        content was archived, reached by a restore path, reports `Reverted::Stale` with a reason naming
+        the archive, and the file on disk is byte-identical to what it was before the attempt. This is
+        the criterion that makes archiving safe to offer at all: writing an empty string over a real
+        file is the one way this release could destroy something outside the database. Sabotage: leave
+        `snapshots.state` unchanged on archive, under which the empty content is written and only F11
+        fails.
+    evidence:
+    - "`an_archived_session_keeps_its_numbers_and_holds_none_of_its_words` (F9),
+      `archiving_twice_clears_nothing_the_second_time` (F10) and
+      `an_archived_restore_point_reports_itself_rather_than_writing_an_empty_file` (F11) in
+      `tests/retention.rs`; `a_column_the_archive_has_never_heard_of_is_treated_as_words` in
+      `src/state.rs`."
+    - "THE NEEDLE SWEEP FOUND THREE DEFECTS THAT REVIEW DID NOT, and all three would have shipped an
+      archive that reported a removal it had not performed. (1) `runs.goal` was classified as a fact
+      — but for a run driving a session turn the goal IS the user's prompt, so the question survived
+      in the trace after the conversation lost it. (2) `decision` was in the universal fact list
+      because it is a verdict in `policy_events`; in `steps` it is the model's own words, which is
+      why the judgement had to become per-table. (3) `sum_of` had to be split out of `sum_text`:
+      summing every text column counted the kinds and paths the archive deliberately keeps, so a
+      SECOND archive reported clearing 148 bytes it never cleared — F10 caught that one."
+    - "F11 goes through the real `rewind_run`, not a stub: an archived snapshot returns
+      `Rewind::NotKept` naming the archive, and the file on disk is asserted byte-identical
+      afterwards. No new variant was needed — `Kept::Unkept` already carries the reason."
+    files:
+      - src/state.rs
+      - src/lib.rs
+      - src/run.rs
+      - tests/retention.rs
+
+  - id: US-IO-HARNESS-0.58.0-T05
+    summary: Compaction — `VACUUM` as a call an operator makes knowingly, returning what the file
+      actually shrank by.
+    why_required: >
+     SQLite frees pages into the file rather than out of it, so a prune that leaves the file the
+     size it was has not done what the operator asked. Without this the release's own instrument
+     looks broken to the person using it.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.58.0-T02
+    acceptance_criteria:
+      - >
+        **F12 — a prune alone does not shrink the file and a compaction does.** `Store::store_size` read
+        three times: before the deletion, after it, and after `Store::compact`. The file's bytes are
+        unchanged by the deletion and the free bytes rise; after the compaction the file's bytes have
+        fallen and the free bytes are near zero. `Store::compact` returns the difference. This is the
+        assertion that justifies compaction being in the release rather than a note in the guide.
+        Sabotage: return the freelist figure instead of the measured difference, under which the returned
+        value disagrees with the two reads and only F12 fails.
+    evidence:
+    - "`a_prune_frees_pages_into_the_file_and_a_compaction_returns_them` (F12) in
+      `tests/retention.rs` — the three store-size reads, plus a fourth assertion against
+      `std::fs::metadata`, so the filesystem agrees and not only SQLite's opinion of the file."
+    - "`compact` returns the measured difference between the file's size before and after, not the
+      freelist figure, which is what F12's equality pins."
+    files:
+      - src/state.rs
+      - tests/retention.rs
+
+  - id: US-IO-HARNESS-0.58.0-T06
+    summary: The checked-in surfaces, the measurements, and every gate the release is judged on.
+    why_required: >
+     The contract makes the docs and the gates part of this release rather than the next one, and
+     two of them are load-bearing this time: the cross-version gate is what proves an index and
+     thirty-three cascades did not break a binary reading the same file, and the doc gates have to
+     run again after the version bump because 0.57.0 shipped five red jobs by not doing that.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.58.0-T03
+      - US-IO-HARNESS-0.58.0-T04
+      - US-IO-HARNESS-0.58.0-T05
+    acceptance_criteria:
+      - >
+        **N1 — no new dependency.** `cargo tree` stays at **402** lines on the default build. This
+        release is SQL, one recursive CTE the crate already writes, and `dbstat`, which is compiled into
+        the bundled SQLite the crate already links.
+      - >
+        **N2 — the public surface addition is stated in advance.** `docs/public-api.txt` tracks
+        crate-root re-exports. The prediction is **+4 lines** — `SessionSize`, `StoreSize`, `Pruned`,
+        `Archived`. The six methods are on `Store`, which is already exported, and add nothing to the
+        snapshot. Any difference is explained in the record rather than absorbed.
+      - >
+        **N3 — the schema change is one index and nothing else.** `git diff main -- src/state.rs` shows
+        `CREATE INDEX IF NOT EXISTS session_turns_session ON session_turns (session_id)` and **no new
+        table, no new column, no dropped column and no `CHECKPOINT_FORMAT` movement**. A 0.57.0 binary
+        reads a 0.58.0 store and a 0.58.0 binary reads a 0.57.0 store.
+      - >
+        **N4 — zero compile breaks.** Four new types, six new methods, one new index, one new value in an
+        existing `TEXT` column. No existing signature changes shape and no enum gains a variant —
+        `Reverted::Stale` already carries a `String`, which is what F11 rests on.
+      - >
+        **N5 — the cost of a deletion is measured and recorded, never asserted.** The time to delete one
+        session is measured at three store sizes — a session of 10, 100 and 1,000 steps, in a store
+        holding ten such sessions — on a named machine, in `docs/MEASUREMENTS.md` with the method. The
+        shape to expect is stated in advance: **linear in the rows removed and linear in the number of
+        tables, with a full scan of each table that carries no `run_id` index**, which is most of them.
+        A timing that does not move when the rows grow tenfold is a defect report and not a pass — the
+        standing lesson of 0.56.0's N5. The sweep is measured at ten sessions beside it, and F8 is what
+        makes that number meaningful rather than accidental.
+      - >
+        **N6 — the compaction's cost and its space requirement are recorded.** The time to `VACUUM` a
+        store of a stated size, and the peak extra disk the operation takes, measured and written where
+        the operator decides whether to call it. This is a number an operator needs before running it on
+        a large file, and it is the reason the call is separate.
+      - >
+        **O1 — the three-platform matrix is green**, `--all-features` included.
+      - >
+        **O2 — nothing in the suite gates on a wall clock.** N5 and N6 are recorded, never asserted. F8
+        asserts a statement count rather than a duration, which is the whole reason it is written that
+        way. Stores are built by construction rather than by driving providers.
+      - >
+        **O3 — the cross-version gate runs, and it is the gate that matters most this release.**
+        `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` then
+        `cargo test --test cross_version_0_29_0 -- --ignored`. A release that deletes rows across
+        thirty-three tables and adds an index is exactly the shape that breaks a binary reading the same
+        file, and the gate is what proves it did not.
+      - >
+        **O4 — `docs/CONTRACT.md` gains a retention section, by name.** What a deletion takes, what it
+        leaves (notes, and anything reachable from no session), what an archive keeps, what refuses to
+        be swept, and the statement that nothing expires on its own. The contract has never spoken about
+        removal because there was nothing to say.
+      - >
+        **O5 — the nightly rustdoc gate passes with `-D warnings`.**
+        `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`, run
+        **after** the version bump as well as before it. It has found something in seven of the last
+        nine releases.
+      - >
+        **O6 — the checked-in doc surfaces are updated in this release.** A retention page in
+        `docs/guide/`, `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md`, `docs/CONTRACT.md`, the README's
+        description of what the store holds, and the changelog. Every new public item carries a worked
         example; `cargo test --doc` and `tests/public_api.rs` pass.
+      - >
+        **O7 — clippy on all three feature polarities**, default, one feature on, and `--all-features`.
+      - >
+        **O8 — the doc gates are re-run after the version bump.** 0.57.0 shipped a first CI round with
+        five red jobs because `readme_dependency_version_matches_cargo_toml` compares the README's pin to
+        `Cargo.toml` and the bump happens during `complete`, after the doc gates ran. The gates run
+        again on the bumped tree before the PR is opened.
+    evidence: []
     files:
       - docs/CONTRACT.md
       - docs/CAPABILITIES.md
-      - docs/guide/context-and-memory.md
-      - docs/guide/tools-and-skills.md
-      - docs/guide/configuration.md
-      - CHANGELOG.md
+      - docs/MEASUREMENTS.md
+      - docs/public-api.txt
+      - docs/guide/retention.md
       - README.md
-    evidence:
-    - "`docs/CONTRACT.md` — two new rules written where the memory section's own sentences stood, and
-      0.56.0's coupling paragraph now says raising a cap costs time rather than relevance."
-    - "`CHANGELOG.md` 0.57.0 section: 2 Added, 4 Changed."
-    - "`docs/guide/context-and-memory.md`, `docs/guide/tools-and-skills.md`,
-      `docs/guide/configuration.md`, `docs/CAPABILITIES.md`, `README.md` and the `render_notes`
-      rustdoc."
-    - "Doc gates: `changelog` 5 passed, `docs_drift` 15 passed, `public_api` 9 passed —
-      `public_surface_matches_snapshot` green with `docs/public-api.txt` UNCHANGED, which is N2's
-      predicted +0 lines met exactly."
+      - CHANGELOG.md

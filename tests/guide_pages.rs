@@ -90,6 +90,13 @@ const GUIDES: &[(&str, bool)] = &[
     // are not individually decided, nothing is ever downloaded, and a selector
     // that matches nothing must fail rather than read as a click that happened.
     ("browser.md", true),
+    // 0.58.0. It carries a limits block because a removal is defined by what it
+    // cannot take back and what it cannot see: nothing expires on its own, a
+    // deletion is not undoable by this crate, a session's size is content bytes
+    // and never pages on disk, a sweep will not touch a resumable run, and the
+    // whole instrument speaks only about what is in the database — never about
+    // the operator's own logs, their provider account, or their filesystem.
+    ("retention.md", true),
 ];
 
 fn guide_dir() -> PathBuf {
