@@ -1,7 +1,113 @@
 product: io-harness
 version: 0.59.0
-status: planned
+status: released
 release_type: minor
+
+released_at: 2026-08-16T02:00:00Z
+mode: published
+delivered: >
+  An operator on Windows can ask for a boundary and be given one, and can drive a browser there.
+
+  `SandboxConfig::with_access_confinement()` selects an AppContainer inside the Job Object and
+  reports `Backend::WindowsAppContainer`: writes confined to the paths the run resolved, and no
+  capability to reach the network unless the run's policy permits egress. The Windows default is
+  unchanged and is still the Job Object. And `browser::launch` no longer refuses on Windows — the
+  browser launches, attaches, navigates, clicks, types and screenshots there, in the ordinary
+  suite, behind neither an `#[ignore]` nor a platform gate.
+evidence:
+  tests:
+  - >
+    `cargo test --all-features` on macOS — **87 binaries, 1,926 passed, 0 failed**, plus **456
+    doctests**. Against 0.58.0's 88 binaries / 1,351: the count moved because this release's own
+    additions land in existing binaries and the suite is being reported whole rather than by the
+    default polarity.
+  - >
+    **The Windows leg, run on `windows-latest` before any PR was opened** (image
+    `win25-vs2026 20260810.198.2`). Container tests: `cargo test --all-features --lib sandbox::`
+    — **59 passed, 0 failed**. Browser suite: `cargo test --all-features --test browser` — **12
+    passed, 0 failed**, on a platform that had never run one.
+  - >
+    **`what_the_container_actually_permits_on_this_host` prints its table and every row reads
+    `backend WindowsAppContainer`** — a shell builtin, a granted read, a granted script, a
+    workspace write, a program on `PATH`, the toolchain binary by absolute path and a granted read
+    by absolute path all permitted; the three absolute-path script rows refused, which is the
+    documented `cmd.exe` property. No row answered by a Job Object, no row answered by a decline.
+  - >
+    **A real browser over the real transport**, `examples/browser_live` on `windows-latest`:
+    Chrome from `C:\Program Files`, headless, **cold start 5,305 ms**; navigated, read the page,
+    screenshotted, clicked, typed; console output and an uncaught page error reached the model as
+    its description; a navigation to an unnamed host was **refused** at the paused request. The
+    page is **44 bytes as text against 9,860 as a PNG**. Whole run 7.46 s, recorded, never
+    asserted.
+  - >
+    **The transport spike, against a real browser, before the contract was written.** Three
+    shapes: the CRT descriptor block alone **speaks**, the block plus a handle list **speaks**,
+    the two ends as standard handles **fail** with Chrome's own `Remote debugging pipe file
+    descriptors are not open`. A Rust child sees the same descriptors
+    (`_get_osfhandle(3)=0x114`, `(4)=0xf4`) and echoed a NUL-framed message back.
+  - >
+    **Sabotage: nine arms, every one kills its named test.** Seven on `windows-latest` (the
+    backend reported, a silent decline, unconditional selection, the memo key, the capability
+    array, the proxy, the claim table) and two locally (the proxy argument, the command-line
+    quoting). **Two survived the first pass and both were findings about the tests**, not props:
+    the capability table never constructs the case the fatal-grant guard exists for, so a test
+    that builds it was written; and one arm was inert rather than surviving, because it wrote the
+    proxy where the test does not read. A third arm reported a survival having **run nothing** —
+    a filter naming a renamed test matches zero tests and exits 0 — and the runner now reports
+    that as neither.
+  - >
+    `cargo test --test cross_version` — 7 passed. `CHECKPOINT_FORMAT` unmoved at **7**, no DDL,
+    `git diff main -- src/state.rs` empty.
+  builds:
+  - "`cargo build --all-features --tests` — exit 0 on macOS and on `windows-latest`."
+  - "`cargo fmt --check` — exit 0. `cargo clippy --all-features --lib --tests -- -D warnings` — exit 0."
+  - >
+    `RUSTDOCFLAGS=\"--cfg docsrs -D warnings\" cargo +nightly doc --all-features --no-deps` — exit
+    0, **found nothing**, which is now the third clean run in five releases rather than the norm.
+  - "`cargo package --locked` — 256 files, **1,945,857 bytes**."
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **Per-host egress is not enforced under Windows access confinement, and this is a platform
+  property rather than a deferral.** A process inside an AppContainer cannot reach a loopback
+  listener under any capability set, nor the host's own network address, so 0.48.0's proxy — the
+  mechanism that makes a per-host policy enforceable under containment — has nothing to bind to.
+  Egress there is the capability: all of the network, or none of it. A contained Windows command
+  is given no proxy at all, and the agent's own boundary section says so.
+  `US-IO-HARNESS-0.59.0-I03`.
+- >
+  **The Windows default is unchanged and that is deliberate.** The container is opt-in until the
+  derived grant set has run a real cargo build, a real npm install and a real python payload on
+  the CI image without a decline. Nothing in this release claims it has.
+- >
+  **`cmd.exe` cannot start a script named by an absolute path inside the container**, and `call`
+  with the byte-identical path can. Answered rather than fixed: it is not the grant set, not the
+  extension, not the separator and not the path's ancestors, because the same path works outside
+  the container and works inside it behind `call`. Documented with its workaround.
+- >
+  **F2 and F3 are met by the suite rather than by tests of their own, and that is stated rather
+  than implied.** F2 — the descriptors by number — is asserted by the fixture reading 3 and 4 and
+  the whole browser suite failing if either moves; a dedicated test would assert the same thing
+  twice. F3's stated risk, that a leaked pipe end hangs the run rather than failing it, cannot
+  occur in this implementation: `Spawned`'s `Drop` kills the child before closing its handles, and
+  `no_browser_process_survives_the_run` asserts that. The criterion was written before the
+  implementation settled and the implementation is the narrower claim.
+- >
+  **`docs/public-api.txt` did not move, where the contract predicted it would.** The snapshot
+  records root-level types, and every addition here is either a variant of an existing enum, a
+  method, a field, or a type under `sandbox::windows`, which that file has never tracked.
+  Recorded because a prediction that was wrong is worth more than a number quietly adjusted.
+- >
+  **The three-OS matrix over both feature polarities had not run at the time this record was
+  sealed.** What ran is the full local suite on macOS and a Windows job carrying the container
+  tests, the browser suite and the live browser. The release PR is where the matrix answers, and
+  the record is amended before the merge into `main` if it disagrees — the only window in which
+  that is legal.
+supersedes: 0.58.0
+next_recommended_version: 0.60.0
+immutable: true
 
 outcome:
   user_can: >

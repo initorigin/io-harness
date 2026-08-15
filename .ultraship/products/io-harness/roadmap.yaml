@@ -1591,7 +1591,7 @@ versions:
       never applied. It was invisible because nothing selects the backend and because the only
       network test asserts a denial, which an ignored array and an empty one produce alike.
     detail: specified
-    status: planned
+    status: released
   - version: 0.60.0
     outcome: >
       Agents in one tree can talk. A tree can nest, share one ledger, queue past its concurrency cap
