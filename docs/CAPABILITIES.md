@@ -38,6 +38,7 @@ the limits that capability actually has.
 | [Hooks](guide/hooks.md) | Reacting to a run from `io.toml`: an audit log, a notification, a formatter, a check that stops the run — and why the whole array is refused in the project scope |
 | [Providers](guide/providers.md) | One `Compatible` provider over any OpenAI-shaped endpoint, the 21 vendor presets, the local runtimes, what `Provider::models()` reports, the routing rules that change which model answers mid-run, and the optional method that reports a finished tool call while the completion is still streaming |
 | [Capability bundles](guide/plugins.md) | A directory that contributes skills, templates, agents, MCP servers, hooks and deny-only policy at once; what a project-scoped declaration may not hand you; how a contribution names the bundle it came from; and why a broken bundle is dropped rather than fatal |
+| [Retention](guide/retention.md) | What a session and a store are holding, removing a session whole, sweeping to a date and what that refuses, keeping every row while emptying every word, and returning the freed pages to the filesystem |
 
 ## The twelve pillars
 
@@ -83,6 +84,10 @@ it, not when a release merely touched it.
   TIFF, ICO, TGA and PNM converted to PNG at the door, and the formats needing a
   decoder this crate does not carry refused by name with the conversion that
   fixes them
+- **Retention** — the store answers what it and each session are holding, removes
+  a session whole or every session older than a date, and empties a session of
+  words while keeping every row an audit rests on; nothing expires on its own,
+  and no model can call any of it
 - **Git** — status, diff, log, add, commit, branch and worktree as fixed-argv
   built-ins, so a run ends as a reviewable commit on a branch of its own
 

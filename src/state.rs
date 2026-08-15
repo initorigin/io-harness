@@ -2938,6 +2938,314 @@ fn handle_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessHandle> {
 /// ```
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Every table this crate creates that hangs off a run, paired with the column
+/// that names the run.
+///
+/// 0.58.0's retention calls all walk this list: the size call sums over it, the
+/// deletion clears it, and the archive empties the words out of it. It is one
+/// list rather than three because three would drift, and a table missing from
+/// one of them is a silent orphan — the schema declares exactly one foreign key
+/// (`steps.run_id`) and never enables `PRAGMA foreign_keys`, so nothing in
+/// SQLite will say a word about a row whose run no longer exists.
+///
+/// **`memory` is deliberately absent.** A note carries the `run_id` that wrote
+/// it, but it is a workspace asset that outlives that run — 0.56.0 made this
+/// explicit by adding a scope above the workspace — so removing a session never
+/// removes a note. `memory_recalls` *is* here: a recall row names a run, and a
+/// recall by a run that no longer exists is not evidence.
+///
+/// `sessions`, `session_turns` and `runs` are absent too, because they are keyed
+/// by the session or are the run row itself, and the retention calls handle them
+/// by name in the order that keeps the walk answerable while it runs.
+pub(crate) const RUN_TABLES: &[(&str, &str)] = &[
+    ("steps", "run_id"),
+    ("policy_events", "run_id"),
+    ("pending_approvals", "run_id"),
+    ("agent_events", "run_id"),
+    ("sandbox_events", "run_id"),
+    ("checkpoint_events", "run_id"),
+    ("spawns", "parent_run_id"),
+    ("mcp_events", "run_id"),
+    ("memory_recalls", "run_id"),
+    ("memory_snapshots", "run_id"),
+    ("context_events", "run_id"),
+    ("run_outcomes", "run_id"),
+    ("run_policies", "run_id"),
+    ("ledger_observations", "run_id"),
+    ("provider_calls", "run_id"),
+    ("edits", "run_id"),
+    ("todos", "run_id"),
+    ("pending_questions", "run_id"),
+    ("citations", "run_id"),
+    ("server_tool_calls", "run_id"),
+    ("process_handles", "run_id"),
+    ("handle_output", "run_id"),
+    ("snapshots", "run_id"),
+    ("plans", "run_id"),
+    ("agent_queue", "parent_run_id"),
+    ("run_events", "run_id"),
+    ("rewinds", "run_id"),
+    ("gate_attempts", "run_id"),
+    ("summaries", "run_id"),
+];
+
+/// What one session is holding, in the bytes of its own rows.
+///
+/// **These are content bytes, not pages on disk, and the distinction is not
+/// pedantry.** SQLite stores rows in b-tree pages shared between whatever
+/// happens to be adjacent, and `dbstat` — which this crate's bundled SQLite does
+/// compile in — reports a page's owner as a *table*, never as a session. A
+/// per-session page count would therefore be a number with no way to be right.
+/// What is exactly answerable is how many bytes of text and blob this session's
+/// rows hold, and how many rows that is, which is what a growth question is
+/// really asking. For the file's own arithmetic, use [`Store::store_size`].
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let session = store.create_session("/repo")?;
+/// let run = store.start_run("summarise the changelog", "/repo")?;
+/// let turn = store.record_turn(session, None, run, "what changed in 0.57?")?;
+/// store.finish_turn(turn, Some("three things"), "ok")?;
+///
+/// let size = store.session_size(session)?.expect("the session exists");
+/// assert_eq!(size.turns, 1);
+/// assert_eq!(size.runs, 1);
+/// assert!(size.bytes > 0);
+///
+/// // Asking the size of a session that is not there has no answer, which is a
+/// // different fact from a session that is there and holds nothing.
+/// assert!(store.session_size(9_999)?.is_none());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSize {
+    /// The session this describes.
+    pub session_id: i64,
+    /// Turns in the conversation.
+    pub turns: u64,
+    /// Runs in the session's tree — its turns' runs, and everything those runs
+    /// spawned.
+    pub runs: u64,
+    /// Rows across every table keyed to those runs, plus the turns themselves.
+    pub rows: u64,
+    /// The summed `length()` of every text and blob column of those rows.
+    pub bytes: u64,
+}
+
+/// Columns whose declared type is text but whose content is a fact rather than
+/// a word — a kind, a verdict, a status, a path, an identifier, a timestamp.
+///
+/// [`Store::archive_session`] empties everything else. This list is the
+/// release's actual decision about where the line between "what did this cost
+/// and what did it touch" and "what exactly was said" falls, so it is written
+/// out and reviewable rather than inferred from a column name.
+///
+/// The default is to **clear**: a column added by a later release and not named
+/// here is treated as words, which is the safe direction — an archive that
+/// clears one number too many loses a figure the trace can live without, while
+/// one that keeps one sentence too many is a promise it did not keep.
+fn is_fact_column(table: &str, column: &str) -> bool {
+    // Universal across the schema: what kind of thing this row is, what was
+    // decided about it, where it happened, and when.
+    if matches!(
+        column,
+        "kind"
+            | "act"
+            | "state"
+            | "status"
+            | "outcome"
+            | "verdict"
+            | "source"
+            | "layer"
+            | "rule"
+            | "provider"
+            | "model"
+            | "finish_reason"
+            | "tool"
+            | "path"
+            | "at"
+            | "created_at"
+            | "started_at"
+            | "finished_at"
+            | "workspace"
+            | "turn_kind"
+    ) {
+        return true;
+    }
+    match (table, column) {
+        // Which workspace the run ran over. **Not the goal**: for a run driving
+        // a session turn the goal IS the user's prompt, so keeping it would
+        // leave the question in the trace after the archive removed it from the
+        // conversation. Found by the needle sweep, not by reading the schema.
+        ("runs", "file") => true,
+        // `decision` is a verdict here and the model's own words in `steps`,
+        // which is why this is a per-table judgement and not a column-name one.
+        ("policy_events", "decision") => true,
+        // The session's root directory.
+        ("sessions", "root") => true,
+        // Which file a restore point or an edit is about, kept while its
+        // contents go.
+        ("snapshots", "path") | ("edits", "path") => true,
+        // What a policy event was about — the target is a path or a command,
+        // which is what "what did it touch" means for a refusal.
+        ("policy_events", "target") | ("ledger_observations", "target") => true,
+        // A memory key names an entry that still exists; the note itself is not
+        // this session's to clear.
+        ("memory_recalls", "key") | ("memory_snapshots", "key") => true,
+        _ => false,
+    }
+}
+
+/// What an archive cleared.
+///
+/// `rows` and `bytes` are what was **removed**, not what remains — an archive
+/// keeps every row, so a count of what is left would be the same before and
+/// after and would say nothing. A second archive of the same session reports
+/// zero for both, which is how idempotence is visible rather than assumed.
+///
+/// See [`Store::archive_session`] for what survives and why.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let session = store.create_session("/repo")?;
+/// let run = store.start_run("a goal", "/repo")?;
+/// let turn = store.record_turn(session, None, run, "something private")?;
+/// store.finish_turn(turn, Some("an answer"), "ok")?;
+///
+/// let first = store.archive_session(session)?;
+/// assert_eq!(first.turns, 1, "the conversation still has its shape");
+/// assert!(first.bytes > 0, "and it no longer has its words");
+///
+/// // Idempotent, and visibly so: nothing was left to clear.
+/// let second = store.archive_session(session)?;
+/// assert_eq!(second.rows, 0);
+/// assert_eq!(second.bytes, 0);
+/// assert_eq!(second.turns, 1);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Archived {
+    /// Turns in the archived session. Unchanged by the archive — the
+    /// conversation still has the shape it had, without the words.
+    pub turns: u64,
+    /// Rows whose text was cleared.
+    pub rows: u64,
+    /// Bytes of text cleared.
+    pub bytes: u64,
+}
+
+/// What a removal took, and what it refused to take.
+///
+/// Returned by [`Store::delete_session`] and [`Store::sweep_sessions`]. Both
+/// report the same shape because they are the same removal reached two ways —
+/// by naming a session, or by naming a date — and an operator comparing a
+/// sweep's result against a targeted deletion should not have to translate
+/// between two kinds of receipt.
+///
+/// `refused` is only ever non-empty for a sweep. A date is a policy applied to
+/// sessions nobody looked at, so a session holding a run that could still be
+/// resumed is left alone and named here; [`Store::delete_session`] takes one id
+/// and removes it, because that is somebody's decision rather than a policy.
+///
+/// **A deletion cannot be undone by this crate.** The counts exist so the caller
+/// can record what happened while the information still exists.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let session = store.create_session("/repo")?;
+/// let run = store.start_run("summarise the changelog", "/repo")?;
+/// let turn = store.record_turn(session, None, run, "what changed in 0.57?")?;
+/// store.finish_turn(turn, Some("three things"), "ok")?;
+///
+/// let pruned = store.delete_session(session)?;
+/// assert_eq!(pruned.sessions, 1);
+/// assert_eq!(pruned.turns, 1);
+/// assert_eq!(pruned.runs, 1);
+/// assert!(pruned.refused.is_empty());
+///
+/// // Deleting what is not there succeeds and reports nothing — which is a
+/// // different answer from asking its size, and deliberately so.
+/// assert_eq!(store.delete_session(session)?.sessions, 0);
+/// assert!(store.session_size(session)?.is_none());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pruned {
+    /// Sessions removed.
+    pub sessions: u64,
+    /// Turns removed with them.
+    pub turns: u64,
+    /// Runs removed, including every run those sessions' runs spawned.
+    pub runs: u64,
+    /// Rows removed across every table.
+    pub rows: u64,
+    /// The bytes those rows held, on the same measure as [`SessionSize::bytes`].
+    pub bytes: u64,
+    /// Restore points removed. An undo depends on these, so a removal says how
+    /// many promises it withdrew at the time rather than at the moment somebody
+    /// reaches for one.
+    pub restore_points: u64,
+    /// Sessions a sweep left alone because they hold a run that can still be
+    /// resumed. Always empty for [`Store::delete_session`].
+    pub refused: Vec<i64>,
+}
+
+/// What the whole store is holding: the file's real page arithmetic, and where
+/// the pages went.
+///
+/// `file_bytes` is `page_size × page_count` — the size SQLite believes the
+/// database to be, which is the size on disk for everything but the trailing
+/// journal. `free_bytes` is the part of that already free *inside* the file and
+/// therefore reusable without growing it. A deletion moves bytes from the first
+/// figure into the second and shrinks nothing; [`Store::compact`] is what moves
+/// them out of the file altogether.
+///
+/// `tables` is `dbstat`'s per-table page usage, largest first, so the answer to
+/// "what is this store holding" is the first line rather than a search.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// store.create_session("/repo")?;
+/// store.start_run("a goal", "/repo")?;
+///
+/// let size = store.store_size()?;
+/// assert_eq!(size.sessions, 1);
+/// assert_eq!(size.runs, 1);
+/// assert!(size.file_bytes > 0);
+/// assert!(size.free_bytes <= size.file_bytes);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreSize {
+    /// `page_size × page_count`: what the database file occupies.
+    pub file_bytes: u64,
+    /// `page_size × freelist_count`: the part of it already free inside the
+    /// file, which a write reuses and a deletion adds to.
+    pub free_bytes: u64,
+    /// Sessions in the store.
+    pub sessions: u64,
+    /// Runs in the store, including runs no session reaches.
+    pub runs: u64,
+    /// Per-table bytes from `dbstat`, largest first.
+    pub tables: Vec<(String, u64)>,
+}
+
 impl Store {
     /// Open (creating if absent) a store at `path` and ensure the schema exists.
     ///
@@ -3841,6 +4149,21 @@ impl Store {
         let _ = conn.execute("ALTER TABLE edits ADD COLUMN hunk TEXT", []);
         let _ = conn.execute("ALTER TABLE rewinds ADD COLUMN undid_step INTEGER", []);
 
+        // 0.58.0 — the index every retention call enters through. `session_turns`
+        // has been queried by `session_id` since 0.20.0 and has never carried one,
+        // which did not matter while the only reader was a conversation reading
+        // its own turns and does once a sweep asks the question for every session
+        // in the store.
+        //
+        // Additive, and deliberately NOT a `CHECKPOINT_FORMAT` bump, for the
+        // reason every addition since 0.13.0 has not been one: no checkpoint
+        // layout changed, a 0.57.0 binary never names this index, and bumping the
+        // format would make [`Self::check_resumable`] refuse every 0.57.0 store
+        // over an index that only makes an existing query faster.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS session_turns_session ON session_turns (session_id);",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -4697,6 +5020,16 @@ impl Store {
                     // "refuse to rewind a file" and "delete a file the run only
                     // rewrote". Only the first is recoverable.
                     "unkept" => Kept::Unkept(before.unwrap_or_default()),
+                    // 0.58.0. The session was archived: the row is still here
+                    // and its content is not. Named rather than left to the
+                    // catch-all below, because "this version does not
+                    // understand it" is the wrong thing to tell somebody about
+                    // a state their own operator asked for — and because the
+                    // one way this release could destroy something outside the
+                    // database is writing an empty string over a real file.
+                    "archived" => Kept::Unkept(
+                        "the session was archived, so the previous contents are gone".to_string(),
+                    ),
                     other => Kept::Unkept(format!("recorded as \"{other}\", which this version of the store does not understand")),
                 },
             })
@@ -7650,6 +7983,606 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Every run in a session's tree: the runs its turns drove, and everything
+    /// those runs spawned, transitively.
+    ///
+    /// The same walk the tree resume takes, and the reason the retention unit is
+    /// a session rather than a turn — a turn's run may have spawned children,
+    /// and a half-removed tree is precisely the orphan state 0.58.0 exists to
+    /// prevent. Takes the ids as a rendered list because SQLite has no array
+    /// parameter and the ids are integers this crate minted; nothing here is
+    /// caller-supplied text.
+    fn session_run_ids(conn: &Connection, sessions: &[i64]) -> Result<Vec<i64>> {
+        if sessions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = id_list(sessions);
+        let mut stmt = conn.prepare(&format!(
+            "WITH RECURSIVE tree(id) AS (
+                 SELECT run_id FROM session_turns WHERE session_id IN ({list})
+                 UNION
+                 SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
+             )
+             SELECT id FROM tree ORDER BY id"
+        ))?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// The text and blob columns of one table, read from the schema this store
+    /// actually has rather than from a list compiled into the binary.
+    ///
+    /// A later release that adds a column gets it counted, cleared and summed
+    /// without anyone remembering to add it here — which is the same argument
+    /// the deletion's own test makes by enumerating `sqlite_master` instead of
+    /// checking a list.
+    fn text_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let cols = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(cols
+            .into_iter()
+            .filter(|(_, ty)| {
+                let ty = ty.to_uppercase();
+                ty.contains("TEXT") || ty.contains("BLOB")
+            })
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    /// What one session is holding, in the bytes of its own rows.
+    ///
+    /// `None` for a session id the store does not have. That is a different
+    /// answer from a session that exists and holds nothing, and the two are kept
+    /// apart on purpose: an operator sweeping a list of ids needs to know which
+    /// of them were already gone.
+    ///
+    /// See [`SessionSize`] for why the figure is content bytes rather than pages
+    /// on disk, and [`Store::store_size`] for the file's own arithmetic.
+    pub fn session_size(&self, session_id: i64) -> Result<Option<SessionSize>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            [session_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        let runs = Self::session_run_ids(&self.conn, &[session_id])?;
+        let turns: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM session_turns WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )?;
+
+        // The session's own row counts too, so this figure and the one
+        // [`Store::delete_session`] reports for the same session are the same
+        // measure rather than two that differ by a constant nobody remembers.
+        let list = id_list(&[session_id]);
+        let mut rows: i64 = turns + 1;
+        let mut bytes: i64 = self.sum_text("session_turns", "session_id", &list, false)?
+            + self.sum_text("sessions", "id", &list, false)?;
+        if !runs.is_empty() {
+            let list = id_list(&runs);
+            rows += runs.len() as i64;
+            bytes += self.sum_text("runs", "id", &list, false)?;
+            for (table, key) in RUN_TABLES {
+                rows += self.count_rows(table, key, &list)?;
+                bytes += self.sum_text(table, key, &list, false)?;
+            }
+        }
+
+        Ok(Some(SessionSize {
+            session_id,
+            turns: turns.max(0) as u64,
+            runs: runs.len() as u64,
+            rows: rows.max(0) as u64,
+            bytes: bytes.max(0) as u64,
+        }))
+    }
+
+    /// Rows of `table` whose `key` is in the rendered `ids` list.
+    fn count_rows(&self, table: &str, key: &str, ids: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {key} IN ({ids})"),
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The summed `length()` of every text and blob column of the matching rows.
+    ///
+    /// `only_nonempty` counts nothing that is already empty, which is what makes
+    /// the archive's second run able to report honestly that it cleared nothing.
+    fn sum_text(&self, table: &str, key: &str, ids: &str, only_nonempty: bool) -> Result<i64> {
+        let cols = Self::text_columns(&self.conn, table)?;
+        self.sum_of(table, key, ids, &cols, only_nonempty)
+    }
+
+    /// [`Store::sum_text`] over a named subset of the columns.
+    ///
+    /// The archive needs exactly this: summing over *every* text column would
+    /// count the kinds, paths and verdicts it deliberately keeps, so a second
+    /// archive of the same session would report clearing bytes that were never
+    /// cleared. Found by F10 rather than by review.
+    fn sum_of(
+        &self,
+        table: &str,
+        key: &str,
+        ids: &str,
+        cols: &[String],
+        only_nonempty: bool,
+    ) -> Result<i64> {
+        if cols.is_empty() {
+            return Ok(0);
+        }
+        let sum = cols
+            .iter()
+            .map(|c| format!("COALESCE(SUM(LENGTH({c})), 0)"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let filter = if only_nonempty {
+            let any = cols
+                .iter()
+                .map(|c| format!("COALESCE(LENGTH({c}), 0) > 0"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            format!(" AND ({any})")
+        } else {
+            String::new()
+        };
+        Ok(self.conn.query_row(
+            &format!("SELECT {sum} FROM {table} WHERE {key} IN ({ids}){filter}"),
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// What the whole store is holding: the file's page arithmetic, and where
+    /// the pages went.
+    ///
+    /// Read this before and after a [`Store::delete_session`] to see that a
+    /// deletion frees pages *into* the file, and before and after a
+    /// [`Store::compact`] to see them leave it.
+    pub fn store_size(&self) -> Result<StoreSize> {
+        let page_size: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let page_count: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        let freelist: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        let sessions: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+        let runs: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))?;
+
+        // `dbstat` is a virtual table over the b-tree pages, compiled into the
+        // bundled SQLite this crate links (`-DSQLITE_ENABLE_DBSTAT_VTAB`). It is
+        // the only source that can say which table the pages went to — and it
+        // cannot say which *session*, which is why `SessionSize` counts bytes
+        // instead. A build without it is not an error worth failing a size call
+        // over: the breakdown is empty and the file's own figures still stand.
+        let tables = {
+            let mut out = Vec::new();
+            if let Ok(mut stmt) = self
+                .conn
+                .prepare("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name")
+            {
+                if let Ok(rows) = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+                }) {
+                    out = rows.filter_map(|r| r.ok()).collect::<Vec<_>>();
+                }
+            }
+            out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            out
+        };
+
+        Ok(StoreSize {
+            file_bytes: (page_size * page_count).max(0) as u64,
+            free_bytes: (page_size * freelist).max(0) as u64,
+            sessions: sessions.max(0) as u64,
+            runs: runs.max(0) as u64,
+            tables,
+        })
+    }
+}
+
+impl Store {
+    /// Remove one session whole: its turns, the runs those turns drove,
+    /// everything those runs spawned, and every row the schema hangs off them.
+    ///
+    /// One transaction. A failure partway through leaves the store exactly as it
+    /// was, which matters more here than anywhere else in the crate: a
+    /// half-removed tree is unreachable rows that nothing will ever mention
+    /// again, because the schema declares one foreign key and never enables
+    /// `PRAGMA foreign_keys`.
+    ///
+    /// **A run in this session that can still be resumed is removed anyway.**
+    /// Naming one session is a decision somebody made; the refusal that protects
+    /// a resumable run lives in [`Store::sweep_sessions`], where a date is being
+    /// applied to sessions nobody looked at.
+    ///
+    /// **Notes are not touched.** A `memory` entry carries the run that wrote
+    /// it and outlives it — 0.56.0 made that explicit by adding a scope above
+    /// the workspace — so removing a session never unlearns anything. Its
+    /// *recall* rows do go, because they name a run that no longer exists.
+    /// Restore points go too, and the count of them is in the returned
+    /// [`Pruned`].
+    ///
+    /// Deleting a session that is not in the store succeeds and reports nothing.
+    /// Nothing here shrinks the file: SQLite frees pages into the database
+    /// rather than out of it, and [`Store::compact`] is what returns them.
+    pub fn delete_session(&self, session_id: i64) -> Result<Pruned> {
+        self.prune(&[session_id], Vec::new())
+    }
+
+    /// Remove every session created strictly before `before`.
+    ///
+    /// `before` is a timestamp string compared against `sessions.created_at`,
+    /// which is a `strftime('%Y-%m-%dT%H:%M:%fZ')` text column — a string
+    /// comparison is what the storage actually does, so that is what this takes
+    /// rather than a duration measured against a clock the store does not have.
+    /// The comparison is strictly before: a session created at exactly `before`
+    /// survives.
+    ///
+    /// **A session holding a run that can still be resumed is refused, not
+    /// deleted**, and its id comes back in [`Pruned::refused`]. A date is a
+    /// policy applied to sessions nobody looked at, and a crash-resumable tree
+    /// that vanished because it was old is the worst outcome this call could
+    /// have. Removing one of those is a decision made per session, through
+    /// [`Store::delete_session`]. A run that `Completed` or `Failed` is finished,
+    /// not resumable, and is swept.
+    ///
+    /// **One pass over the schema however many sessions are swept.** The run set
+    /// is collected for all of them first and each table is deleted from once.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let session = store.create_session("/repo")?;
+    /// let run = store.start_run("a goal", "/repo")?;
+    /// let turn = store.record_turn(session, None, run, "a question")?;
+    /// store.finish_turn(turn, Some("an answer"), "ok")?;
+    ///
+    /// // Still `Running`, which is what an interrupted run looks like in a
+    /// // store, so a date will not take it.
+    /// let swept = store.sweep_sessions("2999-01-01T00:00:00.000Z")?;
+    /// assert_eq!(swept.sessions, 0);
+    /// assert_eq!(swept.refused, vec![session]);
+    ///
+    /// // Finished, and the same sweep takes it.
+    /// store.set_status(run, "completed")?;
+    /// assert_eq!(store.sweep_sessions("2999-01-01T00:00:00.000Z")?.sessions, 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn sweep_sessions(&self, before: &str) -> Result<Pruned> {
+        let mut candidates = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM sessions WHERE created_at < ?1 ORDER BY id")?;
+            let rows = stmt.query_map([before], |r| r.get::<_, i64>(0))?;
+            for row in rows {
+                candidates.push(row?);
+            }
+        }
+
+        // The refusal is evaluated for every candidate before anything is
+        // deleted, which is also what keeps the removal itself to one pass.
+        let mut doomed = Vec::new();
+        let mut refused = Vec::new();
+        for session in candidates {
+            if self.holds_resumable_run(session)? {
+                refused.push(session);
+            } else {
+                doomed.push(session);
+            }
+        }
+        self.prune(&doomed, refused)
+    }
+
+    /// Whether any run in this session's tree could still be resumed.
+    ///
+    /// `Running` is what an interrupted run looks like in a store — the process
+    /// died mid-loop and the row was never closed — and `Paused` is waiting on a
+    /// human decision. Both are resume targets. Anything else is finished.
+    fn holds_resumable_run(&self, session_id: i64) -> Result<bool> {
+        let runs = Self::session_run_ids(&self.conn, &[session_id])?;
+        if runs.is_empty() {
+            return Ok(false);
+        }
+        let list = id_list(&runs);
+        let resumable: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM runs
+                 WHERE id IN ({list}) AND status IN ('running', 'paused')"
+            ),
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(resumable > 0)
+    }
+
+    /// Return the space a removal freed to the filesystem, and say how much.
+    ///
+    /// SQLite frees pages *into* the database file rather than out of it, so a
+    /// deletion moves bytes from [`StoreSize::file_bytes`] into
+    /// [`StoreSize::free_bytes`] and the file on disk stays the size it was. A
+    /// `VACUUM` rewrites the database without those pages, which is the only
+    /// reclamation available here: every store this crate has created was
+    /// created without `auto_vacuum`, so `PRAGMA incremental_vacuum` does
+    /// nothing on any existing file.
+    ///
+    /// **This rewrites the whole database.** It needs free disk space of roughly
+    /// the file's own size while it runs, it cannot run inside a transaction,
+    /// and on a large store it is not quick. That is why it is a call an
+    /// operator makes knowingly rather than something a deletion does on their
+    /// behalf.
+    ///
+    /// Returns the bytes the file shrank by — measured, as the difference
+    /// between the file's size before and after, not inferred from the freelist.
+    pub fn compact(&self) -> Result<u64> {
+        let before = self.store_size()?.file_bytes;
+        self.conn.execute_batch("VACUUM")?;
+        let after = self.store_size()?.file_bytes;
+        Ok(before.saturating_sub(after))
+    }
+
+    /// Keep everything a session cost and touched, and remove everything it
+    /// said.
+    ///
+    /// Every row stays. The counts, the timings, the tokens, the cost, the file
+    /// paths, the line counts, the verdicts and the statuses are all still
+    /// answerable afterwards. Every column holding text or a blob is emptied:
+    /// the prompts and replies, the step traces, the tool results in the ledger,
+    /// the summaries, the restore points' contents and the edits' hunks.
+    ///
+    /// **It is not enough to empty the conversation table, and that is the whole
+    /// reason this call exists rather than being left to the caller.**
+    /// `provider_calls` is the only pure-accounting table in this schema. The
+    /// user's own words are in `steps.prompt`, every tool result is in
+    /// `ledger_observations.text`, and whole file contents are in
+    /// `snapshots.before`. Emptying `session_turns` alone would report a removal
+    /// it had not performed — which, for an operator doing this to satisfy a
+    /// privacy obligation, is worse than doing nothing.
+    ///
+    /// An audit obligation and a privacy obligation usually pull in opposite
+    /// directions on the same rows. This is the call that satisfies both.
+    ///
+    /// **A restore point survives as a row and can no longer restore.** Its
+    /// state records that it was archived, and a rewind reaching it reports
+    /// [`Rewind::NotKept`](crate::Rewind::NotKept) naming the archive instead of
+    /// writing an empty file over a real one.
+    ///
+    /// Idempotent: archiving an already-archived session clears nothing and says
+    /// so. A session that is not in the store clears nothing either.
+    ///
+    /// Nothing here shrinks the file — see [`Store::compact`]. And nothing here
+    /// can say anything about the caller's own logs, their provider account, or
+    /// their filesystem: this removes what is in the database.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let session = store.create_session("/repo")?;
+    /// let run = store.start_run("a goal", "/repo")?;
+    /// let turn = store.record_turn(session, None, run, "something private")?;
+    /// store.finish_turn(turn, Some("an answer"), "ok")?;
+    ///
+    /// let archived = store.archive_session(session)?;
+    /// assert_eq!(archived.turns, 1);
+    /// assert!(archived.bytes > 0);
+    ///
+    /// // The session is still there and still costs what it cost.
+    /// assert!(store.session_size(session)?.is_some());
+    /// // The second run has nothing left to clear, and reports that.
+    /// assert_eq!(store.archive_session(session)?.bytes, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn archive_session(&self, session_id: i64) -> Result<Archived> {
+        let sessions = self.existing_sessions(&[session_id])?;
+        if sessions.is_empty() {
+            return Ok(Archived::default());
+        }
+        let runs = Self::session_run_ids(&self.conn, &sessions)?;
+        let session_list = id_list(&sessions);
+        let run_list = id_list(&runs);
+
+        let turns = self.count_rows("session_turns", "session_id", &session_list)?;
+
+        // The columns to empty come from the schema, so a column a later release
+        // adds is cleared without anyone remembering to add it here. The
+        // exceptions are named rather than filtered by type, because each one is
+        // a fact rather than a word and the list is the release's actual
+        // decision.
+        let mut rows = 0;
+        let mut bytes = 0;
+        let tx = self.conn.unchecked_transaction()?;
+        for (table, key, ids) in std::iter::once(("session_turns", "session_id", &session_list))
+            .chain(std::iter::once(("runs", "id", &run_list)))
+            .chain(RUN_TABLES.iter().map(|(t, k)| (*t, *k, &run_list)))
+        {
+            if runs.is_empty() && key != "session_id" {
+                continue;
+            }
+            let cols: Vec<String> = Self::text_columns(&self.conn, table)?
+                .into_iter()
+                .filter(|c| !is_fact_column(table, c))
+                .collect();
+            if cols.is_empty() {
+                continue;
+            }
+            let cleared = self.sum_of(table, key, ids, &cols, true)?;
+            if cleared == 0 {
+                continue;
+            }
+            let touched = {
+                let any = cols
+                    .iter()
+                    .map(|c| format!("COALESCE(LENGTH({c}), 0) > 0"))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                self.conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {key} IN ({ids}) AND ({any})"),
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?
+            };
+            let set = cols
+                .iter()
+                .map(|c| format!("{c} = ''"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tx.execute_batch(&format!("UPDATE {table} SET {set} WHERE {key} IN ({ids})"))?;
+            rows += touched;
+            bytes += cleared;
+        }
+
+        // A restore point whose content is gone must say so, or a rewind writes
+        // an empty string over a real file.
+        if !runs.is_empty() {
+            tx.execute_batch(&format!(
+                "UPDATE snapshots SET state = 'archived' WHERE run_id IN ({run_list})"
+            ))?;
+        }
+        tx.commit()?;
+
+        Ok(Archived {
+            turns: turns.max(0) as u64,
+            rows: rows.max(0) as u64,
+            bytes: bytes.max(0) as u64,
+        })
+    }
+
+    /// Sessions that exist, out of the ids given.
+    fn existing_sessions(&self, sessions: &[i64]) -> Result<Vec<i64>> {
+        if sessions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = id_list(sessions);
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT id FROM sessions WHERE id IN ({list})"))?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// The removal both entry points share.
+    ///
+    /// Takes the sessions already filtered to those that exist and those that
+    /// are allowed to go, and the ids to report as refused. Everything is
+    /// measured before anything is deleted, because after the transaction there
+    /// is nothing left to count.
+    ///
+    /// **One pass over the schema, whatever the number of sessions.** The run
+    /// set for every session is collected first and each table is deleted from
+    /// exactly once, so a sweep of a thousand sessions issues the same
+    /// statements as a sweep of one. The natural implementation — loop over the
+    /// sessions calling [`Store::delete_session`] — issues them per session, and
+    /// on a schema of this size that is the difference between a maintenance
+    /// call and an outage.
+    fn prune(&self, sessions: &[i64], refused: Vec<i64>) -> Result<Pruned> {
+        Ok(self.prune_counted(sessions, refused)?.0)
+    }
+
+    /// [`Store::prune`], also returning how many `DELETE` statements it issued.
+    ///
+    /// The count is what makes "one pass over the schema" checkable rather than
+    /// asserted in prose: it is a function of the schema and must not move when
+    /// the number of sessions does. Crate-internal because it is a fact about
+    /// the implementation rather than about the store, and a caller with a use
+    /// for it would be measuring the wrong thing.
+    pub(crate) fn prune_counted(
+        &self,
+        sessions: &[i64],
+        refused: Vec<i64>,
+    ) -> Result<(Pruned, usize)> {
+        let sessions = self.existing_sessions(sessions)?;
+        if sessions.is_empty() {
+            return Ok((
+                Pruned {
+                    refused,
+                    ..Pruned::default()
+                },
+                0,
+            ));
+        }
+        let runs = Self::session_run_ids(&self.conn, &sessions)?;
+        let session_list = id_list(&sessions);
+        let run_list = id_list(&runs);
+
+        // Measured first. After the transaction none of it is answerable.
+        let turns = self.count_rows("session_turns", "session_id", &session_list)?;
+        let mut rows = turns + sessions.len() as i64;
+        let mut bytes = self.sum_text("session_turns", "session_id", &session_list, false)?
+            + self.sum_text("sessions", "id", &session_list, false)?;
+        let mut restore_points = 0;
+        if !runs.is_empty() {
+            rows += runs.len() as i64;
+            bytes += self.sum_text("runs", "id", &run_list, false)?;
+            restore_points = self.count_rows("snapshots", "run_id", &run_list)?;
+            for (table, key) in RUN_TABLES {
+                rows += self.count_rows(table, key, &run_list)?;
+                bytes += self.sum_text(table, key, &run_list, false)?;
+            }
+        }
+
+        let mut statements = 0;
+        let tx = self.conn.unchecked_transaction()?;
+        if !runs.is_empty() {
+            for (table, key) in RUN_TABLES {
+                tx.execute_batch(&format!("DELETE FROM {table} WHERE {key} IN ({run_list})"))?;
+                statements += 1;
+            }
+            tx.execute_batch(&format!("DELETE FROM runs WHERE id IN ({run_list})"))?;
+            statements += 1;
+        }
+        tx.execute_batch(&format!(
+            "DELETE FROM session_turns WHERE session_id IN ({session_list})"
+        ))?;
+        tx.execute_batch(&format!(
+            "DELETE FROM sessions WHERE id IN ({session_list})"
+        ))?;
+        statements += 2;
+        tx.commit()?;
+
+        Ok((
+            Pruned {
+                sessions: sessions.len() as u64,
+                turns: turns.max(0) as u64,
+                runs: runs.len() as u64,
+                rows: rows.max(0) as u64,
+                bytes: bytes.max(0) as u64,
+                restore_points: restore_points.max(0) as u64,
+                refused,
+            },
+            statements,
+        ))
+    }
+}
+
+/// Row ids as a SQL list. Every caller passes integers this crate minted, so
+/// there is nothing here to escape — the function exists because SQLite has no
+/// array parameter and a `?` per id would rebuild the statement per call.
+pub(crate) fn id_list(ids: &[i64]) -> String {
+    ids.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
@@ -9966,5 +10899,217 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    /// 0.58.0 F8. A sweep of many sessions is one pass over the schema.
+    ///
+    /// Asserted on the statement count rather than on a clock, which is the
+    /// whole reason `prune_counted` exists: the count is a function of the
+    /// schema and must not move when the number of sessions does. The natural
+    /// implementation — loop over the sessions calling `delete_session` — makes
+    /// it scale with the sessions, and on a schema this size that is the
+    /// difference between a maintenance call and an outage.
+    #[test]
+    fn a_sweep_of_many_sessions_issues_the_same_statements_as_a_sweep_of_one() {
+        fn seed(store: &Store, n: usize) -> Vec<i64> {
+            (0..n)
+                .map(|i| {
+                    let session = store.create_session(&format!("/repo{i}")).unwrap();
+                    let run = store.start_run(&format!("goal {i}"), "/repo").unwrap();
+                    store.record_turn(session, None, run, "a prompt").unwrap();
+                    store
+                        .record(run, &StepRecord::new(1, "a decision", "a result"))
+                        .unwrap();
+                    session
+                })
+                .collect()
+        }
+
+        let one = Store::memory().unwrap();
+        let sessions = seed(&one, 1);
+        let (pruned_one, statements_one) = one.prune_counted(&sessions, Vec::new()).unwrap();
+
+        let many = Store::memory().unwrap();
+        let sessions = seed(&many, 10);
+        let (pruned_many, statements_many) = many.prune_counted(&sessions, Vec::new()).unwrap();
+
+        assert_eq!(pruned_one.sessions, 1);
+        assert_eq!(pruned_many.sessions, 10, "ten sessions really went");
+        assert_eq!(
+            statements_many, statements_one,
+            "the statement count is a function of the schema, not of the sessions"
+        );
+        assert_eq!(
+            statements_one,
+            RUN_TABLES.len() + 3,
+            "every run-keyed table once, then runs, session_turns and sessions"
+        );
+    }
+
+    /// 0.58.0. The archive's fact list is a decision, and the decision is that
+    /// the default is to clear.
+    ///
+    /// A column added by a later release and not named in `is_fact_column` is
+    /// treated as words. That is the safe direction — losing a number the trace
+    /// can live without, rather than keeping a sentence the archive promised to
+    /// remove — and this asserts it rather than leaving it to the reader.
+    #[test]
+    fn a_column_the_archive_has_never_heard_of_is_treated_as_words() {
+        assert!(!is_fact_column("steps", "a_column_from_the_future"));
+        assert!(
+            !is_fact_column("steps", "decision"),
+            "the model's own words"
+        );
+        assert!(is_fact_column("policy_events", "decision"), "a verdict");
+        assert!(!is_fact_column("runs", "goal"), "a session turn's prompt");
+        assert!(
+            is_fact_column("runs", "file"),
+            "which workspace it ran over"
+        );
+    }
+
+    /// 0.58.0 N5 and N6 — what a removal costs, and what a compaction costs.
+    ///
+    /// `#[ignore]`d because it prints rather than asserts: a duration asserted on
+    /// a CI runner is a flake waiting to be written, and this project has paid
+    /// for that lesson more times than any other.
+    ///
+    /// ```text
+    /// cargo test --release --lib retention_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn retention_cost() {
+        use std::time::Instant;
+
+        /// One store on disk holding `sessions` sessions of `steps` steps each.
+        fn build(
+            dir: &std::path::Path,
+            name: &str,
+            sessions: usize,
+            steps: usize,
+        ) -> (Store, std::path::PathBuf) {
+            let path = dir.join(name);
+            let store = Store::open(&path).unwrap();
+            for s in 0..sessions {
+                let session = store.create_session(&format!("/repo{s}")).unwrap();
+                let run = store.start_run(&format!("goal {s}"), "/repo").unwrap();
+                let turn = store
+                    .record_turn(session, None, run, "a prompt of ordinary length")
+                    .unwrap();
+                store
+                    .finish_turn(turn, Some("a reply of ordinary length"), "ok")
+                    .unwrap();
+                store.set_status(run, "completed").unwrap();
+                for step in 1..=steps {
+                    store
+                        .record(
+                            run,
+                            &StepRecord::new(step as u32, "a decision", "a result").with_trace(
+                                "a prompt long enough to be worth measuring the length of",
+                                "a tool call",
+                                120,
+                            ),
+                        )
+                        .unwrap();
+                    store
+                        .record_observations(
+                            run,
+                            &[crate::context::Observation::new(
+                                step as u32,
+                                crate::context::ObsKind::Read,
+                                Some("src/lib.rs".into()),
+                                "an observation of ordinary length",
+                            )],
+                        )
+                        .unwrap();
+                }
+            }
+            (store, path)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        println!("\n0.58.0 retention cost — one session removed from a store of ten\n");
+        for steps in [10usize, 100, 1_000] {
+            let (store, path) = build(dir.path(), &format!("d{steps}.db"), 10, steps);
+            let session: i64 = store
+                .conn
+                .query_row("SELECT MIN(id) FROM sessions", [], |r| r.get(0))
+                .unwrap();
+            let size = store.session_size(session).unwrap().unwrap();
+            let start = Instant::now();
+            let pruned = store.delete_session(session).unwrap();
+            let elapsed = start.elapsed();
+            println!(
+                "  {steps:>5} steps: {:>8.3} ms   {} rows, {} bytes   (file {} KiB)",
+                elapsed.as_secs_f64() * 1000.0,
+                pruned.rows,
+                pruned.bytes,
+                std::fs::metadata(&path).unwrap().len() / 1024,
+            );
+            assert_eq!(pruned.rows, size.rows);
+        }
+
+        println!("\nsweeping ten sessions at once, against ten one-at-a-time removals\n");
+        for steps in [10usize, 100] {
+            let (sweep_store, _) = build(dir.path(), &format!("s{steps}.db"), 10, steps);
+            let start = Instant::now();
+            let swept = sweep_store
+                .sweep_sessions("2999-01-01T00:00:00.000Z")
+                .unwrap();
+            let sweep = start.elapsed();
+
+            let (one_by_one, _) = build(dir.path(), &format!("o{steps}.db"), 10, steps);
+            let ids: Vec<i64> = {
+                let mut stmt = one_by_one.conn.prepare("SELECT id FROM sessions").unwrap();
+                let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+                rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
+            };
+            let start = Instant::now();
+            for id in ids {
+                one_by_one.delete_session(id).unwrap();
+            }
+            let looped = start.elapsed();
+
+            println!(
+                "  {steps:>5} steps: sweep {:>8.3} ms ({} sessions)   loop {:>8.3} ms   {:.1}x",
+                sweep.as_secs_f64() * 1000.0,
+                swept.sessions,
+                looped.as_secs_f64() * 1000.0,
+                looped.as_secs_f64() / sweep.as_secs_f64().max(f64::MIN_POSITIVE),
+            );
+        }
+
+        println!("\ncompaction: what VACUUM costs, and what it needs while it runs\n");
+        let (store, path) = build(dir.path(), "v.db", 20, 400);
+        let ids: Vec<i64> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT id FROM sessions LIMIT 10")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
+        };
+        for id in ids {
+            store.delete_session(id).unwrap();
+        }
+        let before = store.store_size().unwrap();
+        let start = Instant::now();
+        let reclaimed = store.compact().unwrap();
+        let elapsed = start.elapsed();
+        let after = store.store_size().unwrap();
+        println!(
+            "  {:>8.3} ms   file {} KiB -> {} KiB, {} KiB returned; free before {} KiB",
+            elapsed.as_secs_f64() * 1000.0,
+            before.file_bytes / 1024,
+            after.file_bytes / 1024,
+            reclaimed / 1024,
+            before.free_bytes / 1024,
+        );
+        println!(
+            "  peak extra disk while it runs is a second copy of the file: about {} KiB here",
+            before.file_bytes / 1024,
+        );
+        let _ = std::fs::metadata(&path).unwrap();
     }
 }

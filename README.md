@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.57"
+io-harness = "0.58"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -454,6 +454,21 @@ the memory entries it wrote, and the spawn backlog it left queued, in one call �
 while the steps, the events and the ledger stay exactly as they were, because the
 spend happened and an undo that erased them would make the trace lie.
 
+**Deciding what the store keeps.** Nothing expires on its own — there is no
+background job, no default retention window, and how long an audit record
+survives is not a library's decision. What the store does offer is the
+instrument: `store_size` and `session_size` answer what the file and one session
+are actually holding, `delete_session` removes a session whole — its turns, the
+runs those turns drove and every run those spawned, in one transaction —
+`sweep_sessions` applies that to everything older than a date while **refusing**
+any session holding a run that is still resumable, and `compact` returns the
+freed pages to the filesystem, because SQLite frees them into the file rather
+than out of it. `archive_session` is the other half: every row and every number
+stays — what it cost, how long it took, which files it touched — and every column
+holding words is emptied, so an audit obligation and a privacy obligation can be
+satisfied at once. Notes are never taken, a deletion cannot be undone by this
+crate, and none of it is reachable by a model.
+
 ## Guides
 
 | Guide | What it covers |
@@ -480,6 +495,7 @@ spend happened and an undo that erased them would make the trace lie.
 | [Hooks](docs/guide/hooks.md) | An audit log, a notification, a formatter or a check that stops the run, declared in `io.toml` |
 | [Providers](docs/guide/providers.md) | One compatible provider, the 21 vendor presets, running a model locally, what a model costs, and asking one to think harder |
 | [Capability bundles](docs/guide/plugins.md) | A directory that contributes skills, templates, agents, MCP servers, hooks and deny rules at once, what a cloned repository may not hand you, and how a contribution names its bundle |
+| [Retention](docs/guide/retention.md) | What a store is holding, removing a session whole, sweeping to a date and what it refuses, archiving the words while keeping the numbers, and reclaiming the space |
 
 [docs/CAPABILITIES.md](docs/CAPABILITIES.md) indexes them.
 [docs/CONTRACT.md](docs/CONTRACT.md) is the public contract: what is stable, what
