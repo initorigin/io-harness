@@ -26,6 +26,90 @@ notes are produced from it.
 
 ### Security
 
+## [0.58.0] - 2026-08-15
+
+### Added
+
+- **A store can say what it is holding.** `Store::store_size` reports the file's
+  own arithmetic — `page_size × page_count`, the bytes already free inside it, the
+  counts of sessions and runs, and a per-table breakdown from `dbstat`, which is
+  where a store that grew unexpectedly tells you which table grew.
+  `Store::session_size` answers the same question for one session: its turns, the
+  runs in its tree, the rows those runs hang off, and the summed `length()` of
+  their text and blob columns. **That last figure is content bytes and not pages
+  on disk**, deliberately: `dbstat` attributes a page to a table, and a page holds
+  rows belonging to any number of sessions, so a per-session page count has no way
+  to be right. An id the store does not hold is `None`, not a zero — asking the
+  size of nothing has no answer.
+- **`Store::delete_session` removes a session whole.** Its turns, the runs those
+  turns drove, every run those runs spawned transitively, and every row across the
+  schema keyed to that run set — in one transaction, reporting the sessions,
+  turns, runs, rows, content bytes and restore points that went. The unit is a
+  session and not a turn, because a turn's run may have spawned children and a
+  half-removed tree is rows nothing can reach. **A `memory` entry is never taken**:
+  a note outlives the run that wrote it, which is what 0.56.0's scope above the
+  workspace made explicit.
+- **`Store::sweep_sessions` applies that to a date.** Every session whose
+  `created_at` is strictly before the cutoff, in one pass over the schema whatever
+  the sweep's size. A session holding any run that is `Running` or `Paused` is
+  **refused rather than deleted** — left byte-identical, with its id in
+  `Pruned::refused` — because a date is a policy applied to sessions nobody looked
+  at, and a crash-resumable tree that vanished for being old is the worst thing
+  this release could ship. `delete_session` carries no such refusal: naming one id
+  is somebody's decision about that session. The cutoff is a string because
+  `sessions.created_at` is a `strftime` text column and a string comparison is what
+  the storage performs; the guide shows how to build one.
+- **`Store::archive_session` keeps every row and empties every word.** The counts,
+  timings, tokens, cost, file paths, line counts, verdicts and statuses all
+  survive; the prompts, replies, tool results, summaries, snapshot contents and
+  edit hunks do not — so what a session cost and what it touched stay answerable
+  after what was said in it is gone. It is **not** confined to the conversation
+  table and must not be: `provider_calls` is the only pure accounting table in this
+  schema, the user's own words are in `steps.prompt`, every tool result in
+  `ledger_observations.text` and whole file contents in `snapshots.before`, and an
+  archive that emptied only `session_turns` would report a removal it had not
+  performed. Idempotent, and honest the second time.
+- **`Store::compact` returns the space.** SQLite frees pages *into* the file
+  rather than out of it, so a prune leaves the file the size it was and raises
+  `StoreSize::free_bytes`. `compact` runs `VACUUM` and returns the bytes the file
+  shrank by. It is a separate call because it rewrites the whole database, needs
+  free disk of roughly the file's own size while it runs, and cannot run inside a
+  transaction. `PRAGMA incremental_vacuum` is not an alternative — every store this
+  crate has ever created was created without `auto_vacuum`, so it does nothing on
+  any existing file.
+- **A retention guide**, [docs/guide/retention.md](docs/guide/retention.md), and a
+  retention section in [docs/CONTRACT.md](docs/CONTRACT.md).
+
+### Changed
+
+- **An archived restore point says so rather than restoring nothing.** A
+  snapshot's content is words, so archiving empties it; the row stays and records
+  that it was archived, and a restore reaching it reports the existing
+  `Reverted::Stale` naming the archive. Restoring it naively would write an empty
+  file over a real one, which is the one way this release could destroy something
+  outside the database. No new variant and no changed signature.
+- **Pruning a session shifts memory eviction, and this is stated rather than
+  discovered.** No `memory` entry is removed, but `memory_recalls` rows for removed
+  runs are, since they name a run that no longer exists — and 0.56.0's eviction
+  ranks candidates by `COUNT(DISTINCT run_id)` over that table. A note that had
+  earned its place mostly through runs you have now pruned therefore ranks lower,
+  and a later write may evict it. Evidence from a run that no longer exists is not
+  evidence; `Store::memory_pin` is what holds a note regardless.
+
+### Migrations
+
+- **One additive index.** `session_turns_session` on `session_turns (session_id)`,
+  created on the first open by a 0.58.0 binary. `CHECKPOINT_FORMAT` does not move,
+  no table or column is added, and a 0.57.0 binary reads the same database
+  afterwards unchanged. An operator does nothing.
+- **One new value in an existing column.** `snapshots.state` records an archived
+  snapshot. A 0.57.0 binary reads it as an unknown state.
+- **Nothing expires on its own.** Every call above must be made by name, and none
+  is reachable by a model. A program upgraded to 0.58.0 and left alone behaves
+  exactly as it did on 0.57.0. What cannot be rolled back is a deletion that
+  already happened: this crate has no undo for one, and an operator whose recovery
+  position matters copies the file first.
+
 ## [0.57.0] - 2026-08-15
 
 ### Added

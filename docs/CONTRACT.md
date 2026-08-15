@@ -2698,6 +2698,85 @@ the process rather than return an error, if you build with abort.
 written by this crate or by a Rust library. None was produced by Excel, Word, or
 Acrobat, so real-world quirks those applications emit are untested.
 
+## What a deletion takes, what it leaves, and what expires on its own (0.58.0)
+
+**Nothing expires on its own.** There is no background job, no default retention
+window and no age at which anything in a store becomes eligible for removal. The
+crate's position since 0.1.0 — history has no expiry, and the embedding program
+decides — is unchanged by this release. What 0.58.0 adds is the instrument, and
+every one of its calls must be made by name. A program upgraded to 0.58.0 and
+left alone behaves exactly as it did on 0.57.0.
+
+**The unit is a session.** `Store::delete_session` takes the session's turns, the
+runs those turns drove, and every run those runs spawned, transitively, under
+`runs.parent_run_id` — then every row across the schema keyed to that run set,
+then the turns, then the session row, in one transaction. There is no removal of
+a single run, a single turn or a named string. A turn's run may have spawned
+children, and a half-removed tree is unreachable rows that nothing counts.
+
+**What a deletion leaves.** A `memory` entry is never removed: a note is a
+workspace asset that outlives the run that wrote it, which 0.56.0 made explicit
+by giving it a scope above the workspace. A run reachable from no session — one
+started by `run` or `run_with` rather than by a session turn — is named by
+nothing and is not reached.
+
+**What a deletion changes elsewhere.** `memory_recalls` rows for removed runs
+*do* go, because they name a run that no longer exists. Since 0.56.0 memory
+eviction ranks candidates by `COUNT(DISTINCT run_id)` over that table, so pruning
+a session lowers the standing of every note that session had drawn on, and a
+later write may evict a note it would previously have kept. That is the behaviour
+and not a defect — evidence from a run that no longer exists is not evidence —
+and `Store::memory_pin` is what holds a note regardless.
+
+**A resumable run is never swept by a date.** `Store::sweep_sessions(before)`
+removes every session whose `created_at` is **strictly** before the cutoff; a
+session whose `created_at` equals it survives. A session holding any run in
+`RunStatus::Running` or `RunStatus::Paused` is **refused** — left byte-identical,
+with its id in `Pruned::refused` — because a date is a policy applied to sessions
+nobody looked at. `delete_session` carries no such refusal: naming one id is
+somebody's decision about that session. The cutoff is a string because
+`sessions.created_at` is a `strftime('%Y-%m-%dT%H:%M:%fZ','now')` text column and
+a string comparison is what the storage performs.
+
+**What an archive keeps.** `Store::archive_session` keeps every row and empties
+every column that holds words. The counts, timings, tokens, cost, file paths,
+line counts, verdicts, statuses and kinds all survive; the prompts, replies, tool
+results, summaries, snapshot contents and edit hunks do not. It is not confined
+to the conversation table and must not be: `provider_calls` is the only pure
+accounting table in the schema, and the user's own words are in `steps.prompt`,
+every tool result in `ledger_observations.text`, whole file contents in
+`snapshots.before`. An archive that emptied only `session_turns` would report a
+removal it had not performed. Archiving is idempotent, and it does not refuse a
+resumable session — a run whose words are gone can still be resumed.
+
+**An archived restore point can no longer restore.** The `snapshots` row stays
+and records that its content was archived, and a restore reaching it reports
+`Reverted::Stale` naming the archive rather than writing an empty file over a
+real one.
+
+**A session's size is content bytes; a store's size is pages.**
+`Store::session_size` reports the summed `length()` of the session's own text and
+blob columns with the row counts beside it, and `None` for an id the store does
+not hold. It is not a per-session page figure and will not become one: `dbstat`
+attributes a page to a b-tree — a table — and a page holds rows belonging to any
+number of sessions. `Store::store_size` is where the file's arithmetic lives:
+`page_size × page_count`, the freelist, and a per-table breakdown.
+
+**Freed pages stay in the file until `compact` is called.** SQLite frees pages
+into the file rather than out of it, so a prune leaves the file the size it was
+and raises `StoreSize::free_bytes`. `Store::compact` runs `VACUUM` and returns
+the bytes the file shrank by. It rewrites the whole database, needs free disk
+space of roughly the file's own size while it runs, and cannot run inside a
+transaction — which is why it is a separate call. `PRAGMA incremental_vacuum` is
+not an alternative: every store this crate has created was created without
+`auto_vacuum`, so it does nothing on any existing file.
+
+**A deletion cannot be undone by this crate**, and nothing here is a tool a model
+can call. There is no trash and no recovery path; an operator whose recovery
+position matters copies the file first. And what these calls remove is what is in
+the database — they say nothing about the operator's own logs, their provider
+account, or their filesystem.
+
 ## Related
 
 ## What a language server is asked, and what it is not trusted with (0.52.0)

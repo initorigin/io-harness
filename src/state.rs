@@ -3036,35 +3036,6 @@ pub struct SessionSize {
     pub bytes: u64,
 }
 
-/// What the whole store is holding: the file's real page arithmetic, and where
-/// the pages went.
-///
-/// `file_bytes` is `page_size × page_count` — the size SQLite believes the
-/// database to be, which is the size on disk for everything but the trailing
-/// journal. `free_bytes` is the part of that already free *inside* the file and
-/// therefore reusable without growing it. A deletion moves bytes from the first
-/// figure into the second and shrinks nothing; [`Store::compact`] is what moves
-/// them out of the file altogether.
-///
-/// `tables` is `dbstat`'s per-table page usage, largest first, so the answer to
-/// "what is this store holding" is the first line rather than a search.
-///
-/// ```
-/// use io_harness::Store;
-///
-/// # fn main() -> io_harness::Result<()> {
-/// let store = Store::memory()?;
-/// store.create_session("/repo")?;
-/// store.start_run("a goal", "/repo")?;
-///
-/// let size = store.store_size()?;
-/// assert_eq!(size.sessions, 1);
-/// assert_eq!(size.runs, 1);
-/// assert!(size.file_bytes > 0);
-/// assert!(size.free_bytes <= size.file_bytes);
-/// # Ok(())
-/// # }
-/// ```
 /// Columns whose declared type is text but whose content is a fact rather than
 /// a word — a kind, a verdict, a status, a path, an identifier, a timestamp.
 ///
@@ -3137,6 +3108,29 @@ fn is_fact_column(table: &str, column: &str) -> bool {
 /// zero for both, which is how idempotence is visible rather than assumed.
 ///
 /// See [`Store::archive_session`] for what survives and why.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let session = store.create_session("/repo")?;
+/// let run = store.start_run("a goal", "/repo")?;
+/// let turn = store.record_turn(session, None, run, "something private")?;
+/// store.finish_turn(turn, Some("an answer"), "ok")?;
+///
+/// let first = store.archive_session(session)?;
+/// assert_eq!(first.turns, 1, "the conversation still has its shape");
+/// assert!(first.bytes > 0, "and it no longer has its words");
+///
+/// // Idempotent, and visibly so: nothing was left to clear.
+/// let second = store.archive_session(session)?;
+/// assert_eq!(second.rows, 0);
+/// assert_eq!(second.bytes, 0);
+/// assert_eq!(second.turns, 1);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Archived {
     /// Turns in the archived session. Unchanged by the archive — the
@@ -3208,6 +3202,35 @@ pub struct Pruned {
     pub refused: Vec<i64>,
 }
 
+/// What the whole store is holding: the file's real page arithmetic, and where
+/// the pages went.
+///
+/// `file_bytes` is `page_size × page_count` — the size SQLite believes the
+/// database to be, which is the size on disk for everything but the trailing
+/// journal. `free_bytes` is the part of that already free *inside* the file and
+/// therefore reusable without growing it. A deletion moves bytes from the first
+/// figure into the second and shrinks nothing; [`Store::compact`] is what moves
+/// them out of the file altogether.
+///
+/// `tables` is `dbstat`'s per-table page usage, largest first, so the answer to
+/// "what is this store holding" is the first line rather than a search.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// store.create_session("/repo")?;
+/// store.start_run("a goal", "/repo")?;
+///
+/// let size = store.store_size()?;
+/// assert_eq!(size.sessions, 1);
+/// assert_eq!(size.runs, 1);
+/// assert!(size.file_bytes > 0);
+/// assert!(size.free_bytes <= size.file_bytes);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreSize {
     /// `page_size × page_count`: what the database file occupies.
@@ -10939,5 +10962,150 @@ mod tests {
             is_fact_column("runs", "file"),
             "which workspace it ran over"
         );
+    }
+
+    /// 0.58.0 N5 and N6 — what a removal costs, and what a compaction costs.
+    ///
+    /// `#[ignore]`d because it prints rather than asserts: a duration asserted on
+    /// a CI runner is a flake waiting to be written, and this project has paid
+    /// for that lesson more times than any other.
+    ///
+    /// ```text
+    /// cargo test --release --lib retention_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn retention_cost() {
+        use std::time::Instant;
+
+        /// One store on disk holding `sessions` sessions of `steps` steps each.
+        fn build(
+            dir: &std::path::Path,
+            name: &str,
+            sessions: usize,
+            steps: usize,
+        ) -> (Store, std::path::PathBuf) {
+            let path = dir.join(name);
+            let store = Store::open(&path).unwrap();
+            for s in 0..sessions {
+                let session = store.create_session(&format!("/repo{s}")).unwrap();
+                let run = store.start_run(&format!("goal {s}"), "/repo").unwrap();
+                let turn = store
+                    .record_turn(session, None, run, "a prompt of ordinary length")
+                    .unwrap();
+                store
+                    .finish_turn(turn, Some("a reply of ordinary length"), "ok")
+                    .unwrap();
+                store.set_status(run, "completed").unwrap();
+                for step in 1..=steps {
+                    store
+                        .record(
+                            run,
+                            &StepRecord::new(step as u32, "a decision", "a result").with_trace(
+                                "a prompt long enough to be worth measuring the length of",
+                                "a tool call",
+                                120,
+                            ),
+                        )
+                        .unwrap();
+                    store
+                        .record_observations(
+                            run,
+                            &[crate::context::Observation::new(
+                                step as u32,
+                                crate::context::ObsKind::Read,
+                                Some("src/lib.rs".into()),
+                                "an observation of ordinary length",
+                            )],
+                        )
+                        .unwrap();
+                }
+            }
+            (store, path)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        println!("\n0.58.0 retention cost — one session removed from a store of ten\n");
+        for steps in [10usize, 100, 1_000] {
+            let (store, path) = build(dir.path(), &format!("d{steps}.db"), 10, steps);
+            let session: i64 = store
+                .conn
+                .query_row("SELECT MIN(id) FROM sessions", [], |r| r.get(0))
+                .unwrap();
+            let size = store.session_size(session).unwrap().unwrap();
+            let start = Instant::now();
+            let pruned = store.delete_session(session).unwrap();
+            let elapsed = start.elapsed();
+            println!(
+                "  {steps:>5} steps: {:>8.3} ms   {} rows, {} bytes   (file {} KiB)",
+                elapsed.as_secs_f64() * 1000.0,
+                pruned.rows,
+                pruned.bytes,
+                std::fs::metadata(&path).unwrap().len() / 1024,
+            );
+            assert_eq!(pruned.rows, size.rows);
+        }
+
+        println!("\nsweeping ten sessions at once, against ten one-at-a-time removals\n");
+        for steps in [10usize, 100] {
+            let (sweep_store, _) = build(dir.path(), &format!("s{steps}.db"), 10, steps);
+            let start = Instant::now();
+            let swept = sweep_store
+                .sweep_sessions("2999-01-01T00:00:00.000Z")
+                .unwrap();
+            let sweep = start.elapsed();
+
+            let (one_by_one, _) = build(dir.path(), &format!("o{steps}.db"), 10, steps);
+            let ids: Vec<i64> = {
+                let mut stmt = one_by_one.conn.prepare("SELECT id FROM sessions").unwrap();
+                let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+                rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
+            };
+            let start = Instant::now();
+            for id in ids {
+                one_by_one.delete_session(id).unwrap();
+            }
+            let looped = start.elapsed();
+
+            println!(
+                "  {steps:>5} steps: sweep {:>8.3} ms ({} sessions)   loop {:>8.3} ms   {:.1}x",
+                sweep.as_secs_f64() * 1000.0,
+                swept.sessions,
+                looped.as_secs_f64() * 1000.0,
+                looped.as_secs_f64() / sweep.as_secs_f64().max(f64::MIN_POSITIVE),
+            );
+        }
+
+        println!("\ncompaction: what VACUUM costs, and what it needs while it runs\n");
+        let (store, path) = build(dir.path(), "v.db", 20, 400);
+        let ids: Vec<i64> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT id FROM sessions LIMIT 10")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
+        };
+        for id in ids {
+            store.delete_session(id).unwrap();
+        }
+        let before = store.store_size().unwrap();
+        let start = Instant::now();
+        let reclaimed = store.compact().unwrap();
+        let elapsed = start.elapsed();
+        let after = store.store_size().unwrap();
+        println!(
+            "  {:>8.3} ms   file {} KiB -> {} KiB, {} KiB returned; free before {} KiB",
+            elapsed.as_secs_f64() * 1000.0,
+            before.file_bytes / 1024,
+            after.file_bytes / 1024,
+            reclaimed / 1024,
+            before.free_bytes / 1024,
+        );
+        println!(
+            "  peak extra disk while it runs is a second copy of the file: about {} KiB here",
+            before.file_bytes / 1024,
+        );
+        let _ = std::fs::metadata(&path).unwrap();
     }
 }

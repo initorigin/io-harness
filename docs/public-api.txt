@@ -114,6 +114,7 @@ struct Agents src/agent.rs
 struct Anthropic src/provider/anthropic.rs
 struct ApprovalContext src/approve.rs
 struct ApproveAll src/approve.rs
+struct Archived src/state.rs
 struct Attach src/attach.rs
 struct Broadcast src/observe.rs
 struct ChangeReview src/verify.rs
@@ -169,6 +170,7 @@ struct PolicyEvent src/state.rs
 struct ProcessHandle src/state.rs
 struct Progress src/resilience.rs
 struct ProviderCall src/state.rs
+struct Pruned src/state.rs
 struct Question src/approve.rs
 struct Recovery src/state.rs
 struct Reference src/provider/catalog.rs
@@ -190,6 +192,7 @@ struct SandboxLimits src/sandbox.rs
 struct SandboxOutcome src/sandbox.rs
 struct ServerToolCall src/web.rs
 struct Session src/session.rs
+struct SessionSize src/state.rs
 struct Skill src/skills.rs
 struct Skills src/skills.rs
 struct SpawnRow src/state.rs
@@ -201,6 +204,7 @@ struct Steer src/session.rs
 struct SteerInbox src/session.rs
 struct StepRecord src/state.rs
 struct Store src/state.rs
+struct StoreSize src/state.rs
 struct Summary src/state.rs
 struct Tally src/state.rs
 struct TaskContract src/contract.rs
