@@ -89,11 +89,13 @@ move.
 
 ## The limits, stated plainly
 
-- **Windows is not supported in 0.53.0.** The pipe transport needs two inherited
-  descriptors at fixed numbers, which the standard library does not expose there.
-  Every entry point on Windows returns a typed configuration error naming the
-  platform. This is planned work, not an accident, and it was decided before the
-  release was built rather than discovered during it.
+- **Every supported platform drives a browser, since 0.59.0.** The transport is
+  the same pipe on all of them and the difference is one function: unix installs
+  the two ends as descriptors 3 and 4 in `pre_exec`, and Windows writes them into
+  the child's C-runtime descriptor table through `lpReserved2` — because Chromium
+  turns the descriptors it is handed into handles with `_get_osfhandle`, and a
+  descriptor number is not something a handle list can carry. The pipes are
+  anonymous on both, so no other local process has a name to open.
 - **Subresources are not individually policy-checked.** Images, stylesheets, fonts
   and XHR are the page's own traffic to a host already permitted. Document
   navigations bound where the browser *goes*. Under containment everything it
