@@ -8896,7 +8896,7 @@ fn will_proxy(policy: &Policy, contract: &TaskContract) -> bool {
         // one that would swallow every request it makes.
         && crate::sandbox::select(&contract.exec_sandbox)
             .backend()
-            .scopes_egress_per_host()
+            .reaches_loopback_proxy()
 }
 
 /// The run's egress proxy, when it needs one (0.48.0).
@@ -8926,7 +8926,7 @@ async fn start_egress_proxy(
     // run is proxied.
     if !crate::sandbox::select(&containment.config)
         .backend()
-        .scopes_egress_per_host()
+        .reaches_loopback_proxy()
     {
         return None;
     }
@@ -14577,7 +14577,11 @@ fn containment_line(config: &SandboxConfig, proxied: bool) -> String {
     // environment variable a command may ignore, and the word for that is
     // *advisory*: saying anything stronger would be the defect 0.40.0 shipped,
     // where every interface said contained and no machine enforced it.
-    let egress = match (proxied, backend.denies_egress(), backend.scopes_egress_per_host()) {
+    let egress = match (
+        proxied,
+        backend.denies_egress(),
+        backend.reaches_loopback_proxy(),
+    ) {
         (true, true, _) => {
             " Outbound network goes through a proxy this run owns, which permits only the hosts \
              this run's policy names."
@@ -14587,11 +14591,12 @@ fn containment_line(config: &SandboxConfig, proxied: bool) -> String {
              the route to it, so that boundary is advisory: a command that ignores the proxy \
              settings reaches the network."
         }
-        // 0.59.0 — a backend that denies egress and cannot be told which hosts to
-        // permit. Saying "only the hosts this run's policy names" here would be
-        // the 0.40.0 defect again: an interface claiming a boundary no machine
-        // enforces. What is true is narrower and worth the model knowing, because
-        // it decides whether reaching one host is possible at all.
+        // 0.59.0 — a backend that denies egress and cannot reach the proxy that
+        // would scope it, so this run was given none. Saying "only the hosts this
+        // run's policy names" here would be the 0.40.0 defect again: an interface
+        // claiming a boundary no machine enforces. What is true is narrower and
+        // worth the model knowing, because it decides whether reaching one host
+        // is possible at all.
         (false, true, false) => {
             " Outbound network on this host is all or nothing: this run's commands either hold \
              the capability to reach the network or hold none, so the per-host rules above are \

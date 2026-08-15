@@ -204,13 +204,15 @@ impl Backend {
         }
     }
 
-    /// Can this backend hold a contained command to the *hosts* the policy names,
-    /// rather than only to the yes-or-no of [`denies_egress`](Backend::denies_egress)?
+    /// Can a command contained by this backend **reach** the loopback proxy the
+    /// run owns?
     ///
     /// Since 0.48.0 a run whose policy names hosts routes its contained commands
-    /// through a loopback proxy it owns, which asks that policy about every
-    /// `host:port`. That mechanism needs one thing from the backend: that a
-    /// process inside it can reach a loopback listener.
+    /// through a proxy on `127.0.0.1` that asks the policy about every
+    /// `host:port`. Whether the proxy *binds* the command is a separate question
+    /// — on the portable floor it is an environment variable a payload may
+    /// ignore, which is what [`denies_egress`](Backend::denies_egress) answers.
+    /// This one is narrower and comes first: can the connection be made at all.
     ///
     /// **[`WindowsAppContainer`](Backend::WindowsAppContainer) cannot**, and no
     /// capability changes it — measured on `windows-latest` with none, with
@@ -221,6 +223,15 @@ impl Backend {
     /// given no proxy on that backend rather than one it cannot reach, and the
     /// agent's own boundary section says which of the two it has.
     ///
+    /// **Only [`WindowsAppContainer`](Backend::WindowsAppContainer) cannot**, and
+    /// no capability changes it — measured on `windows-latest` with none, with
+    /// `internetClient`, with `privateNetworkClientServer` and with both, while
+    /// the same request succeeds outside the container and an outbound request to
+    /// a real host succeeds inside it. A run that would have been proxied is given
+    /// no proxy on that backend rather than one it cannot reach, because a
+    /// command pointed at an unreachable proxy waits out its own clock on every
+    /// request instead of being scoped.
+    ///
     /// Third exhaustive `match` beside the two above, and for the same reason: the
     /// next backend added is a compile error here rather than a claim it quietly
     /// inherited.
@@ -228,22 +239,25 @@ impl Backend {
     /// ```
     /// use io_harness::Backend;
     ///
-    /// assert!(Backend::MacosSandboxExec.scopes_egress_per_host());
-    /// // Denies egress outright, and cannot be told which hosts to allow.
-    /// assert!(Backend::WindowsAppContainer.denies_egress());
-    /// assert!(!Backend::WindowsAppContainer.scopes_egress_per_host());
+    /// assert!(Backend::MacosSandboxExec.reaches_loopback_proxy());
+    /// // The floor reaches it and does not bind the payload to it, which are two
+    /// // different sentences the prompt has to keep apart.
+    /// assert!(Backend::PortableFloor.reaches_loopback_proxy());
+    /// assert!(!Backend::PortableFloor.denies_egress());
+    /// // And the one that cannot make the connection at all.
+    /// assert!(!Backend::WindowsAppContainer.reaches_loopback_proxy());
     /// ```
-    pub fn scopes_egress_per_host(&self) -> bool {
+    pub fn reaches_loopback_proxy(&self) -> bool {
         match self {
             Backend::MacosSandboxExec
             | Backend::LinuxLandlock
             | Backend::LinuxBubblewrap
-            | Backend::LinuxNamespaces => true,
-            // The two that enforce nothing to scope, and the one that enforces a
-            // boundary the proxy is on the wrong side of.
-            Backend::WindowsAppContainer | Backend::WindowsJobObject | Backend::PortableFloor => {
-                false
-            }
+            | Backend::LinuxNamespaces
+            // Both of these run the command with no network boundary of their
+            // own, so loopback is as reachable as it is outside them.
+            | Backend::WindowsJobObject
+            | Backend::PortableFloor => true,
+            Backend::WindowsAppContainer => false,
         }
     }
 
@@ -2123,6 +2137,56 @@ mod tests {
         assert!(!out.success());
         assert_eq!(out.exit_code, Some(3));
         assert_eq!(out.cap_hit, None);
+    }
+
+    /// **F8 — every backend claims exactly what it delivers.**
+    ///
+    /// One table, three predicates, every variant, and it is portable data so it
+    /// runs on all three hosts rather than on the one that has the backend. The
+    /// three `match`es this asserts are exhaustive on purpose — the next backend
+    /// added is a compile error there — but exhaustive does not mean *right*, and
+    /// nothing before this checked the answers against each other.
+    ///
+    /// The row that matters is the last one: a backend can deny egress outright
+    /// and still be unable to say which hosts to permit, which had never been a
+    /// distinction any backend forced until 0.59.0.
+    #[test]
+    fn each_backend_claims_exactly_what_it_delivers() {
+        // (backend, confines writes, denies egress, reaches the loopback proxy)
+        let table = [
+            (Backend::MacosSandboxExec, true, true, true),
+            (Backend::LinuxLandlock, true, true, true),
+            (Backend::LinuxBubblewrap, true, true, true),
+            (Backend::LinuxNamespaces, true, true, true),
+            (Backend::WindowsAppContainer, true, true, false),
+            (Backend::WindowsJobObject, false, false, true),
+            (Backend::PortableFloor, false, false, true),
+        ];
+        for (backend, writes, egress, reaches) in table {
+            assert_eq!(
+                (
+                    backend.confines_writes(),
+                    backend.denies_egress(),
+                    backend.reaches_loopback_proxy()
+                ),
+                (writes, egress, reaches),
+                "{} claims something other than what it delivers",
+                backend.as_str()
+            );
+        }
+        // And the rule that holds across the table: exactly one backend cannot
+        // reach the proxy, and it is the one whose boundary the proxy sits
+        // outside. Asserted as a count so a second such backend arriving without
+        // its own egress story fails here rather than silently inheriting this
+        // one's.
+        assert_eq!(
+            table
+                .iter()
+                .filter(|(b, _, _, _)| !b.reaches_loopback_proxy())
+                .count(),
+            1,
+            "the set of backends a loopback proxy cannot be reached from has changed"
+        );
     }
 
     #[tokio::test]
