@@ -1433,7 +1433,7 @@ versions:
       what 0.56.0 rendered. The line reference above was also stale: `render_notes` moved to
       `src/context.rs:888` when 0.56.0 added the global scope.
     detail: specified
-    status: planned
+    status: released
   - version: 0.58.0
     outcome: >
       An operator can see what a store is holding and decide what it keeps.
@@ -1480,16 +1480,16 @@ versions:
       it is one spawn path, one machine, and one Windows matrix budget rather than two.
 
       **The access half.** This was specified as half of 0.47.0 and taken out of it whole on
-      2026-08-10, on the owner's
-      decision, after ten matrix rounds on `windows-latest` failed to converge from a development
-      host that cannot run the platform. The record is `US-IO-HARNESS-0.47.0-I01`. Nothing about the
-      goal changed: `docs/CONTRACT.md` still says "Supported, full suite in CI" and "native resource
-      containment only" in the same row, and `sandbox::appcontainer` still holds a mechanism nothing
-      selects — a low-box profile, named paths granted to its container SID with explicit ACEs, and
-      a spawn through `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, proven against negative
-      controls for a refused read and a refused socket. A Job Object is a kernel container for
-      resources; it has no filesystem facility and no network facility. This release is the other
-      half, and it selects it.
+      2026-08-10, on the owner's decision, after ten matrix rounds on `windows-latest` failed to
+      converge from a development host that cannot run the platform. The record is
+      `US-IO-HARNESS-0.47.0-I01`. Nothing about the goal changed: `docs/CONTRACT.md` still says
+      "Supported, full suite in CI" and "native resource containment only" in the same row, and
+      `sandbox::appcontainer` still holds a mechanism nothing selects — a low-box profile, named
+      paths granted to its container SID with explicit ACEs, and a spawn through
+      `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, proven against negative controls for a refused
+      read and a refused socket. A Job Object is a kernel container for resources; it has no
+      filesystem facility and no network facility. This release is the other half, and it selects
+      it.
 
       **It starts from evidence 0.47.0 paid for rather than from where 0.26.0 left it**, and the
       three faults it already fixed are in the tree: an ACE must carry specific rights, because
@@ -1511,15 +1511,15 @@ versions:
       ancestors.
 
       **The browser half, folded in here on 2026-08-15** rather than given an entry of its own; the
-      record is `US-IO-HARNESS-0.59.0-I01`.
-      `browser::launch` has a Windows arm that refuses, and its message says the work is tracked as
-      its own release — that sentence stops being true with this decision and is part of what the
-      release changes. 0.53.0 shipped the hole deliberately: the transport is a pipe and not a
-      debugging port, because a port is a listener any local process on the machine can drive, and
-      that principle is not being traded away to make Windows easy. On unix the spawn dups the two
-      pipe ends onto descriptors 3 and 4 inside `pre_exec`, holding them above 10 with `F_DUPFD`
-      first so the dup targets cannot collide, using only async-signal-safe calls. Windows has no
-      analogue in the standard library, which is the whole of the gap.
+      record is `US-IO-HARNESS-0.59.0-I01`. `browser::launch` has a Windows arm that refuses, and
+      its message says the work is tracked as its own release — that sentence stops being true with
+      this decision and is part of what the release changes. 0.53.0 shipped the hole deliberately:
+      the transport is a pipe and not a debugging port, because a port is a listener any local
+      process on the machine can drive, and that principle is not being traded away to make Windows
+      easy. On unix the spawn dups the two pipe ends onto descriptors 3 and 4 inside `pre_exec`,
+      holding them above 10 with `F_DUPFD` first so the dup targets cannot collide, using only
+      async-signal-safe calls. Windows has no analogue in the standard library, which is the whole
+      of the gap.
 
       **The browser half opens with a spike, not with a contract.** How Chromium on Windows expects
       those two handles — inherited by value on the command line, by slot, or through

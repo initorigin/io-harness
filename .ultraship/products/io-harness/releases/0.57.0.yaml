@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.57.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -501,3 +501,182 @@ open_questions:
   **Whether selection should be observable as its own trace row** — which notes lost, and to what.
   The plan is no: `ContextEvent::memory_recall` already names the carried keys, and what was not
   carried is the complement of a list the trace already holds.
+delivered: >
+  The notes a turn is handed are the notes that turn needs. Past the memory block's quarter-share of
+  a turn — the regime 0.56.0's raisable caps created — the entries that survive the fit are ranked by
+  how many normalised words they share with what the turn is about (the run's goal, and every path or
+  subject a tool has already named in this run), then by how many separate runs have carried them,
+  then by the order the store returned. An entry with no signal and no evidence keeps exactly the
+  position it had, so a turn about nothing the store knows selects as 0.56.0 did.
+
+  Relevance decides what is SELECTED, not the order it is printed in, and that is a correction to the
+  roadmap entry made before any code was written. The memory block is a byte-prefix of the user turn
+  and 0.44.0's second cache breakpoint is withheld unless that prefix repeats byte-identically, so
+  reordering the print would have converted cache reads into cache writes on every marked wire, on
+  every step whose signals moved, for a reordering the model gains nothing from. A store that fits its
+  share therefore renders byte-identically however the turn moves.
+
+  And `remember` stops writing a contradiction silently. On a write whose text closely restates an
+  entry already held in the same scope under a different key, the tool result names that key and
+  quotes what it holds, bounded. The write lands: it is a report, never a refusal. Rewriting the same
+  key is not reported, and a workspace note restating a global one is not reported either — that is
+  the override the second scope exists for.
+released_at: 2026-08-15T00:00:00Z
+mode: published
+evidence:
+  tests:
+  - >
+    **Default suite: 86 binaries, 1,334 tests, 440 doctests, 0 failures.** `cargo test --no-fail-fast`,
+    exit 0, on the shipped tree. 0.56.0 was 85 binaries and 1,317 / 439, so this release adds one
+    binary (`tests/memory_recall.rs`), 17 tests and one doctest.
+  - >
+    **`tests/memory_recall.rs` — 6 passed.** F1 (`a_turn_about_one_subject_carries_the_notes_about_that_subject`,
+    with the newest-cohort control asserted rather than described), F2
+    (`a_path_the_run_has_read_is_a_signal_the_next_turn_recalls_by`, two turns of one run), F3
+    (`draws_break_a_signal_tie_and_the_store_order_breaks_a_draw_tie`, evidence earned by real runs
+    because `record_memory_recall` is crate-private and a test writing its rows would assert against a
+    table no run produced), F5 (`the_block_is_printed_in_the_stores_order_however_the_turn_moves`), F6
+    (`the_same_store_and_the_same_turn_select_the_same_notes_twice`), F7
+    (`a_spawned_child_recalls_under_the_same_ordering_as_the_flat_loop`, a real spawn read at the
+    child's own prompt).
+  - >
+    **`tests/memory_scope.rs` — 10 passed, four of them new.** F9
+    (`a_note_that_restates_one_already_held_names_the_key_that_holds_it`), F10
+    (`an_unrelated_note_and_a_rewrite_of_one_key_are_not_flagged`, both halves on the ABSENCE of the
+    report), F11 (`a_flagged_write_still_lands_and_the_quote_is_bounded`), F12
+    (`the_duplicate_check_is_within_the_scope_being_written`, all three directions).
+  - >
+    **`cargo test --lib` — 488 passed.** F4 (`the_draws_count_is_of_runs_and_not_of_rows`), F8
+    (`ranking_recall_draws_seeks_the_recalls_rather_than_scanning_them`), F13
+    (`the_overlap_measure_is_symmetric_exact_and_immune_to_word_order`,
+    `the_normaliser_reduces_a_path_and_a_sentence_to_the_same_words`), and the three guards the
+    sabotage pass proved were missing.
+  - >
+    **O8 — `a_store_that_fits_its_share_keeps_the_marker_selection_only_costs_it_past_the_cap`.** A
+    store inside its share costs zero marked steps against a run with no notes at all; past the share a
+    moving prefix can only withhold the marker, never add one.
+  - >
+    **Cross-version gate: both halves pass.** `cargo build --manifest-path
+    tests/fixtures/gen-0.29.0/Cargo.toml`, then `cargo test --test cross_version_0_29_0` (2 passed) and
+    `-- --ignored` (1 passed) — a 0.29.0 binary reads a 0.57.0 store, which is the direction that
+    matters for a release that changed `memory_list`'s ORDER BY.
+  - >
+    **Sabotage: 14 arms, and every one now kills a named test.** Three survived their first run and all
+    three were defects in this release's own tests rather than superfluous guards; each is described in
+    `known_limitations` and in the reviews below. Logs in `evidence/0.57.0/sab-*.log`.
+  builds:
+  - "`cargo fmt --all --check` — exit 0 against the shipped tree."
+  - >
+    **`cargo clippy --all-targets -- -D warnings` — exit 0 on all three polarities** (O7): the default
+    build, `--features media`, and `--all-features`. Clean on the first attempt at every one.
+  - >
+    **`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0**
+    (O5), after one fix it found: `memory_list`'s public doc carried an intra-doc link to
+    `MEMORY_CANDIDATES_SQL`, which is `pub(crate)`. Seventh of the last nine releases this gate has
+    caught something stable `cargo doc` cannot see.
+  - "**`cargo tree` — 402 lines, unchanged** (N1). No new dependency."
+  - "**`cargo package --locked` — 1,893,318 bytes, 254 files** (0.56.0: 1,868,619 and 253)."
+  - >
+    **No schema change at all** (N3): `git diff main -- src/state.rs` shows no `CREATE TABLE`, no
+    `CREATE INDEX`, no `ALTER TABLE` and no `CHECKPOINT_FORMAT` movement. 0.56.0's
+    `memory_recalls_entry` is what serves the new aggregate.
+  - >
+    **`docs/public-api.txt` UNCHANGED — N2 predicted +0 lines and got exactly that.**
+    `public_surface_matches_snapshot` green with no edit to the snapshot. `Store::memory_similar` is a
+    method on an exported type and the threshold is a private constant documented on it.
+  - "**Doc gates**: `changelog` 5 passed, `docs_drift` 15 passed, `public_api` 9 passed."
+  - >
+    **Measurement (N5, N6), recorded and not asserted.** Apple M1, release profile, medians of 20, over
+    a 200-observation ledger: ranking one scope is 1.106 / 11.088 / 119.171 ms at 64 / 512 / 4,096
+    entries, and a `remember` including the duplicate check is 1.946 / 21.172 / 201.369 ms. Linear in
+    entries, flat in the recall table — the timings moved about tenfold for an eightfold input, so
+    0.56.0's flat-timing defect shape did not recur. In `docs/MEASUREMENTS.md` with the method.
+  reviews:
+  - >
+    **The roadmap entry's central premise was wrong and the correction was made before any code was
+    written — fourth release running that reading the source first changed what shipped.** The entry
+    asked for recall itself to be ordered by relevance. The memory block is a byte-prefix of the user
+    turn and 0.44.0's second cache breakpoint is withheld unless that prefix repeats byte-identically,
+    so reordering the print would have converted cache reads into cache writes on every marked wire, on
+    every step whose signals moved, for a reordering the model gains nothing from. Relevance selects;
+    the print order is unchanged. Recorded in `roadmap.yaml` rather than reworded to fit.
+  - >
+    **Three sabotage arms survived their first run and every one was a test defect.** (1) F13 claimed
+    to assert the similarity threshold and did not — its pairs are 42%, 50% and 66% of their union, so
+    a strict comparison survived all three; there is now a pair at exactly 60%. (2) Nothing asserted
+    `memory_list`'s total order once the cross-version gate stopped comparing positionally, because
+    every other test writes its entries far enough apart to differ in the millisecond; four rows now
+    share one `created_at` by hand with keys reversed against insertion order. (3) The sort key's index
+    tail was unexercised — a contiguous run of equal keys is the one case an unstable sort leaves
+    alone, so 64 tied entries proved nothing, and two interleaved cohorts is where an unstable
+    partition moves them.
+  - >
+    **The cross-version gate caught the order change, and the tie it caught on is not exotic.** Two of
+    the 0.29.0 fixture's own rows share a `created_at` to the millisecond, which is what writing two
+    notes in one step produces. That is precisely why the key tie-break is load-bearing: under the row
+    id a printer holding only entries cannot reconstruct the store's order, so a tied pair could swap
+    as the ranking moved, change the block's bytes, and withhold the cache marker. The gate was zipping
+    two arrays and asserting an order by accident; it matches by key now.
+  - >
+    **A guard written into a new test caught a claim in an old one.** The plan test asserts its recall
+    table is at least ten thousand rows; 0.56.0's sibling builds 9,984 (64 keys over 156 steps) and has
+    claimed ten thousand since it shipped. The new test asserts the count rather than leaving it as
+    arithmetic in a loop bound.
+  - >
+    **Two arithmetic claims in the drafted guide prose were wrong and were corrected before they
+    shipped.** The measured `remember` figure already contains the eviction ranking a capped write
+    does, so quoting 0.56.0's 73 ms as sitting on top of it double-counted, in two files.
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **The fit is a greedy prefix, not a knapsack.** It stops at the first note that does not fit rather
+  than continuing to pack smaller ones behind it, so one large note near the top of the ranking can
+  cost several small relevant ones. This has been true since 0.10.0 and is unchanged here; it is more
+  visible now that the walk order is relevance rather than age.
+- >
+  **A recall is a carriage, not a use.** Nothing observable says whether the model read a line of the
+  memory block, so the evidence the second rank term reads is "this entry was in the prompt of a run".
+  0.56.0 recorded this for eviction; this release adds a second consumer of the same signal.
+- >
+  **Token overlap is a weak notion of "about".** Two notes on one subject that share no vocabulary
+  rank as unrelated. The measure is chosen because it is exact, local and replayable. The clock tail
+  means a turn with no signal degrades to 0.56.0's behaviour rather than to noise.
+- >
+  **Ranking is recomputed every turn and is linear in entries** — about 1.1 ms at the default 64
+  entries and about 120 ms at 4,096, on every turn. The upgrade path if a store that large becomes
+  ordinary is to cache each entry's token set against its `created_at`, not to make the ranking
+  approximate.
+- >
+  **Past the share, a run that reads new files may pay a cache write it would not have paid on
+  0.56.0.** The selected set can move as the signals grow, and a moved prefix withholds the marker.
+  O8 asserts the fitting case costs nothing and that a moving prefix can only withhold, never add.
+- >
+  **A spawned child does not inherit the root's `ContextBudget`.** A child's `TaskContract` is built
+  fresh by the spawn, so it always assembles under the default 24,000 tokens however tightly the root
+  was bounded. Pre-existing, found while sizing F7's fixture, and outside this release's scope.
+- >
+  **The elision line no longer says "older", which `scope.included` said would be unchanged.** The
+  substance of that line was kept and one word that had become false was removed: the notes are
+  elided for being about something else, not for being old.
+- >
+  **F13's parenthetical was wrong.** It claimed a float comparison would flip the exact-threshold
+  case. It does not — an exactly-60% ratio divides to the same `f64` the literal parses to. The
+  integer comparison is kept because there is then no rounding to reason about, and the boundary is
+  asserted in both directions instead.
+- >
+  **0.56.0's eviction plan test claims ten thousand recall rows and builds 9,984.** Sixty-four keys
+  over 156 steps. Found by the new plan test's own row-count guard; the new test asserts the count
+  rather than leaving it as arithmetic in a loop bound. The sibling is left as it is.
+- >
+  **Three arms of the sabotage pass survived their first run and all three were test defects**, not
+  superfluous guards — recorded in the evidence rather than quietly fixed.
+- >
+  **One handle test fails under full-suite parallelism on this machine and passes serially**:
+  `a_handle_that_exits_on_its_own_stops_reading_as_running`. It races a process reaper, touches
+  nothing this release changed, and is the tenth instance of the standing "never gate a test on a
+  clock" trap.
+supersedes: 0.56.0
+next_recommended_version: 0.58.0
+immutable: true
+
