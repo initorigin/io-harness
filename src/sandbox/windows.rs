@@ -527,7 +527,8 @@ pub(crate) mod job {
     pub(crate) fn container_available() -> bool {
         static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *OK.get_or_init(|| {
-            crate::sandbox::appcontainer::win::Profile::create("io-harness-probe", false).is_ok()
+            crate::sandbox::appcontainer::win::Profile::create(&profile_name("probe"), false)
+                .is_ok()
         })
     }
 
@@ -554,6 +555,24 @@ pub(crate) mod job {
     /// Deliberately a process-global last-one-wins rather than a channel: it
     /// exists so a failure has something to print, and a decline is rare enough
     /// that the most recent one is the interesting one.
+    /// The container profile's name, **per process**.
+    ///
+    /// **A deterministic name is a shared object, and this type deletes it on
+    /// `Drop`.** Two processes containing a command at the same time — two agents,
+    /// a test binary per test, a tree of children — both resolve the same name;
+    /// the first to finish deletes the profile the second is still spawning into,
+    /// and the second gets a decline. It cost the release PR a Windows leg: the
+    /// first row of the capability table declined and every row after it passed,
+    /// which is the signature of a container that existed and then did not.
+    ///
+    /// Per-process is enough because the profile has no reason to outlive the
+    /// process that made it, and the SID derives from the name — so two processes
+    /// now hold two containers and cannot grant, or delete, each other's. Well
+    /// under the 64-character limit.
+    fn profile_name(role: &str) -> String {
+        format!("io-harness-{role}-{}", std::process::id())
+    }
+
     pub(crate) fn last_decline() -> Option<String> {
         DECLINE
             .get()
@@ -595,7 +614,7 @@ pub(crate) mod job {
         // A deterministic name, so a profile stranded by a crashed run is
         // re-entered rather than becoming a permanent failure — the module's own
         // `ERROR_ALREADY_EXISTS` path. Bounded well under the 64-character limit.
-        let profile = match Profile::create("io-harness-sandbox", spec.allow_network) {
+        let profile = match Profile::create(&profile_name("sandbox"), spec.allow_network) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
@@ -665,6 +684,9 @@ pub(crate) mod job {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!("sandbox: could not create a job object for the container ({e})");
+                note_decline(&format!(
+                    "could not create a job object for the container: {e}"
+                ));
                 return None;
             }
         };
@@ -684,6 +706,7 @@ pub(crate) mod job {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!("sandbox: could not open the container's capture file ({e})");
+                note_decline(&format!("could not open the container's capture file: {e}"));
                 return None;
             }
         };
@@ -692,6 +715,7 @@ pub(crate) mod job {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("sandbox: could not spawn into the AppContainer ({e})");
+                note_decline(&format!("could not spawn into the AppContainer: {e}"));
                 let _ = std::fs::remove_file(&out_path);
                 return None;
             }

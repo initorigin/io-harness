@@ -134,6 +134,15 @@ notes are produced from it.
   put on the Start menu. Machine-wide locations for Chrome, Chromium and Edge,
   and the per-user install under `%LOCALAPPDATA%` after them.
 
+- **A deterministic container profile name is a shared object.** The profile is
+  deleted on `Drop`, so two processes containing a command at once — two agents,
+  or a runner that gives each test its own process — resolved the same name and
+  whichever finished first deleted the container the others were still spawning
+  into. Dormant while nothing selected this backend; a race the moment something
+  did. The name is now per process, and every decline path records its reason:
+  three of them did not, so the one failure this release was least equipped to
+  explain was the one that happened.
+
 - **A test that could have passed against an open network.** The container's
   egress probe wrote its body to `NUL`, which a container cannot open, so `curl`
   exited 23 — "failed writing output" — whether or not the request succeeded,

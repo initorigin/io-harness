@@ -46,6 +46,17 @@ evidence:
     descriptors are not open`. A Rust child sees the same descriptors
     (`_get_osfhandle(3)=0x114`, `(4)=0xf4`) and echoed a NUL-framed message back.
   - >
+    **The release PR found a fifth defect the feature PR could not, and the record was amended
+    before the merge into `main`.** The three-OS matrix runs `cargo nextest`, which gives each
+    test its own process; the container profile's name was deterministic and this type deletes
+    the profile on `Drop`, so processes resolving the same name deleted each other's container.
+    The capability table's first row declined and every row after it passed, which is the
+    signature exactly. Selecting the backend is what turned it from dormant into a race between
+    two agents on one machine. The name is now per process, all three previously-silent decline
+    paths record their reason — "no reason recorded" is the gap this release exists to close and
+    it appeared in its own release PR — and a test builds two live profiles and asserts the
+    survivor still spawns a process after the other is dropped.
+  - >
     **Sabotage: nine arms, every one kills its named test.** Seven on `windows-latest` (the
     backend reported, a silent decline, unconditional selection, the memo key, the capability
     array, the proxy, the claim table) and two locally (the proxy argument, the command-line
@@ -100,11 +111,13 @@ known_limitations:
   method, a field, or a type under `sandbox::windows`, which that file has never tracked.
   Recorded because a prediction that was wrong is worth more than a number quietly adjusted.
 - >
-  **The three-OS matrix over both feature polarities had not run at the time this record was
-  sealed.** What ran is the full local suite on macOS and a Windows job carrying the container
-  tests, the browser suite and the live browser. The release PR is where the matrix answers, and
-  the record is amended before the merge into `main` if it disagrees — the only window in which
-  that is legal.
+  **The matrix disagreed with the seal, and the record says so rather than being quietly
+  reconciled.** When this record was first written the three-OS matrix had not run; the feature
+  PR then passed 19 of 19 first try and the release PR failed both Windows legs on one test out
+  of 1,443 — a profile-name race that only a process-per-test runner exposes. It was fixed, the
+  record was amended and re-pinned before the merge into `main`, and the defect is listed with
+  the others above. This is the second release to use that window (0.46.0 and 0.51.0 were the
+  first two) and it is the only one in which an amendment is legal.
 supersedes: 0.58.0
 next_recommended_version: 0.60.0
 immutable: true
