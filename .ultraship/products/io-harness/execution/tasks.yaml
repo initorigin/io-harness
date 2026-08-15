@@ -1,456 +1,285 @@
 product: io-harness
-version: 0.56.0
+version: 0.57.0
 tasks:
-  - id: US-IO-HARNESS-0.56.0-T01
-    summary: "Order eviction candidates by evidence: distinct runs that recalled the entry, then last
-      recall, then the write clock. Add the (workspace, key) index the aggregate needs."
-    why_required: It is the defect the version exists for. `enforce_memory_caps` (`src/state.rs:6656`)
-      orders by `created_at ASC, id ASC`, so the entry a workspace has leaned on longest is the
-      first one dropped. Nothing else in the release matters if the store still curates by clock,
-      and the aggregate is unaffordable on the write path without the index.
+  - id: US-IO-HARNESS-0.57.0-T01
+    summary: One normaliser and one overlap measure, written once and called by both halves of the
+      release.
+    why_required: Both halves ask "how much do these two texts have in common", and two answers to
+      that question is how the ranking and the duplicate check come to disagree about what a word
+      is. The measure also has to be exact at its own threshold, which a float comparison is not.
     status: done
     depends_on: []
     acceptance_criteria:
       - >
-        **F1 — the entry many runs carried survives, and the entry no run carried goes.** A store is
-        filled to `max_entries`. One key is recalled by ten separate runs and is the **oldest**
-        entry in the workspace; another is recalled by none and is newer. One further write forces
-        an eviction. The recalled key survives, the unrecalled one is in `MemoryWrite::evicted`, and
-        the assertion is on both halves. The control is the same sequence asserted to behave the
-        other way round on 0.55.0's ordering, written out in the test so the fix cannot silently
-        revert. Sabotage: restore `ORDER BY created_at ASC, id ASC`, under which the recalled key is
-        evicted and only F1 fails.
-      - >
-        **F2 — one long run does not outvote many short ones.** Two entries: one recalled at 200
-        steps of a single run, one recalled at one step of each of three runs. The 200-row entry is
-        evicted first, because three distinct runs beat one. This is the criterion that fails if the
-        implementation counts rows, which is what the roadmap entry's prose asked for. Sabotage:
-        `COUNT(*)` in place of `COUNT(DISTINCT run_id)`, under which the three-run entry is evicted
-        and only F2 fails.
-      - >
-        **F3 — the unproven cohort keeps 0.10.0's order.** With no recall rows at all for any entry,
-        eviction order is byte-for-byte what 0.55.0 produced: oldest `created_at` first, `id`
-        breaking a tie. Asserted by evicting five entries from a store with no recalls and comparing
-        the evicted list to the literal expected order. Sabotage: drop the `created_at, id` tail of
-        the ORDER BY, under which the order becomes unstable and only F3 fails.
-      - >
-        **F4 — pinned is still not a candidate and the written key is still kept.** A pinned entry
-        with zero recalls and the oldest `created_at` — the worst possible score on every term —
-        survives an eviction that drops three other entries, and the key just written is never among
-        the evicted even when it is the only zero-recall entry. Both halves asserted; both are
-        0.30.0 and 0.10.0 behaviour and this release must not move them. Sabotage: remove the `keep`
-        guard, under which the write becomes a silent no-op and only F4 fails.
-      - >
-        **F5 — the eviction query is answered from an index.** `EXPLAIN QUERY PLAN` over the exact
-        statement the crate runs, on a store holding 64 entries and 10,000 recall rows, names
-        `memory_recalls_entry` and contains no `SCAN memory_recalls`. Asserted on the plan text, and
-        the measured time for one capped write at that size is recorded, never asserted. Sabotage:
-        drop the index creation, under which the plan shows a scan and only F5 fails.
-      - >
-        **N3 — the schema change is one index and nothing else.** `git diff main -- src/state.rs`
-        shows the new index, the limits plumbing and `memory_forget`, and **no new table, no new
-        column and no `CHECKPOINT_FORMAT` change**. A 0.55.0 store and a 0.56.0 store are the same
-        store in both directions, which O4's cross-version gate is what proves.
+        **F13 — the overlap measure is symmetric, exact and immune to word order.** Unit-level: the
+        same two texts compared in either direction give the same answer; two texts with the same
+        words in a different order are maximally similar; a text and its own copy with one word
+        added is not; and the threshold comparison is made on integers, asserted by a pair whose
+        float ratio lands on the threshold exactly. Sabotage: compare with `as f64` division, under
+        which the exact-boundary case flips and only F13's last assertion fails.
     files:
-      - src/state.rs
-      - src/lib.rs
-    evidence:
-      - >-
-        F1 `the_entry_many_runs_carried_survives_and_the_one_no_run_carried_goes`, F2
-        `one_long_run_does_not_outvote_three_short_ones`: both written first and both watched fail
-        against the old order, each evicting `k0` — the clock's pick — where the new order evicts
-        `k1` and `k5`. Both pass after the change.
-      - >-
-        F3 `with_no_recalls_at_all_the_order_is_exactly_the_write_clock` and F4
-        `a_pinned_entry_with_the_worst_score_is_still_never_a_candidate` passed before the change as
-        well as after, which is the point of them: they are the guards on the behaviour this
-        release must NOT move, and 0.10.0's `the_entry_count_cap_evicts_oldest_first_and_never_the_new_entry`
-        still passes unmodified beside them.
-      - >-
-        F5 `ranking_eviction_candidates_seeks_the_recalls_rather_than_scanning_them`: `EXPLAIN QUERY
-        PLAN` over `Store::MEMORY_CANDIDATES_SQL` itself — not a re-typed copy — on 64 entries and
-        9,984 recall rows names `memory_recalls_entry` and contains no `SCAN memory_recalls`. The
-        control asserts `step`, which is in no index, cannot be served from one.
-      - >-
-        `cargo test --lib` — 475 passed, 0 failed, 1 ignored. `cargo test --test memory --test
-        rewind --test determinism` — all green.
-      - >-
-        N3: the schema change is one `CREATE INDEX IF NOT EXISTS memory_recalls_entry ON
-        memory_recalls (workspace, key)`. No table, no column, `CHECKPOINT_FORMAT` unmoved.
-      - >-
-        `MemoryLimits` and `Store::memory_write_with` landed here rather than in T02, because
-        `enforce_memory_caps` needed the type to take its caps from. T02 adds the config and
-        contract plumbing that carries an operator's numbers into it.
-  - id: US-IO-HARNESS-0.56.0-T02
-    summary: "Make the three caps an operator key: `MemoryLimits` defaulting to the existing constants,
-      a `[memory]` table in `io.toml`, project-scope narrowing, and the limits threaded to the
-      write."
-    why_required: The contract requires the caps to be movable and the guide to state what moving them
-      costs. The limits must reach `enforce_memory_caps` through every door a write can come
-      through, or the cap depends on which call site wrote the entry.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.56.0-T01
-    acceptance_criteria:
-      - >
-        **F6 — the caps travel the ordinary configuration path.** `[memory] max_entries = 8` in an
-        `io.toml` reaches `TaskContract` through `Config::apply_to`; a misspelled key beside it is
-        still refused by `deny_unknown_fields`; a run with nothing set evicts at exactly 64, 16,000
-        and 2,000 as 0.55.0 did. Asserted with a set run and an unset run over the same workspace.
-        Sabotage: read the table directly in the run loop rather than projecting it onto the
-        contract, under which the typed-API assertion fails and only F6 fails.
-      - >
-        **F7 — a project-scoped file may lower a cap and may not raise it.** A user-scope `io.toml`
-        setting `max_entries = 64` and a project-scope one setting `128` yields 64; the project file
-        setting `16` yields 16. All three keys asserted, not one representative. Sabotage: omit the
-        three new `NARROWING` entries, under which the 128 wins and only F7 fails.
-      - >
-        **F8 — the entry cap bounds a single value and the total cap bounds the store.** With
-        `max_entry_chars = 100` a longer value is stored truncated with the existing marker; with
-        `max_chars = 500` and a large `max_entries`, writes evict until the character total holds.
-        The two caps are asserted independently, because a single implementation that only honours
-        the entry count would pass a test that sets both. Sabotage: hold only the entry count, under
-        which the character assertion fails and only F8 fails.
-      - >
-        **N4 — zero compile breaks.** `TaskContract` is `#[non_exhaustive]` since 0.35.0, so a new
-        field costs nobody anything; `MemoryLimits` is a new type; the existing
-        `Store::memory_write` and `Store::memory_put` keep their signatures and delegate with
-        `MemoryLimits::default()`. No existing method changes shape. Asserted by the crate's own
-        examples and tests compiling unmodified except where a test asserts the behaviour this
-        release deliberately changes.
-    files:
-      - src/state.rs
-      - src/config.rs
-      - src/contract.rs
-      - src/run.rs
-      - tests/config.rs
-      - tests/memory.rs
-    evidence:
-      - >-
-        F6 `the_memory_caps_reach_the_contract_through_the_ordinary_projection` (tests/config.rs):
-        `[memory] max_entries = 8` reaches `TaskContract` through `Config::apply_to`, the two caps
-        the file did not name keep the crate's constants rather than being reset by a whole-struct
-        projection, and an empty config yields `MemoryLimits::default()` — 64 / 16,000 / 2,000,
-        asserted as literals so a moved default is a failing test.
-      - >-
-        F6's end-to-end half, `a_contracts_memory_caps_bound_what_a_run_may_remember`
-        (tests/memory.rs): a run whose contract sets `max_entries: 2` and whose model calls
-        `remember` four times leaves two entries; the same script with nothing set leaves four. This
-        is what proves the projection is a number something reads — `contract.memory` is threaded to
-        `dispatch` beside `memory_key` and the `remember` arm writes through `memory_write_with`.
-      - >-
-        F6's misspelling guard, `a_memory_key_misspelled_is_still_refused_by_name`: `max_entrys` is
-        refused by name under `deny_unknown_fields`.
-      - >-
-        F7 `a_project_scoped_file_may_lower_a_memory_cap_and_may_not_raise_it`: all three keys in
-        both directions — a project file lowering 64/16,000/2,000 to 16/4,000/500 wins, the same
-        file raising them to 128/900,000/90,000 loses to the user scope, and the control shows
-        `io.local.toml` setting one outright because it is the operator's own file.
-      - >-
-        F8 `an_operators_caps_bound_a_single_value_and_the_store_independently` (src/state.rs): the
-        entry cap truncates one value with the existing marker while the other two caps have room,
-        and the character cap evicts while the entry count is nowhere near its limit. Asserted
-        apart, because an implementation honouring only the count passes a test that sets both.
-      - >-
-        `cargo test --lib` 476 passed, `--test config` 57 passed, `--test memory` 15 passed. N4:
-        zero compile breaks — `TaskContract` is `#[non_exhaustive]`, `memory_write` and `memory_put`
-        keep their signatures, and nothing in the suite needed an edit to go on compiling.
-  - id: US-IO-HARNESS-0.56.0-T03
-    summary: "Add the `forget` tool and `Store::memory_forget`: refused on a pinned entry and on an
-      unapproved plan, restorable by `rewind_run`, and taking the key's recall rows with it where an
-      eviction leaves them."
-    why_required: A run that learns a fact wrong has no way to withdraw it today; rewriting the key
-      under a second name leaves two disagreeing notes. The restore point is what makes the
-      withdrawal as reversible as every other write this crate records.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.56.0-T01
-    acceptance_criteria:
-      - >
-        **F9 — `forget` removes one entry and says so.** A run calls `forget` on a key it wrote. The
-        entry is gone from `Store::memory_list`, absent from the next turn's assembled prompt, and
-        the observation names the key. `forget` on a key that was never written reports that nothing
-        was there, and is not an error. Sabotage: report success unconditionally, under which the
-        not-there assertion fails and only F9 fails.
-      - >
-        **F10 — `forget` is refused on a pinned entry and while a plan is unapproved.** A pinned
-        entry survives a `forget` with a refusal naming the key, and the entry is still there
-        afterwards. With an unapproved plan active, `forget` is refused before it reaches the store,
-        with the same shape of message `remember` gives — asserted by the store still holding the
-        entry, not only by the text. Sabotage: gate `forget` on the plan but not on the pin, under
-        which the pinned assertion fails and only F10 fails.
-      - >
-        **F11 — a forget is undone by a rewind, and an eviction's evidence survives.** After a
-        `forget`, `rewind_run` restores the entry with its value, kind and pin state intact.
-        Separately, a key removed by **eviction** keeps its `memory_recalls` rows, while a key
-        removed by `forget` has none afterwards — the two are asserted in one test, because the
-        whole point is that they differ. Sabotage: delete recall rows on eviction too, under which
-        the eviction half fails and only F11 fails.
-    files:
-      - src/state.rs
-      - src/run.rs
-      - src/observe.rs
-      - src/tools/mod.rs
-      - src/lib.rs
-      - tests/memory.rs
-    evidence:
-      - >-
-        F9 `a_run_withdraws_a_note_and_a_key_that_was_never_there_says_so`: a run calling `forget`
-        removes the entry, and a second call naming a key that was never written records no second
-        withdrawal — asserted by counting `memory_forget` context events, so a blanket success would
-        fail it.
-      - >-
-        F10 `a_pinned_note_survives_a_forget_and_the_refusal_is_recorded`: the pinned entry keeps
-        its value, its kind and its pin, `memory_refused` is in the trace and `memory_forget` is
-        not. Asserted on the store rather than on the message, because a refusal that says the right
-        thing and removes the entry anyway would pass a text assertion. The unapproved-plan refusal
-        is the same guard `remember` has, in the same place, for the reason stated there.
-      - >-
-        F11 half one, `a_rewind_puts_back_the_note_a_forget_took`: written first and **watched
-        fail**, which is what found the real defect. `Store::memory_restore` had been an `UPDATE`
-        since 0.36.0 — it restores an entry a run edited and silently does nothing for one a run
-        removed, so a rewind would have reported `memory_restored: ["retries"]` with the entry still
-        gone. It is now an UPSERT whose `ON CONFLICT` half is 0.36.0's `UPDATE` byte for byte, so
-        nothing about restoring an edited entry moved.
-      - >-
-        F11 half two, `a_forget_takes_the_evidence_with_it_and_an_eviction_leaves_it`: with every
-        entry carried by the same run the evidence terms tie and the clock decides, so the eviction
-        lands on an entry that HAS recall rows — and those rows survive. The withdrawn key's do not,
-        and a third key's are untouched. One test, because the point is that the two differ.
-      - >-
-        `MemorySnapshot` gained `step`, which the INSERT half of the restore needs to attribute the
-        row it puts back; the entry's original run died with the row. `pinned` restores as 0, and
-        that is not a guess — a pinned entry cannot be forgotten, so a restored one was never
-        pinned.
-      - >-
-        `cargo test --lib` 477 passed; `--test memory` 18 passed; `--test rewind --test determinism`
-        green. `--test checkpoint`'s `crash_resume_...` fails only under a bare `--test` invocation,
-        which does not build `examples/` — the same pre-existing condition as `tests/context.rs`'s
-        MCP fixture, unrelated to this task and green under a plain `cargo test`.
-  - id: US-IO-HARNESS-0.56.0-T04
-    summary: "Add the scope above the workspace: a reserved workspace key, `scope` on `remember` and
-      `forget`, both scopes recalled at both loop sites, the workspace winning a collision, and the
-      two groups rendered under their own headings."
-    why_required: A fact true of every repository is learned again per workspace today. The collision
-      rule and the separate headings are what stop a general note being read as something learned
-      about this workspace.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.56.0-T03
-    acceptance_criteria:
-      - >
-        **F12 — a global note is recalled from a workspace that never wrote it.** A run over
-        workspace A writes a note with `scope: "global"`. A run over workspace B, which has no
-        entries of its own, carries it in its memory block and `Assembled::recalled_keys` names it.
-        A second global note written by B is carried by A. Sabotage: recall only the run's own
-        workspace, under which B's block is empty and only F12 fails.
-      - >
-        **F13 — the workspace wins a key collision, and the global entry is not also rendered.**
-        With the same key in both scopes, the assembled prompt contains the workspace value and
-        **does not contain the global value** — asserted on the global value's text being absent,
-        not merely on the workspace value being present, because rendering both would pass the
-        weaker assertion. Sabotage: concatenate the two lists without deduplicating, under which the
-        global text appears and only F13 fails.
-      - >
-        **F14 — the block says which notes are global.** The memory block renders the two groups
-        under separate headings, and a global note is not described as learned over this workspace.
-        Asserted on the rendered text of a prompt holding one note of each. Sabotage: render one
-        undifferentiated list, under which the heading assertion fails and only F14 fails.
-      - >
-        **F15 — the reserved global key cannot be a real workspace.** `memory_key` over a directory
-        whose name is the reserved string still yields that directory's canonical path, which is not
-        equal to the reserved key. Asserted on a real temporary directory, so the claim is about
-        canonicalisation rather than about a string comparison written twice.
-      - >
-        **F16 — each scope holds its own caps.** Filling the global bucket past `max_entries` evicts
-        global entries and touches no workspace entry, and the reverse. Asserted in both directions,
-        because a single shared counter passes the first direction alone.
-    files:
-      - src/state.rs
-      - src/run.rs
       - src/context.rs
-      - src/lib.rs
-      - tests/memory_scope.rs
-      - tests/context.rs
     evidence:
-      - >-
-        F12 `a_global_note_is_recalled_from_a_workspace_that_never_wrote_it`: a run over workspace A
-        writes with `scope: "global"`; a run over workspace B, which has no entries of its own,
-        carries it in its block. Asserted in both directions, so the claim is about the scope rather
-        than the order two workspaces happened to run in. It also asserts the global write is NOT
-        also A's own entry.
-      - >-
-        F13 `the_workspace_wins_a_key_collision_and_the_global_note_is_not_carried`: with the same
-        key in both scopes the prompt holds the workspace value and **does not contain** the global
-        one. Asserted on the global value's absence, because rendering both would satisfy the
-        weaker "the workspace value is present".
-      - >-
-        F14 `the_block_renders_the_two_scopes_under_their_own_headings`: `[memory]` and `[memory:
-        every workspace]` both appear, and the two notes are asserted to fall inside their own
-        heading's span by byte offset rather than merely to be present.
-      - >-
-        F15 `a_directory_named_like_the_reserved_key_is_still_its_own_workspace`: a real temporary
-        directory actually named `<global>` keys on its own canonical path, which is absolute — so
-        the claim is about canonicalisation and not about a string spelled twice. Windows, where
-        `<` and `>` cannot appear in a path at all, is handled as the same property.
-      - >-
-        F16 `each_scope_is_bounded_on_its_own`: filling the global bucket past the cap evicts global
-        entries and touches no workspace entry, and the reverse. Both directions, because a single
-        shared counter passes the first alone.
-      - >-
-        Plus `a_run_withdraws_a_global_note_and_an_unknown_scope_is_refused`: `forget` reaches the
-        global scope, and an unrecognised `scope` writes nothing to either bucket rather than
-        quietly falling back to the workspace — a model that meant "every workspace" and silently
-        got "this one" would go on believing the fact is known everywhere.
-      - >-
-        The recall record is written against the bucket that holds the entry (`record_recalls`).
-        Crediting every carried key to the run's own workspace would have given the evidence for a
-        global note to a *different* entry that happened to share the key, and starved the global
-        one — the two lists are disjoint by construction because `recall_scopes` resolves every
-        collision before assembly sees them.
-      - >-
-        No public struct changed shape. `Assembled` keeps its fields — the loop partitions
-        `recalled_keys` by lookup instead — and `MemoryEntry` gained nothing, so N4's zero-break
-        claim still holds. The two new public items are `GLOBAL_MEMORY_WORKSPACE` and, from T01,
-        `MemoryLimits`; `MemoryForget` from T03 is a third, which N2 predicted as two.
-      - >-
-        `cargo test --test memory_scope` — 6 passed, 0 failed, first run. `tests/context.rs`'s eight
-        `assemble` call sites take the new empty global slice.
-  - id: US-IO-HARNESS-0.56.0-T05
-    summary: "Update every checked-in surface: `docs/CONTRACT.md`, the README, the two guide pages
-      including the coupling paragraph, `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md` and the
-      changelog."
-    why_required: "`docs/CONTRACT.md` states oldest-first eviction and workspace-only scope as this
-      crate's behaviour. Shipping the release with those sentences standing would be shipping a
-      documented lie."
+    - "`the_overlap_measure_is_symmetric_exact_and_immune_to_word_order` and
+      `the_normaliser_reduces_a_path_and_a_sentence_to_the_same_words` in `src/state.rs` — 2 passed."
+    - "F13's parenthetical was wrong and is recorded rather than dropped: an exactly-60% ratio divides
+      to the same f64 the literal 0.6 parses to, so a float comparison does NOT flip the boundary. The
+      boundary is asserted in both directions instead, which `>` in place of `>=` breaks (arm S13)."
+
+  - id: US-IO-HARNESS-0.57.0-T02
+    summary: The draws aggregate — distinct runs per key — as a `pub(crate) const` beside
+      `MEMORY_CANDIDATES_SQL`, with its query plan asserted.
+    why_required: The ranking's second term needs it, and it runs once per scope per turn on a table
+      that grows by one row per carried key per step for the life of the store. Unindexed it is a
+      full scan on the turn's hot path, which is the failure 0.56.0 already paid to learn about.
     status: done
-    depends_on:
-      - US-IO-HARNESS-0.56.0-T02
-      - US-IO-HARNESS-0.56.0-T04
+    depends_on: []
     acceptance_criteria:
       - >
-        **N1 — no new dependency.** `cargo tree` stays at **402** lines on the default build. This
-        release is SQL, config plumbing and two tool arms.
+        **F8 — the draws aggregate is answered from an index.** `EXPLAIN QUERY PLAN` over the exact
+        statement the crate runs, on a store holding 64 entries and 10,000 recall rows, names
+        `memory_recalls_entry` and contains no `SCAN memory_recalls`. Asserted on the plan text of
+        the `const` itself rather than a copy of it, as 0.56.0's F5 is. Sabotage: query by `run_id`
+        instead, under which the plan shows a scan and only F8 fails.
+    files:
+      - src/state.rs
+    evidence:
+    - "`ranking_recall_draws_seeks_the_recalls_rather_than_scanning_them` — the plan of
+      `Store::MEMORY_DRAWS_SQL` names `memory_recalls_entry` and contains no `SCAN memory_recalls`,
+      over 10,048 rows, with a column in no index as the control."
+    - "`the_draws_count_is_of_runs_and_not_of_rows` — 200 rows from one run rank below 3 rows from
+      three runs."
+    - "The row-count guard caught the fixture: 64 keys over 156 steps is 9,984 rows, not the 10,000
+      the criterion names. 0.56.0's sibling plan test has been sixteen short of its own claim since it
+      shipped; this one asserts the count rather than leaving it as arithmetic in a loop bound."
+
+  - id: US-IO-HARNESS-0.57.0-T03
+    summary: Rank at `recall_scopes` from the turn's signals, and split `render_notes` into
+      best-first selection and chronological printing.
+    why_required: This is the release. Without it recall still curates by the write clock, which is
+      the policy 0.56.0's raisable caps made unsafe. The split is what makes a fitting store render
+      byte-identically, which is what keeps 0.44.0's cache boundary.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.57.0-T01
+      - US-IO-HARNESS-0.57.0-T02
+    acceptance_criteria:
       - >
-        **N2 — the public surface addition is stated in advance.** `docs/public-api.txt` tracks
-        crate-root re-exports. The prediction is **+2 lines**: `MemoryLimits` and the reserved
-        global workspace constant. `TaskContract::with_memory_limits`, `Store::memory_forget`, the
-        new `Store` write method and the tool parameters add no line. Any difference is explained in
-        the record rather than absorbed.
+        **F1 — a turn about one subject is handed the notes about that subject.** A store holds notes
+        on several subjects, sized so the block cannot fit them all. A turn whose goal names one
+        subject carries that subject's notes in `Assembled::recalled_keys`, and the notes of the
+        other subjects are the ones elided. The same store and the same turn on 0.56.0's ordering
+        carry the most recently written notes instead, and that control is written out in the test.
+        Sabotage: return the entries in `memory_list` order, under which the recency set is carried
+        and only F1 fails.
       - >
-        **N5 — eviction stays cheap at the caps an operator may now set.** The time for one capped
-        write is measured at three sizes — the default 64 entries, 512 entries, and 4,096 entries —
-        each with a recall table proportional to the store, on a named machine, and recorded in
-        `docs/MEASUREMENTS.md`. Recorded, never asserted. The number that matters is that the
-        aggregate is answered from `memory_recalls_entry` at every size, which is F5's claim.
+        **F2 — a path the run has already read counts as a signal.** With a goal that names nothing
+        in the store, a run whose ledger holds an `Observation` targeting `src/state.rs` carries the
+        note whose value mentions `src/state.rs` over a newer note that mentions nothing the run has
+        touched. Asserted on the carried keys, from a ledger built directly rather than by driving a
+        provider. Sabotage: build the signal set from the goal alone, under which the newer note is
+        carried and only F2 fails.
       - >
-        **O3 — `docs/CONTRACT.md` is amended in this release, by name.** The memory section states
-        oldest-first eviction and workspace-only scope as the crate's behaviour. Both change. The
-        new rules — evidence-ordered candidates, the two scopes, the collision rule, `forget`, and
-        the caps as operator keys — are written where the old sentences stood.
+        **F3 — draws break a signal tie, and the write clock breaks a draw tie.** Two entries with an
+        identical overlap against the turn are separated by the number of distinct runs that carried
+        them; two entries equal on both are separated by `created_at, id`, which is the order
+        `memory_list` delivered. Both halves asserted in one test. Sabotage: drop the draws term,
+        under which the pair orders by clock alone and only F3's first half fails.
       - >
-        **O6 — the checked-in doc surfaces are updated in this release.** The README's memory
-        description, `docs/guide/tools-and-skills.md` (`remember`'s `scope`, the new `forget`),
-        `docs/guide/configuration.md` (the `[memory]` table **and the coupling paragraph**: the
-        block's quarter-share, what raising a cap costs per turn, and why raising it was unwise
-        before this release), `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md` and the changelog.
-        Every new public item carries a worked example; `cargo test --doc` and `tests/public_api.rs`
-        pass.
+        **F4 — one long run does not outvote many short ones.** The draws term is
+        `COUNT(DISTINCT run_id)`, so an entry carried at two hundred steps of one run ranks below one
+        carried at one step of each of three runs. This is 0.56.0's F2 asserted on the other side of
+        the same table, and it exists because the obvious spelling of "how often has this been drawn
+        on" is a row count. Sabotage: `COUNT(*)`, under which the 200-row entry wins and only F4
+        fails.
+      - >
+        **F5 — a store that fits its share renders byte-for-byte what 0.56.0 rendered.** With every
+        note inside the block's quarter-share, the assembled text is identical to the text produced
+        with the ranking disabled — asserted as a string equality of the whole memory block, not on
+        the set of keys, because the caching claim in `outcome.user_can` is about bytes. Sabotage:
+        sort the kept set by rank before printing, under which the block's line order moves and only
+        F5 fails.
+      - >
+        **F6 — the same store and the same turn select the same notes twice.** Two consecutive
+        assemblies over one store with one goal and one ledger produce equal `recalled_keys` and
+        equal block text. A third assembly after one further note is written produces a selection
+        that is still a pure function of the new store — asserted by computing it twice. Sabotage:
+        seed the ranking with anything not derived from the store and the turn, under which the two
+        runs differ and only F6 fails.
+    files:
+      - src/context.rs
+      - src/run.rs
+      - tests/memory_recall.rs
+    evidence:
+    - "`tests/memory_recall.rs` — 6 passed: F1 (`a_turn_about_one_subject_carries_the_notes_about_that_subject`,
+      with the newest-cohort control asserted rather than described), F2
+      (`a_path_the_run_has_read_is_a_signal_the_next_turn_recalls_by`, two turns of one run), F3
+      (`draws_break_a_signal_tie_and_the_store_order_breaks_a_draw_tie`, evidence earned by real runs
+      rather than inserted rows), F5 (`the_block_is_printed_in_the_stores_order_however_the_turn_moves`),
+      F6 (`the_same_store_and_the_same_turn_select_the_same_notes_twice`)."
+    - "`Store::memory_list` tie-breaks on the key rather than the row id, which is what makes the
+      printed order reconstructible from an entry alone. `MemoryEntry` carries no `id`."
+    - "The elision line no longer says the dropped notes are `older`. They are dropped for being about
+      something else. This is a stated deviation from `scope.included`, which said the elision line was
+      unchanged: the substance of that line was kept and one word that had become false was not."
+
+  - id: US-IO-HARNESS-0.57.0-T04
+    summary: Build the turn's signals at the tree loop's recall site too, and prove a child agent
+      recalls under the same ordering.
+    why_required: A release that fixes the workspace loop and not the sub-agent one delivers a
+      feature that works until an agent spawns a child. `run_tree_with_extras` is a separate call
+      site and has been the place a rule lapses before.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.57.0-T03
+    acceptance_criteria:
+      - >
+        **F7 — the ranking reaches the sub-agent loop.** A child agent spawned by a tree run recalls
+        under the same ordering as the flat loop over the same store and the same goal — asserted by
+        driving a spawn and reading the child's assembled block, not by asserting that one function
+        has two callers. Sabotage: rank in `run_workspace_from` rather than in `recall_scopes`, under
+        which the child falls back to recency and only F7 fails.
+    files:
+      - src/run.rs
+      - tests/memory_recall.rs
+    evidence:
+    - "`a_spawned_child_recalls_under_the_same_ordering_as_the_flat_loop` — a real spawn, asserted on
+      the child's own prompt, with the parent as the control."
+    - "Sabotage run at the time of writing: replacing the tree loop's signals with an empty set failed
+      this test and nothing else across all 29 memory tests."
+    - "Found while sizing the fixture: a child's `TaskContract` is built fresh by the spawn and does
+      NOT inherit the root's `ContextBudget`, so a child always assembles under the default 24,000
+      tokens however tightly the root was bounded. Pre-existing and outside this release."
+
+  - id: US-IO-HARNESS-0.57.0-T05
+    summary: "`Store::memory_similar`, and the `remember` arm reporting the entry a new note
+      restates."
+    why_required: "`remember` writes by key, so the same fact under two names leaves two entries
+      that disagree and both are carried. The write is the only moment the writer's own intent is
+      still available to resolve it."
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.57.0-T01
+    acceptance_criteria:
+      - >
+        **F9 — a near-duplicate write names the key already held and what it holds.** A run writes
+        `build-command: "cargo test --all-features"` and then, under a different key, a value
+        restating it. The second call's tool result names the first key and contains its value; the
+        observation recorded in the ledger contains the same text. Sabotage: report only that a
+        duplicate exists without naming the key, under which the assertion on the key's presence
+        fails and only F9 fails.
+      - >
+        **F10 — an unrelated note is not flagged, and a rewrite of the same key is not flagged.** A
+        second note sharing no subject with anything stored produces the plain `[remember <key>]`
+        result with no second line; rewriting an existing key with a value nearly identical to its
+        own current value is a replacement and is not flagged either. Both halves asserted on the
+        absence of the flag text, because an implementation that flags everything passes any test
+        that only checks the positive case. Sabotage: drop the same-key exclusion, under which the
+        rewrite is flagged and only F10's second half fails.
+      - >
+        **F11 — the write still lands, and the entry is bounded and quoted with its cut marked.**
+        After a flagged write, `Store::memory_list` holds both entries: the harness reports and does
+        not refuse. A flagged entry whose value exceeds the quoting bound is quoted truncated with
+        the existing marker, so a 2,000-character note cannot push the turn's other observations out.
+        Sabotage: refuse the write on a hit, under which the two-entry assertion fails and only F11
+        fails.
+      - >
+        **F12 — the check is per scope.** A workspace write that restates a **global** note is not
+        flagged, because the workspace overriding a global note is 0.56.0's designed correction path;
+        a workspace write that restates another **workspace** note is. Both directions asserted, and
+        the global-write side asserted too, so the rule is "within the scope being written" rather
+        than "within the workspace bucket". Sabotage: compare against both scopes, under which the
+        override case is flagged and only F12's first half fails.
+    files:
+      - src/state.rs
+      - src/run.rs
+      - tests/memory_scope.rs
+    evidence:
+    - "`tests/memory_scope.rs` — 10 passed, 4 of them new: F9
+      (`a_note_that_restates_one_already_held_names_the_key_that_holds_it`), F10
+      (`an_unrelated_note_and_a_rewrite_of_one_key_are_not_flagged`, both halves on the ABSENCE of the
+      report), F11 (`a_flagged_write_still_lands_and_the_quote_is_bounded`), F12
+      (`the_duplicate_check_is_within_the_scope_being_written`, all three directions)."
+    - "F11's first fixture padded the held value with a new sentence and put the pair at exactly 50%
+      overlap — the measure working, not failing. Padding by repeating the same sentence is what a
+      restatement actually looks like."
+
+  - id: US-IO-HARNESS-0.57.0-T06
+    summary: Measure the per-turn ranking cost and the added write-path cost at three store sizes,
+      and record them.
+    why_required: Both costs are paid on paths a turn runs every step, and both are bounded by caps
+      an operator sets. A release that hands an operator a knob without saying what pulling it costs
+      is the failure 0.56.0's own coupling paragraph exists to prevent — and its N5 is where that
+      release found a defect no review had.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.57.0-T03
+      - US-IO-HARNESS-0.57.0-T05
+    acceptance_criteria:
+      - >
+        **N5 — the per-turn cost of ranking is measured and recorded, never asserted.** The time to
+        rank one scope is measured at three store sizes — 64, 512 and 4,096 entries, each with a
+        recall table proportional to the store and a ledger of 200 observations — on a named machine,
+        in `docs/MEASUREMENTS.md` with the method. The shape to expect is linear in entries × signal
+        tokens, stated as such; a timing that does not move when the input grows is a defect report
+        and not a pass, which is the standing lesson of 0.56.0's N5.
+      - >
+        **N6 — the write path's added cost is measured at the caps an operator may set.** The time
+        for one `remember` call including `memory_similar` is measured at the same three sizes and
+        recorded beside N5. `memory_similar` reads at most `max_entries` rows, so the cost is bounded
+        by a cap the operator chose and is stated in the guide where that decision is made.
+    files:
+      - src/run.rs
+      - docs/MEASUREMENTS.md
+    evidence:
+    - "`memory_recall_cost` in `src/run.rs`, ignored by default. Apple M1, release profile,
+      2026-08-15, medians of 20, over a 200-observation ledger (208 signal tokens): ranking one scope
+      is 1.106 / 11.088 / 119.171 ms at 64 / 512 / 4,096 entries; a `remember` including the duplicate
+      check is 1.946 / 21.172 / 201.369 ms."
+    - "Linear in entries and flat in the recall table — the timings moved by ~10x for an 8x input, so
+      0.56.0's flat-timing defect shape did not recur. Recorded in `docs/MEASUREMENTS.md` with the
+      method, the machine and the upgrade path if a store that large becomes ordinary."
+
+  - id: US-IO-HARNESS-0.57.0-T07
+    summary: Update every checked-in doc surface and the changelog to the behaviour this release
+      ships.
+    why_required: "`docs/CONTRACT.md`, the guide and the README all state that recall carries the
+      newest notes that fit, and 0.56.0 added a coupling paragraph whose conclusion this release
+      changes. A contract that describes the previous release is worse than no contract."
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.57.0-T03
+      - US-IO-HARNESS-0.57.0-T05
+      - US-IO-HARNESS-0.57.0-T06
+    acceptance_criteria:
+      - >
+        **O3 — `docs/CONTRACT.md` is amended in this release, by name.** Its memory section states
+        that recall carries the newest notes that fit. That changes. The new rules — selection by the
+        turn's signals then by draws then by the clock, the rendered order staying chronological and
+        why, and the near-duplicate report — are written where the old sentences stood.
+      - >
+        **O6 — the checked-in doc surfaces are updated in this release.**
+        `docs/guide/context-and-memory.md` (what decides which notes are carried, and that the
+        printed order is chronological), `docs/guide/tools-and-skills.md` (`remember`'s duplicate
+        report), `docs/guide/configuration.md` (the coupling paragraph 0.56.0 added, which now says
+        what selection does past the share), `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md`, the
+        README's memory description and the changelog. Every new public item carries a worked
+        example; `cargo test --doc` and `tests/public_api.rs` pass.
     files:
       - docs/CONTRACT.md
-      - README.md
+      - docs/CAPABILITIES.md
+      - docs/guide/context-and-memory.md
       - docs/guide/tools-and-skills.md
       - docs/guide/configuration.md
-      - docs/CAPABILITIES.md
-      - docs/MEASUREMENTS.md
       - CHANGELOG.md
-      - docs/public-api.txt
-      - src/state.rs
+      - README.md
     evidence:
-      - >-
-        O3: `docs/CONTRACT.md`'s memory section now states evidence-ordered eviction, the operator
-        caps and their coupling, the two scopes and the collision rule, and `forget` — where the
-        oldest-first and workspace-only sentences stood. The plan-gate paragraph covers `forget`
-        beside `remember`, and the pin paragraph names all three things a pin now stops.
-      - >-
-        O6: `docs/guide/context-and-memory.md` gained three sections (what goes when the store is
-        full, the caps and what raising one costs, unlearning and the scope above the workspace);
-        `docs/guide/configuration.md` gained the `[memory]` table and the coupling paragraph;
-        README, `docs/CAPABILITIES.md` and `docs/guide/tools-and-skills.md` updated; the 0.56.0
-        changelog entry is written. Gates: `docs_drift` 5 passed, `guide_pages` 15 passed,
-        `changelog` 7 passed, `public_api` 9 passed.
-      - >-
-        N2 was **wrong by one, and it is stated rather than absorbed**: the prediction was +2 lines
-        in `docs/public-api.txt` and the surface added **three** — `GLOBAL_MEMORY_WORKSPACE`,
-        `MemoryLimits` and `MemoryForget`. The third is the `forget` return type, which the contract
-        described in prose without counting as a public item.
-      - >-
-        N5 measured and recorded in `docs/MEASUREMENTS.md`: 0.965 ms at 64 entries, 9.042 ms at 512,
-        73.175 ms at 4,096, median of 20 capped writes on an Apple M1, release profile. The shape is
-        the finding — cost is linear in ENTRIES and flat in the size of the recall table, which is
-        what the index buys and what the query-plan test asserts.
-      - >-
-        **The measurement found a real defect, and it was reachable only because this release makes
-        the caps settable.** The first run reported a flat 0.069/0.143/0.068 ms, which was too fast:
-        the cap comparison was `chars <= limits.max_chars as i64`, and the measurement's
-        `max_chars: usize::MAX` wraps to `-1` there, so the loop's exit condition could never hold
-        and every write evicted the whole workspace down to the key it had just written. Exact for
-        the crate's own 16,000 and catastrophic for a large operator number. The comparison is
-        `u128` now, and `a_character_cap_too_large_for_an_i64_is_a_ceiling_and_not_a_purge` is the
-        guard, with a 3-character control so it cannot pass by the cap being ignored.
-  - id: US-IO-HARNESS-0.56.0-T06
-    summary: "Run the release gates: the full suite, clippy on three feature polarities, the nightly
-      rustdoc gate, the cross-version gate, and a sabotage arm for every criterion that names one."
-    why_required: The record is evidence-based, and a criterion whose sabotage kills nothing is a guard
-      that protects nothing. The cross-version gate is what proves the new index left a 0.55.0 store
-      readable.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.56.0-T05
-    acceptance_criteria:
-      - |
-        **O1 — the three-platform matrix is green**, `--all-features` included.
-      - >
-        **O2 — nothing in the suite gates on a wall clock.** N5's timings are recorded, never
-        asserted. The recall-table fixtures are built by inserting rows directly rather than by
-        driving runs, so no test's cost scales with a provider.
-      - >
-        **O4 — the cross-version gate runs.** `cargo build --manifest-path
-        tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0 --
-        --ignored`. A release that adds an index to a shared table is exactly the release that gate
-        exists for.
-      - >
-        **O5 — the nightly rustdoc gate passes with `-D warnings`.** `RUSTDOCFLAGS="--cfg docsrs -D
-        warnings" cargo +nightly doc --all-features --no-deps`, run before the release PR. It found
-        nothing in 0.55.0 and something in six of the seven before it.
-      - >
-        **O7 — clippy on all three feature polarities**, default, one feature on, and
-        `--all-features`.
-    files: []
-    evidence:
-      - >-
-        O2/O7 `cargo fmt --check` exit 0; `cargo clippy --all-targets -- -D warnings` exit 0 on all
-        three polarities — the default build, `--features media`, and `--all-features`. Two lints on
-        this release's own additions were fixed to get there: `nonminimal_bool` on the note-fitting
-        closure and `assertions_on_constants` on the reserved-key test's non-Windows arm.
-      - >-
-        O5 `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` —
-        exit 0, clean on the first attempt. Second release running that it has found nothing, after
-        catching something in six of the seven before 0.55.0.
-      - >-
-        O4 cross-version: `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` exit 0,
-        then `cargo test --test cross_version_0_29_0 -- --ignored` — 1 passed. This is the gate that
-        matters for a release adding an index to a shared table.
-      - >-
-        N1 `cargo tree` — **402 lines, unchanged**. No new dependency: the release is SQL, config
-        plumbing and two tool arms.
-      - >-
-        **Sabotage: 16 arms, and every one now kills a named test. Two survived the first pass and
-        both were findings.** S4 (remove the `keep` guard) compiled and failed nothing, because the
-        existing arm writes into a store with no recalls, where the new key sorts last among
-        candidates either way; the guard is load-bearing only when every OTHER entry carries
-        evidence, which the added test now constructs. S9 (report a removal for a key that was never
-        there) failed nothing because the test counted trace rows and neither arm writes one for an
-        absent key — and asserting the message instead exposed something real in the product: the
-        absent answer wore the same `[forget <key>]` prefix a removal wears. It now reads
-        `[forget: nothing to forget]`. Logs in `evidence/0.56.0/sab-*.log`.
+    - "`docs/CONTRACT.md` — two new rules written where the memory section's own sentences stood, and
+      0.56.0's coupling paragraph now says raising a cap costs time rather than relevance."
+    - "`CHANGELOG.md` 0.57.0 section: 2 Added, 4 Changed."
+    - "`docs/guide/context-and-memory.md`, `docs/guide/tools-and-skills.md`,
+      `docs/guide/configuration.md`, `docs/CAPABILITIES.md`, `README.md` and the `render_notes`
+      rustdoc."
+    - "Doc gates: `changelog` 5 passed, `docs_drift` 15 passed, `public_api` 9 passed —
+      `public_surface_matches_snapshot` green with `docs/public-api.txt` UNCHANGED, which is N2's
+      predicted +0 lines met exactly."
