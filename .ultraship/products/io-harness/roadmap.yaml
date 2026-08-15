@@ -1404,7 +1404,7 @@ versions:
     outcome: >
       The notes a turn is handed are the notes that turn needs, and two of them never disagree.
 
-      Recall today is ordered by recency: `render_notes` (`src/context.rs:436`) fills its quarter of
+      Recall today is ordered by recency: `render_notes` (`src/context.rs:888`) fills its quarter of
       the ceiling newest-first and stops. That is the right answer only while the whole store fits
       the share, and the moment an operator raises the caps 0.56.0 handed them, the order decides
       what the model sees. So recall is ordered by what the turn is about — the words of the prompt,
@@ -1422,7 +1422,17 @@ versions:
       drop the new one — instead of leaving a contradiction for a later run to trip over. The
       comparison is a normalised overlap of the two texts, computed here, on the write path already
       running.
-    detail: outline
+
+      **Correction, made at specification time on 2026-08-15 and recorded rather than reworded.**
+      The prose above asks for recall itself to be ordered by relevance. Relevance decides what is
+      **selected** instead; the block is still printed in `created_at` order. The memory block is a
+      byte-prefix of the user turn, and 0.44.0's second cache breakpoint is withheld unless that
+      prefix repeats byte-identically, so reordering the print would have converted cache reads into
+      cache writes on every marked wire on any step whose signals moved. Selecting rather than
+      reordering delivers the outcome and leaves a store that fits its share rendering byte-for-byte
+      what 0.56.0 rendered. The line reference above was also stale: `render_notes` moved to
+      `src/context.rs:888` when 0.56.0 added the global scope.
+    detail: specified
     status: planned
   - version: 0.58.0
     outcome: >
