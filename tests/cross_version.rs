@@ -207,6 +207,14 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     // which `tests/cross_version_0_29_0.rs` executes rather than asserts on paper.
     "summaries",
     "summaries_run",
+    // 0.58.0 — the index every retention call enters through. `session_turns`
+    // has been queried by `session_id` since 0.20.0 and never carried one, which
+    // did not matter while the only reader was a conversation reading its own
+    // turns and does once a sweep asks the question for every session in the
+    // store. An index added over a table that already existed: a 0.29.0 binary
+    // opens a store carrying it and never names it, which
+    // `tests/cross_version_0_29_0.rs` executes rather than asserts on paper.
+    "session_turns_session",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].
