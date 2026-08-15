@@ -919,8 +919,13 @@ fn render_notes(
     // says, not about what is recorded.
     let line = |e: &MemoryEntry| format!("- {}: {}  (step {})\n", e.key, e.value, e.step);
 
-    // Newest first while deciding what fits; at least one note always survives, so
-    // a workspace with memory never renders an empty block.
+    // Best first while deciding what fits, chronological when printing — and the
+    // two being different orders is the whole of 0.57.0's shape (see the note on
+    // the sort below). The caller hands both slices worst-first, so walking them
+    // in reverse takes the most relevant note first; through 0.56.0 "worst" was
+    // simply "oldest" and this reverse walk was what kept the newest.
+    // At least one note always survives, so a workspace with memory never
+    // renders an empty block.
     // Each heading is charged only when its own list will actually render one.
     // Charging for both unconditionally would quietly shrink the workspace block
     // by the size of a heading the prompt never contains — a behaviour change for
@@ -949,7 +954,19 @@ fn render_notes(
             *used += t;
             keep.push(e.clone());
         }
-        keep.reverse();
+        // 0.57.0 — printed in the store's own order, never in the order the fit
+        // chose. The memory block is a byte-prefix of the user turn, and the
+        // second cache breakpoint (0.44.0) is withheld unless that prefix
+        // repeats byte-identically, so a block whose LINE ORDER moved when the
+        // turn's subject moved would convert a cache read into a cache write on
+        // every marked wire — for a reordering the model gains nothing from,
+        // since it reads the whole block either way. Selection is the behaviour
+        // that was wanted; the order is not part of it.
+        //
+        // `(created_at, key)` is exactly what `Store::memory_list` returns, and
+        // that is why 0.57.0 made the key its tie-break: a printer holding only
+        // entries cannot reconstruct an order that breaks ties on a row id.
+        keep.sort_by(|a, b| (&a.created_at, &a.key).cmp(&(&b.created_at, &b.key)));
         keep
     };
     // The workspace's own notes take the space first. Both scopes hold their own
@@ -968,7 +985,7 @@ fn render_notes(
         let dropped = notes.len() - keep.len();
         if dropped > 0 {
             out.push_str(&format!(
-                "- ({dropped} older note(s) elided to fit — Store::memory_list has all of them)\n"
+                "- ({dropped} note(s) elided to fit — Store::memory_list has all of them)\n"
             ));
         }
     }
@@ -980,7 +997,7 @@ fn render_notes(
         let dropped = global.len() - keep_global.len();
         if dropped > 0 {
             out.push_str(&format!(
-                "- ({dropped} older note(s) elided to fit — Store::memory_list has all of them)\n"
+                "- ({dropped} note(s) elided to fit — Store::memory_list has all of them)\n"
             ));
         }
     }

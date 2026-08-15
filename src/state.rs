@@ -7053,10 +7053,20 @@ impl Store {
     }
 
     /// Every entry for `workspace`, oldest first. Never another workspace's.
+    ///
+    /// The tie-break is the key and not the row id since 0.57.0, which makes the
+    /// order **total** rather than merely oldest-first: a key is unique within a
+    /// workspace, where two entries written in the same millisecond are
+    /// separated only by an id this struct does not carry. 0.57.0 chooses which
+    /// notes a turn keeps by relevance and then prints them back in this order,
+    /// so "the order the store returned" has to be something the printer can
+    /// reconstruct from an entry alone. The eviction candidate order
+    /// ([`Self::MEMORY_CANDIDATES_SQL`]) still tie-breaks on `id`, where the row
+    /// is in hand and 0.10.0's order is a stated guarantee.
     pub fn memory_list(&self, workspace: &str) -> Result<Vec<MemoryEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT key, value, run_id, step, created_at, kind, pinned FROM memory
-             WHERE workspace = ?1 ORDER BY created_at ASC, id ASC",
+             WHERE workspace = ?1 ORDER BY created_at ASC, key ASC",
         )?;
         let rows = stmt.query_map([workspace], memory_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)

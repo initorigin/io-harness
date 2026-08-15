@@ -391,7 +391,7 @@ mod live {
 
         let prompt = &script.prompts()[0];
         assert!(
-            prompt.contains("older note(s) elided to fit"),
+            prompt.contains("note(s) elided to fit"),
             "the cut must be visible, got:\n{prompt}"
         );
         assert!(

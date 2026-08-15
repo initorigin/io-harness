@@ -4750,7 +4750,12 @@ async fn run_workspace_from<P: Provider>(
         // Re-read each turn rather than once at the start, so the notes the model
         // sees are the notes the store holds — including one written this run, and
         // not one the operator has since cleared.
-        let (notes, global_notes) = recall_scopes(store, &mem_key)?;
+        //
+        // 0.57.0 — and ranked by what this turn is about, which grows as the run
+        // reads: the signals are rebuilt here each turn for the same reason the
+        // notes are.
+        let signals = recall_signals(&contract.goal, &ledger);
+        let (notes, global_notes) = recall_scopes(store, &mem_key, &signals)?;
         // 0.43.0 — before assembly, never inside it. Over the threshold, the older
         // observations become one written paragraph and the assembler bounds a
         // shorter ledger; under it, nothing happens and no provider is called.
@@ -7034,7 +7039,12 @@ where
                 &mut collected,
                 &mut ledger,
             )?;
-            let (notes, global_notes) = recall_scopes(tree.store, &mem_key)?;
+            // 0.57.0 — the tree loop's own signals, from this agent's goal and
+            // this agent's ledger. A child ranks against the work IT was given,
+            // not against the parent's: `contract.goal` here is the child's, and
+            // the ledger is the one this depth folds.
+            let signals = recall_signals(&contract.goal, &ledger);
+            let (notes, global_notes) = recall_scopes(tree.store, &mem_key, &signals)?;
             // 0.43.0 — the tree loop's own call to the one fold helper, in the same
             // place for the same reason. A child folds its own ledger at its own
             // depth: the summary is of the work that agent did, not of the tree.
@@ -13221,20 +13231,109 @@ fn memory_scope<'a>(
 /// The specific place always knows better than the general one: a global note an
 /// agent got wrong is corrected by writing the same key in the workspace that
 /// disagrees with it, which is a thing a run can do for itself.
-fn recall_scopes(store: &Store, mem_key: &str) -> Result<(Vec<MemoryEntry>, Vec<MemoryEntry>)> {
-    let notes = store.memory_list(mem_key)?;
+fn recall_scopes(
+    store: &Store,
+    mem_key: &str,
+    signals: &std::collections::BTreeSet<String>,
+) -> Result<(Vec<MemoryEntry>, Vec<MemoryEntry>)> {
+    let mut notes = store.memory_list(mem_key)?;
     // A run over the global bucket itself — which nothing in this crate creates,
     // but an embedder could name — would otherwise see its own notes twice.
     if mem_key == GLOBAL_MEMORY_WORKSPACE {
+        rank_notes(store, mem_key, &mut notes, signals)?;
         return Ok((notes, Vec::new()));
     }
     let own: std::collections::HashSet<&str> = notes.iter().map(|e| e.key.as_str()).collect();
-    let global = store
+    let mut global: Vec<MemoryEntry> = store
         .memory_list(GLOBAL_MEMORY_WORKSPACE)?
         .into_iter()
         .filter(|e| !own.contains(e.key.as_str()))
         .collect();
+    // Each scope is ranked against its own evidence, because a recall row is
+    // credited to the bucket that actually holds the entry (see `record_recalls`)
+    // and counting a global note's draws under the workspace would find none.
+    rank_notes(store, mem_key, &mut notes, signals)?;
+    rank_notes(store, GLOBAL_MEMORY_WORKSPACE, &mut global, signals)?;
     Ok((notes, global))
+}
+
+/// The words this turn is about (0.57.0): the goal it was given, and every path
+/// or subject a tool has already named in this run.
+///
+/// Both halves are already in hand at each recall site — nothing is read from
+/// the workspace and nothing is asked of a model — which is what makes the
+/// ordering a pure function of the store and the turn, and therefore what lets
+/// a replayed run recall in the order the run it replays did.
+///
+/// `Observation::target` is "the path or subject the tool named", so a run that
+/// has read `src/state.rs` carries `src` and `state` as signals and a note about
+/// that file outranks a newer note about something else. An observation that
+/// names nothing contributes nothing rather than contributing its prose: the
+/// text of a `grep` result is not what the turn is about.
+// `crate::context::Ledger` written out: bare `Ledger` in this module is the
+// containment *spend* ledger, and the two are one careless import apart.
+fn recall_signals(
+    goal: &str,
+    ledger: &crate::context::Ledger,
+) -> std::collections::BTreeSet<String> {
+    let mut signals = crate::state::memory_tokens(goal);
+    for obs in ledger.entries() {
+        if let Some(target) = &obs.target {
+            signals.extend(crate::state::memory_tokens(target));
+        }
+    }
+    signals
+}
+
+/// Order one scope's notes worst-first, so the fit in [`crate::context`] — which
+/// walks the slice in reverse — keeps the ones this turn is about (0.57.0).
+///
+/// Three terms, and the last two are the release before this one read the other
+/// way round:
+///
+/// - **How much the entry has in common with the turn.** The count of shared
+///   normalised tokens between the entry's key and value and the turn's signals.
+///   A count and not a ratio: a long note that covers the subject should not
+///   rank below a short one that mentions it once.
+/// - **How many separate runs have carried it** ([`Store::memory_draws`]) — the
+///   same evidence eviction ranks by, and distinct runs rather than rows for the
+///   same reason.
+/// - **The order the store returned**, which is `(created_at, key)`. Every entry
+///   with no signal and no evidence therefore keeps exactly the position it had
+///   before this release, so a turn that is about nothing the store knows
+///   behaves as 0.56.0 did rather than newly.
+///
+/// The decoration is computed once per entry rather than inside a comparator,
+/// which would re-tokenise every value `n log n` times on the turn's own path.
+fn rank_notes(
+    store: &Store,
+    workspace: &str,
+    notes: &mut Vec<MemoryEntry>,
+    signals: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if notes.len() < 2 {
+        return Ok(());
+    }
+    let draws = store.memory_draws(workspace)?;
+    let mut ranked: Vec<(usize, usize, usize)> = notes
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let tokens = crate::state::memory_tokens(&format!("{} {}", e.key, e.value));
+            (
+                signals.intersection(&tokens).count(),
+                draws.get(&e.key).copied().unwrap_or(0),
+                i,
+            )
+        })
+        .collect();
+    // Ascending on all three, so the slice ends worst-first and the reverse walk
+    // in `render_notes` takes the best. The index tail makes the sort total: two
+    // entries equal on signal and draws cannot swap between two turns, which is
+    // what "the same store and the same turn select the same notes" rests on.
+    ranked.sort_unstable();
+    *notes = ranked.iter().map(|&(_, _, i)| notes[i].clone()).collect();
+    Ok(())
 }
 
 /// Record what this step's prompt actually carried, each key against the bucket
