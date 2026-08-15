@@ -92,8 +92,21 @@ fn a_0_29_0_store_reads_back_identically_under_the_current_tree() {
         .unwrap();
     let want = expected["read_back"]["memory"].as_array().unwrap();
     assert_eq!(entries.len(), want.len());
-    for (entry, want) in entries.iter().zip(want) {
-        assert_eq!(json!(entry.key), want["key"]);
+    // Matched by key rather than by position (0.57.0). What this gate is about is
+    // that every row 0.29.0 wrote reads back with its own values, and that the two
+    // columns added after it arrive at their documented defaults — not the order
+    // `memory_list` happens to return them in. Zipping the two arrays made it an
+    // order assertion by accident, and 0.57.0 changed that order deliberately:
+    // the tie-break moved from the row id to the key, so `memory_list` is a total
+    // order that a printer holding only entries can reconstruct. Two of this
+    // fixture's own rows share a `created_at` to the millisecond, which is what
+    // caught it — the tie is not exotic, it is what writing two notes in one step
+    // produces.
+    for entry in &entries {
+        let want = want
+            .iter()
+            .find(|w| w["key"] == json!(entry.key))
+            .unwrap_or_else(|| panic!("0.29.0 wrote no entry keyed {}", entry.key));
         assert_eq!(json!(entry.value), want["value"]);
         assert_eq!(json!(entry.run_id), want["run_id"]);
         assert_eq!(json!(entry.step), want["step"]);
