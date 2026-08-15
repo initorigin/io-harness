@@ -9,6 +9,56 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What ranking a turn's recall costs (0.57.0)
+
+**What is being measured.** 0.57.0 chooses which notes survive the memory block's
+share by what the turn is about rather than by the write clock, and reports a note
+that restates one already held at the moment it is written. The first runs **once
+per scope per turn**, which is the hottest path anything in this feature touches;
+the second runs once per `remember`. The question an operator raising
+`max_entries` has is what each of them starts to cost.
+
+**Method.** `memory_recall_cost` in `src/run.rs`, `#[ignore]`d because it prints
+rather than asserts. A store is filled to the given size, every entry is given a
+recall row from each of twenty separate runs, and a turn is constructed with a
+real goal and a **200-observation ledger** — a long run's worth of read targets,
+which is 208 signal tokens. Twenty rankings and twenty `remember` calls (each
+including its `memory_similar` check) are timed at each size.
+
+```text
+cargo test --release --lib memory_recall_cost -- --ignored --nocapture
+```
+
+**Measured on an Apple M1, macOS 26.5.2, release profile, 2026-08-15:**
+
+| Entries | Recall rows | ms per ranking (median of 20) | ms per `remember` (median of 20) |
+| --- | --- | --- | --- |
+| 64 (the default) | 1,280 | 1.106 | 1.946 |
+| 512 | 10,240 | 11.088 | 21.172 |
+| 4,096 | 81,920 | 119.171 | 201.369 |
+
+**What the shape says.** Both costs are linear in the number of **entries** and
+flat in the size of the recall table — eight times the entries costs roughly ten
+times as long while the recall table grows by the same factor and contributes
+nothing visible. That is 0.56.0's `memory_recalls_entry` still paying for itself,
+and it is the claim the suite asserts rather than times:
+`ranking_recall_draws_seeks_the_recalls_rather_than_scanning_them` checks the
+query plan of the statement the crate runs, over ten thousand rows.
+
+What the linearity costs is the entry-by-entry work, and it is honest to name it:
+every entry's key and value is normalised into a token set on **every turn**,
+because the ranking is computed from the store and the turn rather than stored.
+At the default 64 entries that is about a millisecond per turn against a provider
+call measured in seconds. At 4,096 entries it is about 120 ms per turn, every
+turn, which is a real reason not to raise `max_entries` past what a workspace
+needs. The upgrade path, if a store that large ever becomes ordinary, is to cache
+each entry's token set against its `created_at` — not to make the ranking
+approximate.
+
+The `remember` column is the same work plus the duplicate check, which reads the
+same entries again: at the default it is about two milliseconds per write, and it
+is paid by writes only.
+
 ## What a capped memory write costs (0.56.0)
 
 **What is being measured.** 0.56.0 made eviction rank candidates by the evidence

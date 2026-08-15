@@ -190,7 +190,7 @@ tasks:
         recorded beside N5. `memory_similar` reads at most `max_entries` rows, so the cost is bounded
         by a cap the operator chose and is stated in the guide where that decision is made.
     files:
-      - examples/memory_recall_cost.rs
+      - src/run.rs
       - docs/MEASUREMENTS.md
     evidence: []
 

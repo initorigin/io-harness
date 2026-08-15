@@ -15772,6 +15772,106 @@ fn workspace_tools() -> Vec<ToolSpec> {
 mod tests {
     use super::*;
 
+    /// 0.57.0 N5 and N6 — what ranking a turn's recall costs, and what the
+    /// duplicate check adds to a write, at the three store sizes an operator can
+    /// now reach.
+    ///
+    /// A measurement, not a gate: it prints and asserts nothing about a clock.
+    /// The shape to expect is linear in entries — every entry is tokenised once
+    /// per turn — and flat in the size of the recall table, which is what
+    /// 0.56.0's index buys. **A timing that does not move when the input grows
+    /// eightfold is a defect report and not a pass**, which is the lesson
+    /// 0.56.0's own N5 paid for.
+    ///
+    /// ```text
+    /// cargo test --release --lib memory_recall_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a measurement, not a gate: prints timings, asserts none of them"]
+    fn memory_recall_cost() {
+        use crate::state::{MemoryKind, MemoryLimits};
+
+        // A goal and two hundred read observations, which is a long run's ledger.
+        let goal = "make the parser report the column it stopped at";
+        let mut ledger = crate::context::Ledger::new();
+        for i in 0..200u32 {
+            ledger.push(crate::context::Observation::new(
+                i,
+                crate::context::ObsKind::Read,
+                Some(format!("src/module{i}/handler.rs")),
+                "…",
+            ));
+        }
+        let signals = recall_signals(goal, &ledger);
+        println!("signal tokens: {}", signals.len());
+        println!("entries  recall rows  ms/rank  ms/remember (medians of 20)");
+
+        for entries in [64usize, 512, 4_096] {
+            let store = Store::memory().unwrap();
+            let limits = MemoryLimits {
+                max_entries: entries,
+                max_chars: usize::MAX,
+                ..MemoryLimits::default()
+            };
+            for i in 0..entries {
+                let value = format!(
+                    "note {i} about the parser and the column it stopped at, {}",
+                    "detail ".repeat(10)
+                );
+                store
+                    .memory_write_with("/ws", &format!("k{i}"), &value, 1, 1, MemoryKind::Fact, limits)
+                    .unwrap();
+            }
+            let runs = 20i64;
+            for run in 100..(100 + runs) {
+                let keys: Vec<String> = (0..entries).map(|i| format!("k{i}")).collect();
+                store.record_memory_recall(run, 1, "/ws", &keys).unwrap();
+            }
+
+            let mut rank = Vec::new();
+            for _ in 0..20 {
+                let mut notes = store.memory_list("/ws").unwrap();
+                let at = std::time::Instant::now();
+                rank_notes(&store, "/ws", &mut notes, &signals).unwrap();
+                rank.push(at.elapsed());
+                assert_eq!(notes.len(), entries, "ranking never drops an entry");
+            }
+
+            let mut write = Vec::new();
+            for n in 0..20 {
+                let at = std::time::Instant::now();
+                let restates = store
+                    .memory_similar("/ws", "fresh", "note about the parser and the column")
+                    .unwrap();
+                store
+                    .memory_write_with(
+                        "/ws",
+                        &format!("fresh{n}"),
+                        "note about the parser and the column",
+                        2,
+                        2,
+                        MemoryKind::Fact,
+                        limits,
+                    )
+                    .unwrap();
+                write.push(at.elapsed());
+                assert!(
+                    restates.is_some(),
+                    "the fixture's notes restate the written one, or this measures the miss path"
+                );
+            }
+
+            rank.sort();
+            write.sort();
+            println!(
+                "{entries:>7}  {:>11}  {:>7.3}  {:>11.3}",
+                entries as i64 * runs,
+                rank[rank.len() / 2].as_secs_f64() * 1_000.0,
+                write[write.len() / 2].as_secs_f64() * 1_000.0,
+            );
+        }
+    }
+
     /// 0.50.0 — the operator's ceiling, arm by arm.
     ///
     /// Written because a sabotage found nothing: turning `narrowed`'s `min` into a
