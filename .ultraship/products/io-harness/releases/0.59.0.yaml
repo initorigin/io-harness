@@ -175,9 +175,25 @@ acceptance:
     **F7 — a socket is refused as a socket, and permitted when the policy permits it.** With
     egress denied, an outbound connection from inside the container fails, with the uncontained
     control succeeding in the same test. With egress permitted, the same connection succeeds —
-    the direction that has never been exercised, because the capability array never reached the
+    the direction that had never been exercised, because the capability array never reached the
     token. Sabotage: pass a capability count of zero for a permitting run, under which the
     permitted connection fails and only F7's second half fails.
+  - >
+    **F11 — a contained Windows command is given no proxy, and the absence is asserted.** A
+    process inside an AppContainer cannot reach a loopback listener under any capability set, nor
+    the host's own address, so pointing a contained command at the run's proxy would hang every
+    request it makes instead of scoping it (`US-IO-HARNESS-0.59.0-I03`). The `RunSpec` this backend
+    receives therefore carries no proxy, and a test asserts that rather than leaving it incidental.
+    Sabotage: pass the proxy through, under which the egress test's permitted request times out
+    instead of succeeding and only F11 fails.
+  - >
+    **F12 — the browser on Windows takes the run's proxy, because it is not the thing inside the
+    container.** The harness spawns the browser itself; it is not placed in an AppContainer on any
+    platform, so it reaches a loopback listener like any ordinary process. Asserted the way the
+    other platforms assert it — on the argument the launch actually passes, and against a fixture
+    proxy that records the request — rather than on the absence of an error. Sabotage: drop
+    `--proxy-server` on the Windows arm, under which the recorded request never arrives and only
+    F12 fails.
   - >
     **F8 — `Backend::WindowsAppContainer` claims what it delivers.** `confines_writes` and
     `denies_egress` both answer true for it, in the two exhaustive matches that cannot go stale.
@@ -325,14 +341,19 @@ risks:
 
 open_questions:
 - >
-  **Can a process inside an AppContainer reach the loopback proxy the run owns?** 0.48.0 routes
-  every contained command's traffic through a proxy on 127.0.0.1, and an AppContainer's loopback
-  behaviour is a property of the platform rather than of the capability set. If it cannot, per-host
-  egress lands differently on this platform than on the other two and the release says so rather
-  than implying parity.
+  **Answered, 2026-08-15: no.** A process inside an AppContainer cannot reach a loopback listener
+  under any capability set — none, `internetClient`, `privateNetworkClientServer`, both — and
+  cannot reach the host's own network address either, while the same requests succeed immediately
+  outside the container and an outbound request to a real host succeeds inside it with
+  `internetClient`. So 0.48.0's per-host egress has no mechanism on this platform under access
+  confinement: egress here is a capability, all or nothing, and the tables say so.
+  `US-IO-HARNESS-0.59.0-I03`.
 - >
-  **Are egress denial and filesystem confinement separable here?** The roadmap orders them as two
-  steps with the network first "at roughly 10% of the risk", but the empty capability array only
-  binds a process that is already inside a container, and being inside one is exactly the grant-set
-  problem. If they are inseparable then the landing order has two steps where it thought it had
-  three, and the fallback scope is the browser half alone.
+  **Answered, 2026-08-15: they are not separable.** The capability array binds a process that is
+  already inside a container, and being inside one is the whole grant-set problem. There is no
+  egress-only landing, so the release has two steps where the plan had three and the fallback scope
+  is the browser half alone. `US-IO-HARNESS-0.59.0-I03`.
+- >
+  **Still open: does the derived grant set run a real payload?** A cargo build, an npm install and
+  a python program inside the container, on the CI image, without a decline. It is what the Windows
+  default turns on, and it is deliberately not this release's claim.
