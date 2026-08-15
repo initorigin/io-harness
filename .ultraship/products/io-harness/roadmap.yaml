@@ -1479,11 +1479,11 @@ versions:
       table by table: `provider_calls` is the only pure-accounting table in the schema, while the
       user's own words sit in `steps.prompt`, every tool result in `ledger_observations.text`, whole
       file contents in `snapshots.before` and the change itself in `edits.hunk`. Archiving therefore
-      keeps every **row** and empties every column that holds words — owner's decision, taken against
-      this entry's prose, because an archive that emptied only `session_turns` would report a removal
-      it had not performed.
+      keeps every **row** and empties every column that holds words — owner's decision, taken
+      against this entry's prose, because an archive that emptied only `session_turns` would report
+      a removal it had not performed.
     detail: specified
-    status: planned
+    status: released
   - version: 0.59.0
     outcome: >
       Windows stops being the platform with holes in it. Two of them, and they are the same kind of
