@@ -2125,6 +2125,52 @@ mod tests {
         assert_eq!(out.cap_hit, None);
     }
 
+    /// **F8 — every backend claims exactly what it delivers.**
+    ///
+    /// One table, three predicates, every variant, and it is portable data so it
+    /// runs on all three hosts rather than on the one that has the backend. The
+    /// three `match`es this asserts are exhaustive on purpose — the next backend
+    /// added is a compile error there — but exhaustive does not mean *right*, and
+    /// nothing before this checked the answers against each other.
+    ///
+    /// The row that matters is the last one: a backend can deny egress outright
+    /// and still be unable to say which hosts to permit, which had never been a
+    /// distinction any backend forced until 0.59.0.
+    #[test]
+    fn each_backend_claims_exactly_what_it_delivers() {
+        // (backend, confines writes, denies egress, scopes egress per host)
+        let table = [
+            (Backend::MacosSandboxExec, true, true, true),
+            (Backend::LinuxLandlock, true, true, true),
+            (Backend::LinuxBubblewrap, true, true, true),
+            (Backend::LinuxNamespaces, true, true, true),
+            (Backend::WindowsAppContainer, true, true, false),
+            (Backend::WindowsJobObject, false, false, false),
+            (Backend::PortableFloor, false, false, false),
+        ];
+        for (backend, writes, egress, per_host) in table {
+            assert_eq!(
+                (
+                    backend.confines_writes(),
+                    backend.denies_egress(),
+                    backend.scopes_egress_per_host()
+                ),
+                (writes, egress, per_host),
+                "{} claims something other than what it delivers",
+                backend.as_str()
+            );
+        }
+        // And the one rule that holds across the table: scoping egress per host
+        // is a stronger statement than denying it, never a weaker one.
+        for (backend, _, _, _) in table {
+            assert!(
+                !backend.scopes_egress_per_host() || backend.denies_egress(),
+                "{} says it can scope egress per host while not denying egress at all",
+                backend.as_str()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn force_floor_selects_the_portable_backend() {
         let sb = select(&SandboxConfig::new().floor_only());
