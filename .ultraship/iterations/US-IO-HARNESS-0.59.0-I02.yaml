@@ -1,0 +1,86 @@
+id: US-IO-HARNESS-0.59.0-I02
+timestamp: 2026-08-15T17:13:41Z
+category:
+  - implementation-level
+trigger: >
+  The owner changed the method for closing 0.59.0's two open questions, from a local Windows 11
+  ARM64 virtual machine to an interactive session on the `windows-latest` runner itself. This
+  supersedes the sixth evidence bullet of `US-IO-HARNESS-0.59.0-I01`, which recorded the VM as the
+  constraint's removal and was true when written.
+evidence:
+  - >
+    **The suspected cause of the `CARGO_HOME` decline is the runner, so the runner is where it can
+    be observed.** The decline is suspected to be a property of the `runneradmin` profile and the
+    non-interactive service account the hosted image runs under. A local interactive desktop has
+    neither. Under the VM plan the risk was recorded and accepted that the question might simply
+    not reproduce; under a runner session that risk does not exist, and a non-reproduction becomes
+    as decisive as a reproduction rather than ambiguous.
+  - >
+    **Grant-set discovery is image-sensitive and the grant set is the unbounded part of this
+    release.** Where the toolchain lives, what `%TEMP%` resolves to and how the toolcache is laid
+    out are all properties of the hosted image. Discovery done anywhere else produces a candidate
+    list that still has to be confirmed against the image, so the runner removes a confirmation
+    round rather than adding one.
+  - >
+    **`mxschmitt/action-tmate` supports Windows runners**, dispatched by `workflow_dispatch` from a
+    throwaway branch, which makes the loop free of local hardware entirely.
+  - >
+    **The tmate shell on Windows is MSYS2 bash, which rewrites path-shaped arguments.** The second
+    open question is whether `cmd.exe` refuses a batch file named by an absolute path inside an
+    AppContainer. A hand-typed repro in that shell would exercise MSYS path translation as much as
+    the container, so every experiment must be constructed inside the Rust test binary and the
+    shell used only to dispatch it and read its output. This is a real hazard the VM plan did not
+    have, and it is the reason the checklist now states the rule explicitly.
+before:
+  scope:
+    - "0.59.0 — unchanged: browser transport, egress denial, filesystem confinement opt-in"
+  assumptions:
+    - >
+      That a local Windows 11 ARM64 VM under UTM was the shortest path to the two open questions,
+      with the accepted risk that the `CARGO_HOME` decline might not reproduce on an interactive
+      desktop. Recorded as the sixth evidence bullet of `US-IO-HARNESS-0.59.0-I01`.
+  implementation: >
+    Diagnose locally on a persistent VM, then confirm the grant set on CI.
+change:
+  summary: >
+    The diagnostic loop becomes an interactive session on the `windows-latest` runner —
+    `action-tmate` behind `workflow_dispatch` on a `diag/**` branch, tmate placed after a warm
+    build, findings written to a file and carried off as an `if: always()` artifact. Nothing about
+    the release's scope, landing order or cut line changes. A local VM is demoted from the plan to
+    an escalation path, to be taken only if the grant set turns out to need many short iterations
+    rather than a few deep ones, at which point per-session startup would dominate.
+  added:
+    - "A `diag/**` debug workflow as the primary diagnostic loop"
+    - "The rule that experiments are constructed in the test binary, never at the MSYS2 prompt"
+    - "Session hygiene: findings to a file and an artifact, because the runner is ephemeral"
+  removed:
+    - "The local VM as the planned diagnostic environment"
+  deferred: []
+  replaced:
+    - "US-IO-HARNESS-0.59.0-I01 evidence bullet six — the UTM VM as the constraint's removal"
+impact:
+  products:
+    - io-harness
+  versions:
+    - 0.59.0
+  tasks: []
+  dependencies: []
+  resource_effect: >
+    Trades a persistent environment for an exact one. Removes the VM provisioning and the
+    confirmation round that local findings would have required, and adds a per-session startup cost
+    plus the discipline of carrying findings off an ephemeral runner. Consumes hosted Windows runner
+    time, which bills at a multiplier, so sessions are planned rather than exploratory. Neither the
+    release's scope nor its risk profile changes.
+versioning:
+  previous_target: 0.59.0
+  new_target: 0.59.0
+  consequence: no-version-change
+approval:
+  source: user
+  reference: >
+    Owner changed the method in session on 2026-08-15, having been shown both options and their
+    trade-offs, and asked for the roadmap and the working checklist to be updated to match. The
+    prior record is not rewritten: `US-IO-HARNESS-0.59.0-I01` stated what was true when it was
+    written, and this record supersedes its sixth evidence bullet rather than editing it.
+canonical_updates:
+  - products/io-harness/roadmap.yaml
