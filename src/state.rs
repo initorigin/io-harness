@@ -7715,6 +7715,62 @@ mod tests {
             !memory_is_similar(&left, &right),
             "exactly half is under the threshold, so the comparison is not merely non-zero"
         );
+
+        // **Exactly** the threshold: six shared of a ten-word union is 60%, and
+        // the comparison is `>=`, so it reports. Written because the sabotage
+        // pass caught this test claiming a boundary it did not have — the three
+        // pairs above are 42%, 50% and 66%, and `>` in place of `>=` survived all
+        // of them. This is the only assertion here that distinguishes the two.
+        let left = memory_tokens("alpha bravo charlie delta echo foxtrot golf hotel");
+        let right = memory_tokens("alpha bravo charlie delta echo foxtrot india juliet");
+        let (shared, total) = memory_overlap(&left, &right);
+        assert_eq!((shared, total), (6, 10));
+        assert_eq!(
+            shared * 100,
+            total * MEMORY_SIMILAR_PERCENT,
+            "the pair must sit exactly on the threshold, or it tests the interior again"
+        );
+        assert!(
+            memory_is_similar(&left, &right),
+            "the threshold is inclusive: exactly 60% of the union shared is a restatement"
+        );
+    }
+
+    /// 0.57.0 F5's foundation. `Store::memory_list` is a **total** order since
+    /// this release, and the memory block is printed back in it after selection
+    /// has reordered the slice — so a tie the printer cannot reconstruct is a
+    /// block whose line order can move between two turns over an unchanged store,
+    /// which withholds the second cache breakpoint.
+    ///
+    /// Written after a sabotage: restoring `ORDER BY created_at ASC, id ASC`
+    /// failed nothing, because every other test that touches the order writes its
+    /// entries far enough apart to differ in the millisecond. The rows here are
+    /// given one `created_at` by hand, and their keys are the reverse of their
+    /// insertion order, so id-order and key-order cannot agree.
+    #[test]
+    fn memory_list_breaks_a_same_millisecond_tie_on_the_key_and_not_the_row_id() {
+        let store = Store::memory().unwrap();
+        for key in ["zulu", "yankee", "xray", "whiskey"] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO memory (workspace, key, value, run_id, step, created_at, kind, pinned)
+                     VALUES ('ws', ?1, 'v', 1, 1, '2026-08-15T00:00:00.000Z', 'fact', 0)",
+                    [key],
+                )
+                .unwrap();
+        }
+        let keys: Vec<String> = store
+            .memory_list("ws")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["whiskey", "xray", "yankee", "zulu"],
+            "four entries sharing a created_at order by key, not by the id they were inserted in"
+        );
     }
 
     /// 0.57.0 F13, the normaliser's own half. A path in a note and the same path

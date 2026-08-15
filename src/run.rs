@@ -15772,6 +15772,77 @@ fn workspace_tools() -> Vec<ToolSpec> {
 mod tests {
     use super::*;
 
+    /// 0.57.0 — a cohort with nothing to separate it keeps the order the store
+    /// returned, at a size where an unstable sort would not.
+    ///
+    /// Written after a sabotage: dropping the index from the sort key and sorting
+    /// unstably failed nothing, because every other test here ties at most two
+    /// entries and a two-element unstable sort does not move equal keys. Sixty-four
+    /// is past the threshold where the sort switches strategy, which is where the
+    /// guarantee stops being free. Without the index term this is the assertion
+    /// that goes — and with it, "an entry with no signal and no evidence keeps
+    /// exactly the position it had before this release" is a fact rather than a
+    /// property of whichever sort the standard library ships.
+    #[test]
+    fn a_cohort_with_nothing_to_separate_it_keeps_the_order_the_store_returned() {
+        use crate::state::{MemoryKind, MemoryLimits};
+
+        let store = Store::memory().unwrap();
+        // Two tied cohorts, **interleaved** rather than contiguous: every even
+        // entry shares the goal's word and every odd one shares nothing. A run of
+        // equal keys all together is the one case an unstable sort leaves alone;
+        // equals that have to be partitioned past each other are the case where
+        // it does not, and it is also the ordinary shape of a real store.
+        let mut notes: Vec<crate::state::MemoryEntry> = (0..64)
+            .map(|i| crate::state::MemoryEntry {
+                key: format!("k{i:02}"),
+                value: if i % 2 == 0 {
+                    "the parser".to_string()
+                } else {
+                    "unrelated bookkeeping".to_string()
+                },
+                run_id: 1,
+                step: 1,
+                created_at: format!("2026-08-15T00:00:00.{i:03}Z"),
+                kind: MemoryKind::Fact,
+                pinned: false,
+            })
+            .collect();
+        for e in &notes {
+            store
+                .memory_write_with(
+                    "/ws",
+                    &e.key,
+                    &e.value,
+                    1,
+                    1,
+                    MemoryKind::Fact,
+                    MemoryLimits::default(),
+                )
+                .unwrap();
+        }
+        let signals = crate::state::memory_tokens("fix the parser");
+        rank_notes(&store, "/ws", &mut notes, &signals).unwrap();
+
+        let after: Vec<String> = notes.iter().map(|e| e.key.clone()).collect();
+        // The unmatched cohort first, then the matched one — worst-first, which is
+        // what the fit reads in reverse — and **within each, the order the store
+        // returned**. That second half is the tail of the sort key, and it is what
+        // makes "an entry with no signal and no evidence keeps the position it
+        // had" a fact rather than a property of whichever sort the standard
+        // library happens to ship.
+        let expected: Vec<String> = (0..64)
+            .filter(|i| i % 2 == 1)
+            .chain((0..64).filter(|i| i % 2 == 0))
+            .map(|i| format!("k{i:02}"))
+            .collect();
+        assert_eq!(
+            after, expected,
+            "two interleaved tied cohorts must come back grouped and, inside each \
+             group, in the store's own order"
+        );
+    }
+
     /// 0.57.0 N5 and N6 — what ranking a turn's recall costs, and what the
     /// duplicate check adds to a write, at the three store sizes an operator can
     /// now reach.
