@@ -42,7 +42,7 @@ tasks:
      This is the instrument the release exists for, and the guard is the release's central risk:
      the schema declares one foreign key and never enables `PRAGMA foreign_keys`, so a forgotten
      table produces unreachable rows and no error at all.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.58.0-T01
     acceptance_criteria:
@@ -80,7 +80,21 @@ tasks:
         are all zero and does not fail. The two answers differ on purpose: asking the size of nothing has
         no answer, and deleting nothing succeeds. Sabotage: return `Some` with zeroes, under which the
         distinction collapses and only F14 fails.
-    evidence: []
+    evidence:
+    - "`a_deleted_session_leaves_no_row_in_any_table_the_schema_names` (F1),
+      `deleting_one_session_leaves_the_others_row_for_row` (F2),
+      `a_spawned_child_goes_with_the_parent_that_spawned_it` (F3),
+      `a_deletion_that_fails_partway_leaves_the_store_exactly_as_it_was` (F4),
+      `the_pruned_report_equals_what_the_store_held_a_moment_earlier` (F5) and
+      `deleting_a_session_that_is_not_there_succeeds_and_reports_nothing` (F14) in
+      `tests/retention.rs` — 10 passed with T01's four."
+    - "F4 injects its failure with a `BEFORE DELETE` trigger on `summaries` that RAISEs — a real abort
+      from inside the cascade rather than a mock, and the store is asserted whole afterwards."
+    - "F5 caught a real inconsistency before it shipped: `Pruned` counted the session row and
+      `SessionSize` did not, so the two figures for one session differed by one. They are now the same
+      measure, which is the only way F5's equality means anything."
+    - "F3 drives real spawned children through `start_child_run`, two levels deep, and asserts on the
+      run ids from the tree rather than on a count."
     files:
       - src/state.rs
       - src/lib.rs

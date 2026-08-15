@@ -3065,6 +3065,66 @@ pub struct SessionSize {
 /// # Ok(())
 /// # }
 /// ```
+/// What a removal took, and what it refused to take.
+///
+/// Returned by [`Store::delete_session`] and [`Store::sweep_sessions`]. Both
+/// report the same shape because they are the same removal reached two ways —
+/// by naming a session, or by naming a date — and an operator comparing a
+/// sweep's result against a targeted deletion should not have to translate
+/// between two kinds of receipt.
+///
+/// `refused` is only ever non-empty for a sweep. A date is a policy applied to
+/// sessions nobody looked at, so a session holding a run that could still be
+/// resumed is left alone and named here; [`Store::delete_session`] takes one id
+/// and removes it, because that is somebody's decision rather than a policy.
+///
+/// **A deletion cannot be undone by this crate.** The counts exist so the caller
+/// can record what happened while the information still exists.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let session = store.create_session("/repo")?;
+/// let run = store.start_run("summarise the changelog", "/repo")?;
+/// let turn = store.record_turn(session, None, run, "what changed in 0.57?")?;
+/// store.finish_turn(turn, Some("three things"), "ok")?;
+///
+/// let pruned = store.delete_session(session)?;
+/// assert_eq!(pruned.sessions, 1);
+/// assert_eq!(pruned.turns, 1);
+/// assert_eq!(pruned.runs, 1);
+/// assert!(pruned.refused.is_empty());
+///
+/// // Deleting what is not there succeeds and reports nothing — which is a
+/// // different answer from asking its size, and deliberately so.
+/// assert_eq!(store.delete_session(session)?.sessions, 0);
+/// assert!(store.session_size(session)?.is_none());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pruned {
+    /// Sessions removed.
+    pub sessions: u64,
+    /// Turns removed with them.
+    pub turns: u64,
+    /// Runs removed, including every run those sessions' runs spawned.
+    pub runs: u64,
+    /// Rows removed across every table.
+    pub rows: u64,
+    /// The bytes those rows held, on the same measure as [`SessionSize::bytes`].
+    pub bytes: u64,
+    /// Restore points removed. An undo depends on these, so a removal says how
+    /// many promises it withdrew at the time rather than at the moment somebody
+    /// reaches for one.
+    pub restore_points: u64,
+    /// Sessions a sweep left alone because they hold a run that can still be
+    /// resumed. Always empty for [`Store::delete_session`].
+    pub refused: Vec<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreSize {
     /// `page_size × page_count`: what the database file occupies.
@@ -7883,13 +7943,13 @@ impl Store {
             |r| r.get(0),
         )?;
 
-        let mut rows: i64 = turns;
-        let mut bytes: i64 = self.sum_text(
-            "session_turns",
-            "session_id",
-            &id_list(&[session_id]),
-            false,
-        )?;
+        // The session's own row counts too, so this figure and the one
+        // [`Store::delete_session`] reports for the same session are the same
+        // measure rather than two that differ by a constant nobody remembers.
+        let list = id_list(&[session_id]);
+        let mut rows: i64 = turns + 1;
+        let mut bytes: i64 = self.sum_text("session_turns", "session_id", &list, false)?
+            + self.sum_text("sessions", "id", &list, false)?;
         if !runs.is_empty() {
             let list = id_list(&runs);
             rows += runs.len() as i64;
@@ -7996,6 +8056,115 @@ impl Store {
             sessions: sessions.max(0) as u64,
             runs: runs.max(0) as u64,
             tables,
+        })
+    }
+}
+
+impl Store {
+    /// Remove one session whole: its turns, the runs those turns drove,
+    /// everything those runs spawned, and every row the schema hangs off them.
+    ///
+    /// One transaction. A failure partway through leaves the store exactly as it
+    /// was, which matters more here than anywhere else in the crate: a
+    /// half-removed tree is unreachable rows that nothing will ever mention
+    /// again, because the schema declares one foreign key and never enables
+    /// `PRAGMA foreign_keys`.
+    ///
+    /// **A run in this session that can still be resumed is removed anyway.**
+    /// Naming one session is a decision somebody made; the refusal that protects
+    /// a resumable run lives in [`Store::sweep_sessions`], where a date is being
+    /// applied to sessions nobody looked at.
+    ///
+    /// Notes are not touched — see [`RUN_TABLES`]. Restore points are, and the
+    /// count of them is in the returned [`Pruned`].
+    ///
+    /// Deleting a session that is not in the store succeeds and reports nothing.
+    /// Nothing here shrinks the file: SQLite frees pages into the database
+    /// rather than out of it, and [`Store::compact`] is what returns them.
+    pub fn delete_session(&self, session_id: i64) -> Result<Pruned> {
+        self.prune(&[session_id], Vec::new())
+    }
+
+    /// Sessions that exist, out of the ids given.
+    fn existing_sessions(&self, sessions: &[i64]) -> Result<Vec<i64>> {
+        if sessions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = id_list(sessions);
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT id FROM sessions WHERE id IN ({list})"))?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// The removal both entry points share.
+    ///
+    /// Takes the sessions already filtered to those that exist and those that
+    /// are allowed to go, and the ids to report as refused. Everything is
+    /// measured before anything is deleted, because after the transaction there
+    /// is nothing left to count.
+    ///
+    /// **One pass over the schema, whatever the number of sessions.** The run
+    /// set for every session is collected first and each table is deleted from
+    /// exactly once, so a sweep of a thousand sessions issues the same
+    /// statements as a sweep of one. The natural implementation — loop over the
+    /// sessions calling [`Store::delete_session`] — issues them per session, and
+    /// on a schema of this size that is the difference between a maintenance
+    /// call and an outage.
+    fn prune(&self, sessions: &[i64], refused: Vec<i64>) -> Result<Pruned> {
+        let sessions = self.existing_sessions(sessions)?;
+        if sessions.is_empty() {
+            return Ok(Pruned {
+                refused,
+                ..Pruned::default()
+            });
+        }
+        let runs = Self::session_run_ids(&self.conn, &sessions)?;
+        let session_list = id_list(&sessions);
+        let run_list = id_list(&runs);
+
+        // Measured first. After the transaction none of it is answerable.
+        let turns = self.count_rows("session_turns", "session_id", &session_list)?;
+        let mut rows = turns + sessions.len() as i64;
+        let mut bytes = self.sum_text("session_turns", "session_id", &session_list, false)?
+            + self.sum_text("sessions", "id", &session_list, false)?;
+        let mut restore_points = 0;
+        if !runs.is_empty() {
+            rows += runs.len() as i64;
+            bytes += self.sum_text("runs", "id", &run_list, false)?;
+            restore_points = self.count_rows("snapshots", "run_id", &run_list)?;
+            for (table, key) in RUN_TABLES {
+                rows += self.count_rows(table, key, &run_list)?;
+                bytes += self.sum_text(table, key, &run_list, false)?;
+            }
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        if !runs.is_empty() {
+            for (table, key) in RUN_TABLES {
+                tx.execute_batch(&format!("DELETE FROM {table} WHERE {key} IN ({run_list})"))?;
+            }
+            tx.execute_batch(&format!("DELETE FROM runs WHERE id IN ({run_list})"))?;
+        }
+        tx.execute_batch(&format!(
+            "DELETE FROM session_turns WHERE session_id IN ({session_list})"
+        ))?;
+        tx.execute_batch(&format!(
+            "DELETE FROM sessions WHERE id IN ({session_list})"
+        ))?;
+        tx.commit()?;
+
+        Ok(Pruned {
+            sessions: sessions.len() as u64,
+            turns: turns.max(0) as u64,
+            runs: runs.len() as u64,
+            rows: rows.max(0) as u64,
+            bytes: bytes.max(0) as u64,
+            restore_points: restore_points.max(0) as u64,
+            refused,
         })
     }
 }
