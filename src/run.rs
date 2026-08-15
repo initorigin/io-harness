@@ -14577,7 +14577,11 @@ fn containment_line(config: &SandboxConfig, proxied: bool) -> String {
     // environment variable a command may ignore, and the word for that is
     // *advisory*: saying anything stronger would be the defect 0.40.0 shipped,
     // where every interface said contained and no machine enforced it.
-    let egress = match (proxied, backend.denies_egress(), backend.scopes_egress_per_host()) {
+    let egress = match (
+        proxied,
+        backend.denies_egress(),
+        backend.scopes_egress_per_host(),
+    ) {
         (true, true, _) => {
             " Outbound network goes through a proxy this run owns, which permits only the hosts \
              this run's policy names."

@@ -997,10 +997,10 @@ pub(crate) async fn launch(
 
     // Two pipes: we write commands on one and read messages on the other, so
     // each hands one end to the child and keeps the other.
-    let (child_read, parent_write) = std::io::pipe()
-        .map_err(|e| fail(format!("could not make a pipe for the browser: {e}")))?;
-    let (parent_read, child_write) = std::io::pipe()
-        .map_err(|e| fail(format!("could not make a pipe for the browser: {e}")))?;
+    let (child_read, parent_write) =
+        std::io::pipe().map_err(|e| fail(format!("could not make a pipe for the browser: {e}")))?;
+    let (parent_read, child_write) =
+        std::io::pipe().map_err(|e| fail(format!("could not make a pipe for the browser: {e}")))?;
     for end in [child_read.as_raw_handle(), child_write.as_raw_handle()] {
         inheritable(end)?;
     }
@@ -1042,7 +1042,11 @@ pub(crate) async fn launch(
     drop(child_write);
 
     let gate = Arc::new(NavGate::new(policy.clone()));
-    let client = Client::over(pipe_reader(parent_read), pipe_writer(parent_write), Arc::clone(&gate));
+    let client = Client::over(
+        pipe_reader(parent_read),
+        pipe_writer(parent_write),
+        Arc::clone(&gate),
+    );
     let session = attach(&client, config).await?;
 
     Ok(Browser {
@@ -1060,9 +1064,7 @@ pub(crate) async fn launch(
 /// Mark one handle inheritable, which a pipe end is not by default.
 #[cfg(windows)]
 fn inheritable(handle: std::os::windows::io::RawHandle) -> Result<()> {
-    use windows_sys::Win32::Foundation::{
-        SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
-    };
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
     // SAFETY: the handle belongs to a pipe end the caller owns for this call.
     if unsafe { SetHandleInformation(handle as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
         == 0
@@ -1370,7 +1372,9 @@ mod tests {
                 "the browser was launched without the pipe transport: {args:?}"
             );
             assert!(
-                !args.iter().any(|a| a.starts_with("--remote-debugging-port")),
+                !args
+                    .iter()
+                    .any(|a| a.starts_with("--remote-debugging-port")),
                 "a debugging port was opened: {args:?}"
             );
         }
