@@ -1383,6 +1383,51 @@ mod tests {
         );
     }
 
+    /// **A profile one process owns is not deleted by another's `Drop`.**
+    ///
+    /// Found by the release PR's Windows leg rather than by anything here: under
+    /// a runner that gives each test its own process, the first row of the
+    /// capability table declined and every row after it passed — the signature of
+    /// a container that existed and then did not. The name was deterministic and
+    /// `Drop` deletes it, so whichever process finished first deleted the profile
+    /// the others were still spawning into.
+    ///
+    /// Two live profiles at once, and the second must still be usable after the
+    /// first has been dropped. Asserted by spawning into it, because a SID that
+    /// still resolves is not the same claim as a container that still runs a
+    /// process.
+    #[test]
+    fn one_process_dropping_its_profile_does_not_take_anothers_with_it() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let keep = Profile::create(&name("keeper"), false).expect("the profile that stays");
+        {
+            let _going = Profile::create(&name("goer"), false).expect("the profile that goes");
+        }
+        grant(work.path(), keep.sid(), Access::Full, Reach::Tree).expect("grant to the keeper");
+
+        let out_path = work.path().join("after.txt");
+        let file = std::fs::File::create(&out_path).expect("capture file");
+        let mut child = Spawned::start(
+            "cmd.exe /c echo io-harness-probe",
+            work.path(),
+            &keep,
+            &file,
+        )
+        .expect("the surviving container must still be spawnable");
+        child.resume().expect("resume");
+        drop(file);
+        let code = child.wait(30_000).expect("wait");
+        let mut text = String::new();
+        std::fs::File::open(&out_path)
+            .and_then(|mut f| f.read_to_string(&mut text))
+            .ok();
+        assert_eq!(
+            (code, text.contains("io-harness-probe")),
+            (Some(0), true),
+            "a second profile's lifetime reached into this one: {text:?}"
+        );
+    }
+
     /// **F10 — the grant memo is keyed by the container it granted to.**
     ///
     /// Two profiles in one process, one path, and both must end up carrying an
