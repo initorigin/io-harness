@@ -17,7 +17,8 @@ use std::path::Path;
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    run_with, ApproveAll, ContextBudget, Policy, Provider, Store, TaskContract,
+    run_with, ApproveAll, ContextBudget, MemoryKind, MemoryLimits, Policy, Provider, Store,
+    TaskContract,
 };
 use serde_json::json;
 
@@ -352,6 +353,131 @@ async fn the_block_is_printed_in_the_stores_order_however_the_turn_moves() {
     assert!(
         !one.contains("elided to fit"),
         "the fixture for this half must fit, or it is asserting the other regime"
+    );
+}
+
+/// F7 — the ranking reaches the sub-agent loop.
+///
+/// `run_tree_with_extras` is a second recall site, and a rule that lives in one
+/// loop and not the other is this crate's most repeated defect shape. Asserted
+/// by driving a real spawn and reading the **child's** own prompt — the child's
+/// goal is about the parser and the parent's is about nothing in the store, so a
+/// child falling back to recency is visible as the newest cohort appearing in a
+/// block that should hold parser notes.
+#[tokio::test]
+async fn a_spawned_child_recalls_under_the_same_ordering_as_the_flat_loop() {
+    use io_harness::{run_tree, AgentDef, Agents, Containment};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let key = ws_key(dir.path());
+    // A child's `TaskContract` is built fresh by the spawn (`src/run.rs`) and does
+    // NOT inherit the root's `ContextBudget`, so a child always assembles under
+    // the default 24,000-token ceiling however tightly the root was bounded. The
+    // fixture is sized against that ceiling rather than against the one the other
+    // tests here set — and it has to be written through `memory_write_with`,
+    // because a store this large is past the caps `memory_put` enforces.
+    let big = MemoryLimits {
+        max_entries: 1_000,
+        max_chars: 10_000_000,
+        max_entry_chars: 2_000,
+    };
+    let subjects = [
+        ("a", "the parser rejects a trailing comma and reports the column it stopped at"),
+        ("b", "the sandbox refuses an absent writable root rather than degrading quietly"),
+        ("c", "the release tag is pushed alone or the workflow ships with no assets"),
+    ];
+    for (s, text) in subjects {
+        for i in 0..12 {
+            let value = format!("{text} {}", "z".repeat(1_800));
+            store
+                .memory_write_with(
+                    &key,
+                    &format!("{s}{i:02}"),
+                    &value,
+                    1,
+                    1,
+                    MemoryKind::Fact,
+                    big,
+                )
+                .expect("the fixture writes must land");
+        }
+    }
+
+    let spawn = ToolCall {
+        name: "spawn_agent".into(),
+        arguments: json!({
+            "agent": "reader",
+            "goal": "fix the parser",
+            "verify_file": "done.txt",
+            "verify_contains": "ok",
+            "max_steps": 2
+        }),
+    };
+    let write = ToolCall {
+        name: "write_file".into(),
+        arguments: json!({ "path": "done.txt", "content": "ok" }),
+    };
+
+    let seen = Seen(
+        std::sync::Mutex::new(Vec::new()),
+        vec![vec![spawn], vec![write], vec![]],
+    );
+    let contract = TaskContract::workspace("delegate the assignment", dir.path())
+        .with_max_steps(3)
+        .with_context_budget(ContextBudget {
+            max_tokens: 1_000,
+            share: 0.5,
+        })
+        .with_agents(Agents::new().with(AgentDef::new("reader")));
+    let _ = run_tree(
+        &contract,
+        &seen,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &Containment::new(4, 2, 2, 1_000_000),
+    )
+    .await;
+
+    let prompts = seen.0.lock().unwrap().clone();
+    let child = prompts
+        .iter()
+        .find(|p| p.contains("Goal: fix the parser"))
+        .expect("the child ran and was prompted with its own goal");
+    assert!(
+        child.contains("note(s) elided to fit"),
+        "the child's block must not fit, or nothing is being selected in the tree loop:\n{child}"
+    );
+    let carried: Vec<String> = child
+        .lines()
+        .filter_map(|l| l.strip_prefix("- "))
+        .filter_map(|l| l.split(':').next())
+        .filter(|k| k.len() == 3 && k.starts_with(['a', 'b', 'c']))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !carried.is_empty(),
+        "the child recalled nothing at all, so this asserts nothing:\n{child}"
+    );
+    for k in &carried {
+        assert!(
+            k.starts_with('a'),
+            "the child carried {k}, which is not about its own goal — the tree loop \
+             is still recalling by recency"
+        );
+    }
+
+    // And the parent, whose goal matches nothing, is the control: it carries the
+    // store's own last notes, which is what a child would have carried too if the
+    // ranking had not reached it.
+    let parent = prompts
+        .iter()
+        .find(|p| p.contains("Goal: delegate the assignment"))
+        .expect("the parent was prompted too");
+    assert!(
+        parent.contains("- c11:"),
+        "the parent's goal matches nothing, so the store's own last entry decides for it"
     );
 }
 
