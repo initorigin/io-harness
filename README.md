@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.58"
+io-harness = "0.59"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -522,7 +522,8 @@ dependency at all.
 | --- | --- |
 | macOS | Native, `sandbox-exec` |
 | Linux | Native, a chain: Landlock, `bwrap`, namespaces, floor |
-| Windows | Native, Job Object (memory, CPU, process count, tree kill) — **resources only, no filesystem or network boundary** |
+| Windows, default | Native, Job Object (memory, CPU, process count, tree kill) — **resources only, no filesystem or network boundary** |
+| Windows, opt-in | Native, AppContainer inside a Job Object — writes confined to the paths the run resolved, egress denied (0.59.0) |
 
 The full suite runs on all three in CI.
 
@@ -536,21 +537,38 @@ a chain, and its first rung is Landlock, which needs no namespace at all. The
 rung a host takes is the strongest that can enforce what the run asked for, and
 a run denying egress is never given one that cannot deny egress.
 
-**The Windows hole is still open, and it is the one to read carefully.** A Job
+**0.59.0 closed the Windows hole, and left the default where it was.** A Job
 Object has no filesystem facility and no network facility, so a contained Windows
-command gets the resource caps and nothing else — `ExecMode` is routed and
-reported there and enforces nothing for the filesystem. The access half was
-planned for 0.47.0 and moved whole to 0.59.0; nothing on Windows changed in this
-release, in either direction.
+command has always got the resource caps and nothing else. The access half is an
+AppContainer: a token that is default-deny on every securable object and reaches
+only what an explicit ACE granted it. `SandboxConfig::with_access_confinement()`
+selects it; without that a Windows run gets the Job Object exactly as before.
+
+It is opt-in because the grant set is derived from the run's own facts — the
+workspace, the toolchain's cache roots, the temporary directory, the program's own
+directory, `%SystemRoot%` — and derived is not complete. A toolchain reading a
+machine-wide file outside that set is refused, and a default boundary that cannot
+run an arbitrary payload is worse than one you reach for deliberately. The default
+moves when the derived set has run a real cargo build, npm install and python
+payload on the CI image without a decline.
+
+And it does not degrade. Everywhere else an unavailable primitive falls back to a
+weaker rung and reports it; a boundary you asked for by name and that cannot be
+applied is an error naming the grant that failed, because a run that quietly took
+the Job Object instead would have no boundary at all while every assertion about
+it still passed.
 
 **0.48.0 made egress per-host, and what that is worth also differs by row.** A run
 whose policy names hosts routes its contained commands through a loopback proxy it
 owns. macOS scopes the route to that address exactly; Linux's Landlock rung scopes
 it to a **port**, so another host on that port number is reachable and the contract
 says so; the namespace rungs cannot reach the host's loopback at all and are not
-given such a run; and on Windows and the portable floor the proxy is **advisory** —
-a command that ignores it reaches the network, and the agent's own prompt uses that
-word.
+given such a run; on the portable floor and under a Windows Job
+Object the proxy is **advisory** — a command that ignores it reaches the network,
+and the agent's own prompt uses that word; and under Windows access confinement
+there is no proxy at all, because **a process inside an AppContainer cannot reach
+a loopback listener** under any capability set, which was measured rather than
+assumed. Egress there is the capability: all of the network, or none of it.
 
 Both are still reported rather than assumed: `select().backend()` answers before
 the run and the trace records what actually applied.

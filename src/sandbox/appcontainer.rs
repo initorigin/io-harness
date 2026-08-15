@@ -81,7 +81,7 @@ pub(crate) mod win {
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
-        HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
         GetNamedSecurityInfoW, SetEntriesInAclW, TreeSetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
@@ -93,7 +93,7 @@ pub(crate) mod win {
         DeriveAppContainerSidFromAppContainerName,
     };
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, EqualSid, FreeSid, GetAce, InitializeSecurityDescriptor,
+        CreateWellKnownSid, EqualSid, FreeSid, GetAce, GetLengthSid, InitializeSecurityDescriptor,
         SetKernelObjectSecurity, SetSecurityDescriptorDacl, WinCapabilityInternetClientSid,
         ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, PSID, SECURITY_DESCRIPTOR,
         SID_AND_ATTRIBUTES, UNPROTECTED_DACL_SECURITY_INFORMATION,
@@ -230,7 +230,55 @@ pub(crate) mod win {
     pub(crate) struct Profile {
         name: Vec<u16>,
         sid: PSID,
+        /// Whether dropping this deletes the profile behind it.
+        ///
+        /// **False for the one every contained run shares, and that is two races
+        /// answered at once.** A profile is a registry-backed object named by a
+        /// string, so a deterministic name is shared between every process on the
+        /// machine — and deleting it on drop meant whichever process finished
+        /// first destroyed the container the others were still spawning into.
+        ///
+        /// Giving each process its own name fixes that and creates a worse one:
+        /// the SID derives from the name, soeach process then writes a *different*
+        /// ACE onto the same shared paths — the toolchain home, the temporary
+        /// directory — and two read-modify-write passes over one DACL lose each
+        /// other's entry. The symptom is a container that cannot read the
+        /// toolchain home and a launcher that reports it "could not create home
+        /// directory ... Cannot create a file when that file already exists".
+        ///
+        /// Sharing the name is therefore the *correct* half: every process writes
+        /// the identical ACE for the identical SID, so concurrent grants converge
+        /// instead of clobbering. What had to go is the deletion. The cost is one
+        /// profile left on a machine that has ever run a contained command, which
+        /// is re-entered rather than recreated; the tests keep unique names and
+        /// keep deleting theirs.
+        delete_on_drop: bool,
+        /// The `internetClient` capability SID, when this profile was created
+        /// with the network permitted.
+        ///
+        /// **Registering a capability on the profile is not the same act as
+        /// putting it in a child's token.** The profile's list is what
+        /// `CreateAppContainerProfile` records against the name; what a spawned
+        /// process holds is the array handed to
+        /// `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`. Until 0.59.0 that array
+        /// was empty on every spawn, so the permitting direction this module
+        /// documents was never applied and the denying direction was right for a
+        /// reason that had nothing to do with the capability set.
+        capability: Option<SidBuf>,
     }
+
+    /// A SID buffer at the alignment the kernel reads one at.
+    ///
+    /// **The alignment is load-bearing.** A `SID`'s sub-authority array is `u32`,
+    /// so it is read at four-byte alignment; a bare `[u8; 68]` promises one-byte
+    /// alignment, and as a struct field rather than a stack local it lands
+    /// wherever the layout puts it. `CreateProcessW` handed a misaligned
+    /// capability SID answers `ERROR_NOACCESS` — "Invalid access to memory
+    /// location" — which reads like a bad pointer and is a bad offset.
+    /// `SECURITY_MAX_SID_SIZE` is 68; rounding to 72 costs four bytes.
+    #[derive(Clone, Copy)]
+    #[repr(C, align(8))]
+    pub(crate) struct SidBuf([u8; 72]);
 
     // SAFETY: both members are plain data — an owned UTF-16 buffer and a SID,
     // which is a process-wide allocation addressed by pointer and not a
@@ -270,10 +318,10 @@ pub(crate) mod win {
             // alive across it. `SECURITY_MAX_SID_SIZE` is 68; a fixed buffer
             // avoids an allocation whose lifetime would be one more thing to get
             // right.
-            let mut cap_sid = [0u8; 68];
+            let mut cap_sid = SidBuf([0u8; 72]);
             let mut caps: [SID_AND_ATTRIBUTES; 1] = unsafe { std::mem::zeroed() };
             let cap_count = if allow_network {
-                let mut len = cap_sid.len() as u32;
+                let mut len = cap_sid.0.len() as u32;
                 // SAFETY: `cap_sid` is a live buffer of at least
                 // `SECURITY_MAX_SID_SIZE` bytes and `len` is its true length as a
                 // live in/out parameter. A null domain SID is what a
@@ -282,14 +330,14 @@ pub(crate) mod win {
                     CreateWellKnownSid(
                         WinCapabilityInternetClientSid,
                         std::ptr::null_mut(),
-                        cap_sid.as_mut_ptr().cast::<core::ffi::c_void>(),
+                        cap_sid.0.as_mut_ptr().cast::<core::ffi::c_void>(),
                         &mut len,
                     )
                 } == 0
                 {
                     return Err(io::Error::last_os_error());
                 }
-                caps[0].Sid = cap_sid.as_mut_ptr().cast::<core::ffi::c_void>();
+                caps[0].Sid = cap_sid.0.as_mut_ptr().cast::<core::ffi::c_void>();
                 // `SE_GROUP_ENABLED`. The attribute that makes the capability
                 // present rather than merely listed.
                 caps[0].Attributes = 0x0000_0004;
@@ -336,12 +384,36 @@ pub(crate) mod win {
                 }
             }
 
-            Ok(Profile { name, sid })
+            Ok(Profile {
+                name,
+                sid,
+                capability: (cap_count >= 1).then_some(cap_sid),
+                delete_on_drop: true,
+            })
+        }
+
+        /// The profile every contained run on this machine shares, which outlives
+        /// the process that first created it. See `delete_on_drop`.
+        pub(crate) fn shared(name: &str, allow_network: bool) -> io::Result<Self> {
+            let mut p = Self::create(name, allow_network)?;
+            p.delete_on_drop = false;
+            Ok(p)
         }
 
         /// The container SID. Valid for as long as this `Profile` is.
         pub(crate) fn sid(&self) -> PSID {
             self.sid
+        }
+
+        /// The capability SID this profile grants a child, if any.
+        ///
+        /// The pointer addresses this profile's own buffer and is valid for the
+        /// length of the borrow. Win32 reads it and never writes through it; the
+        /// mutable pointer is what `SID_AND_ATTRIBUTES` declares.
+        pub(crate) fn capability_sid(&self) -> Option<*mut core::ffi::c_void> {
+            self.capability
+                .as_ref()
+                .map(|b| b.0.as_ptr().cast_mut().cast::<core::ffi::c_void>())
         }
     }
 
@@ -352,7 +424,9 @@ pub(crate) mod win {
             // this type, and this is the only free. `self.name` is still live.
             unsafe {
                 FreeSid(self.sid);
-                DeleteAppContainerProfile(self.name.as_ptr());
+                if self.delete_on_drop {
+                    DeleteAppContainerProfile(self.name.as_ptr());
+                }
             }
         }
     }
@@ -383,13 +457,33 @@ pub(crate) mod win {
     /// will hold is not a directory granted across what it already holds, and a
     /// read-execute grant does not stand in for a full one.
     #[allow(clippy::type_complexity)]
-    fn granted_here(
-    ) -> &'static std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, Access, Reach)>>
-    {
-        static DONE: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, Access, Reach)>>,
-        > = std::sync::OnceLock::new();
+    fn granted_here() -> &'static std::sync::Mutex<std::collections::HashSet<MemoKey>> {
+        static DONE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<MemoKey>>> =
+            std::sync::OnceLock::new();
         DONE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+
+    /// A path, what it was granted, how far, **and to which container**.
+    ///
+    /// The SID is not decoration. Without it a second profile in one process
+    /// asking for a path the first already granted is skipped, told it succeeded,
+    /// and reads back with no ACE of its own — the same silent-inert-grant shape
+    /// this module has already paid for once. It survived because the production
+    /// profile name is deterministic and derives one stable SID, so the omission
+    /// could only be seen by a test that builds two containers, and none did.
+    type MemoKey = (std::path::PathBuf, Access, Reach, Vec<u8>);
+
+    /// A SID's own bytes, for use as a map key.
+    ///
+    /// A `PSID` is a pointer, and two pointers to equal SIDs are not equal. The
+    /// SID itself is plain position-independent data, so its bytes are the
+    /// identity.
+    fn sid_key(sid: PSID) -> Vec<u8> {
+        // SAFETY: `sid` is a valid SID for the length of this call, and
+        // `GetLengthSid` returns its whole size in bytes.
+        let len = unsafe { GetLengthSid(sid) } as usize;
+        // SAFETY: the SID is `len` bytes, owned elsewhere, and only read here.
+        unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) }.to_vec()
     }
 
     /// What `path`'s DACL already allows `sid`, if it names it at all.
@@ -497,7 +591,7 @@ pub(crate) mod win {
         // could not start `rustc.exe` while the launcher shim beside it worked.
         // A path this process granted itself is safe to skip, because
         // `SetNamedSecurityInfoW` had returned before it was recorded.
-        let memo_key = (path.to_path_buf(), access, reach);
+        let memo_key = (path.to_path_buf(), access, reach, sid_key(sid));
         {
             let done = granted_here()
                 .lock()
@@ -772,6 +866,25 @@ pub(crate) mod win {
     unsafe impl Send for Spawned {}
     unsafe impl Sync for Spawned {}
 
+    /// What one spawn needs to know.
+    ///
+    /// A struct rather than five positional arguments because two of them are
+    /// optional and the pair that is easiest to transpose — a container and a
+    /// descriptor list — are the two whose failure is silent.
+    pub(crate) struct Plan<'a> {
+        /// The command line, already quoted by the platform's own rules.
+        pub(crate) cmdline: &'a str,
+        /// The working directory the child starts in.
+        pub(crate) cwd: &'a Path,
+        /// The container to enter, or `None` for an ordinary spawn.
+        pub(crate) profile: Option<&'a Profile>,
+        /// Where the child's standard output and error go.
+        pub(crate) out: &'a std::fs::File,
+        /// Handles to place in the child's C-runtime descriptor table, starting
+        /// at descriptor 3. Each must already be marked inheritable.
+        pub(crate) inherited: &'a [HANDLE],
+    }
+
     impl Spawned {
         /// Start `cmdline` inside the container `sid`, in `cwd`, with both
         /// standard streams going to `out`.
@@ -784,9 +897,36 @@ pub(crate) mod win {
         pub(crate) fn start(
             cmdline: &str,
             cwd: &Path,
-            sid: PSID,
+            profile: &Profile,
             out: &std::fs::File,
         ) -> io::Result<Self> {
+            Self::start_with(Plan {
+                cmdline,
+                cwd,
+                profile: Some(profile),
+                out,
+                inherited: &[],
+            })
+        }
+
+        /// Start `plan.cmdline`, optionally inside a container, optionally with
+        /// handles at named C-runtime descriptors.
+        ///
+        /// **One `CreateProcessW` for both of 0.59.0's halves, because they are
+        /// one spawn.** The container needs a process-thread attribute list that
+        /// neither `std`'s nor `tokio`'s `Command` can carry; the browser needs a
+        /// descriptor table that neither can carry either. Two call sites written
+        /// separately would be two places for handle inheritance to be got wrong,
+        /// and the failure is silent in both — a process that starts and never
+        /// speaks.
+        pub(crate) fn start_with(plan: Plan<'_>) -> io::Result<Self> {
+            let Plan {
+                cmdline,
+                cwd,
+                profile,
+                out,
+                inherited,
+            } = plan;
             let handle = out.as_raw_handle() as HANDLE;
             // SAFETY: `handle` belongs to `out`, which is borrowed for this whole
             // call and therefore outlives it.
@@ -800,63 +940,131 @@ pub(crate) mod win {
             // call is *expected* to fail with ERROR_INSUFFICIENT_BUFFER — that is
             // how it reports the size — so its return value is deliberately not
             // checked and `size` is what is read instead.
-            let mut size: usize = 0;
-            // SAFETY: a null list with a live `size` out-parameter is the
-            // documented way to ask how large the list must be.
-            unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
-            if size == 0 {
-                return Err(io::Error::other(
-                    "the process attribute list reported a size of zero",
-                ));
-            }
-            // `Vec<usize>` rather than `Vec<u8>`: the list has pointer alignment
-            // requirements that a byte vector does not promise.
-            let mut buf: Vec<usize> = vec![0; size.div_ceil(size_of::<usize>())];
-            let list = buf.as_mut_ptr().cast::<core::ffi::c_void>() as LPPROC_THREAD_ATTRIBUTE_LIST;
+            // The attribute list exists only for a container. An ordinary spawn
+            // — the browser outside containment — needs no attribute at all, and
+            // asking for a list of one and filling none is a structure the kernel
+            // reads differently from a plain `STARTUPINFO`.
+            let mut buf: Vec<usize>;
+            let mut list: LPPROC_THREAD_ATTRIBUTE_LIST = std::ptr::null_mut();
+            let mut _attrs: Option<AttrGuard> = None;
+            let mut granted: [SID_AND_ATTRIBUTES; 1] = unsafe { std::mem::zeroed() };
+            let caps;
 
-            // SAFETY: `list` points at `buf`, which is at least `size` bytes and
-            // outlives every use below; the count matches the one attribute set
-            // immediately after.
-            if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let _attrs = AttrGuard(list);
+            if let Some(profile) = profile {
+                let mut size: usize = 0;
+                // SAFETY: a null list with a live `size` out-parameter is the
+                // documented way to ask how large the list must be.
+                unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+                if size == 0 {
+                    return Err(io::Error::other(
+                        "the process attribute list reported a size of zero",
+                    ));
+                }
+                // `Vec<usize>` rather than `Vec<u8>`: the list has pointer
+                // alignment requirements that a byte vector does not promise.
+                buf = vec![0; size.div_ceil(size_of::<usize>())];
+                list = buf.as_mut_ptr().cast::<core::ffi::c_void>() as LPPROC_THREAD_ATTRIBUTE_LIST;
 
-            // This is the whole feature: the one attribute that carries a
-            // container SID into a child. It must outlive `CreateProcessW`,
-            // because the list stores a pointer to it rather than a copy.
-            let caps = windows_sys::Win32::Security::SECURITY_CAPABILITIES {
-                AppContainerSid: sid,
-                Capabilities: std::ptr::null_mut(),
-                CapabilityCount: 0,
-                Reserved: 0,
-            };
-            // SAFETY: `list` is initialised, the attribute constant names the
-            // `SECURITY_CAPABILITIES` type that `caps` is, the size passed is
-            // that type's own `size_of`, and `caps` lives until after the spawn
-            // below.
-            if unsafe {
-                UpdateProcThreadAttribute(
-                    list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                    std::ptr::from_ref(&caps).cast(),
-                    size_of_val(&caps),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                )
-            } == 0
-            {
-                return Err(io::Error::last_os_error());
+                // SAFETY: `list` points at `buf`, which is at least `size` bytes
+                // and outlives every use below; the count matches the one
+                // attribute set immediately after.
+                if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                _attrs = Some(AttrGuard(list));
+
+                // **The capability array reaches the child here or nowhere.**
+                // Registering `internetClient` on the profile records it against
+                // the name; what the process holds is what this array says. Both
+                // it and the SID it points at must outlive `CreateProcessW`,
+                // because the attribute list stores pointers rather than copies.
+                let capability_count = match profile.capability_sid() {
+                    Some(cap) => {
+                        granted[0].Sid = cap;
+                        // `SE_GROUP_ENABLED`: present rather than merely listed.
+                        granted[0].Attributes = 0x0000_0004;
+                        1u32
+                    }
+                    None => 0,
+                };
+                caps = windows_sys::Win32::Security::SECURITY_CAPABILITIES {
+                    AppContainerSid: profile.sid(),
+                    Capabilities: if capability_count == 0 {
+                        std::ptr::null_mut()
+                    } else {
+                        granted.as_mut_ptr()
+                    },
+                    CapabilityCount: capability_count,
+                    Reserved: 0,
+                };
+                // SAFETY: `list` is initialised, the attribute constant names the
+                // `SECURITY_CAPABILITIES` type that `caps` is, the size passed is
+                // that type's own `size_of`, and `caps` lives until after the
+                // spawn below.
+                if unsafe {
+                    UpdateProcThreadAttribute(
+                        list,
+                        0,
+                        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                        std::ptr::from_ref(&caps).cast(),
+                        size_of_val(&caps),
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+
+            // **The child's C-runtime descriptor table, which is how a handle
+            // becomes a numbered descriptor.** Chromium turns the descriptors it
+            // is handed into handles with `_get_osfhandle`, so a browser driven
+            // over a pipe needs its two ends at descriptors 3 and 4 in the
+            // *runtime's* table, and the only thing that writes one is this
+            // block. Layout, exactly as the CRT reads it back and as libuv
+            // writes it: a count, then one flag byte per descriptor, then the
+            // handles, unaligned.
+            let mut fds: Vec<u8> = Vec::new();
+            if !inherited.is_empty() {
+                // FOPEN, and FPIPE for the inherited ends.
+                const FOPEN: u8 = 0x01;
+                const FPIPE: u8 = 0x08;
+                let count = 3 + inherited.len();
+                fds.extend_from_slice(&(count as i32).to_ne_bytes());
+                fds.push(0);
+                fds.push(FOPEN);
+                fds.push(FOPEN);
+                for _ in inherited {
+                    fds.push(FOPEN | FPIPE);
+                }
+                for h in [INVALID_HANDLE_VALUE, handle, handle] {
+                    fds.extend_from_slice(&(h as usize).to_ne_bytes());
+                }
+                for h in inherited {
+                    fds.extend_from_slice(&(*h as usize).to_ne_bytes());
+                }
             }
 
             let mut si = STARTUPINFOEXW {
                 StartupInfo: STARTUPINFOW {
-                    cb: size_of::<STARTUPINFOEXW>() as u32,
+                    // `cb` names which structure this is. Extended only when
+                    // there is an attribute list for the kernel to read.
+                    cb: if list.is_null() {
+                        size_of::<STARTUPINFOW>() as u32
+                    } else {
+                        size_of::<STARTUPINFOEXW>() as u32
+                    },
                     dwFlags: STARTF_USESTDHANDLES,
                     hStdInput: std::ptr::null_mut(),
                     hStdOutput: handle,
                     hStdError: handle,
+                    cbReserved2: fds.len() as u16,
+                    lpReserved2: if fds.is_empty() {
+                        std::ptr::null_mut()
+                    } else {
+                        fds.as_mut_ptr()
+                    },
                     ..Default::default()
                 },
                 lpAttributeList: list,
@@ -887,7 +1095,11 @@ pub(crate) mod win {
                     // that is never a member, which then outlives the run and
                     // ignores every limit, and nothing reports a failure. The
                     // caller assigns and then calls `resume`.
-                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+                    if list.is_null() {
+                        CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED
+                    } else {
+                        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED
+                    },
                     std::ptr::null(),
                     wcwd.as_ptr(),
                     std::ptr::from_mut(&mut si).cast::<STARTUPINFOW>(),
@@ -1032,7 +1244,7 @@ mod tests {
 
         let out_path = cwd.join("io-harness-out.txt");
         let file = std::fs::File::create(&out_path).expect("create the capture file");
-        let mut child = Spawned::start(cmdline, cwd, profile.sid(), &file)
+        let mut child = Spawned::start(cmdline, cwd, &profile, &file)
             .unwrap_or_else(|e| panic!("F1: CreateProcessW into the AppContainer failed: {e}"));
         // 0.47.0 spawns suspended so the backend can put the process in its
         // job object before it runs an instruction. A caller that only starts
@@ -1122,6 +1334,17 @@ mod tests {
             !out.contains("io-harness-secret"),
             "the container printed the secret's contents: {out:?}"
         );
+        // **The refusal itself, not merely the absence of success** (0.59.0). A
+        // command that failed to start, failed to find its subject or crashed
+        // also exits non-zero, and every one of those would pass the assertion
+        // above while proving nothing about the boundary. The payload's own
+        // words are what say the access check refused it.
+        assert!(
+            out.to_ascii_lowercase().contains("access is denied")
+                || out.to_ascii_lowercase().contains("cannot find"),
+            "the read failed for some reason other than the access check, which is not \
+             evidence of a boundary: {out:?}"
+        );
     }
 
     /// F3 — a payload inside an AppContainer has no route off the machine.
@@ -1132,7 +1355,14 @@ mod tests {
     #[test]
     fn a_payload_has_no_route_off_the_machine() {
         let work = tempfile::tempdir().expect("tempdir");
-        let probe = "curl.exe -s -m 15 -o NUL https://example.com";
+        // **Not `-o NUL`, and that was hiding the assertion.** A container cannot
+        // write to `NUL`, so `curl` exits 23 — "failed writing output" — whether
+        // or not the request itself succeeded. The denial arm below asserted a
+        // non-zero exit, which that failure satisfies on its own: the test would
+        // have passed against a container with the whole network open. The body
+        // goes to a file in the granted workspace instead, and the assertion is
+        // on the status line the transfer actually produced.
+        let probe = "curl.exe -s -m 15 -o resp.txt -w %{http_code} https://example.com";
 
         // The control. A runner with no egress at all cannot demonstrate that
         // the container is what removed it.
@@ -1144,12 +1374,121 @@ mod tests {
         );
 
         let (code, out) = in_container("net", &format!("cmd.exe /c {probe}"), work.path());
+        assert!(
+            !out.contains("200"),
+            "the container completed an HTTPS request with an empty capability array: {out:?}"
+        );
         assert_ne!(
             code,
             Some(0),
             "the container reached the network with an empty capability array; there is no \
              `internetClient` on this profile, so this means the capability set is not being \
              applied. Output was {out:?}"
+        );
+
+        // **And the other direction, which had never once been applied**
+        // (0.59.0). Until this release the spawn passed a capability count of
+        // zero whatever the profile carried, so the denial above was right for a
+        // reason that had nothing to do with the capability set and this half
+        // could not have passed. A boundary that denies everything is not a
+        // boundary, it is a broken network.
+        let profile = Profile::create(&name("net-allowed"), true)
+            .unwrap_or_else(|e| panic!("could not create a network-permitting profile: {e}"));
+        grant(work.path(), profile.sid(), Access::Full, Reach::Tree)
+            .unwrap_or_else(|e| panic!("could not grant the workspace: {e}"));
+        let out_path = work.path().join("net-allowed.txt");
+        let file = std::fs::File::create(&out_path).expect("capture file");
+        let mut child =
+            Spawned::start(&format!("cmd.exe /c {probe}"), work.path(), &profile, &file)
+                .expect("spawn into a network-permitting container");
+        child.resume().expect("resume");
+        drop(file);
+        let permitted = child.wait(60_000).expect("wait");
+        let mut text = String::new();
+        std::fs::File::open(&out_path)
+            .and_then(|mut f| f.read_to_string(&mut text))
+            .ok();
+        assert_eq!(
+            (permitted, text.contains("200")),
+            (Some(0), true),
+            "a container created with `internetClient` could not reach the network, so the \
+             capability array is not reaching the child's token and the denial above proves \
+             nothing. Output was {text:?}"
+        );
+    }
+
+    /// **A profile one process owns is not deleted by another's `Drop`.**
+    ///
+    /// Found by the release PR's Windows leg rather than by anything here: under
+    /// a runner that gives each test its own process, the first row of the
+    /// capability table declined and every row after it passed — the signature of
+    /// a container that existed and then did not. The name was deterministic and
+    /// `Drop` deletes it, so whichever process finished first deleted the profile
+    /// the others were still spawning into.
+    ///
+    /// Two live profiles at once, and the second must still be usable after the
+    /// first has been dropped. Asserted by spawning into it, because a SID that
+    /// still resolves is not the same claim as a container that still runs a
+    /// process.
+    #[test]
+    fn one_process_dropping_its_profile_does_not_take_anothers_with_it() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let keep = Profile::create(&name("keeper"), false).expect("the profile that stays");
+        {
+            let _going = Profile::create(&name("goer"), false).expect("the profile that goes");
+        }
+        grant(work.path(), keep.sid(), Access::Full, Reach::Tree).expect("grant to the keeper");
+
+        let out_path = work.path().join("after.txt");
+        let file = std::fs::File::create(&out_path).expect("capture file");
+        let mut child = Spawned::start(
+            "cmd.exe /c echo io-harness-probe",
+            work.path(),
+            &keep,
+            &file,
+        )
+        .expect("the surviving container must still be spawnable");
+        child.resume().expect("resume");
+        drop(file);
+        let code = child.wait(30_000).expect("wait");
+        let mut text = String::new();
+        std::fs::File::open(&out_path)
+            .and_then(|mut f| f.read_to_string(&mut text))
+            .ok();
+        assert_eq!(
+            (code, text.contains("io-harness-probe")),
+            (Some(0), true),
+            "a second profile's lifetime reached into this one: {text:?}"
+        );
+    }
+
+    /// **F10 — the grant memo is keyed by the container it granted to.**
+    ///
+    /// Two profiles in one process, one path, and both must end up carrying an
+    /// ACE of their own. The memo used to be keyed by path, access and reach
+    /// alone, so the second container was told its grant was already done and
+    /// got nothing — success reported, DACL unchanged, which is the same silent
+    /// inert grant this module has already paid for once. It survived because
+    /// production uses one deterministic profile name and therefore one stable
+    /// SID, so only a test that builds two containers could ever see it.
+    #[test]
+    fn a_grant_to_one_container_is_not_a_grant_to_another() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let first = Profile::create(&name("memo-a"), false).expect("the first profile");
+        let second = Profile::create(&name("memo-b"), false).expect("the second profile");
+
+        grant(work.path(), first.sid(), Access::Full, Reach::Tree).expect("grant to the first");
+        grant(work.path(), second.sid(), Access::Full, Reach::Tree).expect("grant to the second");
+
+        assert!(
+            granted_mask(work.path(), first.sid()).is_some(),
+            "the first container has no ACE on the path it was granted"
+        );
+        assert!(
+            granted_mask(work.path(), second.sid()).is_some(),
+            "the second container was told its grant succeeded and has no ACE: the memo is \
+             keyed without the container SID, so one container's grant is being read as \
+             another's"
         );
     }
 
@@ -1193,7 +1532,7 @@ mod tests {
             exe.display()
         );
         let mut child =
-            Spawned::start(&line, work.path(), profile.sid(), &file).expect("spawn the payload");
+            Spawned::start(&line, work.path(), &profile, &file).expect("spawn the payload");
         child.resume().expect("resume the contained process");
         let code = child.wait(60_000).expect("wait");
 
@@ -1272,8 +1611,7 @@ mod tests {
             let out_path = root.path().join(format!("o{level}.txt"));
             let file = std::fs::File::create(&out_path).expect("capture");
             let line = "cmd.exe /c depth.bat".to_string();
-            let mut child =
-                Spawned::start(&line, dir, profile.sid(), &file).expect("spawn the payload");
+            let mut child = Spawned::start(&line, dir, &profile, &file).expect("spawn the payload");
             child.resume().expect("resume");
             let code = child.wait(30_000).expect("wait");
             drop(file);
@@ -1315,7 +1653,7 @@ mod tests {
         let mut slow = Spawned::start(
             "cmd.exe /c for /L %i in (1,1,2000000000) do @rem",
             dir.path(),
-            profile.sid(),
+            &profile,
             &file,
         )
         .expect("spawn the slow payload");
@@ -1327,7 +1665,7 @@ mod tests {
         );
 
         let mut quick =
-            Spawned::start("cmd.exe /c exit 7", dir.path(), profile.sid(), &file).expect("spawn");
+            Spawned::start("cmd.exe /c exit 7", dir.path(), &profile, &file).expect("spawn");
         quick.resume().expect("resume the contained process");
         assert_eq!(
             quick.wait(30_000).expect("wait"),

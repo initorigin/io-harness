@@ -203,13 +203,50 @@ pub(crate) const WELL_KNOWN: &[&str] = &[
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
 ];
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub(crate) const WELL_KNOWN: &[&str] = &[
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome",
     "/opt/google/chrome/chrome",
 ];
+
+/// The conventional install locations on Windows.
+///
+/// **This list is the reason the feature is usable on this platform at all.**
+/// Nothing in [`RESOLUTION_ORDER`] is on `PATH` there — a Windows browser is
+/// installed under Program Files and put on the Start menu, not on the search
+/// path — so until 0.59.0 the machine-wide list here was the unix one and a
+/// Windows host with Chrome installed answered "no browser was found". The
+/// transport working and the browser being findable are two different things, and
+/// only running the live example on the platform showed the second.
+#[cfg(windows)]
+pub(crate) const WELL_KNOWN: &[&str] = &[
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files\Chromium\Application\chrome.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+];
+
+/// The same browsers where a per-user install puts them, which is where a
+/// machine nobody administers has them.
+///
+/// Derived from the environment rather than written out, because the path
+/// contains the account name. Consulted after [`WELL_KNOWN`], so a machine-wide
+/// install still wins.
+#[cfg(windows)]
+fn user_installed() -> Vec<std::path::PathBuf> {
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+        return Vec::new();
+    };
+    let local = std::path::PathBuf::from(local);
+    vec![
+        local.join(r"Google\Chrome\Application\chrome.exe"),
+        local.join(r"Chromium\Application\chrome.exe"),
+        local.join(r"Microsoft\Edge\Application\msedge.exe"),
+    ]
+}
 
 /// An error naming the browser, which is the only kind this module returns.
 pub(crate) fn fail(reason: impl Into<String>) -> Error {
@@ -768,6 +805,12 @@ pub(crate) fn resolve(config: &BrowserConfig) -> Result<std::path::PathBuf> {
             return Ok(path.to_path_buf());
         }
     }
+    #[cfg(windows)]
+    for path in user_installed() {
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
     Err(fail(format!(
         "no browser was found. Nothing is downloaded — install one of {}, \
          or name one in the [browser] table",
@@ -810,10 +853,23 @@ pub(crate) fn launch_args(
     args
 }
 
+/// The spawned browser process, by platform.
+#[cfg(unix)]
+type Child = tokio::process::Child;
+/// The spawned browser process, by platform.
+#[cfg(windows)]
+type Child = crate::sandbox::appcontainer::win::Spawned;
+
 /// A running browser: the child, the client speaking to it, and the page.
 pub(crate) struct Browser {
     client: Client,
-    child: tokio::process::Child,
+    /// The browser process.
+    ///
+    /// Two types for one job, because the two platforms spawn differently and
+    /// for the same reason: what the child needs cannot be asked of `Command`.
+    /// On unix that is descriptors placed in `pre_exec`; on Windows it is a
+    /// C-runtime descriptor table, which only `lpReserved2` writes.
+    child: Child,
     /// The flat-mode session every page message carries.
     session: String,
     gate: Arc<NavGate>,
@@ -873,7 +929,12 @@ impl Browser {
     /// mid-action, which is the arm a test has to assert.
     pub(crate) async fn close(mut self) {
         let _ = self.browser("Browser.close", json!({})).await;
+        #[cfg(unix)]
         let _ = self.child.kill().await;
+        // Windows: `TerminateProcess` needs no await and no reaping thread, and
+        // is idempotent on a process that has already gone.
+        #[cfg(windows)]
+        self.child.kill();
     }
 }
 
@@ -882,29 +943,197 @@ impl Drop for Browser {
         // `start_kill` rather than `kill`: this is not an async context, and a
         // browser that outlives its run holds a profile directory, a proxy
         // connection and, unheadless, a window on someone's screen.
+        #[cfg(unix)]
         let _ = self.child.start_kill();
+        // On Windows the same guarantee is `Spawned`'s own `Drop`, which kills
+        // before it closes the handles. Named here rather than left implicit,
+        // because "this arm does nothing" and "this arm was forgotten" look the
+        // same in a diff.
+        #[cfg(windows)]
+        self.child.kill();
     }
 }
 
 /// Start a browser and attach to one page.
 ///
-/// On Windows this refuses: see [`launch`]'s Windows arm for why, and
-/// `docs/CONTRACT.md` for the platform row.
+/// **The transport is the child's C-runtime descriptor table.** Chromium turns
+/// the two descriptors it is handed into handles with `_get_osfhandle`, so what
+/// the child needs is descriptors 3 and 4 open in the *runtime's* table — not
+/// two inherited handles, which is a different thing and is what a handle list
+/// carries. The only structure that populates that table is `lpReserved2` on the
+/// `STARTUPINFO`, which is why this goes through the same `CreateProcessW` the
+/// container spawn owns rather than through `Command`. Asked of a real browser
+/// before it was written: the block alone works, the block with a handle list
+/// works, and the two ends as the child's standard handles produce Chrome's own
+/// `Remote debugging pipe file descriptors are not open`.
+///
+/// The pipes are **anonymous**, so unlike a named pipe there is no name for
+/// another local process to open — which is 0.53.0's argument against a
+/// debugging port, kept rather than traded away to make this platform easy.
 #[cfg(windows)]
 pub(crate) async fn launch(
-    _config: &BrowserConfig,
-    _policy: &Policy,
-    _store: &crate::state::Store,
-    _run_id: i64,
-    _watch: &crate::run::Watch<'_>,
-    _proxy: Option<&str>,
+    config: &BrowserConfig,
+    policy: &Policy,
+    store: &crate::state::Store,
+    run_id: i64,
+    watch: &crate::run::Watch<'_>,
+    proxy: Option<&str>,
 ) -> Result<Browser> {
-    Err(fail(
-        "the browser feature is not available on Windows in this release. The pipe \
-         transport needs two inherited handles at fixed numbers, which the standard \
-         library does not expose; a debugging port would work and is not used because \
-         it is a listener any local process can drive. Tracked as its own release",
-    ))
+    use crate::sandbox::appcontainer::win::{Plan, Spawned};
+    use std::os::windows::io::AsRawHandle;
+
+    let started = std::time::Instant::now();
+    let binary = resolve(config)?;
+    let binary_name = binary.display().to_string();
+
+    // The spawn gate, before any process exists. The same call the MCP and
+    // language server children go through on every platform.
+    crate::mcp::authorize_spawn(&binary_name, policy, store, run_id, watch)?;
+
+    let profile = tempfile::Builder::new()
+        .prefix("io-harness-browser-")
+        .tempdir()
+        .map_err(|e| fail(format!("could not make a browser profile directory: {e}")))?;
+
+    // Two pipes: we write commands on one and read messages on the other, so
+    // each hands one end to the child and keeps the other.
+    let (child_read, parent_write) =
+        std::io::pipe().map_err(|e| fail(format!("could not make a pipe for the browser: {e}")))?;
+    let (parent_read, child_write) =
+        std::io::pipe().map_err(|e| fail(format!("could not make a pipe for the browser: {e}")))?;
+    for end in [child_read.as_raw_handle(), child_write.as_raw_handle()] {
+        inheritable(end)?;
+    }
+
+    // The browser's own chatter goes to the bit bucket, as it does on unix.
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("NUL")
+        .map_err(|e| fail(format!("could not open NUL for the browser's output: {e}")))?;
+
+    let mut argv = vec![binary_name.clone()];
+    argv.extend(launch_args(config, profile.path(), proxy));
+    let cmdline = crate::sandbox::windows::command_line(&argv);
+    let cwd = std::env::current_dir()
+        .map_err(|e| fail(format!("could not read the current directory: {e}")))?;
+
+    let child = Spawned::start_with(Plan {
+        cmdline: &cmdline,
+        cwd: &cwd,
+        profile: None,
+        out: &sink,
+        inherited: &[
+            child_read.as_raw_handle() as _,
+            child_write.as_raw_handle() as _,
+        ],
+    })
+    .map_err(|e| fail(format!("could not start `{binary_name}`: {e}")))?;
+    // Every spawn through this path starts suspended so a contained one can join
+    // its job before it runs an instruction. Nothing is contained here, so it is
+    // released immediately.
+    child
+        .resume()
+        .map_err(|e| fail(format!("could not start `{binary_name}`: {e}")))?;
+
+    // The child's ends belong to the child now. Holding them here would mean
+    // never seeing the browser close its output, which reads as a hang rather
+    // than an exit — the worst failure shape a transport has.
+    drop(child_read);
+    drop(child_write);
+
+    let gate = Arc::new(NavGate::new(policy.clone()));
+    let client = Client::over(
+        pipe_reader(parent_read),
+        pipe_writer(parent_write),
+        Arc::clone(&gate),
+    );
+    let session = attach(&client, config).await?;
+
+    Ok(Browser {
+        client,
+        child,
+        session,
+        gate,
+        config: config.clone(),
+        _profile: profile,
+        binary: binary_name,
+        ready_ms: started.elapsed().as_millis(),
+    })
+}
+
+/// Mark one handle inheritable, which a pipe end is not by default.
+#[cfg(windows)]
+fn inheritable(handle: std::os::windows::io::RawHandle) -> Result<()> {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+    // SAFETY: the handle belongs to a pipe end the caller owns for this call.
+    if unsafe { SetHandleInformation(handle as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+        == 0
+    {
+        return Err(fail(format!(
+            "could not make a browser pipe inheritable: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+/// The parent's read end, as something async.
+///
+/// **A thread rather than the reactor, because an anonymous pipe cannot be
+/// polled.** Windows overlapped I/O needs a handle opened for it, and only a
+/// *named* pipe can be — which would give the transport a name, and a name is
+/// exactly what this design refuses to have. So one blocking read loop per
+/// direction copies into an in-memory duplex the runtime can poll. Two threads
+/// per browser, and a run has one browser.
+///
+/// Both threads end by themselves: this one when the child closes its end and
+/// the read returns zero, and the writer's when the browser is dropped and its
+/// half of the duplex closes.
+#[cfg(windows)]
+fn pipe_reader(mut from_child: std::io::PipeReader) -> tokio::io::DuplexStream {
+    use std::io::Read;
+    use tokio::io::AsyncWriteExt;
+
+    let (mine, mut theirs) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::runtime::Handle::current();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match from_child.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if handle.block_on(theirs.write_all(&buf[..n])).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    mine
+}
+
+/// The parent's write end, as something async. See [`pipe_reader`].
+#[cfg(windows)]
+fn pipe_writer(mut to_child: std::io::PipeWriter) -> tokio::io::DuplexStream {
+    use std::io::Write;
+    use tokio::io::AsyncReadExt;
+
+    let (mine, mut theirs) = tokio::io::duplex(64 * 1024);
+    let handle = tokio::runtime::Handle::current();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match handle.block_on(theirs.read(&mut buf)) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if to_child.write_all(&buf[..n]).is_err() || to_child.flush().is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    mine
 }
 
 /// Start a browser and attach to one page.
@@ -1111,6 +1340,46 @@ async fn attach(client: &Client, config: &BrowserConfig) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// **F12 — the run's proxy is in the list both platforms launch from.**
+    ///
+    /// The list is shared on purpose: unix hands it to `Command` and Windows
+    /// folds it into one command line by hand, and a copy of it in either place
+    /// would be a second thing to keep in step. Asserted here, and asserted to
+    /// *arrive* by the fixture recording its own argv — which is the half a list
+    /// comparison cannot prove, because the Windows command line is built by
+    /// quoting rules of this crate's own.
+    #[test]
+    fn a_run_with_a_proxy_launches_the_browser_through_it() {
+        let dir = std::path::Path::new("/tmp/profile");
+        let config = super::BrowserConfig::default();
+
+        let with = super::launch_args(&config, dir, Some("127.0.0.1:9051"));
+        assert!(
+            with.iter().any(|a| a == "--proxy-server=127.0.0.1:9051"),
+            "the browser was not pointed at the run's proxy: {with:?}"
+        );
+
+        let without = super::launch_args(&config, dir, None);
+        assert!(
+            !without.iter().any(|a| a.starts_with("--proxy-server")),
+            "a run with no proxy still named one: {without:?}"
+        );
+        // The transport is a pipe in both, and that is what stops a second local
+        // process from driving this browser.
+        for args in [&with, &without] {
+            assert!(
+                args.iter().any(|a| a == "--remote-debugging-pipe"),
+                "the browser was launched without the pipe transport: {args:?}"
+            );
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a.starts_with("--remote-debugging-port")),
+                "a debugging port was opened: {args:?}"
+            );
+        }
+    }
+
     use super::*;
 
     fn gate() -> Arc<NavGate> {

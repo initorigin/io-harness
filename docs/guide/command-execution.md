@@ -390,9 +390,13 @@ else the caller configured needs `with_full_access()`. And the `shell_start`
 handles are not contained at all, because a handle outlives the call that made
 it.
 
-[The contract](../CONTRACT.md) states the per-platform table: Windows gets the
-resource caps and neither a filesystem nor a network boundary, because a Job
-Object has neither.
+[The contract](../CONTRACT.md) states the per-platform table: a Windows run gets
+the resource caps and neither a filesystem nor a network boundary by default,
+because a Job Object has neither facility — and gets both when the caller asks
+for access confinement, which selects an AppContainer instead (0.59.0). Per-host
+egress is the one thing that does not follow: a process inside that container
+cannot reach the loopback proxy the rules are enforced by, so its network answer
+is the capability alone.
 
 ## Where it shows up afterwards
 
