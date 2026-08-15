@@ -391,7 +391,8 @@ pub struct TaskContract {
     /// them under containment; the `shell_start` / `shell_poll` / `shell_kill`
     /// handles, which are not contained because a handle outlives the call that
     /// made it; and what a host can actually enforce — macOS and Linux confine
-    /// writes and deny egress, while a Windows Job Object and the portable floor
+    /// writes and deny egress, a Windows AppContainer does both when the caller
+    /// asks for it (0.59.0), and a Windows Job Object and the portable floor
     /// apply the resource caps and have no filesystem facility at all, so there
     /// the mode is routed and reported and enforces nothing for the filesystem.
     ///
