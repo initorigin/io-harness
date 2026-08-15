@@ -8208,8 +8208,12 @@ impl Store {
     /// a resumable run lives in [`Store::sweep_sessions`], where a date is being
     /// applied to sessions nobody looked at.
     ///
-    /// Notes are not touched — see [`RUN_TABLES`]. Restore points are, and the
-    /// count of them is in the returned [`Pruned`].
+    /// **Notes are not touched.** A `memory` entry carries the run that wrote
+    /// it and outlives it — 0.56.0 made that explicit by adding a scope above
+    /// the workspace — so removing a session never unlearns anything. Its
+    /// *recall* rows do go, because they name a run that no longer exists.
+    /// Restore points go too, and the count of them is in the returned
+    /// [`Pruned`].
     ///
     /// Deleting a session that is not in the store succeeds and reports nothing.
     /// Nothing here shrinks the file: SQLite frees pages into the database
