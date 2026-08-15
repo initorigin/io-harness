@@ -555,7 +555,31 @@ pub(crate) mod job {
     /// Deliberately a process-global last-one-wins rather than a channel: it
     /// exists so a failure has something to print, and a decline is rare enough
     /// that the most recent one is the interesting one.
-    /// The container profile's name, **per process**.
+    /// The profile every contained run on this machine shares.
+    ///
+    /// Deterministic on purpose: the SID derives from the name, so one name means
+    /// one SID means every process writes the identical ACE onto the paths they
+    /// share. Two processes with two SIDs racing a read-modify-write over one
+    /// DACL lose each other's entry, and the symptom is a container that cannot
+    /// read the toolchain home. It is not deleted on drop — see `Profile`.
+    ///
+    /// **The name encodes the capability set**, so there are two of them rather
+    /// than one. A profile registers its capabilities when it is *created*, and a
+    /// shared profile is created once and re-entered forever after; if one name
+    /// served both answers, whichever run created it would decide what every
+    /// later run's profile was registered with. The token's array is what an
+    /// access check reads, but registration and token disagreeing is a state
+    /// nothing here has measured, and this release does not ship a boundary whose
+    /// correctness rests on an untested equivalence.
+    pub(crate) fn shared_profile(allow_network: bool) -> &'static str {
+        if allow_network {
+            "io-harness-sandbox-net"
+        } else {
+            "io-harness-sandbox"
+        }
+    }
+
+    /// A throwaway profile name, **per process**, for the availability probe.
     ///
     /// **A deterministic name is a shared object, and this type deletes it on
     /// `Drop`.** Two processes containing a command at the same time — two agents,
@@ -614,7 +638,8 @@ pub(crate) mod job {
         // A deterministic name, so a profile stranded by a crashed run is
         // re-entered rather than becoming a permanent failure — the module's own
         // `ERROR_ALREADY_EXISTS` path. Bounded well under the 64-character limit.
-        let profile = match Profile::create(&profile_name("sandbox"), spec.allow_network) {
+        let profile = match Profile::shared(shared_profile(spec.allow_network), spec.allow_network)
+        {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
