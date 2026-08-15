@@ -10157,6 +10157,10 @@ async fn dispatch(
             // recorded and handed back to the model: an agent that believes it
             // corrected something and did not will act on the correction it
             // thinks it made.
+            // 0.57.0 — asked BEFORE the write, and it has to be: afterwards the
+            // new entry is itself in the scope, and an entry restating itself is
+            // the one answer that is never useful.
+            let restates = store.memory_similar(scope, key, value)?;
             let wrote = store.memory_write_with(
                 scope,
                 key,
@@ -10208,11 +10212,33 @@ async fn dispatch(
                 )?;
             }
             info!(run_id, step, key, evicted = evicted.len(), "remembered");
+            // 0.57.0 — the write landed, and the model is told what it now holds
+            // twice. Reported rather than refused: a harness that declined a
+            // write because two strings overlapped would be guessing at intent,
+            // and one that merged them would be writing a fact nobody stated.
+            // Resolving it is the model's, in this turn, with `remember` or
+            // `forget` — which is the whole reason to say it here rather than
+            // leave it for a later run to trip over.
+            //
+            // The held value is quoted, because "you already know this" without
+            // saying what is known is a line a model can only act on by reading
+            // the store it cannot read. Bounded, because a note may be two
+            // thousand characters and this text is charged to the turn.
+            let restated = match &restates {
+                None => String::new(),
+                Some(entry) => format!(
+                    "\n[remember: this restates `{}`, which holds: \"{}\"] Two notes saying \
+                     the same thing are both carried and the model acts on whichever it read \
+                     last. Replace one, or forget the other.\n",
+                    entry.key,
+                    crate::state::truncate_memory_value(&entry.value, 200),
+                ),
+            };
             // No target: two notes under one key are the store's business, and a
             // remember is not an observation OF anything that could go stale.
             Dispatched::seen(
                 format!("remembered {key}"),
-                format!("\n[remember {key}]\n"),
+                format!("\n[remember {key}]\n{restated}"),
                 ObsKind::Tool,
                 None,
             )

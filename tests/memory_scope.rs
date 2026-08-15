@@ -344,3 +344,213 @@ async fn a_run_withdraws_a_global_note_and_an_unknown_scope_is_refused() {
         .unwrap()
         .is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// 0.57.0 — a note that restates one already held is reported at the write
+// ---------------------------------------------------------------------------
+
+/// Plays a script and keeps every prompt, so an assertion can be made about what
+/// the `remember` arm told the model rather than about what the store holds.
+///
+/// The report lands in the run's observation log, so it is the turn *after* the
+/// write whose prompt carries it — which is also exactly how the model sees it.
+struct Play(Vec<Vec<ToolCall>>, std::sync::Mutex<Vec<String>>);
+
+impl Provider for Play {
+    async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        let mut seen = self.1.lock().unwrap();
+        let i = seen.len();
+        seen.push(req.user.clone());
+        Ok(CompletionResponse {
+            tool_calls: self.0.get(i).cloned().unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+    fn name(&self) -> &str {
+        "play"
+    }
+}
+
+fn remember(key: &str, value: &str) -> ToolCall {
+    ToolCall {
+        name: "remember".into(),
+        arguments: json!({ "key": key, "value": value }),
+    }
+}
+
+fn remember_scoped(key: &str, value: &str, scope: &str) -> ToolCall {
+    ToolCall {
+        name: "remember".into(),
+        arguments: json!({ "key": key, "value": value, "scope": scope }),
+    }
+}
+
+/// Every prompt of a run that plays `calls`, one per turn.
+async fn played(root: &Path, store: &Store, calls: Vec<ToolCall>) -> Vec<String> {
+    let steps = calls.len() as u32 + 1;
+    let play = Play(
+        calls.into_iter().map(|c| vec![c]).collect(),
+        std::sync::Mutex::new(Vec::new()),
+    );
+    run_with(
+        &contract(root).with_max_steps(steps),
+        &play,
+        store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .expect("the run itself must not error");
+    let out = play.1.lock().unwrap().clone();
+    out
+}
+
+const TEST_CMD: &str = "the test command is cargo test --all-features";
+const TEST_CMD_AGAIN: &str = "the test command here is cargo test --all-features";
+
+/// F9 — a near-duplicate write names the key already held and quotes what it
+/// holds, in the tool result of the same call.
+#[tokio::test]
+async fn a_note_that_restates_one_already_held_names_the_key_that_holds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+
+    let seen = played(
+        dir.path(),
+        &store,
+        vec![
+            remember("build-command", TEST_CMD),
+            remember("how-to-test", TEST_CMD_AGAIN),
+        ],
+    )
+    .await;
+    let after = seen.last().expect("a turn followed the second write");
+    assert!(
+        after.contains("restates `build-command`"),
+        "the report must name the key already held:\n{after}"
+    );
+    assert!(
+        after.contains("cargo test --all-features"),
+        "and quote what that key holds:\n{after}"
+    );
+}
+
+/// F10 — an unrelated note is not flagged, and rewriting a key is not flagged.
+///
+/// Both halves asserted on the *absence* of the report, because an
+/// implementation that flags everything passes any test that only checks the
+/// positive case.
+#[tokio::test]
+async fn an_unrelated_note_and_a_rewrite_of_one_key_are_not_flagged() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+
+    let seen = played(
+        dir.path(),
+        &store,
+        vec![
+            remember("build-command", TEST_CMD),
+            remember("review-day", "the maintainer reviews pull requests on Tuesdays"),
+            // The same key, with a value nearly identical to its own: a
+            // replacement, which is what writing by key has meant since 0.10.0.
+            remember("build-command", TEST_CMD_AGAIN),
+        ],
+    )
+    .await;
+    for prompt in &seen {
+        assert!(
+            !prompt.contains("restates"),
+            "nothing here restates anything under another key:\n{prompt}"
+        );
+    }
+    assert_eq!(
+        store.memory_list(&ws_key(dir.path())).unwrap().len(),
+        2,
+        "two keys, the second write of one of them having replaced its value"
+    );
+}
+
+/// F11 — the write lands, and a long held value is quoted with its cut marked.
+#[tokio::test]
+async fn a_flagged_write_still_lands_and_the_quote_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let key = ws_key(dir.path());
+
+    // A held value far longer than the quote may be, padded by repeating the
+    // sentence rather than by adding one — new words are new vocabulary, and a
+    // note that says more is legitimately less of a restatement. Padding with
+    // "and it is run from the repository root" put the pair at exactly 50%,
+    // which is the measure working rather than failing.
+    let long = format!("{TEST_CMD}. ").repeat(20);
+    store.memory_put(&key, "build-command", &long, 1, 1).unwrap();
+
+    let seen = played(
+        dir.path(),
+        &store,
+        vec![remember("how-to-test", TEST_CMD_AGAIN)],
+    )
+    .await;
+    let after = seen.last().expect("a turn followed the write");
+    assert!(
+        after.contains("restates `build-command`"),
+        "the long entry is still the one restated:\n{after}"
+    );
+    assert!(
+        after.contains("…[truncated]"),
+        "a quote of a 900-character note is bounded and says so:\n{after}"
+    );
+
+    let held = store.memory_list(&key).unwrap();
+    assert_eq!(held.len(), 2, "the harness reports and does not refuse: {held:?}");
+    assert!(
+        held.iter().any(|e| e.key == "how-to-test"),
+        "the new note is in the store, which is what makes this a report"
+    );
+}
+
+/// F12 — the check is per scope.
+///
+/// A workspace note restating a **global** one is the override 0.56.0 designed;
+/// a workspace note restating another workspace note is the contradiction this
+/// release exists for. Both directions, and the global side too.
+#[tokio::test]
+async fn the_duplicate_check_is_within_the_scope_being_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+
+    store
+        .memory_put(GLOBAL_MEMORY_WORKSPACE, "build-command", TEST_CMD, 1, 1)
+        .unwrap();
+
+    // Writing the same fact into the workspace is how a run corrects a wrong
+    // global note. It must not be reported as a contradiction.
+    let seen = played(dir.path(), &store, vec![remember("how-to-test", TEST_CMD_AGAIN)]).await;
+    for prompt in &seen {
+        assert!(
+            !prompt.contains("restates"),
+            "a workspace note restating a global one is the override, not a clash:\n{prompt}"
+        );
+    }
+
+    // The same write against a note in its own scope IS reported.
+    let seen = played(dir.path(), &store, vec![remember("build-here", TEST_CMD)]).await;
+    let after = seen.last().unwrap();
+    assert!(
+        after.contains("restates `how-to-test`"),
+        "two workspace notes saying one thing is the case this release is for:\n{after}"
+    );
+
+    // And the global scope checks against itself, not against a workspace.
+    let seen = played(
+        dir.path(),
+        &store,
+        vec![remember_scoped("test-command", TEST_CMD_AGAIN, "global")],
+    )
+    .await;
+    let after = seen.last().unwrap();
+    assert!(
+        after.contains("restates `build-command`"),
+        "a global write is compared against the global scope:\n{after}"
+    );
+}

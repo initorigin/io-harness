@@ -2122,7 +2122,7 @@ const MEMORY_TRUNCATED: &str = "…[truncated]";
 
 /// Cut `value` to [`MEMORY_MAX_ENTRY_CHARS`] on a char boundary, marking the
 /// cut. Returned unchanged when it already fits.
-fn truncate_memory_value(value: &str, cap: usize) -> String {
+pub(crate) fn truncate_memory_value(value: &str, cap: usize) -> String {
     if value.chars().count() <= cap {
         return value.to_string();
     }
@@ -6838,6 +6838,88 @@ impl Store {
             refused: false,
             evicted: self.enforce_memory_caps(workspace, key, limits)?,
         })
+    }
+
+    /// The entry in `workspace` that `value` most restates, under a different
+    /// key, or `None` (0.57.0).
+    ///
+    /// `remember` writes by key, so the same fact learned twice under two names
+    /// leaves two entries that disagree, both carried into the next turn, and
+    /// the model acting on whichever it read last. This is what lets the write
+    /// path say so at the moment the second one is written, while the writer's
+    /// own intent is still available to resolve it.
+    ///
+    /// **Under a different key.** Rewriting a key is an intentional replacement
+    /// and has been since 0.10.0; `key` is excluded rather than reported.
+    ///
+    /// **Within one scope.** A workspace note that restates a global one is not
+    /// a contradiction — it is the override the second scope exists for, and
+    /// 0.56.0 made it the designed way to correct a wrong global note. Pass the
+    /// scope being written and nothing else.
+    ///
+    /// The comparison is a normalised token overlap computed here, in this
+    /// process: no embedding, no model, nothing over a network. Where several
+    /// entries qualify the one sharing the most words wins, and an exact tie
+    /// goes to whichever [`Self::memory_list`] returns first, so two identical
+    /// stores answer identically.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("port the parser", "/repo")?;
+    /// store.memory_put(
+    ///     "/repo", "build-command", "the test command is cargo test --all-features", run, 1,
+    /// )?;
+    ///
+    /// // The same fact, in different words, under a second key.
+    /// let clash = store.memory_similar(
+    ///     "/repo", "how-to-test", "the test command here is cargo test --all-features",
+    /// )?;
+    /// assert_eq!(clash.expect("a restatement").key, "build-command");
+    ///
+    /// // A note about something else is not a restatement...
+    /// assert!(store
+    ///     .memory_similar("/repo", "editor", "the maintainer reviews on Tuesdays")?
+    ///     .is_none());
+    /// // ...and neither is rewriting the key that already holds it.
+    /// assert!(store
+    ///     .memory_similar(
+    ///         "/repo", "build-command", "the test command is cargo test --all-features",
+    ///     )?
+    ///     .is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn memory_similar(
+        &self,
+        workspace: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<Option<MemoryEntry>> {
+        let tokens = memory_tokens(value);
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        let mut best: Option<(usize, MemoryEntry)> = None;
+        for entry in self.memory_list(workspace)? {
+            if entry.key == key {
+                continue;
+            }
+            let other = memory_tokens(&entry.value);
+            if !memory_is_similar(&tokens, &other) {
+                continue;
+            }
+            let (shared, _) = memory_overlap(&tokens, &other);
+            // Strictly greater, so an exact tie keeps the earlier entry — which
+            // is the one `memory_list` returned first, and therefore an answer
+            // that does not depend on iteration order.
+            if best.as_ref().is_none_or(|(most, _)| shared > *most) {
+                best = Some((shared, entry));
+            }
+        }
+        Ok(best.map(|(_, entry)| entry))
     }
 
     /// Pin or unpin one entry, so a run cannot overwrite it (0.30.0). True when
