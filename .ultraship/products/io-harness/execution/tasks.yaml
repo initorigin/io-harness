@@ -107,7 +107,7 @@ tasks:
      rule that stops this release destroying a crash-resumable tree because it was old. The
      one-pass requirement forbids the natural implementation, so it has to be built in rather than
      optimised later.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.58.0-T02
     acceptance_criteria:
@@ -130,7 +130,20 @@ tasks:
         `delete_session` — and it is the reason `Pruned` accumulates rather than being returned per
         session. Sabotage: loop per session, under which the statement count scales with the sessions
         and only F8 fails.
-    evidence: []
+    evidence:
+    - "`a_sweep_refuses_a_session_holding_a_resumable_run_and_names_it` (F6) and
+      `the_sweeps_cutoff_is_strictly_before_and_the_boundary_is_the_assertion` (F7) in
+      `tests/retention.rs`; `a_sweep_of_many_sessions_issues_the_same_statements_as_a_sweep_of_one`
+      (F8) in `src/state.rs`."
+    - "F8 IS MET IN A DIFFERENT FORM AND THIS IS RECORDED RATHER THAN ABSORBED. The criterion names
+      `rusqlite`'s trace hook; that needs the `trace` feature and a connection the test owns, and
+      `Store::from_conn` is private. The count is instead returned by a `pub(crate) prune_counted`,
+      asserted equal for a sweep of ten sessions and of one, AND asserted equal to
+      `RUN_TABLES.len() + 3` — which is a stronger claim than the criterion made, since it pins the
+      count to the schema rather than only to its own invariance."
+    - "F7 asserts one millisecond either side of the cutoff, not a day, and a session created at
+      exactly the cutoff survives."
+    - "F6 asserts a `failed` run is swept: finished is finished, and only `running`/`paused` refuse."
     files:
       - src/state.rs
       - tests/retention.rs
@@ -142,7 +155,7 @@ tasks:
      This is the half that cannot be assembled from outside the crate, because it needs to know
      which of a hundred and forty columns hold words. It is also the half with a way to destroy
      something outside the database, which F11 is the guard against.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.58.0-T02
     acceptance_criteria:
@@ -167,7 +180,23 @@ tasks:
         file is the one way this release could destroy something outside the database. Sabotage: leave
         `snapshots.state` unchanged on archive, under which the empty content is written and only F11
         fails.
-    evidence: []
+    evidence:
+    - "`an_archived_session_keeps_its_numbers_and_holds_none_of_its_words` (F9),
+      `archiving_twice_clears_nothing_the_second_time` (F10) and
+      `an_archived_restore_point_reports_itself_rather_than_writing_an_empty_file` (F11) in
+      `tests/retention.rs`; `a_column_the_archive_has_never_heard_of_is_treated_as_words` in
+      `src/state.rs`."
+    - "THE NEEDLE SWEEP FOUND THREE DEFECTS THAT REVIEW DID NOT, and all three would have shipped an
+      archive that reported a removal it had not performed. (1) `runs.goal` was classified as a fact
+      — but for a run driving a session turn the goal IS the user's prompt, so the question survived
+      in the trace after the conversation lost it. (2) `decision` was in the universal fact list
+      because it is a verdict in `policy_events`; in `steps` it is the model's own words, which is
+      why the judgement had to become per-table. (3) `sum_of` had to be split out of `sum_text`:
+      summing every text column counted the kinds and paths the archive deliberately keeps, so a
+      SECOND archive reported clearing 148 bytes it never cleared — F10 caught that one."
+    - "F11 goes through the real `rewind_run`, not a stub: an archived snapshot returns
+      `Rewind::NotKept` naming the archive, and the file on disk is asserted byte-identical
+      afterwards. No new variant was needed — `Kept::Unkept` already carries the reason."
     files:
       - src/state.rs
       - src/lib.rs
@@ -181,7 +210,7 @@ tasks:
      SQLite frees pages into the file rather than out of it, so a prune that leaves the file the
      size it was has not done what the operator asked. Without this the release's own instrument
      looks broken to the person using it.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.58.0-T02
     acceptance_criteria:
@@ -193,7 +222,12 @@ tasks:
         assertion that justifies compaction being in the release rather than a note in the guide.
         Sabotage: return the freelist figure instead of the measured difference, under which the returned
         value disagrees with the two reads and only F12 fails.
-    evidence: []
+    evidence:
+    - "`a_prune_frees_pages_into_the_file_and_a_compaction_returns_them` (F12) in
+      `tests/retention.rs` — the three store-size reads, plus a fourth assertion against
+      `std::fs::metadata`, so the filesystem agrees and not only SQLite's opinion of the file."
+    - "`compact` returns the measured difference between the file's size before and after, not the
+      freelist figure, which is what F12's equality pins."
     files:
       - src/state.rs
       - tests/retention.rs

@@ -3065,6 +3065,89 @@ pub struct SessionSize {
 /// # Ok(())
 /// # }
 /// ```
+/// Columns whose declared type is text but whose content is a fact rather than
+/// a word — a kind, a verdict, a status, a path, an identifier, a timestamp.
+///
+/// [`Store::archive_session`] empties everything else. This list is the
+/// release's actual decision about where the line between "what did this cost
+/// and what did it touch" and "what exactly was said" falls, so it is written
+/// out and reviewable rather than inferred from a column name.
+///
+/// The default is to **clear**: a column added by a later release and not named
+/// here is treated as words, which is the safe direction — an archive that
+/// clears one number too many loses a figure the trace can live without, while
+/// one that keeps one sentence too many is a promise it did not keep.
+fn is_fact_column(table: &str, column: &str) -> bool {
+    // Universal across the schema: what kind of thing this row is, what was
+    // decided about it, where it happened, and when.
+    if matches!(
+        column,
+        "kind"
+            | "act"
+            | "state"
+            | "status"
+            | "outcome"
+            | "verdict"
+            | "source"
+            | "layer"
+            | "rule"
+            | "provider"
+            | "model"
+            | "finish_reason"
+            | "tool"
+            | "path"
+            | "at"
+            | "created_at"
+            | "started_at"
+            | "finished_at"
+            | "workspace"
+            | "turn_kind"
+    ) {
+        return true;
+    }
+    match (table, column) {
+        // Which workspace the run ran over. **Not the goal**: for a run driving
+        // a session turn the goal IS the user's prompt, so keeping it would
+        // leave the question in the trace after the archive removed it from the
+        // conversation. Found by the needle sweep, not by reading the schema.
+        ("runs", "file") => true,
+        // `decision` is a verdict here and the model's own words in `steps`,
+        // which is why this is a per-table judgement and not a column-name one.
+        ("policy_events", "decision") => true,
+        // The session's root directory.
+        ("sessions", "root") => true,
+        // Which file a restore point or an edit is about, kept while its
+        // contents go.
+        ("snapshots", "path") | ("edits", "path") => true,
+        // What a policy event was about — the target is a path or a command,
+        // which is what "what did it touch" means for a refusal.
+        ("policy_events", "target") | ("ledger_observations", "target") => true,
+        // A memory key names an entry that still exists; the note itself is not
+        // this session's to clear.
+        ("memory_recalls", "key") | ("memory_snapshots", "key") => true,
+        _ => false,
+    }
+}
+
+/// What an archive cleared.
+///
+/// `rows` and `bytes` are what was **removed**, not what remains — an archive
+/// keeps every row, so a count of what is left would be the same before and
+/// after and would say nothing. A second archive of the same session reports
+/// zero for both, which is how idempotence is visible rather than assumed.
+///
+/// See [`Store::archive_session`] for what survives and why.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Archived {
+    /// Turns in the archived session. Unchanged by the archive — the
+    /// conversation still has the shape it had, without the words.
+    pub turns: u64,
+    /// Rows whose text was cleared.
+    pub rows: u64,
+    /// Bytes of text cleared.
+    pub bytes: u64,
+}
+
 /// What a removal took, and what it refused to take.
 ///
 /// Returned by [`Store::delete_session`] and [`Store::sweep_sessions`]. Both
@@ -4914,6 +4997,16 @@ impl Store {
                     // "refuse to rewind a file" and "delete a file the run only
                     // rewrote". Only the first is recoverable.
                     "unkept" => Kept::Unkept(before.unwrap_or_default()),
+                    // 0.58.0. The session was archived: the row is still here
+                    // and its content is not. Named rather than left to the
+                    // catch-all below, because "this version does not
+                    // understand it" is the wrong thing to tell somebody about
+                    // a state their own operator asked for — and because the
+                    // one way this release could destroy something outside the
+                    // database is writing an empty string over a real file.
+                    "archived" => Kept::Unkept(
+                        "the session was archived, so the previous contents are gone".to_string(),
+                    ),
                     other => Kept::Unkept(format!("recorded as \"{other}\", which this version of the store does not understand")),
                 },
             })
@@ -7984,6 +8077,23 @@ impl Store {
     /// the archive's second run able to report honestly that it cleared nothing.
     fn sum_text(&self, table: &str, key: &str, ids: &str, only_nonempty: bool) -> Result<i64> {
         let cols = Self::text_columns(&self.conn, table)?;
+        self.sum_of(table, key, ids, &cols, only_nonempty)
+    }
+
+    /// [`Store::sum_text`] over a named subset of the columns.
+    ///
+    /// The archive needs exactly this: summing over *every* text column would
+    /// count the kinds, paths and verdicts it deliberately keeps, so a second
+    /// archive of the same session would report clearing bytes that were never
+    /// cleared. Found by F10 rather than by review.
+    fn sum_of(
+        &self,
+        table: &str,
+        key: &str,
+        ids: &str,
+        cols: &[String],
+        only_nonempty: bool,
+    ) -> Result<i64> {
         if cols.is_empty() {
             return Ok(0);
         }
@@ -8085,6 +8195,250 @@ impl Store {
         self.prune(&[session_id], Vec::new())
     }
 
+    /// Remove every session created strictly before `before`.
+    ///
+    /// `before` is a timestamp string compared against `sessions.created_at`,
+    /// which is a `strftime('%Y-%m-%dT%H:%M:%fZ')` text column — a string
+    /// comparison is what the storage actually does, so that is what this takes
+    /// rather than a duration measured against a clock the store does not have.
+    /// The comparison is strictly before: a session created at exactly `before`
+    /// survives.
+    ///
+    /// **A session holding a run that can still be resumed is refused, not
+    /// deleted**, and its id comes back in [`Pruned::refused`]. A date is a
+    /// policy applied to sessions nobody looked at, and a crash-resumable tree
+    /// that vanished because it was old is the worst outcome this call could
+    /// have. Removing one of those is a decision made per session, through
+    /// [`Store::delete_session`]. A run that `Completed` or `Failed` is finished,
+    /// not resumable, and is swept.
+    ///
+    /// **One pass over the schema however many sessions are swept.** The run set
+    /// is collected for all of them first and each table is deleted from once.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let session = store.create_session("/repo")?;
+    /// let run = store.start_run("a goal", "/repo")?;
+    /// let turn = store.record_turn(session, None, run, "a question")?;
+    /// store.finish_turn(turn, Some("an answer"), "ok")?;
+    ///
+    /// // Still `Running`, which is what an interrupted run looks like in a
+    /// // store, so a date will not take it.
+    /// let swept = store.sweep_sessions("2999-01-01T00:00:00.000Z")?;
+    /// assert_eq!(swept.sessions, 0);
+    /// assert_eq!(swept.refused, vec![session]);
+    ///
+    /// // Finished, and the same sweep takes it.
+    /// store.set_status(run, "completed")?;
+    /// assert_eq!(store.sweep_sessions("2999-01-01T00:00:00.000Z")?.sessions, 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn sweep_sessions(&self, before: &str) -> Result<Pruned> {
+        let mut candidates = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM sessions WHERE created_at < ?1 ORDER BY id")?;
+            let rows = stmt.query_map([before], |r| r.get::<_, i64>(0))?;
+            for row in rows {
+                candidates.push(row?);
+            }
+        }
+
+        // The refusal is evaluated for every candidate before anything is
+        // deleted, which is also what keeps the removal itself to one pass.
+        let mut doomed = Vec::new();
+        let mut refused = Vec::new();
+        for session in candidates {
+            if self.holds_resumable_run(session)? {
+                refused.push(session);
+            } else {
+                doomed.push(session);
+            }
+        }
+        self.prune(&doomed, refused)
+    }
+
+    /// Whether any run in this session's tree could still be resumed.
+    ///
+    /// `Running` is what an interrupted run looks like in a store — the process
+    /// died mid-loop and the row was never closed — and `Paused` is waiting on a
+    /// human decision. Both are resume targets. Anything else is finished.
+    fn holds_resumable_run(&self, session_id: i64) -> Result<bool> {
+        let runs = Self::session_run_ids(&self.conn, &[session_id])?;
+        if runs.is_empty() {
+            return Ok(false);
+        }
+        let list = id_list(&runs);
+        let resumable: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM runs
+                 WHERE id IN ({list}) AND status IN ('running', 'paused')"
+            ),
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(resumable > 0)
+    }
+
+    /// Return the space a removal freed to the filesystem, and say how much.
+    ///
+    /// SQLite frees pages *into* the database file rather than out of it, so a
+    /// deletion moves bytes from [`StoreSize::file_bytes`] into
+    /// [`StoreSize::free_bytes`] and the file on disk stays the size it was. A
+    /// `VACUUM` rewrites the database without those pages, which is the only
+    /// reclamation available here: every store this crate has created was
+    /// created without `auto_vacuum`, so `PRAGMA incremental_vacuum` does
+    /// nothing on any existing file.
+    ///
+    /// **This rewrites the whole database.** It needs free disk space of roughly
+    /// the file's own size while it runs, it cannot run inside a transaction,
+    /// and on a large store it is not quick. That is why it is a call an
+    /// operator makes knowingly rather than something a deletion does on their
+    /// behalf.
+    ///
+    /// Returns the bytes the file shrank by — measured, as the difference
+    /// between the file's size before and after, not inferred from the freelist.
+    pub fn compact(&self) -> Result<u64> {
+        let before = self.store_size()?.file_bytes;
+        self.conn.execute_batch("VACUUM")?;
+        let after = self.store_size()?.file_bytes;
+        Ok(before.saturating_sub(after))
+    }
+
+    /// Keep everything a session cost and touched, and remove everything it
+    /// said.
+    ///
+    /// Every row stays. The counts, the timings, the tokens, the cost, the file
+    /// paths, the line counts, the verdicts and the statuses are all still
+    /// answerable afterwards. Every column holding text or a blob is emptied:
+    /// the prompts and replies, the step traces, the tool results in the ledger,
+    /// the summaries, the restore points' contents and the edits' hunks.
+    ///
+    /// **It is not enough to empty the conversation table, and that is the whole
+    /// reason this call exists rather than being left to the caller.**
+    /// `provider_calls` is the only pure-accounting table in this schema. The
+    /// user's own words are in `steps.prompt`, every tool result is in
+    /// `ledger_observations.text`, and whole file contents are in
+    /// `snapshots.before`. Emptying `session_turns` alone would report a removal
+    /// it had not performed — which, for an operator doing this to satisfy a
+    /// privacy obligation, is worse than doing nothing.
+    ///
+    /// An audit obligation and a privacy obligation usually pull in opposite
+    /// directions on the same rows. This is the call that satisfies both.
+    ///
+    /// **A restore point survives as a row and can no longer restore.** Its
+    /// state records that it was archived, and a rewind reaching it reports
+    /// [`Rewind::NotKept`](crate::Rewind::NotKept) naming the archive instead of
+    /// writing an empty file over a real one.
+    ///
+    /// Idempotent: archiving an already-archived session clears nothing and says
+    /// so. A session that is not in the store clears nothing either.
+    ///
+    /// Nothing here shrinks the file — see [`Store::compact`]. And nothing here
+    /// can say anything about the caller's own logs, their provider account, or
+    /// their filesystem: this removes what is in the database.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let session = store.create_session("/repo")?;
+    /// let run = store.start_run("a goal", "/repo")?;
+    /// let turn = store.record_turn(session, None, run, "something private")?;
+    /// store.finish_turn(turn, Some("an answer"), "ok")?;
+    ///
+    /// let archived = store.archive_session(session)?;
+    /// assert_eq!(archived.turns, 1);
+    /// assert!(archived.bytes > 0);
+    ///
+    /// // The session is still there and still costs what it cost.
+    /// assert!(store.session_size(session)?.is_some());
+    /// // The second run has nothing left to clear, and reports that.
+    /// assert_eq!(store.archive_session(session)?.bytes, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn archive_session(&self, session_id: i64) -> Result<Archived> {
+        let sessions = self.existing_sessions(&[session_id])?;
+        if sessions.is_empty() {
+            return Ok(Archived::default());
+        }
+        let runs = Self::session_run_ids(&self.conn, &sessions)?;
+        let session_list = id_list(&sessions);
+        let run_list = id_list(&runs);
+
+        let turns = self.count_rows("session_turns", "session_id", &session_list)?;
+
+        // The columns to empty come from the schema, so a column a later release
+        // adds is cleared without anyone remembering to add it here. The
+        // exceptions are named rather than filtered by type, because each one is
+        // a fact rather than a word and the list is the release's actual
+        // decision.
+        let mut rows = 0;
+        let mut bytes = 0;
+        let tx = self.conn.unchecked_transaction()?;
+        for (table, key, ids) in std::iter::once(("session_turns", "session_id", &session_list))
+            .chain(std::iter::once(("runs", "id", &run_list)))
+            .chain(RUN_TABLES.iter().map(|(t, k)| (*t, *k, &run_list)))
+        {
+            if runs.is_empty() && key != "session_id" {
+                continue;
+            }
+            let cols: Vec<String> = Self::text_columns(&self.conn, table)?
+                .into_iter()
+                .filter(|c| !is_fact_column(table, c))
+                .collect();
+            if cols.is_empty() {
+                continue;
+            }
+            let cleared = self.sum_of(table, key, ids, &cols, true)?;
+            if cleared == 0 {
+                continue;
+            }
+            let touched = {
+                let any = cols
+                    .iter()
+                    .map(|c| format!("COALESCE(LENGTH({c}), 0) > 0"))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                self.conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {key} IN ({ids}) AND ({any})"),
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?
+            };
+            let set = cols
+                .iter()
+                .map(|c| format!("{c} = ''"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tx.execute_batch(&format!("UPDATE {table} SET {set} WHERE {key} IN ({ids})"))?;
+            rows += touched;
+            bytes += cleared;
+        }
+
+        // A restore point whose content is gone must say so, or a rewind writes
+        // an empty string over a real file.
+        if !runs.is_empty() {
+            tx.execute_batch(&format!(
+                "UPDATE snapshots SET state = 'archived' WHERE run_id IN ({run_list})"
+            ))?;
+        }
+        tx.commit()?;
+
+        Ok(Archived {
+            turns: turns.max(0) as u64,
+            rows: rows.max(0) as u64,
+            bytes: bytes.max(0) as u64,
+        })
+    }
+
     /// Sessions that exist, out of the ids given.
     fn existing_sessions(&self, sessions: &[i64]) -> Result<Vec<i64>> {
         if sessions.is_empty() {
@@ -8115,12 +8469,30 @@ impl Store {
     /// on a schema of this size that is the difference between a maintenance
     /// call and an outage.
     fn prune(&self, sessions: &[i64], refused: Vec<i64>) -> Result<Pruned> {
+        Ok(self.prune_counted(sessions, refused)?.0)
+    }
+
+    /// [`Store::prune`], also returning how many `DELETE` statements it issued.
+    ///
+    /// The count is what makes "one pass over the schema" checkable rather than
+    /// asserted in prose: it is a function of the schema and must not move when
+    /// the number of sessions does. Crate-internal because it is a fact about
+    /// the implementation rather than about the store, and a caller with a use
+    /// for it would be measuring the wrong thing.
+    pub(crate) fn prune_counted(
+        &self,
+        sessions: &[i64],
+        refused: Vec<i64>,
+    ) -> Result<(Pruned, usize)> {
         let sessions = self.existing_sessions(sessions)?;
         if sessions.is_empty() {
-            return Ok(Pruned {
-                refused,
-                ..Pruned::default()
-            });
+            return Ok((
+                Pruned {
+                    refused,
+                    ..Pruned::default()
+                },
+                0,
+            ));
         }
         let runs = Self::session_run_ids(&self.conn, &sessions)?;
         let session_list = id_list(&sessions);
@@ -8142,12 +8514,15 @@ impl Store {
             }
         }
 
+        let mut statements = 0;
         let tx = self.conn.unchecked_transaction()?;
         if !runs.is_empty() {
             for (table, key) in RUN_TABLES {
                 tx.execute_batch(&format!("DELETE FROM {table} WHERE {key} IN ({run_list})"))?;
+                statements += 1;
             }
             tx.execute_batch(&format!("DELETE FROM runs WHERE id IN ({run_list})"))?;
+            statements += 1;
         }
         tx.execute_batch(&format!(
             "DELETE FROM session_turns WHERE session_id IN ({session_list})"
@@ -8155,17 +8530,21 @@ impl Store {
         tx.execute_batch(&format!(
             "DELETE FROM sessions WHERE id IN ({session_list})"
         ))?;
+        statements += 2;
         tx.commit()?;
 
-        Ok(Pruned {
-            sessions: sessions.len() as u64,
-            turns: turns.max(0) as u64,
-            runs: runs.len() as u64,
-            rows: rows.max(0) as u64,
-            bytes: bytes.max(0) as u64,
-            restore_points: restore_points.max(0) as u64,
-            refused,
-        })
+        Ok((
+            Pruned {
+                sessions: sessions.len() as u64,
+                turns: turns.max(0) as u64,
+                runs: runs.len() as u64,
+                rows: rows.max(0) as u64,
+                bytes: bytes.max(0) as u64,
+                restore_points: restore_points.max(0) as u64,
+                refused,
+            },
+            statements,
+        ))
     }
 }
 
@@ -10493,5 +10872,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    /// 0.58.0 F8. A sweep of many sessions is one pass over the schema.
+    ///
+    /// Asserted on the statement count rather than on a clock, which is the
+    /// whole reason `prune_counted` exists: the count is a function of the
+    /// schema and must not move when the number of sessions does. The natural
+    /// implementation — loop over the sessions calling `delete_session` — makes
+    /// it scale with the sessions, and on a schema this size that is the
+    /// difference between a maintenance call and an outage.
+    #[test]
+    fn a_sweep_of_many_sessions_issues_the_same_statements_as_a_sweep_of_one() {
+        fn seed(store: &Store, n: usize) -> Vec<i64> {
+            (0..n)
+                .map(|i| {
+                    let session = store.create_session(&format!("/repo{i}")).unwrap();
+                    let run = store.start_run(&format!("goal {i}"), "/repo").unwrap();
+                    store.record_turn(session, None, run, "a prompt").unwrap();
+                    store
+                        .record(run, &StepRecord::new(1, "a decision", "a result"))
+                        .unwrap();
+                    session
+                })
+                .collect()
+        }
+
+        let one = Store::memory().unwrap();
+        let sessions = seed(&one, 1);
+        let (pruned_one, statements_one) = one.prune_counted(&sessions, Vec::new()).unwrap();
+
+        let many = Store::memory().unwrap();
+        let sessions = seed(&many, 10);
+        let (pruned_many, statements_many) = many.prune_counted(&sessions, Vec::new()).unwrap();
+
+        assert_eq!(pruned_one.sessions, 1);
+        assert_eq!(pruned_many.sessions, 10, "ten sessions really went");
+        assert_eq!(
+            statements_many, statements_one,
+            "the statement count is a function of the schema, not of the sessions"
+        );
+        assert_eq!(
+            statements_one,
+            RUN_TABLES.len() + 3,
+            "every run-keyed table once, then runs, session_turns and sessions"
+        );
+    }
+
+    /// 0.58.0. The archive's fact list is a decision, and the decision is that
+    /// the default is to clear.
+    ///
+    /// A column added by a later release and not named in `is_fact_column` is
+    /// treated as words. That is the safe direction — losing a number the trace
+    /// can live without, rather than keeping a sentence the archive promised to
+    /// remove — and this asserts it rather than leaving it to the reader.
+    #[test]
+    fn a_column_the_archive_has_never_heard_of_is_treated_as_words() {
+        assert!(!is_fact_column("steps", "a_column_from_the_future"));
+        assert!(
+            !is_fact_column("steps", "decision"),
+            "the model's own words"
+        );
+        assert!(is_fact_column("policy_events", "decision"), "a verdict");
+        assert!(!is_fact_column("runs", "goal"), "a session turn's prompt");
+        assert!(
+            is_fact_column("runs", "file"),
+            "which workspace it ran over"
+        );
     }
 }

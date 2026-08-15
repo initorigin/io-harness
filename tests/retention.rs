@@ -7,7 +7,8 @@
 //! rest use a file for the same reason the release does: the instrument is for
 //! stores an operator actually has.
 
-use io_harness::{RunStatus, StepRecord, Store};
+use io_harness::tools::Workspace;
+use io_harness::{rewind_run, Policy, Rewind, RunStatus, StepRecord, Store};
 use rusqlite::Connection;
 
 /// A store on disk, and the directory that keeps it alive for the test.
@@ -542,4 +543,383 @@ fn deleting_a_session_that_is_not_there_succeeds_and_reports_nothing() {
     assert_eq!(pruned.rows, 0);
     assert_eq!(pruned.bytes, 0);
     assert!(pruned.refused.is_empty());
+}
+
+/// Put a session's `created_at` where the test needs it. The column is a
+/// `strftime` text column, which is exactly why the sweep compares strings.
+fn backdate(conn: &Connection, session: i64, at: &str) {
+    conn.execute(
+        "UPDATE sessions SET created_at = ?1 WHERE id = ?2",
+        rusqlite::params![at, session],
+    )
+    .expect("a backdated session");
+}
+
+/// F6. A sweep refuses a session holding a resumable run, names it, and leaves
+/// it exactly as it was.
+#[test]
+fn a_sweep_refuses_a_session_holding_a_resumable_run_and_names_it() {
+    let (_dir, store, path) = on_disk();
+    let running = seed_session(&store, "/a", 1, 2, "alpha");
+    let paused = seed_session(&store, "/b", 1, 2, "beta");
+    let finished = seed_session(&store, "/c", 2, 2, "gamma");
+
+    let conn = Connection::open(&path).expect("the store, read directly");
+    for session in [running, paused, finished] {
+        backdate(&conn, session, "2020-01-01T00:00:00.000Z");
+    }
+    store
+        .set_status(tree_of(&conn, running)[0], "running")
+        .expect("a status");
+    store
+        .set_status(tree_of(&conn, paused)[0], "paused")
+        .expect("a status");
+    for run in tree_of(&conn, finished) {
+        store.set_status(run, "completed").expect("a status");
+    }
+    // A failed run is finished, not resumable — the sweep takes it.
+    store
+        .set_status(tree_of(&conn, finished)[0], "failed")
+        .expect("a status");
+
+    let before_running = store.session_size(running).expect("a size");
+    let before_paused = store.session_size(paused).expect("a size");
+
+    let pruned = store
+        .sweep_sessions("2021-01-01T00:00:00.000Z")
+        .expect("the sweep");
+
+    let mut refused = pruned.refused.clone();
+    refused.sort_unstable();
+    let mut expected = vec![running, paused];
+    expected.sort_unstable();
+    assert_eq!(refused, expected, "both resumable sessions were named");
+
+    assert_eq!(pruned.sessions, 1, "only the finished session went");
+    assert!(
+        store.session_size(finished).expect("a size").is_none(),
+        "the finished session is gone"
+    );
+    assert_eq!(
+        store.session_size(running).expect("a size"),
+        before_running,
+        "the running session is byte-for-byte what it was"
+    );
+    assert_eq!(
+        store.session_size(paused).expect("a size"),
+        before_paused,
+        "and so is the paused one"
+    );
+}
+
+/// F7. The cutoff is strictly before, asserted one millisecond either side of it
+/// rather than a day either side.
+#[test]
+fn the_sweeps_cutoff_is_strictly_before_and_the_boundary_is_the_assertion() {
+    let (_dir, store, path) = on_disk();
+    let older = seed_session(&store, "/a", 1, 1, "alpha");
+    let exactly = seed_session(&store, "/b", 1, 1, "beta");
+    let newer = seed_session(&store, "/c", 1, 1, "gamma");
+
+    let conn = Connection::open(&path).expect("the store, read directly");
+    let cutoff = "2026-01-01T00:00:00.500Z";
+    backdate(&conn, older, "2026-01-01T00:00:00.499Z");
+    backdate(&conn, exactly, cutoff);
+    backdate(&conn, newer, "2026-01-01T00:00:00.501Z");
+    for session in [older, exactly, newer] {
+        for run in tree_of(&conn, session) {
+            store.set_status(run, "completed").expect("a status");
+        }
+    }
+
+    let pruned = store.sweep_sessions(cutoff).expect("the sweep");
+
+    assert_eq!(pruned.sessions, 1, "one millisecond is the whole margin");
+    assert!(store.session_size(older).expect("a size").is_none());
+    assert!(
+        store.session_size(exactly).expect("a size").is_some(),
+        "a session whose created_at equals the cutoff survives: the comparison is strictly before"
+    );
+    assert!(store.session_size(newer).expect("a size").is_some());
+}
+
+/// F12. A prune alone does not shrink the file; a compaction does.
+#[test]
+fn a_prune_frees_pages_into_the_file_and_a_compaction_returns_them() {
+    let (_dir, store, path) = on_disk();
+    // Big enough that the freed pages are visible against SQLite's own
+    // allocation granularity.
+    let doomed = seed_session(&store, "/repo", 40, 40, "alpha");
+    seed_session(&store, "/other", 2, 2, "beta");
+
+    let before = store.store_size().expect("a size");
+    assert!(before.file_bytes > 0);
+
+    store.delete_session(doomed).expect("the deletion");
+    let pruned = store.store_size().expect("a size");
+
+    assert_eq!(
+        pruned.file_bytes, before.file_bytes,
+        "a deletion frees pages into the file, never out of it"
+    );
+    assert!(
+        pruned.free_bytes > before.free_bytes,
+        "and the freelist is where they went: {} then {}",
+        before.free_bytes,
+        pruned.free_bytes
+    );
+
+    let reclaimed = store.compact().expect("the compaction");
+    let after = store.store_size().expect("a size");
+
+    assert!(
+        after.file_bytes < pruned.file_bytes,
+        "the compaction returned the pages to the filesystem: {} then {}",
+        pruned.file_bytes,
+        after.file_bytes
+    );
+    assert_eq!(
+        reclaimed,
+        pruned.file_bytes - after.file_bytes,
+        "the returned figure is the difference, measured, not the freelist guess"
+    );
+    assert_eq!(
+        after.free_bytes, 0,
+        "a vacuumed file has no free pages left"
+    );
+
+    // The file on disk moved too, not only SQLite's opinion of it.
+    let on_disk_bytes = std::fs::metadata(&path).expect("the file").len();
+    assert!(
+        on_disk_bytes <= pruned.file_bytes,
+        "the filesystem agrees: {on_disk_bytes} against {}",
+        pruned.file_bytes
+    );
+}
+
+/// Every text or blob value in the whole database, whatever table it is in.
+/// Driven from the schema so a column nobody thought of is still swept.
+fn every_text_value(conn: &Connection) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let names: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .expect("the schema");
+        stmt.query_map([], |r| r.get(0))
+            .expect("the tables")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the tables")
+    };
+    for table in names {
+        let cols: Vec<String> = {
+            let mut info = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("the columns");
+            info.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                .expect("the columns")
+                .filter_map(|c| {
+                    let (name, ty) = c.ok()?;
+                    let ty = ty.to_uppercase();
+                    (ty.contains("TEXT") || ty.contains("BLOB")).then_some(name)
+                })
+                .collect()
+        };
+        for col in cols {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {col} FROM {table} WHERE {col} IS NOT NULL AND LENGTH({col}) > 0"
+                ))
+                .expect("the values");
+            let values = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .expect("the values")
+                .filter_map(|v| v.ok())
+                .collect::<Vec<_>>();
+            for value in values {
+                out.push((table.clone(), col.clone(), value));
+            }
+        }
+    }
+    out
+}
+
+/// F9. An archived session keeps every row and every number, and holds no words.
+#[test]
+fn an_archived_session_keeps_its_numbers_and_holds_none_of_its_words() {
+    let (_dir, store, path) = on_disk();
+    let session = seed_session(&store, "/repo", 3, 4, "SECRETPHRASE");
+    let other = seed_session(&store, "/other", 2, 2, "beta");
+
+    let conn = Connection::open(&path).expect("the store, read directly");
+    let runs = tree_of(&conn, session);
+
+    // The needles go into six different tables on purpose: an archive that
+    // emptied only the conversation would pass a test that only seeded one.
+    store
+        .put_summary(runs[0], 2, 1, "SECRETPHRASE in a summary", 40)
+        .expect("a summary");
+    conn.execute(
+        "INSERT INTO snapshots (run_id, step, path, before, state)
+         VALUES (?1, 1, 'src/lib.rs', 'SECRETPHRASE in a file', 'text')",
+        [runs[0]],
+    )
+    .expect("a restore point");
+    conn.execute(
+        "INSERT INTO ledger_observations (run_id, step, kind, target, text)
+         VALUES (?1, 1, 'read', 'src/lib.rs', 'SECRETPHRASE in a tool result')",
+        [runs[0]],
+    )
+    .expect("an observation");
+    conn.execute(
+        "INSERT INTO edits (run_id, step, tool, path, lines_added, lines_removed, hunk)
+         VALUES (?1, 1, 'edit_file', 'src/lib.rs', 3, 1, '+SECRETPHRASE in a hunk')",
+        [runs[0]],
+    )
+    .expect("an edit");
+    conn.execute(
+        "INSERT INTO provider_calls (run_id, step, attempt, provider, model, total_tokens, latency_ms)
+         VALUES (?1, 1, 1, 'openrouter', 'a-model', 1234, 56)",
+        [runs[0]],
+    )
+    .expect("a provider call");
+
+    let run_list = as_list(&runs);
+    let counts: Vec<(String, i64)> = tables(&path)
+        .into_iter()
+        .filter_map(|t| run_key(&t).map(|k| (t.clone(), rows_for(&conn, &t, k, &run_list))))
+        .collect();
+    let tokens: i64 = conn
+        .query_row(
+            &format!("SELECT SUM(total_tokens) FROM provider_calls WHERE run_id IN ({run_list})"),
+            [],
+            |r| r.get(0),
+        )
+        .expect("the tokens");
+    let other_before = store.session_size(other).expect("a size");
+
+    let archived = store.archive_session(session).expect("the archive");
+    assert!(
+        archived.rows > 0 && archived.bytes > 0,
+        "it cleared something"
+    );
+    assert_eq!(archived.turns, 3);
+
+    // Every row is still there.
+    for (table, rows) in counts {
+        let key = run_key(&table).expect("filtered above");
+        assert_eq!(
+            rows_for(&conn, &table, key, &run_list),
+            rows,
+            "{table} lost a row to an archive, which keeps rows"
+        );
+    }
+    assert!(
+        store.session_size(session).expect("a size").is_some(),
+        "the session is still there"
+    );
+
+    // Every number is still there.
+    assert_eq!(
+        conn.query_row(
+            &format!("SELECT SUM(total_tokens) FROM provider_calls WHERE run_id IN ({run_list})"),
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .expect("the tokens"),
+        tokens,
+        "what it cost outlives what was said"
+    );
+    assert_eq!(
+        conn.query_row(
+            &format!("SELECT path || ':' || lines_added || '/' || lines_removed FROM edits WHERE run_id IN ({run_list})"),
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .expect("the edit"),
+        "src/lib.rs:3/1",
+        "and so does what it touched"
+    );
+
+    // And not one word of it survives, anywhere in the database.
+    let leaks: Vec<_> = every_text_value(&conn)
+        .into_iter()
+        .filter(|(_, _, v)| v.contains("SECRETPHRASE"))
+        .collect();
+    assert!(
+        leaks.is_empty(),
+        "an archive that reports a removal it did not perform: {leaks:?}"
+    );
+
+    assert_eq!(
+        store.session_size(other).expect("a size"),
+        other_before,
+        "the sibling session is untouched"
+    );
+}
+
+/// F10. Archiving is idempotent, and says so honestly the second time.
+#[test]
+fn archiving_twice_clears_nothing_the_second_time() {
+    let (_dir, store, _path) = on_disk();
+    let session = seed_session(&store, "/repo", 2, 3, "alpha");
+
+    let first = store.archive_session(session).expect("the archive");
+    assert!(first.rows > 0 && first.bytes > 0);
+
+    let second = store.archive_session(session).expect("the second archive");
+    assert_eq!(second.rows, 0, "there was nothing left to clear");
+    assert_eq!(second.bytes, 0);
+    assert_eq!(second.turns, 2, "the session is still two turns long");
+}
+
+/// F11. An archived restore point says so rather than restoring nothing over a
+/// real file.
+#[test]
+fn an_archived_restore_point_reports_itself_rather_than_writing_an_empty_file() {
+    let (dir, store, path) = on_disk();
+    let session = seed_session(&store, "/repo", 1, 1, "alpha");
+    let conn = Connection::open(&path).expect("the store, read directly");
+    let run = tree_of(&conn, session)[0];
+
+    let target = dir.path().join("src.rs");
+    std::fs::write(&target, "the file as it is now").expect("a file");
+    conn.execute(
+        "INSERT INTO snapshots (run_id, step, path, before, state)
+         VALUES (?1, 1, ?2, 'the file as it was', 'text')",
+        rusqlite::params![run, target.to_string_lossy()],
+    )
+    .expect("a restore point");
+
+    store.archive_session(session).expect("the archive");
+
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM snapshots WHERE run_id = ?1",
+            [run],
+            |r| r.get(0),
+        )
+        .expect("the snapshot");
+    assert_eq!(
+        state, "archived",
+        "the row says its content is gone rather than pretending to hold it"
+    );
+
+    let ws = Workspace::with_policy(dir.path(), Policy::permissive());
+    let rewound = rewind_run(&ws, &store, run).expect("the rewind");
+    assert_eq!(rewound.files.len(), 1);
+    let (_, outcome) = &rewound.files[0];
+    match outcome {
+        Rewind::NotKept(why) => assert!(
+            why.contains("archived"),
+            "the refusal names the archive rather than reading as a version mismatch: {why}"
+        ),
+        other => panic!("an archived restore point must refuse, not act: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the file"),
+        "the file as it is now",
+        "an archived restore point never writes an empty file over a real one"
+    );
 }
