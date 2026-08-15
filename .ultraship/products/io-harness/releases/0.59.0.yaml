@@ -1,0 +1,338 @@
+product: io-harness
+version: 0.59.0
+status: planned
+release_type: minor
+
+outcome:
+  user_can: >
+    An operator running this crate on Windows can ask for a boundary and be given one, and can
+    drive a browser there.
+
+    **The access half.** Today `sandbox::select` returns the Job Object on Windows and there is
+    nothing else to return. A Job Object is a kernel container for *resources* — committed memory,
+    user-mode CPU, active processes, and a guaranteed teardown of the whole tree when its handle
+    closes — and it has no filesystem facility and no network facility, because those are not
+    options the API declines to use, they do not exist in it. So a Windows caller who sets
+    `ExecMode::WorkspaceWrite` gets a mode that is routed, recorded in the trace and enforced by
+    nothing, and a caller whose policy denies egress gets a proxy-environment strip that a payload
+    ignoring those variables walks straight through. `sandbox::appcontainer` has held the other
+    half since 0.26.0 — a low-box profile, paths granted to its container SID with explicit ACEs,
+    and a spawn through `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` — proven against negative
+    controls and selected by nothing. After this release a caller reaches for it deliberately, and
+    what they get is default-deny on the filesystem and no route off the machine, with
+    `EventKind::Contained.backend` naming the container rather than the job.
+
+    **It is opt-in, and the opt-in is the honest landing rather than a hedge.** The grant set is
+    derived from the run's own resolved facts — the workspace, the writable cache roots the
+    toolchain named, the redirected temporary directory, the resolved program's own directory,
+    `%SystemRoot%`, and every ancestor of each of those traverse-only — and "derived" is not
+    "complete". A default boundary that cannot run an arbitrary payload is worse than one a caller
+    asks for, which `US-IO-HARNESS-0.26.0-I02` settled and this release does not reopen. The
+    Windows default stays the Job Object until the derived set is proven against real cargo, npm
+    and python payloads on the CI image.
+
+    **The browser half.** `browser::launch` has a Windows arm that refuses outright, and its
+    message says the work is tracked as its own release — a promise no roadmap entry ever backed
+    until 2026-08-15. After this release the browser launches, attaches, navigates and screenshots
+    on Windows the same way it does everywhere else, in the same suite, behind neither an
+    `#[ignore]` nor a platform gate, and the refusal is gone from the code and from every sentence
+    in the tree that repeated it.
+  business_value: >
+    This is the release that makes the crate's Windows column true rather than aspirational. The
+    0.6.0 outcome sentence — the same harness isolates code the same way on macOS, Linux and
+    Windows — has been carrying an asterisk for fifty releases, and the asterisk is not a
+    documentation problem: an embedder shipping an agent to Windows users today either accepts that
+    "contained" means something weaker there than it does on the other two platforms, or writes
+    their own confinement beside a crate that advertises it.
+
+    The browser half is the same shape. A feature that exists on two of three supported platforms
+    is a feature an embedder cannot build a product on without a platform branch of their own, and
+    0.53.0's refusal named a release that did not exist.
+
+    And one defect found while specifying this release is worth the release on its own: the
+    capability array that this module documents as its network boundary **in both directions** was
+    never reaching the child at all. Nothing selected the backend, so nothing could see it.
+  evidence_of_value: >
+    The instrument is `what_the_container_actually_permits_on_this_host`, which asks each
+    capability separately through the container path itself and prints the backend that answered
+    each one. A table on `windows-latest` in which every row was answered by the container — no row
+    by the Job Object, no row by a silent decline — is the evidence that the boundary is real
+    rather than reported. Beside it, negative controls that assert the specific refusal: a read
+    outside the grants is refused as a read, and a socket is refused as a socket, each with the
+    identical operation run outside the container as its control.
+
+    For the browser half the evidence is a page driven on `windows-latest` in the ordinary suite,
+    and a real browser answering over the transport in the live example.
+
+scope:
+  included:
+  - >
+    **The browser's Windows transport, over the mechanism a real browser was asked about before
+    any of it was written down.** Chromium converts the two descriptors it is handed with
+    `_get_osfhandle`, so the parent must populate the child's **C-runtime descriptor table** by
+    writing `STARTUPINFO.lpReserved2` — not the process-thread attribute list, which cannot
+    express a descriptor number. Anonymous pipes, so there is no name for another local process
+    to open, which is the same argument that rejected a debugging port in 0.53.0.
+  - >
+    `tests/browser.rs` and `examples/browser_fixture.rs` run on Windows. The fixture is a Rust
+    binary and Rust's standard library never populates the CRT descriptor table itself, so this
+    depends on the UCRT parsing the block on its behalf — established on the runner rather than
+    assumed.
+  - >
+    **The typed Windows refusal removed**, and with it every sentence in the tree that says the
+    browser is unsupported there: `src/browser.rs`, `docs/CONTRACT.md`, `docs/guide/browser.md`,
+    the examples, and the `unix` half of `tests/browser.rs`'s own gate.
+  - >
+    **The capability array carried to the spawn.** `Profile::create` builds it and
+    `Spawned::start` passed `CapabilityCount: 0` regardless, so `internetClient` was registered
+    against the profile name and absent from every token. Fixed, with the permitting direction
+    tested for the first time and the denying direction re-tested for the right reason.
+  - >
+    **`Backend::WindowsAppContainer` returns to the public enum**, and with it the two exhaustive
+    matches that decide what a backend claims: `confines_writes` and `denies_egress` both answer
+    true for it. 0.47.0 removed the variant because no production path could return it; this
+    release is the one that makes it returnable.
+  - >
+    **`sandbox::select` chooses it**, for a run whose configuration asks for access confinement and
+    whose mode asks for a filesystem boundary. `EventKind::Contained.backend` then says
+    `windows-appcontainer` and the trace stops being the only thing distinguishing a confined
+    Windows run from a naked one.
+  - >
+    **The grant set derived from the run's resolved facts**, memoised per process by path, access,
+    reach **and container SID** — the existing memo omits the SID, so a second profile in one
+    process is silently skipped and its grant reads back absent.
+  - >
+    **The instrument prints its table unconditionally.** It builds one today and shows it only on
+    failure, which is the one case where a passing run tells you nothing.
+  - >
+    Both open questions answered in `docs/CONTRACT.md`, the platform tables updated in the same
+    release as the code, CHANGELOG, README and rustdoc with them.
+  excluded:
+  - >
+    **Flipping the Windows default.** The default stays the Job Object until the derived grant set
+    runs a real cargo build, a real npm install and a real python payload on the CI image without
+    a decline. Named here with its condition rather than left as a silence.
+  - >
+    **A loopback exemption for the container.** `CheckNetIsolation` and the registry state behind
+    it are machine-wide and need administrator rights; a library that quietly edits a machine's
+    network-isolation policy to make its own tests pass has done something worse than the problem
+    it solved.
+  - >
+    **A microVM or an external sandbox binary.** Wrong granularity and a dependency class this
+    crate does not take. If it lands anywhere it is a layer above this one.
+  - >
+    **`cmd.exe` starting a script by absolute path inside a container.** Answered rather than
+    fixed: it is refused, `call` with the byte-identical path runs, and the answer is documented
+    with its workaround.
+  fallback_scope:
+  - The browser's Windows transport, its tests in the ordinary suite, and the refusal removed.
+  - The capability array reaching the spawn, which is a defect fix and not a feature.
+  - >
+    **The cut line, decided now.** If the grant set has not converged when the rest is ready, the
+    browser half ships and the access half moves to its own version. The reverse is not on the
+    table: a bounded piece of work does not wait on an unbounded one because they share a number.
+
+acceptance:
+  functional:
+  - >
+    **F1 — a browser launches and speaks on Windows.** `browser::launch` returns a `Browser` on
+    Windows, the handshake completes, and a page is attached. Asserted against the fixture in the
+    ordinary suite and against a real browser in the live example. Sabotage: write the descriptor
+    block with a count of three, so the two transport descriptors are absent — under which the
+    child reports its pipe descriptors are not open and only F1 fails, as a typed error rather
+    than a hang.
+  - >
+    **F2 — the transport is the child's descriptor table, and the test says so by number.** The
+    block the spawn writes places the read end at descriptor 3 and the write end at 4, and the
+    child reads them back at those numbers. Sabotage: swap the two entries, under which the child
+    reads its own output and only F2 fails.
+  - >
+    **F3 — every handle placed in the block is closed on both paths.** After a successful launch
+    and after a launch whose spawn failed, the parent holds neither child end. Asserted by
+    observing that the child sees end-of-file when the parent drops the browser, which is the
+    behaviour a leak destroys — a leaked end means the child never sees EOF and the run hangs
+    rather than failing, the worst shape for a transport. Sabotage: keep the child's read end
+    open in the parent, under which the shutdown never completes and only F3 fails.
+  - >
+    **F4 — no Windows arm refuses, and no sentence claims one does.** A grep gate over the tree
+    finds no text asserting the browser is unsupported on Windows, in the same shape as the
+    existing checked-in documentation gates. Sabotage: restore one such sentence in the README,
+    under which only F4 fails and it names the file.
+  - >
+    **F5 — the container is what answers, and the table says which.** Every row of
+    `what_the_container_actually_permits_on_this_host` reports `windows-appcontainer` as the
+    backend that answered it. A row answered by the Job Object and a row answered by a silent
+    decline both fail, and the printed table names the decline reason. Sabotage: make one fatal
+    grant fail, under which `run_contained` declines, the Job Object answers, and F5 fails naming
+    that row — rather than passing, which is what a test asserting only `success()` does.
+  - >
+    **F6 — a read outside the grants is refused as a read.** A file beside the workspace, readable
+    by the same user outside the container, is refused inside it, and the assertion is on the
+    refusal — the payload's own error naming access — not on `!success()`. The identical read runs
+    outside the container as its control in the same test. Sabotage: add the file's directory to
+    the grant set, under which the read succeeds and only F6 fails.
+  - >
+    **F7 — a socket is refused as a socket, and permitted when the policy permits it.** With
+    egress denied, an outbound connection from inside the container fails, with the uncontained
+    control succeeding in the same test. With egress permitted, the same connection succeeds —
+    the direction that has never been exercised, because the capability array never reached the
+    token. Sabotage: pass a capability count of zero for a permitting run, under which the
+    permitted connection fails and only F7's second half fails.
+  - >
+    **F8 — `Backend::WindowsAppContainer` claims what it delivers.** `confines_writes` and
+    `denies_egress` both answer true for it, in the two exhaustive matches that cannot go stale.
+    Sabotage: answer false in either, under which the platform-claims test fails by name.
+  - >
+    **F9 — selection is the caller's, and the default did not move.** A default Windows
+    `SandboxConfig` still selects the Job Object and reports it; the same config asking for access
+    confinement selects the container. Asserted on `Sandbox::backend` and on the `Contained` event,
+    not on a field. Sabotage: select the container unconditionally, under which the default-path
+    assertion fails and only F9 fails.
+  - >
+    **F10 — the grant memo is keyed by the container it granted to.** Two profiles in one process
+    granting the same path both leave an ACE for their own SID, read back from the DACL. Sabotage:
+    drop the SID from the memo key — the shape the code has today — under which the second
+    profile's ACE is absent and only F10 fails.
+  non_functional:
+  - >
+    **N1 — the Windows matrix leg finishes inside its budget.** No leg cancelled by its own
+    timeout. The 40-minute signature is a subtree walk: both `aclapi` write entry points impose
+    the inheritance model on every object below their target, so a directory-only grant must not
+    use one. Recorded as a number beside the previous release's, not asserted against a threshold.
+  - >
+    **N2 — what the container costs per command, measured against the Job Object rather than
+    against an unconfined spawn**, because the Job Object is what a contained Windows run got
+    before this release. Reported, not gated.
+  - >
+    **N3 — the public surface grows by the variant and the opt-in and nothing else.**
+    `docs/public-api.txt` moves by exactly the lines those two additions produce, stated in advance
+    and checked after.
+  - >
+    **N4 — no new dependency.** `windows-sys` gains no feature it does not already carry, and
+    `cargo tree` stays at 402.
+  operational:
+  - >
+    **O1 — the browser tests run on the Windows leg of the ordinary matrix**, not behind an
+    `#[ignore]` and not behind a platform gate, and the fixture example is built there.
+  - >
+    **O2 — every finding carries the runner image label.** The hosted image is versioned and moves
+    between rounds; a Windows finding without its image is not reproducible.
+  - >
+    **O3 — both open questions are answered in `docs/CONTRACT.md`.** "Platform property,
+    documented" is an acceptable answer; "unresolved" is not.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.59.0, GitHub at initorigin/io-harness with the tag `v0.59.0` and a
+    Release titled `io-harness 0.59.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.59.0` off `develop`, committed incrementally as it
+    lands, including the sealed UltraShip release record and the hand-appended lock pin. PR into
+    `develop`, merged with the PR button. `git diff --quiet feat/0.59.0 develop` before the release
+    PR is opened, because a Dependabot merge has landed above the feature merge twice in the last
+    twenty releases. Release PR `develop` into `main`, merged the same way. The GitHub Release is
+    cut by `release.yml` from a tag pushed alone, taking its notes verbatim from the changelog.
+    `cargo publish --locked` by hand afterwards, always last, with the registry token sourced from
+    the repo-local `.env` in the same shell invocation. `develop` synced to `main` fast-forward
+    only at the end. No branch is deleted. The `diag/**` branches are never merged.
+  migrations:
+  - >
+    **No schema change.** No table, no column, no index, no `CHECKPOINT_FORMAT` move.
+  - >
+    **No behaviour change for anyone who does not ask for one.** A Windows run that does not opt
+    into access confinement takes the Job Object and behaves exactly as it does on 0.58.0. A
+    Windows program using the browser feature could not use it at all before this release, so
+    there is nothing there to change.
+  - >
+    **One addition to a `#[non_exhaustive]` enum.** `Backend::WindowsAppContainer` returns.
+    Downstream matches already carry a wildcard, which is what `#[non_exhaustive]` obliges, so this
+    breaks no caller — the same property that let 0.47.0 remove it.
+  observability:
+  - >
+    `EventKind::Contained` already carries the backend, the mode and the roots, once per run. On
+    Windows it begins carrying a name that means access confinement, which is the whole of the
+    observable change. The decline reason recorded by `last_decline` is what the table prints when
+    a row was not answered by the container.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.59.1 and `cargo yank --version
+    0.59.0` is the escape hatch, leaving 0.58.0 as what `cargo install` resolves. Nothing about
+    this release is durable — no schema, no on-disk format — so a downgrade is a version change and
+    nothing else. A caller who opted into access confinement and finds their payload refused
+    reverts by not opting in, without changing versions.
+
+dependencies:
+  products: []
+  services:
+  - GitHub Actions `windows-latest` runners, which are the only host that can answer any of this.
+  - A Chromium-family browser on the runner image, for the live half of the browser evidence.
+  human_approvals:
+  - >
+    The owner's decision on the opt-in, if the derived grant set turns out to run every payload on
+    the CI image — flipping the default would then be a separate decision and not this release's.
+
+resource_profile:
+  complexity: large
+  uncertainty: high
+  likely_cost_drivers:
+  - >
+    Reduced from where this release started, and unevenly. The browser transport is settled: three
+    hypotheses were asked of a real browser and the answer was unambiguous, so its remaining risk
+    is ordinary implementation. Both open questions are answered. What is still open is the grant
+    set's completeness against payloads nobody has run inside the container yet, which is the one
+    part of this release whose size is not known in advance and the reason the cut line exists.
+  - >
+    Windows CI rounds. Every fact about this platform costs a cold build, and the crate's Windows
+    leg is roughly three times the macOS leg. Batching questions into one round is the mitigation,
+    not shortening the questions.
+  - >
+    The documentation surface. Thirty-odd living sentences across code, README, CONTRACT, the
+    guides and the tests say Windows has a hole in it, and every one is either true of the default
+    or false after this release. Sorting which is which is most of the docs work.
+  preferred_tools:
+  - >
+    A throwaway `diag/**` branch with the experiments built inside the test binary. Never a shell
+    prompt: an interactive Windows session is MSYS2 bash, which rewrites path-shaped arguments,
+    and one of the two open questions was a question about absolute paths.
+  constraints:
+  - No new runtime dependency, and no new `windows-sys` feature.
+  - >
+    Nothing may weaken the unix or macOS spawn path. Both halves of this release touch a spawn
+    that exists only on Windows, and the shared runner is not to be modified for either.
+  - >
+    The user's profile directory is never granted. That is where credentials live, and a
+    default-deny boundary whose first act is to hand over the home directory is not one.
+
+risks:
+- >
+  **The grant set does not converge.** The mitigation is the cut line, decided in advance: the
+  browser half ships and the access half moves. What makes this credible is that the two halves
+  share a spawn path and nothing else.
+- >
+  **A decline is silent and every assertion still passes.** `run_contained` answers `None` when a
+  grant it must have fails, and the Job Object then runs the command unconfined. This release
+  began by making that mistake twice in 0.47.0. Every container test asserts the backend before it
+  asserts anything else.
+- >
+  **A grant that reports success and grants nothing.** Between 0.26.0 and 0.47.0 every ACE this
+  module wrote was inert while being readable back off the DACL, because `SetEntriesInAclW` stores
+  a generic mask verbatim. The class is not closed by that one fix — the memo key defect found
+  while specifying this release produces the same shape — so the criteria read the mask back
+  rather than trusting the return value.
+- >
+  **The runner image moves between rounds.** Findings are recorded with the image label, and a
+  finding from an older image is re-established rather than quoted.
+
+open_questions:
+- >
+  **Can a process inside an AppContainer reach the loopback proxy the run owns?** 0.48.0 routes
+  every contained command's traffic through a proxy on 127.0.0.1, and an AppContainer's loopback
+  behaviour is a property of the platform rather than of the capability set. If it cannot, per-host
+  egress lands differently on this platform than on the other two and the release says so rather
+  than implying parity.
+- >
+  **Are egress denial and filesystem confinement separable here?** The roadmap orders them as two
+  steps with the network first "at roughly 10% of the risk", but the empty capability array only
+  binds a process that is already inside a container, and being inside one is exactly the grant-set
+  problem. If they are inseparable then the landing order has two steps where it thought it had
+  three, and the fallback scope is the browser half alone.
