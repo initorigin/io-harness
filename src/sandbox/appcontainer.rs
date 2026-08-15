@@ -1064,9 +1064,7 @@ pub(crate) mod win {
                     if list.is_null() {
                         CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED
                     } else {
-                        EXTENDED_STARTUPINFO_PRESENT
-                            | CREATE_UNICODE_ENVIRONMENT
-                            | CREATE_SUSPENDED
+                        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED
                     },
                     std::ptr::null(),
                     wcwd.as_ptr(),
@@ -1366,8 +1364,9 @@ mod tests {
             .unwrap_or_else(|e| panic!("could not grant the workspace: {e}"));
         let out_path = work.path().join("net-allowed.txt");
         let file = std::fs::File::create(&out_path).expect("capture file");
-        let mut child = Spawned::start(&format!("cmd.exe /c {probe}"), work.path(), &profile, &file)
-            .expect("spawn into a network-permitting container");
+        let mut child =
+            Spawned::start(&format!("cmd.exe /c {probe}"), work.path(), &profile, &file)
+                .expect("spawn into a network-permitting container");
         child.resume().expect("resume");
         drop(file);
         let permitted = child.wait(60_000).expect("wait");
@@ -1533,8 +1532,7 @@ mod tests {
             let out_path = root.path().join(format!("o{level}.txt"));
             let file = std::fs::File::create(&out_path).expect("capture");
             let line = "cmd.exe /c depth.bat".to_string();
-            let mut child =
-                Spawned::start(&line, dir, &profile, &file).expect("spawn the payload");
+            let mut child = Spawned::start(&line, dir, &profile, &file).expect("spawn the payload");
             child.resume().expect("resume");
             let code = child.wait(30_000).expect("wait");
             drop(file);

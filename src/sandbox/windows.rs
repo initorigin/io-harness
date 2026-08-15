@@ -161,8 +161,7 @@ impl Sandbox for WindowsAppContainerSandbox {
                          this host: {}. Nothing was started — a command run under the job \
                          object instead would have had no filesystem and no network boundary, \
                          which is the failure this refusal exists to prevent",
-                        job::last_decline()
-                            .unwrap_or_else(|| "no reason was recorded".to_string())
+                        job::last_decline().unwrap_or_else(|| "no reason was recorded".to_string())
                     ),
                 }),
             }
@@ -1529,6 +1528,62 @@ mod tests {
             .backend(),
             Backend::WindowsJobObject,
             "full access was put inside a default-deny container"
+        );
+    }
+
+    /// **F5b — a boundary that cannot be applied is refused, not degraded.**
+    ///
+    /// Added because a sabotage survived: making a failed `Full` grant non-fatal
+    /// broke nothing, since on a healthy host no `Full` grant fails and the
+    /// capability table never constructs the case the guard exists for. A guard
+    /// whose sabotage survives is a test that never built the situation, so this
+    /// builds it — a writable root that cannot be granted because it is not
+    /// there.
+    ///
+    /// The assertion is that **nothing ran**. A decline that fell back to the Job
+    /// Object would run the command with no access boundary while every
+    /// assertion about the command still passed, which is the failure this whole
+    /// release exists to end.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_boundary_that_cannot_be_applied_refuses_rather_than_running_uncontained() {
+        use crate::sandbox::Sandbox;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let limits = SandboxLimits::none();
+        // A root the grant pass must fail on, chosen so it fails for a reason no
+        // privilege level changes: it does not exist.
+        let missing = std::path::PathBuf::from(format!(
+            r"C:\io-harness-no-such-root-{}",
+            std::process::id()
+        ));
+        let roots = vec![missing.clone()];
+        let argv: Vec<String> = vec![
+            "cmd".into(),
+            "/c".into(),
+            "echo io-harness-should-not-run> ran.txt".into(),
+        ];
+        let spec = RunSpec::new(&argv, dir.path(), &limits)
+            .with_mode(ExecMode::WorkspaceWrite)
+            .with_network(false)
+            .with_writable_roots(&roots);
+
+        let outcome = WindowsAppContainerSandbox.run(spec).await;
+        let Err(e) = outcome else {
+            panic!(
+                "a run that asked for access confinement was given something else instead of \
+                 an error: {outcome:?}"
+            );
+        };
+        let said = e.to_string();
+        assert!(
+            said.contains("access confinement") && said.contains("Nothing was started"),
+            "the refusal does not say what was refused or that nothing ran: {said}"
+        );
+        assert!(
+            !dir.path().join("ran.txt").exists(),
+            "the payload ran anyway, which means the container declined and something else \
+             executed the command with no access boundary"
         );
     }
 

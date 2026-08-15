@@ -32,16 +32,25 @@ ARMS = [
      "                        granted[0].Attributes = 0x0000_0004;\n                        1u32",
      "                        granted[0].Attributes = 0x0000_0004;\n                        0u32",
      "sandbox::appcontainer::tests::a_payload_has_no_route_off_the_machine"),
+    # S11's first arm was inert rather than a finding: it wrote the proxy into
+    # `stderr`, and the test reads `stdout`. An arm that cannot express the defect
+    # is not evidence the guard is load-bearing. This one hands the command line
+    # the proxy the way a regression actually would.
     ("S11 a contained command is handed the run's proxy",
      "src/sandbox/windows.rs",
-     "            stderr: String::new(),\n        }))",
-     "            stderr: format!(\"{:?}\", spec.proxy),\n        }))",
+     "        let cmdline = super::command_line(spec.argv);",
+     "        let cmdline = match spec.proxy {\n            Some(p) => format!(\"cmd.exe /c set HTTP_PROXY=http://{p}&& {}\", super::command_line(spec.argv)),\n            None => super::command_line(spec.argv),\n        };",
      "sandbox::windows::tests::a_contained_command_is_not_pointed_at_a_proxy_it_cannot_reach"),
+    ("S7b a failed Full grant declines silently instead of refusing",
+     "src/sandbox/windows.rs",
+     "            if g.grant == Grant::ReadExecute || g.grant == Grant::Traverse {",
+     "            if true {",
+     "sandbox::windows::tests::a_boundary_that_cannot_be_applied_refuses_rather_than_running_uncontained"),
     ("S12 the container claims it can scope egress per host",
      "src/sandbox.rs",
      "            Backend::WindowsAppContainer | Backend::WindowsJobObject | Backend::PortableFloor => {\n                false\n            }",
      "            Backend::WindowsJobObject | Backend::PortableFloor => false,\n            Backend::WindowsAppContainer => true,",
-     "sandbox::tests::each_backend_claims_exactly_what_it_delivers"),
+     "sandbox::tests::backend_claims"),
 ]
 
 def revert():

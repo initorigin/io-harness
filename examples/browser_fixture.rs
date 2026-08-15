@@ -42,12 +42,7 @@ fn transport() -> (std::fs::File, std::fs::File) {
     {
         use std::os::fd::FromRawFd;
         // SAFETY: 3 and 4 are the ends the parent installed before exec.
-        unsafe {
-            (
-                std::fs::File::from_raw_fd(3),
-                std::fs::File::from_raw_fd(4),
-            )
-        }
+        unsafe { (std::fs::File::from_raw_fd(3), std::fs::File::from_raw_fd(4)) }
     }
     #[cfg(windows)]
     {
