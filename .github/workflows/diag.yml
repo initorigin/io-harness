@@ -68,7 +68,8 @@ jobs:
       - name: the container tests
         continue-on-error: true
         shell: pwsh
-        run: cargo test --all-features --lib -- --nocapture --test-threads=1 sandbox:: 2>&1 | Tee-Object -FilePath diagnostics/container.txt
+        run: |
+          cargo test --all-features --lib -- --nocapture --test-threads=1 sandbox:: 2>&1 | Tee-Object -FilePath diagnostics/container.txt
 
       # The browser half against the fixture, on the platform that had none.
       - name: the browser suite

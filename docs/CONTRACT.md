@@ -143,10 +143,14 @@ What it does **not** claim, stated rather than left to be discovered:
   fonts and XHR are the page's own traffic to a host already permitted. Document
   navigations bound where the browser *goes*; under containment everything it
   sends takes the run's own egress proxy, like every other contained command.
-- **Windows is not supported in 0.53.0.** The pipe transport needs two inherited
-  descriptors at fixed numbers, which the standard library does not expose on
-  Windows. Every entry point there returns a typed configuration error naming the
-  platform. It is planned work, not an accident.
+- **Every platform the crate supports drives a browser, since 0.59.0.** The
+  transport is the same pipe everywhere and the difference is in one function: on
+  unix the two ends are installed as descriptors 3 and 4 in `pre_exec`; on Windows
+  they are written into the child's C-runtime descriptor table through
+  `lpReserved2`, because Chromium turns the descriptors it is handed into handles
+  with `_get_osfhandle` and a descriptor number is not something a handle list can
+  carry. The pipes are anonymous on both, so there is no name another local
+  process could open — the same reason there is no debugging port.
 - **One page per run.** No tabs, windows, downloads, uploads, PDF printing,
   device emulation, request mocking, or cookie and storage manipulation.
 - **No waiting on arbitrary page conditions.** An action settles on the page's own
@@ -170,7 +174,7 @@ change for every `match` a caller wrote.
 | --- | --- | --- |
 | macOS | Supported, full suite in CI | Native, `sandbox-exec` |
 | Linux | Supported, full suite in CI | Native, a **chain** — Landlock, `bwrap`, namespaces, floor |
-| Windows | Supported, full suite in CI | Native, Job Object — **resources only** |
+| Windows | Supported, full suite in CI | Native: Job Object by default (**resources only**), AppContainer when the caller asks for access confinement (0.59.0) |
 
 Since 0.47.0 Linux is not one backend and a fallback but an ordered chain, and
 the rung a host takes is the strongest one that can enforce what the run asked
@@ -227,31 +231,36 @@ network namespaces; Windows does neither. So "sandboxed" on Windows means
 resource-capped and does not mean access-confined, and the two must not be read
 as the same claim.
 
-**The access half is `AppContainer`, 0.26.0 built it, and nothing selects it
-yet.** `io_harness::sandbox::appcontainer` creates a container profile, derives
-its SID, grants a path to it with an explicit ACE, and spawns into it through
+**The access half is `AppContainer`, and since 0.59.0 something selects it.**
+`io_harness::sandbox::appcontainer` creates a container profile, derives its SID,
+grants a path to it with an explicit ACE, and spawns into it through
 `CreateProcessW` with a `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute
-list. On the Windows CI runner a payload inside one is refused a read it was not
-granted and has no route off the machine, each against a negative control that
-must succeed outside the container.
+list. `SandboxConfig::access_confinement` is what reaches for it; without that the
+Job Object is still what a Windows run gets, which is why the table above has two
+Windows rows rather than one.
 
-`Sandbox::select` chooses the Job Object on Windows, so **the table above is what
-a run actually gets**.
+**0.47.0 was specified to select it and did not.** The Windows half was taken out
+of that release whole on 2026-08-10 and rescheduled to **0.59.0**; the record is
+`US-IO-HARNESS-0.47.0-I01`. Three real defects in the module were found and fixed
+on the way and are in the tree: an ACE built from `GENERIC_ALL` is stored verbatim
+by `SetEntriesInAclW` and matches no access check, so every grant the module made
+between 0.26.0 and 0.47.0 was inert while being readable back off the DACL; a tree
+grant must survive a descendant another process holds open, because `CARGO_HOME`
+is being read by the very build that asked for the sandbox; and a grant on a
+directory alone must not enumerate it, because both `aclapi` write entry points
+walk the whole subtree below their target.
 
-**0.47.0 was specified to select the container and does not.** The Windows half
-was taken out of that release whole on 2026-08-10 and rescheduled to **0.59.0**;
-the record is `US-IO-HARNESS-0.47.0-I01`. Three real defects in the module were
-found and fixed on the way and are in the tree: an ACE built from `GENERIC_ALL`
-is stored verbatim by `SetEntriesInAclW` and matches no access check, so every
-grant the module made between 0.26.0 and 0.47.0 was inert while being readable
-back off the DACL; a tree grant must survive a descendant another process holds
-open, because `CARGO_HOME` is being read by the very build that asked for the
-sandbox; and a grant on a directory alone must not enumerate it, because both
-`aclapi` write entry points walk the whole subtree below their target. What
-remains open is why the container declines the `CARGO_HOME` grant on
-`windows-latest`, and whether `cmd.exe` refusing to start a batch file named by an
-absolute path inside an AppContainer is a property of the platform or of this
-spawn.
+**0.59.0 found two more of the same shape, and neither was what any test was
+looking for.** The capability array that this module documents as its network
+boundary in both directions never reached the child: the spawn passed a count of
+zero unconditionally, so `internetClient` was registered against the profile name
+and absent from every token — the denial was right for a reason that had nothing
+to do with the capability set, and the permitting direction had never once been
+applied. And the memo that stops a path being granted twice was keyed by path,
+access and reach but not by the container it granted to, so a second profile in
+one process was told its grant was already done and read back carrying no ACE of
+its own. Both are fixed, both are asserted, and both are the same shape as the
+`GENERIC_ALL` defect: a grant that reports success and grants nothing.
 
 The original obstacle stands and is the grant set rather than the mechanism: an
 AppContainer is default-deny for reads, so the workspace is the easy part and the
@@ -1103,26 +1112,72 @@ wrote, which is what an incremental build depends on.
 **What each platform actually enforces differs, and the differences are not
 cosmetic.**
 
-| Platform | Resource caps | Writes confined | Egress denied |
-| --- | --- | --- | --- |
-| macOS | Yes | Yes, to what the mode grants | Yes |
-| Linux | Yes | Yes, to what the mode grants (0.40.0) | Yes, on every rung but Landlock below ABI 4 |
-| Windows | Yes | **No** | **No** |
+| Platform | Resource caps | Writes confined | Egress denied | Scoped per host |
+| --- | --- | --- | --- | --- |
+| macOS | Yes | Yes, to what the mode grants | Yes | Yes, through the run's proxy |
+| Linux | Yes | Yes, to what the mode grants (0.40.0) | Yes, on every rung but Landlock below ABI 4 | Yes, through the run's proxy |
+| Windows, default (Job Object) | Yes | **No** | **No** | **No** |
+| Windows, opt-in (AppContainer, 0.59.0) | Yes | Yes, to the paths the run resolved | Yes | **No — all or nothing** |
 
-**Windows is the row that is still open, and it did not change in 0.47.0.** A
-Job Object contains resources and nothing else, so a contained Windows command
-gets the caps and nothing more — no filesystem boundary and no egress boundary,
-because a job object has neither facility. `ExecMode` is routed and reported on
-this platform and enforces nothing for the filesystem.
+**Windows has two rows because it has two backends, and which one a run gets is
+the caller's decision.** The default is unchanged and is the Job Object: a kernel
+container for resources, with no filesystem facility and no network facility,
+where `ExecMode` is routed and reported and enforces nothing. Setting
+[`SandboxConfig::access_confinement`] selects the AppContainer instead — a low-box
+token that is default-deny on every securable object and reaches only the paths
+this run resolved, with no capability granting it a socket unless the run's policy
+permits egress.
 
-That was to change in 0.47.0. The Windows half of that release — the AppContainer
-selected, a grant set derived from the run's resolved facts, an empty capability
-array as the egress denial — was taken out of it whole on 2026-08-10 and is
-**0.59.0**. The record is `US-IO-HARNESS-0.47.0-I01`, and the reason is that the
-half could not be verified from the development host: ten CI rounds on
-`windows-latest` found three real defects in the module, fixed them, and did not
-converge. What a Windows run gets today is exactly what 0.46.0 gave it, which is
-why there is no migration note for this platform in this release.
+**It is opt-in because the grant set is derived and derived is not complete.** The
+workspace, the writable cache roots the toolchain named, the redirected temporary
+directory, the resolved program's own directory and `%SystemRoot%` come from the
+run's own facts; a toolchain reading a machine-wide file outside that set is
+refused. A default boundary that cannot run an arbitrary payload is worse than one
+a caller reaches for deliberately (`US-IO-HARNESS-0.26.0-I02`), so the default
+moves when the derived set has run a real cargo build, a real npm install and a
+real python payload on the CI image without a decline — and not before.
+
+**And it does not degrade.** Everywhere else in this crate an unavailable
+primitive falls back to a weaker rung and reports it. A boundary the caller asked
+for by name and that cannot be applied is an error instead, naming the grant that
+failed: a run that quietly took the Job Object here would have no access boundary
+at all while every assertion about it still passed, which is exactly how 0.47.0
+twice read a green run as proof the container had run `cargo`.
+
+**Per-host egress is the one column this platform does not deliver, and the
+reason is the platform's.** Since 0.48.0 a contained command's traffic goes
+through a loopback proxy the run owns, which asks the run's own `Policy` about
+every `host:port`. **A process inside an AppContainer cannot reach a loopback
+listener** — measured on `windows-latest` with no capability, with
+`internetClient`, with `privateNetworkClientServer` and with both, four arms and
+one outcome, while the same request succeeds immediately outside the container and
+an outbound request to a real host succeeds inside it with `internetClient`. It
+cannot reach the host's own network address either. So egress under Windows access
+confinement is a **capability**: a run permitting any egress reaches the network,
+a run denying egress reaches nothing, and the policy's per-host rules are not
+enforced there. A contained Windows command is therefore given no proxy at all,
+because pointing it at one it cannot reach would hang every request it makes
+instead of scoping it. The record is `US-IO-HARNESS-0.59.0-I03`.
+
+**Two answers this platform owed, both settled on the runner in 0.59.0.**
+
+- **The `CARGO_HOME` decline does not reproduce.** 0.47.0 left open why the
+  container declined that grant. On image `win25-vs2026 20260810.198.2` all four
+  shapes of the grant succeed, and so does every child of the directory
+  individually, while the cargo build that asked for the sandbox holds them open —
+  which is 0.47.0's own `TreeSetNamedSecurityInfoW` fix working. The question
+  outlived the fix that closed it. What does refuse on that image is
+  `%SystemRoot%`, which is read-execute, non-fatal by design, and already carries
+  an `ALL APPLICATION PACKAGES` ACE of its own.
+- **`cmd.exe` refusing a batch file named by an absolute path is a property of
+  the container, and `call` defeats it.** Inside the container `cmd /c <absolute
+  path>.bat` answers `Access is denied.` while `cmd /c call <the byte-identical
+  path>` runs, `type` reads the same file at the same path, and `.cmd`, forward
+  slashes and the long-name form all behave like the bare form. Outside the
+  container every one of them runs. So it is not the grant set, not the extension,
+  not the separator and not the path's ancestors: it is what `cmd.exe` does when a
+  *script* is the command name inside a low-box token. Name a payload relative to
+  the working directory, or put `call` in front of it.
 
 **On Windows and on the portable floor
 the `ExecMode` is therefore routed and reported and enforces nothing for the
