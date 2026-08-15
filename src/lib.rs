@@ -557,10 +557,10 @@ pub use state::{
     AgentEvent, CheckpointEvent, ContextEvent, Edit, FirstTry, GateAttempt, GateOutcome, McpEvent,
     MemoryEntry, MemoryForget, MemoryKind, MemoryLimits, MemoryRecall, MemoryWrite, Pending,
     PendingPlan, PendingQuestion, PolicyEvent, ProcessHandle, ProviderCall, Recovery, RewindRecord,
-    RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, Summary, Tally, TodoItem,
-    TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT, GLOBAL_MEMORY_WORKSPACE, MEMORY_MAX_CHARS,
-    MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP,
-    UNKNOWN_MODEL,
+    RunStatus, RunSummary, SandboxEvent, SessionSize, SpawnRow, StepRecord, Store, StoreSize,
+    Summary, Tally, TodoItem, TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT,
+    GLOBAL_MEMORY_WORKSPACE, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
+    SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP, UNKNOWN_MODEL,
 };
 pub use template::{Template, Templates};
 pub use tools::git::Identity;

@@ -10,7 +10,7 @@ tasks:
      compaction is proved by three reads of the same store size. If the size call is wrong the
      deletion and the compaction cannot be proved at all. It is also the half that delivers "an
      operator can see what a store is holding" on its own.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -19,7 +19,17 @@ tasks:
         the test, and `rows` equals the seeded row count. `StoreSize::file_bytes` equals
         `page_size × page_count` read directly. Sabotage: count only the tables with an obvious text
         column, under which the independent sum disagrees and only F13 fails.
-    evidence: []
+    evidence:
+    - "`the_size_of_a_session_is_the_bytes_of_its_own_rows`,
+      `the_size_of_a_store_is_the_files_own_page_arithmetic`,
+      `the_size_of_a_session_that_is_not_there_is_none` and
+      `a_seeded_run_can_be_put_into_every_status_the_sweep_reads` in `tests/retention.rs` — 4 passed."
+    - "The independence F13 claims is real on the dimension that can actually go wrong: the crate sums
+      over a static `RUN_TABLES` list, and the test sums over `sqlite_master`, so a table missing from
+      the crate's list makes the two disagree. Both read columns from `PRAGMA table_info`, which is
+      what keeps a column added by a later release counted without anyone remembering to."
+    - "`dbstat` answers on this build, as the premise check predicted — the per-table breakdown is
+      non-empty and sums to no more than the file's own bytes."
     files:
       - src/state.rs
       - src/lib.rs

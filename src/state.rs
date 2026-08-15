@@ -2938,6 +2938,148 @@ fn handle_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessHandle> {
 /// ```
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Every table this crate creates that hangs off a run, paired with the column
+/// that names the run.
+///
+/// 0.58.0's retention calls all walk this list: the size call sums over it, the
+/// deletion clears it, and the archive empties the words out of it. It is one
+/// list rather than three because three would drift, and a table missing from
+/// one of them is a silent orphan — the schema declares exactly one foreign key
+/// (`steps.run_id`) and never enables `PRAGMA foreign_keys`, so nothing in
+/// SQLite will say a word about a row whose run no longer exists.
+///
+/// **`memory` is deliberately absent.** A note carries the `run_id` that wrote
+/// it, but it is a workspace asset that outlives that run — 0.56.0 made this
+/// explicit by adding a scope above the workspace — so removing a session never
+/// removes a note. `memory_recalls` *is* here: a recall row names a run, and a
+/// recall by a run that no longer exists is not evidence.
+///
+/// `sessions`, `session_turns` and `runs` are absent too, because they are keyed
+/// by the session or are the run row itself, and the retention calls handle them
+/// by name in the order that keeps the walk answerable while it runs.
+pub(crate) const RUN_TABLES: &[(&str, &str)] = &[
+    ("steps", "run_id"),
+    ("policy_events", "run_id"),
+    ("pending_approvals", "run_id"),
+    ("agent_events", "run_id"),
+    ("sandbox_events", "run_id"),
+    ("checkpoint_events", "run_id"),
+    ("spawns", "parent_run_id"),
+    ("mcp_events", "run_id"),
+    ("memory_recalls", "run_id"),
+    ("memory_snapshots", "run_id"),
+    ("context_events", "run_id"),
+    ("run_outcomes", "run_id"),
+    ("run_policies", "run_id"),
+    ("ledger_observations", "run_id"),
+    ("provider_calls", "run_id"),
+    ("edits", "run_id"),
+    ("todos", "run_id"),
+    ("pending_questions", "run_id"),
+    ("citations", "run_id"),
+    ("server_tool_calls", "run_id"),
+    ("process_handles", "run_id"),
+    ("handle_output", "run_id"),
+    ("snapshots", "run_id"),
+    ("plans", "run_id"),
+    ("agent_queue", "parent_run_id"),
+    ("run_events", "run_id"),
+    ("rewinds", "run_id"),
+    ("gate_attempts", "run_id"),
+    ("summaries", "run_id"),
+];
+
+/// What one session is holding, in the bytes of its own rows.
+///
+/// **These are content bytes, not pages on disk, and the distinction is not
+/// pedantry.** SQLite stores rows in b-tree pages shared between whatever
+/// happens to be adjacent, and `dbstat` — which this crate's bundled SQLite does
+/// compile in — reports a page's owner as a *table*, never as a session. A
+/// per-session page count would therefore be a number with no way to be right.
+/// What is exactly answerable is how many bytes of text and blob this session's
+/// rows hold, and how many rows that is, which is what a growth question is
+/// really asking. For the file's own arithmetic, use [`Store::store_size`].
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let session = store.create_session("/repo")?;
+/// let run = store.start_run("summarise the changelog", "/repo")?;
+/// let turn = store.record_turn(session, None, run, "what changed in 0.57?")?;
+/// store.finish_turn(turn, Some("three things"), "ok")?;
+///
+/// let size = store.session_size(session)?.expect("the session exists");
+/// assert_eq!(size.turns, 1);
+/// assert_eq!(size.runs, 1);
+/// assert!(size.bytes > 0);
+///
+/// // Asking the size of a session that is not there has no answer, which is a
+/// // different fact from a session that is there and holds nothing.
+/// assert!(store.session_size(9_999)?.is_none());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSize {
+    /// The session this describes.
+    pub session_id: i64,
+    /// Turns in the conversation.
+    pub turns: u64,
+    /// Runs in the session's tree — its turns' runs, and everything those runs
+    /// spawned.
+    pub runs: u64,
+    /// Rows across every table keyed to those runs, plus the turns themselves.
+    pub rows: u64,
+    /// The summed `length()` of every text and blob column of those rows.
+    pub bytes: u64,
+}
+
+/// What the whole store is holding: the file's real page arithmetic, and where
+/// the pages went.
+///
+/// `file_bytes` is `page_size × page_count` — the size SQLite believes the
+/// database to be, which is the size on disk for everything but the trailing
+/// journal. `free_bytes` is the part of that already free *inside* the file and
+/// therefore reusable without growing it. A deletion moves bytes from the first
+/// figure into the second and shrinks nothing; [`Store::compact`] is what moves
+/// them out of the file altogether.
+///
+/// `tables` is `dbstat`'s per-table page usage, largest first, so the answer to
+/// "what is this store holding" is the first line rather than a search.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// store.create_session("/repo")?;
+/// store.start_run("a goal", "/repo")?;
+///
+/// let size = store.store_size()?;
+/// assert_eq!(size.sessions, 1);
+/// assert_eq!(size.runs, 1);
+/// assert!(size.file_bytes > 0);
+/// assert!(size.free_bytes <= size.file_bytes);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreSize {
+    /// `page_size × page_count`: what the database file occupies.
+    pub file_bytes: u64,
+    /// `page_size × freelist_count`: the part of it already free inside the
+    /// file, which a write reuses and a deletion adds to.
+    pub free_bytes: u64,
+    /// Sessions in the store.
+    pub sessions: u64,
+    /// Runs in the store, including runs no session reaches.
+    pub runs: u64,
+    /// Per-table bytes from `dbstat`, largest first.
+    pub tables: Vec<(String, u64)>,
+}
+
 impl Store {
     /// Open (creating if absent) a store at `path` and ensure the schema exists.
     ///
@@ -3840,6 +3982,21 @@ impl Store {
         // two would no longer be the same database.
         let _ = conn.execute("ALTER TABLE edits ADD COLUMN hunk TEXT", []);
         let _ = conn.execute("ALTER TABLE rewinds ADD COLUMN undid_step INTEGER", []);
+
+        // 0.58.0 — the index every retention call enters through. `session_turns`
+        // has been queried by `session_id` since 0.20.0 and has never carried one,
+        // which did not matter while the only reader was a conversation reading
+        // its own turns and does once a sweep asks the question for every session
+        // in the store.
+        //
+        // Additive, and deliberately NOT a `CHECKPOINT_FORMAT` bump, for the
+        // reason every addition since 0.13.0 has not been one: no checkpoint
+        // layout changed, a 0.57.0 binary never names this index, and bumping the
+        // format would make [`Self::check_resumable`] refuse every 0.57.0 store
+        // over an index that only makes an existing query faster.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS session_turns_session ON session_turns (session_id);",
+        )?;
 
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
@@ -7650,6 +7807,207 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Every run in a session's tree: the runs its turns drove, and everything
+    /// those runs spawned, transitively.
+    ///
+    /// The same walk the tree resume takes, and the reason the retention unit is
+    /// a session rather than a turn — a turn's run may have spawned children,
+    /// and a half-removed tree is precisely the orphan state 0.58.0 exists to
+    /// prevent. Takes the ids as a rendered list because SQLite has no array
+    /// parameter and the ids are integers this crate minted; nothing here is
+    /// caller-supplied text.
+    fn session_run_ids(conn: &Connection, sessions: &[i64]) -> Result<Vec<i64>> {
+        if sessions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = id_list(sessions);
+        let mut stmt = conn.prepare(&format!(
+            "WITH RECURSIVE tree(id) AS (
+                 SELECT run_id FROM session_turns WHERE session_id IN ({list})
+                 UNION
+                 SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
+             )
+             SELECT id FROM tree ORDER BY id"
+        ))?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// The text and blob columns of one table, read from the schema this store
+    /// actually has rather than from a list compiled into the binary.
+    ///
+    /// A later release that adds a column gets it counted, cleared and summed
+    /// without anyone remembering to add it here — which is the same argument
+    /// the deletion's own test makes by enumerating `sqlite_master` instead of
+    /// checking a list.
+    fn text_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let cols = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(cols
+            .into_iter()
+            .filter(|(_, ty)| {
+                let ty = ty.to_uppercase();
+                ty.contains("TEXT") || ty.contains("BLOB")
+            })
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    /// What one session is holding, in the bytes of its own rows.
+    ///
+    /// `None` for a session id the store does not have. That is a different
+    /// answer from a session that exists and holds nothing, and the two are kept
+    /// apart on purpose: an operator sweeping a list of ids needs to know which
+    /// of them were already gone.
+    ///
+    /// See [`SessionSize`] for why the figure is content bytes rather than pages
+    /// on disk, and [`Store::store_size`] for the file's own arithmetic.
+    pub fn session_size(&self, session_id: i64) -> Result<Option<SessionSize>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            [session_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        let runs = Self::session_run_ids(&self.conn, &[session_id])?;
+        let turns: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM session_turns WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )?;
+
+        let mut rows: i64 = turns;
+        let mut bytes: i64 = self.sum_text(
+            "session_turns",
+            "session_id",
+            &id_list(&[session_id]),
+            false,
+        )?;
+        if !runs.is_empty() {
+            let list = id_list(&runs);
+            rows += runs.len() as i64;
+            bytes += self.sum_text("runs", "id", &list, false)?;
+            for (table, key) in RUN_TABLES {
+                rows += self.count_rows(table, key, &list)?;
+                bytes += self.sum_text(table, key, &list, false)?;
+            }
+        }
+
+        Ok(Some(SessionSize {
+            session_id,
+            turns: turns.max(0) as u64,
+            runs: runs.len() as u64,
+            rows: rows.max(0) as u64,
+            bytes: bytes.max(0) as u64,
+        }))
+    }
+
+    /// Rows of `table` whose `key` is in the rendered `ids` list.
+    fn count_rows(&self, table: &str, key: &str, ids: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {key} IN ({ids})"),
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The summed `length()` of every text and blob column of the matching rows.
+    ///
+    /// `only_nonempty` counts nothing that is already empty, which is what makes
+    /// the archive's second run able to report honestly that it cleared nothing.
+    fn sum_text(&self, table: &str, key: &str, ids: &str, only_nonempty: bool) -> Result<i64> {
+        let cols = Self::text_columns(&self.conn, table)?;
+        if cols.is_empty() {
+            return Ok(0);
+        }
+        let sum = cols
+            .iter()
+            .map(|c| format!("COALESCE(SUM(LENGTH({c})), 0)"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let filter = if only_nonempty {
+            let any = cols
+                .iter()
+                .map(|c| format!("COALESCE(LENGTH({c}), 0) > 0"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            format!(" AND ({any})")
+        } else {
+            String::new()
+        };
+        Ok(self.conn.query_row(
+            &format!("SELECT {sum} FROM {table} WHERE {key} IN ({ids}){filter}"),
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// What the whole store is holding: the file's page arithmetic, and where
+    /// the pages went.
+    ///
+    /// Read this before and after a [`Store::delete_session`] to see that a
+    /// deletion frees pages *into* the file, and before and after a
+    /// [`Store::compact`] to see them leave it.
+    pub fn store_size(&self) -> Result<StoreSize> {
+        let page_size: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let page_count: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        let freelist: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        let sessions: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+        let runs: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))?;
+
+        // `dbstat` is a virtual table over the b-tree pages, compiled into the
+        // bundled SQLite this crate links (`-DSQLITE_ENABLE_DBSTAT_VTAB`). It is
+        // the only source that can say which table the pages went to — and it
+        // cannot say which *session*, which is why `SessionSize` counts bytes
+        // instead. A build without it is not an error worth failing a size call
+        // over: the breakdown is empty and the file's own figures still stand.
+        let tables = {
+            let mut out = Vec::new();
+            if let Ok(mut stmt) = self
+                .conn
+                .prepare("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name")
+            {
+                if let Ok(rows) = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+                }) {
+                    out = rows.filter_map(|r| r.ok()).collect::<Vec<_>>();
+                }
+            }
+            out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            out
+        };
+
+        Ok(StoreSize {
+            file_bytes: (page_size * page_count).max(0) as u64,
+            free_bytes: (page_size * freelist).max(0) as u64,
+            sessions: sessions.max(0) as u64,
+            runs: runs.max(0) as u64,
+            tables,
+        })
+    }
+}
+
+/// Row ids as a SQL list. Every caller passes integers this crate minted, so
+/// there is nothing here to escape — the function exists because SQLite has no
+/// array parameter and a `?` per id would rebuild the statement per call.
+pub(crate) fn id_list(ids: &[i64]) -> String {
+    ids.iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
