@@ -1424,6 +1424,220 @@ mod tests {
         );
     }
 
+    /// DIAG (0.59.0, throwaway — never merged): why the container declines a
+    /// grant on this host, asked one path at a time with the error printed.
+    ///
+    /// `run_contained` returns `None` on the first fatal grant failure and the
+    /// Job Object then runs the command unconfined, so the release only ever saw
+    /// "declined" with one reason attached. This applies the whole derived set
+    /// itself, reports every path's outcome, and then asks the same question of
+    /// `CARGO_HOME` in four different shapes to separate "this path" from "this
+    /// reach" from "this right".
+    #[cfg(windows)]
+    #[test]
+    fn diag_which_grants_this_host_refuses_and_why() {
+        use crate::sandbox::appcontainer::win::{grant_for, granted_mask, Profile};
+
+        let mut report = String::from("\n  environment:");
+        for key in [
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "USERPROFILE",
+            "TEMP",
+            "TMP",
+            "USERNAME",
+            "SystemRoot",
+        ] {
+            report.push_str(&format!(
+                "\n    {key}={:?}",
+                std::env::var(key).unwrap_or_else(|_| "<unset>".into())
+            ));
+        }
+        report.push_str(&format!(
+            "\n    current_dir={:?}",
+            std::env::current_dir().unwrap_or_default()
+        ));
+
+        let here = std::env::current_dir().unwrap_or_default();
+        let toolchain = crate::toolchain::detect(&here);
+        let roots = crate::sandbox::writable_cache_roots(toolchain.as_ref());
+        report.push_str(&format!("\n  writable cache roots: {roots:?}"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = std::env::temp_dir();
+        let program_dir = crate::sandbox::resolve_program("cmd")
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .filter(|p| !p.as_os_str().is_empty());
+        let system_root = std::env::var_os("SystemRoot").map(PathBuf::from);
+        let derived = grants(
+            ExecMode::WorkspaceWrite,
+            dir.path(),
+            &roots,
+            &crate::toolchain::Toolchain::launcher_homes(),
+            program_dir.as_deref(),
+            system_root.as_deref(),
+            &tmp,
+        );
+
+        let profile = match Profile::create("io-harness-diag", false) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("{report}\n  NO PROFILE: {e}");
+                panic!("the host could not create an AppContainer profile: {e}");
+            }
+        };
+
+        report.push_str("\n  applying the derived set, one path at a time:");
+        for g in &derived {
+            let outcome = match grant_for(&g.path, profile.sid(), g.grant, g.reach) {
+                Ok(()) => format!(
+                    "ok, mask now {:?}",
+                    granted_mask(&g.path, profile.sid()).map(|m| format!("{m:#010x}"))
+                ),
+                Err(e) => format!("REFUSED os_error={:?} {e}", e.raw_os_error()),
+            };
+            report.push_str(&format!(
+                "\n    {:?} {:?} is_dir={} {} -> {outcome}",
+                g.grant,
+                g.reach,
+                g.path.is_dir(),
+                g.path.display()
+            ));
+        }
+
+        // The same question of `CARGO_HOME` in four shapes. A `Full`/`Tree` grant
+        // on a cache root is the one this release saw refused, and the reach and
+        // the right have never been varied separately.
+        if let Some(cargo_home) = roots.iter().find(|p| p.ends_with(".cargo")).cloned() {
+            report.push_str("\n  CARGO_HOME, four shapes:");
+            for (grant, reach) in [
+                (Grant::Full, Reach::Tree),
+                (Grant::Full, Reach::DirectoryOnly),
+                (Grant::ReadExecute, Reach::Tree),
+                (Grant::Traverse, Reach::DirectoryOnly),
+            ] {
+                let outcome = match grant_for(&cargo_home, profile.sid(), grant, reach) {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => format!("REFUSED os_error={:?} {e}", e.raw_os_error()),
+                };
+                report.push_str(&format!("\n    {grant:?} {reach:?} -> {outcome}"));
+            }
+            // Which descendant refuses, if the tree grant does. A tree walk stops
+            // at the first object that says no, and naming it is the whole
+            // question.
+            report.push_str("\n  CARGO_HOME children, Full/Tree each:");
+            if let Ok(entries) = std::fs::read_dir(&cargo_home) {
+                for entry in entries.flatten().take(12) {
+                    let path = entry.path();
+                    let outcome = match grant_for(&path, profile.sid(), Grant::Full, Reach::Tree) {
+                        Ok(()) => "ok".to_string(),
+                        Err(e) => format!("REFUSED os_error={:?} {e}", e.raw_os_error()),
+                    };
+                    report.push_str(&format!(
+                        "\n    is_dir={} {} -> {outcome}",
+                        path.is_dir(),
+                        path.display()
+                    ));
+                }
+            }
+        } else {
+            report.push_str("\n  CARGO_HOME: not among the writable roots on this host");
+        }
+
+        println!("{report}");
+    }
+
+    /// DIAG (0.59.0, throwaway — never merged): is `cmd.exe` refusing a batch
+    /// file named by an absolute path a property of the platform, of the
+    /// container, or of how this spawn names it?
+    ///
+    /// 0.47.0 established that the same file runs when named relative to the
+    /// working directory and is *read* by `type` at the same absolute path, so it
+    /// is neither the grant set nor the path's ancestors. What was never varied:
+    /// the same command run **outside** the container (the control that decides
+    /// platform-or-container), `call`, a `.cmd` extension, forward slashes, and
+    /// an executable rather than a script at the same kind of path.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn diag_what_exactly_cmd_refuses_by_absolute_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = "@echo off\r\necho io-harness-probe\r\n";
+        for name in ["probe.bat", "probe.cmd"] {
+            std::fs::write(dir.path().join(name), script).expect("probe script");
+        }
+        let bat = dir.path().join("probe.bat").display().to_string();
+        let cmd_ext = dir.path().join("probe.cmd").display().to_string();
+        let slashed = bat.replace('\\', "/");
+        let long = std::fs::canonicalize(dir.path())
+            .map(|p| p.to_string_lossy().trim_start_matches(r"\\?\").to_string())
+            .unwrap_or_else(|_| dir.path().display().to_string());
+        let quoted = format!("\"{long}\\probe.bat\"");
+        let cmd_exe = crate::sandbox::resolve_program("cmd")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "cmd".into());
+
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            ("bare absolute .bat", vec!["cmd".into(), "/c".into(), bat.clone()]),
+            (
+                "call + absolute .bat",
+                vec!["cmd".into(), "/c".into(), "call".into(), bat.clone()],
+            ),
+            ("absolute .cmd", vec!["cmd".into(), "/c".into(), cmd_ext]),
+            ("forward slashes", vec!["cmd".into(), "/c".into(), slashed]),
+            ("quoted long absolute", vec!["cmd".into(), "/c".into(), quoted]),
+            (
+                "cmd.exe by absolute path, relative script",
+                vec![cmd_exe, "/c".into(), "probe.bat".into()],
+            ),
+            (
+                "an .exe by absolute path",
+                vec![
+                    crate::sandbox::resolve_program("where")
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    "cmd".into(),
+                ],
+            ),
+        ];
+
+        let limits = SandboxLimits::none();
+        let mut report = String::from("\n  inside the container | outside it:");
+        for (what, argv) in cases {
+            if argv.iter().any(String::is_empty) {
+                report.push_str(&format!("\n    {what}: no path to the subject here"));
+                continue;
+            }
+            let spec = RunSpec::new(&argv, dir.path(), &limits)
+                .with_mode(ExecMode::WorkspaceWrite)
+                .with_network(false);
+            let inside = match job::run_contained(&spec).await {
+                None => format!(
+                    "DECLINED — {}",
+                    job::last_decline().unwrap_or_else(|| "no reason recorded".into())
+                ),
+                Some(Err(e)) => format!("backend error: {e}"),
+                Some(Ok(o)) => format!("exit {:?} out {:?}", o.exit_code, o.stdout.trim()),
+            };
+            // The control. Same argv, same working directory, no container: if
+            // this refuses too, the platform refuses it and the container is not
+            // the subject.
+            let outside = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .current_dir(dir.path())
+                .output()
+                .map(|o| {
+                    format!(
+                        "exit {:?} out {:?}",
+                        o.status.code(),
+                        String::from_utf8_lossy(&o.stdout).trim().to_string()
+                    )
+                })
+                .unwrap_or_else(|e| format!("could not start: {e}"));
+            report.push_str(&format!("\n    {what}: [{inside}] | [{outside}]"));
+        }
+        println!("{report}");
+    }
+
     fn find<'a>(g: &'a [GrantedPath], p: &str) -> Option<&'a GrantedPath> {
         g.iter().find(|x| x.path == Path::new(p))
     }
