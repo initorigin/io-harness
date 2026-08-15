@@ -1,0 +1,90 @@
+# Throwaway diagnostic for 0.59.0's Windows spawn. Never merged.
+#
+# `ci.yml` triggers on pushes to `main`/`develop` and on pull requests, so a
+# `diag/**` branch runs only what is written here.
+#
+# **Push-triggered, and that is not the default choice.** An interactive session
+# would be dispatched by hand — but `workflow_dispatch` is not available for a
+# workflow file that is not on the default branch, which is the trap 0.48.0
+# recorded. So the probes run on a push and the job ends when they do, which is
+# also the shape that cannot strand a runner. The interactive shell is opt-in on
+# the commit message (`[tmate]`), for the case a round comes back ambiguous.
+#
+# Every experiment is built inside the test binary rather than typed at the
+# prompt: the tmate shell on Windows is MSYS2 bash, which rewrites path-shaped
+# arguments — and one of the two open questions *is* a question about absolute
+# paths, so a hand-typed repro there could manufacture the symptom.
+name: diag
+on:
+  push:
+    branches: ["diag/**"]
+
+permissions:
+  contents: read
+
+# **Not the default.** Cancelling in progress kills a live diagnostic session and
+# takes the finding with it; a diag round is the one thing worth finishing even
+# when a newer commit exists.
+concurrency:
+  group: diag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: diag (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      # 19 GiB of `target/` against 159 MiB on this crate. Runner disk is finite
+      # and cannot be extended mid-job.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      RUSTFLAGS: "-Clinker=rust-lld"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      # A restored cache rewrites `CARGO_HOME` as the runner user — the very tree
+      # one of the two questions is about. The first round on this key is cold by
+      # construction, and that is recorded with the answer rather than assumed.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: diag
+
+      - name: a place for findings that survives the runner
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path diagnostics | Out-Null
+
+      - name: what this runner has
+        shell: pwsh
+        run: |
+          "image: $env:ImageOS $env:ImageVersion" | Tee-Object -FilePath diagnostics/runner.txt
+
+      - name: build what the tests spawn
+        run: cargo build --all-features --tests --example browser_fixture
+
+      # The access half: every Windows container test, the instrument included.
+      - name: the container tests
+        continue-on-error: true
+        shell: pwsh
+        run: cargo test --all-features --lib -- --nocapture --test-threads=1 sandbox:: 2>&1 | Tee-Object -FilePath diagnostics/container.txt
+
+      # The browser half against the fixture, on the platform that had none.
+      - name: the browser suite
+        continue-on-error: true
+        shell: pwsh
+        run: cargo test --all-features --test browser -- --nocapture 2>&1 | Tee-Object -FilePath diagnostics/browser.txt
+
+      # And against a real browser, which is the only thing that can show the
+      # transport was understood rather than merely made to compile.
+      - name: a real browser over the real transport
+        continue-on-error: true
+        shell: pwsh
+        run: cargo run --all-features --example browser_live 2>&1 | Tee-Object -FilePath diagnostics/live.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: diagnostics
+          path: diagnostics/
