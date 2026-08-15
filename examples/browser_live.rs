@@ -20,30 +20,30 @@
 //! is exercised against a real `host:port` rather than a `data:` URL that reaches
 //! no host at all.
 
-#[cfg(not(feature = "browser"))]
+#[cfg(not(all(feature = "browser", unix)))]
 fn main() {
-    eprintln!("this example needs the `browser` feature; nothing to run here");
+    eprintln!("the browser feature is unix-only in 0.53.0; nothing to run here");
 }
 
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 use std::io::{Read, Write};
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 use std::sync::Mutex;
 
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 use io_harness::{ApproveAll, BrowserConfig, Policy, Provider, Store, TaskContract, Verification};
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 use serde_json::{json, Value};
 
 /// The page the run drives: something to read, something to click, something to
 /// type into, and a script that logs and throws.
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 const PAGE: &str = r#"<!doctype html><html><body>
 <h1 id="title">Live page</h1>
 <p>The quick brown fox jumps over the lazy dog.</p>
@@ -57,7 +57,7 @@ const PAGE: &str = r#"<!doctype html><html><body>
 </body></html>"#;
 
 /// A provider that plays a fixed list of browser calls and keeps what it was shown.
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 struct Script {
     steps: Vec<Vec<ToolCall>>,
     at: AtomicUsize,
@@ -66,7 +66,7 @@ struct Script {
     image_bytes: Mutex<usize>,
 }
 
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 impl Provider for Script {
     fn name(&self) -> &str {
         "live-script"
@@ -89,11 +89,11 @@ impl Provider for Script {
     }
 }
 
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 #[derive(Default)]
 struct Events(Mutex<Vec<RunEvent>>);
 
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 impl Observer for Events {
     fn event(&self, event: &RunEvent) -> Flow {
         self.0.lock().unwrap().push(event.clone());
@@ -101,7 +101,7 @@ impl Observer for Events {
     }
 }
 
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 fn call(name: &str, args: Value) -> ToolCall {
     ToolCall {
         name: name.into(),
@@ -114,7 +114,7 @@ fn call(name: &str, args: Value) -> ToolCall {
 /// Written by hand over `std::net` rather than pulled from a dependency: it is
 /// twenty lines, it runs in this example only, and the whole point of the release
 /// is that the crate adds no dependency to talk to a browser.
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 fn serve() -> std::net::SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let addr = listener.local_addr().expect("the bound address");
@@ -137,7 +137,7 @@ fn serve() -> std::net::SocketAddr {
     addr
 }
 
-#[cfg(feature = "browser")]
+#[cfg(all(feature = "browser", unix))]
 #[tokio::main]
 async fn main() {
     let addr = serve();

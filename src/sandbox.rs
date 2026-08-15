@@ -204,6 +204,49 @@ impl Backend {
         }
     }
 
+    /// Can this backend hold a contained command to the *hosts* the policy names,
+    /// rather than only to the yes-or-no of [`denies_egress`](Backend::denies_egress)?
+    ///
+    /// Since 0.48.0 a run whose policy names hosts routes its contained commands
+    /// through a loopback proxy it owns, which asks that policy about every
+    /// `host:port`. That mechanism needs one thing from the backend: that a
+    /// process inside it can reach a loopback listener.
+    ///
+    /// **[`WindowsAppContainer`](Backend::WindowsAppContainer) cannot**, and no
+    /// capability changes it — measured on `windows-latest` with none, with
+    /// `internetClient`, with `privateNetworkClientServer` and with both, while
+    /// the same request succeeds outside the container and an outbound request to
+    /// a real host succeeds inside it. So egress there is the capability itself:
+    /// all of the network, or none of it. A run that would have been proxied is
+    /// given no proxy on that backend rather than one it cannot reach, and the
+    /// agent's own boundary section says which of the two it has.
+    ///
+    /// Third exhaustive `match` beside the two above, and for the same reason: the
+    /// next backend added is a compile error here rather than a claim it quietly
+    /// inherited.
+    ///
+    /// ```
+    /// use io_harness::Backend;
+    ///
+    /// assert!(Backend::MacosSandboxExec.scopes_egress_per_host());
+    /// // Denies egress outright, and cannot be told which hosts to allow.
+    /// assert!(Backend::WindowsAppContainer.denies_egress());
+    /// assert!(!Backend::WindowsAppContainer.scopes_egress_per_host());
+    /// ```
+    pub fn scopes_egress_per_host(&self) -> bool {
+        match self {
+            Backend::MacosSandboxExec
+            | Backend::LinuxLandlock
+            | Backend::LinuxBubblewrap
+            | Backend::LinuxNamespaces => true,
+            // The two that enforce nothing to scope, and the one that enforces a
+            // boundary the proxy is on the wrong side of.
+            Backend::WindowsAppContainer | Backend::WindowsJobObject | Backend::PortableFloor => {
+                false
+            }
+        }
+    }
+
     /// A stable label for the trace and logs.
     pub fn as_str(&self) -> &'static str {
         match self {

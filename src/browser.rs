@@ -203,13 +203,50 @@ pub(crate) const WELL_KNOWN: &[&str] = &[
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
 ];
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub(crate) const WELL_KNOWN: &[&str] = &[
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome",
     "/opt/google/chrome/chrome",
 ];
+
+/// The conventional install locations on Windows.
+///
+/// **This list is the reason the feature is usable on this platform at all.**
+/// Nothing in [`RESOLUTION_ORDER`] is on `PATH` there — a Windows browser is
+/// installed under Program Files and put on the Start menu, not on the search
+/// path — so until 0.59.0 the machine-wide list here was the unix one and a
+/// Windows host with Chrome installed answered "no browser was found". The
+/// transport working and the browser being findable are two different things, and
+/// only running the live example on the platform showed the second.
+#[cfg(windows)]
+pub(crate) const WELL_KNOWN: &[&str] = &[
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files\Chromium\Application\chrome.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+];
+
+/// The same browsers where a per-user install puts them, which is where a
+/// machine nobody administers has them.
+///
+/// Derived from the environment rather than written out, because the path
+/// contains the account name. Consulted after [`WELL_KNOWN`], so a machine-wide
+/// install still wins.
+#[cfg(windows)]
+fn user_installed() -> Vec<std::path::PathBuf> {
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+        return Vec::new();
+    };
+    let local = std::path::PathBuf::from(local);
+    vec![
+        local.join(r"Google\Chrome\Application\chrome.exe"),
+        local.join(r"Chromium\Application\chrome.exe"),
+        local.join(r"Microsoft\Edge\Application\msedge.exe"),
+    ]
+}
 
 /// An error naming the browser, which is the only kind this module returns.
 pub(crate) fn fail(reason: impl Into<String>) -> Error {
@@ -768,6 +805,12 @@ pub(crate) fn resolve(config: &BrowserConfig) -> Result<std::path::PathBuf> {
             return Ok(path.to_path_buf());
         }
     }
+    #[cfg(windows)]
+    for path in user_installed() {
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
     Err(fail(format!(
         "no browser was found. Nothing is downloaded — install one of {}, \
          or name one in the [browser] table",
@@ -974,7 +1017,7 @@ pub(crate) async fn launch(
     let cwd = std::env::current_dir()
         .map_err(|e| fail(format!("could not read the current directory: {e}")))?;
 
-    let mut child = Spawned::start_with(Plan {
+    let child = Spawned::start_with(Plan {
         cmdline: &cmdline,
         cwd: &cwd,
         profile: None,

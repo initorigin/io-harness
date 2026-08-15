@@ -347,7 +347,8 @@
 //! | --- | --- |
 //! | macOS | Native, `sandbox-exec` |
 //! | Linux | Native, namespaces and rlimits |
-//! | Windows | Native resource containment (memory, CPU, process count, tree kill); no filesystem or network boundary |
+//! | Windows, default | Native resource containment (memory, CPU, process count, tree kill); no filesystem or network boundary |
+//! | Windows, opt-in | Native access confinement: an AppContainer inside that job, writes confined and egress denied (0.59.0) |
 //!
 //! The Windows row is deliberately not the word "Native" on its own, because it
 //! would not mean there what it means in the two rows above it. Since 0.24.0 a
@@ -373,18 +374,25 @@
 //! degrades to [`Backend::PortableFloor`] and **reports the floor**, because the
 //! one thing worse than no boundary is a boundary that is named and absent.
 //!
-//! **Windows has no access half yet, and this paragraph is the honest version of
-//! that.** A contained Windows run gets a Job Object: memory, CPU, active
+//! **Windows has an access half since 0.59.0, and the caller chooses it.** By
+//! default a contained Windows run still gets a Job Object: memory, CPU, active
 //! processes and a tree kill on close, reported as
-//! [`Backend::WindowsJobObject`]. A job object has no filesystem facility and no
-//! network facility, so [`ExecMode`] is routed and reported on this platform and
-//! enforces nothing for the filesystem. `sandbox::appcontainer` holds the
-//! mechanism that would change it — a container created, paths granted to its
-//! SID, a spawn into it, proven on CI against negative controls for both a
-//! refused read and a refused socket — and nothing selects it. 0.47.0 was to be
-//! the release that did; the Windows half was taken out of it whole and is
-//! **0.59.0**, which is recorded rather than implied: see `docs/CONTRACT.md` for
-//! what a Windows run does and does not enforce today.
+//! [`Backend::WindowsJobObject`], with no filesystem facility and no network
+//! facility, so [`ExecMode`] is routed and reported there and enforces nothing.
+//! [`SandboxConfig::with_access_confinement`] selects `sandbox::appcontainer`
+//! instead — a low-box token that is default-deny on every securable object and
+//! reaches only the paths this run resolved, reported as
+//! [`Backend::WindowsAppContainer`], which both
+//! [`Backend::confines_writes`] and [`Backend::denies_egress`] answer true for.
+//!
+//! It is the caller's decision because the grant set is derived from the run's
+//! own facts and derived is not complete: a toolchain reading a machine-wide file
+//! outside it is refused, and a default boundary that cannot run an arbitrary
+//! payload is worse than one a caller reaches for deliberately. And unlike every
+//! other backend here it does not degrade — a boundary asked for by name that
+//! cannot be applied is an error naming the grant that failed, because a run that
+//! silently took the Job Object instead would have no boundary at all while every
+//! assertion about it still passed.
 //!
 //! Linux likewise stopped being one backend and a fallback. It is a chain —
 //! Landlock, `bwrap`, the namespace backend, the floor — and the rung a host takes
@@ -402,10 +410,13 @@
 //! started. And a run whose [`Policy`] names hosts routes its contained commands
 //! through a loopback proxy the run owns, which asks that policy about every
 //! `host:port`. What the proxy proves differs per backend and the weaker answer is
-//! reported: address-scoped on macOS, **port-scoped** under Landlock, and
-//! **advisory** on the portable floor and on Windows — where the agent's own
-//! boundary section uses that word rather than implying a boundary it does not
-//! have.
+//! reported: address-scoped on macOS, **port-scoped** under Landlock,
+//! **advisory** on the portable floor and under a Windows Job Object — where the
+//! agent's own boundary section uses that word rather than implying a boundary it
+//! does not have — and **absent** under Windows access confinement, where a
+//! process cannot reach a loopback listener at all under any capability set, so
+//! egress is the capability rather than the route: all of the network, or none of
+//! it.
 //!
 //! Two smaller differences worth knowing rather than discovering: the job's CPU
 //! limit counts user-mode time only, where unix `RLIMIT_CPU` counts kernel time
