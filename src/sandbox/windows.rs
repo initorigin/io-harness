@@ -130,6 +130,63 @@ impl Sandbox for WindowsSandbox {
     }
 }
 
+/// The Windows **access** backend: an AppContainer inside a Job Object.
+///
+/// Selected only when the caller set
+/// [`access_confinement`](super::SandboxConfig::access_confinement), which is
+/// the whole of the difference between this and [`WindowsSandbox`]. What it adds
+/// is the two columns a job object has no facility for: a filesystem the
+/// container's token is default-denied on and reaches only by explicit ACE, and
+/// a network the token holds no capability for unless the run's policy permits
+/// egress.
+///
+/// **A decline is an error here, and that is the point.** Every other backend in
+/// this crate degrades to a weaker rung and reports it, because the caller asked
+/// for *a* run and would rather have a weaker boundary than none. This one was
+/// asked for by name. A run that quietly took the Job Object instead is a run
+/// with no access boundary at all whose every assertion still passes — 0.47.0
+/// read exactly that as proof the container had run `cargo`, twice — so the
+/// grant that could not be applied is returned to the caller with its reason.
+pub struct WindowsAppContainerSandbox;
+
+impl Sandbox for WindowsAppContainerSandbox {
+    async fn run(&self, spec: RunSpec<'_>) -> Result<SandboxOutcome> {
+        #[cfg(windows)]
+        {
+            match job::run_contained(&spec).await {
+                Some(outcome) => outcome,
+                None => Err(crate::error::Error::Sandbox {
+                    reason: format!(
+                        "this run asked for access confinement and it could not be applied on \
+                         this host: {}. Nothing was started — a command run under the job \
+                         object instead would have had no filesystem and no network boundary, \
+                         which is the failure this refusal exists to prevent",
+                        job::last_decline()
+                            .unwrap_or_else(|| "no reason was recorded".to_string())
+                    ),
+                }),
+            }
+        }
+        // Off Windows this type is compiled so the selection logic beside it can
+        // be read and tested on the build host, and it is never selected there.
+        #[cfg(not(windows))]
+        {
+            super::run_capped(Backend::PortableFloor, spec, |_cmd| {}).await
+        }
+    }
+
+    fn backend(&self) -> Backend {
+        #[cfg(windows)]
+        {
+            Backend::WindowsAppContainer
+        }
+        #[cfg(not(windows))]
+        {
+            Backend::PortableFloor
+        }
+    }
+}
+
 /// The Job Object limits derived from [`super::SandboxLimits`], as the flags and
 /// values a `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` carries. Factored out as pure
 /// data so the mapping — the part with the unit conversion in it, which is the
@@ -712,10 +769,11 @@ pub(crate) mod job {
         }
 
         Some(Ok(SandboxOutcome {
-            // The job object is what this outcome can honestly claim: the
-            // container is not a backend this crate selects, so it is not a
-            // backend a caller can be told it got. 0.59.0 is where that changes.
-            backend: Backend::WindowsJobObject,
+            // The container ran it, so the container is what the outcome says.
+            // Until 0.59.0 this reported the job object, because nothing selected
+            // this path and a backend no caller can be given is not one a caller
+            // may be told about.
+            backend: Backend::WindowsAppContainer,
             argv: spec.argv.to_vec(),
             exit_code,
             cap_hit,

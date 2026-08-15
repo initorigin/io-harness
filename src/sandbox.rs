@@ -109,6 +109,21 @@ pub enum Backend {
     /// seccomp filter; only the kernel's own defaults for an unprivileged user
     /// namespace apply on top.
     LinuxNamespaces,
+    /// Windows AppContainer **and** Job Object: a low-box security context whose
+    /// token reaches only what was granted to its own container SID, inside a
+    /// job that bounds its resources and takes its tree down on close.
+    ///
+    /// The access half and the resource half together, which is why this and
+    /// [`WindowsJobObject`](Backend::WindowsJobObject) are two backends rather
+    /// than one with a flag: a run reporting this one had its writes confined to
+    /// the paths the run resolved and, when its policy denied egress, no
+    /// capability granting it a socket.
+    ///
+    /// **Reachable only when the caller asked for it** (0.59.0). The grant set is
+    /// derived from the run's own facts and derived is not complete, so a default
+    /// boundary that cannot run an arbitrary payload would be worse than one a
+    /// caller reaches for deliberately.
+    WindowsAppContainer,
     /// Windows Job Object: memory, CPU and active-process limits, and a
     /// tree kill on close. A **resource** boundary and nothing else — a Job
     /// Object has no filesystem facility and no network facility, so a run
@@ -147,7 +162,10 @@ impl Backend {
             Backend::MacosSandboxExec
             | Backend::LinuxLandlock
             | Backend::LinuxBubblewrap
-            | Backend::LinuxNamespaces => true,
+            | Backend::LinuxNamespaces
+            // An AppContainer is default-deny for every securable object, so a
+            // path it can write is a path something granted by name.
+            | Backend::WindowsAppContainer => true,
             // A Job Object is a resource container: there is no path rule to set
             // on one. The floor is an ephemeral working directory and nothing.
             Backend::WindowsJobObject | Backend::PortableFloor => false,
@@ -176,7 +194,12 @@ impl Backend {
             Backend::MacosSandboxExec
             | Backend::LinuxLandlock
             | Backend::LinuxBubblewrap
-            | Backend::LinuxNamespaces => true,
+            | Backend::LinuxNamespaces
+            // The denial is an absent capability rather than an applied filter:
+            // without `internetClient` the token holds nothing that grants a
+            // socket to the outside. The same shape as an empty network
+            // namespace.
+            | Backend::WindowsAppContainer => true,
             Backend::WindowsJobObject | Backend::PortableFloor => false,
         }
     }
@@ -188,6 +211,7 @@ impl Backend {
             Backend::LinuxLandlock => "linux-landlock",
             Backend::LinuxBubblewrap => "linux-bubblewrap",
             Backend::LinuxNamespaces => "linux-namespaces",
+            Backend::WindowsAppContainer => "windows-appcontainer",
             Backend::WindowsJobObject => "windows-job-object",
             Backend::PortableFloor => "portable-floor",
         }
@@ -612,12 +636,59 @@ pub struct SandboxConfig {
     /// mode named there needs no second path.
     #[serde(default)]
     pub mode: ExecMode,
+    /// Ask for an **access** boundary on a host where one is not the default
+    /// (0.59.0). Off by default, and today that means Windows and nothing else.
+    ///
+    /// macOS and Linux confine access under every native backend already, so on
+    /// those hosts this changes nothing and is not read. On Windows the default
+    /// is a Job Object, which contains resources and has no filesystem facility
+    /// and no network facility; setting this selects the AppContainer, whose
+    /// token is default-deny for every securable object and reaches only the
+    /// paths this run resolved.
+    ///
+    /// **It is opt-in because the grant set is derived and derived is not
+    /// complete.** The workspace, the writable cache roots the toolchain named,
+    /// the redirected temporary directory, the program's own directory and
+    /// `%SystemRoot%` are named from the run's own facts; a toolchain reading a
+    /// machine-wide file outside that set is refused. A default boundary that
+    /// cannot run an arbitrary payload is worse than one a caller reaches for
+    /// deliberately, so the caller reaches for it.
+    ///
+    /// **And it does not degrade.** Where an unavailable primitive falls back to
+    /// a weaker rung and reports it, a boundary the caller *asked* for and that
+    /// cannot be applied is an error instead: a run that quietly took the Job
+    /// Object here is a run whose every assertion still passes with no boundary
+    /// at all, which is the exact failure this release was written to end.
+    #[serde(default)]
+    pub access_confinement: bool,
 }
 
 impl SandboxConfig {
     /// A config with default caps and network denied — the recommended default.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Ask for an access boundary where one is not the default — see
+    /// [`access_confinement`](SandboxConfig::access_confinement).
+    ///
+    /// ```
+    /// use io_harness::sandbox::{select, Sandbox, SandboxConfig};
+    ///
+    /// let asked = SandboxConfig::new().with_access_confinement();
+    /// // On macOS and Linux the native backend already confines access, so this
+    /// // changes nothing; on Windows it is the difference between a resource
+    /// // boundary and an access one.
+    /// let backend = select(&asked).backend();
+    /// assert!(backend.confines_writes() || cfg!(not(any(
+    ///     target_os = "macos",
+    ///     target_os = "linux",
+    ///     target_os = "windows",
+    /// ))));
+    /// ```
+    pub fn with_access_confinement(mut self) -> Self {
+        self.access_confinement = true;
+        self
     }
 
     /// Force the portable floor backend (disable the native one).
@@ -894,9 +965,13 @@ pub enum Selected {
     /// The Linux native backend.
     #[cfg(target_os = "linux")]
     Linux(linux::LinuxSandbox),
-    /// The Windows native backend.
+    /// The Windows native backend: a Job Object, which contains resources.
     #[cfg(target_os = "windows")]
     Windows(windows::WindowsSandbox),
+    /// The Windows access backend: an AppContainer inside a Job Object, chosen
+    /// only when the caller asked for [`access_confinement`](SandboxConfig::access_confinement).
+    #[cfg(target_os = "windows")]
+    WindowsContained(windows::WindowsAppContainerSandbox),
 }
 
 impl Sandbox for Selected {
@@ -909,6 +984,8 @@ impl Sandbox for Selected {
             Selected::Linux(s) => s.run(spec).await,
             #[cfg(target_os = "windows")]
             Selected::Windows(s) => s.run(spec).await,
+            #[cfg(target_os = "windows")]
+            Selected::WindowsContained(s) => s.run(spec).await,
         }
     }
 
@@ -921,6 +998,8 @@ impl Sandbox for Selected {
             Selected::Linux(s) => s.backend(),
             #[cfg(target_os = "windows")]
             Selected::Windows(s) => s.backend(),
+            #[cfg(target_os = "windows")]
+            Selected::WindowsContained(s) => s.backend(),
         }
     }
 }
@@ -968,7 +1047,16 @@ pub fn select(config: &SandboxConfig) -> Selected {
         #[cfg(target_os = "linux")]
         return Selected::Linux(linux::LinuxSandbox);
         #[cfg(target_os = "windows")]
-        return Selected::Windows(windows::WindowsSandbox);
+        {
+            // The access backend only when it was asked for, and only for a mode
+            // that wants a filesystem boundary at all: `FullAccess` says the
+            // payload may write anywhere, and putting that inside a default-deny
+            // container would refuse the very thing the mode grants.
+            if config.access_confinement && config.mode != ExecMode::FullAccess {
+                return Selected::WindowsContained(windows::WindowsAppContainerSandbox);
+            }
+            return Selected::Windows(windows::WindowsSandbox);
+        }
     }
     Selected::Floor(FloorSandbox)
 }
