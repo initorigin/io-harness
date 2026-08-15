@@ -89,6 +89,16 @@ fn the_size_of_a_session_is_the_bytes_of_its_own_rows() {
     let session = seed_session(&store, "/repo", 3, 4, "alpha");
     seed_session(&store, "/other", 2, 2, "beta");
 
+    // Every run-keyed table gets a row, so the sum is over the whole schema
+    // rather than over `steps` alone — without this, counting only the first
+    // few tables produces the same number and the criterion asserts nothing.
+    {
+        let seed_conn = Connection::open(&path).expect("the store, read directly");
+        for run in tree_of(&seed_conn, session) {
+            seed_every_run_table(&seed_conn, run, "alpha");
+        }
+    }
+
     let size = store
         .session_size(session)
         .expect("a size")
@@ -295,6 +305,87 @@ fn as_list(ids: &[i64]) -> String {
         .join(",")
 }
 
+/// Put one row into every table that hangs off a run, built from the schema.
+///
+/// **This is what makes F1 bite.** Enumerating `sqlite_master` proves nothing
+/// about a table the fixture never wrote to: dropping `citations` from the
+/// cascade failed nothing until this existed, because there was no citation to
+/// leave behind. Every NOT NULL column without a default is filled with a
+/// placeholder, so a table a later release adds is seeded without anyone
+/// remembering to come back here.
+fn seed_every_run_table(conn: &Connection, run: i64, needle: &str) {
+    let names: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .expect("the schema");
+        stmt.query_map([], |r| r.get(0))
+            .expect("the tables")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the tables")
+    };
+    for table in names {
+        // `runs`, `sessions` and `session_turns` are written by the fixture
+        // proper; `memory` is deliberately not a session's property.
+        if matches!(
+            table.as_str(),
+            "runs" | "sessions" | "session_turns" | "memory"
+        ) {
+            continue;
+        }
+        let Some(key) = run_key(&table) else { continue };
+        let cols: Vec<(String, String, i64, Option<String>, i64)> = {
+            let mut info = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("the columns");
+            info.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })
+            .expect("the columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the columns")
+        };
+        // The run key must be present; everything else only if it is NOT NULL
+        // with no default and is not the integer primary key.
+        let mut names = Vec::new();
+        let mut values = Vec::new();
+        for (name, ty, notnull, dflt, pk) in &cols {
+            if name == key {
+                names.push(name.clone());
+                values.push(run.to_string());
+                continue;
+            }
+            if *pk == 1 || *notnull == 0 || dflt.is_some() {
+                continue;
+            }
+            names.push(name.clone());
+            let ty = ty.to_uppercase();
+            if ty.contains("INT") || ty.contains("REAL") {
+                values.push("1".to_string());
+            } else {
+                values.push(format!("'{needle} in {table}.{name}'"));
+            }
+        }
+        if !names.iter().any(|n| n == key) {
+            continue;
+        }
+        let sql = format!(
+            "INSERT INTO {table} ({}) VALUES ({})",
+            names.join(", "),
+            values.join(", ")
+        );
+        conn.execute(&sql, [])
+            .unwrap_or_else(|e| panic!("seeding {table}: {e}\n{sql}"));
+    }
+}
+
 /// F1. A deleted session leaves no row anywhere, and the check is driven from
 /// the schema rather than from a list this test would have to be remembered to
 /// update when the crate grows a table.
@@ -306,6 +397,14 @@ fn a_deleted_session_leaves_no_row_in_any_table_the_schema_names() {
     let kept_b = seed_session(&store, "/third", 1, 2, "gamma");
 
     let conn = Connection::open(&path).expect("the store, read directly");
+    for run in tree_of(&conn, doomed) {
+        seed_every_run_table(&conn, run, "alpha");
+    }
+    for session in [kept_a, kept_b] {
+        for run in tree_of(&conn, session) {
+            seed_every_run_table(&conn, run, "kept");
+        }
+    }
     let doomed_runs = as_list(&tree_of(&conn, doomed));
     store
         .memory_put(
@@ -466,11 +565,37 @@ fn a_deletion_that_fails_partway_leaves_the_store_exactly_as_it_was() {
         )
         .expect("a summary");
 
+    // Every table's row count, taken before the deletion is attempted. The
+    // per-table counts are the assertion and not the turns and runs, because
+    // `summaries` is LAST in the cascade: an implementation with no transaction
+    // at all reaches the trigger before it touches the turns, the runs or the
+    // session, so asserting on those three passes whether or not the removal was
+    // atomic. Found by a sabotage that removed the transaction and failed
+    // nothing.
+    let run_list = as_list(&tree_of(&conn, session));
+    let counts: Vec<(String, i64)> = tables(&path)
+        .into_iter()
+        .filter_map(|t| run_key(&t).map(|k| (t.clone(), rows_for(&conn, &t, k, &run_list))))
+        .collect();
+    assert!(
+        counts.iter().any(|(t, n)| t == "steps" && *n > 0),
+        "the fixture wrote steps, which is FIRST in the cascade"
+    );
+
     let failed = store.delete_session(session);
     assert!(failed.is_err(), "the injected failure reached the caller");
 
     conn.execute_batch("DROP TRIGGER refuse_summaries")
         .expect("the trigger goes");
+
+    for (table, rows) in counts {
+        let key = run_key(&table).expect("filtered above");
+        assert_eq!(
+            rows_for(&conn, &table, key, &run_list),
+            rows,
+            "{table} did not come back: the removal was not one transaction"
+        );
+    }
     assert_eq!(
         store
             .session_size(session)
@@ -754,8 +879,13 @@ fn an_archived_session_keeps_its_numbers_and_holds_none_of_its_words() {
 
     let conn = Connection::open(&path).expect("the store, read directly");
     let runs = tree_of(&conn, session);
+    // Every run-keyed table gets a row carrying the needle, so the sweep is over
+    // the whole schema rather than over the tables that came to mind.
+    for run in &runs {
+        seed_every_run_table(&conn, *run, "SECRETPHRASE");
+    }
 
-    // The needles go into six different tables on purpose: an archive that
+    // And six of them are written by hand as well: an archive that
     // emptied only the conversation would pass a test that only seeded one.
     store
         .put_summary(runs[0], 2, 1, "SECRETPHRASE in a summary", 40)
@@ -833,7 +963,7 @@ fn an_archived_session_keeps_its_numbers_and_holds_none_of_its_words() {
     );
     assert_eq!(
         conn.query_row(
-            &format!("SELECT path || ':' || lines_added || '/' || lines_removed FROM edits WHERE run_id IN ({run_list})"),
+            &format!("SELECT path || ':' || lines_added || '/' || lines_removed FROM edits WHERE run_id IN ({run_list}) AND path = 'src/lib.rs'"),
             [],
             |r| r.get::<_, String>(0)
         )
@@ -843,14 +973,75 @@ fn an_archived_session_keeps_its_numbers_and_holds_none_of_its_words() {
     );
 
     // And not one word of it survives, anywhere in the database.
+    //
+    // The seeder wrote the needle into EVERY text column of every run-keyed
+    // table, including the ones the archive deliberately keeps. So the sweep is
+    // over the whole schema and the expectation is stated here, independently of
+    // the crate's own `is_fact_column`: a needle may survive only in a column
+    // this test itself calls a fact. Two lists written separately, and a
+    // disagreement between them fails rather than passing quietly.
+    let expected_to_survive = |column: &str| {
+        matches!(
+            column,
+            "kind"
+                | "act"
+                | "state"
+                | "status"
+                | "outcome"
+                | "verdict"
+                | "source"
+                | "layer"
+                | "rule"
+                | "provider"
+                | "model"
+                | "finish_reason"
+                | "tool"
+                | "path"
+                | "target"
+                | "key"
+                | "workspace"
+                | "file"
+                | "at"
+                | "created_at"
+                | "started_at"
+                | "finished_at"
+                | "turn_kind"
+                | "decision"
+        )
+    };
     let leaks: Vec<_> = every_text_value(&conn)
         .into_iter()
-        .filter(|(_, _, v)| v.contains("SECRETPHRASE"))
+        .filter(|(table, col, v)| {
+            v.contains("SECRETPHRASE")
+                && !(expected_to_survive(col) && table != "steps" && table != "session_turns")
+        })
         .collect();
     assert!(
         leaks.is_empty(),
         "an archive that reports a removal it did not perform: {leaks:?}"
     );
+
+    // And the six written by hand — the ones that are words under any reading —
+    // are gone from the columns they were written into.
+    for (table, column) in [
+        ("session_turns", "prompt"),
+        ("session_turns", "reply"),
+        ("steps", "prompt"),
+        ("steps", "decision"),
+        ("summaries", "text"),
+        ("snapshots", "before"),
+        ("ledger_observations", "text"),
+        ("edits", "hunk"),
+    ] {
+        let hits: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} LIKE '%SECRETPHRASE%'"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(hits, 0, "{table}.{column} still holds what was said");
+    }
 
     assert_eq!(
         store.session_size(other).expect("a size"),
