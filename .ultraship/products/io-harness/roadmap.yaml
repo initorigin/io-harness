@@ -1463,9 +1463,14 @@ versions:
     status: planned
   - version: 0.59.0
     outcome: >
-      A Windows run is access-confined, not merely resource-contained.
+      Windows stops being the platform with holes in it. Two of them, and they are the same kind of
+      problem: a process spawned on this platform needs an attribute the standard library does not
+      hand out. Access confinement needs `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`; the browser
+      needs its two transport handles inherited at numbers the child expects. One release, because
+      it is one spawn path, one machine, and one Windows matrix budget rather than two.
 
-      This was specified as half of 0.47.0 and taken out of it whole on 2026-08-10, on the owner's
+      **The access half.** This was specified as half of 0.47.0 and taken out of it whole on
+      2026-08-10, on the owner's
       decision, after ten matrix rounds on `windows-latest` failed to converge from a development
       host that cannot run the platform. The record is `US-IO-HARNESS-0.47.0-I01`. Nothing about the
       goal changed: `docs/CONTRACT.md` still says "Supported, full suite in CI" and "native resource
@@ -1494,6 +1499,36 @@ versions:
       by absolute path with `type` and runs when named relative to the working directory, on a
       workspace nowhere near the user profile, so it is not the grant set and not the path's
       ancestors.
+
+      **The browser half, folded in here on 2026-08-15** rather than given an entry of its own; the
+      record is `US-IO-HARNESS-0.59.0-I01`.
+      `browser::launch` has a Windows arm that refuses, and its message says the work is tracked as
+      its own release — that sentence stops being true with this decision and is part of what the
+      release changes. 0.53.0 shipped the hole deliberately: the transport is a pipe and not a
+      debugging port, because a port is a listener any local process on the machine can drive, and
+      that principle is not being traded away to make Windows easy. On unix the spawn dups the two
+      pipe ends onto descriptors 3 and 4 inside `pre_exec`, holding them above 10 with `F_DUPFD`
+      first so the dup targets cannot collide, using only async-signal-safe calls. Windows has no
+      analogue in the standard library, which is the whole of the gap.
+
+      **The browser half opens with a spike, not with a contract.** How Chromium on Windows expects
+      those two handles — inherited by value on the command line, by slot, or through
+      `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` on the `STARTUPINFOEX` the container spawn already builds
+      — is to be established against a real browser before any of it is written down. The last three
+      releases each carried a roadmap premise that was wrong at the source and each was caught by
+      reading it before writing the contract; this entry declines to be the fourth.
+
+      **The halves are ordered by risk and are independently shippable, and the cut line is decided
+      now rather than under deadline.** The browser transport goes first: it is bounded, it has no
+      discovery problem, and its scope cannot grow. Egress denial goes second, because an empty
+      capability array denies the network with no grant-set discovery at all. Filesystem confinement
+      goes last and lands opt-in, because a default boundary that cannot run an arbitrary payload
+      would be worse than one a caller reaches for deliberately (`US-IO-HARNESS-0.26.0-I02`), and
+      the grant set — the executed binary, the toolchain, the redirected temporary directory and
+      every language's install tree — is the one part of this release whose size is not known in
+      advance. **If it has not converged when the rest is ready, the browser and egress halves ship
+      and the filesystem half moves.** The reverse is not on the table: a bounded piece of work does
+      not wait on an unbounded one merely because they share a version number.
 
       **The instrument to keep.** `what_the_container_actually_permits_on_this_host` asks each
       capability separately — a builtin, a read, a script, a write, a program on `PATH` — through
