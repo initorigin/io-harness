@@ -1212,7 +1212,7 @@ mod tests {
 
         let out_path = cwd.join("io-harness-out.txt");
         let file = std::fs::File::create(&out_path).expect("create the capture file");
-        let mut child = Spawned::start(cmdline, cwd, profile.sid(), &file)
+        let mut child = Spawned::start(cmdline, cwd, &profile, &file)
             .unwrap_or_else(|e| panic!("F1: CreateProcessW into the AppContainer failed: {e}"));
         // 0.47.0 spawns suspended so the backend can put the process in its
         // job object before it runs an instruction. A caller that only starts
@@ -1302,6 +1302,17 @@ mod tests {
             !out.contains("io-harness-secret"),
             "the container printed the secret's contents: {out:?}"
         );
+        // **The refusal itself, not merely the absence of success** (0.59.0). A
+        // command that failed to start, failed to find its subject or crashed
+        // also exits non-zero, and every one of those would pass the assertion
+        // above while proving nothing about the boundary. The payload's own
+        // words are what say the access check refused it.
+        assert!(
+            out.to_ascii_lowercase().contains("access is denied")
+                || out.to_ascii_lowercase().contains("cannot find"),
+            "the read failed for some reason other than the access check, which is not \
+             evidence of a boundary: {out:?}"
+        );
     }
 
     /// F3 — a payload inside an AppContainer has no route off the machine.
@@ -1330,6 +1341,65 @@ mod tests {
             "the container reached the network with an empty capability array; there is no \
              `internetClient` on this profile, so this means the capability set is not being \
              applied. Output was {out:?}"
+        );
+
+        // **And the other direction, which had never once been applied**
+        // (0.59.0). Until this release the spawn passed a capability count of
+        // zero whatever the profile carried, so the denial above was right for a
+        // reason that had nothing to do with the capability set and this half
+        // could not have passed. A boundary that denies everything is not a
+        // boundary, it is a broken network.
+        let profile = Profile::create(&name("net-allowed"), true)
+            .unwrap_or_else(|e| panic!("could not create a network-permitting profile: {e}"));
+        grant(work.path(), profile.sid(), Access::Full, Reach::Tree)
+            .unwrap_or_else(|e| panic!("could not grant the workspace: {e}"));
+        let out_path = work.path().join("net-allowed.txt");
+        let file = std::fs::File::create(&out_path).expect("capture file");
+        let mut child = Spawned::start(&format!("cmd.exe /c {probe}"), work.path(), &profile, &file)
+            .expect("spawn into a network-permitting container");
+        child.resume().expect("resume");
+        drop(file);
+        let permitted = child.wait(60_000).expect("wait");
+        let mut text = String::new();
+        std::fs::File::open(&out_path)
+            .and_then(|mut f| f.read_to_string(&mut text))
+            .ok();
+        assert_eq!(
+            permitted,
+            Some(0),
+            "a container created with `internetClient` could not reach the network, so the \
+             capability array is not reaching the child's token and the denial above proves \
+             nothing. Output was {text:?}"
+        );
+    }
+
+    /// **F10 — the grant memo is keyed by the container it granted to.**
+    ///
+    /// Two profiles in one process, one path, and both must end up carrying an
+    /// ACE of their own. The memo used to be keyed by path, access and reach
+    /// alone, so the second container was told its grant was already done and
+    /// got nothing — success reported, DACL unchanged, which is the same silent
+    /// inert grant this module has already paid for once. It survived because
+    /// production uses one deterministic profile name and therefore one stable
+    /// SID, so only a test that builds two containers could ever see it.
+    #[test]
+    fn a_grant_to_one_container_is_not_a_grant_to_another() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let first = Profile::create(&name("memo-a"), false).expect("the first profile");
+        let second = Profile::create(&name("memo-b"), false).expect("the second profile");
+
+        grant(work.path(), first.sid(), Access::Full, Reach::Tree).expect("grant to the first");
+        grant(work.path(), second.sid(), Access::Full, Reach::Tree).expect("grant to the second");
+
+        assert!(
+            granted_mask(work.path(), first.sid()).is_some(),
+            "the first container has no ACE on the path it was granted"
+        );
+        assert!(
+            granted_mask(work.path(), second.sid()).is_some(),
+            "the second container was told its grant succeeded and has no ACE: the memo is \
+             keyed without the container SID, so one container's grant is being read as \
+             another's"
         );
     }
 
@@ -1373,7 +1443,7 @@ mod tests {
             exe.display()
         );
         let mut child =
-            Spawned::start(&line, work.path(), profile.sid(), &file).expect("spawn the payload");
+            Spawned::start(&line, work.path(), &profile, &file).expect("spawn the payload");
         child.resume().expect("resume the contained process");
         let code = child.wait(60_000).expect("wait");
 
@@ -1453,7 +1523,7 @@ mod tests {
             let file = std::fs::File::create(&out_path).expect("capture");
             let line = "cmd.exe /c depth.bat".to_string();
             let mut child =
-                Spawned::start(&line, dir, profile.sid(), &file).expect("spawn the payload");
+                Spawned::start(&line, dir, &profile, &file).expect("spawn the payload");
             child.resume().expect("resume");
             let code = child.wait(30_000).expect("wait");
             drop(file);
@@ -1495,7 +1565,7 @@ mod tests {
         let mut slow = Spawned::start(
             "cmd.exe /c for /L %i in (1,1,2000000000) do @rem",
             dir.path(),
-            profile.sid(),
+            &profile,
             &file,
         )
         .expect("spawn the slow payload");
@@ -1507,7 +1577,7 @@ mod tests {
         );
 
         let mut quick =
-            Spawned::start("cmd.exe /c exit 7", dir.path(), profile.sid(), &file).expect("spawn");
+            Spawned::start("cmd.exe /c exit 7", dir.path(), &profile, &file).expect("spawn");
         quick.resume().expect("resume the contained process");
         assert_eq!(
             quick.wait(30_000).expect("wait"),

@@ -1476,9 +1476,109 @@ mod tests {
                 }
             }
         }
+        // **Printed whether or not it passes** (0.59.0). A table that only
+        // appears on failure is a table nobody reads on the one run where it
+        // would have told them the boundary is real, and this instrument exists
+        // precisely because a pass and a silent decline look identical.
+        println!("{report}");
         assert_eq!(
             failed, 0,
             "the AppContainer did not behave as the grant set says it does:{report}"
+        );
+        assert!(
+            !report.contains("THE CONTAINER DECLINED"),
+            "a row was answered by a decline rather than by the container:{report}"
+        );
+        assert!(
+            !report.contains("WindowsJobObject"),
+            "a row was answered by the Job Object, which has no filesystem facility and no \
+             network facility — so whatever that row proved, it did not prove containment:{report}"
+        );
+    }
+
+    /// **F9 — selection is the caller's, and the default did not move.**
+    ///
+    /// The Windows default stays the Job Object because the grant set is derived
+    /// and derived is not complete. Asserted on what `select` returns and on what
+    /// that thing reports, not on the flag that was set — a config field proves
+    /// only that a config field exists.
+    #[cfg(windows)]
+    #[test]
+    fn the_container_is_chosen_only_when_the_caller_asks_for_it() {
+        use crate::sandbox::{select, Backend, Sandbox, SandboxConfig};
+
+        assert_eq!(
+            select(&SandboxConfig::new()).backend(),
+            Backend::WindowsJobObject,
+            "the Windows default moved; it is the Job Object until the derived grant set is \
+             proven against a real payload"
+        );
+        assert_eq!(
+            select(&SandboxConfig::new().with_access_confinement()).backend(),
+            Backend::WindowsAppContainer,
+            "the caller asked for an access boundary and did not get the backend that has one"
+        );
+        // `FullAccess` says the payload may write anywhere, so putting it inside
+        // a default-deny token would refuse the one thing the mode grants.
+        assert_eq!(
+            select(
+                &SandboxConfig::new()
+                    .with_access_confinement()
+                    .with_mode(ExecMode::FullAccess)
+            )
+            .backend(),
+            Backend::WindowsJobObject,
+            "full access was put inside a default-deny container"
+        );
+    }
+
+    /// **F11 — a contained command is given no proxy, and the absence is
+    /// asserted rather than incidental.**
+    ///
+    /// A process inside an AppContainer cannot reach a loopback listener under
+    /// any capability set, nor the host's own network address
+    /// (`US-IO-HARNESS-0.59.0-I03`). So pointing a contained command at the run's
+    /// egress proxy would not scope its traffic, it would hang every request it
+    /// makes against something unreachable. Egress here is the capability and
+    /// nothing else.
+    ///
+    /// The assertion is on what the child can actually see: its own environment,
+    /// printed by the payload, carrying no address of ours.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_contained_command_is_not_pointed_at_a_proxy_it_cannot_reach() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let limits = SandboxLimits::none();
+        let argv: Vec<String> = vec![
+            "cmd".into(),
+            "/c".into(),
+            "echo [%HTTP_PROXY%][%HTTPS_PROXY%][%ALL_PROXY%]".into(),
+        ];
+        let proxy: std::net::SocketAddr = "127.0.0.1:65123".parse().expect("an address");
+        let spec = RunSpec::new(&argv, dir.path(), &limits)
+            .with_mode(ExecMode::WorkspaceWrite)
+            .with_network(true)
+            .with_proxy(Some(proxy));
+
+        let outcome = job::run_contained(&spec)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "the container declined: {}",
+                    job::last_decline().unwrap_or_else(|| "no reason recorded".into())
+                )
+            })
+            .expect("the contained command ran");
+        assert_eq!(
+            outcome.backend,
+            Backend::WindowsAppContainer,
+            "this assertion is about a contained command and this one was not contained"
+        );
+        assert!(
+            !outcome.stdout.contains("65123"),
+            "a contained command was handed the run's proxy, which it cannot reach — every \
+             request it makes would wait out its own clock instead of being scoped: {:?}",
+            outcome.stdout
         );
     }
 

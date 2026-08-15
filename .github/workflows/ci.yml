@@ -173,8 +173,10 @@ jobs:
       # `browser` feature, so naming it on the default polarity fails outright —
       # cargo refuses a `--example` whose `required-features` are not enabled.
       # It is built on the all-features leg only, which is the leg whose tests
-      # spawn it: `tests/browser.rs` is `#![cfg(all(feature = "browser", unix))]`
-      # and compiles to nothing without the feature.
+      # spawn it: `tests/browser.rs` is `#![cfg(feature = "browser")]` and
+      # compiles to nothing without the feature. Since 0.59.0 that gate carries
+      # no platform half, so this step matters on all three operating systems
+      # rather than on the two that had a transport.
       #
       # `tests/ci_workflow.rs` scans this whole file for `--example`, so this
       # step is what keeps that guard satisfied — and the guard is what caught

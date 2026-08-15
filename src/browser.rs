@@ -1295,6 +1295,44 @@ async fn attach(client: &Client, config: &BrowserConfig) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// **F12 — the run's proxy is in the list both platforms launch from.**
+    ///
+    /// The list is shared on purpose: unix hands it to `Command` and Windows
+    /// folds it into one command line by hand, and a copy of it in either place
+    /// would be a second thing to keep in step. Asserted here, and asserted to
+    /// *arrive* by the fixture recording its own argv — which is the half a list
+    /// comparison cannot prove, because the Windows command line is built by
+    /// quoting rules of this crate's own.
+    #[test]
+    fn a_run_with_a_proxy_launches_the_browser_through_it() {
+        let dir = std::path::Path::new("/tmp/profile");
+        let config = super::BrowserConfig::default();
+
+        let with = super::launch_args(&config, dir, Some("127.0.0.1:9051"));
+        assert!(
+            with.iter().any(|a| a == "--proxy-server=127.0.0.1:9051"),
+            "the browser was not pointed at the run's proxy: {with:?}"
+        );
+
+        let without = super::launch_args(&config, dir, None);
+        assert!(
+            !without.iter().any(|a| a.starts_with("--proxy-server")),
+            "a run with no proxy still named one: {without:?}"
+        );
+        // The transport is a pipe in both, and that is what stops a second local
+        // process from driving this browser.
+        for args in [&with, &without] {
+            assert!(
+                args.iter().any(|a| a == "--remote-debugging-pipe"),
+                "the browser was launched without the pipe transport: {args:?}"
+            );
+            assert!(
+                !args.iter().any(|a| a.starts_with("--remote-debugging-port")),
+                "a debugging port was opened: {args:?}"
+            );
+        }
+    }
+
     use super::*;
 
     fn gate() -> Arc<NavGate> {
