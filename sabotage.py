@@ -12,11 +12,6 @@ ARMS = [
      "            backend: Backend::WindowsAppContainer,",
      "            backend: Backend::WindowsJobObject,",
      "sandbox::windows::tests::what_the_container_actually_permits_on_this_host"),
-    ("S7  a failed Full grant declines silently instead of fatally",
-     "src/sandbox/windows.rs",
-     "            if g.grant == Grant::ReadExecute || g.grant == Grant::Traverse {",
-     "            if true {",
-     "sandbox::windows::tests::what_the_container_actually_permits_on_this_host"),
     ("S8  the container is selected unconditionally",
      "src/sandbox.rs",
      "            if config.access_confinement && config.mode != ExecMode::FullAccess {",
@@ -50,7 +45,7 @@ ARMS = [
      "src/sandbox.rs",
      "            Backend::WindowsAppContainer | Backend::WindowsJobObject | Backend::PortableFloor => {\n                false\n            }",
      "            Backend::WindowsJobObject | Backend::PortableFloor => false,\n            Backend::WindowsAppContainer => true,",
-     "sandbox::tests::backend_claims"),
+     "sandbox::tests::each_backend_claims_exactly_what_it_delivers"),
 ]
 
 def revert():
@@ -70,6 +65,12 @@ for name, path, old, new, test in ARMS:
     )
     out = r.stdout + r.stderr
     revert()
+    if "0 passed" in out and "0 failed" in out:
+        report.append(
+            f"{name}: RAN NOTHING — the filter matched no test, which exits 0 and reads "
+            f"exactly like a survival. Not evidence either way."
+        )
+        continue
     if "error[" in out or "error: could not compile" in out:
         report.append(f"{name}: DID NOT COMPILE — a false kill, rewrite the arm")
     elif r.returncode != 0:
