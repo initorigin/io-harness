@@ -184,6 +184,37 @@ Every other tool's output is still bounded rather than refused. A command's
 output and a search's matches were never documents, and a prefix of one is not a
 lie.
 
+## What `remember` reports back (0.57.0)
+
+`remember` writes one keyed note against a scope — the workspace by default, or
+the scope above it — and the result says the note was stored. It writes *by key*,
+which is the whole of its failure mode: the same fact learned twice under two
+names leaves two entries that disagree, both carried into later prompts, and the
+model acting on whichever it read last. Nothing about a keyed write notices that.
+
+So a write whose text closely overlaps an entry already stored **in the same scope
+under a different key** comes back naming that key and quoting what it holds,
+bounded with the same `…[truncated]` marker every other bounded result carries.
+The write still lands: this is a report and never a refusal, because declining a
+write because two strings overlapped would be guessing at intent, and merging them
+would write a fact nobody stated. The model has the conflicting key and its text
+in the same turn, so it settles the contradiction with another `remember` or a
+`forget` rather than leaving it for a later run to trip over.
+
+Two writes are deliberately not reported. Rewriting the **same key** is the
+replacement writing by key has meant since 0.10.0. A workspace note restating a
+**global** one is the override the second scope exists for, which is how a wrong
+global note is corrected locally — so the check only ever looks inside the scope
+being written.
+
+The comparison is a normalised token overlap — shared words over union words, on
+the lowercased alphanumeric tokens of three characters or more — computed in this
+process on the write path already running. No embedding, no model call, nothing
+over a network. `Store::memory_similar` is the same answer for the embedding
+program; what it costs at each cap is in
+[docs/MEASUREMENTS.md](../MEASUREMENTS.md), and what the note is worth to a later
+turn is in [Context and memory](context-and-memory.md).
+
 ## Skills: instructions, not code
 
 Point the contract at a directory of markdown. Both conventions in common use

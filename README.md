@@ -345,9 +345,16 @@ later write invalidated is re-read rather than trusted. Durable memory survives 
 — as a fact or a decision, pinnable so a run cannot overwrite a correction, with
 a per-run record of which entries it actually drew on. It is kept for what it is
 worth rather than for how recently it was written: at a cap the store drops the
-entry the fewest separate runs have carried, not the oldest. An agent that learns
-something wrong can `forget` it, and a fact true of every repository can be kept
-once, above the workspace, where a workspace's own note still overrides it.
+entry the fewest separate runs have carried, not the oldest. When a store outgrows
+its share of a turn, the notes that survive the fit are the ones whose words the
+turn is about — the run's goal, and every path a tool has already named — then the
+ones the most separate runs have carried; the block is still *printed* in the
+store's own order, so a store that fits its share assembles the same bytes it did
+before. A note that restates one already held under a different key is reported
+back at the moment it is written, rather than left for a later run to trip over.
+An agent that learns something wrong can `forget` it, and a fact true of every
+repository can be kept once, above the workspace, where a workspace's own note
+still overrides it.
 
 **Observation and replay.** Register an observer and be called as the run
 happens — steps, tool calls, approvals, refusals, spend draws, retries,

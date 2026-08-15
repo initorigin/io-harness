@@ -7,7 +7,7 @@ tasks:
     why_required: Both halves ask "how much do these two texts have in common", and two answers to
       that question is how the ranking and the duplicate check come to disagree about what a word
       is. The measure also has to be exact at its own threshold, which a float comparison is not.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -19,7 +19,12 @@ tasks:
         which the exact-boundary case flips and only F13's last assertion fails.
     files:
       - src/context.rs
-    evidence: []
+    evidence:
+    - "`the_overlap_measure_is_symmetric_exact_and_immune_to_word_order` and
+      `the_normaliser_reduces_a_path_and_a_sentence_to_the_same_words` in `src/state.rs` — 2 passed."
+    - "F13's parenthetical was wrong and is recorded rather than dropped: an exactly-60% ratio divides
+      to the same f64 the literal 0.6 parses to, so a float comparison does NOT flip the boundary. The
+      boundary is asserted in both directions instead, which `>` in place of `>=` breaks (arm S13)."
 
   - id: US-IO-HARNESS-0.57.0-T02
     summary: The draws aggregate — distinct runs per key — as a `pub(crate) const` beside
@@ -27,7 +32,7 @@ tasks:
     why_required: The ranking's second term needs it, and it runs once per scope per turn on a table
       that grows by one row per carried key per step for the life of the store. Unindexed it is a
       full scan on the turn's hot path, which is the failure 0.56.0 already paid to learn about.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -38,7 +43,15 @@ tasks:
         instead, under which the plan shows a scan and only F8 fails.
     files:
       - src/state.rs
-    evidence: []
+    evidence:
+    - "`ranking_recall_draws_seeks_the_recalls_rather_than_scanning_them` — the plan of
+      `Store::MEMORY_DRAWS_SQL` names `memory_recalls_entry` and contains no `SCAN memory_recalls`,
+      over 10,048 rows, with a column in no index as the control."
+    - "`the_draws_count_is_of_runs_and_not_of_rows` — 200 rows from one run rank below 3 rows from
+      three runs."
+    - "The row-count guard caught the fixture: 64 keys over 156 steps is 9,984 rows, not the 10,000
+      the criterion names. 0.56.0's sibling plan test has been sixteen short of its own claim since it
+      shipped; this one asserts the count rather than leaving it as arithmetic in a loop bound."
 
   - id: US-IO-HARNESS-0.57.0-T03
     summary: Rank at `recall_scopes` from the turn's signals, and split `render_notes` into
@@ -46,7 +59,7 @@ tasks:
     why_required: This is the release. Without it recall still curates by the write clock, which is
       the policy 0.56.0's raisable caps made unsafe. The split is what makes a fitting store render
       byte-identically, which is what keeps 0.44.0's cache boundary.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.57.0-T01
       - US-IO-HARNESS-0.57.0-T02
@@ -97,7 +110,18 @@ tasks:
       - src/context.rs
       - src/run.rs
       - tests/memory_recall.rs
-    evidence: []
+    evidence:
+    - "`tests/memory_recall.rs` — 6 passed: F1 (`a_turn_about_one_subject_carries_the_notes_about_that_subject`,
+      with the newest-cohort control asserted rather than described), F2
+      (`a_path_the_run_has_read_is_a_signal_the_next_turn_recalls_by`, two turns of one run), F3
+      (`draws_break_a_signal_tie_and_the_store_order_breaks_a_draw_tie`, evidence earned by real runs
+      rather than inserted rows), F5 (`the_block_is_printed_in_the_stores_order_however_the_turn_moves`),
+      F6 (`the_same_store_and_the_same_turn_select_the_same_notes_twice`)."
+    - "`Store::memory_list` tie-breaks on the key rather than the row id, which is what makes the
+      printed order reconstructible from an entry alone. `MemoryEntry` carries no `id`."
+    - "The elision line no longer says the dropped notes are `older`. They are dropped for being about
+      something else. This is a stated deviation from `scope.included`, which said the elision line was
+      unchanged: the substance of that line was kept and one word that had become false was not."
 
   - id: US-IO-HARNESS-0.57.0-T04
     summary: Build the turn's signals at the tree loop's recall site too, and prove a child agent
@@ -105,7 +129,7 @@ tasks:
     why_required: A release that fixes the workspace loop and not the sub-agent one delivers a
       feature that works until an agent spawns a child. `run_tree_with_extras` is a separate call
       site and has been the place a rule lapses before.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.57.0-T03
     acceptance_criteria:
@@ -118,7 +142,14 @@ tasks:
     files:
       - src/run.rs
       - tests/memory_recall.rs
-    evidence: []
+    evidence:
+    - "`a_spawned_child_recalls_under_the_same_ordering_as_the_flat_loop` — a real spawn, asserted on
+      the child's own prompt, with the parent as the control."
+    - "Sabotage run at the time of writing: replacing the tree loop's signals with an empty set failed
+      this test and nothing else across all 29 memory tests."
+    - "Found while sizing the fixture: a child's `TaskContract` is built fresh by the spawn and does
+      NOT inherit the root's `ContextBudget`, so a child always assembles under the default 24,000
+      tokens however tightly the root was bounded. Pre-existing and outside this release."
 
   - id: US-IO-HARNESS-0.57.0-T05
     summary: "`Store::memory_similar`, and the `remember` arm reporting the entry a new note
@@ -126,7 +157,7 @@ tasks:
     why_required: "`remember` writes by key, so the same fact under two names leaves two entries
       that disagree and both are carried. The write is the only moment the writer's own intent is
       still available to resolve it."
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.57.0-T01
     acceptance_criteria:
@@ -163,7 +194,15 @@ tasks:
       - src/state.rs
       - src/run.rs
       - tests/memory_scope.rs
-    evidence: []
+    evidence:
+    - "`tests/memory_scope.rs` — 10 passed, 4 of them new: F9
+      (`a_note_that_restates_one_already_held_names_the_key_that_holds_it`), F10
+      (`an_unrelated_note_and_a_rewrite_of_one_key_are_not_flagged`, both halves on the ABSENCE of the
+      report), F11 (`a_flagged_write_still_lands_and_the_quote_is_bounded`), F12
+      (`the_duplicate_check_is_within_the_scope_being_written`, all three directions)."
+    - "F11's first fixture padded the held value with a new sentence and put the pair at exactly 50%
+      overlap — the measure working, not failing. Padding by repeating the same sentence is what a
+      restatement actually looks like."
 
   - id: US-IO-HARNESS-0.57.0-T06
     summary: Measure the per-turn ranking cost and the added write-path cost at three store sizes,
@@ -172,7 +211,7 @@ tasks:
       an operator sets. A release that hands an operator a knob without saying what pulling it costs
       is the failure 0.56.0's own coupling paragraph exists to prevent — and its N5 is where that
       release found a defect no review had.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.57.0-T03
       - US-IO-HARNESS-0.57.0-T05
@@ -192,7 +231,14 @@ tasks:
     files:
       - src/run.rs
       - docs/MEASUREMENTS.md
-    evidence: []
+    evidence:
+    - "`memory_recall_cost` in `src/run.rs`, ignored by default. Apple M1, release profile,
+      2026-08-15, medians of 20, over a 200-observation ledger (208 signal tokens): ranking one scope
+      is 1.106 / 11.088 / 119.171 ms at 64 / 512 / 4,096 entries; a `remember` including the duplicate
+      check is 1.946 / 21.172 / 201.369 ms."
+    - "Linear in entries and flat in the recall table — the timings moved by ~10x for an 8x input, so
+      0.56.0's flat-timing defect shape did not recur. Recorded in `docs/MEASUREMENTS.md` with the
+      method, the machine and the upgrade path if a store that large becomes ordinary."
 
   - id: US-IO-HARNESS-0.57.0-T07
     summary: Update every checked-in doc surface and the changelog to the behaviour this release
@@ -200,7 +246,7 @@ tasks:
     why_required: "`docs/CONTRACT.md`, the guide and the README all state that recall carries the
       newest notes that fit, and 0.56.0 added a coupling paragraph whose conclusion this release
       changes. A contract that describes the previous release is worse than no contract."
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.57.0-T03
       - US-IO-HARNESS-0.57.0-T05
@@ -227,4 +273,13 @@ tasks:
       - docs/guide/configuration.md
       - CHANGELOG.md
       - README.md
-    evidence: []
+    evidence:
+    - "`docs/CONTRACT.md` — two new rules written where the memory section's own sentences stood, and
+      0.56.0's coupling paragraph now says raising a cap costs time rather than relevance."
+    - "`CHANGELOG.md` 0.57.0 section: 2 Added, 4 Changed."
+    - "`docs/guide/context-and-memory.md`, `docs/guide/tools-and-skills.md`,
+      `docs/guide/configuration.md`, `docs/CAPABILITIES.md`, `README.md` and the `render_notes`
+      rustdoc."
+    - "Doc gates: `changelog` 5 passed, `docs_drift` 15 passed, `public_api` 9 passed —
+      `public_surface_matches_snapshot` green with `docs/public-api.txt` UNCHANGED, which is N2's
+      predicted +0 lines met exactly."

@@ -26,6 +26,53 @@ notes are produced from it.
 
 ### Security
 
+## [0.57.0] - 2026-08-15
+
+### Added
+
+- **A `remember` that restates a note you already hold says so.** Writing by key
+  means the same fact learned twice under two names leaves two entries that
+  disagree, both carried into the next turn, and the model acting on whichever it
+  read last. A write whose text closely overlaps an entry already stored **in the
+  same scope under a different key** now comes back naming that key and quoting
+  what it holds, so the model resolves it in the same turn — replace one, or
+  `forget` the other — instead of leaving the contradiction for a later run. The
+  write still lands: this is a report, not a refusal. Rewriting the same key is
+  not reported, because that is the replacement writing by key has always meant,
+  and a workspace note restating a **global** one is not reported either, because
+  that is the override the second scope exists for. The comparison is a
+  normalised word overlap computed in-process — no embedding, no model call,
+  nothing over a network.
+- **`Store::memory_similar`.** The same answer for a caller: the entry in a
+  workspace that a value most restates, under a different key, or `None`.
+
+### Changed
+
+- **Which notes a turn carries is decided by what the turn is about.** Until now
+  the memory block kept the **newest** notes that fit its quarter-share of the
+  turn, which is the right answer only while the whole store fits that share —
+  and 0.56.0 is the release that let you raise the caps past it. When the store
+  does not fit, the notes that survive are now ranked by how many words the entry
+  shares with what this turn is about (the run's goal, and every path a tool has
+  already named in this run), then by how many **separate runs** have carried the
+  entry, then by the order the store returned. An entry with no signal and no
+  evidence keeps exactly the position it had, so a turn about nothing the store
+  knows behaves as it did before.
+- **The block is still printed in the store's own order**, never in the order the
+  selection chose, and this is deliberate. The memory block is a byte-prefix of
+  the user turn, and the second prompt-cache breakpoint is withheld unless that
+  prefix repeats byte-identically — so reordering the print would have turned
+  cache reads into cache writes on every wire that takes the marker, for a
+  reordering the model gains nothing from. A store that fits its share assembles
+  a byte-identical prompt however the turn moves.
+- **`Store::memory_list` breaks ties on the key rather than the row id.** Still
+  oldest first; now a **total** order, which is what lets the block be printed
+  back in the order the store returned it after selection has reordered it.
+- **The block's elision line no longer calls the dropped notes "older".** It
+  reads `(N note(s) elided to fit — Store::memory_list has all of them)`. They
+  are dropped for being about something else, and the previous wording described
+  a policy this release replaces.
+
 ## [0.56.0] - 2026-08-15
 
 ### Added

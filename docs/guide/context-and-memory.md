@@ -61,7 +61,8 @@ store.memory_clear(&workspace)?;
 
 Entries are attributed to the run and step that wrote them, capped in count and
 in total size, and every write, eviction, withdrawal and recall is in the trace.
-`Store` also exposes `memory_get` for a single key.
+`Store` also exposes `memory_get` for a single key, and `memory_similar` for the
+question "does this scope already hold this note under another name?".
 
 ### What goes when the store is full
 
@@ -81,6 +82,50 @@ so a note written this morning is a candidate, and the entry just written is
 never one, because evicting it would make a write a silent no-op. A pinned entry
 is never a candidate at all.
 
+### Which notes a turn is handed
+
+Eviction decides what the store keeps. Selection decides what one turn gets, and
+the two are separate questions: a store inside its share hands over everything it
+holds and never selects at all. Past that share something has to go, and until
+0.57.0 what went was whatever was written least recently — the same curation by
+clock that eviction stopped doing in 0.56.0, applied one layer later.
+
+Since 0.57.0 the entries that survive the fit are ranked by three terms, in order:
+
+1. **How much of the entry is about this turn** — the count of normalised words
+   the entry's key and value share with the turn's signals, which are the words of
+   the run's goal plus every path or subject a tool has already named in this run
+   (the `target` of each observation in the ledger).
+2. **How many separate runs have carried it** — distinct runs in `memory_recalls`,
+   not rows, for exactly the reason 0.56.0's eviction counts runs: rows are written
+   once per carried key per step, so counting them would measure how long the entry
+   has existed.
+3. **The order the store returned**, which is `(created_at, key)`.
+
+Normalisation is lowercase, split on anything that is not alphanumeric, drop
+anything shorter than three characters — which is why `src/state.rs` in a note
+matches the same path in a run's ledger: both reduce to `src` and `state`. Nothing
+is scored by a model and nothing leaves the process, so a replayed run selects
+what the run it replays selected. The third term is what makes the change safe to
+adopt: an entry with no signal and no evidence keeps exactly the position it had
+before, so a turn about nothing the store knows behaves as 0.56.0 did.
+
+**The printed order does not change.** However the ranking comes out, the block is
+rendered in the store's own `(created_at, key)` order, and that is a guarantee
+rather than an implementation detail. The memory block is a byte-prefix of the
+user turn, and 0.44.0's second cache breakpoint is withheld unless that prefix
+repeats byte-identically; reordering the print would have turned cache reads into
+cache writes on every marked wire, on every step whose signals moved. So a store
+that fits its share assembles a byte-identical prompt to the one 0.56.0 produced,
+and only the over-cap regime — the one raising a cap creates — sees any change.
+
+What is left out is visible to the model rather than silent, on a line that no
+longer claims the omission was about age:
+
+```text
+- (3 note(s) elided to fit — Store::memory_list has all of them)
+```
+
 ### The caps, and what raising one costs
 
 `MEMORY_MAX_ENTRIES` (64), `MEMORY_MAX_CHARS` (16,000 across the workspace) and
@@ -99,13 +144,24 @@ let contract = contract.with_memory_limits(MemoryLimits {
 Those three numbers were not arbitrary. The memory block gets a quarter of a
 turn's effective tokens, and the defaults were chosen so the *whole* store fits
 inside that share — which is why raising them is not the free win it looks like.
-Past that point recall can no longer carry everything, selection starts deciding
-what the model sees, and what grows with the store is the per-turn bill. A bigger
-store is worth having with evidence-ordered selection under it, which is what the
-same release put there; it was not worth having before.
+Past that point recall can no longer carry everything and selection starts
+deciding what the model sees. What that selection is has moved twice: 0.56.0 put
+evidence under it, and 0.57.0 put the turn's own subject on top of that, so the
+notes that survive the fit are the ones the goal and the paths already touched
+point at. From a *selection* standpoint a bigger store is now safe to have.
 
-The write pays too: ranking candidates reads every entry in the workspace, so a
-capped write costs about 1 ms at 64 entries and about 73 ms at 4,096 — see
+What is left is the bill, and it is a per-turn one. Ranking a scope normalises
+every entry it holds into a token set on every turn, because the ranking is
+computed from the store and the turn rather than stored: about 1.106 ms at the
+default 64 entries, 11.088 ms at 512 and 119.171 ms at 4,096. A `remember`
+including its duplicate check is a second pass over the same entries — 1.946,
+21.172 and 201.369 ms at those sizes, paid by writes only, and already inclusive
+of the eviction ranking a capped write does (0.56.0's own measurement of that
+alone is about 73 ms at 4,096, so the duplicate check is roughly the balance).
+Both costs are linear in the number of entries and flat in the size
+of the recall table. About a millisecond a turn against a provider call measured in
+seconds is nothing; 120 ms a turn, every turn, is the honest reason not to raise
+`max_entries` past what a workspace actually needs. See
 [docs/MEASUREMENTS.md](../MEASUREMENTS.md) for the machine and the method.
 
 ### Unlearning, and a scope above the workspace
@@ -132,6 +188,33 @@ ceiling that has not grown, and the workspace's own notes take that space first.
 
 `remember` and `forget` are deliberately narrow: they write one keyed note into
 the harness's own store, not into the workspace, so neither is a path act.
+
+### A note that restates one already held (0.57.0)
+
+`forget` closes the contradiction the agent noticed. The one it does not notice is
+the one that costs: the same fact learned twice under two names leaves two entries
+that disagree, both carried into the prompt, and the model acting on whichever it
+read last. Since 0.57.0 that is caught where it is written. On a write whose text
+closely overlaps an entry already stored **in the same scope under a different
+key**, the tool result names that key and quotes what it holds, bounded by the
+same `…[truncated]` marker every other bounded result uses.
+
+**The write still lands.** This is a report and never a refusal, and both halves
+of that are deliberate: refusing because two strings overlapped would be guessing
+at intent, and merging them would write a fact nobody stated. The model has the
+key and the text in the same turn, so it resolves the contradiction with a
+`remember` or a `forget` while it still knows which one it meant.
+
+Two writes are not reported, because neither is a contradiction. Rewriting the
+**same key** is the replacement writing by key has meant since 0.10.0. And a
+workspace note restating a **global** one is the override the second scope exists
+for — the way a wrong global note is corrected locally — so the check is only ever
+within the scope being written.
+
+The comparison is a normalised token overlap, shared words over union words,
+computed in this process on the write path already running: no embedding, no model
+call, nothing over a network. `Store::memory_similar(workspace, key, value)` is
+the same answer for a caller who wants to ask it directly.
 
 ## A correction that sticks
 
@@ -188,9 +271,13 @@ for recall in store.memory_recalls(run_id)? {
 
 The context assembler writes these at recall time, so they record what actually
 reached the model after the memory block was fitted to its share of the budget —
-not what was available to it. `Assembled::recalled_keys` is the same list for the
-turn in hand, beside the `recalled` count that was already there: the count says
-how much a turn leaned on memory, the keys say what it leaned on.
+not what was available to it. Since 0.57.0 that fit is decided by what the turn is
+about, so on an over-cap store these rows are also the record of which notes the
+goal and the paths already touched pulled in, turn by turn.
+`Assembled::recalled_keys` is the same list for the turn in hand, beside the
+`recalled` count that was already there: the count says how much a turn leaned on
+memory, the keys say what it leaned on. Both remain a record of **carriage** — the
+note was in the prompt — and nothing here observes whether the model read it.
 
 One row per key per recall, never a replacement. A run that recalls the same entry
 on three turns is three rows, and a caller that wants the set deduplicates it —

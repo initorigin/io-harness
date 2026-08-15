@@ -880,8 +880,15 @@ pub async fn assemble(
 /// Rendered as the agent's own notes rather than as instructions, and said to be
 /// possibly out of date, because a note one run wrote is read by every later run
 /// over that workspace: an entry that reads as a directive is one a later run may
-/// follow without judging it. Newest notes are kept when the block does not fit,
-/// and the count dropped is stated rather than hidden.
+/// follow without judging it. The count dropped is stated rather than hidden.
+///
+/// **Which notes are kept and the order they are printed in are two different
+/// orders (0.57.0).** The caller hands each slice worst-first — ranked by what
+/// the turn is about, then by how many runs have carried the entry, then by the
+/// order the store returned — and the fit below walks it in reverse, so what
+/// survives is what this turn needs. What is printed is always `(created_at,
+/// key)`, which is `Store::memory_list`'s own order. Through 0.56.0 the two
+/// coincided because "worst" simply meant "oldest".
 ///
 /// One note renders as `- {key}: {value}  (step {step})` — deliberately *not*
 /// naming the run that wrote it. See the note on `line` below.
