@@ -4750,7 +4750,12 @@ async fn run_workspace_from<P: Provider>(
         // Re-read each turn rather than once at the start, so the notes the model
         // sees are the notes the store holds — including one written this run, and
         // not one the operator has since cleared.
-        let (notes, global_notes) = recall_scopes(store, &mem_key)?;
+        //
+        // 0.57.0 — and ranked by what this turn is about, which grows as the run
+        // reads: the signals are rebuilt here each turn for the same reason the
+        // notes are.
+        let signals = recall_signals(&contract.goal, &ledger);
+        let (notes, global_notes) = recall_scopes(store, &mem_key, &signals)?;
         // 0.43.0 — before assembly, never inside it. Over the threshold, the older
         // observations become one written paragraph and the assembler bounds a
         // shorter ledger; under it, nothing happens and no provider is called.
@@ -7034,7 +7039,12 @@ where
                 &mut collected,
                 &mut ledger,
             )?;
-            let (notes, global_notes) = recall_scopes(tree.store, &mem_key)?;
+            // 0.57.0 — the tree loop's own signals, from this agent's goal and
+            // this agent's ledger. A child ranks against the work IT was given,
+            // not against the parent's: `contract.goal` here is the child's, and
+            // the ledger is the one this depth folds.
+            let signals = recall_signals(&contract.goal, &ledger);
+            let (notes, global_notes) = recall_scopes(tree.store, &mem_key, &signals)?;
             // 0.43.0 — the tree loop's own call to the one fold helper, in the same
             // place for the same reason. A child folds its own ledger at its own
             // depth: the summary is of the work that agent did, not of the tree.
@@ -10147,6 +10157,10 @@ async fn dispatch(
             // recorded and handed back to the model: an agent that believes it
             // corrected something and did not will act on the correction it
             // thinks it made.
+            // 0.57.0 — asked BEFORE the write, and it has to be: afterwards the
+            // new entry is itself in the scope, and an entry restating itself is
+            // the one answer that is never useful.
+            let restates = store.memory_similar(scope, key, value)?;
             let wrote = store.memory_write_with(
                 scope,
                 key,
@@ -10198,11 +10212,33 @@ async fn dispatch(
                 )?;
             }
             info!(run_id, step, key, evicted = evicted.len(), "remembered");
+            // 0.57.0 — the write landed, and the model is told what it now holds
+            // twice. Reported rather than refused: a harness that declined a
+            // write because two strings overlapped would be guessing at intent,
+            // and one that merged them would be writing a fact nobody stated.
+            // Resolving it is the model's, in this turn, with `remember` or
+            // `forget` — which is the whole reason to say it here rather than
+            // leave it for a later run to trip over.
+            //
+            // The held value is quoted, because "you already know this" without
+            // saying what is known is a line a model can only act on by reading
+            // the store it cannot read. Bounded, because a note may be two
+            // thousand characters and this text is charged to the turn.
+            let restated = match &restates {
+                None => String::new(),
+                Some(entry) => format!(
+                    "\n[remember: this restates `{}`, which holds: \"{}\"] Two notes saying \
+                     the same thing are both carried and the model acts on whichever it read \
+                     last. Replace one, or forget the other.\n",
+                    entry.key,
+                    crate::state::truncate_memory_value(&entry.value, 200),
+                ),
+            };
             // No target: two notes under one key are the store's business, and a
             // remember is not an observation OF anything that could go stale.
             Dispatched::seen(
                 format!("remembered {key}"),
-                format!("\n[remember {key}]\n"),
+                format!("\n[remember {key}]\n{restated}"),
                 ObsKind::Tool,
                 None,
             )
@@ -13221,20 +13257,109 @@ fn memory_scope<'a>(
 /// The specific place always knows better than the general one: a global note an
 /// agent got wrong is corrected by writing the same key in the workspace that
 /// disagrees with it, which is a thing a run can do for itself.
-fn recall_scopes(store: &Store, mem_key: &str) -> Result<(Vec<MemoryEntry>, Vec<MemoryEntry>)> {
-    let notes = store.memory_list(mem_key)?;
+fn recall_scopes(
+    store: &Store,
+    mem_key: &str,
+    signals: &std::collections::BTreeSet<String>,
+) -> Result<(Vec<MemoryEntry>, Vec<MemoryEntry>)> {
+    let mut notes = store.memory_list(mem_key)?;
     // A run over the global bucket itself — which nothing in this crate creates,
     // but an embedder could name — would otherwise see its own notes twice.
     if mem_key == GLOBAL_MEMORY_WORKSPACE {
+        rank_notes(store, mem_key, &mut notes, signals)?;
         return Ok((notes, Vec::new()));
     }
     let own: std::collections::HashSet<&str> = notes.iter().map(|e| e.key.as_str()).collect();
-    let global = store
+    let mut global: Vec<MemoryEntry> = store
         .memory_list(GLOBAL_MEMORY_WORKSPACE)?
         .into_iter()
         .filter(|e| !own.contains(e.key.as_str()))
         .collect();
+    // Each scope is ranked against its own evidence, because a recall row is
+    // credited to the bucket that actually holds the entry (see `record_recalls`)
+    // and counting a global note's draws under the workspace would find none.
+    rank_notes(store, mem_key, &mut notes, signals)?;
+    rank_notes(store, GLOBAL_MEMORY_WORKSPACE, &mut global, signals)?;
     Ok((notes, global))
+}
+
+/// The words this turn is about (0.57.0): the goal it was given, and every path
+/// or subject a tool has already named in this run.
+///
+/// Both halves are already in hand at each recall site — nothing is read from
+/// the workspace and nothing is asked of a model — which is what makes the
+/// ordering a pure function of the store and the turn, and therefore what lets
+/// a replayed run recall in the order the run it replays did.
+///
+/// `Observation::target` is "the path or subject the tool named", so a run that
+/// has read `src/state.rs` carries `src` and `state` as signals and a note about
+/// that file outranks a newer note about something else. An observation that
+/// names nothing contributes nothing rather than contributing its prose: the
+/// text of a `grep` result is not what the turn is about.
+// `crate::context::Ledger` written out: bare `Ledger` in this module is the
+// containment *spend* ledger, and the two are one careless import apart.
+fn recall_signals(
+    goal: &str,
+    ledger: &crate::context::Ledger,
+) -> std::collections::BTreeSet<String> {
+    let mut signals = crate::state::memory_tokens(goal);
+    for obs in ledger.entries() {
+        if let Some(target) = &obs.target {
+            signals.extend(crate::state::memory_tokens(target));
+        }
+    }
+    signals
+}
+
+/// Order one scope's notes worst-first, so the fit in [`crate::context`] — which
+/// walks the slice in reverse — keeps the ones this turn is about (0.57.0).
+///
+/// Three terms, and the last two are the release before this one read the other
+/// way round:
+///
+/// - **How much the entry has in common with the turn.** The count of shared
+///   normalised tokens between the entry's key and value and the turn's signals.
+///   A count and not a ratio: a long note that covers the subject should not
+///   rank below a short one that mentions it once.
+/// - **How many separate runs have carried it** ([`Store::memory_draws`]) — the
+///   same evidence eviction ranks by, and distinct runs rather than rows for the
+///   same reason.
+/// - **The order the store returned**, which is `(created_at, key)`. Every entry
+///   with no signal and no evidence therefore keeps exactly the position it had
+///   before this release, so a turn that is about nothing the store knows
+///   behaves as 0.56.0 did rather than newly.
+///
+/// The decoration is computed once per entry rather than inside a comparator,
+/// which would re-tokenise every value `n log n` times on the turn's own path.
+fn rank_notes(
+    store: &Store,
+    workspace: &str,
+    notes: &mut Vec<MemoryEntry>,
+    signals: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if notes.len() < 2 {
+        return Ok(());
+    }
+    let draws = store.memory_draws(workspace)?;
+    let mut ranked: Vec<(usize, usize, usize)> = notes
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let tokens = crate::state::memory_tokens(&format!("{} {}", e.key, e.value));
+            (
+                signals.intersection(&tokens).count(),
+                draws.get(&e.key).copied().unwrap_or(0),
+                i,
+            )
+        })
+        .collect();
+    // Ascending on all three, so the slice ends worst-first and the reverse walk
+    // in `render_notes` takes the best. The index tail makes the sort total: two
+    // entries equal on signal and draws cannot swap between two turns, which is
+    // what "the same store and the same turn select the same notes" rests on.
+    ranked.sort_unstable();
+    *notes = ranked.iter().map(|&(_, _, i)| notes[i].clone()).collect();
+    Ok(())
 }
 
 /// Record what this step's prompt actually carried, each key against the bucket
@@ -15646,6 +15771,185 @@ fn workspace_tools() -> Vec<ToolSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0.57.0 — a cohort with nothing to separate it keeps the order the store
+    /// returned, at a size where an unstable sort would not.
+    ///
+    /// Written after a sabotage: dropping the index from the sort key and sorting
+    /// unstably failed nothing, because every other test here ties at most two
+    /// entries and a two-element unstable sort does not move equal keys. Sixty-four
+    /// is past the threshold where the sort switches strategy, which is where the
+    /// guarantee stops being free. Without the index term this is the assertion
+    /// that goes — and with it, "an entry with no signal and no evidence keeps
+    /// exactly the position it had before this release" is a fact rather than a
+    /// property of whichever sort the standard library ships.
+    #[test]
+    fn a_cohort_with_nothing_to_separate_it_keeps_the_order_the_store_returned() {
+        use crate::state::{MemoryKind, MemoryLimits};
+
+        let store = Store::memory().unwrap();
+        // Two tied cohorts, **interleaved** rather than contiguous: every even
+        // entry shares the goal's word and every odd one shares nothing. A run of
+        // equal keys all together is the one case an unstable sort leaves alone;
+        // equals that have to be partitioned past each other are the case where
+        // it does not, and it is also the ordinary shape of a real store.
+        let mut notes: Vec<crate::state::MemoryEntry> = (0..64)
+            .map(|i| crate::state::MemoryEntry {
+                key: format!("k{i:02}"),
+                value: if i % 2 == 0 {
+                    "the parser".to_string()
+                } else {
+                    "unrelated bookkeeping".to_string()
+                },
+                run_id: 1,
+                step: 1,
+                created_at: format!("2026-08-15T00:00:00.{i:03}Z"),
+                kind: MemoryKind::Fact,
+                pinned: false,
+            })
+            .collect();
+        for e in &notes {
+            store
+                .memory_write_with(
+                    "/ws",
+                    &e.key,
+                    &e.value,
+                    1,
+                    1,
+                    MemoryKind::Fact,
+                    MemoryLimits::default(),
+                )
+                .unwrap();
+        }
+        let signals = crate::state::memory_tokens("fix the parser");
+        rank_notes(&store, "/ws", &mut notes, &signals).unwrap();
+
+        let after: Vec<String> = notes.iter().map(|e| e.key.clone()).collect();
+        // The unmatched cohort first, then the matched one — worst-first, which is
+        // what the fit reads in reverse — and **within each, the order the store
+        // returned**. That second half is the tail of the sort key, and it is what
+        // makes "an entry with no signal and no evidence keeps the position it
+        // had" a fact rather than a property of whichever sort the standard
+        // library happens to ship.
+        let expected: Vec<String> = (0..64)
+            .filter(|i| i % 2 == 1)
+            .chain((0..64).filter(|i| i % 2 == 0))
+            .map(|i| format!("k{i:02}"))
+            .collect();
+        assert_eq!(
+            after, expected,
+            "two interleaved tied cohorts must come back grouped and, inside each \
+             group, in the store's own order"
+        );
+    }
+
+    /// 0.57.0 N5 and N6 — what ranking a turn's recall costs, and what the
+    /// duplicate check adds to a write, at the three store sizes an operator can
+    /// now reach.
+    ///
+    /// A measurement, not a gate: it prints and asserts nothing about a clock.
+    /// The shape to expect is linear in entries — every entry is tokenised once
+    /// per turn — and flat in the size of the recall table, which is what
+    /// 0.56.0's index buys. **A timing that does not move when the input grows
+    /// eightfold is a defect report and not a pass**, which is the lesson
+    /// 0.56.0's own N5 paid for.
+    ///
+    /// ```text
+    /// cargo test --release --lib memory_recall_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a measurement, not a gate: prints timings, asserts none of them"]
+    fn memory_recall_cost() {
+        use crate::state::{MemoryKind, MemoryLimits};
+
+        // A goal and two hundred read observations, which is a long run's ledger.
+        let goal = "make the parser report the column it stopped at";
+        let mut ledger = crate::context::Ledger::new();
+        for i in 0..200u32 {
+            ledger.push(crate::context::Observation::new(
+                i,
+                crate::context::ObsKind::Read,
+                Some(format!("src/module{i}/handler.rs")),
+                "…",
+            ));
+        }
+        let signals = recall_signals(goal, &ledger);
+        println!("signal tokens: {}", signals.len());
+        println!("entries  recall rows  ms/rank  ms/remember (medians of 20)");
+
+        for entries in [64usize, 512, 4_096] {
+            let store = Store::memory().unwrap();
+            let limits = MemoryLimits {
+                max_entries: entries,
+                max_chars: usize::MAX,
+                ..MemoryLimits::default()
+            };
+            for i in 0..entries {
+                let value = format!(
+                    "note {i} about the parser and the column it stopped at, {}",
+                    "detail ".repeat(10)
+                );
+                store
+                    .memory_write_with(
+                        "/ws",
+                        &format!("k{i}"),
+                        &value,
+                        1,
+                        1,
+                        MemoryKind::Fact,
+                        limits,
+                    )
+                    .unwrap();
+            }
+            let runs = 20i64;
+            for run in 100..(100 + runs) {
+                let keys: Vec<String> = (0..entries).map(|i| format!("k{i}")).collect();
+                store.record_memory_recall(run, 1, "/ws", &keys).unwrap();
+            }
+
+            let mut rank = Vec::new();
+            for _ in 0..20 {
+                let mut notes = store.memory_list("/ws").unwrap();
+                let at = std::time::Instant::now();
+                rank_notes(&store, "/ws", &mut notes, &signals).unwrap();
+                rank.push(at.elapsed());
+                assert_eq!(notes.len(), entries, "ranking never drops an entry");
+            }
+
+            let mut write = Vec::new();
+            for n in 0..20 {
+                let at = std::time::Instant::now();
+                let restates = store
+                    .memory_similar("/ws", "fresh", "note about the parser and the column")
+                    .unwrap();
+                store
+                    .memory_write_with(
+                        "/ws",
+                        &format!("fresh{n}"),
+                        "note about the parser and the column",
+                        2,
+                        2,
+                        MemoryKind::Fact,
+                        limits,
+                    )
+                    .unwrap();
+                write.push(at.elapsed());
+                assert!(
+                    restates.is_some(),
+                    "the fixture's notes restate the written one, or this measures the miss path"
+                );
+            }
+
+            rank.sort();
+            write.sort();
+            println!(
+                "{entries:>7}  {:>11}  {:>7.3}  {:>11.3}",
+                entries as i64 * runs,
+                rank[rank.len() / 2].as_secs_f64() * 1_000.0,
+                write[write.len() / 2].as_secs_f64() * 1_000.0,
+            );
+        }
+    }
 
     /// 0.50.0 — the operator's ceiling, arm by arm.
     ///

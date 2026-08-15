@@ -1941,6 +1941,42 @@ steps elapsed since the write and would make the order monotone in age again. A
 recall means the entry was **carried into a prompt**, which is the strongest
 signal this crate can observe; nothing here claims the model read it.
 
+**Which notes a turn carries is decided by the turn, and the order they are
+printed in is not (0.57.0).** When the store does not fit the memory block's
+share, the entries that survive the fit are ranked by three terms: how many
+normalised words the entry's key and value share with what this turn is about —
+the words of the run's goal, plus every path or subject a tool has already named
+in this run — then how many **distinct runs** have carried the entry, then the
+order the store returned, which is `(created_at, key)`. An entry with no signal
+and no evidence therefore keeps exactly the position it had before this release,
+so a turn about nothing the store knows selects as 0.56.0 did.
+
+The block is nonetheless always **printed** in the store's own order, never in
+rank order, and that is a guarantee rather than an implementation detail: the
+memory block is a byte-prefix of the user turn, and the second cache breakpoint
+(0.44.0) is withheld unless that prefix repeats byte-identically. A store that
+fits its share therefore assembles a byte-identical prompt however the turn
+moves, and only the over-cap regime — the one raising a cap creates — sees any
+change at all. Normalisation is: lowercase, split on anything that is not
+alphanumeric, drop anything shorter than three characters. Nothing is scored by
+a model and nothing leaves the process, so a replayed run selects what the run
+it replays selected.
+
+**A note that restates one already held is reported where it is written
+(0.57.0).** `remember` writes by key, so the same fact learned twice under two
+names leaves two entries that disagree, both carried, and the model acting on
+whichever it read last. On a write whose text closely overlaps an entry already
+stored **in the same scope under a different key**, the tool result names that
+key and quotes what it holds, bounded. The write still lands: this is a report
+and never a refusal, because a harness that declined a write because two strings
+overlapped would be guessing at intent and one that merged them would be writing
+a fact nobody stated. Rewriting the same key is not reported — that is the
+replacement writing by key has meant since 0.10.0 — and a workspace note
+restating a **global** one is not reported either, because that is the override
+the second scope exists for. The comparison is a normalised token overlap
+computed in this process; `Store::memory_similar` is the same answer for a
+caller.
+
 **The three caps are the operator's (0.56.0).** `MEMORY_MAX_ENTRIES` (64),
 `MEMORY_MAX_CHARS` (16,000) and `MEMORY_MAX_ENTRY_CHARS` (an eighth of that)
 remain the defaults and are now movable, through `[memory]` in `io.toml` or
@@ -1948,7 +1984,9 @@ remain the defaults and are now movable, through `[memory]` in `io.toml` or
 widen. Raising one is coupled to what a prompt can carry: the memory block gets a
 quarter of a turn's effective tokens, and the defaults were chosen so a whole
 store fits inside that share — past it, selection begins deciding what the model
-sees, which is only safe because selection is now by evidence.
+sees, which is only safe because selection is now by evidence. Since 0.57.0 that
+selection is by what the turn is about, so raising a cap costs time rather than
+relevance: ranking is linear in entries and measured in `docs/MEASUREMENTS.md`.
 
 **Memory has two scopes, and the specific one wins (0.56.0).** A workspace's
 canonical path, and `GLOBAL_MEMORY_WORKSPACE` above it, which every run over

@@ -242,17 +242,28 @@ database — they are chosen against what fits in a *prompt*. The memory block g
 a quarter of a turn's effective tokens, and at these caps the whole store fits
 inside that share, so recall carries everything and nothing has to be selected.
 Past that point selection begins, and what the model sees stops being "your
-notes" and becomes "the notes that fit". That is survivable now — since 0.56.0
-selection is by which entries separate runs have actually carried, rather than by
-which were written most recently — but it is a real change in behaviour, and the
-thing that grows with the store is the per-turn bill. Raise them because you
-measured the block being short, not on principle.
+notes" and becomes "the notes that fit". **Which notes those are is no longer the
+objection it was.** Since 0.57.0 the entries that survive the fit are chosen by
+what the turn is about — the words of the run's goal and every path a tool has
+already named — then by how many separate runs have carried them, then by the
+store's own order, so a turn's own subject decides what it is handed. The block is
+still printed in `(created_at, key)` order, which is why a store that fits its
+share assembles the same bytes it did before. From a *selection* standpoint,
+raising these is now safe.
 
-The write pays for it too. A capped write ranks every entry in the workspace, so
-its cost is linear in `max_entries`: about 1 ms at the default 64 and about 73 ms
-at 4,096 on the machine named in
-[docs/MEASUREMENTS.md](../MEASUREMENTS.md). That is per `remember` that evicts,
-not per turn.
+What is left is time, and it is per turn rather than per write. Ranking a scope
+normalises every entry it holds into a token set on every turn, because the
+ranking is computed from the store and the turn rather than stored: about 1.106 ms
+at the default 64 entries, 11.088 ms at 512 and 119.171 ms at 4,096, on the
+machine named in [docs/MEASUREMENTS.md](../MEASUREMENTS.md). A `remember` — the
+same work plus the duplicate check, which reads those entries again — is 1.946,
+21.172 and 201.369 ms at those sizes, and that figure already contains the
+eviction ranking a capped write does, measured alone at about 73 ms at 4,096 in
+0.56.0. Both are linear in
+`max_entries` and flat in the size of the recall table. A millisecond a turn is
+nothing beside a provider call; 120 ms a turn, on every turn, is the honest reason
+not to raise `max_entries` past what a workspace needs. Raise them because you
+measured the block being short, not on principle.
 
 The table bounds one *scope*. The scope above the workspace holds its own, so a
 run recalling both can carry up to twice `max_chars` — inside the same block

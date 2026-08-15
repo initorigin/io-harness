@@ -880,8 +880,15 @@ pub async fn assemble(
 /// Rendered as the agent's own notes rather than as instructions, and said to be
 /// possibly out of date, because a note one run wrote is read by every later run
 /// over that workspace: an entry that reads as a directive is one a later run may
-/// follow without judging it. Newest notes are kept when the block does not fit,
-/// and the count dropped is stated rather than hidden.
+/// follow without judging it. The count dropped is stated rather than hidden.
+///
+/// **Which notes are kept and the order they are printed in are two different
+/// orders (0.57.0).** The caller hands each slice worst-first — ranked by what
+/// the turn is about, then by how many runs have carried the entry, then by the
+/// order the store returned — and the fit below walks it in reverse, so what
+/// survives is what this turn needs. What is printed is always `(created_at,
+/// key)`, which is `Store::memory_list`'s own order. Through 0.56.0 the two
+/// coincided because "worst" simply meant "oldest".
 ///
 /// One note renders as `- {key}: {value}  (step {step})` — deliberately *not*
 /// naming the run that wrote it. See the note on `line` below.
@@ -919,8 +926,13 @@ fn render_notes(
     // says, not about what is recorded.
     let line = |e: &MemoryEntry| format!("- {}: {}  (step {})\n", e.key, e.value, e.step);
 
-    // Newest first while deciding what fits; at least one note always survives, so
-    // a workspace with memory never renders an empty block.
+    // Best first while deciding what fits, chronological when printing — and the
+    // two being different orders is the whole of 0.57.0's shape (see the note on
+    // the sort below). The caller hands both slices worst-first, so walking them
+    // in reverse takes the most relevant note first; through 0.56.0 "worst" was
+    // simply "oldest" and this reverse walk was what kept the newest.
+    // At least one note always survives, so a workspace with memory never
+    // renders an empty block.
     // Each heading is charged only when its own list will actually render one.
     // Charging for both unconditionally would quietly shrink the workspace block
     // by the size of a heading the prompt never contains — a behaviour change for
@@ -949,7 +961,19 @@ fn render_notes(
             *used += t;
             keep.push(e.clone());
         }
-        keep.reverse();
+        // 0.57.0 — printed in the store's own order, never in the order the fit
+        // chose. The memory block is a byte-prefix of the user turn, and the
+        // second cache breakpoint (0.44.0) is withheld unless that prefix
+        // repeats byte-identically, so a block whose LINE ORDER moved when the
+        // turn's subject moved would convert a cache read into a cache write on
+        // every marked wire — for a reordering the model gains nothing from,
+        // since it reads the whole block either way. Selection is the behaviour
+        // that was wanted; the order is not part of it.
+        //
+        // `(created_at, key)` is exactly what `Store::memory_list` returns, and
+        // that is why 0.57.0 made the key its tie-break: a printer holding only
+        // entries cannot reconstruct an order that breaks ties on a row id.
+        keep.sort_by(|a, b| (&a.created_at, &a.key).cmp(&(&b.created_at, &b.key)));
         keep
     };
     // The workspace's own notes take the space first. Both scopes hold their own
@@ -968,7 +992,7 @@ fn render_notes(
         let dropped = notes.len() - keep.len();
         if dropped > 0 {
             out.push_str(&format!(
-                "- ({dropped} older note(s) elided to fit — Store::memory_list has all of them)\n"
+                "- ({dropped} note(s) elided to fit — Store::memory_list has all of them)\n"
             ));
         }
     }
@@ -980,7 +1004,7 @@ fn render_notes(
         let dropped = global.len() - keep_global.len();
         if dropped > 0 {
             out.push_str(&format!(
-                "- ({dropped} older note(s) elided to fit — Store::memory_list has all of them)\n"
+                "- ({dropped} note(s) elided to fit — Store::memory_list has all of them)\n"
             ));
         }
     }

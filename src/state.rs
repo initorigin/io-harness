@@ -2122,7 +2122,7 @@ const MEMORY_TRUNCATED: &str = "…[truncated]";
 
 /// Cut `value` to [`MEMORY_MAX_ENTRY_CHARS`] on a char boundary, marking the
 /// cut. Returned unchanged when it already fits.
-fn truncate_memory_value(value: &str, cap: usize) -> String {
+pub(crate) fn truncate_memory_value(value: &str, cap: usize) -> String {
     if value.chars().count() <= cap {
         return value.to_string();
     }
@@ -2133,6 +2133,69 @@ fn truncate_memory_value(value: &str, cap: usize) -> String {
     let mut out: String = value.chars().take(keep).collect();
     out.push_str(MEMORY_TRUNCATED);
     out
+}
+
+/// The normalised words of a text (0.57.0): lowercased, split on anything that
+/// is not alphanumeric, and anything shorter than three characters dropped.
+///
+/// One normaliser, called by both halves of 0.57.0 — the recall ranking in
+/// [`crate::context`] and [`Store::memory_similar`] — because two answers to
+/// "what counts as a word here" is how the two come to disagree.
+///
+/// The three-character floor is a stopword list nobody has to maintain: it
+/// removes `a`, `of`, `is`, `to` and the rest of the closed class, and keeps
+/// every identifier a note or a goal is actually about. Splitting on
+/// non-alphanumerics is what makes `src/state.rs` in a note match the same path
+/// in a run's ledger — the two tokens are `src` and `state` either way, and `rs`
+/// falls under the floor.
+///
+/// A [`BTreeSet`](std::collections::BTreeSet) and not a `HashSet`: the iteration
+/// order of a `HashSet` is seeded per process, and 0.57.0's ranking must be a
+/// pure function of the store and the turn or a replayed run recalls differently
+/// than the run it replays.
+pub(crate) fn memory_tokens(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// How much two token sets have in common, as `(shared, total)` — the two halves
+/// of `|A ∩ B| / |A ∪ B|`, returned rather than divided (0.57.0).
+///
+/// Returned as a pair so the caller compares by cross-multiplication instead of
+/// by float division: `shared * 100 >= total * percent` is exact at the
+/// threshold, where `shared as f64 / total as f64 >= 0.6` is at the mercy of
+/// whichever way the division rounded.
+pub(crate) fn memory_overlap(
+    a: &std::collections::BTreeSet<String>,
+    b: &std::collections::BTreeSet<String>,
+) -> (usize, usize) {
+    let shared = a.intersection(b).count();
+    (shared, a.len() + b.len() - shared)
+}
+
+/// How much of two texts must overlap before one is reported as restating the
+/// other, in percent of their union (0.57.0).
+///
+/// High deliberately. A hit is handed to the model as "you already hold this
+/// under another key", and a threshold that fires on a neighbouring subject
+/// teaches the model to ignore the line — which costs more than the report is
+/// worth. At 60 the two texts share three words in five.
+const MEMORY_SIMILAR_PERCENT: usize = 60;
+
+/// Whether one text restates another: at least [`MEMORY_SIMILAR_PERCENT`] of the
+/// two token sets' union is shared (0.57.0).
+///
+/// Cross-multiplied rather than divided, so nothing rounds. Two texts with no
+/// words at all between them are not similar — an empty union would otherwise
+/// divide by zero, and "these two say nothing" is not a restatement.
+pub(crate) fn memory_is_similar(
+    a: &std::collections::BTreeSet<String>,
+    b: &std::collections::BTreeSet<String>,
+) -> bool {
+    let (shared, total) = memory_overlap(a, b);
+    total > 0 && shared * 100 >= total * MEMORY_SIMILAR_PERCENT
 }
 
 /// The workspace key the scope above every workspace is stored under (0.56.0).
@@ -6777,6 +6840,88 @@ impl Store {
         })
     }
 
+    /// The entry in `workspace` that `value` most restates, under a different
+    /// key, or `None` (0.57.0).
+    ///
+    /// `remember` writes by key, so the same fact learned twice under two names
+    /// leaves two entries that disagree, both carried into the next turn, and
+    /// the model acting on whichever it read last. This is what lets the write
+    /// path say so at the moment the second one is written, while the writer's
+    /// own intent is still available to resolve it.
+    ///
+    /// **Under a different key.** Rewriting a key is an intentional replacement
+    /// and has been since 0.10.0; `key` is excluded rather than reported.
+    ///
+    /// **Within one scope.** A workspace note that restates a global one is not
+    /// a contradiction — it is the override the second scope exists for, and
+    /// 0.56.0 made it the designed way to correct a wrong global note. Pass the
+    /// scope being written and nothing else.
+    ///
+    /// The comparison is a normalised token overlap computed here, in this
+    /// process: no embedding, no model, nothing over a network. Where several
+    /// entries qualify the one sharing the most words wins, and an exact tie
+    /// goes to whichever [`Self::memory_list`] returns first, so two identical
+    /// stores answer identically.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("port the parser", "/repo")?;
+    /// store.memory_put(
+    ///     "/repo", "build-command", "the test command is cargo test --all-features", run, 1,
+    /// )?;
+    ///
+    /// // The same fact, in different words, under a second key.
+    /// let clash = store.memory_similar(
+    ///     "/repo", "how-to-test", "the test command here is cargo test --all-features",
+    /// )?;
+    /// assert_eq!(clash.expect("a restatement").key, "build-command");
+    ///
+    /// // A note about something else is not a restatement...
+    /// assert!(store
+    ///     .memory_similar("/repo", "editor", "the maintainer reviews on Tuesdays")?
+    ///     .is_none());
+    /// // ...and neither is rewriting the key that already holds it.
+    /// assert!(store
+    ///     .memory_similar(
+    ///         "/repo", "build-command", "the test command is cargo test --all-features",
+    ///     )?
+    ///     .is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn memory_similar(
+        &self,
+        workspace: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<Option<MemoryEntry>> {
+        let tokens = memory_tokens(value);
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        let mut best: Option<(usize, MemoryEntry)> = None;
+        for entry in self.memory_list(workspace)? {
+            if entry.key == key {
+                continue;
+            }
+            let other = memory_tokens(&entry.value);
+            if !memory_is_similar(&tokens, &other) {
+                continue;
+            }
+            let (shared, _) = memory_overlap(&tokens, &other);
+            // Strictly greater, so an exact tie keeps the earlier entry — which
+            // is the one `memory_list` returned first, and therefore an answer
+            // that does not depend on iteration order.
+            if best.as_ref().is_none_or(|(most, _)| shared > *most) {
+                best = Some((shared, entry));
+            }
+        }
+        Ok(best.map(|(_, entry)| entry))
+    }
+
     /// Pin or unpin one entry, so a run cannot overwrite it (0.30.0). True when
     /// an entry was there to change.
     ///
@@ -6901,6 +7046,37 @@ impl Store {
            FROM memory m WHERE m.workspace = ?1
           ORDER BY runs ASC, last_recall ASC, m.created_at ASC, m.id ASC";
 
+    /// How many separate runs have carried each of a workspace's entries
+    /// (0.57.0). The same evidence [`Self::MEMORY_CANDIDATES_SQL`] evicts by,
+    /// read whole rather than per entry, because recall ranks every key at once
+    /// where eviction orders them.
+    ///
+    /// **Distinct runs, not rows**, for the reason the candidate order states: a
+    /// recall row is written once per carried key per *step*, so rows count
+    /// steps elapsed since the write rather than how often the entry was drawn
+    /// on, and one long run would outvote fifty short ones.
+    ///
+    /// Served by `memory_recalls_entry (workspace, key)`, added in 0.56.0 —
+    /// which is why this release adds no index. It runs once per scope per turn
+    /// on a table that grows for the life of the store, so a scan here would be
+    /// a scan on the turn's own path.
+    pub(crate) const MEMORY_DRAWS_SQL: &'static str =
+        "SELECT key, COUNT(DISTINCT run_id) FROM memory_recalls
+          WHERE workspace = ?1 GROUP BY key";
+
+    /// Every key this workspace has recall evidence for, and how many separate
+    /// runs carried it (0.57.0). Keys with no evidence are simply absent.
+    pub(crate) fn memory_draws(
+        &self,
+        workspace: &str,
+    ) -> Result<std::collections::BTreeMap<String, usize>> {
+        let mut stmt = self.conn.prepare(Self::MEMORY_DRAWS_SQL)?;
+        let rows = stmt.query_map([workspace], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as usize))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Evict this workspace's least-proven entries until both caps hold, never
     /// the entry `keep` (the one just written — evicting it would make a write a
     /// silent no-op). Returns the evicted keys in eviction order.
@@ -6959,10 +7135,20 @@ impl Store {
     }
 
     /// Every entry for `workspace`, oldest first. Never another workspace's.
+    ///
+    /// The tie-break is the key and not the row id since 0.57.0, which makes the
+    /// order **total** rather than merely oldest-first: a key is unique within a
+    /// workspace, where two entries written in the same millisecond are
+    /// separated only by an id this struct does not carry. 0.57.0 chooses which
+    /// notes a turn keeps by relevance and then prints them back in this order,
+    /// so "the order the store returned" has to be something the printer can
+    /// reconstruct from an entry alone. The eviction candidate order still
+    /// tie-breaks on the row `id`, where the row is in hand and 0.10.0's order is
+    /// a stated guarantee.
     pub fn memory_list(&self, workspace: &str) -> Result<Vec<MemoryEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT key, value, run_id, step, created_at, kind, pinned FROM memory
-             WHERE workspace = ?1 ORDER BY created_at ASC, id ASC",
+             WHERE workspace = ?1 ORDER BY created_at ASC, key ASC",
         )?;
         let rows = stmt.query_map([workspace], memory_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -7469,6 +7655,154 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0.57.0 F13. The measure both halves of the release rest on, asserted at
+    /// the unit rather than through a store, because everything above it is a
+    /// consumer of exactly these four properties.
+    ///
+    /// The criterion's parenthetical said a float comparison would flip the
+    /// boundary case. It does not, and that is recorded rather than quietly
+    /// dropped: an exactly-60% ratio divides to the same `f64` the literal `0.6`
+    /// parses to, because both round to the nearest double of the same real
+    /// number. What the integer comparison buys is that there is no rounding to
+    /// reason about at all — so the boundary is asserted in both directions
+    /// instead, which is what `>` in place of `>=` breaks.
+    #[test]
+    fn the_overlap_measure_is_symmetric_exact_and_immune_to_word_order() {
+        let a = memory_tokens("the release gate runs cargo clippy with all features");
+        let b = memory_tokens("features all with clippy cargo runs gate release the");
+        assert_eq!(
+            memory_overlap(&a, &b),
+            memory_overlap(&b, &a),
+            "the measure must not depend on which text is asked about first"
+        );
+        let (shared, total) = memory_overlap(&a, &b);
+        assert_eq!(
+            shared, total,
+            "the same words in another order are the same set"
+        );
+
+        // One word added is one word of disagreement, and the pair is no longer
+        // maximally similar. It is still well over the threshold, which is the
+        // point of a threshold rather than an equality.
+        let c = memory_tokens("the release gate runs cargo clippy with all features twice");
+        let (shared, total) = memory_overlap(&a, &c);
+        assert!(shared < total, "an added word must cost something");
+        assert!(
+            memory_is_similar(&a, &c),
+            "one word in nine is not a new fact"
+        );
+
+        // The boundary, in both directions, on a pair whose ratio is exactly the
+        // threshold: three shared words and two on each side that are not.
+        let left = memory_tokens("alpha bravo charlie delta echo");
+        let right = memory_tokens("alpha bravo charlie foxtrot golf");
+        assert_eq!(memory_overlap(&left, &right), (3, 7));
+        assert!(
+            !memory_is_similar(&left, &right),
+            "three in seven is 42 percent and must not report"
+        );
+        let right = memory_tokens("alpha bravo charlie delta foxtrot");
+        assert_eq!(memory_overlap(&left, &right), (4, 6));
+        assert!(
+            memory_is_similar(&left, &right),
+            "four in six is 66 percent and must report"
+        );
+        let left = memory_tokens("alpha bravo charlie delta echo");
+        let right = memory_tokens("alpha bravo charlie delta foxtrot golf hotel");
+        assert_eq!(memory_overlap(&left, &right), (4, 8));
+        assert!(
+            !memory_is_similar(&left, &right),
+            "exactly half is under the threshold, so the comparison is not merely non-zero"
+        );
+
+        // **Exactly** the threshold: six shared of a ten-word union is 60%, and
+        // the comparison is `>=`, so it reports. Written because the sabotage
+        // pass caught this test claiming a boundary it did not have — the three
+        // pairs above are 42%, 50% and 66%, and `>` in place of `>=` survived all
+        // of them. This is the only assertion here that distinguishes the two.
+        let left = memory_tokens("alpha bravo charlie delta echo foxtrot golf hotel");
+        let right = memory_tokens("alpha bravo charlie delta echo foxtrot india juliet");
+        let (shared, total) = memory_overlap(&left, &right);
+        assert_eq!((shared, total), (6, 10));
+        assert_eq!(
+            shared * 100,
+            total * MEMORY_SIMILAR_PERCENT,
+            "the pair must sit exactly on the threshold, or it tests the interior again"
+        );
+        assert!(
+            memory_is_similar(&left, &right),
+            "the threshold is inclusive: exactly 60% of the union shared is a restatement"
+        );
+    }
+
+    /// 0.57.0 F5's foundation. `Store::memory_list` is a **total** order since
+    /// this release, and the memory block is printed back in it after selection
+    /// has reordered the slice — so a tie the printer cannot reconstruct is a
+    /// block whose line order can move between two turns over an unchanged store,
+    /// which withholds the second cache breakpoint.
+    ///
+    /// Written after a sabotage: restoring `ORDER BY created_at ASC, id ASC`
+    /// failed nothing, because every other test that touches the order writes its
+    /// entries far enough apart to differ in the millisecond. The rows here are
+    /// given one `created_at` by hand, and their keys are the reverse of their
+    /// insertion order, so id-order and key-order cannot agree.
+    #[test]
+    fn memory_list_breaks_a_same_millisecond_tie_on_the_key_and_not_the_row_id() {
+        let store = Store::memory().unwrap();
+        for key in ["zulu", "yankee", "xray", "whiskey"] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO memory (workspace, key, value, run_id, step, created_at, kind, pinned)
+                     VALUES ('ws', ?1, 'v', 1, 1, '2026-08-15T00:00:00.000Z', 'fact', 0)",
+                    [key],
+                )
+                .unwrap();
+        }
+        let keys: Vec<String> = store
+            .memory_list("ws")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["whiskey", "xray", "yankee", "zulu"],
+            "four entries sharing a created_at order by key, not by the id they were inserted in"
+        );
+    }
+
+    /// 0.57.0 F13, the normaliser's own half. A path in a note and the same path
+    /// in a run's ledger have to reduce to the same tokens, or the signal the
+    /// ranking rests on never fires.
+    #[test]
+    fn the_normaliser_reduces_a_path_and_a_sentence_to_the_same_words() {
+        let from_note = memory_tokens("the eviction order lives in src/state.rs");
+        let from_ledger = memory_tokens("src/state.rs");
+        assert!(
+            from_note.contains("state") && from_note.contains("src"),
+            "a path in prose has to split into its components"
+        );
+        assert_eq!(
+            memory_overlap(&from_note, &from_ledger).0,
+            2,
+            "`src` and `state`; `rs` is under the floor"
+        );
+        assert!(
+            !from_note.contains("in") && !from_note.contains("rs"),
+            "anything shorter than three characters is dropped, which is the stopword list"
+        );
+        assert_eq!(
+            memory_tokens("CARGO Cargo cargo"),
+            memory_tokens("cargo"),
+            "case is not a distinction a note and a goal should differ on"
+        );
+        assert!(
+            memory_tokens("").is_empty() && memory_tokens("a of is").is_empty(),
+            "a text with nothing to say produces no signal rather than a false one"
+        );
+    }
 
     /// 0.30.0 F4, first half. [`MEMORY_KIND_NAMES`] is what
     /// [`MemoryKind::from_stored`] matches on, so a variant missing from it
@@ -9108,6 +9442,118 @@ mod tests {
         assert!(
             entries.len() < 10,
             "the character cap evicted while the count cap was untouched"
+        );
+    }
+
+    /// 0.57.0 F8. The same claim 0.56.0's F5 makes about the eviction
+    /// aggregate, asserted for the one recall ranks by — which runs once per
+    /// scope per *turn* rather than once per capped write, so it is the hotter
+    /// of the two.
+    ///
+    /// Ten thousand rows deliberately: `memory_recalls` gains one row per
+    /// carried key per step for the life of a store, so the size that matters is
+    /// the one a busy workspace reaches and not the one a fresh test has.
+    #[test]
+    fn ranking_recall_draws_seeks_the_recalls_rather_than_scanning_them() {
+        let store = Store::memory().unwrap();
+        fill_to_the_cap(&store, "ws");
+        // 157 and not 0.56.0's 156: sixty-four keys over 156 steps is 9,984
+        // rows, and the criterion names ten thousand. The count is asserted
+        // below rather than left as arithmetic in a loop bound, which is how the
+        // sibling test came to be sixteen rows short of what it claims.
+        for step in 1..=157u32 {
+            let keys: Vec<String> = (0..MEMORY_MAX_ENTRIES).map(|i| format!("k{i}")).collect();
+            store.record_memory_recall(7, step, "ws", &keys).unwrap();
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+        assert!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM memory_recalls", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap()
+                >= 10_000,
+            "the plan is only worth asserting on a table big enough for a scan to hurt"
+        );
+
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", Store::MEMORY_DRAWS_SQL))
+            .unwrap();
+        let plan = stmt
+            .query_map(["ws"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" | ");
+
+        assert!(
+            plan.contains("memory_recalls_entry"),
+            "the draws aggregate must seek on memory_recalls_entry, got {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN memory_recalls"),
+            "a turn must not read every recall row in the store, got {plan}"
+        );
+
+        // The control, the same one the eviction plan's test uses: `run_id` alone
+        // is served by a different index and `step` by none, so the assertions
+        // above are about this index rather than about a planner that never
+        // scans anything.
+        let mut stmt = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT key, COUNT(DISTINCT run_id) FROM memory_recalls
+                  WHERE step = ?1 GROUP BY key",
+            )
+            .unwrap();
+        let control = stmt
+            .query_map([1], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" | ");
+        assert!(
+            control.contains("SCAN memory_recalls"),
+            "a column in no index must scan, or the assertions above prove nothing, got {control}"
+        );
+    }
+
+    /// 0.57.0 F4, at the store. The draws term counts separate runs, and the
+    /// obvious spelling — how many recall rows does this key have — is the one
+    /// that makes a single long run outrank three short ones.
+    #[test]
+    fn the_draws_count_is_of_runs_and_not_of_rows() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "ws").unwrap();
+        store
+            .memory_put("ws", "long", "one long run", run, 1)
+            .unwrap();
+        store
+            .memory_put("ws", "short", "three short runs", run, 1)
+            .unwrap();
+        for step in 1..=200u32 {
+            store
+                .record_memory_recall(1, step, "ws", &["long".to_string()])
+                .unwrap();
+        }
+        for other in 2..=4i64 {
+            store
+                .record_memory_recall(other, 1, "ws", &["short".to_string()])
+                .unwrap();
+        }
+
+        let draws = store.memory_draws("ws").unwrap();
+        assert_eq!(draws.get("long"), Some(&1), "200 rows, one run");
+        assert_eq!(draws.get("short"), Some(&3), "3 rows, three runs");
+        assert!(
+            draws["short"] > draws["long"],
+            "three runs that each leaned on an entry beat one run that carried it 200 times"
+        );
+        assert!(
+            !draws.contains_key("never-written"),
+            "a key with no evidence is absent rather than zero, so a caller cannot mistake \
+             'no rows' for 'a row saying none'"
         );
     }
 
