@@ -15819,7 +15819,15 @@ mod tests {
                     "detail ".repeat(10)
                 );
                 store
-                    .memory_write_with("/ws", &format!("k{i}"), &value, 1, 1, MemoryKind::Fact, limits)
+                    .memory_write_with(
+                        "/ws",
+                        &format!("k{i}"),
+                        &value,
+                        1,
+                        1,
+                        MemoryKind::Fact,
+                        limits,
+                    )
                     .unwrap();
             }
             let runs = 20i64;

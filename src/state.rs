@@ -7677,7 +7677,10 @@ mod tests {
             "the measure must not depend on which text is asked about first"
         );
         let (shared, total) = memory_overlap(&a, &b);
-        assert_eq!(shared, total, "the same words in another order are the same set");
+        assert_eq!(
+            shared, total,
+            "the same words in another order are the same set"
+        );
 
         // One word added is one word of disagreement, and the pair is no longer
         // maximally similar. It is still well over the threshold, which is the
@@ -7685,7 +7688,10 @@ mod tests {
         let c = memory_tokens("the release gate runs cargo clippy with all features twice");
         let (shared, total) = memory_overlap(&a, &c);
         assert!(shared < total, "an added word must cost something");
-        assert!(memory_is_similar(&a, &c), "one word in nine is not a new fact");
+        assert!(
+            memory_is_similar(&a, &c),
+            "one word in nine is not a new fact"
+        );
 
         // The boundary, in both directions, on a pair whose ratio is exactly the
         // threshold: three shared words and two on each side that are not.
@@ -9464,8 +9470,12 @@ mod tests {
     fn the_draws_count_is_of_runs_and_not_of_rows() {
         let store = Store::memory().unwrap();
         let run = store.start_run("goal", "ws").unwrap();
-        store.memory_put("ws", "long", "one long run", run, 1).unwrap();
-        store.memory_put("ws", "short", "three short runs", run, 1).unwrap();
+        store
+            .memory_put("ws", "long", "one long run", run, 1)
+            .unwrap();
+        store
+            .memory_put("ws", "short", "three short runs", run, 1)
+            .unwrap();
         for step in 1..=200u32 {
             store
                 .record_memory_recall(1, step, "ws", &["long".to_string()])

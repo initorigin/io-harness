@@ -450,7 +450,10 @@ async fn an_unrelated_note_and_a_rewrite_of_one_key_are_not_flagged() {
         &store,
         vec![
             remember("build-command", TEST_CMD),
-            remember("review-day", "the maintainer reviews pull requests on Tuesdays"),
+            remember(
+                "review-day",
+                "the maintainer reviews pull requests on Tuesdays",
+            ),
             // The same key, with a value nearly identical to its own: a
             // replacement, which is what writing by key has meant since 0.10.0.
             remember("build-command", TEST_CMD_AGAIN),
@@ -483,7 +486,9 @@ async fn a_flagged_write_still_lands_and_the_quote_is_bounded() {
     // "and it is run from the repository root" put the pair at exactly 50%,
     // which is the measure working rather than failing.
     let long = format!("{TEST_CMD}. ").repeat(20);
-    store.memory_put(&key, "build-command", &long, 1, 1).unwrap();
+    store
+        .memory_put(&key, "build-command", &long, 1, 1)
+        .unwrap();
 
     let seen = played(
         dir.path(),
@@ -502,7 +507,11 @@ async fn a_flagged_write_still_lands_and_the_quote_is_bounded() {
     );
 
     let held = store.memory_list(&key).unwrap();
-    assert_eq!(held.len(), 2, "the harness reports and does not refuse: {held:?}");
+    assert_eq!(
+        held.len(),
+        2,
+        "the harness reports and does not refuse: {held:?}"
+    );
     assert!(
         held.iter().any(|e| e.key == "how-to-test"),
         "the new note is in the store, which is what makes this a report"
@@ -525,7 +534,12 @@ async fn the_duplicate_check_is_within_the_scope_being_written() {
 
     // Writing the same fact into the workspace is how a run corrects a wrong
     // global note. It must not be reported as a contradiction.
-    let seen = played(dir.path(), &store, vec![remember("how-to-test", TEST_CMD_AGAIN)]).await;
+    let seen = played(
+        dir.path(),
+        &store,
+        vec![remember("how-to-test", TEST_CMD_AGAIN)],
+    )
+    .await;
     for prompt in &seen {
         assert!(
             !prompt.contains("restates"),
