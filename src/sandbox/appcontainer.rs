@@ -1323,7 +1323,14 @@ mod tests {
     #[test]
     fn a_payload_has_no_route_off_the_machine() {
         let work = tempfile::tempdir().expect("tempdir");
-        let probe = "curl.exe -s -m 15 -o NUL https://example.com";
+        // **Not `-o NUL`, and that was hiding the assertion.** A container cannot
+        // write to `NUL`, so `curl` exits 23 — "failed writing output" — whether
+        // or not the request itself succeeded. The denial arm below asserted a
+        // non-zero exit, which that failure satisfies on its own: the test would
+        // have passed against a container with the whole network open. The body
+        // goes to a file in the granted workspace instead, and the assertion is
+        // on the status line the transfer actually produced.
+        let probe = "curl.exe -s -m 15 -o resp.txt -w %{http_code} https://example.com";
 
         // The control. A runner with no egress at all cannot demonstrate that
         // the container is what removed it.
@@ -1335,6 +1342,10 @@ mod tests {
         );
 
         let (code, out) = in_container("net", &format!("cmd.exe /c {probe}"), work.path());
+        assert!(
+            !out.contains("200"),
+            "the container completed an HTTPS request with an empty capability array: {out:?}"
+        );
         assert_ne!(
             code,
             Some(0),
@@ -1365,8 +1376,8 @@ mod tests {
             .and_then(|mut f| f.read_to_string(&mut text))
             .ok();
         assert_eq!(
-            permitted,
-            Some(0),
+            (permitted, text.contains("200")),
+            (Some(0), true),
             "a container created with `internetClient` could not reach the network, so the \
              capability array is not reaching the child's token and the denial above proves \
              nothing. Output was {text:?}"
