@@ -8888,7 +8888,15 @@ fn tool_mode(name: &str, custom: &Toolbox) -> Option<crate::sandbox::ExecMode> {
 /// listener having been started yet — and so the two can never disagree about
 /// whether a run is proxied.
 fn will_proxy(policy: &Policy, contract: &TaskContract) -> bool {
-    contract.exec_sandbox.mode.is_contained() && policy.names_hosts()
+    contract.exec_sandbox.mode.is_contained()
+        && policy.names_hosts()
+        // 0.59.0 — and the backend has to be one a proxy can be reached from. A
+        // process inside a Windows AppContainer cannot reach a loopback listener
+        // under any capability set, so a run there is given no proxy rather than
+        // one that would swallow every request it makes.
+        && crate::sandbox::select(&contract.exec_sandbox)
+            .backend()
+            .scopes_egress_per_host()
 }
 
 /// The run's egress proxy, when it needs one (0.48.0).
@@ -8908,8 +8916,18 @@ async fn start_egress_proxy(
     std::sync::Arc<std::sync::RwLock<Policy>>,
     std::sync::Arc<std::sync::atomic::AtomicU32>,
 )> {
-    containment?;
+    let containment = containment?;
     if !policy.names_hosts() {
+        return None;
+    }
+    // 0.59.0 — and the backend must be one a contained command can reach a
+    // loopback listener from. `will_proxy` asks the same question as a pure
+    // predicate for the prompt, and the two must not disagree about whether this
+    // run is proxied.
+    if !crate::sandbox::select(&containment.config)
+        .backend()
+        .scopes_egress_per_host()
+    {
         return None;
     }
     let shared = std::sync::Arc::new(std::sync::RwLock::new(policy.clone()));
@@ -14559,17 +14577,27 @@ fn containment_line(config: &SandboxConfig, proxied: bool) -> String {
     // environment variable a command may ignore, and the word for that is
     // *advisory*: saying anything stronger would be the defect 0.40.0 shipped,
     // where every interface said contained and no machine enforced it.
-    let egress = match (proxied, backend.denies_egress()) {
-        (true, true) => {
+    let egress = match (proxied, backend.denies_egress(), backend.scopes_egress_per_host()) {
+        (true, true, _) => {
             " Outbound network goes through a proxy this run owns, which permits only the hosts \
              this run's policy names."
         }
-        (true, false) => {
+        (true, false, _) => {
             " Outbound network is offered a proxy this run owns, but this backend cannot confine \
              the route to it, so that boundary is advisory: a command that ignores the proxy \
              settings reaches the network."
         }
-        (false, _) => " Outbound network is permitted only where this run's policy permits it.",
+        // 0.59.0 — a backend that denies egress and cannot be told which hosts to
+        // permit. Saying "only the hosts this run's policy names" here would be
+        // the 0.40.0 defect again: an interface claiming a boundary no machine
+        // enforces. What is true is narrower and worth the model knowing, because
+        // it decides whether reaching one host is possible at all.
+        (false, true, false) => {
+            " Outbound network on this host is all or nothing: this run's commands either hold \
+             the capability to reach the network or hold none, so the per-host rules above are \
+             not enforced for them."
+        }
+        (false, _, _) => " Outbound network is permitted only where this run's policy permits it.",
     };
     match backend.confines_writes() {
         false => format!(
