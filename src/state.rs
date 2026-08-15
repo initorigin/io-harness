@@ -6964,6 +6964,37 @@ impl Store {
            FROM memory m WHERE m.workspace = ?1
           ORDER BY runs ASC, last_recall ASC, m.created_at ASC, m.id ASC";
 
+    /// How many separate runs have carried each of a workspace's entries
+    /// (0.57.0). The same evidence [`Self::MEMORY_CANDIDATES_SQL`] evicts by,
+    /// read whole rather than per entry, because recall ranks every key at once
+    /// where eviction orders them.
+    ///
+    /// **Distinct runs, not rows**, for the reason the candidate order states: a
+    /// recall row is written once per carried key per *step*, so rows count
+    /// steps elapsed since the write rather than how often the entry was drawn
+    /// on, and one long run would outvote fifty short ones.
+    ///
+    /// Served by `memory_recalls_entry (workspace, key)`, added in 0.56.0 —
+    /// which is why this release adds no index. It runs once per scope per turn
+    /// on a table that grows for the life of the store, so a scan here would be
+    /// a scan on the turn's own path.
+    pub(crate) const MEMORY_DRAWS_SQL: &'static str =
+        "SELECT key, COUNT(DISTINCT run_id) FROM memory_recalls
+          WHERE workspace = ?1 GROUP BY key";
+
+    /// Every key this workspace has recall evidence for, and how many separate
+    /// runs carried it (0.57.0). Keys with no evidence are simply absent.
+    pub(crate) fn memory_draws(
+        &self,
+        workspace: &str,
+    ) -> Result<std::collections::BTreeMap<String, usize>> {
+        let mut stmt = self.conn.prepare(Self::MEMORY_DRAWS_SQL)?;
+        let rows = stmt.query_map([workspace], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as usize))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Evict this workspace's least-proven entries until both caps hold, never
     /// the entry `keep` (the one just written — evicting it would make a write a
     /// silent no-op). Returns the evicted keys in eviction order.
@@ -9257,6 +9288,114 @@ mod tests {
         assert!(
             entries.len() < 10,
             "the character cap evicted while the count cap was untouched"
+        );
+    }
+
+    /// 0.57.0 F8. The same claim 0.56.0's F5 makes about the eviction
+    /// aggregate, asserted for the one recall ranks by — which runs once per
+    /// scope per *turn* rather than once per capped write, so it is the hotter
+    /// of the two.
+    ///
+    /// Ten thousand rows deliberately: `memory_recalls` gains one row per
+    /// carried key per step for the life of a store, so the size that matters is
+    /// the one a busy workspace reaches and not the one a fresh test has.
+    #[test]
+    fn ranking_recall_draws_seeks_the_recalls_rather_than_scanning_them() {
+        let store = Store::memory().unwrap();
+        fill_to_the_cap(&store, "ws");
+        // 157 and not 0.56.0's 156: sixty-four keys over 156 steps is 9,984
+        // rows, and the criterion names ten thousand. The count is asserted
+        // below rather than left as arithmetic in a loop bound, which is how the
+        // sibling test came to be sixteen rows short of what it claims.
+        for step in 1..=157u32 {
+            let keys: Vec<String> = (0..MEMORY_MAX_ENTRIES).map(|i| format!("k{i}")).collect();
+            store.record_memory_recall(7, step, "ws", &keys).unwrap();
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+        assert!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM memory_recalls", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap()
+                >= 10_000,
+            "the plan is only worth asserting on a table big enough for a scan to hurt"
+        );
+
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", Store::MEMORY_DRAWS_SQL))
+            .unwrap();
+        let plan = stmt
+            .query_map(["ws"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" | ");
+
+        assert!(
+            plan.contains("memory_recalls_entry"),
+            "the draws aggregate must seek on memory_recalls_entry, got {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN memory_recalls"),
+            "a turn must not read every recall row in the store, got {plan}"
+        );
+
+        // The control, the same one the eviction plan's test uses: `run_id` alone
+        // is served by a different index and `step` by none, so the assertions
+        // above are about this index rather than about a planner that never
+        // scans anything.
+        let mut stmt = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT key, COUNT(DISTINCT run_id) FROM memory_recalls
+                  WHERE step = ?1 GROUP BY key",
+            )
+            .unwrap();
+        let control = stmt
+            .query_map([1], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" | ");
+        assert!(
+            control.contains("SCAN memory_recalls"),
+            "a column in no index must scan, or the assertions above prove nothing, got {control}"
+        );
+    }
+
+    /// 0.57.0 F4, at the store. The draws term counts separate runs, and the
+    /// obvious spelling — how many recall rows does this key have — is the one
+    /// that makes a single long run outrank three short ones.
+    #[test]
+    fn the_draws_count_is_of_runs_and_not_of_rows() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "ws").unwrap();
+        store.memory_put("ws", "long", "one long run", run, 1).unwrap();
+        store.memory_put("ws", "short", "three short runs", run, 1).unwrap();
+        for step in 1..=200u32 {
+            store
+                .record_memory_recall(1, step, "ws", &["long".to_string()])
+                .unwrap();
+        }
+        for other in 2..=4i64 {
+            store
+                .record_memory_recall(other, 1, "ws", &["short".to_string()])
+                .unwrap();
+        }
+
+        let draws = store.memory_draws("ws").unwrap();
+        assert_eq!(draws.get("long"), Some(&1), "200 rows, one run");
+        assert_eq!(draws.get("short"), Some(&3), "3 rows, three runs");
+        assert!(
+            draws["short"] > draws["long"],
+            "three runs that each leaned on an entry beat one run that carried it 200 times"
+        );
+        assert!(
+            !draws.contains_key("never-written"),
+            "a key with no evidence is absent rather than zero, so a caller cannot mistake \
+             'no rows' for 'a row saying none'"
         );
     }
 
