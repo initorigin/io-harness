@@ -7142,9 +7142,9 @@ impl Store {
     /// separated only by an id this struct does not carry. 0.57.0 chooses which
     /// notes a turn keeps by relevance and then prints them back in this order,
     /// so "the order the store returned" has to be something the printer can
-    /// reconstruct from an entry alone. The eviction candidate order
-    /// ([`Self::MEMORY_CANDIDATES_SQL`]) still tie-breaks on `id`, where the row
-    /// is in hand and 0.10.0's order is a stated guarantee.
+    /// reconstruct from an entry alone. The eviction candidate order still
+    /// tie-breaks on the row `id`, where the row is in hand and 0.10.0's order is
+    /// a stated guarantee.
     pub fn memory_list(&self, workspace: &str) -> Result<Vec<MemoryEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT key, value, run_id, step, created_at, kind, pinned FROM memory
