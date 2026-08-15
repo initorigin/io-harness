@@ -93,7 +93,7 @@ jobs:
       - name: appcontainer grants and the absolute-path refusal
         continue-on-error: true
         shell: pwsh
-        run: cargo test --lib -- --nocapture --test-threads=1 diag_which_grants_this_host_refuses_and_why diag_what_exactly_cmd_refuses_by_absolute_path 2>&1 | Tee-Object -FilePath diagnostics/grants.txt
+        run: cargo test --lib -- --nocapture --test-threads=1 diag_which_grants_this_host_refuses_and_why diag_what_exactly_cmd_refuses_by_absolute_path diag_what_the_capability_array_actually_buys_this_container 2>&1 | Tee-Object -FilePath diagnostics/grants.txt
 
       # The instrument 0.47.0 left behind, run on this same tree so the table and
       # the two probes above are read from one round.

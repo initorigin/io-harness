@@ -230,6 +230,18 @@ pub(crate) mod win {
     pub(crate) struct Profile {
         name: Vec<u16>,
         sid: PSID,
+        /// The `internetClient` capability SID, when this profile was created
+        /// with the network permitted.
+        ///
+        /// **Kept because registering a capability on the profile is not the same
+        /// act as putting it in the child's token.** The profile's capability
+        /// list is what `CreateAppContainerProfile` records; what a spawned
+        /// process actually holds is the array handed to
+        /// `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`. Until 0.59.0 that array
+        /// was empty on every spawn, so the permitting direction the module's own
+        /// documentation describes was never applied — a denial that happened to
+        /// be right for the denying case and silently wrong for the other.
+        capability: Option<[u8; 68]>,
     }
 
     // SAFETY: both members are plain data — an owned UTF-16 buffer and a SID,
@@ -336,12 +348,28 @@ pub(crate) mod win {
                 }
             }
 
-            Ok(Profile { name, sid })
+            Ok(Profile {
+                name,
+                sid,
+                capability: (cap_count == 1).then_some(cap_sid),
+            })
         }
 
         /// The container SID. Valid for as long as this `Profile` is.
         pub(crate) fn sid(&self) -> PSID {
             self.sid
+        }
+
+        /// The capability SID this profile grants a child, if any.
+        ///
+        /// The pointer addresses this profile's own buffer and is valid for as
+        /// long as the borrow. Win32 reads it and never writes through it; the
+        /// mutable pointer is what `SID_AND_ATTRIBUTES` declares, not a claim
+        /// that anything mutates.
+        pub(crate) fn capability_sid(&self) -> Option<*mut core::ffi::c_void> {
+            self.capability
+                .as_ref()
+                .map(|b| b.as_ptr().cast_mut().cast::<core::ffi::c_void>())
         }
     }
 
@@ -784,9 +812,10 @@ pub(crate) mod win {
         pub(crate) fn start(
             cmdline: &str,
             cwd: &Path,
-            sid: PSID,
+            profile: &Profile,
             out: &std::fs::File,
         ) -> io::Result<Self> {
+            let sid = profile.sid();
             let handle = out.as_raw_handle() as HANDLE;
             // SAFETY: `handle` belongs to `out`, which is borrowed for this whole
             // call and therefore outlives it.
@@ -825,10 +854,29 @@ pub(crate) mod win {
             // This is the whole feature: the one attribute that carries a
             // container SID into a child. It must outlive `CreateProcessW`,
             // because the list stores a pointer to it rather than a copy.
+            // **The capability array reaches the child here or nowhere.**
+            // Registering `internetClient` on the profile records it against the
+            // name; what the process holds is what this array says. Both must
+            // live until after `CreateProcessW`, because the attribute list
+            // stores pointers rather than copies.
+            let mut granted: [SID_AND_ATTRIBUTES; 1] = unsafe { std::mem::zeroed() };
+            let capability_count = match profile.capability_sid() {
+                Some(cap) => {
+                    granted[0].Sid = cap;
+                    // `SE_GROUP_ENABLED`: present rather than merely listed.
+                    granted[0].Attributes = 0x0000_0004;
+                    1u32
+                }
+                None => 0,
+            };
             let caps = windows_sys::Win32::Security::SECURITY_CAPABILITIES {
                 AppContainerSid: sid,
-                Capabilities: std::ptr::null_mut(),
-                CapabilityCount: 0,
+                Capabilities: if capability_count == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    granted.as_mut_ptr()
+                },
+                CapabilityCount: capability_count,
                 Reserved: 0,
             };
             // SAFETY: `list` is initialised, the attribute constant names the
@@ -1032,7 +1080,7 @@ mod tests {
 
         let out_path = cwd.join("io-harness-out.txt");
         let file = std::fs::File::create(&out_path).expect("create the capture file");
-        let mut child = Spawned::start(cmdline, cwd, profile.sid(), &file)
+        let mut child = Spawned::start(cmdline, cwd, &profile, &file)
             .unwrap_or_else(|e| panic!("F1: CreateProcessW into the AppContainer failed: {e}"));
         // 0.47.0 spawns suspended so the backend can put the process in its
         // job object before it runs an instruction. A caller that only starts
@@ -1047,6 +1095,101 @@ mod tests {
             .read_to_string(&mut text)
             .ok();
         (code, text)
+    }
+
+    /// DIAG (0.59.0, throwaway — never merged): the two network questions this
+    /// module documents an answer to and has never asked.
+    ///
+    /// **Question one: does the capability array reach the child at all?** Until
+    /// this branch `Spawned::start` passed `CapabilityCount: 0` on every spawn,
+    /// so `internetClient` was registered on the profile and absent from the
+    /// token. The denying direction was right by accident and the permitting
+    /// direction — the one that matters the moment this backend is selected for a
+    /// run whose policy permits egress — was never exercised. Both directions are
+    /// asked here, with the outside-the-container control beside them.
+    ///
+    /// **Question two: can a contained process reach the run's egress proxy?**
+    /// 0.48.0 routes a contained command's traffic through a loopback proxy the
+    /// run owns. An AppContainer's loopback behaviour is a documented restriction
+    /// of the platform rather than a consequence of the capability set, so if the
+    /// proxy is unreachable the whole per-host egress design lands differently on
+    /// this platform — and that has to be known before the contract is written,
+    /// not after the browser half depends on it.
+    #[test]
+    fn diag_what_the_capability_array_actually_buys_this_container() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let work = tempfile::tempdir().expect("tempdir");
+        let mut report = String::new();
+
+        // A listener standing in for the run's own egress proxy: same address
+        // family, same loopback, answered by this process.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(8) {
+                let Ok(mut s) = stream else { continue };
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nreached",
+                );
+            }
+        });
+
+        // The same run, inside a container built with and without the capability,
+        // so the difference is the capability and nothing else.
+        let mut run = |tag: &str, allow_network: bool, cmdline: &str| -> (Option<i32>, String) {
+            let profile = Profile::create(&name(tag), allow_network)
+                .unwrap_or_else(|e| panic!("could not create a profile: {e}"));
+            grant(work.path(), profile.sid(), Access::Full, Reach::Tree)
+                .unwrap_or_else(|e| panic!("could not grant the workspace: {e}"));
+            let out_path = work.path().join(format!("out-{tag}.txt"));
+            let file = std::fs::File::create(&out_path).expect("capture file");
+            let mut child = Spawned::start(cmdline, work.path(), &profile, &file)
+                .unwrap_or_else(|e| panic!("spawn: {e}"));
+            child.resume().expect("resume");
+            drop(file);
+            let code = child.wait(40_000).expect("wait");
+            let mut text = String::new();
+            std::fs::File::open(&out_path)
+                .expect("reopen")
+                .read_to_string(&mut text)
+                .ok();
+            (code, text.trim().to_string())
+        };
+
+        let loopback = format!("curl.exe -s -m 10 http://127.0.0.1:{port}/");
+        let outward = "curl.exe -s -m 20 -o NUL -w %{http_code} https://example.com";
+
+        for (what, allow, line) in [
+            ("loopback, no capability", false, loopback.as_str()),
+            ("loopback, internetClient", true, loopback.as_str()),
+            ("outward, no capability", false, outward),
+            ("outward, internetClient", true, outward),
+        ] {
+            let tag = what.replace([' ', ','], "-");
+            let (code, out) = run(&tag, allow, &format!("cmd.exe /c {line}"));
+            report.push_str(&format!("\n    {what}: exit {code:?} out {out:?}"));
+        }
+
+        // The controls, uncontained. A denial that would also have been a denial
+        // outside the container proves nothing about the container.
+        for (what, line) in [("loopback", loopback.as_str()), ("outward", outward)] {
+            let out = std::process::Command::new("cmd.exe")
+                .raw_arg(format!("/c {line}"))
+                .current_dir(work.path())
+                .output();
+            report.push_str(&match out {
+                Ok(o) => format!(
+                    "\n    CONTROL {what} outside any container: exit {:?} out {:?}",
+                    o.status.code(),
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                ),
+                Err(e) => format!("\n    CONTROL {what}: could not start: {e}"),
+            });
+        }
+
+        println!("\n  what the capability array buys:{report}");
     }
 
     /// The same command, with no container at all. This is the negative control,
@@ -1193,7 +1336,7 @@ mod tests {
             exe.display()
         );
         let mut child =
-            Spawned::start(&line, work.path(), profile.sid(), &file).expect("spawn the payload");
+            Spawned::start(&line, work.path(), &profile, &file).expect("spawn the payload");
         child.resume().expect("resume the contained process");
         let code = child.wait(60_000).expect("wait");
 
@@ -1273,7 +1416,7 @@ mod tests {
             let file = std::fs::File::create(&out_path).expect("capture");
             let line = "cmd.exe /c depth.bat".to_string();
             let mut child =
-                Spawned::start(&line, dir, profile.sid(), &file).expect("spawn the payload");
+                Spawned::start(&line, dir, &profile, &file).expect("spawn the payload");
             child.resume().expect("resume");
             let code = child.wait(30_000).expect("wait");
             drop(file);
@@ -1315,7 +1458,7 @@ mod tests {
         let mut slow = Spawned::start(
             "cmd.exe /c for /L %i in (1,1,2000000000) do @rem",
             dir.path(),
-            profile.sid(),
+            &profile,
             &file,
         )
         .expect("spawn the slow payload");
@@ -1327,7 +1470,7 @@ mod tests {
         );
 
         let mut quick =
-            Spawned::start("cmd.exe /c exit 7", dir.path(), profile.sid(), &file).expect("spawn");
+            Spawned::start("cmd.exe /c exit 7", dir.path(), &profile, &file).expect("spawn");
         quick.resume().expect("resume the contained process");
         assert_eq!(
             quick.wait(30_000).expect("wait"),

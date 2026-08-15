@@ -632,7 +632,7 @@ pub(crate) mod job {
             }
         };
         let cmdline = super::command_line(spec.argv);
-        let mut child = match Spawned::start(&cmdline, spec.workdir, profile.sid(), &file) {
+        let mut child = match Spawned::start(&cmdline, spec.workdir, &profile, &file) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("sandbox: could not spawn into the AppContainer ({e})");
