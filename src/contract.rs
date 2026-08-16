@@ -62,21 +62,31 @@ pub enum SystemPrompt {
     /// does not replace what the crate has to say about the request it is
     /// building.
     Replace(String),
-    /// (0.49.0) One of the crate's own shaped descriptions, chosen **by name**.
+    /// (0.49.0) One of the crate's own working styles, chosen **by name**.
     ///
-    /// Composed exactly where [`SystemPrompt::Replace`]'s text is, so everything
-    /// the crate has to say about the request is still built around it.
+    /// Unlike [`SystemPrompt::Replace`] this does not stand in for the crate's
+    /// description: it is appended to whichever description the run's own loop
+    /// chose, and everything the crate has to say about the request is still
+    /// composed around the pair (0.60.3). A preset therefore never decides which
+    /// world the agent is in — that is the loop's and the classification's — only
+    /// how the work is done and reported.
     Preset(Preset),
 }
 
-/// (0.49.0) A shaped agent description this crate ships, for an embedder who wants
-/// more than four tool names and less than a whole prompt of their own.
+/// (0.49.0) A working style this crate ships, for an embedder who wants more than
+/// four tool names and less than a whole prompt of their own.
 ///
 /// [`SystemPrompt::Builtin`] says what the tools are and nothing about how to use
 /// them: no tone, no output format, no rule about length. The two options before
 /// this were to accept that or to write an agent prompt from scratch. A preset is
 /// the third, and it is **opt-in by name** — see [`SystemPrompt`] for why that is
 /// not the thing 0.45.0 declined to ship.
+///
+/// **Manner and framing are separate axes (0.60.3).** A preset names no tools and
+/// describes no agent, because the framing it is appended to already did both. Up
+/// to 0.60.2 it carried a whole description and was composed *instead of* that
+/// framing, which meant selecting one silently decided what world the agent was in
+/// — the one thing the sentence below says it never does.
 ///
 /// Deliberately small. Each variant states the working style it is for, and a
 /// variant that is merely a tone would be the catalogue this is not.
