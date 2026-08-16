@@ -1629,10 +1629,10 @@ versions:
       It also closes the doc drift the audit found: `docs/CONTRACT.md` still tells a reader that
       nothing selects the Windows AppContainer, which 0.59.0 made false; the README's guide table
       lists twenty-four of twenty-five pages; and nothing on the landing page links
-      `docs/MEASUREMENTS.md` at all. Each of the three is closed and each is given a test, because
-      a gap a reviewer found once and nothing checks is a gap that reopens.
+      `docs/MEASUREMENTS.md` at all. Each of the three is closed and each is given a test, because a
+      gap a reviewer found once and nothing checks is a gap that reopens.
 
       No `src/` behaviour changes and `docs/public-api.txt` does not move, which is what makes this
       a patch rather than a minor.
     detail: specified
-    status: planned
+    status: released
