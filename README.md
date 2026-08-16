@@ -653,7 +653,9 @@ the unprivileged user namespace the namespace backend needs.
 no network facility, so a contained Windows command gets the resource caps and nothing
 else unless you ask for more. The access half is an AppContainer: a token that is
 default-deny on every securable object and reaches only what an explicit ACE granted
-it. `SandboxConfig::with_access_confinement()` selects it. It is opt-in because the
+it. `SandboxConfig::with_access_confinement()` selects it — except under
+`FullAccess`, which says the payload may write anywhere, and putting that inside a
+default-deny container would refuse the very thing the mode grants. It is opt-in because the
 grant set is derived from the run's own facts — the workspace, the toolchain's cache
 roots, the temporary directory, the program's own directory, `%SystemRoot%` — and
 derived is not complete. A toolchain reading a machine-wide file outside that set is

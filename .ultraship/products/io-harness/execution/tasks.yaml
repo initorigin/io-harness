@@ -109,7 +109,7 @@ tasks:
     nothing selects the Windows AppContainer — false since 0.59.0 shipped `SandboxConfig::with_access_confinement()`.
     A contract that is wrong about the security boundary is worse than one that is silent, because a reader
     who checks is misinformed rather than uninformed.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F4 — the contract no longer claims the AppContainer is unselected.** A test asserts `docs/CONTRACT.md`
@@ -121,7 +121,23 @@ tasks:
   files:
   - docs/CONTRACT.md
   - tests/docs_drift.rs
-  evidence: []
+  evidence:
+  - 'docs/CONTRACT.md:233 no longer says the AppContainer is built with nothing selecting it; it names
+    `SandboxConfig::with_access_confinement()` as the selector. F4''s test `contract_states_the_appcontainer_selector`
+    passes: the file contains `with_access_confinement` 4 times and `nothing selects it` 0 times.'
+  - 'The sweep found eight further outlived claims beyond the known defect, each corrected against the
+    source rather than the CHANGELOG''s prose: the browser''s ''Windows is not supported'' bullet, the
+    platform table''s single Windows row (now two backends), the unqualified ''sandboxed on Windows means
+    resource-capped'', the 0.47.0 rescheduling note, two open questions that 0.59.0 answered, the per-platform
+    enforcement table, the ExecMode ''enforces nothing for the filesystem'' claim, and the proxy-per-backend
+    table which had no AppContainer row.'
+  - 'One claim was verified in the source by the main thread rather than taken from the agent: `Sandbox::select`
+    at src/sandbox.rs:1112 selects the AppContainer only when `config.access_confinement && config.mode
+    != ExecMode::FullAccess`. That bound is narrower than the CHANGELOG''s prose, and the README was corrected
+    to carry it so N3 holds — no claim on the landing page is stronger than the contract''s.'
+  - 'Four items were found suspicious and deliberately left, with reasons recorded: a forward-looking
+    removal note for `user`, an unslotted `rusqlite::Error` variant, a ''named roadmap work'' phrase,
+    and a spawn-argument count that may have drifted by one. None is false today.'
 - id: US-IO-HARNESS-0.60.1-T04
   summary: Bump the version to 0.60.1 and write the CHANGELOG section.
   why_required: 'F5 requires the new release table to cover every version CHANGELOG.md declares, 0.60.1
