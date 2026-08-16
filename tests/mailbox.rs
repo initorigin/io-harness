@@ -44,10 +44,27 @@ fn on_disk() -> (tempfile::TempDir, Store, std::path::PathBuf) {
 /// cannot express "write down what you were told" — it would write the right
 /// answer whether or not the message arrived, which is the one thing the test
 /// exists to rule out.
-type Step = Box<dyn Fn(&CompletionRequest) -> Vec<ToolCall> + Send + Sync>;
+type Step = Box<dyn Fn(&CompletionRequest) -> CompletionResponse + Send + Sync>;
 
 fn fixed(calls: Vec<ToolCall>) -> Step {
-    Box::new(move |_| calls.clone())
+    Box::new(move |_| CompletionResponse {
+        tool_calls: calls.clone(),
+        ..Default::default()
+    })
+}
+
+/// A step that SAYS something and calls nothing.
+///
+/// The crate records a completion's prose as an `AgentEvent::said` row, and the
+/// last of those is what a parent composes as its child's conclusion. A child
+/// that never speaks leaves no such row — which is why a test asserting "the
+/// terminal post is the short line and not the report" proves nothing unless its
+/// child has a report to confuse it with.
+fn says(text: &'static str) -> Step {
+    Box::new(move |_| CompletionResponse {
+        text: Some(text.to_string()),
+        ..Default::default()
+    })
 }
 
 /// Plays one script per agent, keyed by the goal that agent was given.
@@ -110,15 +127,12 @@ impl Provider for ByGoal {
             *i += 1;
             was
         };
-        let calls = self.scripts[&key]
+        let response = self.scripts[&key]
             .get(i)
             .map(|f| f(&req))
             .unwrap_or_default();
         self.seen.lock().unwrap().push(req);
-        Ok(CompletionResponse {
-            tool_calls: calls,
-            ..Default::default()
-        })
+        Ok(response)
     }
 }
 
@@ -238,10 +252,13 @@ async fn a_child_tells_a_sibling_what_it_found() {
                         .nth(1)
                         .map(|rest| rest.split_whitespace().next().unwrap_or("nothing"))
                         .unwrap_or("nothing");
-                    vec![call(
-                        "write_file",
-                        json!({ "path": "edited.txt", "content": line }),
-                    )]
+                    CompletionResponse {
+                        tool_calls: vec![call(
+                            "write_file",
+                            json!({ "path": "edited.txt", "content": line }),
+                        )],
+                        ..Default::default()
+                    }
                 }),
                 fixed(vec![]),
             ],
@@ -279,10 +296,13 @@ async fn two_children_of_one_definition_are_two_addresses() {
                     .into_iter()
                     .filter(|needle| req.user.contains(needle))
                     .collect();
-                vec![call(
-                    "write_file",
-                    json!({ "path": format!("{name}.txt"), "content": saw.join("+") }),
-                )]
+                CompletionResponse {
+                    tool_calls: vec![call(
+                        "write_file",
+                        json!({ "path": format!("{name}.txt"), "content": saw.join("+") }),
+                    )],
+                    ..Default::default()
+                }
             }),
             fixed(vec![]),
         ]
@@ -731,7 +751,13 @@ async fn a_finished_child_posts_once_and_the_report_still_arrives() {
                 fixed(vec![]),
             ],
         ),
-        ("do a thing", vec![fixed(vec![])]),
+        (
+            "do a thing",
+            vec![says(
+                "I read every handler and the shared one is src/session.rs:88, which is \
+                 the report a parent would confuse the terminal line with",
+            )],
+        ),
     ]);
     let store = Store::memory().unwrap();
     let result = drive(&root_contract(dir.path(), "one child"), &provider, &store).await;
@@ -743,6 +769,11 @@ async fn a_finished_child_posts_once_and_the_report_still_arrives() {
     assert!(
         inbox[0].body.starts_with("[finished] "),
         "the terminal line, not the report: {:?}",
+        inbox[0].body
+    );
+    assert!(
+        !inbox[0].body.contains("src/session.rs:88"),
+        "the child HAS a conclusion and this is not it: {:?}",
         inbox[0].body
     );
     assert!(
