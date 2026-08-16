@@ -72,16 +72,20 @@ let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?
   in it; the refusal is an observation the agent adapts to, with the deciding
   rule and layer in the trace. An `ask_exec` routes to the `Approver` and
   survives a restart like any other [deferred approval](durable-runs.md).
-- **Nothing may shadow anything** — a registered tool cannot take one of the
-  names the harness reserves (`write_file`, `grep`, `find`, `list_dir`,
-  `read_file`, `shell`, `exec`, `read_skill`, `remember`, `forget`, `spawn_agent`), cannot use the `mcp__` prefix
-  reserved for server tools, and two registered tools cannot share a name. Each
-  is an `Error::Config` raised **before the provider is called once**, not a
-  silent shadowing found at dispatch. The feature-gated built-ins — the `git_*`
-  tools, `view_image`, and the [document tools](documents.md) — are *not* in the
-  reserved set, and dispatch matches every built-in before it reaches the
-  toolbox, so a registered tool that takes one of those names is accepted by
-  validation and then never reached. Do not name a tool after one of them.
+- **Nothing may shadow anything** — a registered tool cannot take a name the
+  harness reserves, cannot use the `mcp__` prefix reserved for server tools, and
+  two registered tools cannot share a name. Each is an `Error::Config` raised
+  **before the provider is called once**, not a silent shadowing found at
+  dispatch. The reserved set is `RESERVED_TOOL_NAMES` in `src/tools/custom.rs`,
+  and that list is the statement of it rather than this page — a set retyped into
+  prose is a set that goes stale. It holds the feature-gated built-ins it names
+  in every build, including builds that do not compile them, so enabling a
+  feature can never take away a tool that was working. It does **not** yet hold
+  every name dispatch answers: the `browser_*` and `lsp_*` tools are among
+  eighteen that are dispatched and not reserved, and because dispatch matches
+  every built-in before it reaches the toolbox, a registered tool taking one of
+  those validates and is then never reached. 0.61.0 closes that gap. Until it
+  does, do not name a tool after anything the harness already answers.
 - **A failing tool is an observation** — returning `Err` puts the message in the
   observations and the run continues, the same treatment `grep` gives a bad
   regex. Only the model can tell "try another id" from "give up on this

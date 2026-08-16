@@ -40,9 +40,21 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// A checked-in text file, with its line endings normalised to `\n`.
+///
+/// `.gitattributes` pins `eol=lf` for `tests/fixtures/**` and for nothing else,
+/// so a Windows checkout hands these pages back with CRLF. A checker that looks
+/// for a blank line before a marker — `"\n\n**"` — matches nothing in
+/// `"\r\n\r\n**"`, and the failure is silent: the window it was computing simply
+/// runs to the end of the file and the assertion inside it passes for the wrong
+/// reason. Normalising here rather than in each checker is what stops the next
+/// one reintroducing it. Found by a control test on the Windows leg, green on
+/// macOS throughout.
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    text.replace("\r\n", "\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -988,5 +1000,382 @@ fn marker_parse_reads_the_list_and_not_the_whole_file() {
     assert!(
         !found.contains("not-a-marker"),
         "parsed beyond the list: {found:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// One exec boundary, stated once — F1 of 0.60.2
+// ---------------------------------------------------------------------------
+//
+// `docs/CONTRACT.md` carried two answers to "what is a command bounded by" for
+// fifteen releases. One paragraph said a command runs outside the sandbox with
+// the embedding program's privileges — true up to 0.44.0 — and another, 1,300
+// lines earlier, said everything a run starts is contained. Nothing told a
+// reader which superseded which, and the stale one was the reassuring one.
+
+/// The `**What a command the agent runs is bounded by.**` block of the contract.
+///
+/// A bold lead opens each claim in that part of the file and the next one closes
+/// this block, so the window is the marker up to the next blank line followed by
+/// a bold lead. Scoping the assertion to the block is the point: the retired
+/// phrasing is quoted elsewhere in the file *as* retired, and a whole-file
+/// search could not tell a quotation from a claim.
+fn command_execution_section(contract: &str) -> String {
+    const LEAD: &str = "**What a command the agent runs is bounded by.**";
+    let start = contract
+        .find(LEAD)
+        .unwrap_or_else(|| panic!("docs/CONTRACT.md no longer opens a block with {LEAD:?}"));
+    let rest = &contract[start + LEAD.len()..];
+    let end = rest.find("\n\n**").unwrap_or(rest.len());
+    format!("{LEAD}{}", &rest[..end])
+}
+
+/// Backticks and line breaks removed, so an assertion is about the sentence and
+/// not about where the paragraph happened to wrap.
+fn flatten(text: &str) -> String {
+    text.replace('`', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn states_one_exec_boundary(section: &str) -> Result<(), String> {
+    let flat = flatten(section);
+    if flat.contains("outside the sandbox") {
+        return Err(
+            "the command-execution block still says a command runs outside the sandbox. That \
+             was true up to 0.44.0; ExecMode::WorkspaceWrite has been the default since 0.45.0 \
+             and docs/CONTRACT.md states 1,300 lines earlier that everything a run starts is \
+             contained."
+                .to_string(),
+        );
+    }
+    if !flat.contains("ExecMode::WorkspaceWrite is the default") {
+        return Err(
+            "the command-execution block does not name ExecMode::WorkspaceWrite as the default. \
+             A reader who reaches this block must be told today's boundary here, not left to \
+             find it in the containment section."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn contract_states_one_exec_boundary() {
+    if let Err(why) =
+        states_one_exec_boundary(&command_execution_section(&read("docs/CONTRACT.md")))
+    {
+        panic!("{why}");
+    }
+}
+
+#[test]
+fn exec_boundary_checker_rejects_the_pre_0_45_0_sentence() {
+    let fixture = "**What a command the agent runs is bounded by.** A command runs **in the \
+                   workspace root with the embedding program's privileges, outside the \
+                   sandbox**.\n\n**Toolchain detection is a default.**";
+    let err = states_one_exec_boundary(&command_execution_section(fixture)).unwrap_err();
+    assert!(err.contains("outside the sandbox"), "{err}");
+}
+
+#[test]
+fn exec_boundary_checker_rejects_silence_about_the_default() {
+    // Removing the false sentence without stating the true one is not a fix:
+    // the block would then say nothing at all about what contains a command.
+    let fixture = "**What a command the agent runs is bounded by.** Every call is an `Act::Exec` \
+                   check on the program and on the whole argv.\n\n**Toolchain detection is a \
+                   default.**";
+    let err = states_one_exec_boundary(&command_execution_section(fixture)).unwrap_err();
+    assert!(err.contains("ExecMode::WorkspaceWrite"), "{err}");
+}
+
+#[test]
+fn exec_boundary_checker_accepts_the_corrected_paragraph() {
+    let fixture = "**What a command the agent runs is bounded by.** Since 0.46.0 it runs\n\
+                   contained by default: `ExecMode::WorkspaceWrite` is the default\n\
+                   `exec_sandbox` mode.\n\n**Toolchain detection is a default.**";
+    assert!(states_one_exec_boundary(&command_execution_section(fixture)).is_ok());
+}
+
+#[test]
+fn command_execution_section_stops_at_the_next_claim() {
+    // The window must not run on into the rest of the file. If it did, the
+    // retired phrasing quoted elsewhere as retired would fail this test.
+    let section = command_execution_section(&read("docs/CONTRACT.md"));
+    assert!(
+        !section.contains("Toolchain detection"),
+        "the window ran past the block it is scoped to:\n{section}"
+    );
+    assert!(
+        section.contains("Act::Exec"),
+        "the window did not reach the block's own body:\n{section}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A rustdoc block does not carry a retired sentence — F2 of 0.60.2
+// ---------------------------------------------------------------------------
+//
+// The same boundary in the second place a caller reads it, and the only one
+// that renders on docs.rs. `TaskContract::exec_sandbox` told a caller the
+// `shell_start` / `shell_poll` / `shell_kill` handles "are not contained
+// because a handle outlives the call that made it" — the exact sentence
+// `docs/CONTRACT.md` names as the one 0.48.0 retired. This is the first check
+// in this file that reads a doc comment inside `src/` rather than a page.
+
+/// The `///` block immediately above `item` in a Rust source file.
+///
+/// Walks back from the item's own line and stops at the first line that is not
+/// a doc comment, so an attribute, a blank line, or the previous item ends the
+/// block. A block that swallowed its neighbours would pass any assertion that
+/// only looks for an absent phrase.
+fn doc_block_above(source: &str, item: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with(item))
+        .unwrap_or_else(|| panic!("no line in the source opens with {item:?}"));
+    let mut start = at;
+    while start > 0 && lines[start - 1].trim_start().starts_with("///") {
+        start -= 1;
+    }
+    lines[start..at]
+        .iter()
+        .map(|l| l.trim_start().trim_start_matches("///").trim())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn carries_no_retired_containment_claim(block: &str) -> Result<(), String> {
+    if flatten(block).contains("not contained") {
+        return Err(
+            "the exec_sandbox rustdoc still says the shell handles are not contained. 0.48.0 \
+             retired that sentence — docs/CONTRACT.md names it as retired at line 1222 — and a \
+             handle has taken the same containment every other spawn takes ever since."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn exec_sandbox_rustdoc_does_not_carry_the_retired_sentence() {
+    let block = doc_block_above(&read("src/contract.rs"), "pub exec_sandbox:");
+    if let Err(why) = carries_no_retired_containment_claim(&block) {
+        panic!("{why}");
+    }
+    assert!(
+        flatten(&block).contains("take the same containment every other spawn takes"),
+        "the block no longer states what a handle does take, which is the half a caller \
+         needs:\n{block}"
+    );
+}
+
+#[test]
+fn retired_containment_checker_rejects_the_0_47_0_clause() {
+    let fixture = "/// the `shell_start` / `shell_poll` / `shell_kill`\n\
+                   /// handles, which are not contained because a handle outlives the call that\n\
+                   /// made it;\n";
+    let err = carries_no_retired_containment_claim(fixture).unwrap_err();
+    assert!(err.contains("not contained"), "{err}");
+}
+
+#[test]
+fn doc_block_extractor_stops_at_the_previous_item() {
+    let fixture = "    /// The first field.\n    pub first: u8,\n    /// The second field.\n    \
+                   /// Two lines of it.\n    pub second: u8,\n";
+    let block = doc_block_above(fixture, "pub second:");
+    assert!(block.contains("The second field."), "{block}");
+    assert!(
+        !block.contains("The first field."),
+        "the extractor swallowed the previous item's block:\n{block}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The guide's reserved-name claim matches the source — F3 of 0.60.2
+// ---------------------------------------------------------------------------
+//
+// `docs/guide/tools-and-skills.md` was stale in both directions at once. It said
+// the feature-gated built-ins are *not* in the reserved set, which 0.17.0 made
+// false, and its hand-typed list of reserved names held `forget`, which is not
+// reserved, while omitting seven that are. A list retyped into prose is a list
+// that goes stale, so the page now defers to `RESERVED_TOOL_NAMES` and this
+// check exists to keep it deferring.
+
+/// Every `pub const NAME_TOOL: &str = "…"` in the crate, ident to tool name.
+fn tool_name_consts(sources: &str) -> std::collections::BTreeMap<String, String> {
+    let re = Regex::new(r#"const ([A-Z0-9_]+_TOOL): &str = "([a-z0-9_]+)""#).unwrap();
+    re.captures_iter(sources)
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .collect()
+}
+
+/// The tool names `RESERVED_TOOL_NAMES` actually holds, resolved through the
+/// constants rather than read off a list in prose.
+fn reserved_tool_names(custom_rs: &str, sources: &str) -> BTreeSet<String> {
+    let block = Regex::new(r"(?s)const RESERVED_TOOL_NAMES: &\[&str\] = &\[(.*?)\];").unwrap();
+    let body = block
+        .captures(custom_rs)
+        .map(|c| c[1].to_string())
+        .unwrap_or_else(|| {
+            panic!("RESERVED_TOOL_NAMES is no longer a slice literal in src/tools/custom.rs")
+        });
+    let consts = tool_name_consts(sources);
+    Regex::new(r"([A-Z0-9_]+_TOOL)")
+        .unwrap()
+        .captures_iter(&body)
+        .filter_map(|c| consts.get(&c[1]).cloned())
+        .collect()
+}
+
+/// Every `.rs` file under `src/`, concatenated. The constants are spread across
+/// the tool modules and `src/run.rs`, so resolving one file is not enough.
+fn rust_sources() -> String {
+    fn walk(dir: &Path, out: &mut String) {
+        let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            .map(|e| e.expect("dir entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push_str(&fs::read_to_string(&path).expect("read source"));
+                out.push('\n');
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(&repo_root().join("src"), &mut out);
+    out
+}
+
+/// The `**Nothing may shadow anything**` bullet of the tools guide.
+fn shadowing_bullet(guide: &str) -> String {
+    const LEAD: &str = "- **Nothing may shadow anything**";
+    let start = guide
+        .find(LEAD)
+        .unwrap_or_else(|| panic!("docs/guide/tools-and-skills.md no longer carries {LEAD:?}"));
+    let rest = &guide[start + LEAD.len()..];
+    let end = rest.find("\n- **").unwrap_or(rest.len());
+    format!("{LEAD}{}", &rest[..end])
+}
+
+fn guide_defers_to_the_reserved_set(
+    bullet: &str,
+    reserved: &BTreeSet<String>,
+) -> Result<(), String> {
+    if bullet.contains("are *not* in the reserved set") {
+        return Err(
+            "the guide still says the feature-gated built-ins are not in the reserved set. 0.17.0 \
+             put them in it, under `### Breaking changes`."
+                .to_string(),
+        );
+    }
+    if !bullet.contains("RESERVED_TOOL_NAMES") {
+        return Err(
+            "the guide no longer defers to RESERVED_TOOL_NAMES. Naming the set is what keeps this \
+             page from carrying a second copy of it that nothing checks."
+                .to_string(),
+        );
+    }
+    // A backticked lowercase identifier in this bullet reads as a reserved name.
+    // A trailing underscore is a prefix (`mcp__`) and a `*` never matches, so
+    // the two things the page names that are not tool names are not caught here.
+    let named = Regex::new(r"`([a-z][a-z0-9_]*)`").unwrap();
+    let wrong: Vec<String> = named
+        .captures_iter(bullet)
+        .map(|c| c[1].to_string())
+        .filter(|n| !n.ends_with('_') && !reserved.contains(n))
+        .collect();
+    if !wrong.is_empty() {
+        return Err(format!(
+            "the guide names {wrong:?} as reserved and RESERVED_TOOL_NAMES does not hold them. \
+             This page had `forget` in its list for four releases; do not restate the set here, \
+             refer to it."
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn the_guide_reserved_name_claim_matches_the_source() {
+    let reserved = reserved_tool_names(&read("src/tools/custom.rs"), &rust_sources());
+    assert!(
+        reserved.len() >= 30,
+        "the reserved-set parse resolved only {} names, so it has stopped reading what it was \
+         written for: {reserved:?}",
+        reserved.len()
+    );
+    let bullet = shadowing_bullet(&read("docs/guide/tools-and-skills.md"));
+    if let Err(why) = guide_defers_to_the_reserved_set(&bullet, &reserved) {
+        panic!("{why}");
+    }
+}
+
+#[test]
+fn reserved_set_parse_resolves_names_and_not_idents() {
+    let reserved = reserved_tool_names(&read("src/tools/custom.rs"), &rust_sources());
+    assert!(reserved.contains("write_file"), "{reserved:?}");
+    assert!(reserved.contains("view_image"), "{reserved:?}");
+    assert!(
+        !reserved.contains("browser_click"),
+        "browser_click is dispatched and not reserved; a parse that finds it there is reading \
+         the wrong list: {reserved:?}"
+    );
+}
+
+#[test]
+fn guide_checker_rejects_the_claim_0_17_0_made_false() {
+    let fixture = "- **Nothing may shadow anything** — RESERVED_TOOL_NAMES holds them. The \
+                   feature-gated built-ins are *not* in the reserved set.\n- **Next bullet**";
+    let reserved = BTreeSet::from(["write_file".to_string()]);
+    let err = guide_defers_to_the_reserved_set(&shadowing_bullet(fixture), &reserved).unwrap_err();
+    assert!(err.contains("not in the reserved set"), "{err}");
+}
+
+#[test]
+fn guide_checker_rejects_a_reinstated_hand_list() {
+    // The sabotage the contract names: `forget` back in the guide's list.
+    let fixture = "- **Nothing may shadow anything** — see RESERVED_TOOL_NAMES: `write_file`, \
+                   `forget`, `mcp__`.\n- **Next bullet**";
+    let reserved = BTreeSet::from(["write_file".to_string()]);
+    let err = guide_defers_to_the_reserved_set(&shadowing_bullet(fixture), &reserved).unwrap_err();
+    assert!(err.contains("forget"), "{err}");
+    assert!(!err.contains("mcp__"), "a prefix is not a name: {err}");
+}
+
+#[test]
+fn guide_checker_accepts_a_bullet_that_defers() {
+    let fixture = "- **Nothing may shadow anything** — the reserved set is `RESERVED_TOOL_NAMES` \
+                   in `src/tools/custom.rs`, and the `browser_*` tools are not in it.\n\
+                   - **Next bullet**";
+    let reserved = BTreeSet::from(["write_file".to_string()]);
+    assert!(guide_defers_to_the_reserved_set(&shadowing_bullet(fixture), &reserved).is_ok());
+}
+
+#[test]
+fn the_section_window_survives_a_crlf_checkout() {
+    // The regression the Windows leg found. Both windowing helpers look for a
+    // blank line followed by a marker, which CRLF spells differently; `read`
+    // normalises, and this asserts the helpers work on the shape it produces
+    // even if someone hands them a raw CRLF string directly.
+    let crlf = "**What a command the agent runs is bounded by.** `Act::Exec` on the argv.\r\n\
+                \r\n**Toolchain detection is a default.**";
+    let section = command_execution_section(&crlf.replace("\r\n", "\n"));
+    assert!(
+        !section.contains("Toolchain detection"),
+        "the window ran past its block on a normalised CRLF page:\n{section}"
+    );
+
+    let bullet_crlf = "- **Nothing may shadow anything** — see `RESERVED_TOOL_NAMES`.\r\n\
+                       - **A failing tool is an observation**";
+    let bullet = shadowing_bullet(&bullet_crlf.replace("\r\n", "\n"));
+    assert!(
+        !bullet.contains("A failing tool"),
+        "the bullet window ran past its own bullet:\n{bullet}"
     );
 }
