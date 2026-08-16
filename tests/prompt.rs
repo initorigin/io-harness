@@ -1487,9 +1487,10 @@ async fn a_preset_is_the_framing_plus_its_manner_and_nothing_else() {
         (Preset::Concise, CONCISE_MANNER),
         (Preset::Careful, CAREFUL_MANNER),
     ] {
-        let shaped =
-            workspace_system(&contract(dir.path()).with_system_prompt(SystemPrompt::Preset(preset)))
-                .await;
+        let shaped = workspace_system(
+            &contract(dir.path()).with_system_prompt(SystemPrompt::Preset(preset)),
+        )
+        .await;
         // The description, byte for byte: everything before the boundary section the
         // crate composes after it. `You may edit several files.` is the sentence the
         // old replacing form dropped, and it is inside this comparison.
