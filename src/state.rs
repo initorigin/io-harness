@@ -654,6 +654,73 @@ pub struct Pending {
     pub resolved: Option<String>,
 }
 
+/// One message from one agent in a tree to another (0.60.0).
+///
+/// The first horizontal edge in this schema. A tree could already nest, share one
+/// ledger, queue past its concurrency cap and hand a child's report up to its
+/// parent — every one of those a *vertical* edge. Two children investigating two
+/// subsystems had no way to tell each other what they found: the only channel
+/// between them was a file one wrote and the other happened to read, which is
+/// unaddressed, unordered, invisible to the trace and indistinguishable from
+/// ordinary workspace churn.
+///
+/// A message is addressed to a run id, because a run id is the only per-instance
+/// identity an agent has. [`AgentDef::name`](crate::AgentDef::name) is a *role*,
+/// and two children spawned from one definition — the ordinary shape of a
+/// fan-out — are both called by it. [`from_name`](Self::from_name) is the sender's
+/// own instance name, which is what a reader renders and what a `from` filter
+/// matches.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let scout = store.start_run("locate the symbol", "openrouter")?;
+/// let author = store.start_run("make the edit", "openrouter")?;
+///
+/// store.send_message(scout, author, "scout", 3, "it is at src/auth.rs:210")?;
+///
+/// // The author drains its inbox. Reading marks, so the same message is not
+/// // delivered twice — including to a process that resumed this tree.
+/// let inbox = store.read_messages(author, None)?;
+/// assert_eq!(inbox.len(), 1);
+/// assert_eq!(inbox[0].from_name, "scout");
+/// assert_eq!(inbox[0].body, "it is at src/auth.rs:210");
+/// assert!(store.read_messages(author, None)?.is_empty(), "delivered exactly once");
+///
+/// // An auditor reads without consuming.
+/// assert_eq!(store.messages_for(author)?.len(), 1);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AgentMessage {
+    /// The row id. Also the delivery order: messages are read oldest first, and
+    /// `AUTOINCREMENT` makes this monotonic across the whole store rather than
+    /// merely unique, so one number orders a tree whose agents interleave.
+    pub id: i64,
+    /// The run that sent it.
+    pub from_run_id: i64,
+    /// The run it was addressed to.
+    pub to_run_id: i64,
+    /// The sender's instance name — its address inside the tree, not the name of
+    /// the roster definition it was spawned from.
+    pub from_name: String,
+    /// The sender's step when it sent this.
+    pub step: u32,
+    /// What was said. Text, and deliberately nothing more: a reply-to id or a
+    /// request/response framing is the embedder's to choose.
+    pub body: String,
+    /// When it was sent.
+    pub sent_at: String,
+    /// When it was delivered, or `None` while it is still waiting. This column is
+    /// what makes delivery exactly-once across a process boundary — a resumed tree
+    /// reads it rather than an in-memory set that did not survive the restart.
+    pub read_at: Option<String>,
+}
+
 /// One event in a tree of agents: a parent spawning a child, a spawn refused by
 /// the containment boundary, or a draw against the tree's shared spend ceiling.
 ///
@@ -2987,6 +3054,12 @@ pub(crate) const RUN_TABLES: &[(&str, &str)] = &[
     ("rewinds", "run_id"),
     ("gate_attempts", "run_id"),
     ("summaries", "run_id"),
+    // 0.60.0 — keyed by the RECIPIENT, and the sender end is covered because a
+    // mailbox lives inside one tree and a session's run list is that whole tree, so
+    // both ends of every message are in the list. That is an argument rather than a
+    // guarantee, which is why `a_deleted_session_leaves_no_message_at_either_end`
+    // asserts the table is empty afterwards instead of trusting it.
+    ("agent_messages", "to_run_id"),
 ];
 
 /// What one session is holding, in the bytes of its own rows.
@@ -4164,6 +4237,70 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS session_turns_session ON session_turns (session_id);",
         )?;
 
+        // 0.60.0 — the mailbox. One row is one message from one agent in a tree to
+        // another, and it is the first horizontal edge this schema has ever had:
+        // `spawns` records that a parent started a child and `agent_events` records
+        // what each agent drew from the shared ledger, but nothing until now records
+        // one agent telling another something.
+        //
+        // Both ends are run ids because a run id is the only per-instance identity
+        // an agent has — a roster name is a *role* two children of one definition
+        // share. `from_name` is stored beside `from_run_id` and is not redundant
+        // with it: it is what a read renders and what a `from:` filter matches, and
+        // a name is fixed for the life of the agent that holds it, so denormalising
+        // it cannot drift. There is deliberately no `to_name` — the recipient is the
+        // agent doing the reading and already knows what it is called — and no
+        // `root_run_id`: which tree an address belongs to is settled when the name is
+        // resolved, one layer up, and a third run column here would be a second
+        // place for that answer to be wrong.
+        //
+        // `read_at` is the delivery mark and it is what makes exactly-once survive a
+        // process boundary. A set of delivered ids in memory passes every
+        // in-process test and re-delivers everything the first time a tree is
+        // resumed, which is the defect this column exists to make impossible.
+        //
+        // The index leads on `to_run_id` because every read is "what is waiting for
+        // me", and carries `id` because that ordering IS the delivery order. Both
+        // `read_at` and `body` are deliberately in **no** index, for the reason
+        // `run_events.kind` and `summaries.text` are: they are the control columns
+        // the query-plan test filters on, and a column merely absent from a left
+        // prefix is not a control — SQLite skip-scans a trailing composite column and
+        // produces a full read wearing an index's name.
+        //
+        // Additive, and deliberately NOT a `CHECKPOINT_FORMAT` bump, for the reason
+        // every addition since 0.13.0 has not been one: no checkpoint layout
+        // changed, a 0.59.0 binary never names this table, and bumping the format
+        // would make [`Self::check_resumable`] refuse every 0.59.0 store over a table
+        // it does not read.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_messages (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 from_run_id INTEGER NOT NULL,
+                 to_run_id   INTEGER NOT NULL,
+                 from_name   TEXT NOT NULL,
+                 step        INTEGER NOT NULL,
+                 body        TEXT NOT NULL,
+                 sent_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                 read_at     TEXT
+             );
+             CREATE INDEX IF NOT EXISTS agent_messages_to ON agent_messages (to_run_id, id);",
+        )?;
+
+        // 0.60.0 — the address a spawn was given, so a resumed tree re-adopts its
+        // children under the names they already had. Empty for every row an earlier
+        // release wrote and for a spawn that named none, in which case the name is
+        // derived from the child's run id and is stamped here on the way through.
+        //
+        // Added by `ALTER` rather than declared in the `CREATE TABLE` above, for the
+        // reason `edits.hunk` and `memory.kind` are: SQLite appends an added column
+        // to the statement it keeps in `sqlite_master`, so declaring it in both
+        // places puts it in the middle for a fresh store and at the end for a
+        // migrated one, and the two stop being the same database.
+        let _ = conn.execute(
+            "ALTER TABLE spawns ADD COLUMN as_name TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -4356,6 +4493,138 @@ impl Store {
                 detail: r.get(4)?,
                 tokens: r.get::<_, Option<i64>>(5)?.map(|n| n as u64),
                 remaining: r.get::<_, Option<i64>>(6)?.map(|n| n as u64),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Send one message from one agent to another; returns its row id (0.60.0).
+    ///
+    /// The store writes what it is told and asks nothing about the tree. Whether
+    /// `to_run_id` is an agent the sender may address is settled where names are
+    /// resolved, one layer up, and deliberately not here: a check duplicated in two
+    /// places is a check that will disagree with itself.
+    ///
+    /// See [`AgentMessage`] for the round trip.
+    pub fn send_message(
+        &self,
+        from_run_id: i64,
+        to_run_id: i64,
+        from_name: &str,
+        step: u32,
+        body: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO agent_messages (from_run_id, to_run_id, from_name, step, body)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (from_run_id, to_run_id, from_name, step, body),
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Deliver every message waiting for `to_run_id`, oldest first, and mark them
+    /// delivered (0.60.0). `from_name` narrows to one sender.
+    ///
+    /// **The select and the mark are one transaction, and that is the whole of the
+    /// exactly-once claim.** Reading the rows and then marking them in a second
+    /// statement is correct on every happy path and loses the batch whenever
+    /// anything fails between the two — a message a model has not seen, recorded as
+    /// one it has. Marking is durable rather than in memory for the same reason
+    /// stated on [`AgentMessage::read_at`]: an in-process set re-delivers everything
+    /// the first time a tree is resumed in a new process.
+    ///
+    /// The returned rows carry the `read_at` this call stamped, so a caller holding
+    /// one can tell it was the delivery rather than an audit.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let a = store.start_run("a", "openrouter")?;
+    /// let b = store.start_run("b", "openrouter")?;
+    /// let me = store.start_run("me", "openrouter")?;
+    /// store.send_message(a, me, "scout", 1, "first")?;
+    /// store.send_message(b, me, "critic", 1, "second")?;
+    ///
+    /// // Narrowed to one sender: the other message stays waiting.
+    /// let from_critic = store.read_messages(me, Some("critic"))?;
+    /// assert_eq!(from_critic.len(), 1);
+    /// assert_eq!(from_critic[0].body, "second");
+    /// assert!(from_critic[0].read_at.is_some());
+    ///
+    /// assert_eq!(store.read_messages(me, None)?.len(), 1, "the scout's is still there");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_messages(
+        &self,
+        to_run_id: i64,
+        from_name: Option<&str>,
+    ) -> Result<Vec<AgentMessage>> {
+        let tx = self.conn.unchecked_transaction()?;
+        // `read_at IS NULL` and `from_name` are both filters on columns outside the
+        // index on purpose: the index leads on the recipient, which is the term that
+        // selects, and the plan test asserts it is the one used.
+        let mut stmt = tx.prepare(
+            "SELECT id, from_run_id, to_run_id, from_name, step, body, sent_at
+             FROM agent_messages
+             WHERE to_run_id = ?1 AND read_at IS NULL AND (?2 IS NULL OR from_name = ?2)
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![to_run_id, from_name], |r| {
+            Ok(AgentMessage {
+                id: r.get(0)?,
+                from_run_id: r.get(1)?,
+                to_run_id: r.get(2)?,
+                from_name: r.get(3)?,
+                step: r.get::<_, i64>(4)? as u32,
+                body: r.get(5)?,
+                sent_at: r.get(6)?,
+                read_at: None,
+            })
+        })?;
+        let mut out: Vec<AgentMessage> = rows.collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+
+        // One stamp for the batch, so every message delivered by one read carries
+        // the same instant — a reader comparing two `read_at` values is asking which
+        // read delivered them, not which microsecond a row was written in.
+        let now: String = tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| {
+            r.get(0)
+        })?;
+        for m in &mut out {
+            tx.execute(
+                "UPDATE agent_messages SET read_at = ?1 WHERE id = ?2",
+                (&now, m.id),
+            )?;
+            m.read_at = Some(now.clone());
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Every message ever addressed to a run, delivered or not, oldest first
+    /// (0.60.0). Reading this delivers nothing.
+    ///
+    /// The audit half. [`Self::read_messages`] is the agent's own call and consumes
+    /// what it returns; this is for an operator asking what an agent was told, which
+    /// must not change what that agent will read next.
+    pub fn messages_for(&self, to_run_id: i64) -> Result<Vec<AgentMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_run_id, to_run_id, from_name, step, body, sent_at, read_at
+             FROM agent_messages WHERE to_run_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([to_run_id], |r| {
+            Ok(AgentMessage {
+                id: r.get(0)?,
+                from_run_id: r.get(1)?,
+                to_run_id: r.get(2)?,
+                from_name: r.get(3)?,
+                step: r.get::<_, i64>(4)? as u32,
+                body: r.get(5)?,
+                sent_at: r.get(6)?,
+                read_at: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -8835,6 +9104,112 @@ mod tests {
     /// flaky test on a loaded CI runner, and it passes on a fast machine running
     /// a full scan. The plan is the property — every one of these must reach its
     /// rows through an index rather than reading the table.
+    /// **F5, third clause — a read that fails after selecting leaves every message
+    /// still unread.**
+    ///
+    /// This lives here rather than in `tests/mailbox.rs` because the only way to
+    /// make the write half fail while the read half succeeds is to reach the
+    /// connection, which is private. `query_only` is exactly that lever: the
+    /// `SELECT` runs, the `UPDATE` is refused, and the question is whether the
+    /// batch was marked anyway.
+    ///
+    /// A read and a mark in two statements passes every ordinary test and loses
+    /// the batch here — a message no model ever saw, recorded as one it has.
+    #[test]
+    fn a_read_that_fails_after_selecting_marks_nothing() {
+        let store = Store::memory().unwrap();
+        let me = store.start_run("coordinate", "/repo").unwrap();
+        let scout = store.start_run("scout", "/repo").unwrap();
+        for i in 0..3 {
+            store
+                .send_message(scout, me, "scout", i + 1, &format!("finding {i}"))
+                .unwrap();
+        }
+
+        store
+            .conn
+            .execute_batch("PRAGMA query_only = 1")
+            .expect("the pragma itself is not a write");
+        let refused = store.read_messages(me, None);
+        assert!(refused.is_err(), "the mark cannot be written");
+        store.conn.execute_batch("PRAGMA query_only = 0").unwrap();
+
+        let waiting = store.messages_for(me).unwrap();
+        assert_eq!(waiting.len(), 3);
+        assert!(
+            waiting.iter().all(|m| m.read_at.is_none()),
+            "a read that could not mark delivered nothing"
+        );
+        assert_eq!(
+            store.read_messages(me, None).unwrap().len(),
+            3,
+            "and all three are still there to be read"
+        );
+    }
+
+    /// **N5, the plan half — a read is an index seek on the recipient, not a scan.**
+    ///
+    /// The mailbox is the one table in this schema every agent in a tree queries on
+    /// every step it chooses to read, so a scan here is paid per agent per step. The
+    /// statement asserted is the one [`Store::read_messages`] actually prepares,
+    /// copied rather than paraphrased: a hand-written equivalent can be planned
+    /// differently from the real one and prove nothing.
+    #[test]
+    fn a_mailbox_read_reaches_its_rows_through_the_recipient_index() {
+        let store = Store::memory().unwrap();
+        // A plan is chosen against the table as it stands, so it cannot be empty.
+        let me = store.start_run("coordinate", "/repo").unwrap();
+        for i in 0..64 {
+            let sender = store.start_run("s", "/repo").unwrap();
+            store
+                .send_message(sender, me, "scout", i + 1, "finding")
+                .unwrap();
+            // Traffic addressed elsewhere, so "seek to my rows" is a real saving
+            // rather than the whole table under another name.
+            store
+                .send_message(me, sender, "root", i + 1, "ack")
+                .unwrap();
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let mut stmt = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, from_run_id, to_run_id, from_name, step, body, sent_at
+                 FROM agent_messages
+                 WHERE to_run_id = ?1 AND read_at IS NULL AND (?2 IS NULL OR from_name = ?2)
+                 ORDER BY id ASC",
+            )
+            .unwrap();
+        // Bound, because `EXPLAIN QUERY PLAN` still prepares a statement with the
+        // real parameter count. The values are irrelevant to the plan; the shape is
+        // not.
+        let plan = stmt
+            .query_map(rusqlite::params![me, Option::<&str>::None], |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" | ");
+
+        assert!(
+            plan.contains("agent_messages_to"),
+            "the read must seek by recipient: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN agent_messages\n") && !plan.ends_with("SCAN agent_messages"),
+            "and must not fall back to a scan of the table: {plan}"
+        );
+        // The ordering is the index's own, so no sorter is built for it. A
+        // `USE TEMP B-TREE FOR ORDER BY` here means every read sorts its own inbox.
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "delivery order is the index's order, not a sort: {plan}"
+        );
+    }
+
     #[test]
     fn every_aggregate_reaches_its_rows_through_an_index() {
         let store = Store::memory().unwrap();

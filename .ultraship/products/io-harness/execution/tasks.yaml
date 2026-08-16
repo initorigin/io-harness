@@ -7,7 +7,7 @@ tasks:
     properties that cannot be retrofitted live: the read and the mark happen in one transaction, and
     the new table is in `RUN_TABLES` so a session delete accounts for it. A table missed by that list
     produces a silent orphan and no error — 0.58.0 paid for that lesson.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F5 — reads are ordered, exactly-once, and marked in the same transaction as they are returned.**
@@ -44,7 +44,36 @@ tasks:
     index by name, and the recipient column is the leading one.
 
     '
-  evidence: []
+  evidence:
+  - 'F5, first two clauses — `messages_are_delivered_oldest_first_across_interleaved_senders`, `a_message_is_delivered_exactly_once`,
+    `a_from_filter_delivers_only_that_senders_messages`, `an_audit_read_does_not_deliver` and `a_body_survives_being_arbitrary_text`
+    in `tests/mailbox.rs` — 6 passed (the sixth is N5''s measurement, ignored by default). The ordering
+    test round-robins three senders so no sender''s messages are adjacent: a per-sender order would
+    pass a contiguous fixture and reorder a real tree.'
+  - F5, third clause — `a_read_that_fails_after_selecting_marks_nothing` in `src/state.rs`, 491 lib
+    tests passed. It lives in the crate rather than in `tests/` because the only lever that fails the
+    write half while the read half succeeds is `PRAGMA query_only`, and the connection is private. A
+    read-then-mark in two statements loses the batch here.
+  - 'N1 — one `CREATE TABLE IF NOT EXISTS agent_messages`, one `CREATE INDEX IF NOT EXISTS agent_messages_to`,
+    one `ALTER TABLE spawns ADD COLUMN as_name`. `CHECKPOINT_FORMAT` unmoved at 7: no checkpoint layout
+    changed, and a bump would make `check_resumable` refuse every 0.59.0 store over a table it does
+    not read.'
+  - N2 — `agent_messages` and `agent_messages_to` in `ADDED_SINCE_0_22_0`, and `spawns` with `as_name
+    TEXT NOT NULL DEFAULT ''` in `COLUMNS_ADDED_SINCE_0_22_0`. `cargo test --test cross_version` — 7
+    passed. The real-0.29.0-binary half runs in T07 with the generator built.
+  - N3 — `a_deleted_session_leaves_no_message_at_either_end` in `tests/mailbox.rs`. Messages are sent
+    in BOTH directions before the delete, so a cascade covering only the recipient end still fails,
+    and the count is taken straight off `agent_messages` through a second connection rather than through
+    either run id — a row orphaned by a missed cascade is exactly a row no run id reaches.
+  - 'N5, plan half — `a_mailbox_read_reaches_its_rows_through_the_recipient_index` in `src/state.rs`.
+    The statement asserted is the one `read_messages` prepares, copied rather than paraphrased. Asserts
+    the index by name, no fallback scan, and no `TEMP B-TREE`: delivery order is the index''s own order
+    rather than a sort built per read. The fixture writes traffic addressed elsewhere too, so seeking
+    to one recipient''s rows is a real saving rather than the whole table under another name.'
+  - N5, measurement half — `n5_what_a_drain_costs`, release build, on-disk stores, median of 20. **0.152
+    / 0.727 / 3.612 ms at 1 / 100 / 1,000 unread.** A thousandfold more messages for about twenty-four
+    times the cost, because the transaction commit is paid once per read whatever the size and only
+    the per-row `UPDATE` scales.
   files:
   - src/state.rs
   - src/lib.rs
