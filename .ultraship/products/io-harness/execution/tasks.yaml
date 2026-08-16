@@ -330,3 +330,14 @@ tasks:
     with the reason in its rustdoc. `the_section_window_survives_a_crlf_checkout` is the regression
     test. Local after the fix: `docs_drift` 45 of 45, `guide_pages` 10 of 10, clippy all-features
     clean.
+  - >
+    O1 — the round after the fix confirmed it: `test (windows-latest, default)` **passes**, which is
+    the leg the CRLF defect owned. Two other legs failed on that round and **both are recorded
+    environmental flakes, matched by signature before being rerun rather than after**:
+    `test (windows-latest, all)` on `f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin`
+    at `tests/hooks.rs:349`, in a job whose own log carries
+    `install-action: installation failed due to bash startup failure`
+    (actions/partner-runner-images#169) — the documented pair, not one half of it; and
+    `test (ubuntu-latest, default)` on `two_concurrent_children_with_their_own_worktrees_do_not_collide`,
+    open since 0.58.0, which had passed on the previous round of this same tree. Neither is reachable
+    from a release that changes no `src/` behaviour. Cleared with `gh run rerun --failed`.
