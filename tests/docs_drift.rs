@@ -1100,3 +1100,83 @@ fn command_execution_section_stops_at_the_next_claim() {
         "the window did not reach the block's own body:\n{section}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A rustdoc block does not carry a retired sentence — F2 of 0.60.2
+// ---------------------------------------------------------------------------
+//
+// The same boundary in the second place a caller reads it, and the only one
+// that renders on docs.rs. `TaskContract::exec_sandbox` told a caller the
+// `shell_start` / `shell_poll` / `shell_kill` handles "are not contained
+// because a handle outlives the call that made it" — the exact sentence
+// `docs/CONTRACT.md` names as the one 0.48.0 retired. This is the first check
+// in this file that reads a doc comment inside `src/` rather than a page.
+
+/// The `///` block immediately above `item` in a Rust source file.
+///
+/// Walks back from the item's own line and stops at the first line that is not
+/// a doc comment, so an attribute, a blank line, or the previous item ends the
+/// block. A block that swallowed its neighbours would pass any assertion that
+/// only looks for an absent phrase.
+fn doc_block_above(source: &str, item: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with(item))
+        .unwrap_or_else(|| panic!("no line in the source opens with {item:?}"));
+    let mut start = at;
+    while start > 0 && lines[start - 1].trim_start().starts_with("///") {
+        start -= 1;
+    }
+    lines[start..at]
+        .iter()
+        .map(|l| l.trim_start().trim_start_matches("///").trim())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn carries_no_retired_containment_claim(block: &str) -> Result<(), String> {
+    if flatten(block).contains("not contained") {
+        return Err(
+            "the exec_sandbox rustdoc still says the shell handles are not contained. 0.48.0 \
+             retired that sentence — docs/CONTRACT.md names it as retired at line 1222 — and a \
+             handle has taken the same containment every other spawn takes ever since."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn exec_sandbox_rustdoc_does_not_carry_the_retired_sentence() {
+    let block = doc_block_above(&read("src/contract.rs"), "pub exec_sandbox:");
+    if let Err(why) = carries_no_retired_containment_claim(&block) {
+        panic!("{why}");
+    }
+    assert!(
+        flatten(&block).contains("take the same containment every other spawn takes"),
+        "the block no longer states what a handle does take, which is the half a caller \
+         needs:\n{block}"
+    );
+}
+
+#[test]
+fn retired_containment_checker_rejects_the_0_47_0_clause() {
+    let fixture = "/// the `shell_start` / `shell_poll` / `shell_kill`\n\
+                   /// handles, which are not contained because a handle outlives the call that\n\
+                   /// made it;\n";
+    let err = carries_no_retired_containment_claim(fixture).unwrap_err();
+    assert!(err.contains("not contained"), "{err}");
+}
+
+#[test]
+fn doc_block_extractor_stops_at_the_previous_item() {
+    let fixture = "    /// The first field.\n    pub first: u8,\n    /// The second field.\n    \
+                   /// Two lines of it.\n    pub second: u8,\n";
+    let block = doc_block_above(fixture, "pub second:");
+    assert!(block.contains("The second field."), "{block}");
+    assert!(
+        !block.contains("The first field."),
+        "the extractor swallowed the previous item's block:\n{block}"
+    );
+}

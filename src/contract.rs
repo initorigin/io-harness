@@ -402,13 +402,24 @@ pub struct TaskContract {
     /// What the mode does **not** decide, and each is documented in
     /// `docs/CONTRACT.md`: egress, which comes from this run's [`Policy`] and is
     /// still one boolean per run, so a policy allowing one host permits all of
-    /// them under containment; the `shell_start` / `shell_poll` / `shell_kill`
-    /// handles, which are not contained because a handle outlives the call that
-    /// made it; and what a host can actually enforce — macOS and Linux confine
-    /// writes and deny egress, a Windows AppContainer does both when the caller
-    /// asks for it (0.59.0), and a Windows Job Object and the portable floor
-    /// apply the resource caps and have no filesystem facility at all, so there
-    /// the mode is routed and reported and enforces nothing for the filesystem.
+    /// them under containment; and what a host can actually enforce — macOS and
+    /// Linux confine writes and deny egress, a Windows AppContainer does both
+    /// when the caller asks for it (0.59.0), and a Windows Job Object and the
+    /// portable floor apply the resource caps and have no filesystem facility at
+    /// all, so there the mode is routed and reported and enforces nothing for the
+    /// filesystem.
+    ///
+    /// **The `shell_start` / `shell_poll` / `shell_kill` handles take the same
+    /// containment every other spawn takes, per stage (0.48.0.)** A handle's
+    /// restriction lives *with its processes* — a `pre_exec` rule set or a
+    /// wrapper argv on unix, and on Windows the Job Object the handle already
+    /// owns — so a resumed run has nothing to tear down and nothing to re-enter.
+    /// The one cap that does not reach a handle is
+    /// [`SandboxLimits::max_wall_secs`](crate::sandbox::SandboxLimits::max_wall_secs),
+    /// enforced inside the sandbox's own runner, which `exec` uses and no
+    /// `shell` path reaches. That is the intended answer rather than a gap: a dev
+    /// server killed at the sandbox's ceiling would be containment deleting the
+    /// tool's purpose. The CPU and open-file rlimits do apply.
     ///
     /// [`Policy`]: crate::Policy
     pub exec_sandbox: crate::sandbox::SandboxConfig,

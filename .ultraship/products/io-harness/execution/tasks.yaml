@@ -64,7 +64,7 @@ tasks:
     docs.rs. `TaskContract::exec_sandbox` still carries the clause `docs/CONTRACT.md:1222` names as
     the one 0.48.0 retired, so a caller who reads the API docs rather than the contract is told the
     shell handles escape containment.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.2-T01
   acceptance_criteria:
@@ -83,7 +83,38 @@ tasks:
   files:
   - src/contract.rs
   - tests/docs_drift.rs
-  evidence: []
+  evidence:
+  - >
+    `src/contract.rs:402` — the clause "the `shell_start` / `shell_poll` / `shell_kill` handles, which
+    are not contained because a handle outlives the call that made it" is removed from the list of
+    things the mode does not decide, and replaced by a paragraph of its own stating what 0.48.0
+    actually did: a handle takes the same containment every other spawn takes, per stage, and its
+    restriction lives with its processes.
+  - >
+    The paragraph also carries the half `docs/CONTRACT.md:1236` states and the rustdoc did not — that
+    `SandboxLimits::max_wall_secs` reaches no `shell` path, deliberately, because a dev server killed
+    at the sandbox ceiling would be containment deleting the tool's purpose, while the CPU and
+    open-file rlimits do apply.
+  - >
+    F2 — `exec_sandbox_rustdoc_does_not_carry_the_retired_sentence` in `tests/docs_drift.rs`. It is
+    the first check in that file to read a doc comment inside `src/` rather than a markdown page, so
+    it comes with `doc_block_above`, an extractor that walks back from the item and stops at the first
+    line that is not a `///`, plus a control asserting it does not swallow the previous item's block.
+    The test asserts both directions: the retired sentence is absent AND the replacement claim is
+    present, so deleting the paragraph outright does not pass.
+  - >
+    F2 sabotage, run: `git stash push src/contract.rs` restores the 0.47.0-era clause.
+    `cargo test --test docs_drift` then reports `test result: FAILED. 38 passed; 1 failed`, the single
+    failure being `exec_sandbox_rustdoc_does_not_carry_the_retired_sentence`. 39 of 39 pass with the
+    fix in place.
+  - >
+    N1 — `git diff develop -- src/` filtered to lines that are not `///` comments is **empty**, and the
+    diff touches one file. No behaviour, no public item, no snapshot regeneration.
+  - >
+    O2, early — `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`
+    is clean. Run here rather than only at the gate stage because this task adds an intra-doc link
+    (`crate::sandbox::SandboxLimits::max_wall_secs`) and that gate is what catches a bad one; stable
+    `cargo doc` cannot see it.
 - id: US-IO-HARNESS-0.60.2-T03
   summary: >-
     Correct the reserved-name claims in the guide, in the contract and in the set's own doc comment,
