@@ -39,6 +39,7 @@ the limits that capability actually has.
 | [Providers](guide/providers.md) | One `Compatible` provider over any OpenAI-shaped endpoint, the 21 vendor presets, the local runtimes, what `Provider::models()` reports, the routing rules that change which model answers mid-run, and the optional method that reports a finished tool call while the completion is still streaming |
 | [Capability bundles](guide/plugins.md) | A directory that contributes skills, templates, agents, MCP servers, hooks and deny-only policy at once; what a project-scoped declaration may not hand you; how a contribution names the bundle it came from; and why a broken bundle is dropped rather than fatal |
 | [Retention](guide/retention.md) | What a session and a store are holding, removing a session whole, sweeping to a date and what that refuses, keeping every row while emptying every word, and returning the freed pages to the filesystem |
+| [The mailbox](guide/mailbox.md) | Giving each agent in a tree an address, sending a finding to a named sibling, reading an inbox oldest-first exactly once, and a bounded wait that returns on the message or on the sender finishing |
 
 ## The twelve pillars
 

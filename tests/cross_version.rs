@@ -215,6 +215,12 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     // opens a store carrying it and never names it, which
     // `tests/cross_version_0_29_0.rs` executes rather than asserts on paper.
     "session_turns_session",
+    // 0.60.0 — the mailbox, the schema's first horizontal edge. One table and its
+    // index, added and nothing altered: a 0.29.0 binary opens a store carrying both
+    // and never names either, which `tests/cross_version_0_29_0.rs` executes rather
+    // than asserts on paper.
+    "agent_messages",
+    "agent_messages_to",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].
@@ -251,10 +257,18 @@ fn is_added_since_0_22_0(stmt: &str) -> bool {
 /// changed. Nullable for exactly that reason — every row an earlier release
 /// wrote has no hunk, and is reported as having none rather than as having an
 /// empty one.
+/// 0.60.0 adds the fourth: `spawns` gains `as_name`, the instance name a parent
+/// gave one child. NOT NULL with a default rather than nullable, which is the
+/// first of these four to be so and is deliberate — an address is a string an
+/// agent is called by, and "" is the honest reading of a spawn from a release that
+/// had no addresses, where a nullable column would make every reader decide
+/// separately what `NULL` meant. A 0.29.0 binary selects the columns it knows by
+/// name and never sees it.
 const COLUMNS_ADDED_SINCE_0_22_0: &[(&str, &[&str])] = &[
     ("memory", &["kind TEXT", "pinned INTEGER"]),
     ("runs", &["turn_kind TEXT"]),
     ("edits", &["hunk TEXT"]),
+    ("spawns", &["as_name TEXT NOT NULL DEFAULT ''"]),
 ];
 
 /// Whether `new` is `old` with exactly the declared columns added, and nothing

@@ -313,6 +313,20 @@ pub struct TaskContract {
     /// A read is refused when it exceeds *either* ceiling, and the refusal says
     /// which — the two call for different answers.
     pub max_read_chars: Option<u64>,
+    /// The longest an agent may block waiting for a message, in seconds (0.60.0).
+    ///
+    /// `None` — the default — is [`DEFAULT_MAX_WAIT`](crate::DEFAULT_MAX_WAIT),
+    /// and an agent asking for longer is given the cap and told so. There is deliberately no way to say
+    /// "wait forever": an agent that blocks holds its concurrency slot, and the
+    /// sibling that would answer it may be the one queued behind that slot. A
+    /// bounded wait turns that from a tree that stops into a tree that carries on
+    /// having learnt nothing, which is a bad step and not a dead run.
+    ///
+    /// This is a ceiling on one call, not a budget across a run. An agent may wait
+    /// this long on every step it chooses to, bounded by
+    /// [`TaskContract::max_duration`] and [`TaskContract::max_steps`] like
+    /// everything else it does.
+    pub max_wait_secs: Option<u64>,
     /// How much this workspace's durable memory may hold (0.56.0).
     ///
     /// Defaults to [`MemoryLimits::default`], which is the crate's three
@@ -554,6 +568,7 @@ impl TaskContract {
             tools: crate::tools::Toolbox::new(),
             context: ContextBudget::default(),
             max_read_chars: None,
+            max_wait_secs: None,
             memory: MemoryLimits::default(),
             compaction: Compaction::default(),
             retry: RetryPolicy::default(),
@@ -628,6 +643,7 @@ impl TaskContract {
             tools: crate::tools::Toolbox::new(),
             context: ContextBudget::default(),
             max_read_chars: None,
+            max_wait_secs: None,
             memory: MemoryLimits::default(),
             compaction: Compaction::default(),
             retry: RetryPolicy::default(),
@@ -1389,6 +1405,32 @@ impl TaskContract {
     #[must_use]
     pub fn with_max_read_chars(mut self, chars: u64) -> Self {
         self.max_read_chars = Some(chars);
+        self
+    }
+
+    /// Cap how long an agent may block waiting for a message (0.60.0).
+    ///
+    /// The operator's ceiling on `read_messages`'s `wait_secs`. An agent asking
+    /// for longer is given this and reads a line saying its request was narrowed —
+    /// silence would leave a model believing it had waited a minute when it waited
+    /// five seconds, and drawing the wrong conclusion from an empty mailbox.
+    ///
+    /// ```
+    /// use io_harness::TaskContract;
+    ///
+    /// let contract = TaskContract::workspace("coordinate the fan-out", "/repo")
+    ///     .with_max_wait_secs(5);
+    ///
+    /// assert_eq!(contract.max_wait_secs, Some(5));
+    /// // Unset means the crate's own ceiling, never "forever".
+    /// assert_eq!(
+    ///     TaskContract::workspace("coordinate the fan-out", "/repo").max_wait_secs,
+    ///     None,
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_max_wait_secs(mut self, secs: u64) -> Self {
+        self.max_wait_secs = Some(secs);
         self
     }
 

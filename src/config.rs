@@ -568,6 +568,10 @@ struct RunSection {
     // other budgets because it is one: what a run may spend, what one request may
     // carry, and what one read may be.
     max_read_chars: Option<u64>,
+    // 0.60.0 — the ceiling on a blocking mailbox read, in seconds. Beside
+    // `max_read_chars` because it is the same kind of key: a number an operator
+    // chose, which a project scope may lower and may not raise.
+    max_wait_secs: Option<u64>,
     commit_identity: Option<Identity>,
 }
 
@@ -1634,6 +1638,9 @@ impl Config {
         if let Some(v) = run.max_read_chars {
             out = out.with_max_read_chars(v);
         }
+        if let Some(v) = run.max_wait_secs {
+            out = out.with_max_wait_secs(v);
+        }
         if let Some(v) = &run.commit_identity {
             out = out.with_commit_identity(v.name.clone(), v.email.clone());
         }
@@ -2059,6 +2066,10 @@ const APPENDING: &[&[&str]] = &[&["policy", "layers"], &["agent"], &["plugin"]];
 /// distinction [`refuse_widening`] already draws.
 const NARROWING: &[&[&str]] = &[
     &["run", "max_read_chars"],
+    // 0.60.0 — the ceiling on a blocking mailbox read. A number, like
+    // `max_read_chars`, so it cannot be refused by its value the way `exec =
+    // "allow"` is: the lower of the two wins when the incoming scope is `Project`.
+    &["run", "max_wait_secs"],
     // 0.56.0 — the three memory caps. All three, not one representative: a rule
     // that covered two of them would be a boundary that depends on which cap a
     // repository chose to argue about.

@@ -184,6 +184,24 @@
 //! [`TaskContract::with_spawn_background_after`] and
 //! [`TaskContract::without_detached_spawns`] are the operator's ceiling on both.
 //!
+//! **Agents in a tree talking to each other.** Everything above is a *vertical*
+//! edge: a parent starts a child, a child reports to its parent. Two children
+//! investigating two subsystems had no way to tell each other what they found.
+//! Now every agent in a tree has an **address** — [`SPAWN_TOOL`] takes an `as`,
+//! and one is derived from the role and the run id when it is omitted — and that
+//! address names *one* agent, unlike [`AgentDef::name`], which is a role several
+//! children may share. [`SEND_MESSAGE_TOOL`] tells a named agent something;
+//! [`READ_MESSAGES_TOOL`] returns what was sent to this one, oldest first,
+//! delivered exactly once, optionally narrowed to one sender and optionally
+//! blocking. Every wait is bounded by [`TaskContract::with_max_wait_secs`] or
+//! [`DEFAULT_MAX_WAIT`], because an agent that blocks holds its concurrency slot
+//! and the sibling that would answer it may be queued behind that slot; a request
+//! over the ceiling is narrowed and said. A terminating agent posts one short line
+//! to its parent, so waiting for a named child and waiting for a message are the
+//! same call. Messages are [`AgentMessage`] rows, so a resumed tree reads the same
+//! ones in the same order, once — and an address reaches inside its own tree and
+//! nowhere else.
+//!
 //! **Providers, with fallback.** [`OpenRouter`], [`Anthropic`] and [`OpenAi`]
 //! behind one [`Provider`] trait, over the crate's own HTTP+SSE client.
 //! [`provider::Fallback`] moves to the next configured provider when one is down
@@ -549,7 +567,8 @@ pub use run::{
     resume_with_observed, resume_with_plan_decision, resume_with_plan_decision_observed,
     retry_gate, retry_gate_observed, rewind, rewind_run, rewind_run_observed, rewind_step,
     rewind_step_observed, run, run_observed, run_tree, run_tree_observed, run_with,
-    run_with_observed, Reverted, Rewind, Rewound, RunOutcome, RunResult, SPAWN_TOOL,
+    run_with_observed, Reverted, Rewind, Rewound, RunOutcome, RunResult, DEFAULT_MAX_WAIT,
+    READ_MESSAGES_TOOL, SEND_MESSAGE_TOOL, SPAWN_TOOL,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, ExecMode, Sandbox, SandboxConfig, SandboxLimits,
@@ -565,13 +584,14 @@ pub use skills::{Skill, Skills};
 // leaving its own audit table reachable only by opening the SQLite file.
 pub use agent::{AgentDef, Agents};
 pub use state::{
-    AgentEvent, Archived, CheckpointEvent, ContextEvent, Edit, FirstTry, GateAttempt, GateOutcome,
-    McpEvent, MemoryEntry, MemoryForget, MemoryKind, MemoryLimits, MemoryRecall, MemoryWrite,
-    Pending, PendingPlan, PendingQuestion, PolicyEvent, ProcessHandle, ProviderCall, Pruned,
-    Recovery, RewindRecord, RunStatus, RunSummary, SandboxEvent, SessionSize, SpawnRow, StepRecord,
-    Store, StoreSize, Summary, Tally, TodoItem, TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT,
-    GLOBAL_MEMORY_WORKSPACE, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
-    SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP, UNKNOWN_MODEL,
+    AgentEvent, AgentMessage, Archived, CheckpointEvent, ContextEvent, Edit, FirstTry, GateAttempt,
+    GateOutcome, McpEvent, MemoryEntry, MemoryForget, MemoryKind, MemoryLimits, MemoryRecall,
+    MemoryWrite, Pending, PendingPlan, PendingQuestion, PolicyEvent, ProcessHandle, ProviderCall,
+    Pruned, Recovery, RewindRecord, RunStatus, RunSummary, SandboxEvent, SessionSize, SpawnRow,
+    StepRecord, Store, StoreSize, Summary, Tally, TodoItem, TodoState, Turn, BUSY_TIMEOUT,
+    CHECKPOINT_FORMAT, GLOBAL_MEMORY_WORKSPACE, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES,
+    MEMORY_MAX_ENTRY_CHARS, ROOT_ADDRESS, SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP,
+    UNKNOWN_MODEL,
 };
 pub use template::{Template, Templates};
 pub use tools::git::Identity;

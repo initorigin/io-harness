@@ -1,0 +1,44 @@
+product: io-harness
+version: 0.60.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      No recorded constraints exist for this release — `ultraship constraints` reports none for the
+      product, so this assessment is made against the repository's own condition rather than against
+      any user estimate, and says so rather than implying a figure was measured.
+    - >
+      The release adds no dependency. It is one table, one index, one nullable column added by an
+      additive `ALTER`, one struct, three store methods, two tool schemas and one optional spawn
+      argument, against a schema and a spawn path both already described in one file each.
+    - >
+      The deployment path is the standing flow and has carried the last twenty-one releases
+      unchanged, including a release whose record was amended twice mid-flight.
+    - >
+      The vertical slice is already cut and it is the contract's own `fallback_scope`: names, send,
+      and a non-blocking read. That path is demonstrable on its own, so a release that runs short
+      still ships something coherent rather than half a mechanism.
+  major_cost_drivers:
+    - >
+      **The bounded wait against the concurrency cap.** An agent that blocks holds its slot and a
+      sibling that could answer it may be queued behind that slot. The clock makes it survivable;
+      whether it makes it correct is the one thing not known before implementation, and it is why
+      the cut line was written into the contract rather than left to be improvised.
+    - >
+      **Eight of fifteen functional criteria involve a clock**, on three platforms, on runners where
+      the Windows leg is roughly three times slower. The ledger records nine separate CI failures
+      caused by gating on a duration. Every timing assertion has to be a comparison against the
+      clock the test itself supplied.
+    - >
+      **Exactly-once delivery across a process boundary.** The obvious implementation — a set of
+      delivered ids in memory — passes every in-process test and is wrong the moment a tree is
+      resumed. The correctness lives in a `read_at` column and in a transaction boundary, neither of
+      which an in-process fixture can exercise.
+    - >
+      **Two things are both called "the agent's name".** The roster definition's name is a role and
+      the new instance name is an address. One sentence in a tool description that conflates them is
+      enough to make a model address a role, and the risk lives in the prose more than in the code.
+  recommended_scope_change: null

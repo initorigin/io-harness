@@ -1520,12 +1520,11 @@ versions:
       matrix round. That shell is an interactive session on the `windows-latest` runner itself,
       dispatched by hand from a throwaway branch: the environment under test and the environment
       being read are then the same one, the suspected cause of the decline is the runner's own
-      profile and service account, and a non-reproduction becomes as decisive as a reproduction.
-      And whether `cmd.exe` refusing to start a batch file named by an absolute path
-      inside an AppContainer is a property of the platform or of this spawn: the same file is read
-      by absolute path with `type` and runs when named relative to the working directory, on a
-      workspace nowhere near the user profile, so it is not the grant set and not the path's
-      ancestors.
+      profile and service account, and a non-reproduction becomes as decisive as a reproduction. And
+      whether `cmd.exe` refusing to start a batch file named by an absolute path inside an
+      AppContainer is a property of the platform or of this spawn: the same file is read by absolute
+      path with `type` and runs when named relative to the working directory, on a workspace nowhere
+      near the user profile, so it is not the grant set and not the path's ancestors.
 
       **The browser half, folded in here on 2026-08-15** rather than given an entry of its own; the
       record is `US-IO-HARNESS-0.59.0-I01`. `browser::launch` has a Windows arm that refuses, and
@@ -1567,29 +1566,29 @@ versions:
       **Specified 2026-08-15, and the spike this entry insisted on corrected the entry.** The
       transport is **not** `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. Chromium converts the two
       descriptors it is handed with `_get_osfhandle`, so what the child needs is a populated
-      C-runtime descriptor table, and the only thing that writes one is
-      `STARTUPINFO.lpReserved2` — a structure the attribute list cannot express a descriptor
-      number in. Asked of a real browser on `windows-latest` in three shapes: the descriptor block
-      alone speaks, the block plus a handle list speaks, and the two ends as the child's standard
-      handles fails with Chrome's own `Remote debugging pipe file descriptors are not open`. So
-      the two halves do *not* sit on the same attribute after all; they sit on the same
-      `CreateProcessW`. Anonymous pipes are enough, which means no pipe name for another local
-      process to open — 0.53.0's argument against a debugging port, preserved.
+      C-runtime descriptor table, and the only thing that writes one is `STARTUPINFO.lpReserved2` —
+      a structure the attribute list cannot express a descriptor number in. Asked of a real browser
+      on `windows-latest` in three shapes: the descriptor block alone speaks, the block plus a
+      handle list speaks, and the two ends as the child's standard handles fails with Chrome's own
+      `Remote debugging pipe file descriptors are not open`. So the two halves do *not* sit on the
+      same attribute after all; they sit on the same `CreateProcessW`. Anonymous pipes are enough,
+      which means no pipe name for another local process to open — 0.53.0's argument against a
+      debugging port, preserved.
 
-      **Both open questions are answered, and one of them had already been fixed.** The
-      `CARGO_HOME` decline does not reproduce: all four grant shapes and every child of the
-      directory succeed while the cargo build that asked for the sandbox holds them open, which is
-      0.47.0's own `TreeSetNamedSecurityInfoW` fix working. What refuses on this image is
-      `%SystemRoot%`, which is read-execute and non-fatal by design. And `cmd.exe` refusing a
-      batch file by absolute path is a property of the container rather than the platform, with a
-      workaround: `call` with the byte-identical path runs.
+      **Both open questions are answered, and one of them had already been fixed.** The `CARGO_HOME`
+      decline does not reproduce: all four grant shapes and every child of the directory succeed
+      while the cargo build that asked for the sandbox holds them open, which is 0.47.0's own
+      `TreeSetNamedSecurityInfoW` fix working. What refuses on this image is `%SystemRoot%`, which
+      is read-execute and non-fatal by design. And `cmd.exe` refusing a batch file by absolute path
+      is a property of the container rather than the platform, with a workaround: `call` with the
+      byte-identical path runs.
 
       **A defect found by reading the spawn against this module's own documentation.** The
-      capability array — described here and in the module as the network boundary in both
-      directions — never reached the child: `Spawned::start` passed a count of zero on every
-      spawn. The denying direction was right for the wrong reason and the permitting direction was
-      never applied. It was invisible because nothing selects the backend and because the only
-      network test asserts a denial, which an ignored array and an empty one produce alike.
+      capability array — described here and in the module as the network boundary in both directions
+      — never reached the child: `Spawned::start` passed a count of zero on every spawn. The denying
+      direction was right for the wrong reason and the permitting direction was never applied. It
+      was invisible because nothing selects the backend and because the only network test asserts a
+      denial, which an ignored array and an empty one produce alike.
     detail: specified
     status: released
   - version: 0.60.0
@@ -1607,5 +1606,5 @@ versions:
       entry after it, because 0.47.0's released record is immutable and names **0.59.0** as the
       Windows access half — a renumber would have left a published claim pointing at the wrong
       version.
-    detail: outline
-    status: planned
+    detail: specified
+    status: released

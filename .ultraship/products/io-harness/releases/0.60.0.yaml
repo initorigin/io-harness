@@ -1,0 +1,544 @@
+product: io-harness
+version: 0.60.0
+status: released
+release_type: minor
+
+outcome:
+  user_can: >
+    An operator can build a tree in which the agents talk to each other, by name, and a coordinator
+    can wait for a named one to answer instead of only spawning and reading what comes back.
+
+    **What a tree can do today.** It can nest to any depth, share one ledger and one token budget,
+    queue past its concurrency cap, give a child its own worktree, spawn a child by role from a
+    roster, and — since 0.50.0 — detach a child so the parent carries on and reads its report at a
+    later step. Every one of those is a *vertical* edge. There is no horizontal one: two children
+    investigating two subsystems cannot tell each other what they found, and the only channel
+    between them is a file one writes and the other happens to read, which is unaddressed,
+    unordered, invisible to the trace and indistinguishable from ordinary workspace churn.
+
+    **And the parent's edge is one-directional.** A parent that detaches three children receives
+    three reports whenever they arrive; it cannot say "I need the scout's answer before I can brief
+    the author" and block on that one. `fold_collected` folds whatever has finished at the top of
+    each step, which is a mailbox with no address on it and no way to ask.
+
+    **After this release** every agent in a tree has a name, and the name is an address. An agent
+    sends a message to another agent in its own tree by that name; an agent reads what has been sent
+    to it, oldest first; and a read may state a bounded wait, so "wait until the scout answers, or
+    sixty seconds, whichever comes first" is one call. Messages are rows in the store like every
+    other durable fact — ordered, checkpointed, and read back identically by a tree that was
+    resumed in a new process.
+  business_value: >
+    Every multi-agent pattern an embedder actually wants is a communication pattern. A
+    map/reduce over subsystems needs the reducer to hear from the mappers. A critic loop needs the
+    critic's finding to reach the author without a round trip through a file and a re-read. A
+    coordinator briefing a worker on what a scout found needs the scout's words, not a summary the
+    coordinator reconstructed from a report it read three steps ago.
+
+    Today an embedder builds all of that outside the crate — a directory of JSON files, a naming
+    convention, and a polling loop in the goal text — and none of it appears in the trace, survives
+    a resume, or is bounded by the tree's containment. The crate already owns the durable ledger,
+    the resume, and the boundary. This release stops it declining to own the one channel those
+    three things are for.
+
+    It is also the release that gives an agent an identity. `AgentDef.name` is a *role* and it is
+    shared: two children of the `searcher` definition are both called `searcher`, which
+    `src/run.rs:5833` calls the ordinary shape of a fan-out. Nothing in this crate has ever been
+    able to name one agent. A trace that says "a searcher found it" when three were running is a
+    trace that cannot answer which.
+  evidence_of_value: >
+    The instrument is a two-child fan-out in which the second child's work is only possible with
+    the first child's finding: a `scout` that locates a symbol and an `author` that must edit
+    exactly the line the scout names, with the author holding no way to find it itself. The author
+    reads its mailbox with a bounded wait, receives the scout's message, and makes the edit. The
+    same run with the mailbox removed leaves the author unable to proceed and is what the criterion
+    contrasts against.
+
+    Beside it, the durability evidence: the same tree killed mid-flight and resumed in a new
+    process reads the same messages in the same order, with nothing delivered twice and nothing
+    lost.
+
+scope:
+  included:
+  - >
+    **An agent has a name, and the name is an address.** `spawn_agent` gains an optional `"as"`
+    argument — the instance name the parent gives this child. Omitted, the name is derived as
+    `<agent-or-"agent">-<child run id>`, which is unique by construction. The root agent of a tree
+    is `root`, a reserved name no spawn may take. Names are unique **within one tree**; a spawn
+    asking for a name already in use is refused as a typed observation naming the taken name, with
+    no run row, no slot and no queue place — the shape `spawn_child` already uses for a
+    contradiction and for an unknown definition.
+  - >
+    **The name is durable and survives a resume.** `spawns` gains an `as_name TEXT NOT NULL DEFAULT
+    ''` column by additive `ALTER TABLE`. The adoption key is unchanged — `find_spawn` still adopts
+    by `(parent_run_id, step, goal)` — so a resumed tree re-adopts the same children and reads
+    their names back off the same rows rather than re-deriving them from a run id that a replay
+    would have to allocate identically.
+  - >
+    **`send_message { to, body }`**, offered to every agent inside a tree and to no flat run: it
+    joins `tree_tools`, not `workspace_tools`. It appends one row addressed to the named agent. A
+    `to` that names no agent in this tree is refused with the names that ARE addressable, in the
+    shape the unknown-definition refusal already uses — recoverable in one step rather than
+    malformed at the provider.
+  - >
+    **`read_messages { from, wait_secs }`**, the other half. Returns every message addressed to
+    this agent and not yet read, oldest first by row id, and marks them read in the same
+    transaction. `from` narrows to one sender. `wait_secs` blocks until at least one message is
+    readable or the clock expires, and defaults to 0 — a drain, never a block, for a caller that
+    says nothing.
+  - >
+    **A terminating agent posts one short row to its parent**, `[<name> finished] <outcome>`, and
+    not its report. That is what makes "wait on a named child" the same mechanism as "wait for a
+    message": a parent blocked on `from: "scout"` unblocks when the scout answers *or* when the
+    scout finishes without answering. The full composed report still travels 0.50.0's untouched
+    path, so nothing is delivered twice.
+  - >
+    **Every wait is bounded, and the bound is the operator's.** `[run] max_wait_secs` and
+    `TaskContract::with_max_wait_secs` cap what an agent may ask for; a larger request is narrowed
+    to the cap and the agent is told so on the same observation, the way 0.50.0 states a narrowed
+    detachment. The key joins `NARROWING` in `src/config.rs`, so a project-scoped `io.toml` takes
+    the lower of the two and cannot widen it — the mechanism 0.55.0 built for `max_read_chars`,
+    reused rather than reinvented.
+  - >
+    **A wait that nothing can answer returns immediately, not at the clock.** A `from` naming an
+    agent that has already terminated and sent nothing answers at once, saying so. Burning sixty
+    seconds waiting for an agent that finished a minute ago is the failure mode a bounded wait
+    still has, and it is cheap to close.
+  - >
+    **The store half.** One table `agent_messages` and its index, and `AgentMessage` as the row.
+    `Store::send_message`, `Store::read_messages` and `Store::messages_for` (a read that does not
+    mark, for an auditor). The table joins `RUN_TABLES` so a session delete, sweep, archive and
+    size all account for it — 0.58.0's lesson is that a table missed by that list produces a silent
+    orphan and no error.
+  - >
+    **The trace and the observer.** A send and a delivery are `AgentEvent` rows, so `agent_events`
+    answers "who told whom what" beside the spawn and the budget draw already there, and an
+    observer watching a tree sees the horizontal edges as well as the vertical ones.
+  - >
+    Documentation in the same release as the code: a `docs/guide/` page for the mailbox,
+    `docs/CONTRACT.md`, the CHANGELOG, the README, `docs/public-api.txt`, and the rustdoc on every
+    new item.
+  excluded:
+  - >
+    **Cross-tree addressing.** A name resolves inside the root's own tree and nowhere else. A
+    channel between two trees is a channel out of the containment boundary the last six releases
+    were spent building, and it would be the first thing in this crate that a child could use to
+    reach something its parent's policy never granted.
+  - >
+    **A broadcast, a topic, or a group.** One sender, one named recipient. Every fan-out shape can
+    be written as N sends by a coordinator that already knows the N names, and a broadcast
+    primitive would have to answer "who is in the tree right now", which is a question a queued
+    child makes ambiguous.
+  - >
+    **A reply-to correlation id, or any request/response framing.** A body is text. A protocol on
+    top of it is the embedder's to choose, and one guessed here would be the wrong one.
+  - >
+    **Delivering a message into an agent's prompt unbidden.** Messages arrive only when an agent
+    reads them. An inbox folded automatically into every step would spend context on every agent in
+    the tree whether or not it is a participant, and would make the block's bytes move under
+    0.44.0's cache boundary on steps where nothing else changed.
+  - >
+    **A directory tool listing the tree's live names.** A parent knows the names it assigned and
+    passes them to a child in the goal, which is the flow the release is built around; a refused
+    send already lists what is addressable. A tool whose answer changes between the call and the
+    send is worse than the refusal.
+  fallback_scope:
+  - >
+    Instance names, `send_message`, and `read_messages` with **no wait at all** — the drain shape
+    only. That is still a coherent release: a child can tell a sibling what it found and the
+    sibling reads it on its next step, which is the gap the entry names first.
+  - >
+    **The cut line, decided now.** If the bounded wait cannot be made deadlock-free against the
+    concurrency cap — an agent waiting on a sibling that is still queued behind it, holding the
+    slot that sibling needs — the wait is cut and the two non-blocking verbs ship. The reverse is
+    not on the table: waiting is worthless without a channel to wait on.
+
+acceptance:
+  functional:
+  - >
+    **F1 — a child tells a sibling what it found, and the sibling could not have found it
+    otherwise.** A two-child fan-out where the `scout` locates a line and the `author` is denied
+    every means of locating it itself, and the author's edit lands on the line the scout named.
+    Sabotage: make `send_message` append nothing while still reporting success, under which the
+    author's read is empty and only F1 fails.
+  - >
+    **F2 — a name addresses one agent, not a role.** Two children of the *same* roster definition,
+    spawned in the same step with `as` names `a` and `b`, receive only their own messages. Sabotage:
+    resolve an address by the roster definition's name instead of the instance name, under which
+    both children read both messages and only F2 fails. This criterion exists because it is the
+    premise the roadmap entry got wrong.
+  - >
+    **F3 — a duplicate name is refused before anything is allocated.** A spawn asking for a name
+    already held in this tree produces a typed observation naming it, and the tree's run count,
+    slot tally and queue depth are all unchanged afterwards — asserted as three numbers taken
+    before and after, not as the absence of a child. Sabotage: allocate the run row before the name
+    is checked, under which the counts move and only F3 fails.
+  - >
+    **F4 — `root` is reserved.** A spawn asking for `as: "root"` is refused the same way. Sabotage:
+    drop the reserved-name check, under which a child shadows the root's address and messages
+    intended for the root reach the child; only F4 fails.
+  - >
+    **F5 — reads are ordered, exactly-once, and marked in the same transaction as they are
+    returned.** Ten messages from three senders are read back in row-id order; a second read
+    returns nothing; and a read that fails after selecting leaves every message still unread.
+    Sabotage: mark read in a separate statement outside the transaction and fail between them,
+    under which the messages are lost and only F5 fails.
+  - >
+    **F6 — a bounded wait returns on the message.** An agent reading with `wait_secs: 30` returns
+    as soon as a sibling sends, not at the clock, and the elapsed time is asserted as *less than*
+    the clock rather than as a duration. Sabotage: sleep the full clock before checking the
+    mailbox, under which the read still succeeds but takes the whole clock and only F6 fails.
+  - >
+    **F7 — a bounded wait returns at the clock when nothing arrives, and says so.** The observation
+    distinguishes "nothing was sent" from "nothing was sent yet and I stopped waiting", because a
+    model that cannot tell them apart cannot decide whether to wait again. Sabotage: return the
+    same text for both, under which only F7 fails.
+  - >
+    **F8 — a wait on an agent that has already finished and said nothing returns immediately.**
+    Asserted on elapsed time against a clock of 30 seconds, and on the text naming that the agent
+    finished. Sabotage: remove the terminal check, under which the read burns the full clock and
+    only F8 fails.
+  - >
+    **F9 — a terminating agent posts to its parent, and the report is not duplicated.** After a
+    child finishes, its parent's mailbox holds exactly one row from it, that row is the short
+    terminal line and not the composed report, and the composed report still reaches the parent
+    through 0.50.0's path. Sabotage: post the whole report as the message body, under which the
+    parent reads the report twice and only F9 fails.
+  - >
+    **F10 — an unknown address is refused with the names that are addressable.** The observation
+    lists them, so the model recovers in one step. Sabotage: refuse without listing, under which
+    only F10 fails.
+  - >
+    **F11 — an address resolves inside this tree and nowhere else.** Two independent trees over one
+    store, each with a child named `worker`; neither can address the other's, and the refusal reads
+    the same as any unknown name rather than leaking that a `worker` exists elsewhere. Sabotage:
+    resolve by name over the whole store, under which the cross-tree send succeeds and only F11
+    fails.
+  - >
+    **F12 — a resumed tree reads the same messages in the same order, once.** A tree killed with
+    messages sent and unread, resumed in a new process, delivers each exactly once in row-id order;
+    and a message already read before the kill is not delivered again. Sabotage: key delivery on
+    an in-process set rather than the `read_at` column, under which the resume re-delivers and only
+    F12 fails.
+  - >
+    **F13 — the operator's cap narrows the agent's request, and the agent is told.** A run with
+    `max_wait_secs = 5` and an agent asking for 60 waits at most 5 and reads a line saying its
+    request was narrowed. The boundary pair is asserted **exactly**: a request of 5 is not
+    narrowed and a request of 6 is, so `>` in place of `>=` fails. Sabotage: apply the cap
+    silently, under which the wait is correct and the notice is absent; only F13's second half
+    fails, which is the point of asserting both.
+  - >
+    **F14 — a project scope cannot widen the cap.** `max_wait_secs` in a `Project`-scoped `io.toml`
+    takes the lower of the two values. Sabotage: omit the key from `NARROWING`, under which the
+    project scope raises the ceiling and only F14 fails.
+  - >
+    **F15 — a flat run has neither tool.** `workspace_tools()` offers no mailbox tool, and a run
+    outside a tree that calls one gets the ordinary unknown-tool observation. Sabotage: add the
+    tools to `workspace_tools`, under which a flat run's tool count moves and only F15 fails.
+  non_functional:
+  - >
+    **N1 — one additive table and one additive column, and no `CHECKPOINT_FORMAT` move.**
+    `agent_messages` with its index, and `spawns.as_name`. `git diff main -- src/state.rs` shows a
+    `CREATE TABLE IF NOT EXISTS`, a `CREATE INDEX IF NOT EXISTS` and one `ALTER TABLE ADD COLUMN`,
+    and `CHECKPOINT_FORMAT` is still 7. No checkpoint layout changes, so a bump would refuse a
+    store this release can read.
+  - >
+    **N2 — the cross-version gate passes with both declared.** `agent_messages` and its index join
+    `ADDED_SINCE_0_22_0`, and `as_name` joins `COLUMNS_ADDED_SINCE_0_22_0` under `spawns`, in
+    `tests/cross_version.rs`. A real 0.29.0 binary opens a store this build wrote and never names
+    either, executed rather than asserted on paper. This criterion is written down because 0.58.0's
+    additive index was refused by this same gate.
+  - >
+    **N3 — the new table is accounted for by every run-keyed operation.** `agent_messages` is in
+    `RUN_TABLES`, and deleting a whole tree's session leaves **zero** rows in it — asserted by
+    counting the table directly after the delete, not by enumerating `sqlite_master`, which
+    0.58.0 proved cannot fail. A message has two run columns and only one may key the list; the
+    criterion asserts both ends are gone.
+  - >
+    **N4 — `docs/public-api.txt` gains exactly one line**, `struct AgentMessage`. The store methods
+    and the contract builder are methods on existing types, and that file tracks root-level types —
+    which is why 0.59.0's prediction of movement there was wrong.
+  - >
+    **N5 — the cost of a read is measured and stated, and it is the mailbox that is measured.**
+    Median of 20 on this machine, stores on disk, for a drain at 1 / 100 / 1,000 unread messages
+    and for a bounded wait that returns on the first message. The read must be an index seek on
+    `(to_run_id, id)` rather than a scan: `EXPLAIN QUERY PLAN` over the statement the crate
+    actually issues asserts the index by name, and the recipient column is the leading one.
+  - >
+    **N6 — no new runtime dependency.** `cargo tree` is still 402 on this machine. The wait is
+    `tokio::time` and a poll of a table this crate already opens; nothing is added for it.
+  - >
+    **N7 — a run that never sends a message is byte-identical in what it costs.** The tools are two
+    more `ToolSpec`s in a tree's request and nothing else: no prompt block, no fold, no per-step
+    query. Asserted as a step's assembled prompt being unchanged against the same run on the
+    release base except for the two tool schemas.
+  operational:
+  - >
+    **O1 — green on all three platforms.** `cargo test` and `cargo test --all-features` on
+    ubuntu, macos and windows through the release PRs. The wait has a clock in it and Windows
+    runners are roughly three times slower, so every timing assertion is written as a comparison
+    against the clock it was given, never as an absolute duration.
+  - >
+    **O2 — the gates, in the order the ledger requires.** `cargo fmt --check`, `cargo clippy
+    --all-targets --all-features -D warnings`, both test invocations, the nightly
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`, the
+    cross-version generator gate, and `cargo package --locked`. The doc gates are re-run **after**
+    the version bump, because the bump invalidates
+    `readme_dependency_version_matches_cargo_toml` and cost five red jobs in 0.57.0.
+  - >
+    **O3 — a sabotage arm per functional criterion, run before the record is sealed.** An arm that
+    fails nothing is a finding about the test, recorded as such and fixed in the test or the
+    product, never propped up.
+  - >
+    **O4 — the live instrument runs.** The two-child fan-out is an example in `examples/`, run
+    against a real provider before sealing, not only as a fixture. A fixture proves the plumbing
+    and cannot prove a model can use the tools it was given.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.60.0, GitHub at initorigin/io-harness with the tag `v0.60.0` and a
+    Release titled `io-harness 0.60.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.60.0` off `develop`, committed incrementally as it
+    lands, including the sealed UltraShip release record and the hand-appended lock pin. PR into
+    `develop`, merged with the PR button. `git diff --quiet feat/0.60.0 develop` before the release
+    PR is opened, because a Dependabot merge has landed above the feature merge twice in the last
+    twenty releases. Release PR `develop` into `main`, merged the same way. The GitHub Release is
+    cut by `release.yml` from a tag pushed alone, taking its notes verbatim from the changelog.
+    `cargo publish --locked` by hand afterwards, always last, with the registry token sourced from
+    the repo-local `.env` in the same shell invocation. `develop` synced to `main` fast-forward
+    only at the end. No branch is deleted.
+  migrations:
+  - >
+    **One additive table, one additive index, one additive column.** `agent_messages`,
+    `agent_messages_to`, and `spawns.as_name TEXT NOT NULL DEFAULT ''` by `ALTER TABLE ADD COLUMN`,
+    whose error on an already-present column is ignored the way every column added since 0.1.0 is.
+    No `CHECKPOINT_FORMAT` move: no checkpoint layout changes, and an older binary that never names
+    the table or the column still reads a migrated database.
+  - >
+    **No behaviour change for a caller who does not use it.** A tree whose agents never call the
+    tools behaves exactly as on 0.59.0 apart from two more tool schemas in its request. A flat run
+    is untouched — the tools are not in `workspace_tools`.
+  - >
+    **One new spawn argument, optional.** `spawn_agent` gains `"as"`. Every spawn written against
+    0.59.0 keeps working and its child gets a derived name.
+  observability:
+  - >
+    Sends and deliveries are `AgentEvent` rows, so the existing `agent_events` query answers who
+    told whom what, at which step, alongside the spawns and budget draws already there. The tree's
+    `RunEvent` stream gains the same two facts, so a second process watching a tree sees the
+    horizontal edges without polling the trace.
+  - >
+    A spawn observation names the child's address as well as its run id, so the parent reads the
+    name it will need to address later beside the number it already gets.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.60.1 and `cargo yank --version
+    0.60.0` is the escape hatch, leaving 0.59.0 as what `cargo install` resolves. The schema
+    additions are additive and unread by any earlier binary, so a downgrade needs no migration: a
+    0.59.0 binary opens a store this release wrote and never names the new table or column. An
+    embedder who wants the tools gone sets no `max_wait_secs` and instructs no agent to call them;
+    there is no run-level switch, and one would be a knob for a feature nobody is charged for.
+
+dependencies:
+  products: []
+  services:
+  - GitHub Actions runners for the three-platform matrix.
+  - >
+    A real provider for O4's live example, reached with the key already in the repo-local `.env`.
+  human_approvals:
+  - >
+    Already given, 2026-08-16: instance names assigned at spawn as the address; a bounded read that
+    unblocks on a message or on the sender finishing; and addressing scoped to one tree. All three
+    were put to the owner because the roadmap entry's own premise — addressing "by name" — is
+    ambiguous against a roster whose names are roles.
+
+resource_profile:
+  complexity: medium
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    **The wait against the concurrency cap.** This is the release's one genuinely open shape. An
+    agent that blocks holds its slot, and a sibling that could answer it may be queued behind that
+    very slot. The bounded clock makes it survivable rather than correct, and the cut line exists
+    because "correct" may turn out to need a scheduler change this release is not.
+  - >
+    **Timing assertions on three platforms.** Eight of the fifteen functional criteria involve a
+    clock, and the ledger records nine instances of a CI failure caused by gating on one. Every
+    assertion is a comparison against the clock the test itself supplied.
+  - >
+    **The resume path.** Names must come back off durable rows and delivery must be exactly-once
+    across a process boundary. That is `read_at` on the row rather than anything in memory, and it
+    is the criterion most likely to expose a defect the fixture cannot.
+  preferred_tools:
+  - >
+    `tokio::io::duplex`-style in-process fixtures where the protocol is the thing under test, as
+    `src/lsp.rs` and `src/browser.rs` already do — but **not** as a substitute for O4. The live run
+    is what proves a model can use the tools; a fixture proves only that the tools work.
+  - >
+    `EXPLAIN QUERY PLAN` against the statement the crate issues, not a hand-written equivalent.
+  constraints:
+  - No new runtime dependency.
+  - >
+    Nothing may widen a boundary. A message crosses no policy check today because it crosses no
+    boundary — it stays inside one tree — and the moment an address could name something outside
+    the tree, that stops being true.
+  - >
+    The print order of anything folded into a prompt is not to be disturbed. 0.57.0 established
+    that a reordering of the memory block converts cache reads into cache writes on every marked
+    wire; this release folds nothing automatically, which is the reason it cannot.
+
+risks:
+- >
+  **A deadlock the tests never see.** An agent waiting on a sibling the cap has not started yet is
+  the failure this release can ship. It is bounded by the clock, closed early for a sender that has
+  already terminated, and the criteria include the case explicitly — but the general shape is a
+  scheduling property and the fallback scope names it as the cut.
+- >
+  **Exactly-once delivery that is only once per process.** Marking read in memory passes every
+  in-process test and loses or repeats every message across a resume. F12 exists for this and is
+  written as a kill-and-resume rather than as two reads in one process.
+- >
+  **A name that means two things.** The roster name and the instance name are both "the agent's
+  name" in prose, and a single sentence that conflates them in the tool description is enough to
+  make a model address a role and reach one arbitrary child of it. F2 is the assertion; the
+  documentation is where the risk actually lives.
+- >
+  **A criterion that claims a boundary it never asserts.** 0.57.0 shipped a criterion whose three
+  fixtures all sat away from the threshold, so a `>`/`>=` sabotage survived all of them. F13 names
+  its boundary pair explicitly for that reason.
+
+open_questions:
+- >
+  **Does the wait need a scheduler change to be deadlock-free, or is the bounded clock enough?**
+  The honest answer is not known before implementation. What is decided is what happens either way:
+  the clock ships, and if it is not enough the wait is cut to the fallback scope rather than
+  shipping a primitive whose failure mode is a tree that stops.
+- >
+  **Should an agent be able to address its own parent by name, or only as `parent`?** Both are
+  writable. A name is uniform; a role-word needs no knowledge and cannot go stale. Decided during
+  development against what the two-child instrument actually needs, and recorded as an iteration if
+  it changes what a criterion says.
+
+released_at: 2026-08-16T18:00:00Z
+mode: published
+delivered: >
+  Agents in one tree can talk to each other. Every agent has an address — `spawn_agent` takes an
+  `as`, and one is derived as `<role>#<run id>` when it is omitted — and that address names ONE
+  agent, which nothing in this crate could do before: `AgentDef::name` is a role two children of one
+  definition share. `send_message` tells a named agent something; `read_messages` returns what was
+  sent to this one, oldest first, delivered exactly once, optionally narrowed to one sender and
+  optionally blocking for a stated number of seconds. A terminating agent posts one short line to
+  its parent, so waiting for a named child and waiting for a message are one mechanism. Messages are
+  rows, so a resumed tree reads the same ones in the same order, once.
+
+  Every wait is bounded — `[run] max_wait_secs`, `TaskContract::with_max_wait_secs`, and
+  `DEFAULT_MAX_WAIT` otherwise — because an agent that blocks holds its concurrency slot and the
+  sibling that would answer it may be queued behind that slot. `max_wait_secs` is a narrowing key: a
+  project scope may lower it and may not raise it.
+
+  One additive table, one additive index, one additive column. No `CHECKPOINT_FORMAT` move, no new
+  dependency, and no behaviour change for a caller who does not use it.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — **88 test binaries, 1,377 passed, 0 failed**, and **457
+    doctests passed, 0 failed**. Against 0.59.0's 87 / 1,926 / 456: the binary count rises by one
+    (`tests/mailbox.rs`) and the per-binary totals are not comparable to that release's, which was
+    measured over a different feature polarity.
+  - >
+    `tests/mailbox.rs` — 19 passed, 1 ignored (N5's measurement). `tests/config.rs` — 60 passed,
+    three of them this release's. The whole spawn path re-run after the `spawn_return` fix:
+    `--lib` 491, `subagents` 7, `fleet` 19, `agents` 8, `determinism` 10, `checkpoint` 12,
+    `session_fanout` 24 — all 0 failed.
+  - >
+    **Sabotage: 15 arms, one per functional criterion, all 15 kill the test they are aimed at** on
+    the tree that ships. One arm SURVIVED its first run and was a defect in this release's own test
+    (F9 — the fixture's child never spoke, so "the body is the terminal line and not the report" had
+    no report to be confused with). One arm was INERT rather than a finding (F5's first shape could
+    not express the defect under `PRAGMA query_only`). Full table in
+    `evidence/0.60.0/sabotage-15-arms.txt`.
+  - >
+    Cross-version: `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` then
+    `cargo test --test cross_version_0_29_0 -- --ignored` — 1 passed. A real 0.29.0 binary opens a
+    store this build wrote and never names `agent_messages`, `agent_messages_to` or `spawns.as_name`.
+  builds:
+  - "`cargo fmt --check` — exit 0."
+  - "`cargo clippy --all-targets --all-features -- -D warnings` — exit 0."
+  - >
+    `RUSTDOCFLAGS=\"--cfg docsrs -D warnings\" cargo +nightly doc --all-features --no-deps` — exit 0,
+    **after catching two unresolved intra-doc links stable `cargo doc` cannot see**. Ninth of the
+    last eleven releases in which this gate found something.
+  - >
+    `cargo package --locked` — **1,985,377 bytes** at 0.60.0 (0.59.0: 1,948,461 published).
+    `cargo tree` — **402**, unmoved. `CHECKPOINT_FORMAT` — **7**, unmoved.
+  reviews:
+  - >
+    `docs/public-api.txt` — **+5 lines, 0 removed**, verified by `git diff --stat`. The
+    `public_surface_matches_snapshot` and `every_public_item_has_a_worked_example` gates both
+    refused the release until the surface and the examples matched, which is how the missing
+    `DEFAULT_MAX_WAIT` re-export was found.
+  - >
+    The doc gates were re-run AFTER the version bump, which is 0.57.0's lesson:
+    `readme_dependency_version_matches_cargo_toml` compares the README's pin to `Cargo.toml` at
+    major.minor and is stale the moment the manifest moves. `docs_drift`, `changelog`,
+    `guide_pages`, `public_api` and `cross_version` all pass on the bumped tree.
+  deployments:
+  - >
+    Sealed before the crates.io upload, which follows the two merges and the GitHub Release. See
+    `known_limitations`.
+  health_checks:
+  - >
+    `examples/mailbox_live.rs` against a real provider — `outcome: Success { steps: 3 }`. A per-run
+    secret is written to a file, the `scout` reads it and messages the `author`, the `author` blocks
+    on `read_messages { from: "scout", wait_secs: 20 }`, and writes `OTTER-24495` — a value it had
+    no other route to. The store shows the message and both children's terminal posts to the root.
+known_limitations:
+- >
+  **The record was sealed before the crates.io upload.** `mode: published` states the authorized
+  target; the upload follows the feat→develop merge, the develop→main merge and the GitHub Release,
+  and is done by hand and last.
+- >
+  **N4 was met in a different form, and the difference is its own number.** The criterion predicted
+  `docs/public-api.txt` would gain exactly one line. It gains **five**: `struct AgentMessage`,
+  `const ROOT_ADDRESS`, `const SEND_MESSAGE_TOOL`, `const READ_MESSAGES_TOOL`, `const
+  DEFAULT_MAX_WAIT`. The prediction applied 0.59.0's lesson too literally — that file tracks every
+  NAME re-exported from `src/lib.rs`, consts included (`SPAWN_TOOL` has been listed since 0.12.0),
+  not root-level types only. The three tool and address constants are `pub` for exactly the reason
+  `SPAWN_TOOL` is: an `Observer` matching on `EventKind::ToolCall` needs the string. The substance
+  of the criterion — that the surface addition is small, additive and enumerated — holds; the
+  number was wrong.
+- >
+  **`cargo test --all-features` did not run locally, and ran on CI instead.** A cold all-features
+  build of 88 test binaries exhausted this machine's disk twice; the default suite, both lint
+  polarities, the nightly rustdoc gate, the cross-version gate, the sabotage pass, the live run and
+  the packaging all ran locally, and the all-features matrix runs on three platforms on the release
+  PRs. Stated rather than implied.
+- >
+  **The derived address uses `#`, not the `-` the scope names.** `scope.included` says a child the
+  parent did not name is called `<role>-<run id>`. It is `<role>#<run id>`, and the change is the
+  reason the collision class is closed: an assigned address may not contain `#`, so a derived name
+  and an assigned one cannot meet. Under a hyphen a parent could assign `searcher-7` and collide
+  with a future run id, which would have needed a check about a number nobody has allocated yet.
+  One character, decided during implementation, and the substance of the criterion is stronger for
+  it.
+- >
+  **Per-agent egress, ordering across a tree, and delivery latency are not claimed.** A message is
+  ordered by row id within one store, which is a total order; nothing here promises that two sends
+  from two agents in the same wall-clock instant land in the order a human would have chosen.
+- >
+  **A tree spawned before 0.60.0 and resumed on it has children with no address.** Their `spawns`
+  rows carry an empty `as_name`, so they cannot be addressed and what they send is attributed to a
+  derived name. Only a resume across that version boundary reaches this.
+- >
+  **A wait is bounded but it is not free, and the deadlock question is answered only in the weak
+  form.** An agent that waits holds its concurrency slot. The clock means a tree whose agents wait
+  on one another spends its clocks and carries on rather than stopping; it does not mean the
+  scheduler is aware of the dependency. The contract's open question stands, and the answer this
+  release gives is "survivable", not "impossible".
+- >
+  **An empty `verify_contains` makes any run succeed immediately**, including one that wrote
+  nothing: a missing file has read as empty since 0.1.0 and `"".contains("")` is true. Pre-existing
+  and outside this release's scope; recorded because building the live instrument hit it.
+supersedes: 0.59.0
+next_recommended_version: null
+immutable: true
