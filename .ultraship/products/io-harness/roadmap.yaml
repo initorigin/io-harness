@@ -1607,5 +1607,5 @@ versions:
       entry after it, because 0.47.0's released record is immutable and names **0.59.0** as the
       Windows access half — a renumber would have left a published claim pointing at the wrong
       version.
-    detail: outline
+    detail: specified
     status: planned

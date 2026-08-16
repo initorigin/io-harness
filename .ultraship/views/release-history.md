@@ -85,7 +85,7 @@ Run `ultraship views` to regenerate.
 
 - **`docs/public-api.txt` did not move, where the contract predicted it would.** The snapshot records root-level types, and every addition here is either a variant of an existing enum, a method, a field, or a type under `sandbox::windows`, which that file has never tracked. Recorded because a prediction that was wrong is worth more than a number quietly adjusted.
 
-- **The three-OS matrix over both feature polarities had not run at the time this record was sealed.** What ran is the full local suite on macOS and a Windows job carrying the container tests, the browser suite and the live browser. The release PR is where the matrix answers, and the record is amended before the merge into `main` if it disagrees — the only window in which that is legal.
+- **The matrix disagreed with the seal, and the record says so rather than being quietly reconciled.** When this record was first written the three-OS matrix had not run; the feature PR then passed 19 of 19 first try and the release PR failed both Windows legs on one test out of 1,443 — a profile-name race that only a process-per-test runner exposes. It was fixed, the record was amended and re-pinned before the merge into `main`, and the defect is listed with the others above. This is the second release to use that window (0.46.0 and 0.51.0 were the first two) and it is the only one in which an amendment is legal.
 
 
 ### 0.58.0 known limitations
