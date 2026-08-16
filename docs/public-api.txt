@@ -46,6 +46,7 @@ const ASK_QUESTION_TOOL src/tools/mod.rs
 const BUSY_TIMEOUT src/state.rs
 const CHECKPOINT_FORMAT src/state.rs
 const DEFAULT_EXEC_TIMEOUT src/tools/exec.rs
+const DEFAULT_MAX_WAIT src/run.rs
 const GLOBAL_MEMORY_WORKSPACE src/state.rs
 const IMAGE_MEDIA_TYPES src/provider/mod.rs (feature = "media")
 const MAX_ID src/plugin.rs
@@ -57,7 +58,10 @@ const NAMESPACE src/plugin.rs
 const PLUGIN_FILE src/plugin.rs
 const POLL_LIMIT src/attach.rs
 const PROPOSE_PLAN_TOOL src/tools/mod.rs
+const READ_MESSAGES_TOOL src/run.rs
 const REQUEST_TIMEOUT src/net.rs
+const ROOT_ADDRESS src/state.rs
+const SEND_MESSAGE_TOOL src/run.rs
 const SPAWN_TOOL src/run.rs
 const SUCCESS_OUTCOME src/state.rs
 const TEST_BINARY src/verify.rs
@@ -110,6 +114,7 @@ fn select src/sandbox.rs
 struct AcceptPlan src/approve.rs
 struct AgentDef src/agent.rs
 struct AgentEvent src/state.rs
+struct AgentMessage src/state.rs
 struct Agents src/agent.rs
 struct Anthropic src/provider/anthropic.rs
 struct ApprovalContext src/approve.rs

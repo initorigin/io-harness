@@ -106,6 +106,19 @@ fn kind_from_wire(kind: &str, run_id: i64) -> Result<ObsKind> {
 /// ```
 pub const CHECKPOINT_FORMAT: i64 = 7;
 
+/// The address of the agent at the top of a tree (0.60.0).
+///
+/// Every other agent in a tree is addressed by the instance name its parent gave
+/// it at spawn time, recorded in [`SpawnRow::as_name`]. The root has no spawn row
+/// to carry one, and it is the one agent every child can be sure exists — so it
+/// has a reserved word instead, and no spawn may take it.
+///
+/// Named rather than inlined because three places compare against it — the spawn
+/// that refuses it, the resolution that answers it, and the listing a refusal
+/// prints — and a literal repeated three times is a literal that will disagree
+/// with itself.
+pub const ROOT_ADDRESS: &str = "root";
+
 /// The one outcome string that means the run did what it was asked.
 ///
 /// Named rather than inlined so that [`RunSummary::success`] and any future
@@ -202,7 +215,7 @@ impl RunStatus {
 /// let store = Store::memory()?;
 /// let parent = store.start_run("summarise the repo", "NOTES.md")?;
 /// let child = store.start_child_run("summarise src/", "NOTES.md", parent, 1)?;
-/// store.record_spawn(parent, 4, child, "summarise src/", "NOTES.md", "#", Some(8), "[]")?;
+/// store.record_spawn(parent, 4, child, "summarise src/", "NOTES.md", "#", Some(8), "[]", "scout")?;
 ///
 /// // What a tree resume does with it: the parent replays step 4, looks the spawn
 /// // up by (parent, step, goal), and adopts the child it already made. Without
@@ -235,6 +248,11 @@ pub struct SpawnRow {
     pub max_steps: Option<u32>,
     /// JSON array of `deny_write` globs the parent narrowed the child with.
     pub deny_write: String,
+    /// (0.60.0) The child's address inside the tree — the instance name the
+    /// parent gave it, or the one derived for it. Empty for every row written
+    /// before 0.60.0, which is what a store read back by this release looks like
+    /// and not an error.
+    pub as_name: String,
 }
 
 /// What one finished run cost and whether it worked.
@@ -795,6 +813,49 @@ impl AgentEvent {
             kind: "spawn".into(),
             child_run_id: Some(child_run_id),
             detail: Some(goal.into()),
+            tokens: None,
+            remaining: None,
+        }
+    }
+
+    /// One agent sent another a message (0.60.0).
+    ///
+    /// `child_run_id` is the RECIPIENT, which is a widening of that field's
+    /// meaning and a deliberate one: it has always held "the other run this event
+    /// is about", and a mailbox event whose other run lived in a free-form string
+    /// would be unqueryable. The recipient of a message is not always a child —
+    /// a child answering its parent sends upward, and two siblings send sideways.
+    ///
+    /// `detail` is the recipient's address and the message's length, never the
+    /// body. A trace answering "who told whom, and when" is an audit; a trace
+    /// holding every word an agent said to another is a second copy of the
+    /// mailbox that no retention call would know to delete.
+    pub fn message_sent(run_id: i64, step: u32, to_run_id: i64, to: &str, chars: usize) -> Self {
+        Self {
+            run_id,
+            step,
+            kind: "message_sent".into(),
+            child_run_id: Some(to_run_id),
+            detail: Some(format!("to {to}, {chars} chars")),
+            tokens: None,
+            remaining: None,
+        }
+    }
+
+    /// An agent read its mailbox, and how many messages it was given (0.60.0).
+    ///
+    /// Recorded even when the answer is none, because "I looked and there was
+    /// nothing" is the fact that explains a step that did nothing else.
+    pub fn message_read(run_id: i64, step: u32, delivered: usize, from: Option<&str>) -> Self {
+        Self {
+            run_id,
+            step,
+            kind: "message_read".into(),
+            child_run_id: None,
+            detail: Some(match from {
+                Some(f) => format!("{delivered} from {f}"),
+                None => format!("{delivered} delivered"),
+            }),
             tokens: None,
             remaining: None,
         }
@@ -6367,11 +6428,13 @@ impl Store {
         needle: &str,
         max_steps: Option<u32>,
         deny_write_json: &str,
+        as_name: &str,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO spawns
-                 (parent_run_id, step, child_run_id, goal, verify_file, needle, max_steps, deny_write)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (parent_run_id, step, child_run_id, goal, verify_file, needle, max_steps,
+                  deny_write, as_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             (
                 parent_run_id,
                 step,
@@ -6381,9 +6444,93 @@ impl Store {
                 needle,
                 max_steps,
                 deny_write_json,
+                as_name,
             ),
         )?;
         Ok(())
+    }
+
+    /// The run at the top of `run_id`'s tree — itself, for a root (0.60.0).
+    ///
+    /// An address means something inside one tree and nothing outside it, so every
+    /// resolution starts here. `runs.parent_run_id` has carried the edge since
+    /// 0.5.0; this walks it to the top rather than asking `spawns`, because a run
+    /// row exists for a child whose spawn row is still being written.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let root = store.start_run("coordinate", "/repo")?;
+    /// let child = store.start_child_run("scout", "/repo", root, 1)?;
+    /// let grandchild = store.start_child_run("deeper", "/repo", child, 2)?;
+    ///
+    /// assert_eq!(store.run_root(grandchild)?, root);
+    /// assert_eq!(store.run_root(root)?, root, "a root is its own root");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn run_root(&self, run_id: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "WITH RECURSIVE up(id, parent) AS (
+                 SELECT id, parent_run_id FROM runs WHERE id = ?1
+                 UNION ALL
+                 SELECT r.id, r.parent_run_id FROM runs r JOIN up ON r.id = up.parent
+             )
+             SELECT id FROM up WHERE parent IS NULL LIMIT 1",
+            [run_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Every addressable agent in the tree rooted at `root`, as `(name, run id)`
+    /// sorted by name (0.60.0).
+    ///
+    /// The root is included under [`ROOT_ADDRESS`] — it has no `spawns` row to
+    /// carry a name and it is the one agent every child can be sure exists. A
+    /// child whose row predates 0.60.0 has an empty `as_name` and is left out
+    /// rather than listed under `""`: it has no address, which is the honest
+    /// answer for a tree spawned by a release that had none.
+    ///
+    /// Sorted rather than in row order because this is what a refusal prints, and
+    /// a list whose order depends on spawn timing is a message that reads
+    /// differently on every run.
+    ///
+    /// ```
+    /// use io_harness::{Store, ROOT_ADDRESS};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let root = store.start_run("coordinate", "/repo")?;
+    /// let scout = store.start_child_run("locate it", "/repo", root, 1)?;
+    /// store.record_spawn(root, 1, scout, "locate it", "out.txt", "done", None, "[]", "scout")?;
+    ///
+    /// assert_eq!(
+    ///     store.tree_addresses(root)?,
+    ///     vec![(ROOT_ADDRESS.to_string(), root), ("scout".to_string(), scout)],
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tree_addresses(&self, root: i64) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM runs WHERE id = ?1
+                 UNION ALL
+                 SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
+             )
+             SELECT s.as_name, s.child_run_id FROM spawns s JOIN tree ON s.child_run_id = tree.id
+             WHERE s.as_name <> ''",
+        )?;
+        let rows = stmt.query_map([root], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut out: Vec<(String, i64)> = rows.collect::<std::result::Result<_, _>>()?;
+        out.push((ROOT_ADDRESS.to_string(), root));
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     /// Find the child spawned by `parent_run_id` at `step` for `goal`, if any —
@@ -6397,7 +6544,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT child_run_id, goal, verify_file, needle, max_steps, deny_write
+                "SELECT child_run_id, goal, verify_file, needle, max_steps, deny_write, as_name
                  FROM spawns WHERE parent_run_id = ?1 AND step = ?2 AND goal = ?3
                  ORDER BY id ASC LIMIT 1",
                 (parent_run_id, step, goal),
@@ -6409,6 +6556,7 @@ impl Store {
                         needle: r.get(3)?,
                         max_steps: r.get::<_, Option<i64>>(4)?.map(|n| n as u32),
                         deny_write: r.get(5)?,
+                        as_name: r.get(6)?,
                     })
                 },
             )
@@ -10963,7 +11111,7 @@ mod tests {
                 .record_sandbox_event(&SandboxEvent::create(run, 1, "proc"))
                 .unwrap();
             store
-                .record_spawn(run, 1, child, "sub", "out.txt", "ok", None, "[]")
+                .record_spawn(run, 1, child, "sub", "out.txt", "ok", None, "[]", "sub")
                 .unwrap();
             store
                 .record_mcp(run, &McpEvent::connected("files", "stdio"))

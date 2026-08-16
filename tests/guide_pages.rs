@@ -97,6 +97,12 @@ const GUIDES: &[(&str, bool)] = &[
     // whole instrument speaks only about what is in the database — never about
     // the operator's own logs, their provider account, or their filesystem.
     ("retention.md", true),
+    // 0.60.0. It carries a limits block because a channel between agents is
+    // defined by where it stops: an address reaches inside one tree and nowhere
+    // else, nothing is delivered unbidden, a body is text and carries no
+    // protocol, a message is not authorization, and a wait is bounded because an
+    // agent that waits is holding a slot the agent it waits on may need.
+    ("mailbox.md", true),
 ];
 
 fn guide_dir() -> PathBuf {

@@ -71,7 +71,7 @@ use crate::state::PolicyEvent;
 use crate::state::{
     AgentEvent, ContextEvent, GateOutcome, Kept, MemoryEntry, MemoryForget, MemoryKind,
     MemoryLimits, RunStatus, Snapshot, StepRecord, Store, TodoItem, TodoState,
-    GLOBAL_MEMORY_WORKSPACE, MAX_SNAPSHOT_BYTES,
+    GLOBAL_MEMORY_WORKSPACE, MAX_SNAPSHOT_BYTES, ROOT_ADDRESS,
 };
 use crate::toolchain::Toolchain;
 use crate::tools::exec::{Exec, ExecOutcome};
@@ -5819,6 +5819,312 @@ fn goal_digest(goal: &str) -> u32 {
     h
 }
 
+/// The longest an agent may block on its mailbox when the contract names no
+/// ceiling (0.60.0).
+///
+/// A number rather than "forever", and the absence of "forever" is the design.
+/// An agent that blocks holds its concurrency slot, and the sibling that would
+/// answer it may be the one queued behind that slot — so an unbounded wait turns a
+/// tree that would have carried on into a tree that stops. Thirty seconds is long
+/// enough that a sibling doing real work can answer within it and short enough
+/// that a whole fan-out cannot be lost to one agent's patience.
+pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(30);
+
+/// How often a blocked read looks again (0.60.0).
+///
+/// A poll rather than a notification, and the reason is that the mailbox is a
+/// table: a tree may span processes, and an in-process notifier would wake only
+/// the agents this process happens to be running. Two hundred milliseconds is
+/// below what a step costs by orders of magnitude, so the latency it adds is not
+/// measurable against a provider call, and it costs one indexed seek per tick.
+const WAIT_POLL: Duration = Duration::from_millis(200);
+
+/// The tool an agent uses to tell another agent in its tree something (0.60.0).
+///
+/// Named like [`SPAWN_TOOL`] and for the same reason: an [`Observer`] matching on
+/// [`EventKind::ToolCall`] needs the string, and a literal typed into an
+/// embedder's match arm is one that goes stale silently.
+pub const SEND_MESSAGE_TOOL: &str = "send_message";
+
+/// The tool an agent uses to read what other agents have sent it (0.60.0).
+pub const READ_MESSAGES_TOOL: &str = "read_messages";
+
+/// The character a *derived* address uses and an assigned one may not (0.60.0).
+///
+/// It is what keeps the two namespaces from meeting. A child the parent did not
+/// name is called `<role>#<run id>`, which is unique because run ids are — but
+/// only if no parent can assign that same string, and a parent that guessed a
+/// future run id could. Forbidding one character in an assigned name closes the
+/// whole class with one rule rather than with a collision check that would have to
+/// be right about a number nobody has allocated yet.
+const DERIVED_MARK: char = '#';
+
+/// The longest address a parent may assign. Long enough for any name a model will
+/// think of, short enough that the refusal listing stays readable.
+const ADDRESS_MAX: usize = 64;
+
+/// Whether a parent may assign `name` as a child's address, or why not (0.60.0).
+///
+/// The message is what the model reads, so each refusal names the rule it broke
+/// rather than saying the name is invalid. Deliberately strict: an address is
+/// typed back by another agent from a goal string, and a name carrying a space, a
+/// quote or a newline is one that will be retyped wrong.
+fn address_is_assignable(name: &str) -> std::result::Result<(), String> {
+    if name == ROOT_ADDRESS {
+        return Err(format!(
+            "`{ROOT_ADDRESS}` is the address of the agent at the top of this tree and cannot be \
+             taken. Pick another name."
+        ));
+    }
+    if name.chars().count() > ADDRESS_MAX {
+        return Err(format!(
+            "an address may be at most {ADDRESS_MAX} characters and `{name}` is longer"
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+    {
+        return Err(format!(
+            "an address may contain only letters, digits, `-` and `_`, and `{name}` contains \
+             `{bad}`. A name another agent has to retype is one it will retype wrong."
+        ));
+    }
+    Ok(())
+}
+
+/// Who this agent is and who it may reach, resolved once per mailbox call
+/// (0.60.0).
+///
+/// Deliberately computed inside the call rather than at the top of the agent loop.
+/// A run whose agents never message costs nothing for the mailbox existing — no
+/// query per step, no field on the loop's state — which is the property N7 asserts
+/// on the assembled prompt.
+struct Addressing {
+    /// This agent's own address, as its siblings would write it.
+    me: String,
+    /// Every addressable agent in the tree, sorted by name.
+    tree: Vec<(String, i64)>,
+}
+
+impl Addressing {
+    fn resolve(store: &Store, run_id: i64) -> Result<Self> {
+        let root = store.run_root(run_id)?;
+        let tree = store.tree_addresses(root)?;
+        // An agent whose `spawns` row predates 0.60.0 has no recorded address —
+        // only reachable by resuming a tree a previous release spawned. It is
+        // given a derived one so what it sends is still attributed, and it stays
+        // out of `tree`, so nobody can address it. Stated rather than papered
+        // over: the alternative is a sender rendered as an empty name.
+        let me = tree
+            .iter()
+            .find(|(_, id)| *id == run_id)
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| format!("agent{DERIVED_MARK}{run_id}"));
+        Ok(Self { me, tree })
+    }
+
+    /// The run behind an address, or the refusal that lists what is reachable.
+    ///
+    /// The refusal names the alternatives because a model that mistyped an
+    /// address recovers in one step when it is told the right ones and burns a
+    /// step guessing when it is not. It is the same shape the unknown-definition
+    /// refusal has used since 0.21.0.
+    fn resolve_to(&self, name: &str) -> std::result::Result<i64, String> {
+        match self.tree.iter().find(|(n, _)| n == name) {
+            Some((_, id)) => Ok(*id),
+            None => Err(format!(
+                "no agent in this tree is addressed `{name}`. Reachable from here: {}",
+                self.tree
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+}
+
+/// Render one delivered message as the line its recipient reads.
+fn render_message(m: &crate::state::AgentMessage) -> String {
+    format!("[{} @step {}] {}\n", m.from_name, m.step, m.body)
+}
+
+/// Handle one [`SEND_MESSAGE_TOOL`] or [`READ_MESSAGES_TOOL`] call (0.60.0).
+///
+/// Returns the `(decision, observation)` pair the tree loop records, exactly as
+/// [`dispatch`] does for every other tool. Every failure here is a typed
+/// observation the agent can adapt to and never an error that ends its run — a
+/// mistyped address is the ordinary case, not a fault.
+///
+/// It is handled in the tree loop rather than in `dispatch` because it needs three
+/// things `dispatch` is not given and should not be: the tree this run belongs to,
+/// the addresses in it, and the fact that a flat run has neither tool.
+async fn mailbox_call(
+    store: &Store,
+    call: &ToolCall,
+    run_id: i64,
+    step: u32,
+    max_wait: Duration,
+) -> Result<(String, String)> {
+    let a = &call.arguments;
+    let who = Addressing::resolve(store, run_id)?;
+
+    if call.name == SEND_MESSAGE_TOOL {
+        let to = a.get("to").and_then(|v| v.as_str()).unwrap_or_default();
+        let body = a.get("body").and_then(|v| v.as_str()).unwrap_or_default();
+        if to.is_empty() || body.is_empty() {
+            return Ok((
+                "send missing fields".into(),
+                format!("\n[{SEND_MESSAGE_TOOL} error] needs \"to\" and \"body\"\n"),
+            ));
+        }
+        if to == who.me {
+            return Ok((
+                "send to self".into(),
+                format!(
+                    "\n[{SEND_MESSAGE_TOOL} error] `{to}` is you. A message to yourself is a note; \
+                     write it down instead.\n"
+                ),
+            ));
+        }
+        let to_run = match who.resolve_to(to) {
+            Ok(id) => id,
+            Err(why) => {
+                return Ok((
+                    format!("unknown address {to}"),
+                    format!("\n[{SEND_MESSAGE_TOOL} error] {why}\n"),
+                ))
+            }
+        };
+        store.send_message(run_id, to_run, &who.me, step, body)?;
+        store.record_agent_event(&AgentEvent::message_sent(
+            run_id,
+            step,
+            to_run,
+            to,
+            body.chars().count(),
+        ))?;
+        return Ok((
+            format!("messaged {to}"),
+            format!(
+                "\n[sent to {to}] {} characters. It reads this when it next checks its \
+                 messages.\n",
+                body.chars().count()
+            ),
+        ));
+    }
+
+    // READ_MESSAGES_TOOL.
+    let from = a
+        .get("from")
+        .and_then(|v| v.as_str())
+        .filter(|f| !f.is_empty());
+    if let Some(f) = from {
+        if let Err(why) = who.resolve_to(f) {
+            return Ok((
+                format!("unknown address {f}"),
+                format!("\n[{READ_MESSAGES_TOOL} error] {why}\n"),
+            ));
+        }
+    }
+    // 0.60.0 — the wall clock, narrowed by the operator's ceiling. A request the
+    // cap cut is said once, at the front of whatever the read comes back as, so
+    // the model reads it beside the result: an agent that believes it waited a
+    // minute and waited five seconds draws the wrong conclusion from an empty
+    // mailbox. The same shape 0.50.0 uses for a narrowed detachment.
+    let asked = a
+        .get("wait_secs")
+        .and_then(|v| v.as_u64())
+        .map(Duration::from_secs)
+        .unwrap_or_default();
+    let wait = asked.min(max_wait);
+    let narrowed = (asked > wait).then(|| {
+        format!(
+            "\n[wait narrowed] this run allows a wait of at most {}s, so that is what was \
+             waited\n",
+            wait.as_secs()
+        )
+    });
+
+    let mut delivered = store.read_messages(run_id, from)?;
+    let mut waited_out = false;
+    if delivered.is_empty() && !wait.is_zero() {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            // Nothing can answer, so nothing is worth waiting for. A named sender
+            // that has already finished without sending is the case a bounded
+            // wait still gets wrong — thirty seconds spent on an agent that ended
+            // a minute ago — and it costs one lookup to close.
+            if let Some(f) = from {
+                let sender = who.resolve_to(f).ok();
+                if let Some(id) = sender {
+                    if terminal_outcome(store, id)?.is_some() {
+                        return Ok((
+                            format!("{f} finished without sending"),
+                            format!(
+                                "\n[messages] {f} has finished and sent you nothing. Waiting for \
+                                 it again will not help.\n"
+                            ),
+                        ));
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                waited_out = true;
+                break;
+            }
+            tokio::time::sleep(WAIT_POLL.min(deadline - tokio::time::Instant::now())).await;
+            delivered = store.read_messages(run_id, from)?;
+            if !delivered.is_empty() {
+                break;
+            }
+        }
+    }
+
+    store.record_agent_event(&AgentEvent::message_read(
+        run_id,
+        step,
+        delivered.len(),
+        from,
+    ))?;
+    let note = |obs: String| match &narrowed {
+        Some(why) => format!("{why}{}", obs.trim_start_matches('\n')),
+        None => obs,
+    };
+    if delivered.is_empty() {
+        // "Nothing was sent" and "nothing was sent YET and I stopped waiting" are
+        // different facts and a model that cannot tell them apart cannot decide
+        // whether to wait again. F7 is this distinction.
+        return Ok((
+            if waited_out {
+                "waited, nothing arrived".into()
+            } else {
+                "no messages".into()
+            },
+            note(match (waited_out, from) {
+                (true, Some(f)) => format!(
+                    "\n[messages] nothing from {f} after {}s; it is still running and may yet \
+                     send\n",
+                    wait.as_secs()
+                ),
+                (true, None) => format!(
+                    "\n[messages] nothing arrived in {}s; the agents you are waiting on are still \
+                     running\n",
+                    wait.as_secs()
+                ),
+                (false, Some(f)) => format!("\n[messages] nothing from {f}\n"),
+                (false, None) => "\n[messages] nothing waiting\n".into(),
+            }),
+        ));
+    }
+    let mut obs = format!("\n[messages] {} waiting\n", delivered.len());
+    for m in &delivered {
+        obs.push_str(&render_message(m));
+    }
+    Ok((format!("read {} messages", delivered.len()), note(obs)))
+}
+
 /// The worktree one agent of one spawn works in, made if it is not there already
 /// (0.36.0).
 ///
@@ -7319,6 +7625,49 @@ where
                     spawn_calls.push(call);
                     continue;
                 }
+                // 0.60.0 — the mailbox, handled here rather than in `dispatch`
+                // because it needs the tree this run belongs to and because a flat
+                // run must not have it. In order with every other non-spawn tool:
+                // a send and the write that follows it are one agent's sequence,
+                // and reordering them would let a sibling read a finding about a
+                // file that had not been written yet.
+                if call.name == SEND_MESSAGE_TOOL || call.name == READ_MESSAGES_TOOL {
+                    // 0.60.0 — DRIVEN, for the reason the provider call is, and
+                    // this is the release's sharpest lesson. A detached child is
+                    // a future in this agent's own `inflight` set: nothing else
+                    // polls it. So a wait that merely slept would stop the very
+                    // siblings whose message it was waiting for, and every wait
+                    // would run to its full clock and then succeed on the step
+                    // after — which is exactly what the first implementation did.
+                    // The mechanism already existed; the wait had to use it.
+                    let (decision, obs) = driving(
+                        inflight,
+                        &mut collected,
+                        mailbox_call(
+                            tree.store,
+                            call,
+                            run_id,
+                            step,
+                            contract
+                                .max_wait_secs
+                                .map(Duration::from_secs)
+                                .unwrap_or(DEFAULT_MAX_WAIT),
+                        ),
+                    )
+                    .await?;
+                    ledger.push(Observation::new(
+                        step,
+                        ObsKind::Child,
+                        None,
+                        bound(&obs, entry_cap, ObsKind::Child),
+                    ));
+                    decisions.push(decision);
+                    // Reading is not progress and sending is: an agent that only
+                    // ever polls an empty mailbox is exactly the stall the loop's
+                    // no-change detection exists to notice.
+                    step_changed |= call.name == SEND_MESSAGE_TOOL;
+                    continue;
+                }
                 match dispatch(
                     &ws,
                     call,
@@ -7912,6 +8261,26 @@ async fn spawn_child<'f, P: Provider>(
 
     let child_depth = depth + 1;
 
+    // 0.60.0 — the address this child will answer to, if the parent named one.
+    // Its *shape* is checked here, beside the other argument contradictions and
+    // for the same reason: a malformed request must cost no run row, no slot and
+    // no queue place. Whether the name is already taken is a question about the
+    // tree rather than about the argument, so it is asked on the fresh path below
+    // — a replayed spawn adopts the child that already holds the name and must not
+    // find itself a duplicate of itself.
+    let asked_as = a
+        .get("as")
+        .and_then(|v| v.as_str())
+        .filter(|n| !n.is_empty());
+    if let Some(name) = asked_as {
+        if let Err(why) = address_is_assignable(name) {
+            return Ok(SpawnOutcome::Settled(SpawnResult::Composed {
+                decision: format!("spawn address refused ({name})"),
+                obs: format!("\n[spawn error] {why}\n"),
+            }));
+        }
+    }
+
     // 0.21.0 — an optional named definition. Unknown is an error observation and no
     // child: a spawn that silently became an unnarrowed agent because its definition
     // was misspelled is exactly the failure a roster must not have.
@@ -8031,6 +8400,29 @@ async fn spawn_child<'f, P: Provider>(
             Some(row)
         }
         None => {
+            // 0.60.0 — and the address is decided before any of that, for the same
+            // reason: a name already held is a spawn that does not happen, and it
+            // must cost nothing. Ahead of `register_agent`, so the tree's agent
+            // count, its slot tally and its queue depth are all unmoved by a
+            // refusal — which is what F3 asserts as three numbers rather than as
+            // the absence of a child.
+            if let Some(name) = asked_as {
+                let root = tree.store.run_root(parent_run_id)?;
+                if tree
+                    .store
+                    .tree_addresses(root)?
+                    .iter()
+                    .any(|(n, _)| n == name)
+                {
+                    return Ok(SpawnOutcome::Settled(SpawnResult::Composed {
+                        decision: format!("spawn address taken ({name})"),
+                        obs: format!(
+                            "\n[spawn error] `{name}` is already the address of an agent in this \
+                             tree. An address names one agent, not a role, so pick another.\n"
+                        ),
+                    }));
+                }
+            }
             // Fresh: the containment boundary decides whether it may exist. This
             // is ahead of admission on purpose — a child the tree will never let
             // exist must not first spend time in a queue.
@@ -8100,12 +8492,19 @@ async fn spawn_child<'f, P: Provider>(
     };
     emit_fleet(tree, parent_run_id, step, depth, child_depth);
 
-    let (child_run, child_start) = match adopted {
+    let (child_run, child_start, address) = match adopted {
         // Adopted: already counted in the reconstructed ledger, so do NOT
         // register it again. It resumes from its OWN next step.
+        //
+        // 0.60.0 — and it keeps the address it already had, read off the row
+        // rather than derived again. Re-deriving would need the run id a replay
+        // does not allocate and the roster the definition may have left, and an
+        // agent whose address changed across a restart is one every sibling
+        // holding that name can no longer reach.
         Some(row) => (
             row.child_run_id,
             tree.store.last_step(row.child_run_id)? + 1,
+            row.as_name.clone(),
         ),
         None => {
             let child_run = tree.store.start_child_run(
@@ -8119,17 +8518,32 @@ async fn spawn_child<'f, P: Provider>(
                 parent_run_id,
                 child_depth,
             )?;
+            // 0.60.0 — the address, derived now that there is a run id to derive it
+            // from. `<role>#<run id>` for a child the parent did not name: unique
+            // because run ids are, and unreachable by an assigned name because
+            // `DERIVED_MARK` is the one character `address_is_assignable` forbids.
+            // A parent that names nothing still gets an addressable child, which is
+            // what keeps every spawn written before this release usable with the
+            // mailbox rather than merely unbroken by it.
+            let address = match asked_as {
+                Some(n) => n.to_string(),
+                None => format!(
+                    "{}{DERIVED_MARK}{child_run}",
+                    def.map(|d| d.name.as_str()).unwrap_or("agent")
+                ),
+            };
             // `detail` is free-form and documented as the child's goal; a child
             // spawned from a definition records that too, so the trace says which
-            // role ran without the `spawns` table gaining a column (and this
-            // release alters no table).
+            // role ran without the `spawns` table gaining a column. 0.60.0 puts the
+            // ADDRESS first, because the role answers "what kind of agent was this"
+            // and only the address answers "which one".
             tree.store.record_agent_event(&AgentEvent::spawn(
                 parent_run_id,
                 step,
                 child_run,
                 match def {
-                    Some(d) => format!("as {}: {goal}", d.name),
-                    None => goal.to_string(),
+                    Some(d) => format!("{address} as {}: {goal}", d.name),
+                    None => format!("{address}: {goal}"),
                 },
             ))?;
             // Attributed to the PARENT's run and depth: the parent is what spawned
@@ -8159,6 +8573,7 @@ async fn spawn_child<'f, P: Provider>(
                     .and_then(|v| v.as_u64())
                     .map(|n| n as u32),
                 &deny_json,
+                &address,
             )?;
             // 0.50.0 — the call itself, so a child the parent stopped waiting for
             // can be re-adopted after a restart.
@@ -8179,7 +8594,7 @@ async fn spawn_child<'f, P: Provider>(
                 child_run,
                 a,
             ))?;
-            (child_run, 1)
+            (child_run, 1, address)
         }
     };
 
@@ -8189,6 +8604,7 @@ async fn spawn_child<'f, P: Provider>(
     // it, and every shape below except `Wait` outlives it. 0.41.0's read batch
     // reached the same answer for the same reason.
     let goal_owned = goal.to_string();
+    let address_owned = address.clone();
     let child = async move {
         let outcome = run_agent(
             tree,
@@ -8209,7 +8625,37 @@ async fn spawn_child<'f, P: Provider>(
         // long as it is actually working.
         drop(slot);
         emit_fleet(tree, parent_run_id, step, depth, child_depth);
-        match outcome? {
+        let settled = outcome?;
+        // 0.60.0 — one short row to the parent saying this agent is done, and
+        // deliberately NOT its report. That is what makes "wait for a named child"
+        // and "wait for a message" one mechanism: a parent blocked on `scout`
+        // unblocks when the scout answers OR when the scout finishes having
+        // answered nothing, and neither case needs a second tool.
+        //
+        // The report itself still travels 0.50.0's path unchanged. Putting it in
+        // the body instead would deliver it twice — once folded as an observation
+        // and once as a message — and the parent would read the same paragraph in
+        // two places without being able to tell they were one event.
+        //
+        // Not for a pause: a child stopped for a human has not terminated, and
+        // saying it has would tell a waiting sibling to stop waiting for an agent
+        // that is about to carry on.
+        if !matches!(
+            settled,
+            RunOutcome::AwaitingApproval { .. } | RunOutcome::AwaitingAnswer { .. }
+        ) {
+            tree.store.send_message(
+                child_run,
+                parent_run_id,
+                &address_owned,
+                step,
+                // The same `{:?}` rendering `compose_child` prints, so a parent
+                // reading "finished" in its mailbox and reading the composed
+                // report reads one word for one event rather than two spellings.
+                &format!("[finished] {settled:?}"),
+            )?;
+        }
+        match settled {
             // A child that deferred pauses the whole tree, surfacing its
             // request_id so the caller can resume that child once a human decides.
             RunOutcome::AwaitingApproval { request_id, .. } => {
@@ -8254,10 +8700,15 @@ async fn spawn_child<'f, P: Provider>(
                 },
             ));
             Ok(SpawnOutcome::InFlight {
-                decision: format!("child {child_run} detached"),
+                decision: format!("child {address} (run {child_run}) detached"),
+                // 0.60.0 — the address, because this is the shape where the parent
+                // needs it: a child it stopped waiting for is one it may want to
+                // message or read from before the report arrives. A waited child is
+                // already finished by the time its observation is written and has
+                // nothing left to be told.
                 obs: format!(
-                    "\n[child {child_run} \"{goal}\" detached] it is running now; its report \
-                     reaches you at a later step\n"
+                    "\n[child {address} (run {child_run}) \"{goal}\" detached] it is running now; \
+                     its report reaches you at a later step, and you can reach it at `{address}`\n"
                 ),
                 fut: Box::pin(child),
             })
@@ -8282,10 +8733,13 @@ async fn spawn_child<'f, P: Provider>(
                         },
                     ));
                     Ok(SpawnOutcome::InFlight {
-                        decision: format!("child {child_run} moved to the background"),
+                        decision: format!(
+                            "child {address} (run {child_run}) moved to the background"
+                        ),
                         obs: format!(
-                            "\n[child {child_run} \"{goal}\" moved to the background after {}s] \
-                             it is still running; its report reaches you at a later step\n",
+                            "\n[child {address} (run {child_run}) \"{goal}\" moved to the \
+                             background after {}s] it is still running; its report reaches you at \
+                             a later step, and you can reach it at `{address}`\n",
                             d.as_secs()
                         ),
                         fut,
@@ -15033,7 +15487,8 @@ fn tree_tools(agents: &Agents) -> Vec<ToolSpec> {
             "type": "object",
             "properties": {
                 "goal": { "type": "string", "description": "The sub-agent's goal." },
-                "agent": { "type": "string", "description": "Optional name of a configured agent to spawn, which gives the sub-agent that agent's role, model and permissions." },
+                "agent": { "type": "string", "description": "Optional name of a configured agent to spawn, which gives the sub-agent that agent's role, model and permissions. This is a ROLE, and several sub-agents may share it." },
+                "as": { "type": "string", "description": "Optional address for THIS sub-agent, unique in this tree — letters, digits, `-` and `_`. It is how you and its siblings send it messages and read what it sends. Omitted, one is derived and reported back to you. Tell a sub-agent the addresses it needs in its goal." },
                 "verify_file": { "type": "string", "description": "File (relative to the workspace root) whose contents decide the sub-agent's success." },
                 "verify_contains": { "type": "string", "description": "Text that file must contain for the sub-agent to succeed." },
                 "deny_write": { "type": "array", "items": { "type": "string" }, "description": "Optional globs the sub-agent must not write — tightens its inherited policy." },
@@ -15043,6 +15498,40 @@ fn tree_tools(agents: &Agents) -> Vec<ToolSpec> {
                 "background_after_secs": { "type": "integer", "description": "Optional: wait at most this many seconds, then let the sub-agent carry on in the background and take your next step. Its report reaches you when it finishes. Cannot be combined with \"wait\": false." }
             },
             "required": ["goal", "verify_file", "verify_contains"]
+        }),
+    });
+    // 0.60.0 — the mailbox. In `tree_tools` and deliberately not in
+    // `workspace_tools`: an agent with nobody to talk to offered a tool for
+    // talking is being told about a world it is not in, which is the rule
+    // `TREE_PROMPT` and `WORKSPACE_PROMPT` already hold each other to.
+    tools.push(ToolSpec {
+        name: SEND_MESSAGE_TOOL.to_string(),
+        description: "Tell another agent in this tree something. Address it by the name it was \
+                      spawned under — that names ONE agent, unlike a configured agent's name, \
+                      which is a role several may share. Use this to hand a sibling a finding it \
+                      cannot get for itself, or to answer one that asked you."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "to": { "type": "string", "description": "The address of the agent to tell. `root` is the agent at the top of this tree." },
+                "body": { "type": "string", "description": "What to tell it. Plain text; say the whole finding rather than a pointer to it." }
+            },
+            "required": ["to", "body"]
+        }),
+    });
+    tools.push(ToolSpec {
+        name: READ_MESSAGES_TOOL.to_string(),
+        description: "Read what other agents in this tree have sent you, oldest first. Each \
+                      message is delivered once. Call it with no arguments to take whatever is \
+                      waiting without pausing."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "from": { "type": "string", "description": "Optional: take only what this one agent sent, and leave the rest waiting." },
+                "wait_secs": { "type": "integer", "description": "Optional: if nothing is waiting, block up to this many seconds for something to arrive. Bounded by the run's own ceiling, and you are told when it was. Returns early if the agent you named has finished without sending." }
+            }
         }),
     });
     tools

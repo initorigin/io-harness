@@ -2847,3 +2847,71 @@ result cannot be told from a slow one.
 - [CAPABILITIES.md](CAPABILITIES.md) — the guide index.
 - [RELEASE_PROCESS.md](RELEASE_PROCESS.md) — how a release is cut.
 - [public-api.txt](public-api.txt) — the enumerated public surface.
+
+## What an address reaches, and what a message is not (0.60.0)
+
+An agent inside a tree has an **address**, and it names one agent. `spawn_agent`
+takes an optional `as`; omitted, one is derived as `<role>#<run id>`. The
+distinction the whole feature rests on is that `AgentDef::name` is a **role** —
+two children spawned from one definition share it, which is the ordinary shape of
+a fan-out — so a roster name has never identified an agent and does not now.
+
+An address is unique within one tree, is letters, digits, `-` and `_` up to 64
+characters, and may not be `ROOT_ADDRESS`. A spawn asking for one already held is
+refused before anything is allocated: no run row, no agent against the
+containment cap, no place in the queue. The address is stored in `spawns.as_name`,
+so a resumed tree re-adopts its children under the names they already had; the
+adoption key is unchanged.
+
+`send_message { to, body }` and `read_messages { from, wait_secs }` are offered
+inside a tree and in no flat run. A read returns what is waiting for that agent,
+oldest first by row id, and marks it delivered **in the same transaction as the
+select** — a read that fails after selecting delivers nothing and leaves every
+message where it was. `Store::messages_for` is the audit read and consumes
+nothing.
+
+`wait_secs` blocks until something arrives or the clock expires. The ceiling is
+`[run] max_wait_secs` or `TaskContract::with_max_wait_secs`, and
+`DEFAULT_MAX_WAIT` when neither is set; a request over it is narrowed and the
+narrowing is said on the same observation. `max_wait_secs` is a narrowing key: a
+`Project`-scoped `io.toml` takes the lower of the two values.
+
+A terminating agent sends its parent one line — `[finished]` and its outcome —
+and never its report, which continues to travel 0.50.0's path. A read naming a
+sender that has already terminated without sending returns immediately rather
+than at the clock.
+
+### Stated plainly
+
+- **An address resolves inside its own tree and nowhere else.** Two trees sharing
+  one store cannot address each other, and a cross-tree address is refused as an
+  unknown name rather than as a forbidden one — the refusal lists what is
+  reachable and never admits what is not. There is no configuration that widens
+  this and there is not intended to be one: a channel between trees would be a
+  channel out of the containment boundary a child inherited.
+- **A message is not authorization.** Nothing in a body is read by the `Policy`.
+  A sibling that says "you may write there" has changed nothing, and an agent that
+  acts on such a message is refused by the same rule that would have refused it
+  anyway.
+- **Nothing is delivered unbidden.** An inbox is read when an agent calls the
+  tool. Messages are never folded into a prompt automatically, which is what
+  keeps the mailbox off the cache-marked prefix 0.44.0 depends on for every agent
+  that is not participating.
+- **A wait is bounded, and the bound is not a formality.** An agent that blocks
+  holds its concurrency slot, and the sibling that would answer it may be the one
+  queued behind that slot. There is no unbounded wait, and a run whose agents all
+  wait on one another spends its clocks and carries on rather than stopping.
+- **A wait drives this agent's own in-flight children and nothing else.** A
+  detached child is a future polled by its parent's loop; the wait is raced
+  against that set the same way a provider call is. It does not drive another
+  agent's children, and it cannot make a queued sibling start.
+- **One sender, one named recipient, and a body of text.** There is no broadcast,
+  no topic, no group, no reply-to id and no request/response framing. A protocol
+  over the body is the embedding program's to define.
+- **The trace records that a message was sent and how long it was, never what it
+  said.** The body lives in `agent_messages` and nowhere else, so one retention
+  call accounts for it.
+- **A tree spawned before 0.60.0 and resumed on it has children with no address.**
+  Their `spawns` rows carry an empty `as_name`; they cannot be addressed, and what
+  they send is attributed to a derived name. Only a resume across that version
+  boundary reaches this.
