@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.60.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -418,3 +418,127 @@ open_questions:
   writable. A name is uniform; a role-word needs no knowledge and cannot go stale. Decided during
   development against what the two-child instrument actually needs, and recorded as an iteration if
   it changes what a criterion says.
+
+released_at: 2026-08-16T18:00:00Z
+mode: published
+delivered: >
+  Agents in one tree can talk to each other. Every agent has an address — `spawn_agent` takes an
+  `as`, and one is derived as `<role>#<run id>` when it is omitted — and that address names ONE
+  agent, which nothing in this crate could do before: `AgentDef::name` is a role two children of one
+  definition share. `send_message` tells a named agent something; `read_messages` returns what was
+  sent to this one, oldest first, delivered exactly once, optionally narrowed to one sender and
+  optionally blocking for a stated number of seconds. A terminating agent posts one short line to
+  its parent, so waiting for a named child and waiting for a message are one mechanism. Messages are
+  rows, so a resumed tree reads the same ones in the same order, once.
+
+  Every wait is bounded — `[run] max_wait_secs`, `TaskContract::with_max_wait_secs`, and
+  `DEFAULT_MAX_WAIT` otherwise — because an agent that blocks holds its concurrency slot and the
+  sibling that would answer it may be queued behind that slot. `max_wait_secs` is a narrowing key: a
+  project scope may lower it and may not raise it.
+
+  One additive table, one additive index, one additive column. No `CHECKPOINT_FORMAT` move, no new
+  dependency, and no behaviour change for a caller who does not use it.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — **88 test binaries, 1,377 passed, 0 failed**, and **457
+    doctests passed, 0 failed**. Against 0.59.0's 87 / 1,926 / 456: the binary count rises by one
+    (`tests/mailbox.rs`) and the per-binary totals are not comparable to that release's, which was
+    measured over a different feature polarity.
+  - >
+    `tests/mailbox.rs` — 19 passed, 1 ignored (N5's measurement). `tests/config.rs` — 60 passed,
+    three of them this release's. The whole spawn path re-run after the `spawn_return` fix:
+    `--lib` 491, `subagents` 7, `fleet` 19, `agents` 8, `determinism` 10, `checkpoint` 12,
+    `session_fanout` 24 — all 0 failed.
+  - >
+    **Sabotage: 15 arms, one per functional criterion, all 15 kill the test they are aimed at** on
+    the tree that ships. One arm SURVIVED its first run and was a defect in this release's own test
+    (F9 — the fixture's child never spoke, so "the body is the terminal line and not the report" had
+    no report to be confused with). One arm was INERT rather than a finding (F5's first shape could
+    not express the defect under `PRAGMA query_only`). Full table in
+    `evidence/0.60.0/sabotage-15-arms.txt`.
+  - >
+    Cross-version: `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` then
+    `cargo test --test cross_version_0_29_0 -- --ignored` — 1 passed. A real 0.29.0 binary opens a
+    store this build wrote and never names `agent_messages`, `agent_messages_to` or `spawns.as_name`.
+  builds:
+  - "`cargo fmt --check` — exit 0."
+  - "`cargo clippy --all-targets --all-features -- -D warnings` — exit 0."
+  - >
+    `RUSTDOCFLAGS=\"--cfg docsrs -D warnings\" cargo +nightly doc --all-features --no-deps` — exit 0,
+    **after catching two unresolved intra-doc links stable `cargo doc` cannot see**. Ninth of the
+    last eleven releases in which this gate found something.
+  - >
+    `cargo package --locked` — **1,985,377 bytes** at 0.60.0 (0.59.0: 1,948,461 published).
+    `cargo tree` — **402**, unmoved. `CHECKPOINT_FORMAT` — **7**, unmoved.
+  reviews:
+  - >
+    `docs/public-api.txt` — **+5 lines, 0 removed**, verified by `git diff --stat`. The
+    `public_surface_matches_snapshot` and `every_public_item_has_a_worked_example` gates both
+    refused the release until the surface and the examples matched, which is how the missing
+    `DEFAULT_MAX_WAIT` re-export was found.
+  - >
+    The doc gates were re-run AFTER the version bump, which is 0.57.0's lesson:
+    `readme_dependency_version_matches_cargo_toml` compares the README's pin to `Cargo.toml` at
+    major.minor and is stale the moment the manifest moves. `docs_drift`, `changelog`,
+    `guide_pages`, `public_api` and `cross_version` all pass on the bumped tree.
+  deployments:
+  - >
+    Sealed before the crates.io upload, which follows the two merges and the GitHub Release. See
+    `known_limitations`.
+  health_checks:
+  - >
+    `examples/mailbox_live.rs` against a real provider — `outcome: Success { steps: 3 }`. A per-run
+    secret is written to a file, the `scout` reads it and messages the `author`, the `author` blocks
+    on `read_messages { from: "scout", wait_secs: 20 }`, and writes `OTTER-24495` — a value it had
+    no other route to. The store shows the message and both children's terminal posts to the root.
+known_limitations:
+- >
+  **The record was sealed before the crates.io upload.** `mode: published` states the authorized
+  target; the upload follows the feat→develop merge, the develop→main merge and the GitHub Release,
+  and is done by hand and last.
+- >
+  **N4 was met in a different form, and the difference is its own number.** The criterion predicted
+  `docs/public-api.txt` would gain exactly one line. It gains **five**: `struct AgentMessage`,
+  `const ROOT_ADDRESS`, `const SEND_MESSAGE_TOOL`, `const READ_MESSAGES_TOOL`, `const
+  DEFAULT_MAX_WAIT`. The prediction applied 0.59.0's lesson too literally — that file tracks every
+  NAME re-exported from `src/lib.rs`, consts included (`SPAWN_TOOL` has been listed since 0.12.0),
+  not root-level types only. The three tool and address constants are `pub` for exactly the reason
+  `SPAWN_TOOL` is: an `Observer` matching on `EventKind::ToolCall` needs the string. The substance
+  of the criterion — that the surface addition is small, additive and enumerated — holds; the
+  number was wrong.
+- >
+  **`cargo test --all-features` did not run locally, and ran on CI instead.** A cold all-features
+  build of 88 test binaries exhausted this machine's disk twice; the default suite, both lint
+  polarities, the nightly rustdoc gate, the cross-version gate, the sabotage pass, the live run and
+  the packaging all ran locally, and the all-features matrix runs on three platforms on the release
+  PRs. Stated rather than implied.
+- >
+  **The derived address uses `#`, not the `-` the scope names.** `scope.included` says a child the
+  parent did not name is called `<role>-<run id>`. It is `<role>#<run id>`, and the change is the
+  reason the collision class is closed: an assigned address may not contain `#`, so a derived name
+  and an assigned one cannot meet. Under a hyphen a parent could assign `searcher-7` and collide
+  with a future run id, which would have needed a check about a number nobody has allocated yet.
+  One character, decided during implementation, and the substance of the criterion is stronger for
+  it.
+- >
+  **Per-agent egress, ordering across a tree, and delivery latency are not claimed.** A message is
+  ordered by row id within one store, which is a total order; nothing here promises that two sends
+  from two agents in the same wall-clock instant land in the order a human would have chosen.
+- >
+  **A tree spawned before 0.60.0 and resumed on it has children with no address.** Their `spawns`
+  rows carry an empty `as_name`, so they cannot be addressed and what they send is attributed to a
+  derived name. Only a resume across that version boundary reaches this.
+- >
+  **A wait is bounded but it is not free, and the deadlock question is answered only in the weak
+  form.** An agent that waits holds its concurrency slot. The clock means a tree whose agents wait
+  on one another spends its clocks and carries on rather than stopping; it does not mean the
+  scheduler is aware of the dependency. The contract's open question stands, and the answer this
+  release gives is "survivable", not "impossible".
+- >
+  **An empty `verify_contains` makes any run succeed immediately**, including one that wrote
+  nothing: a missing file has read as empty since 0.1.0 and `"".contains("")` is true. Pre-existing
+  and outside this release's scope; recorded because building the live instrument hit it.
+supersedes: 0.59.0
+next_recommended_version: null
+immutable: true
