@@ -108,18 +108,28 @@ pub enum Preset {
 }
 
 impl Preset {
-    /// The description this preset composes in place of the builtin one.
+    /// The working style this preset appends to whichever framing the loop chose.
     ///
-    /// It names the same tools as [`SystemPrompt::Builtin`] because it describes the
-    /// same agent in the same workspace — a preset shapes how the work is done and
-    /// reported, never what the agent can reach.
-    pub(crate) fn describe(self) -> &'static str {
+    /// **A manner, not a description (0.60.3).** Up to 0.60.2 a preset returned a
+    /// whole replacement description and was composed *instead of* the loop's own
+    /// framing — so choosing `Concise` on a session turn threw away
+    /// `CONVERSATION_PROMPT` and handed the operator back the two claims 0.49.0
+    /// removed, and choosing it on a contained turn threw away the paragraph that
+    /// says the agent may spawn. That made this type's own promise — a preset shapes
+    /// how the work is done and reported, never what the agent can reach — untrue as
+    /// written.
+    ///
+    /// The two axes are separate and compose: which world the agent is in is chosen
+    /// by the loop and by the classification, how it works and reports is chosen by
+    /// the embedder. So this names no tools and describes no agent; the framing
+    /// beside it already did both, once.
+    pub(crate) fn manner(self) -> &'static str {
         match self {
             Preset::Concise => {
-                "You are an agent working across a repository to meet a stated specification. Use `grep` to search file contents and `find` to locate files by name, then `read_file` to inspect a file before changing it, and `write_file` with the file's path and full new contents to edit it. Work in small steps; after each of your steps the whole set is checked against the success criterion. Act before you explain: make the change, then report what you changed in one or two sentences. Do not restate the request, do not narrate what you are about to do, and do not summarise work the operator can see in the diff."
+                "Act before you explain: make the change, then report what you changed in one or two sentences. Do not restate the request, do not narrate what you are about to do, and do not summarise work the operator can see in the diff."
             }
             Preset::Careful => {
-                "You are an agent working across a repository to meet a stated specification. Use `grep` to search file contents and `find` to locate files by name, then `read_file` to inspect a file before changing it, and `write_file` with the file's path and full new contents to edit it. Work in small steps; after each of your steps the whole set is checked against the success criterion. Before you report a change as done, check it: read back what you wrote, or run the project's own check where one exists. Say what you verified and how. If you could not verify something, say that instead of implying you did."
+                "Before you report a change as done, check it: read back what you wrote, or run the project's own check where one exists. Say what you verified and how. If you could not verify something, say that instead of implying you did."
             }
         }
     }

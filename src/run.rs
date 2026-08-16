@@ -4074,6 +4074,13 @@ fn open_turn_kind(store: &Store, run_id: i64, extras: &TurnExtras<'_>) -> Result
 /// different worlds (one of them has sub-agents) and must keep saying so — but
 /// what is wrapped around it, and the condition under which it is used at all,
 /// is one rule in one place.
+///
+/// Both boundaries are passed and this function chooses (0.60.3), for the same
+/// reason the directive is built here: the rule "the boundary an agent reads is the
+/// one that will refuse it" held in the `system` block and lapsed in this one, at
+/// **both** call sites, because each site chose for itself and both chose the
+/// post-plan value. A rule that each caller applies is a rule that lapses wherever
+/// one of them forgets.
 #[allow(clippy::too_many_arguments)]
 fn conversational_opening(
     base: &str,
@@ -4082,7 +4089,8 @@ fn conversational_opening(
     extra: &[ToolSpec],
     skills: &Skills,
     planning: bool,
-    boundary: Option<&str>,
+    after_planning: Option<&str>,
+    while_planning: Option<&str>,
     family: PromptFamily,
 ) -> Option<String> {
     if !extras.classify {
@@ -4094,10 +4102,15 @@ fn conversational_opening(
         extra,
         skills,
         // The roster the directive names is the contract's, at both call sites, so
-        // it is read here rather than passed twice.
-        directive: planning.then(|| planning_directive(&contract.agents)),
+        // it is read here rather than passed twice. `true`: this is the one block
+        // composed above `CONVERSATIONAL_ENDING`, and the gate is stated to a turn
+        // that may still answer.
+        directive: planning.then(|| planning_directive(&contract.agents, true)),
         instructions: &contract.instructions,
-        boundary,
+        boundary: match planning {
+            true => while_planning,
+            false => after_planning,
+        },
         family,
         // 0.45.0 — the sentence that decides what a turn is, emitted last so that
         // nothing an embedder or a repository supplied can be read after it.
@@ -4478,6 +4491,14 @@ async fn run_workspace_from<P: Provider>(
     // and a prompt composed once cannot follow it (`docs/CONTRACT.md`).
     let after_planning =
         boundary_section(policy, &contract.exec_sandbox, will_proxy(policy, contract));
+    // 0.60.3 — a binding rather than an argument built inline, matching the shape the
+    // tree loop has had since 0.45.0, because two blocks of one turn now read it: the
+    // `system` block's planning arm and the classifying opening below.
+    let while_planning = boundary_section(
+        &effective,
+        &contract.exec_sandbox,
+        will_proxy(&effective, contract),
+    );
     let base_system = compose(PromptSpec {
         base: WORKSPACE_PROMPT,
         prompt: &contract.prompt,
@@ -4495,14 +4516,11 @@ async fn run_workspace_from<P: Provider>(
             prompt: &contract.prompt,
             extra: &extra,
             skills,
-            directive: Some(planning_directive(&contract.agents)),
+            // `false`: this block is composed for a turn already decided to be work,
+            // so there is one reading of it and the gate binds all of it.
+            directive: Some(planning_directive(&contract.agents, false)),
             instructions: &contract.instructions,
-            boundary: boundary_section(
-                &effective,
-                &contract.exec_sandbox,
-                will_proxy(&effective, contract),
-            )
-            .as_deref(),
+            boundary: while_planning.as_deref(),
             family: provider.prompt_family(),
             ending: CALL_TOOLS_ENDING,
         }),
@@ -4537,6 +4555,7 @@ async fn run_workspace_from<P: Provider>(
         skills,
         planning,
         after_planning.as_deref(),
+        while_planning.as_deref(),
         provider.prompt_family(),
     );
     let mut tools = workspace_tools();
@@ -7226,7 +7245,8 @@ where
         let base_system = with_role(None, after_planning.as_deref());
         let mut system = match planning {
             true => with_role(
-                Some(planning_directive(&contract.agents)),
+                // `false`: composed for a turn already decided to be work.
+                Some(planning_directive(&contract.agents, false)),
                 while_planning.as_deref(),
             ),
             false => base_system.clone(),
@@ -7253,6 +7273,7 @@ where
             tree.skills,
             planning,
             after_planning.as_deref(),
+            while_planning.as_deref(),
             tree.provider.prompt_family(),
         );
         let mut tools = tree_tools(tree.agents);
@@ -9164,7 +9185,22 @@ fn plan_lock() -> Policy {
 }
 
 /// The system prompt while a plan is unreviewed.
-fn planning_directive(agents: &crate::agent::Agents) -> String {
+///
+/// `classifying` is the one path that composes this block above
+/// [`CONVERSATIONAL_ENDING`] (0.60.3). A turn that has not been decided to be work
+/// was being ordered to plan before it was permitted to answer — the directive said
+/// "before you do anything else", the ending said "if a plain answer is the whole of
+/// what is wanted, call no tool", and an operator who typed a greeting into a gated
+/// session got a plan proposed for it and a human asked to approve one. So the gate
+/// binds the *work* reading there and says so. It is not weakened: the sentence about
+/// what is refused is the same in both forms, and [`plan_lock`] is what enforces it
+/// either way — what changes is that a turn allowed to answer is not told the answer
+/// must wait for a plan.
+///
+/// One function with a flag rather than two strings, for the reason
+/// [`CONVERSATIONAL_ENDING`] is a `const`: a rule reworded in one of them and not the
+/// other is a gate that reads differently depending on which block composed it.
+fn planning_directive(agents: &crate::agent::Agents, classifying: bool) -> String {
     let roster = match agents.len() {
         0 => {
             "There are no sub-agents on this run, so leave `agent` unset on every step.".to_string()
@@ -9175,9 +9211,19 @@ fn planning_directive(agents: &crate::agent::Agents) -> String {
             agents.names().join(", ")
         ),
     };
+    let order = match classifying {
+        true => format!(
+            "If any part of this needs the repository written to or a command run, then before \
+             you do that or anything else you must call `{PROPOSE_PLAN_TOOL}` with the ordered \
+             steps you intend to take, and wait."
+        ),
+        false => format!(
+            "Before you do anything else you must call `{PROPOSE_PLAN_TOOL}` with the ordered \
+             steps you intend to take, and wait."
+        ),
+    };
     format!(
-        " Before you do anything else you must call `{PROPOSE_PLAN_TOOL}` with the ordered \
-         steps you intend to take, and wait. Until that plan is approved you may read, search \
+        " {order} Until that plan is approved you may read, search \
          and think, and every attempt to write a file, run a command or call any other tool \
          WILL be refused — so read what you need first, then propose. {roster}"
     )
@@ -14803,9 +14849,13 @@ struct PromptSpec<'a> {
 fn compose(spec: PromptSpec<'_>) -> String {
     let description = match spec.prompt {
         SystemPrompt::Replace(text) => text.clone(),
-        // 0.49.0 — a preset sits exactly where a replacement sits, so everything
-        // the crate has to say about the request is still composed around it.
-        SystemPrompt::Preset(preset) => preset.describe().to_string(),
+        // 0.60.3 — a preset is a manner appended to the framing this loop chose, not
+        // a replacement for it. Up to 0.60.2 it sat exactly where a replacement sits,
+        // which meant an embedder who selected one had the conversational framing
+        // discarded on a classifying turn and the tree framing discarded on a
+        // contained one — a preset deciding what world the agent is in, which is the
+        // one thing `Preset` says it never does.
+        SystemPrompt::Preset(preset) => format!("{} {}", spec.base, preset.manner()),
         _ => spec.base.to_string(),
     };
     let mut out = with_skill_catalog(with_extra_tools(description, spec.extra), spec.skills);
@@ -16616,5 +16666,146 @@ mod tests {
         );
         // The boundary, asserted exactly: zero is not a contradiction and one is.
         assert!(r(json!({ "wait": false, "background_after_secs": 1 })).is_err());
+    }
+
+    // ------------------- 0.60.3: the tree loop's classifying turn, at unit level
+    //
+    // `Session::turn_contained` and `turn_contained_observed` build their contract
+    // from text (`src/session.rs:731`), so no caller can hand a contained turn a
+    // plan gate or a preset. The composition defects at `conversational_opening`
+    // and `compose` are real on this path and unreachable from outside the crate,
+    // which is why they are asserted here rather than in `tests/prompt.rs`
+    // (`US-IO-HARNESS-0.60.3-I01`). The flat loop's half is asserted there, end to
+    // end, because a caller can reach it today.
+
+    /// The opening a contained classifying turn would be composed from, handed both
+    /// boundaries exactly as the tree loop hands them over.
+    fn tree_opening(
+        contract: &TaskContract,
+        planning: bool,
+        after_planning: Option<&str>,
+        while_planning: Option<&str>,
+    ) -> String {
+        let extras = TurnExtras {
+            classify: true,
+            ..Default::default()
+        };
+        conversational_opening(
+            CONVERSATION_TREE_PROMPT,
+            contract,
+            &extras,
+            &[],
+            &Skills::default(),
+            planning,
+            after_planning,
+            while_planning,
+            PromptFamily::Generic,
+        )
+        .expect("a classifying turn composes an opening")
+    }
+
+    /// **F1**, tree loop — the plan gate does not order a turn that may still answer.
+    #[test]
+    fn the_tree_loops_gated_classifying_turn_may_still_answer() {
+        let contract = TaskContract::workspace("hi", "/ws");
+        let composed = tree_opening(&contract, true, None, None);
+
+        assert!(
+            !composed.contains("Before you do anything else you must call"),
+            "a turn allowed to answer was ordered to propose a plan first:\n{composed}"
+        );
+        assert!(
+            composed.contains(PROPOSE_PLAN_TOOL),
+            "the gate is in force and the turn is still told about it:\n{composed}"
+        );
+        assert!(composed.ends_with(CONVERSATIONAL_ENDING));
+
+        // The control: a turn already decided to be work reads one thing, not two.
+        assert!(planning_directive(&contract.agents, false)
+            .contains("Before you do anything else you must call"));
+    }
+
+    /// **F2**, tree loop — a gated classifying turn reads the boundary in force.
+    ///
+    /// Handed both, exactly as the loop hands them, so what is asserted is the
+    /// *selection* — which is the whole of the defect. Up to 0.60.2 the choice was
+    /// made at the call site and both sites chose `after_planning`; the pre-fix
+    /// function took one boundary and could not be given the other, which is why
+    /// this assertion's failing-first evidence is
+    /// `a_plan_gated_classifying_turn_reads_the_boundary_in_force` in
+    /// `tests/prompt.rs` and the sabotage arm, rather than a red run of this test.
+    #[test]
+    fn the_tree_loops_gated_classifying_turn_reads_the_boundary_in_force() {
+        let contract = TaskContract::workspace("hi", "/ws");
+        let while_planning = boundary_section(
+            &Policy::permissive().merge(plan_lock()),
+            &contract.exec_sandbox,
+            false,
+        )
+        .expect("the plan gate denies enough to be worth describing");
+        let after_planning = boundary_section(&Policy::permissive(), &contract.exec_sandbox, false);
+
+        let gated = tree_opening(
+            &contract,
+            true,
+            after_planning.as_deref(),
+            Some(&while_planning),
+        );
+        assert!(
+            gated.contains("(plan-gate)"),
+            "the layer that will refuse is not the layer named:\n{gated}"
+        );
+        for act in ["Writing files", "Running a command"] {
+            assert!(gated.contains(act), "{act} is not accounted for");
+        }
+
+        // And the other way round: once the plan is approved the narrowed boundary is
+        // gone, so a turn is never told about a layer that has stopped refusing it.
+        let ungated = tree_opening(
+            &contract,
+            false,
+            after_planning.as_deref(),
+            Some(&while_planning),
+        );
+        assert!(
+            !ungated.contains("(plan-gate)"),
+            "a turn that is no longer gated was told the gate still refuses it:\n{ungated}"
+        );
+    }
+
+    /// **F4** — a preset over either tree framing keeps the world the agent is in.
+    ///
+    /// `Preset::describe` returned a whole replacement description, so a preset on a
+    /// contained turn discarded the one paragraph that says the agent may spawn — the
+    /// exact claim `Preset`'s own rustdoc makes about itself.
+    #[test]
+    fn a_preset_keeps_the_world_a_contained_agent_is_in() {
+        for base in [CONVERSATION_TREE_PROMPT, TREE_PROMPT] {
+            for preset in [Preset::Concise, Preset::Careful] {
+                let contract = TaskContract::workspace("hi", "/ws")
+                    .with_system_prompt(SystemPrompt::Preset(preset));
+                let composed = compose(PromptSpec {
+                    base,
+                    prompt: &contract.prompt,
+                    extra: &[],
+                    skills: &Skills::default(),
+                    directive: None,
+                    instructions: &contract.instructions,
+                    boundary: None,
+                    family: PromptFamily::Generic,
+                    ending: CALL_TOOLS_ENDING,
+                });
+                assert!(
+                    composed.starts_with(base),
+                    "{preset:?} replaced the framing instead of shaping it:\n{composed}"
+                );
+                for kept in [SPAWN_TOOL, "inherits your permissions"] {
+                    assert!(
+                        composed.contains(kept),
+                        "{preset:?} dropped {kept} from a contained agent's world"
+                    );
+                }
+            }
+        }
     }
 }

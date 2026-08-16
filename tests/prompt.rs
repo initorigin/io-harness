@@ -125,17 +125,25 @@ async fn policy_system(contract: &TaskContract, policy: &Policy) -> String {
 
 /// The prompt a classifying session turn's first completion is made with.
 async fn conversational_system(contract: &TaskContract, root: &std::path::Path) -> String {
+    conversational_system_under(contract, root, &Policy::permissive()).await
+}
+
+/// [`conversational_system`] under a policy the caller chose (0.60.3).
+///
+/// The permissive default is why three composition defects on this path survived
+/// four releases: a permissive, ungated turn is the one shape where the boundary
+/// section is absent and the plan directive is never composed, so neither could be
+/// read off the prompt no matter how closely the baselines were checked.
+async fn conversational_system_under(
+    contract: &TaskContract,
+    root: &std::path::Path,
+    policy: &Policy,
+) -> String {
     let provider = Rec::new(vec![vec![]]);
     let store = Store::memory().unwrap();
     let mut session = Session::open(&store, root).unwrap();
     let _ = session
-        .turn_bounded(
-            contract,
-            &provider,
-            &store,
-            &Policy::permissive(),
-            &ApproveAll,
-        )
+        .turn_bounded(contract, &provider, &store, policy, &ApproveAll)
         .await;
     provider.system()
 }
@@ -1321,3 +1329,188 @@ async fn a_preset_is_opt_in_and_the_builtin_does_not_move() {
         "the builtin moved once a preset existed, which is exactly what must not happen"
     );
 }
+
+// ------------------------- 0.60.3: every block a classifying turn is composed from
+//
+// Three of them said something untrue of the turn being taken. The plan gate ordered
+// a turn the ending allows to answer; the boundary section described the policy the
+// run would have *after* the gate rather than the one holding it; and a preset threw
+// the conversational framing away and handed back the two claims 0.49.0 removed.
+//
+// All three live in `conversational_opening` and `compose`, which both loops share.
+// Only the flat loop is reachable from a caller's contract — `Session::turn_contained`
+// builds its own — so the tree loop's half is asserted in `src/run.rs`'s own tests
+// (`US-IO-HARNESS-0.60.3-I01`).
+
+/// The sentence a turn that may still answer must not be given.
+const UNCONDITIONAL_PLAN: &str = "Before you do anything else you must call `propose_plan`";
+
+/// A contract whose run is held by a gate no one will approve.
+fn gated(root: &std::path::Path) -> TaskContract {
+    contract(root).with_plan_gate(Arc::new(io_harness::PlanGateNone))
+}
+
+/// The boundary section of a composed prompt, without the ending that follows it.
+///
+/// `None` when the prompt carries no boundary section at all, which is a distinct
+/// answer from an empty one and is exactly what a permissive plan-gated classifying
+/// turn returned before this release.
+fn boundary_of(composed: &str, ending: &str) -> Option<String> {
+    let (_, rest) = composed.split_once("Your boundary.")?;
+    Some(rest.strip_suffix(ending).unwrap_or(rest).to_string())
+}
+
+/// **F1** — a plan-gated classifying turn is not ordered to plan before it may answer.
+///
+/// The control is the same contract's work prompt, which must still carry the
+/// unconditional form: the gate is not being weakened, it is being stated to a turn
+/// that has not yet been decided to be work. `plan_lock` is what actually refuses a
+/// write either way, so the cost of the old wording was a plan proposed for a
+/// greeting and a human asked to approve it — 0.48.0's `I03` on the one path that
+/// composes a directive above the ending.
+#[tokio::test]
+async fn a_plan_gated_classifying_turn_may_still_answer() {
+    let dir = workspace();
+    let c = gated(dir.path());
+
+    let opening = conversational_system(&c, dir.path()).await;
+    assert!(
+        !opening.contains(UNCONDITIONAL_PLAN),
+        "a turn allowed to answer was ordered to propose a plan first:\n{opening}"
+    );
+    assert!(
+        opening.contains("propose_plan"),
+        "the gate is still in force and the turn is still told about it:\n{opening}"
+    );
+    assert!(
+        opening.ends_with(CONVERSATIONAL_ENDING),
+        "the crate's own ending is not last:\n{opening}"
+    );
+
+    // The control: a turn already decided to be work reads one thing, not two.
+    let work = workspace_system(&c).await;
+    assert!(
+        work.contains(UNCONDITIONAL_PLAN),
+        "the gate was weakened for work as well, which is not what this fixes:\n{work}"
+    );
+}
+
+/// **F2** — a plan-gated classifying turn reads the boundary that will refuse it.
+///
+/// Under a permissive policy the defect is at its starkest: `plan_lock` refuses every
+/// write and every command, the work prompt says so, and the classifying opening
+/// carried no boundary section at all — so a turn under the gate read nothing about
+/// the one layer that would refuse it.
+#[tokio::test]
+async fn a_plan_gated_classifying_turn_reads_the_boundary_in_force() {
+    let dir = workspace();
+    let c = gated(dir.path());
+
+    let opening = conversational_system(&c, dir.path()).await;
+    let work = workspace_system(&c).await;
+
+    let seen = boundary_of(&opening, CONVERSATIONAL_ENDING)
+        .expect("a gated classifying turn is told what will refuse it");
+    let enforced =
+        boundary_of(&work, CALL_TOOLS_ENDING).expect("the work prompt names the gate's boundary");
+
+    assert_eq!(
+        seen, enforced,
+        "the two blocks of one turn describe two different boundaries"
+    );
+    assert!(
+        seen.contains("(plan-gate)"),
+        "the layer that will refuse is not the layer named:\n{seen}"
+    );
+    for act in ["Writing files", "Running a command"] {
+        assert!(seen.contains(act), "{act} is not accounted for:\n{seen}");
+    }
+}
+
+/// **F3** — a preset never introduces a success criterion onto a turn that has none.
+///
+/// `compose` returned `Preset::describe()` in place of the loop's own framing, so an
+/// embedder who chose `Concise` had `CONVERSATION_PROMPT` discarded and got back the
+/// two claims 0.49.0 removed — on every greeting, through `turn_bounded`, with no
+/// verification anywhere in sight.
+#[tokio::test]
+async fn a_preset_does_not_reframe_a_classifying_turn_as_work() {
+    let dir = workspace();
+    let framing = without_ending(V0490_CONVERSATIONAL, CONVERSATIONAL_ENDING);
+
+    for (preset, marker) in [
+        (Preset::Concise, "Act before you explain"),
+        (
+            Preset::Careful,
+            "Before you report a change as done, check it",
+        ),
+    ] {
+        let c = contract(dir.path()).with_system_prompt(SystemPrompt::Preset(preset));
+        let opening = conversational_system(&c, dir.path()).await;
+
+        assert!(
+            opening.starts_with(&framing),
+            "{preset:?} replaced the turn's framing instead of shaping it:\n{opening}"
+        );
+        for claim in [
+            "to meet a stated specification",
+            "checked against the success criterion",
+        ] {
+            assert!(
+                !opening.contains(claim),
+                "{preset:?} put back the claim 0.49.0 removed ({claim}):\n{opening}"
+            );
+        }
+        assert!(
+            opening.contains(marker),
+            "{preset:?} lost its own working style:\n{opening}"
+        );
+        assert!(
+            opening.ends_with(CONVERSATIONAL_ENDING),
+            "{preset:?} got past the crate's ending:\n{opening}"
+        );
+    }
+}
+
+/// **F6** — the one composed prompt this release moves, stated byte for byte.
+///
+/// `Preset::describe`'s bodies omitted "You may edit several files.", which
+/// `WORKSPACE_PROMPT` carries; composing a manner onto a framing restores it. That is
+/// the whole of the change an embedder who snapshots prompts will see, and it is
+/// asserted here rather than left to be found in a diff of their own fixtures.
+#[tokio::test]
+async fn a_preset_is_the_framing_plus_its_manner_and_nothing_else() {
+    let dir = workspace();
+    let framing = without_ending(V0440_WORKSPACE, CALL_TOOLS_ENDING);
+
+    for (preset, manner) in [
+        (Preset::Concise, CONCISE_MANNER),
+        (Preset::Careful, CAREFUL_MANNER),
+    ] {
+        let shaped =
+            workspace_system(&contract(dir.path()).with_system_prompt(SystemPrompt::Preset(preset)))
+                .await;
+        // The description, byte for byte: everything before the boundary section the
+        // crate composes after it. `You may edit several files.` is the sentence the
+        // old replacing form dropped, and it is inside this comparison.
+        let described = shaped
+            .split("\n\nYour boundary.")
+            .next()
+            .expect("split always yields a head");
+        assert_eq!(
+            described,
+            format!("{framing} {manner}"),
+            "{preset:?} is not its framing plus its manner"
+        );
+        assert!(
+            shaped.ends_with(CALL_TOOLS_ENDING),
+            "{preset:?} got past the crate's ending:\n{shaped}"
+        );
+    }
+}
+
+/// The working style `Preset::Concise` adds, and the whole of what it adds.
+const CONCISE_MANNER: &str = "Act before you explain: make the change, then report what you changed in one or two sentences. Do not restate the request, do not narrate what you are about to do, and do not summarise work the operator can see in the diff.";
+
+/// The working style `Preset::Careful` adds, and the whole of what it adds.
+const CAREFUL_MANNER: &str = "Before you report a change as done, check it: read back what you wrote, or run the project's own check where one exists. Say what you verified and how. If you could not verify something, say that instead of implying you did.";
