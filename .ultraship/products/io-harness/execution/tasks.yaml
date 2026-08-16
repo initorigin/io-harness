@@ -311,3 +311,22 @@ tasks:
     O1 — `cargo test --all-features` is handed to the PR matrix on three platforms rather than run
     locally, which is this repository's standing arrangement for that one gate. Stated plainly rather
     than implied: it ran on CI, not here.
+  - >
+    **The PR matrix found a defect neither the local suite nor macOS could see, and what caught it
+    was a control test rather than an assertion.** Both Windows legs failed on exactly one test of
+    1,383 (1,500 with all features): `command_execution_section_stops_at_the_next_claim`.
+    `.gitattributes` pins `eol=lf` for `tests/fixtures/**` and nothing else, so `docs/CONTRACT.md`
+    checks out CRLF on Windows and the window helper's `"\n\n**"` marker matches nothing in
+    `"\r\n\r\n**"` — the window ran to the end of the file.
+  - >
+    **The failure mode is the part worth keeping: the assertion it guards would have passed anyway,
+    for the wrong reason.** With the window running to EOF, `contract_states_one_exec_boundary` was
+    searching the whole file for a phrase this release had already removed everywhere, so F1 was
+    green on Windows while checking nothing. A checker whose scope silently widens is
+    indistinguishable from one that works — which is exactly why the control asserting "the window
+    stops at the next claim" was written beside it.
+  - >
+    Fixed in `read()` rather than in the two helpers, so a checker added later cannot reintroduce it,
+    with the reason in its rustdoc. `the_section_window_survives_a_crlf_checkout` is the regression
+    test. Local after the fix: `docs_drift` 45 of 45, `guide_pages` 10 of 10, clippy all-features
+    clean.

@@ -40,9 +40,21 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// A checked-in text file, with its line endings normalised to `\n`.
+///
+/// `.gitattributes` pins `eol=lf` for `tests/fixtures/**` and for nothing else,
+/// so a Windows checkout hands these pages back with CRLF. A checker that looks
+/// for a blank line before a marker — `"\n\n**"` — matches nothing in
+/// `"\r\n\r\n**"`, and the failure is silent: the window it was computing simply
+/// runs to the end of the file and the assertion inside it passes for the wrong
+/// reason. Normalising here rather than in each checker is what stops the next
+/// one reintroducing it. Found by a control test on the Windows leg, green on
+/// macOS throughout.
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    text.replace("\r\n", "\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,4 +1355,27 @@ fn guide_checker_accepts_a_bullet_that_defers() {
                    - **Next bullet**";
     let reserved = BTreeSet::from(["write_file".to_string()]);
     assert!(guide_defers_to_the_reserved_set(&shadowing_bullet(fixture), &reserved).is_ok());
+}
+
+#[test]
+fn the_section_window_survives_a_crlf_checkout() {
+    // The regression the Windows leg found. Both windowing helpers look for a
+    // blank line followed by a marker, which CRLF spells differently; `read`
+    // normalises, and this asserts the helpers work on the shape it produces
+    // even if someone hands them a raw CRLF string directly.
+    let crlf = "**What a command the agent runs is bounded by.** `Act::Exec` on the argv.\r\n\
+                \r\n**Toolchain detection is a default.**";
+    let section = command_execution_section(&crlf.replace("\r\n", "\n"));
+    assert!(
+        !section.contains("Toolchain detection"),
+        "the window ran past its block on a normalised CRLF page:\n{section}"
+    );
+
+    let bullet_crlf = "- **Nothing may shadow anything** — see `RESERVED_TOOL_NAMES`.\r\n\
+                       - **A failing tool is an observation**";
+    let bullet = shadowing_bullet(&bullet_crlf.replace("\r\n", "\n"));
+    assert!(
+        !bullet.contains("A failing tool"),
+        "the bullet window ran past its own bullet:\n{bullet}"
+    );
 }
