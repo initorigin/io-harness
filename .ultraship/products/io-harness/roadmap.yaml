@@ -1720,7 +1720,16 @@ versions:
       **Ordered before 0.63.0 deliberately.** That release decomposes `run.rs`, and every site this
       entry touches is inside it. Fixing them afterwards means re-finding the defect in a file that
       no longer has this shape, against tests that were never written.
-    detail: outline
+
+
+      **One premise of this entry was wrong and is corrected in the contract.** It said
+      `tests/prompt.rs` "carries no assertion about the conversational opening at all — not its
+      ending, not its directive, not its boundary". The ending *is* asserted, in three places
+      (`V0490_CONVERSATIONAL` at line 37, and `ends_with(CONVERSATIONAL_ENDING)` at lines 297 and
+      1019). What the file has no assertion about is the directive, the boundary, and a preset on a
+      classifying turn — because its two helpers compose under `Policy::permissive()` with no plan
+      gate. The gap is real; its shape is narrower than this entry claimed.
+    detail: specified
     status: planned
   - version: 0.61.0
     outcome: >

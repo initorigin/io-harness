@@ -1,0 +1,368 @@
+product: io-harness
+version: 0.60.3
+status: planned
+release_type: patch
+outcome:
+  user_can: >
+    Every block a classifying turn is composed from says something true of that turn. Three of them
+    do not today, and each is the same defect this crate has already paid for twice: a sentence that
+    describes a different turn than the one being taken.
+
+
+    **The plan gate orders a turn that is allowed to answer.** `conversational_opening`
+    (`src/run.rs:4078-4106`) composes `directive: planning.then(|| planning_directive(...))` and
+    `ending: CONVERSATIONAL_ENDING` into one block. The directive opens " Before you do anything else
+    you must call `propose_plan` with the ordered steps you intend to take, and wait"
+    (`src/run.rs:9178-9183`); the ending, emitted last in the same block, answers "If a plain answer
+    is the whole of what is wanted, write that answer and call no tool", and closes "When the two
+    readings are both possible, act" (`src/run.rs:15251-15256`). An operator who types a greeting into
+    a plan-gated session gets a plan proposed for it and a human asked to approve one. This is
+    0.48.0's `I03` restored on the one path that composes a directive above the ending, and it is
+    present in both loops — the flat loop passes `planning` at `src/run.rs:4538` and the tree loop at
+    `src/run.rs:7254`.
+
+
+    **The same turn is told a boundary that is not in force.** The rule this crate states for itself
+    is that the boundary an agent reads is the one that will refuse it — written out at
+    `src/run.rs:4474-4478`, and honoured by the `system` block, whose planning arm composes from the
+    plan-narrowed policy (`src/run.rs:4500-4505`, `src/run.rs:7228-7231`). The conversational opening
+    is handed `after_planning` at **both** call sites (`src/run.rs:4539` and `src/run.rs:7255`), so a
+    classifying turn under the gate reads a boundary derived from the un-narrowed `policy` while
+    `plan_lock()` — `deny_write("*")`, `deny_exec("*")` (`src/run.rs:9159-9164`) — is what will
+    actually refuse it. In the tree loop the correct value is `while_planning`, already computed one
+    binding above at `src/run.rs:7185-7189` and not used by the call at 7255.
+
+
+    **A preset discards the framing 0.49.0 shipped.** `Preset::describe` (`src/contract.rs:116-125`)
+    returns a whole replacement description, and `compose` honours it over `spec.base`
+    (`src/run.rs:14804-14810`: `SystemPrompt::Preset(preset) => preset.describe().to_string()`). An
+    embedder who selected `Concise` or `Careful` therefore has `CONVERSATION_PROMPT` thrown away on a
+    classifying turn and gets back the two claims 0.49.0 removed — "to meet a stated specification"
+    and "checked against the success criterion" — on every greeting. Reachable through
+    `Session::turn_bounded` with `Verification::None`. On a contained turn it discards
+    `CONVERSATION_TREE_PROMPT` and `TREE_PROMPT` instead, dropping the guidance that the agent may
+    spawn, which makes `Preset`'s own rustdoc claim — "a preset shapes how the work is done and
+    reported, never what the agent can reach" (`src/contract.rs:113-115`) — untrue as written.
+
+
+    After this release a preset is a **manner appended to a framing**, not a replacement for one. The
+    two axes are separated: which world the agent is in is chosen by the loop and the classification,
+    how it works and reports is chosen by the embedder, and the two compose. That also retires the
+    duplication the collapse forced — the four tool sentences are copied into both preset bodies
+    today, which is the shape this crate warns about in `compose`'s own doc comment: "a rule added to
+    one of four prompts is a rule that lapses in three" (`src/run.rs:14800-14802`).
+  business_value: >
+    The classifying turn is the one surface of this crate that a human types into directly. Every
+    other prompt is composed for a run a program declared; this one is composed for a sentence a
+    person wrote, and the whole of 0.37.0, 0.39.0, 0.48.0's `I03` and 0.49.0 exists because getting it
+    wrong is not a cosmetic defect — it is the agent doing work nobody asked for, or refusing an
+    answer it was allowed to give.
+
+
+    Two of the three defects here are that same class, restored on the paths those releases did not
+    reach. The third is worse in kind: the boundary block is the crate's own answer to "what will
+    refuse me", and a turn that reads "Writing files: allowed" about writes `plan_lock` denies is
+    being told the opposite of what is enforced. That is the one category of prompt defect this
+    project has already declared costs more than silence (0.60.2, on the contract's exec boundary).
+
+
+    The preset fix is the compounding half. `Preset` is `#[non_exhaustive]` and 0.49.0 shipped it
+    saying another working style is a thing a minor may add — under today's shape, every style added
+    later has to re-copy the tool sentences into a third and fourth body, and each copy is a place the
+    tool description can go stale independently. Separating manner from framing means a preset added
+    in 0.62.0 is one clause, not one more full description that has to be kept in step with three
+    others.
+  evidence_of_value: >
+    The functional criteria are the evidence: after this release a plan-gated classifying turn cannot
+    carry the unconditional propose-first sentence, cannot be handed the un-narrowed boundary, and
+    cannot have its framing replaced by a preset — each asserted by a test in `tests/prompt.rs` with a
+    named sabotage that makes exactly that test fail and no other.
+
+
+    The negative evidence matters as much: the baselines `tests/prompt.rs` already holds
+    (`V0440_WORKSPACE`, `V0490_CONVERSATIONAL`, `V0440_TREE`, byte-exact prefix plus byte-exact
+    suffix) must stay green untouched, which is what proves the composition rules changed only where
+    they were wrong.
+scope:
+  included:
+  - >
+    **The plan gate is stated conditionally on a classifying turn.** `planning_directive` gains a
+    second form for the one path that composes it above `CONVERSATIONAL_ENDING`: the classification is
+    decided first, and the gate binds the work reading only — if any part of the turn needs the
+    repository written to or a command run, `propose_plan` comes before it; if a plain answer is the
+    whole of what is wanted, the answer is the turn. The gate is **not** dropped from the opening: the
+    comment at `src/run.rs:4524-4525` put it there deliberately, and a classifying turn that decides
+    it is work carries on **from that same completion** (`src/run.rs:4110-4113`), so a turn that was
+    never told about the gate would spend its first step on a write `plan_lock` refuses. The roster
+    sentence is unchanged in both forms.
+  - >
+    **The conversational opening reads the boundary in force.** `conversational_opening` selects
+    between the plan-narrowed and post-plan boundary by the `planning` flag it already takes, so the
+    rule lives in the one place the directive's rule already lives rather than being repeated at two
+    call sites. The flat loop hoists its plan-narrowed `boundary_section` — computed inline today at
+    `src/run.rs:4500-4505` — into a binding beside `after_planning`, matching the shape the tree loop
+    already has at `src/run.rs:7183-7189`, and both call sites pass both values.
+  - >
+    **`Preset` becomes a manner, appended to whichever framing the loop chose.** `Preset::describe` is
+    replaced by `Preset::manner`, returning only the working-style clause — the text that today
+    follows the shared tool sentences in each body, byte for byte, so `Concise` still carries "Act
+    before you explain" and `Careful` still carries "Before you report a change as done, check it".
+    `compose` appends it to `spec.base` instead of replacing it. Both items are `pub(crate)`; the
+    public `Preset` enum, its variants and `SystemPrompt::Preset` do not move.
+  - >
+    **The rustdoc that describes the old shape is corrected with it.** `SystemPrompt::Preset`
+    (`src/contract.rs:65-69`) says a preset is "Composed exactly where `SystemPrompt::Replace`'s text
+    is", which stops being true; `Preset`'s own doc block (`src/contract.rs:110-115`) says a preset
+    "names the same tools as `SystemPrompt::Builtin` because it describes the same agent" — after this
+    release it names no tools at all, because it no longer describes the agent.
+  - >
+    **Four new assertions in `tests/prompt.rs`**, each failing on today's tree, covering both loops:
+    the directive under a plan gate, the boundary under a plan gate, a preset on a classifying turn,
+    and a preset on a contained turn. The file's existing helpers `conversational_system` and
+    `tree_system` gain plan-gated and policy-bearing variants; every existing baseline assertion stays
+    exactly as it is.
+  - >
+    **`docs/CONTRACT.md` gains one paragraph** stating the design the classification rule comes from:
+    the one-shot API is task-framed because its caller declared work in code, and the session API is
+    conversation-framed because its operator did not — and a preset chooses neither, because manner
+    and framing are different axes. One paragraph in the section that already states the
+    classification rule; no restructuring.
+  - >
+    **`docs/STYLE.md` is new and small** — the register this crate's own prose already follows,
+    written down once so a later release cannot drift out of it by imitation. It documents nothing it
+    does not already do.
+  - >
+    **The CHANGELOG entry, and the version bump.** `0.60.3` in `Cargo.toml` and `Cargo.lock`, and a
+    `## [0.60.3]` section written under the structure `docs/CHANGELOG_STRUCTURE.md` requires,
+    including the prompt-text change stated plainly rather than elided.
+  excluded:
+  - >
+    **Any change to the public API.** `docs/public-api.txt` must be byte-identical to the 0.60.2
+    snapshot. `Preset::describe` and its replacement are `pub(crate)`; if a fix here appears to need a
+    public item added, renamed or removed, it is a different release. This is the line that makes
+    0.60.3 a patch and it is asserted rather than intended — see N1.
+  - >
+    **Adding a `Preset` variant.** Separating manner from framing makes a third style cheap, which is
+    exactly why it is not done here — a new variant is new functionality and a minor.
+  - >
+    **Rewording `CONVERSATIONAL_ENDING`, `CONVERSATION_PROMPT`, `CONVERSATION_TREE_PROMPT`,
+    `WORKSPACE_PROMPT` or `TREE_PROMPT`.** The five framings are correct; what is wrong is what gets
+    composed around and instead of them. A release that also retunes the framings cannot show that its
+    composition fix is what changed the output.
+  - >
+    **Deduplicating the framings themselves.** `CONVERSATION_PROMPT` and `WORKSPACE_PROMPT` share
+    three sentences, as do `CONVERSATION_TREE_PROMPT` and `TREE_PROMPT`; they are deliberately whole
+    strings so a byte-exact baseline can assert them, and folding them into a builder would rewrite
+    every baseline in `tests/prompt.rs` in the same release that changes composition. Retiring the
+    preset copies is the duplication this release removes; the framing copies stay.
+  - >
+    **The plan gate's behaviour.** `plan_lock()`, when `planning` is set, what `propose_plan` accepts
+    and what the approval path does are all untouched. Only what the classifying turn is *told* moves.
+  - >
+    **Any change to `product.yaml` or to the roadmap entries after this one.**
+  fallback_scope:
+  - >
+    The directive and the boundary corrected on both loops, with F1, F2 and their sabotages. That is
+    still a coherent release: the two ways a plan-gated classifying turn is currently lied to — told to
+    plan before it may answer, and told a boundary that will not refuse it — are closed, and neither
+    can reopen. The boundary half is the one that must not drop: it is the crate's own answer to "what
+    will refuse me", given wrong.
+  - >
+    The preset fix drops first if the release must shrink. It is reachable only by an embedder who
+    opted into a preset **and** uses the session API, and its worst outcome is a greeting answered in
+    the register of a work turn — nobody is misled about what is enforced. It would move to 0.61.0
+    whole, manner-and-framing separation included.
+  - >
+    `docs/STYLE.md` drops second, and costs nothing but itself: it documents a register the prose
+    already follows, so its absence changes no file in the repository.
+acceptance:
+  functional:
+  - >
+    **F1 — a plan-gated classifying turn is not ordered to plan before it may answer.** A test
+    composes the classifying opening under a contract with a plan gate, in both loops, and asserts the
+    composed block does not contain the unconditional sentence "Before you do anything else you must
+    call `propose_plan`" while still naming `propose_plan` and still ending with
+    `CONVERSATIONAL_ENDING`. It must fail on today's tree, which composes the unconditional form at
+    `src/run.rs:4098`. Sabotage: restore the unconditional directive on the classifying path, under
+    which only F1 fails.
+  - >
+    **F2 — a plan-gated classifying turn reads the boundary that will refuse it.** A test composes the
+    classifying opening under a plan gate with a policy that allows writes, in both loops, and asserts
+    the boundary section it carries is the one `plan_lock()` produces — writes and commands refused —
+    and is byte-identical to the section the same turn's `system` block carries on its planning arm.
+    It must fail on today's tree, where `after_planning` is passed at `src/run.rs:4539` and
+    `src/run.rs:7255`. Sabotage: pass `after_planning` on the classifying path again, under which only
+    F2 fails.
+  - >
+    **F3 — a preset never introduces a success criterion onto a turn that has none.** A test composes
+    a classifying turn with `SystemPrompt::Preset(Preset::Concise)` and with `Preset::Careful`, in the
+    flat loop, and asserts the result contains neither "to meet a stated specification" nor "checked
+    against the success criterion", contains `CONVERSATION_PROMPT`'s own framing, and still carries
+    the preset's marker clause. It must fail on today's tree, where `compose` returns
+    `preset.describe()` alone. Sabotage: restore the replacing arm in `compose`, under which F3 and F4
+    fail and no other.
+  - >
+    **F4 — a preset on a contained turn keeps the world it is in.** The same shape as F3 over the tree
+    loop: a preset on a classifying contained turn still carries `spawn_agent` and the sentence that a
+    sub-agent inherits its permissions, which today's replacement discards. It must fail on today's
+    tree.
+  - >
+    **F5 — every existing prompt baseline is untouched.** `V0440_WORKSPACE`, `V0490_CONVERSATIONAL`
+    and `V0440_TREE` still pass byte-exact prefix plus byte-exact suffix for `Builtin`, `Append` and
+    `Replace`, and `a_preset_is_opt_in_and_the_builtin_does_not_move` still passes with its marker and
+    tool assertions unedited. The one composed output this release deliberately moves is a preset's,
+    and F6 states exactly how.
+  - >
+    **F6 — the one prompt-text change is stated, not discovered.** Today `Preset::describe`'s bodies
+    omit "You may edit several files.", which `WORKSPACE_PROMPT` carries; composing manner onto framing
+    restores that sentence for a preset user on the workspace loop. The CHANGELOG says so under the
+    heading `docs/CHANGELOG_STRUCTURE.md` gives that class, and a test asserts the composed preset
+    prompt is exactly `WORKSPACE_PROMPT` plus the manner clause, so the change is one a reader can
+    reproduce rather than one they find in a diff of their own snapshots.
+  - >
+    **F7 — every existing docs gate stays green.** `tests/docs_drift.rs`, `tests/guide_pages.rs`,
+    `tests/readme.rs`, `public_api` and the `changelog` suite. Two to watch, both of which have cost a
+    round before: `readme_dependency_version_matches_cargo_toml` pins the README snippet at
+    major.minor, so `io-harness = "0.60"` must stay exactly as it is while `Cargo.toml` goes to
+    0.60.3; and `the_capabilities_release_table_covers_every_released_version` needs its
+    `docs/CAPABILITIES.md` row, which can only be checked after the version bump.
+  non_functional:
+  - >
+    **N1 — no public item moves.** `docs/public-api.txt` is byte-identical to the 0.60.2 snapshot, with
+    no regeneration. Asserted by the `public_api` suite staying green and by reading `git diff develop
+    -- docs/public-api.txt` as empty. This is what makes 0.60.3 a patch.
+  - >
+    **N2 — the version moves in exactly two files.** `Cargo.toml` and `Cargo.lock`, 0.60.2 → 0.60.3.
+  - >
+    **N3 — no framing is weakened and no boundary claim is widened.** The boundary section a classifying
+    turn now reads is produced by the same `boundary_section` call the `system` block's planning arm
+    already uses, from the same `effective` policy — not a new string, and not a stronger claim.
+    Evidenced by F2's byte-identity assertion between the two blocks rather than by review alone.
+  - >
+    **N4 — the composition rule stays in one place.** After this release `conversational_opening` still
+    has exactly one definition and the directive and the boundary are each selected inside it, not at
+    its call sites. A fix that made each loop choose for itself would restore the shape that produced
+    two of these three defects.
+  operational:
+  - >
+    **O1 — CI is green on all three platforms** on the feature branch and again on the merge to develop.
+    The prompt suites are cheap; the release still runs the whole matrix, because a composition change
+    reaches every loop.
+  - >
+    **O2 — the nightly rustdoc gate is green.** `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly
+    doc --all-features --no-deps`. This release edits two rustdoc blocks in `src/contract.rs` and
+    renames a `pub(crate)` item that one of them links to, which is exactly the shape of intra-doc
+    breakage the gate has caught in four of the last five releases.
+  - >
+    **O3 — the sabotage pass runs before the seal, one arm per functional criterion**, and each arm
+    fails its own criterion and no other. An arm that fails nothing is a finding recorded in the
+    record, not a rounding error.
+delivery:
+  target_mode: published
+  environment: >
+    crates.io for the crate, GitHub for the Release, docs.rs for the rendered rustdoc. No service, no
+    deployment target, no migration — the artifact is a library.
+  deployment_method: >
+    One feature branch `feat/0.60.3` off develop, one PR into develop, merged with the PR button. The
+    UltraShip record is sealed, the lock pinned and `ultraship validate` run to exit 0 **on that same
+    feature branch, in that same PR**, before the merge — not on a later `chore/*-record` branch, which
+    is the mistake 0.60.2 made and the owner corrected. develop then merges to main by PR, and the tag
+    `v0.60.3` is pushed on its own — pushing the tag is what cuts the GitHub Release, and creating the
+    Release by hand ships it with no assets. `cargo publish` is run manually, last, after the Release
+    exists, with the registry token sourced from the repo-local `.env`.
+  migrations:
+  - >
+    None. No schema, no checkpoint format, no configuration key, and no public item added, renamed or
+    removed. A program on 0.60.2 upgrading to 0.60.3 recompiles unchanged. An embedder who snapshots
+    composed system prompts and who selected a `Preset` will see one changed string; F6 states it and
+    the CHANGELOG names it.
+  observability:
+  - >
+    `EventKind::PromptComposed` already reports the family, the byte length, the source and whether a
+    boundary section was present, per run (`src/run.rs:14862-14883`). The boundary fix changes the
+    bytes a plan-gated classifying turn reports and nothing about the event's shape.
+  rollback: >
+    A prompt-composition defect is fixed forward as 0.60.4, not rolled back. `cargo yank` removes a
+    version from resolution for new dependents and does not delete it. The GitHub Release and tag can
+    be deleted; the crates.io publish cannot.
+dependencies:
+  products: []
+  services:
+  - crates.io, for the publish
+  - GitHub Actions, for CI on the three platforms and for the Release the tag cuts
+  - docs.rs, for the rendered rustdoc
+  human_approvals:
+  - >
+    None beyond the owner's standing authorisation to run the flow end to end. The conditional plan
+    directive is new prose the crate says to a model on a gated turn; it is reported in the release
+    record verbatim so the owner reads what shipped, but it does not gate the merge.
+resource_profile:
+  complexity: small
+  uncertainty: low
+  likely_cost_drivers:
+  - >
+    **`src/run.rs` is 16,620 lines and every site is inside it.** The three defects sit at 4078-4106,
+    4479-4541, 7183-7257 and 14803-14810; reading enough around each to change composition safely is
+    the bulk of the work, and it is why this entry is ordered before 0.63.0 decomposes the file.
+  - >
+    **The test helpers do not exist yet.** `conversational_system` and `tree_system`
+    (`tests/prompt.rs:127-158`) both compose under `Policy::permissive()` with no plan gate, which is
+    precisely why none of these three defects was caught. F1 and F2 need plan-gated, policy-bearing
+    variants of both, and a plan-gated turn needs the store to hold no approved plan.
+  - >
+    **The full suite on a contended machine.** `target/` is 26 G against 29 G free at planning time;
+    `target/debug/deps`, `build` and `incremental` are cleared before any full run, and the
+    all-features suite goes to the PR matrix rather than being run locally.
+  preferred_tools:
+  - '`tests/prompt.rs` as the pattern every new assertion follows — one file owns this class of claim'
+  - '`git log -S` on the composed sentences, to confirm which release introduced each and why'
+  - Grep over `src/run.rs` for `compose(`, `conversational_opening` and `boundary_section` call sites
+  constraints:
+  - >
+    No public item added, renamed or removed. The temptation here is a public `Preset::manner` — the
+    separation makes it look like an API worth exposing. It is `pub(crate)`, and exposing it is a minor.
+  - >
+    Nothing in this release may assert a duration or a timing. This project has paid for a timing
+    assertion on a CI runner more times than for anything else.
+  - >
+    No framing string is reworded. If a framing reads badly beside a manner clause, that is a finding
+    for a later release, not an edit here — F5's baselines are what make the composition fix legible.
+risks:
+- >
+  **The conditional directive weakens the gate in prose while the policy still holds.** `plan_lock()`
+  is what actually refuses a write, so the worst case of a badly worded directive is a wasted step and
+  a refusal, not an ungated write — but a directive that reads as optional invites exactly that wasted
+  step on every gated turn. The wording must bind the work reading as hard as today's binds every
+  reading. F1 asserts the sentence is present and conditional; the record quotes it in full so it is
+  reviewed as prose, not inferred from a test name.
+- >
+  **The boundary fix changes what a plan-gated turn's prompt contains, which moves 0.44.0's cache
+  boundary for that turn.** The prompt is still composed once per run and reused across steps
+  (`src/run.rs:4471-4473`), so the prefix is stable within a run; what changes is that a gated run's
+  prefix differs from the same run's ungated prefix, which was already true of the `system` block.
+  `a_classifying_turn_keeps_the_order_the_cache_boundary_reads` (`tests/prompt.rs:1082`) is the gate
+  and must stay green.
+- >
+  **The preset change alters a composed prompt an embedder may snapshot.** Stated in F6, in the
+  CHANGELOG and in `migrations` rather than elided. The alternative — leaving `describe` replacing the
+  framing — is the defect.
+- >
+  **A patch is treated as a low-risk release.** It publishes to crates.io irreversibly. The full
+  suite, all three platforms, the nightly rustdoc gate and the sabotage pass run exactly as they do
+  for a release that ships a feature.
+open_questions:
+- >
+  **Whether the conditional directive should also be used on the `system` block's planning arm.** That
+  block is composed for a turn already decided to be work, so the unconditional form is correct there
+  and the conditional one would be a second reading offered where there is only one. Excluded on that
+  reasoning; if implementation shows the two forms drifting, one function with a flag is the answer,
+  not two strings.
+- >
+  **Whether `Preset::manner` wants its own baseline constant in `tests/prompt.rs`.** The existing
+  preset test asserts a marker substring rather than the whole body. F6 needs a byte-exact composed
+  form for one case; whether all four preset-times-loop combinations deserve baselines, or whether that
+  is the false precision the file's other baselines exist to avoid, is a call for implementation.
+- >
+  **Whether `docs/STYLE.md` belongs in `docs/` or `docs/guide/`.** `tests/guide_pages.rs` governs the
+  guide directory and may require registration; `docs/` holds the contract-adjacent files. Decide by
+  reading that test rather than by preference.
