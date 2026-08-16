@@ -62,21 +62,31 @@ pub enum SystemPrompt {
     /// does not replace what the crate has to say about the request it is
     /// building.
     Replace(String),
-    /// (0.49.0) One of the crate's own shaped descriptions, chosen **by name**.
+    /// (0.49.0) One of the crate's own working styles, chosen **by name**.
     ///
-    /// Composed exactly where [`SystemPrompt::Replace`]'s text is, so everything
-    /// the crate has to say about the request is still built around it.
+    /// Unlike [`SystemPrompt::Replace`] this does not stand in for the crate's
+    /// description: it is appended to whichever description the run's own loop
+    /// chose, and everything the crate has to say about the request is still
+    /// composed around the pair (0.60.3). A preset therefore never decides which
+    /// world the agent is in — that is the loop's and the classification's — only
+    /// how the work is done and reported.
     Preset(Preset),
 }
 
-/// (0.49.0) A shaped agent description this crate ships, for an embedder who wants
-/// more than four tool names and less than a whole prompt of their own.
+/// (0.49.0) A working style this crate ships, for an embedder who wants more than
+/// four tool names and less than a whole prompt of their own.
 ///
 /// [`SystemPrompt::Builtin`] says what the tools are and nothing about how to use
 /// them: no tone, no output format, no rule about length. The two options before
 /// this were to accept that or to write an agent prompt from scratch. A preset is
 /// the third, and it is **opt-in by name** — see [`SystemPrompt`] for why that is
 /// not the thing 0.45.0 declined to ship.
+///
+/// **Manner and framing are separate axes (0.60.3).** A preset names no tools and
+/// describes no agent, because the framing it is appended to already did both. Up
+/// to 0.60.2 it carried a whole description and was composed *instead of* that
+/// framing, which meant selecting one silently decided what world the agent was in
+/// — the one thing the sentence below says it never does.
 ///
 /// Deliberately small. Each variant states the working style it is for, and a
 /// variant that is merely a tone would be the catalogue this is not.
@@ -108,18 +118,28 @@ pub enum Preset {
 }
 
 impl Preset {
-    /// The description this preset composes in place of the builtin one.
+    /// The working style this preset appends to whichever framing the loop chose.
     ///
-    /// It names the same tools as [`SystemPrompt::Builtin`] because it describes the
-    /// same agent in the same workspace — a preset shapes how the work is done and
-    /// reported, never what the agent can reach.
-    pub(crate) fn describe(self) -> &'static str {
+    /// **A manner, not a description (0.60.3).** Up to 0.60.2 a preset returned a
+    /// whole replacement description and was composed *instead of* the loop's own
+    /// framing — so choosing `Concise` on a session turn threw away
+    /// `CONVERSATION_PROMPT` and handed the operator back the two claims 0.49.0
+    /// removed, and choosing it on a contained turn threw away the paragraph that
+    /// says the agent may spawn. That made this type's own promise — a preset shapes
+    /// how the work is done and reported, never what the agent can reach — untrue as
+    /// written.
+    ///
+    /// The two axes are separate and compose: which world the agent is in is chosen
+    /// by the loop and by the classification, how it works and reports is chosen by
+    /// the embedder. So this names no tools and describes no agent; the framing
+    /// beside it already did both, once.
+    pub(crate) fn manner(self) -> &'static str {
         match self {
             Preset::Concise => {
-                "You are an agent working across a repository to meet a stated specification. Use `grep` to search file contents and `find` to locate files by name, then `read_file` to inspect a file before changing it, and `write_file` with the file's path and full new contents to edit it. Work in small steps; after each of your steps the whole set is checked against the success criterion. Act before you explain: make the change, then report what you changed in one or two sentences. Do not restate the request, do not narrate what you are about to do, and do not summarise work the operator can see in the diff."
+                "Act before you explain: make the change, then report what you changed in one or two sentences. Do not restate the request, do not narrate what you are about to do, and do not summarise work the operator can see in the diff."
             }
             Preset::Careful => {
-                "You are an agent working across a repository to meet a stated specification. Use `grep` to search file contents and `find` to locate files by name, then `read_file` to inspect a file before changing it, and `write_file` with the file's path and full new contents to edit it. Work in small steps; after each of your steps the whole set is checked against the success criterion. Before you report a change as done, check it: read back what you wrote, or run the project's own check where one exists. Say what you verified and how. If you could not verify something, say that instead of implying you did."
+                "Before you report a change as done, check it: read back what you wrote, or run the project's own check where one exists. Say what you verified and how. If you could not verify something, say that instead of implying you did."
             }
         }
     }

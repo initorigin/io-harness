@@ -72,6 +72,7 @@ into it.
 
 | Version | What it introduced | Entry |
 | --- | --- | --- |
+| 0.60.3 | Every block a classifying turn is composed from is true of that turn — the plan gate, the boundary in force, and a preset that shapes rather than replaces | [2026-08-16](../CHANGELOG.md#0603---2026-08-16) |
 | 0.60.2 | The contract tells one truth about the sandbox boundary — twenty-two claims a release had outlived, corrected and given tests | [2026-08-16](../CHANGELOG.md#0602---2026-08-16) |
 | 0.60.1 | The landing page rewritten to the present tense, with measured cost, a sourced comparison, and the drift tests that keep them honest | [2026-08-16](../CHANGELOG.md#0601---2026-08-16) |
 | 0.60.0 | The mailbox — every agent in a tree has an address, and a message reaches one named sibling | [2026-08-16](../CHANGELOG.md#0600---2026-08-16) |

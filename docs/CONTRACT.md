@@ -1716,6 +1716,28 @@ it. There is no preset catalogue and there will not be one: a preset shipped by 
 library is an opinion about model behaviour the library cannot test and cannot
 withdraw.
 
+**A preset is a manner appended to a framing, never a replacement for one
+(0.60.3).** Which world the agent is in — a task to meet, a conversation to answer,
+a tree it may fan out across — is chosen by the loop and by the classification.
+How the work is done and reported is chosen by the embedder. They are separate
+axes and they compose, so `SystemPrompt::Preset` names no tools and describes no
+agent: the framing beside it already did both, once. Up to 0.60.2 a preset carried
+a whole description and stood where `Replace`'s text stands, which meant selecting
+`Concise` on a session turn silently reframed a greeting as work.
+
+**Why the framings differ at all.** The one-shot entry points are task-framed
+because their caller declared work in code — a `TaskContract` with a goal and a
+`Verification` is a statement that there is something to meet. The session entry
+points are conversation-framed on the first completion of a turn carrying
+`Verification::None`, because their operator declared nothing: what they typed may
+be work and may be a question, and the model is the thing best placed to tell them
+apart. Every block composed for that turn is held to the same standard as a result
+— **it must be true of the turn being taken**. That is one rule with three
+consequences already paid for: the user block stopped telling a classifying turn to
+call a tool (0.48.0), the system block stopped telling it that it had a
+specification (0.49.0), and the plan directive stopped ordering it to plan before it
+was permitted to answer (0.60.3).
+
 ## What the boundary section tells the agent, and what it leaves out (0.45.0)
 
 When a run enforces a policy, the system block carries one line per act — read,
@@ -1738,7 +1760,10 @@ event carries, so the prompt and the refusal name the same thing.
   composed once. The remembered rule *widens* what is permitted, so the section
   stays conservative rather than wrong. A plan gate is reflected: the narrowed
   policy is what the planning prompt describes, and the loop already switches
-  prompts when the phase ends.
+  prompts when the phase ends. **Both blocks of a gated turn describe the same
+  narrowed policy (0.60.3)** — the classifying opening was handed the post-plan
+  boundary until then, so a turn under the gate read one thing while `plan_lock`
+  refused another.
 - **The section is not the boundary.** The `Policy` is, enforced in the tool and
   verification layers before any call runs. Telling the agent is an optimisation
   against paying a step per refusal, and no prompt text widens anything.
