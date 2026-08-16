@@ -5828,6 +5828,24 @@ fn goal_digest(goal: &str) -> u32 {
 /// tree that would have carried on into a tree that stops. Thirty seconds is long
 /// enough that a sibling doing real work can answer within it and short enough
 /// that a whole fan-out cannot be lost to one agent's patience.
+///
+/// ```
+/// use io_harness::{TaskContract, DEFAULT_MAX_WAIT};
+///
+/// // What an agent may ask for when the contract names no ceiling of its own.
+/// assert_eq!(DEFAULT_MAX_WAIT.as_secs(), 30);
+/// assert_eq!(
+///     TaskContract::workspace("coordinate the fan-out", "/repo").max_wait_secs,
+///     None,
+///     "unset means this constant, never `forever`",
+/// );
+///
+/// // An operator who wants a tighter one says so, and a project-scoped
+/// // `io.toml` may lower it further and may not raise it.
+/// let bounded = TaskContract::workspace("coordinate the fan-out", "/repo")
+///     .with_max_wait_secs(5);
+/// assert!(bounded.max_wait_secs.unwrap() < DEFAULT_MAX_WAIT.as_secs());
+/// ```
 pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(30);
 
 /// How often a blocked read looks again (0.60.0).
@@ -5844,9 +5862,38 @@ const WAIT_POLL: Duration = Duration::from_millis(200);
 /// Named like [`SPAWN_TOOL`] and for the same reason: an [`Observer`] matching on
 /// [`EventKind::ToolCall`] needs the string, and a literal typed into an
 /// embedder's match arm is one that goes stale silently.
+///
+/// ```
+/// use io_harness::{EventKind, Flow, Observer, RunEvent, SEND_MESSAGE_TOOL};
+///
+/// // An observer that counts what one agent told another, without matching on a
+/// // string literal of its own.
+/// struct Chatter(std::sync::atomic::AtomicUsize);
+/// impl Observer for Chatter {
+///     fn event(&self, e: &RunEvent) -> Flow {
+///         if let EventKind::ToolCall { name, .. } = &e.kind {
+///             if name == SEND_MESSAGE_TOOL {
+///                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+///             }
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// assert_eq!(SEND_MESSAGE_TOOL, "send_message");
+/// ```
 pub const SEND_MESSAGE_TOOL: &str = "send_message";
 
 /// The tool an agent uses to read what other agents have sent it (0.60.0).
+///
+/// ```
+/// use io_harness::{READ_MESSAGES_TOOL, SEND_MESSAGE_TOOL};
+///
+/// // The pair. Both are offered inside a tree and in neither `run` nor
+/// // `run_with`, which never expose a tool that needs somebody to talk to.
+/// assert_eq!(READ_MESSAGES_TOOL, "read_messages");
+/// assert_ne!(READ_MESSAGES_TOOL, SEND_MESSAGE_TOOL);
+/// ```
 pub const READ_MESSAGES_TOOL: &str = "read_messages";
 
 /// The character a *derived* address uses and an assigned one may not (0.60.0).

@@ -117,6 +117,20 @@ pub const CHECKPOINT_FORMAT: i64 = 7;
 /// that refuses it, the resolution that answers it, and the listing a refusal
 /// prints — and a literal repeated three times is a literal that will disagree
 /// with itself.
+///
+/// ```
+/// use io_harness::{Store, ROOT_ADDRESS};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let root = store.start_run("coordinate the fan-out", "/repo")?;
+///
+/// // A tree with no children is still addressable, and the root is the address
+/// // in it. Nothing has to be spawned for that to be true.
+/// assert_eq!(store.tree_addresses(root)?, vec![(ROOT_ADDRESS.to_string(), root)]);
+/// # Ok(())
+/// # }
+/// ```
 pub const ROOT_ADDRESS: &str = "root";
 
 /// The one outcome string that means the run did what it was asked.

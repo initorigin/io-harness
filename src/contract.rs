@@ -315,8 +315,8 @@ pub struct TaskContract {
     pub max_read_chars: Option<u64>,
     /// The longest an agent may block waiting for a message, in seconds (0.60.0).
     ///
-    /// `None` — the default — is [`DEFAULT_MAX_WAIT`], and an agent asking for
-    /// longer is given the cap and told so. There is deliberately no way to say
+    /// `None` — the default — is [`DEFAULT_MAX_WAIT`](crate::DEFAULT_MAX_WAIT),
+    /// and an agent asking for longer is given the cap and told so. There is deliberately no way to say
     /// "wait forever": an agent that blocks holds its concurrency slot, and the
     /// sibling that would answer it may be the one queued behind that slot. A
     /// bounded wait turns that from a tree that stops into a tree that carries on

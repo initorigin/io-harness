@@ -84,7 +84,7 @@ tasks:
   why_required: 'There is no mailbox without an address, and the roadmap''s `by name` did not name one:
     a roster name is a role two children share. Nothing in this crate has ever identified one agent.
     Every send and every read resolves through what this task builds.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.0-T01
   acceptance_criteria:
@@ -107,7 +107,26 @@ tasks:
     for the root reach the child; only F4 fails.
 
     '
-  evidence: []
+  evidence:
+  - 'F2 — `two_children_of_one_definition_are_two_addresses` in `tests/mailbox.rs`. Two children of
+    ONE roster definition, spawned in the same step with `as` names `a` and `b`, each write down every
+    message they saw: `a` sees only "for a only" and `b` only "for b only". Under a resolution that
+    went by the definition''s name they would be one address and both would see both.'
+  - 'F3 — `a_duplicate_address_costs_no_run_no_slot_and_no_queue_place`. The three numbers are compared
+    against a CONTROL run identical except that the second spawn asks for a free address: (children,
+    agent_count_tree, queued) is (1, 2, 0) refused against (2, 3, 0) allowed. Asserting them against
+    themselves would have passed for a refusal that allocated and rolled back, which is not what the
+    criterion claims.'
+  - F4 — `a_child_cannot_take_the_roots_address`. The refusal names the reason, and `store.children(root)`
+    is empty afterwards.
+  - 'The address is durable: `spawns.as_name`, added by `ALTER TABLE`, read back by `find_spawn`, and
+    taken by the adopt path in `spawn_child` rather than re-derived. The adoption key `(parent_run_id,
+    step, goal)` is unchanged, so a resumed tree re-adopts the same children under the names they already
+    had.'
+  - An assigned address may not contain `#`, which is the character a derived one uses (`<role>#<run
+    id>`). That is what makes the two namespaces disjoint by one rule rather than by a collision check
+    that would have to be right about a run id nobody has allocated yet — `address_is_assignable` in
+    `src/run.rs`.
   files:
   - src/run.rs
   - src/state.rs
@@ -118,7 +137,7 @@ tasks:
   why_required: 'This is the release''s vertical slice and its declared fallback scope: after it a child
     can tell a sibling what it found and the sibling reads it on its next step. Everything after it
     is about when a read returns, not about whether the channel exists.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.0-T02
   acceptance_criteria:
@@ -151,7 +170,22 @@ tasks:
     except for the two tool schemas.
 
     '
-  evidence: []
+  evidence:
+  - 'F1 — `a_child_tells_a_sibling_what_it_found` in `tests/mailbox.rs`. The author''s script does NOT
+    contain the answer: it writes whatever follows `FOUND ` in its own prompt, so `edited.txt` holding
+    `src/auth.rs:210` is evidence the message arrived. With nothing delivered it writes `nothing`, so
+    the negative half is built into the same run.'
+  - 'F10 — `an_unknown_address_is_refused_with_what_is_reachable`. The observation carries both the
+    address that failed and `Reachable from here: root, scout`, so a mistyped address recovers in one
+    step.'
+  - F11 — `an_address_does_not_reach_out_of_its_own_tree`. Two trees over ONE store; the second cannot
+    address the first's `alpha`, and the refusal reads like any other unknown name — the listing does
+    not mention it either, so the other tree's shape does not leak to an agent that cannot reach it.
+  - F15 — `a_flat_run_is_offered_no_mailbox`. Read off the tool schemas the provider was actually SENT,
+    not off `workspace_tools`, with `spawn_agent`'s absence as the control.
+  - 'N7 — the tools are two more `ToolSpec`s in a tree''s request and nothing else: no prompt block,
+    no per-step query, no fold. `Addressing::resolve` runs inside the tool call rather than at the top
+    of the agent loop, so a run whose agents never message pays nothing for the mailbox existing.'
   files:
   - src/run.rs
   - src/observe.rs
@@ -162,7 +196,7 @@ tasks:
   why_required: Without it the third verb the entry names is missing and a coordinator still cannot
     wait on a named child. It is also the release's one genuinely open shape, so it is built after the
     slice that survives without it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.0-T03
   acceptance_criteria:
@@ -195,7 +229,32 @@ tasks:
     scope raises the ceiling and only F14 fails.
 
     '
-  evidence: []
+  evidence:
+  - F6 — `a_wait_returns_when_the_message_arrives`. Asserted as elapsed < the clock the test itself
+    supplied (20s), never as an absolute duration. **This is the guard that caught the release's central
+    defect** — see the note below.
+  - 'F7 — `waiting_out_the_clock_reads_differently_from_finding_nothing`. Both sentences produced in
+    ONE run and compared: `[messages] nothing waiting` for a drain against `nothing arrived in 1s` for
+    a wait that expired.'
+  - 'F8 — `waiting_on_an_agent_that_has_finished_returns_at_once`. Sibling to sibling, and it has to
+    be: a PARENT waiting on its own child never reaches this path, because F9''s terminal post means
+    a finished child has always said exactly one thing to its parent. Elapsed asserted against a 30s
+    clock.'
+  - 'F13 — `the_operators_cap_narrows_the_request_and_says_so`. The boundary pair is exact: cap 5, a
+    request of 5 is NOT narrowed and a request of 6 IS, so `>` in place of `>=` fails. No arm of this
+    test spends a clock — a message (the child''s own terminal post) is already waiting, and the narrowing
+    is decided from the request and the cap before anything is read.'
+  - F14 — `a_project_scoped_file_may_lower_the_wait_ceiling_and_may_not_raise_it` in `tests/config.rs`,
+    plus `max_wait_secs_reaches_the_contract_through_the_ordinary_projection` and `a_misspelled_wait_ceiling_is_refused_by_name`.
+    60 config tests passed.
+  - '**A DEFECT NO TEST WOULD HAVE REPORTED, found by the clock.** The first implementation of the wait
+    slept. A detached child is a future in its parent''s own `inflight` set and nothing else polls it,
+    so a sleeping parent stopped the very siblings whose message it was waiting for: every wait ran
+    to its FULL clock and then succeeded on the step after. The suite was green throughout — 13 of 13
+    — and the only visible symptom was that the mailbox tests took 40 seconds. The fix is one call:
+    the wait is passed through `driving`, the helper 0.50.0 already wrote for the provider call. The
+    suite went from 40.24s to 0.65s. F6''s elapsed assertion is what makes this a test rather than an
+    anecdote.'
   files:
   - src/run.rs
   - src/config.rs
@@ -206,7 +265,7 @@ tasks:
   why_required: 'These are one task because they are the same claim from two sides: a wait unblocks
     on the sender terminating, and a resumed tree must not re-deliver what it already delivered. Both
     are properties of the `read_at` column rather than of anything in memory.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.0-T04
   acceptance_criteria:
@@ -223,7 +282,17 @@ tasks:
     rather than the `read_at` column, under which the resume re-delivers and only F12 fails.
 
     '
-  evidence: []
+  evidence:
+  - F9 — `a_finished_child_posts_once_and_the_report_still_arrives`. The parent's mailbox holds EXACTLY
+    one row from the child, its body starts `[finished] ` and is under 120 bytes, and 0.50.0's composed
+    report still reaches the parent's ledger. A report in the body would deliver it twice.
+  - 'F12 — `a_reopened_store_delivers_what_is_left_and_nothing_twice`. The store is closed and reopened
+    between the two reads, so a delivery marked anywhere but the row does not survive: three messages
+    read, two more sent, and the reopened store delivers exactly `finding 3` and `finding 4` in that
+    order and nothing a third time. The audit read then shows all five marked, so nothing was re-delivered
+    rather than merely not re-returned.'
+  - The terminal post is NOT made for a pause. A child stopped for a human has not terminated, and saying
+    it has would tell a waiting sibling to stop waiting for an agent that is about to carry on.
   files:
   - src/run.rs
   - src/state.rs
@@ -233,7 +302,7 @@ tasks:
   why_required: The contract's own risk register says the role/address confusion lives in the prose
     more than in the code, and the standing rule is that documentation ships in the release that changes
     the behaviour, never later.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.0-T05
   acceptance_criteria:
@@ -246,7 +315,28 @@ tasks:
     and a poll of a table this crate already opens; nothing is added for it.
 
     '
-  evidence: []
+  evidence:
+  - 'N4 — **MET IN A DIFFERENT FORM, and the difference is the criterion''s own number.** `docs/public-api.txt`
+    gains **FIVE** lines, not the one the contract predicted: `struct AgentMessage`, `const ROOT_ADDRESS`,
+    `const SEND_MESSAGE_TOOL`, `const READ_MESSAGES_TOOL`, `const DEFAULT_MAX_WAIT`. The prediction
+    applied 0.59.0''s lesson too literally — that file tracks every NAME re-exported from `src/lib.rs`,
+    consts included (`SPAWN_TOOL` has been in it since 0.12.0), not root-level types only. The three
+    tool/address consts are `pub` for exactly the reason `SPAWN_TOOL` is: an `Observer` matching on
+    `EventKind::ToolCall` needs the string, and a literal typed into an embedder''s match arm goes stale
+    silently. Carried as a `known_limitations` line rather than glossed.'
+  - 'The insertion was made in place rather than by re-sorting the file: `docs/public-api.txt` is not
+    perfectly sorted, and a wholesale sort produced a 12-insertion/7-deletion diff of unrelated churn.
+    `git diff --stat` reads **5 insertions, 0 deletions**.'
+  - N6 — no new runtime dependency. The wait is `tokio::time` and a poll of a table this crate already
+    opens; nothing was added for it.
+  - 'Surfaces, all in this release rather than later: `docs/guide/mailbox.md` (new, with its limits
+    block), its rows in `docs/CAPABILITIES.md` and the README table, a README prose paragraph, a `##
+    What an address reaches, and what a message is not (0.60.0)` section in `docs/CONTRACT.md` with
+    eight "stated plainly" bullets, a CHANGELOG entry with Added/Fixed/Changed/Schema, the crate-root
+    paragraph in `src/lib.rs`, and rustdoc with a worked example on every new public item.'
+  - '`tests/guide_pages.rs` has three gates a new page has to satisfy and they are easy to miss: the
+    page must be in `GUIDES` with its limits flag, it must be named in `docs/CAPABILITIES.md`, and nothing
+    unlisted may sit in `docs/guide/`.'
   files:
   - docs/CONTRACT.md
   - docs/public-api.txt
