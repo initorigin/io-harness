@@ -254,3 +254,68 @@ fn control_a_complete_page_is_not_reported() {
     )]);
     assert!(found.is_empty(), "expected no loss, got {found:#?}");
 }
+
+// ---------------------------------------------------------------------------
+// The README's own table is the other way in, and it drifts the same way
+// ---------------------------------------------------------------------------
+
+/// Guide pages `readme` does not carry a table row for.
+///
+/// `no_guide_page_is_orphaned_from_the_index` checks the same claim against
+/// `docs/CAPABILITIES.md` and has done since the split. Nothing ever checked it
+/// against the README, which is how the browser page came to be linked in a
+/// sentence of prose and absent from the table of twenty-four rows beside
+/// twenty-five pages.
+///
+/// A table row, not a mention: a page linked only from a paragraph is reachable
+/// by a reader who is already reading that paragraph, which is not what an index
+/// is for.
+fn pages_missing_a_readme_row<'a>(readme: &str, pages: &[&'a str]) -> Vec<&'a str> {
+    let rows: Vec<&str> = readme
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("| ["))
+        .collect();
+    pages
+        .iter()
+        .copied()
+        .filter(|page| !rows.iter().any(|row| row.contains(page)))
+        .collect()
+}
+
+#[test]
+fn every_guide_page_has_a_readme_row() {
+    let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        .expect("README.md");
+    let names: Vec<&str> = GUIDES.iter().map(|(name, _)| *name).collect();
+    let missing = pages_missing_a_readme_row(&readme, &names);
+
+    assert!(
+        missing.is_empty(),
+        "the README's guide table is the way in for a reader who arrived at the landing \
+         page. These pages exist and its table does not list them: {missing:?}"
+    );
+}
+
+#[test]
+fn control_a_page_linked_only_from_prose_is_reported() {
+    // Exactly the defect: a real link, in a real sentence, and no row.
+    let readme = "See [driving a browser](docs/guide/browser.md) for the details.\n\
+                  \n\
+                  | Guide | What it covers |\n\
+                  | --- | --- |\n\
+                  | [Permissions](docs/guide/permissions.md) | rules |\n";
+    assert_eq!(
+        pages_missing_a_readme_row(readme, &["permissions.md", "browser.md"]),
+        vec!["browser.md"]
+    );
+}
+
+#[test]
+fn control_a_complete_readme_table_is_not_reported() {
+    let readme = "| Guide | What it covers |\n\
+                  | --- | --- |\n\
+                  | [Permissions](docs/guide/permissions.md) | rules |\n\
+                  | [Driving a browser](docs/guide/browser.md) | pages |\n";
+    assert!(pages_missing_a_readme_row(readme, &["permissions.md", "browser.md"]).is_empty());
+}
