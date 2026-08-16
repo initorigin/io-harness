@@ -195,7 +195,7 @@ tasks:
     F5 is satisfied by the recorded output, not by the reading. This release exists because 0.60.1's
     sweep over the same file did not reach three contradictions; a sweep whose evidence is 'I looked'
     is the thing that lets a fourth survive into 0.63.0.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.2-T01
   - US-IO-HARNESS-0.60.2-T02
@@ -209,7 +209,50 @@ tasks:
   files:
   - .ultraship/products/io-harness/evidence/0.60.2/contract-sweep.md
   - docs/CONTRACT.md
-  evidence: []
+  evidence:
+  - >
+    The sweep is recorded per claim in
+    `.ultraship/products/io-harness/evidence/0.60.2/contract-sweep.md` — the population (222
+    version-numbered lines, ~150 distinct claims), the method, and a row per claim with its verdict
+    and the source file:line it was checked against. Evidence is untracked by design.
+  - >
+    **The sweep found nineteen further stale claims, and they are fixed here: 24 corrections in 22
+    places.** That is far past the "handful" the contract's first open question set as the threshold
+    for splitting the sweep into its own release. The judgement is recorded rather than made
+    silently: every correction is a one-or-two-sentence replacement in the same class as the three
+    the release was written for, none touches `src/` behaviour, and leaving twenty-two known-false
+    statements standing in the file this release exists to correct would have been the worse outcome.
+    The structural work the audit also wants stays excluded.
+  - >
+    **The sharpest one was wrong in the safe direction, which is why nobody caught it.**
+    `docs/CONTRACT.md:1168` told a reader that on a stock Ubuntu 24.04 — the commonest Linux CI image
+    — a contained command takes `PortableFloor` and gets **no filesystem confinement and no egress
+    denial**. The Landlock rung needs no namespace and exists precisely because that host refuses
+    one, so it gets confinement. The claim appeared in three places (1168, 1707, 2645) and each said
+    the same false thing.
+  - >
+    **`docs/CONTRACT.md:1222` was the same shape as the paragraph this release was written for.**
+    "Everything a run starts is contained (0.48.0)" declared a class closed; 0.51.0, 0.52.0 and
+    0.53.0 then each opened one — the post-edit checker and `check` build their own uncontained
+    `Exec` (`src/tools/diagnostics.rs:271` says so in a code comment), a language server is spawned
+    directly (`src/lsp.rs:321`), and on unix the browser child is spawned directly
+    (`src/browser.rs:856`). The heading is narrowed, the three are named with what each still passes
+    through, and wrapping them is recorded as a finding for a later release rather than smuggled in.
+  - >
+    Verification discipline held: **every row whose verdict was not `current` was re-checked by hand
+    against the named source before anything was edited.** Two reported items did not survive that
+    check and were not acted on — `libsqlite3-sys 0.38.1` at line 80 (the sentence is about which
+    version introduced the 1.95 floor, and that is still 0.38.1, whatever the lock now resolves) and
+    the `## Related` heading's position (structural, and excluded by scope). Both are recorded in the
+    evidence so a later sweep does not reopen them.
+  - >
+    One correction is a defect that was never drift: `docs/CONTRACT.md:1961` names five aggregate
+    queries and gives four timings "respectively". `git show 3856084` shows it has read that way
+    since the 0.30.0 commit that wrote it. The false pairing is removed and no timing is
+    re-measured — this release forbids asserting one.
+  - >
+    F4 after the sweep edits: `docs_drift` 44 of 44, `guide_pages` 10 of 10, `changelog` 5 of 5,
+    `public_api` 9 of 9, all green.
 - id: US-IO-HARNESS-0.60.2-T05
   summary: >-
     Run every docs gate, the lint polarities and the nightly rustdoc gate, and record the sabotage arms.
