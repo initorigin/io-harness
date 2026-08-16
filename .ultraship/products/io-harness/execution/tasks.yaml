@@ -260,7 +260,7 @@ tasks:
     Three new tests that must each fail on today's tree and each be killed by exactly one sabotage arm,
     plus the existing suites that read the same files. F4 and O2 are this task; without it the release
     ships three assertions nobody has watched fail.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.2-T01
   - US-IO-HARNESS-0.60.2-T02
@@ -282,4 +282,32 @@ tasks:
     two rustdoc blocks, so it is exactly the one that must not skip it.
   files:
   - .ultraship/products/io-harness/evidence/0.60.2/gates.md
-  evidence: []
+  evidence:
+  - >
+    Every gate command and its result is recorded in
+    `.ultraship/products/io-harness/evidence/0.60.2/gates.md`. Green locally: `cargo fmt --check`,
+    `cargo clippy --all-targets --all-features -- -D warnings`, `cargo clippy --all-targets -- -D
+    warnings`, `cargo test` (exit 0 — 88 test binaries plus the doctest run, **1,866 passed**, of
+    which 457 doctests), the nightly rustdoc gate, and the cross-version generator plus
+    `a_current_store_is_read_by_a_0_29_0_binary`.
+  - >
+    O2 — the nightly rustdoc gate was run **twice**, not once, because this release edits two rustdoc
+    blocks in separate tasks. The first run followed `exec_sandbox` gaining an intra-doc link to
+    `SandboxLimits::max_wall_secs`; the second followed `src/tools/custom.rs`'s doc comment changing.
+    A gate that ran before the last edit to the surface it gates has not run. Clean both times.
+  - >
+    F4 — every existing docs gate stays green: `docs_drift` 44 of 44, `guide_pages` 10 of 10,
+    `changelog` 5 of 5, `public_api` 9 of 9, and the whole default suite is green with them.
+    `readme_dependency_version_matches_cargo_toml` is the one to re-check after the version bump, not
+    before it, and that happens at `complete`.
+  - >
+    **Four sabotage arms, all four killed their named test and nothing else.** F1 restores the
+    pre-0.45.0 sentence (35 passed, 1 failed); F2 restores the 0.47.0-era clause (38 passed, 1
+    failed); F3a restores the whole pre-fix guide bullet (43 passed, 1 failed, and `guide_pages`
+    stays 10 of 10); F3b reinstates `forget` alone in the corrected bullet and the failure **names
+    it**, while `mcp__` in the same sentence is correctly not reported. No arm survived, so there is
+    no "a sabotage that failed nothing" finding for this release.
+  - >
+    O1 — `cargo test --all-features` is handed to the PR matrix on three platforms rather than run
+    locally, which is this repository's standing arrangement for that one gate. Stated plainly rather
+    than implied: it ran on CI, not here.
