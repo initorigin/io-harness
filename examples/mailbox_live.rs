@@ -51,29 +51,34 @@ async fn main() -> io_harness::Result<()> {
         "You are a coordinator. Do NOT read any file yourself and do NOT write \
          answer.txt yourself.\n\
          \n\
-         Spawn exactly two sub-agents, both with \"wait\": false so they run at \
-         the same time:\n\
-         1. goal: \"read secret.txt and send the release word to the agent \
-            addressed `author` using send_message\", as: \"scout\"\n\
-         2. goal: \"call read_messages with from=scout and wait_secs=60. The \
-            scout will send you a release word. Then write answer.txt containing \
-            exactly that word.\", as: \"author\"\n\
+         Call spawn_agent exactly twice, in one step. On BOTH calls pass \
+         \"wait\": false and pass NOTHING else about waiting — do not pass \
+         background_after_secs at all, it cannot be combined with wait:false.\n\
          \n\
-         Use verify_file secret.txt / verify_contains release for the scout, and \
-         verify_file answer.txt / verify_contains OTTER for the author.\n\
+         First call: goal \"Read secret.txt. It contains one release word. Send \
+         that word to the agent addressed `author` with send_message. Then write \
+         sent.txt containing the word SENT.\", as \"scout\", verify_file \
+         \"sent.txt\", verify_contains \"SENT\".\n\
          \n\
-         After spawning both, call read_messages with wait_secs=60 until both \
-         have reported finishing, then stop.",
+         Second call: goal \"You cannot read any file. Call read_messages with \
+         from=scout and wait_secs=20. The scout will send you one release word. \
+         Write answer.txt containing exactly the word the scout sent you and \
+         nothing else — do not invent one — and then write done.txt containing \
+         the word DONE.\", as \"author\", verify_file \"done.txt\", \
+         verify_contains \"DONE\".\n\
+         \n\
+         After both spawns, call read_messages with wait_secs=20 until both \
+         sub-agents have reported finishing, then stop.",
         dir.path(),
     )
     .with_verification(Verification::WorkspaceFileContains {
         file: "answer.txt".into(),
         needle: secret.clone(),
     })
-    .with_max_steps(10)
+    .with_max_steps(8)
     // Long enough for a real model to think between the send and the read, and
     // short enough that a run that has gone wrong ends rather than hangs.
-    .with_max_wait_secs(60);
+    .with_max_wait_secs(20);
 
     // The author is denied the file. This is what makes the run evidence: there
     // is no path from the author to the secret except the scout's message.
@@ -96,6 +101,15 @@ async fn main() -> io_harness::Result<()> {
     .await?;
 
     println!("outcome: {:?}", result.outcome);
+
+    // What each agent actually did, step by step. A live run that produced no
+    // messages has to say why, or it is an anecdote rather than a gate.
+    for run in std::iter::once(result.run_id).chain(store.children(result.run_id)?) {
+        println!("-- run {run}");
+        for s in store.steps(run)? {
+            println!("   {}: {}", s.step, s.decision);
+        }
+    }
 
     // What actually travelled, read back out of the store rather than out of the
     // run: this is the same rendering an operator auditing the tree would get.

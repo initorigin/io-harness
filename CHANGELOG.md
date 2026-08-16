@@ -86,6 +86,18 @@ notes are produced from it.
 
 ### Fixed
 
+- **`spawn_agent` no longer refuses `"wait": false` beside
+  `"background_after_secs": 0`.** 0.50.0 wrote the rule that a zero-second wall
+  clock and "do not wait" are the same request, and applied it to only one of the
+  two spellings: `wait: true` with a zero clock detached, and `wait: false` with
+  the same zero was refused as a contradiction. Filling every property of a tool
+  schema with its zero value is ordinary model behaviour, not exotic — the live
+  run that found this sent `"agent": ""`, `"deny_write": []`, `"deny_net": []`
+  and `"background_after_secs": 0` on every call, and every other one of those
+  was already read as "unset". Such a model could not spawn a detached child at
+  all, and no fixture noticed because a fixture writes only the arguments it
+  means. A contradiction is now a clock that is actually asked to elapse.
+
 - **A blocked agent no longer starves the children it is waiting for.** A
   detached child is a future driven by its parent's own loop and by nothing else,
   so the first implementation of the wait — which slept — stopped the very

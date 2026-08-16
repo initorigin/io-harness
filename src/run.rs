@@ -8215,16 +8215,30 @@ fn narrowed(
 /// A zero-second wall clock is [`Return::Detach`] and not an error: "wait zero
 /// seconds for it" and "do not wait for it" are the same request, and refusing
 /// one spelling of a coherent instruction teaches a model nothing.
+///
+/// **That rule was stated in 0.50.0 and applied to only one of the two spellings,
+/// which a live run found in 0.60.0.** `wait: false` beside
+/// `background_after_secs: 0` was refused as a contradiction while `wait: true`
+/// beside the same zero was honoured — the identical request, decided two ways.
+/// It matters because filling every property of a tool schema with its zero value
+/// is ordinary model behaviour, not an exotic one: the run that found this sent
+/// `"agent": ""`, `"deny_write": []`, `"deny_net": []` and
+/// `"background_after_secs": 0` on every call, and every other one of those was
+/// already treated as "unset". The spawn tool was unusable for such a model, and
+/// no fixture noticed because a fixture writes only the arguments it means.
+///
+/// A contradiction is a wall clock that is actually asked to elapse — a positive
+/// number — beside a parent that says it is not waiting. Nothing else.
 fn spawn_return(a: &serde_json::Value) -> std::result::Result<Return, String> {
     let wait = a.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
     let after = a.get("background_after_secs").and_then(|v| v.as_u64());
     match (wait, after) {
-        (false, Some(_)) => Err(
+        (false, Some(s)) if s > 0 => Err(
             "\"wait\": false and \"background_after_secs\" cannot both be set — a child you are \
              not waiting for has no wall clock to cross. Pick one."
                 .into(),
         ),
-        (false, None) | (true, Some(0)) => Ok(Return::Detach),
+        (false, _) | (true, Some(0)) => Ok(Return::Detach),
         (true, Some(s)) => Ok(Return::WaitUntil(Duration::from_secs(s))),
         (true, None) => Ok(Return::Wait),
     }
@@ -16589,5 +16603,18 @@ mod tests {
             why.contains("wait") && why.contains("background_after_secs"),
             "{why}"
         );
+        // 0.60.0 — the OTHER spelling of a zero clock, which this rule was
+        // written for in 0.50.0 and never applied to. `wait: false` beside a
+        // clock of zero is the same request as `wait: false` alone, and was
+        // refused as a contradiction for ten releases. A live run found it: a
+        // model filling every property of the schema with its zero value sent
+        // exactly this on every call and could not spawn a detached child at all.
+        assert_eq!(
+            r(json!({ "wait": false, "background_after_secs": 0 })).unwrap(),
+            Return::Detach,
+            "a zero clock means the same thing whichever way it is spelt",
+        );
+        // The boundary, asserted exactly: zero is not a contradiction and one is.
+        assert!(r(json!({ "wait": false, "background_after_secs": 1 })).is_err());
     }
 }
