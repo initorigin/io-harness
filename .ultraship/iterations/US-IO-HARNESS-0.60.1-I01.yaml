@@ -1,0 +1,123 @@
+id: US-IO-HARNESS-0.60.1-I01
+timestamp: 2026-08-16 12:40:00+00:00
+category:
+- release-level
+trigger: 'The owner asked, mid-release, for the README to carry a full list of the file formats the harness
+  supports. The rewritten page names the *features* that carry them — `media`, `xlsx`, `docx`, `pptx`,
+  `pdf`, `barcode` — and says what each feature adds in a sentence, but it never enumerates the concrete
+  formats, so the question "can it read a TIFF, and what happens to a HEIC" is answerable nowhere on the
+  landing page.
+
+
+
+  **Widened in the same session.** The owner then asked for the list to cover text and code files as well
+  — "md, txt, etc, and all coding file formats" — and for language support, "maybe with lsp as well".
+  That is a larger claim than the document and image tables, and the honest answer to most of it is that
+  there is no list: the workspace tools treat every text file the same way, by design. What CAN be enumerated
+  is the shipped toolchain table and the check commands, and what cannot is the set of languages, because
+  the crate speaks LSP rather than any language.
+
+  '
+evidence:
+- '**The authoritative sets live in source and in no document.** `IMAGE_MEDIA_TYPES` at `src/provider/mod.rs:218`
+  is the four types every provider accepts — `image/jpeg`, `image/png`, `image/gif`, `image/webp`. `decodable`
+  at `src/provider/mod.rs:255` is the five this crate converts to PNG on the way in — BMP, TIFF, ICO,
+  TGA and PNM. The extension map at `src/provider/mod.rs:435` names three more — SVG, HEIC/HEIF and AVIF
+  — which exist only so the refusal can name the format rather than say "unsupported". A reader has no
+  way to learn any of that from the README, and `docs/guide/images-and-git.md` carries it for a reader
+  who already knows to look there.
+
+  '
+- '**The two bounds are equally invisible.** `MAX_IMAGE_BYTES` is 5 MiB and `MAX_IMAGE_PIXELS` is 50,000,000,
+  and an image over either is refused. Those are the numbers that decide whether a scan attaches, and
+  the landing page states neither.
+
+  '
+- '**The document side is a capability list, not a format list.** `docs/guide/documents.md` names twelve
+  built-ins across five features, and the difference that matters to a reader choosing the crate is which
+  direction each format goes: `xlsx` reads, writes and edits a single cell; `docx` reads and generates
+  but deliberately never edits in place; `pptx` extracts text and has no writer at all; `pdf` generates,
+  extracts, watermarks and fills AcroForm fields; `barcode` decodes from a PNG or JPEG and never encodes.
+  Read from the feature table alone, `pptx` and `barcode` both look bidirectional.
+
+  '
+- '**There is no source-extension allowlist to publish.** `read_file`, `write_file`, `edit_file` and `patch_file`
+  are extension-agnostic; nothing in `src/` gates them on a language. Publishing a list of supported code
+  formats would have been fiction, and a reader whose language was missing from it would draw exactly
+  the wrong conclusion. The page states the absence of the list as the design.'
+- '**What is enumerable is enumerated, from source.** `MARKERS` at `src/toolchain.rs:349` holds 16 marker
+  files mapping to 14 ecosystems, with the driver chosen by lockfile for node (bun/pnpm/yarn/npm) and
+  python (uv/poetry/pip), and the .NET marker being a pattern rather than a filename. The post-write check
+  covers five ecosystems and deliberately skips the other nine, which `docs/guide/language-support.md:112`
+  states and the README now repeats with the reason.'
+before:
+  scope:
+  - '"A capability matrix and a feature-flag table on the README, each naming what a feature adds in one
+    line"
+
+    '
+  assumptions:
+  - 'That the feature-flag table answers the format question. It answers which cargo feature to turn on,
+    which is a different question from which files the agent can actually open.
+
+    '
+  implementation: 'The feature table''s "What it adds" column, plus a sentence in the depth section, plus
+    two guide pages a reader has to already know to open.
+
+    '
+change:
+  summary: 'Add a **Supported file formats** section to the README: one table per direction, naming every
+    format by media type and extension, saying whether it is read, generated, edited or refused, and stating
+    the two image bounds. The refused set is included deliberately — a list that omits what is not supported
+    reads as a claim that everything else works.
+
+    The section is generated from the same facts the crate enforces, and a test asserts it stays complete:
+    every entry of `IMAGE_MEDIA_TYPES`, every media type `decodable` converts, and every document feature
+    must appear on the page.
+
+    '
+  added:
+  - A supported-file-formats section on the README, with the refused formats named
+  - '"F9 — a test asserting the section lists every format the crate accepts, converts or names in a refusal,
+    so the list cannot fall behind the source that decides it"
+
+    '
+  - A statement that there is no source-extension allowlist, and why that is the design rather than a
+    gap
+  - The toolchain marker table on the README — 16 markers, 14 ecosystems, the lockfile-chosen drivers,
+    and the two deliberate orderings
+  - The five post-write type-check commands, and the reason the other nine ecosystems are skipped
+  - A language-server section stating that there is no built-in language list either, because the crate
+    speaks LSP rather than a language
+  - F10 — a test asserting every marker in `MARKERS` appears on the README, so an ecosystem added to the
+    crate cannot go unlisted
+  removed: []
+  deferred: []
+  replaced: []
+impact:
+  products:
+  - io-harness
+  versions:
+  - 0.60.1
+  tasks:
+  - US-IO-HARNESS-0.60.1-T07
+  dependencies: []
+  resource_effect: 'Small and additive. One README section and one checker in `tests/docs_drift.rs`, both
+    built from constants that already exist. It costs a second CI round on a branch whose suite was green,
+    which is the real price and is worth paying for a question every prospective user asks.
+
+    '
+versioning:
+  previous_target: 0.60.1
+  new_target: 0.60.1
+  consequence: no-version-change
+approval:
+  source: user
+  reference: 'Asked for directly in session on 2026-08-16, while PR #175 was mid-CI: "i also want a full
+    list of supported file formates shown in the readme as well." Recorded here rather than added quietly,
+    because it is scope entering a release after its contract was written.
+
+    '
+canonical_updates:
+- products/io-harness/releases/0.60.1.yaml
+- products/io-harness/execution/tasks.yaml

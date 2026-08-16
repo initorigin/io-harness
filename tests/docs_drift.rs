@@ -568,3 +568,425 @@ fn link_checker_reports_an_absent_target() {
         "exactly the absent relative target should be reported"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The landing page states the present, not the diff that produced it
+// ---------------------------------------------------------------------------
+
+/// Every release-version literal in `doc_text`, as `(line number, version)`.
+///
+/// The shape is this crate's own: `0.<minor>.<patch>`. Rust versions (`1.95`),
+/// the `major.minor` install requirement (`"0.60"`) and a measured duration
+/// (`0.965 ms`) all have too few components to match, which is deliberate —
+/// each of those is a claim the landing page is supposed to make.
+fn release_version_mentions(doc_text: &str) -> Vec<(usize, String)> {
+    let version = Regex::new(r"\b0\.\d+\.\d+\b").unwrap();
+    doc_text
+        .lines()
+        .enumerate()
+        .flat_map(|(i, line)| {
+            version
+                .find_iter(line)
+                .map(move |m| (i + 1, m.as_str().to_string()))
+        })
+        .collect()
+}
+
+/// Does `doc_text` state what the crate does, rather than which release changed
+/// it?
+///
+/// The README grew one release at a time, and by 0.60.0 most of its capability
+/// section was written as the release that added it — "Since 0.46.0 every
+/// command `exec` ...", "**0.47.0 closed the Linux hole in this table**",
+/// "Through 0.49.0 a child came back as ...". A reader who has never run this
+/// crate was being handed the diff between two releases they have never used and
+/// asked to reconstruct the present from it. CHANGELOG.md is the changelog, and
+/// `docs/CAPABILITIES.md` records which release introduced what.
+fn states_the_present(doc_text: &str) -> Result<(), String> {
+    let found = release_version_mentions(doc_text);
+    if found.is_empty() {
+        return Ok(());
+    }
+    let listed: Vec<String> = found
+        .iter()
+        .map(|(line, v)| format!("line {line}: {v}"))
+        .collect();
+    Err(format!(
+        "narrates its own release history:\n  {}",
+        listed.join("\n  ")
+    ))
+}
+
+#[test]
+fn readme_states_no_release_version_outside_the_pinned_lines() {
+    if let Err(e) = states_the_present(&read("README.md")) {
+        panic!(
+            "README.md {e}\n\n\
+             A landing page states what the crate does now. Which release introduced a \
+             capability belongs in docs/CAPABILITIES.md, and the full history belongs in \
+             CHANGELOG.md. The two version claims this page *does* make — the install \
+             snippet's `major.minor` and the MSRV — have their own gates above and are too \
+             short to match this one.\n"
+        );
+    }
+}
+
+#[test]
+fn present_tense_checker_rejects_a_reinstated_sentence() {
+    // The real sentence, verbatim, as README.md carried it through 0.60.0.
+    let fixture = "**0.47.0 closed the Linux hole in this table**, which was the easiest \
+                   thing on this page to over-read.\n";
+    let err = states_the_present(fixture).expect_err("the archaeology must be reported");
+    assert!(
+        err.contains("0.47.0"),
+        "must quote the version it found: {err}"
+    );
+    assert!(err.contains("line 1"), "must say where: {err}");
+}
+
+#[test]
+fn present_tense_checker_accepts_the_claims_the_page_is_meant_to_make() {
+    // The install snippet, the MSRV, a measured duration, and a pre-1.0 note:
+    // none of them is release archaeology, and a checker that flagged them would
+    // be deleted within a release.
+    let fixture = "io-harness = \"0.60\"\n\
+                   **MSRV: Rust 1.95** or later.\n\
+                   0.965 ms per capped write, and 303.8 ms saved.\n\
+                   The crate is pre-1.0 and stays pre-1.0.\n";
+    assert_eq!(states_the_present(fixture), Ok(()));
+}
+
+// ---------------------------------------------------------------------------
+// The landing page points at the numbers
+// ---------------------------------------------------------------------------
+
+/// Does `doc_text` link `docs/MEASUREMENTS.md`?
+///
+/// Five measured benchmark sets sat in that file while the README linked it zero
+/// times, so the one question a reader evaluating a runtime always has — what
+/// does it cost — was answerable everywhere except the page they land on.
+fn links_the_measurements(doc_text: &str) -> Result<(), String> {
+    if doc_text.contains("docs/MEASUREMENTS.md") {
+        Ok(())
+    } else {
+        Err("links docs/MEASUREMENTS.md nowhere".to_string())
+    }
+}
+
+#[test]
+fn readme_links_the_measurements() {
+    if let Err(e) = links_the_measurements(&read("README.md")) {
+        panic!(
+            "README.md {e}\n\n\
+             The measurements are the method behind every number the landing page quotes. \
+             A number with no reachable method is a number nobody can reproduce or refute.\n"
+        );
+    }
+}
+
+#[test]
+fn measurements_link_checker_reports_silence() {
+    assert!(links_the_measurements("# io-harness\n\nFast. Trust me.\n").is_err());
+    assert_eq!(
+        links_the_measurements("See [the numbers](docs/MEASUREMENTS.md).\n"),
+        Ok(())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The contract does not outlive a release
+// ---------------------------------------------------------------------------
+
+/// The claim `docs/CONTRACT.md` carried for thirty-three releases after it
+/// stopped being true.
+const RETIRED_APPCONTAINER_CLAIM: &str = "nothing selects it";
+
+/// Does `doc_text` state the Windows access-confinement selector, and has it
+/// stopped saying nothing selects it?
+///
+/// A contract that is wrong about the security boundary is worse than one that
+/// is silent: a reader who checks is misinformed rather than uninformed.
+fn states_the_appcontainer_selector(doc_text: &str) -> Result<(), String> {
+    let mut wrong = Vec::new();
+    if !doc_text.contains("with_access_confinement") {
+        wrong.push(
+            "names no selector for Windows access confinement — \
+             `SandboxConfig::with_access_confinement()` is what a caller writes"
+                .to_string(),
+        );
+    }
+    if let Some(line) = doc_text
+        .lines()
+        .position(|l| l.contains(RETIRED_APPCONTAINER_CLAIM))
+    {
+        wrong.push(format!(
+            "line {}: still says \"{RETIRED_APPCONTAINER_CLAIM}\", which a shipped selector \
+             made false",
+            line + 1
+        ));
+    }
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(wrong.join("; "))
+    }
+}
+
+#[test]
+fn contract_states_the_appcontainer_selector() {
+    if let Err(e) = states_the_appcontainer_selector(&read("docs/CONTRACT.md")) {
+        panic!(
+            "docs/CONTRACT.md {e}\n\n\
+             This file is what a caller may depend on. It kept describing the AppContainer as \
+             built-but-unselectable after the release that selected it shipped, which is the \
+             one kind of drift that leaves a careful reader worse off than a careless one.\n"
+        );
+    }
+}
+
+#[test]
+fn appcontainer_checker_reports_the_sentence_that_was_there() {
+    // The real sentence, verbatim.
+    let fixture = "**The access half is `AppContainer`, 0.26.0 built it, and nothing selects \
+                   it yet.**\n";
+    let err = states_the_appcontainer_selector(fixture).expect_err("must be reported");
+    assert!(err.contains("nothing selects it"), "{err}");
+    assert!(err.contains("with_access_confinement"), "{err}");
+    assert_eq!(
+        states_the_appcontainer_selector(
+            "`SandboxConfig::with_access_confinement()` selects it.\n"
+        ),
+        Ok(())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The release table is a list, and stays one
+// ---------------------------------------------------------------------------
+
+/// Every version CHANGELOG.md declares a section for.
+fn changelog_versions(changelog: &str) -> BTreeSet<String> {
+    let heading = Regex::new(r"^##\s*\[(\d+\.\d+\.\d+)\]").unwrap();
+    changelog
+        .lines()
+        .filter_map(|line| heading.captures(line).map(|c| c[1].to_string()))
+        .collect()
+}
+
+/// Versions the release table in `index` accounts for.
+///
+/// A table row, so a version merely mentioned in prose does not count as
+/// recorded: the claim is that the table is the list.
+fn release_table_versions(index: &str) -> BTreeSet<String> {
+    let row = Regex::new(r"^\|\s*\[?(\d+\.\d+\.\d+)\]?").unwrap();
+    index
+        .lines()
+        .filter_map(|line| row.captures(line.trim()).map(|c| c[1].to_string()))
+        .collect()
+}
+
+/// Does the index's release table cover every released version?
+fn release_table_covers(changelog: &str, index: &str) -> Result<(), String> {
+    let declared = changelog_versions(changelog);
+    if declared.is_empty() {
+        return Err(
+            "CHANGELOG.md declares no versions at all, so this check is vacuous \
+                    and the parser is wrong"
+                .to_string(),
+        );
+    }
+    let recorded = release_table_versions(index);
+    let missing: Vec<&String> = declared.difference(&recorded).collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "records {} of the {} released versions; missing: {:?}",
+            recorded.len(),
+            declared.len(),
+            missing
+        ))
+    }
+}
+
+#[test]
+fn the_capabilities_release_table_covers_every_released_version() {
+    if let Err(e) = release_table_covers(&read("CHANGELOG.md"), &read("docs/CAPABILITIES.md")) {
+        panic!(
+            "docs/CAPABILITIES.md {e}\n\n\
+             That table is where the release-anchored facts live now that the README states \
+             the present. A table that silently stops being complete is worse than no table: \
+             a reader cannot tell the difference between \"this capability arrived in no \
+             release\" and \"nobody updated the row\".\n"
+        );
+    }
+}
+
+#[test]
+fn release_table_checker_reports_a_dropped_row() {
+    let changelog = "## [0.2.0] - 2026-01-02\n\nstuff\n\n## [0.1.0] - 2026-01-01\n\nstuff\n";
+    let complete = "| Version | What |\n| --- | --- |\n| [0.2.0](x) | b |\n| [0.1.0](x) | a |\n";
+    assert_eq!(release_table_covers(changelog, complete), Ok(()));
+
+    let dropped = "| Version | What |\n| --- | --- |\n| [0.2.0](x) | b |\n";
+    let err = release_table_covers(changelog, dropped).expect_err("must be reported");
+    assert!(
+        err.contains("0.1.0"),
+        "must name the missing version: {err}"
+    );
+}
+
+#[test]
+fn release_table_checker_does_not_count_a_version_named_in_prose() {
+    // The failure this guards: a table that lost a row while the version is
+    // still mentioned somewhere on the page would otherwise read as covered.
+    let changelog = "## [0.1.0] - 2026-01-01\n";
+    let prose_only = "0.1.0 was the first release.\n";
+    assert!(release_table_covers(changelog, prose_only).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// The format list is complete, and the source is what says so
+// ---------------------------------------------------------------------------
+
+/// The media types `src/provider/mod.rs` names, read out of the source rather
+/// than retyped here.
+///
+/// Retyping them would make this test agree with itself: a format added to the
+/// crate and to neither the README nor the fixture would pass. Everything the
+/// crate can accept, convert, or refuse by name appears in one of the three
+/// places this parses.
+fn media_types_in_source(provider_rs: &str) -> BTreeSet<String> {
+    let quoted = Regex::new(r#""(image/[a-z0-9.+-]+)""#).unwrap();
+    quoted
+        .captures_iter(provider_rs)
+        .map(|c| c[1].to_string())
+        .collect()
+}
+
+/// Media types the README does not account for.
+fn formats_missing_from(readme: &str, types: &BTreeSet<String>) -> Vec<String> {
+    types
+        .iter()
+        .filter(|t| !readme.contains(t.as_str()))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn readme_lists_every_media_type_the_crate_names() {
+    let types = media_types_in_source(&read("src/provider/mod.rs"));
+    assert!(
+        types.len() >= 12,
+        "the source parse found only {} media types, so it has stopped matching what it \
+         was written to read: {types:?}",
+        types.len()
+    );
+
+    let missing = formats_missing_from(&read("README.md"), &types);
+    assert!(
+        missing.is_empty(),
+        "the README's format tables do not account for {missing:?}. Every type the crate \
+         accepts, converts, or refuses by name belongs on that page — a list that omits a \
+         format reads as a claim that it does not exist, and a refusal a reader could not \
+         have anticipated is the worst of the three outcomes."
+    );
+}
+
+#[test]
+fn readme_lists_every_document_feature() {
+    let readme = read("README.md");
+    let documented = documented_features(&readme);
+    let missing: Vec<&str> = ["xlsx", "docx", "pptx", "pdf", "barcode", "media"]
+        .into_iter()
+        .filter(|f| !documented.contains(*f))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the README does not name the format features {missing:?}, so a reader cannot tell \
+         which cargo feature carries the file type they came for"
+    );
+}
+
+#[test]
+fn format_checker_reports_a_dropped_row() {
+    // Exactly the drift this guards: TIFF leaves the table while the rest stays.
+    let types: BTreeSet<String> = ["image/png", "image/tiff"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let readme = "| `image/png` | `.png` | passed through |\n";
+    assert_eq!(formats_missing_from(readme, &types), vec!["image/tiff"]);
+}
+
+#[test]
+fn format_source_parse_finds_the_accepted_the_converted_and_the_refused() {
+    // The parse must reach all three sets, not just the constant. If it ever
+    // matched only `IMAGE_MEDIA_TYPES`, the README could drop every converted
+    // and refused format and stay green.
+    let types = media_types_in_source(&read("src/provider/mod.rs"));
+    for expected in [
+        "image/png",               // accepted
+        "image/tiff",              // converted
+        "image/x-portable-anymap", // converted, and the easiest to mistype
+        "image/heic",              // refused by name
+    ] {
+        assert!(
+            types.contains(expected),
+            "the source parse missed {expected}, so it is no longer reading what it claims"
+        );
+    }
+}
+
+/// Every marker file `src/toolchain.rs` detects, read out of the source.
+///
+/// The `.NET` marker is a pattern rather than a filename, so it is added
+/// explicitly — it is the one entry `MARKERS` does not hold.
+fn markers_in_source(toolchain_rs: &str) -> BTreeSet<String> {
+    let list = Regex::new(r"(?s)const MARKERS: &\[&str\] = &\[(.*?)\];").unwrap();
+    let entry = Regex::new(r#""([^"]+)""#).unwrap();
+    let body = list
+        .captures(toolchain_rs)
+        .map(|c| c[1].to_string())
+        .unwrap_or_default();
+    let mut out: BTreeSet<String> = entry
+        .captures_iter(&body)
+        .map(|c| c[1].to_string())
+        .collect();
+    out.insert(".csproj".to_string());
+    out
+}
+
+#[test]
+fn readme_lists_every_toolchain_marker() {
+    let markers = markers_in_source(&read("src/toolchain.rs"));
+    assert!(
+        markers.len() >= 16,
+        "the MARKERS parse found only {} entries, so it has stopped reading the table it \
+         was written for: {markers:?}",
+        markers.len()
+    );
+
+    let readme = read("README.md");
+    let missing: Vec<&String> = markers.iter().filter(|m| !readme.contains(*m)).collect();
+    assert!(
+        missing.is_empty(),
+        "the README's toolchain table does not name {missing:?}. That table is what tells a \
+         reader whether their project is one the harness already knows how to build and \
+         test, and a row missing from it reads as an ecosystem that is not supported."
+    );
+}
+
+#[test]
+fn marker_parse_reads_the_list_and_not_the_whole_file() {
+    // The guard: a parse that matched every quoted string in the file would
+    // "find" hundreds of markers and pass against any README at all.
+    let fixture = "const MARKERS: &[&str] = &[\n    \"Cargo.toml\",\n    \"go.mod\",\n];\n\
+                   const OTHER: &str = \"not-a-marker\";\n";
+    let found = markers_in_source(fixture);
+    assert!(found.contains("Cargo.toml") && found.contains("go.mod"));
+    assert!(
+        !found.contains("not-a-marker"),
+        "parsed beyond the list: {found:?}"
+    );
+}
