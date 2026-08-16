@@ -26,6 +26,60 @@ notes are produced from it.
 
 ### Security
 
+## [0.60.1] - 2026-08-16
+
+### Added
+
+- **A comparison table on the README.** io-harness set against the agent
+  harnesses it is most often confused with (Claude Code, Codex CLI, opencode,
+  Goose, pi) and against the Rust libraries in the same import slot (rig,
+  swiftide, langchain-rust), on the four properties this crate is actually built
+  around: a permission boundary that shows up in the trace, per-step resume that
+  survives the process, an execution sandbox, and a spend ceiling shared across a
+  tree of agents. Every cell carries its source and the date it was read
+  (2026-08-16), and a cell reads "not documented" rather than "no" where a
+  project simply does not state the property — the table records what each
+  project says about itself, not what we assume it does.
+
+- **Four documentation-drift tests**, one per gap this release found, so none of
+  them can silently reopen: no release-version literal may appear in README
+  prose, every guide page under `docs/` must have a row in the README's guide
+  table, the README must link `docs/MEASUREMENTS.md`, and the release table in
+  `docs/CAPABILITIES.md` must cover every released version.
+
+### Changed
+
+- **A documentation release.** Nothing under `src/` changed and
+  `docs/public-api.txt` does not move; a program on 0.60.0 recompiles against
+  0.60.1 unchanged.
+
+- **The README is rewritten.** It had grown one release at a time to 618 lines,
+  most of it a single flat section of thirty-odd paragraphs each written as the
+  release that added it — "since 0.46.0", "0.47.0 closed", "through 0.49.0 a
+  child came back as". That is a changelog wearing a landing page's clothes: a
+  reader arriving today had to reconstruct the present state from a sequence of
+  past ones. The page is now present tense, opens with a table of contents and a
+  capability matrix above the prose, and carries no release-version archaeology
+  at all — the fourth test above enforces that last part.
+
+- **The measured numbers reach the landing page.** `docs/MEASUREMENTS.md` has
+  held five measured benchmark sets for several releases and the README linked it
+  zero times. The README now summarises them, names the machine each was measured
+  on, and states plainly that none of them is a gate — they are recorded costs,
+  not thresholds anything fails.
+
+- **`docs/CAPABILITIES.md` covers the capabilities that shipped after it was last
+  touched**, and gains a release table recording which release introduced what.
+  That table is where the release-anchored facts removed from the README now
+  live: the history is kept, it is just kept somewhere a first-time reader is not
+  standing.
+
+### Fixed
+
+- **`docs/CONTRACT.md` no longer claims that nothing selects the Windows
+  AppContainer.** That has been false since 0.59.0 shipped
+  `SandboxConfig::with_access_confinement()`, which is exactly what selects it.
+
 ## [0.60.0] - 2026-08-16
 
 ### Added
