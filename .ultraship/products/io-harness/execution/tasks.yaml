@@ -7,7 +7,7 @@ tasks:
     only under Policy::permissive() with no plan gate today, which is exactly why neither defect was caught,
     so the helpers have to exist before either fix can be shown to work. A test written after the fix
     checks nothing.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F1 — a plan-gated classifying turn is not ordered to plan before it may answer.** An end-to-end
@@ -35,13 +35,33 @@ tasks:
     '
   files:
   - tests/prompt.rs
-  evidence: []
+  evidence:
+  - Four assertions appended to `tests/prompt.rs`, and three to `src/run.rs`'s `mod tests`. `conversational_system`
+    was split so `conversational_system_under` takes the caller's policy; the existing helper now calls
+    it with `Policy::permissive()`, so no existing assertion moved.
+  - 'Watched them fail on the pre-fix tree. `cargo test --test prompt`: `test result: FAILED. 21 passed;
+    4 failed` — `a_plan_gated_classifying_turn_may_still_answer`, `a_plan_gated_classifying_turn_reads_the_boundary_in_force`,
+    `a_preset_does_not_reframe_a_classifying_turn_as_work`, `a_preset_is_the_framing_plus_its_manner_and_nothing_else`.'
+  - 'The F2 failure is the sharpest evidence in the release. The classifying opening carried `- Commands
+    you run are contained (mode: workspace-write, ...)` and nothing else; the work prompt for the same
+    contract carried `- Writing files: allowed by default. Refused: * (plan-gate).` and `- Running a command:
+    allowed by default. Refused: * (plan-gate).` A turn under the gate was told nothing about the layer
+    refusing every write it might make.'
+  - '`cargo test --lib run::tests` before the fix: `4 passed; 2 failed` — `the_tree_loops_gated_classifying_turn_may_still_answer`
+    and `a_preset_keeps_the_world_a_contained_agent_is_in`.'
+  - '**A test that failed nothing, found and reshaped.** The tree loop''s F2 assertion PASSED on the pre-fix
+    tree, because it asserted the function keeps the boundary it is handed — which was never the defect.
+    The defect was which of two values each call site passed. The pre-fix signature took one boundary
+    and could not be given the other, so the assertion could not be written against it at all. It was
+    reshaped after the fix to assert the *selection* (gated reads the plan-gate layer, ungated does not),
+    and its failing-first evidence is the flat loop''s end-to-end assertion plus the sabotage arm, which
+    the record states rather than glosses.'
 - id: US-IO-HARNESS-0.60.3-T02
   summary: State the plan gate conditionally on the classifying path (F1).
   why_required: Without this a greeting typed into a plan-gated session gets a plan proposed for it and
     a human asked to approve one. It is 0.48.0's I03 restored on the one path that composes a directive
     above the ending.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.3-T01
   acceptance_criteria:
@@ -66,13 +86,25 @@ tasks:
   files:
   - src/run.rs
   - tests/prompt.rs
-  evidence: []
+  evidence:
+  - '`planning_directive` takes a `classifying: bool` (`src/run.rs`). The classifying form opens "If any
+    part of this needs the repository written to or a command run, then before you do that or anything
+    else you must call `propose_plan` with the ordered steps you intend to take, and wait." The refusal
+    sentence and the roster clause are byte-identical in both forms.'
+  - 'One function with a flag, not two strings — the same reason `CONVERSATIONAL_ENDING` is a `const`:
+    a rule reworded in one and not the other is a gate that reads differently depending on which block
+    composed it.'
+  - 'Three call sites updated: `conversational_opening` passes `true` (the one block composed above the
+    ending), the flat loop''s `system` planning arm and the tree loop''s `with_role` planning arm pass
+    `false`.'
+  - '`a_plan_gated_classifying_turn_may_still_answer` green, with its control — the same contract''s work
+    prompt must still contain the unconditional sentence, so the gate is not weakened for work.'
 - id: US-IO-HARNESS-0.60.3-T03
   summary: Hand the classifying opening the boundary in force (F2).
   why_required: The boundary block is the crate's own answer to "what will refuse me". A gated turn that
     reads the post-plan boundary is told the opposite of what plan_lock enforces, and that is the one
     class of prompt defect this project has declared costs more than silence.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.3-T01
   acceptance_criteria:
@@ -102,14 +134,25 @@ tasks:
   files:
   - src/run.rs
   - tests/prompt.rs
-  evidence: []
+  evidence:
+  - '`conversational_opening` takes `after_planning` and `while_planning` and selects on the `planning`
+    flag it already had. The rule lives in the one function both loops share, because a rule each caller
+    applies is a rule that lapses wherever one forgets — which is exactly what happened, at both sites.'
+  - The flat loop hoists `while_planning` into a binding beside `after_planning`, matching the shape the
+    tree loop has had since 0.45.0; its `system` planning arm now reads that binding instead of building
+    the same section inline.
+  - '`a_plan_gated_classifying_turn_reads_the_boundary_in_force` green: the classifying opening''s boundary
+    section is byte-identical to the one the same contract''s `system` block carries, names `(plan-gate)`,
+    and accounts for both `Writing files` and `Running a command`.'
+  - The tree-loop unit assertion covers both directions — a gated turn reads the plan-gate layer, an ungated
+    one is not told about a layer that has stopped refusing it.
 - id: US-IO-HARNESS-0.60.3-T04
   summary: Make a preset a manner appended to a framing (F3, F4, F6).
   why_required: Preset::describe replaces the framing, so an embedder who selected Concise or Careful
     has CONVERSATION_PROMPT thrown away and gets back the two claims 0.49.0 removed on every greeting
     — and on a contained turn loses the guidance that it may spawn. It also retires the duplicated tool
     sentences the collapse forced.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.3-T01
   acceptance_criteria:
@@ -146,13 +189,31 @@ tasks:
   - src/run.rs
   - src/contract.rs
   - tests/prompt.rs
-  evidence: []
+  evidence:
+  - '`Preset::describe` replaced by `Preset::manner` (`src/contract.rs`), returning the working-style
+    clause alone — byte-identical to the text that followed the shared tool sentences in each old body,
+    so `Concise` still carries "Act before you explain" and `Careful` still carries "Before you report
+    a change as done, check it". Both are `pub(crate)`.'
+  - '`compose` appends rather than replaces: `SystemPrompt::Preset(preset) => format!("{} {}", spec.base,
+    preset.manner())`. The four tool sentences are no longer copied into the preset bodies, which is the
+    duplication `compose`''s own doc comment warns about.'
+  - '`a_preset_does_not_reframe_a_classifying_turn_as_work` green for both variants: the opening starts
+    with `CONVERSATION_PROMPT`, contains neither "to meet a stated specification" nor "checked against
+    the success criterion", carries the preset''s marker, and ends with `CONVERSATIONAL_ENDING`.'
+  - '`a_preset_keeps_the_world_a_contained_agent_is_in` green over both tree framings and both variants:
+    `spawn_agent` and "inherits your permissions" survive, which the replacing form discarded.'
+  - 'F6: `a_preset_is_the_framing_plus_its_manner_and_nothing_else` asserts the composed description byte
+    for byte — everything before the boundary section equals `{framing} {manner}`. That comparison contains
+    "You may edit several files.", the sentence the old preset bodies omitted and the one string this
+    release moves.'
+  - '`a_preset_is_opt_in_and_the_builtin_does_not_move` (0.49.0''s F9) passes unedited, and every 0.44.0/0.49.0
+    baseline passes unedited: 25 of 25 in `tests/prompt.rs`.'
 - id: US-IO-HARNESS-0.60.3-T05
   summary: Correct the rustdoc that describes the replaced shape.
   why_required: SystemPrompt::Preset says a preset is composed where Replace's text is, and Preset says
     it names the same tools as Builtin. Both stop being true in T04. A release that fixes the code and
     leaves the doc comment describing the old shape has moved the defect rather than closed it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.3-T04
   acceptance_criteria:
@@ -172,14 +233,22 @@ tasks:
     '
   files:
   - src/contract.rs
-  evidence: []
+  evidence:
+  - '`SystemPrompt::Preset`''s rustdoc no longer says it is "Composed exactly where `SystemPrompt::Replace`''s
+    text is"; it says it is appended to the description the run''s own loop chose, and that a preset never
+    decides which world the agent is in.'
+  - '`Preset`''s doc block no longer says it "names the same tools as `SystemPrompt::Builtin` because
+    it describes the same agent" — after this release it names no tools and describes no agent. The manner/framing
+    split is stated with the reason the old shape was wrong.'
+  - '`cargo test --doc contract`: `28 passed; 0 failed`. The `Preset` doctest, which asserts a preset
+    is chosen and never inherited, is unchanged and green.'
 - id: US-IO-HARNESS-0.60.3-T06
   summary: Write the design paragraph in docs/CONTRACT.md and add docs/STYLE.md.
   why_required: docs/CONTRACT.md records the classification rule but never the design it comes from, which
     is why three separate releases have had to rediscover that a classifying turn is framed differently.
     docs/STYLE.md writes down the register the prose already follows so a later release cannot drift out
     of it by imitation.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.3-T02
   - US-IO-HARNESS-0.60.3-T03
@@ -195,14 +264,28 @@ tasks:
   files:
   - docs/CONTRACT.md
   - docs/STYLE.md
-  evidence: []
+  evidence:
+  - '`docs/CONTRACT.md` gains two paragraphs in the system-prompt section: a preset is a manner appended
+    to a framing, and why the framings differ at all — the one-shot API is task-framed because its caller
+    declared work in code, the session API is conversation-framed because its operator did not, and every
+    block composed for such a turn must be true of the turn being taken. That rule is named as the common
+    cause of 0.48.0''s, 0.49.0''s and this release''s fixes.'
+  - The boundary section's plan-gate bullet now states that both blocks of a gated turn describe the same
+    narrowed policy, and names what was true until 0.60.3.
+  - '`docs/STYLE.md` written — eight short sections describing the register the prose already follows,
+    with the leading rule being the one this release exists to enforce. It states outright that no test
+    enforces it and why.'
+  - 'Placed in `docs/` rather than `docs/guide/`: `the_guide_directory_holds_nothing_unlisted` governs
+    the guide directory against a hard-coded list, and STYLE.md is not a capability page. The open question
+    is resolved by reading that test, as the contract said it should be.'
+  - '`docs_drift` 45, `guide_pages` 10, `readme` 9, `public_api` 8 — all green.'
 - id: US-IO-HARNESS-0.60.3-T07
   summary: Bump the version and write the CHANGELOG and CAPABILITIES entries.
   why_required: 'The release is not shippable without the bump, and two gates can only be checked after
     it: the README dependency pin at major.minor and the CAPABILITIES row that must exist for every released
     version. F6 also requires the one moved prompt string named in the CHANGELOG rather than left in a
     diff.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.3-T06
   acceptance_criteria:
@@ -229,4 +312,14 @@ tasks:
   - Cargo.lock
   - CHANGELOG.md
   - docs/CAPABILITIES.md
-  evidence: []
+  evidence:
+  - '`Cargo.toml` and `Cargo.lock` 0.60.2 -> 0.60.3, and no other file carries the version.'
+  - '`## [0.60.3]` written under Fixed / Changed / Added. The three defects are Fixed; the one moved prompt
+    string, the CONTRACT.md design paragraph and the new STYLE.md are Changed; the seven assertions are
+    Added. The Changed entry names the moved string and says exactly who sees it — an embedder who snapshots
+    composed prompts and selected a preset.'
+  - '`docs/CAPABILITIES.md` row added for 0.60.3, which `the_capabilities_release_table_covers_every_released_version`
+    requires and which cannot exist before the bump.'
+  - 'Both post-bump gates green: `readme_dependency_version_matches_cargo_toml` (the README pin stays
+    `io-harness = "0.60"` at major.minor) and the capabilities release table. `changelog` 5, `docs_drift`
+    45, `guide_pages` 10, `readme` 9, `public_api` 8.'
