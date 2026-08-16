@@ -1,0 +1,39 @@
+product: io-harness
+version: 0.60.1
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      Every artifact this release touches already exists and is already gated. README.md,
+      docs/CONTRACT.md and docs/CAPABILITIES.md are checked-in surfaces with tests over them —
+      tests/docs_drift.rs and tests/guide_pages.rs — so the four new tests extend a pattern rather
+      than invent one, and the release adds no file the project does not already maintain.
+    - >
+      No `src/` behaviour changes and docs/public-api.txt does not move, so the whole class of risk
+      a feature release carries — a schema, a checkpoint format, a public item, a cross-version gate
+      — is absent by construction rather than by care.
+    - >
+      The gaps are already located. The audit that produced this contract named them by file and
+      line: docs/CONTRACT.md:230, the README's 24-row table against 25 guide pages, zero links to
+      docs/MEASUREMENTS.md, and a "Beyond the pillars" list that stops before the browser, LSP and
+      the mailbox. None of the implementation work begins with a search.
+    - >
+      The release is not `high` for one reason: the comparison table depends on reading eight
+      external projects' current documentation, and how long that takes and what it finds are both
+      outside this repository. That is where the uncertainty sits, and it is why it is task T01.
+  major_cost_drivers:
+    - >
+      Re-verifying eight external projects — Claude Code, Codex, opencode, pi, Goose, rig, swiftide,
+      langchain-rust — on four properties each, where "not documented" has to be told apart from
+      "absent", which is a slower read than confirming a feature exists.
+    - >
+      Rewriting 618 lines of dense, deliberately-worded prose without weakening any claim. N3 makes
+      that a criterion; the cost is the section-by-section read of the rewritten page against
+      docs/CONTRACT.md.
+    - >
+      Sweeping 2,917 lines of docs/CONTRACT.md for version-numbered assertions a release has
+      outlived. The AppContainer paragraph was found by grep; the rest is a read.
+  recommended_scope_change: null

@@ -1,39 +1,45 @@
 product: io-harness
-version: 0.60.1
+version: 0.60.2
 execution_state: DEVELOPING
 checkpoint: null
 blockers: []
 release_fit:
-  assessment: probable
+  assessment: high
   reasons:
   - >
-    Every artifact this release touches already exists and is already gated. README.md,
-    docs/CONTRACT.md and docs/CAPABILITIES.md are checked-in surfaces with tests over them —
-    tests/docs_drift.rs and tests/guide_pages.rs — so the four new tests extend a pattern rather than
-    invent one, and the release adds no file the project does not already maintain.
+    No constraint of any kind is recorded for this release — `ultraship constraints` reports no
+    active release to hold one, and `.ultraship/ultraship.yaml` leaves every figure under
+    `resource_profile.available` null. The one recorded preference that bears on the work is
+    `minimize_cost: true`, and this is the cheapest entry on the roadmap: it changes four files of
+    prose and adds three assertions to a suite that already exists.
   - >
-    No `src/` behaviour changes and docs/public-api.txt does not move, so the whole class of risk a
-    feature release carries — a schema, a checkpoint format, a public item, a cross-version gate — is
-    absent by construction rather than by care.
+    Every claim to be corrected is already located by file and line in the contract itself —
+    `docs/CONTRACT.md:2536`, `src/contract.rs:405`, `docs/guide/tools-and-skills.md:80`,
+    `src/tools/custom.rs:497`. No task begins with a search, which is what separates this from
+    0.60.1, whose first task was an eight-project external audit.
   - >
-    The gaps are already located. The audit that produced this contract named them by file and line:
-    docs/CONTRACT.md:230, the README's 24-row table against 25 guide pages, zero links to
-    docs/MEASUREMENTS.md, and a "Beyond the pillars" list that stops before the browser, LSP and the
-    mailbox. None of the implementation work begins with a search.
+    The whole class of risk a feature release carries is absent by construction: no schema, no
+    checkpoint format, no configuration key, no public item, and therefore no cross-version gate to
+    satisfy. N1 asserts that by diff and by the unchanged `docs/public-api.txt` snapshot rather than
+    trusting it.
   - >
-    The release is not `high` for one reason: the comparison table depends on reading eight external
-    projects' current documentation, and how long that takes and what it finds are both outside this
-    repository. That is where the uncertainty sits, and it is why it is task T01.
+    The three tests extend `tests/docs_drift.rs`, which already reads real files through one `read`
+    helper and already carries the checker-plus-control pattern each new assertion follows. Only F2
+    is a new shape — an assertion over a rustdoc block inside `src/` rather than over a markdown
+    file — and it reads a source file the same way the existing checks read a page.
   major_cost_drivers:
   - >
-    Re-verifying eight external projects — Claude Code, Codex, opencode, pi, Goose, rig, swiftide,
-    langchain-rust — on four properties each, where "not documented" has to be told apart from
-    "absent", which is a slower read than confirming a feature exists.
+    Getting the replacement containment paragraph right per platform. The correction is not
+    "commands are sandboxed": macOS and Linux confine writes and deny egress, a Windows AppContainer
+    does both when asked (0.59.0), and a Windows Job Object and the portable floor apply resource
+    caps and have no filesystem facility at all. N3 exists to catch a replacement that flattens
+    that, and the platform table already in `docs/CONTRACT.md` is the source it is checked against.
   - >
-    Rewriting 618 lines of dense, deliberately-worded prose without weakening any claim. N3 makes
-    that a criterion; the cost is the section-by-section read of the rewritten page against
-    docs/CONTRACT.md.
+    The F5 sweep of 2,949 lines for version-numbered assertions. The three contradictions in scope
+    were found by grep; the rest of the file is a read, and F5 requires the verdict per claim
+    recorded rather than asserted.
   - >
-    Sweeping 2,917 lines of docs/CONTRACT.md for version-numbered assertions a release has outlived.
-    The AppContainer paragraph was found by grep; the rest is a read.
+    A docs-only release still runs the whole suite on three platforms, because the suite is where
+    the docs gates live — and the nightly rustdoc gate is mandatory here rather than customary,
+    since two of the four edits are rustdoc blocks.
   recommended_scope_change: null

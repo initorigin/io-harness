@@ -1,0 +1,321 @@
+product: io-harness
+version: 0.60.2
+status: planned
+release_type: patch
+outcome:
+  user_can: >
+    A developer reading this crate's own documentation gets one answer about what a command and a
+    shell handle can reach, and one answer about which tool names are reserved. Today they get two of
+    each, and in three of the four cases the wrong one is the older one still sitting in a file that
+    presents itself as current truth.
+
+
+    **The security claim that reversed.** `docs/CONTRACT.md` line 2536 tells a reader that "A command
+    runs **in the workspace root with the embedding program's privileges, outside the sandbox**". That
+    was true up to 0.44.0. `ExecMode::WorkspaceWrite` has been `#[default]` since 0.45.0
+    (`src/sandbox.rs:389`, whose own doc comment names `FullAccess` as "What every release up to
+    0.45.0 did by default"), and line 1222 of the same file states **"Everything a run starts is
+    contained (0.48.0)"**. Two paragraphs in one contract, 1,300 lines apart, describing opposite
+    boundaries, with nothing telling a reader which one supersedes the other.
+
+
+    **The rustdoc that carries the retired sentence.** `TaskContract::exec_sandbox`
+    (`src/contract.rs:405`) tells a caller the `shell_start` / `shell_poll` / `shell_kill` handles
+    "are not contained because a handle outlives the call that made it". `docs/CONTRACT.md:1222`
+    names that exact sentence as the one 0.48.0 retired: "Up to 0.47.0 this paragraph said the
+    `shell_start` … handles were not, and it did not mention that the git built-ins were not either …
+    Both now take the same containment every other spawn takes, per stage."
+
+
+    **The guide that is stale in both directions.** `docs/guide/tools-and-skills.md:80` tells a
+    developer the feature-gated built-ins — the `git_*` tools, `view_image`, the document tools — are
+    "*not* in the reserved set", which `RESERVED_TOOL_NAMES` has contradicted since 0.17.0 shipped
+    that fix under **Breaking changes**. The same bullet's list of reserved names is wrong the other
+    way: it names ten, omits `edit_file`, `shell_start`, `shell_poll`, `shell_kill`, `todo_write`,
+    `ask_question` and `propose_plan`, all of which are reserved, and names `forget`, which is not.
+
+
+    After this release each claim appears once, in the present tense, and each is asserted by a test
+    rather than by the next reviewer's attention.
+  business_value: >
+    This crate's pitch is a permission boundary, a sandbox and a durable trace the caller owns.
+    `docs/CONTRACT.md` is the file that says what may be depended on, and it is currently wrong about
+    where the sandbox boundary is. A reader who checks the contract before trusting the harness with
+    sensitive work is worse off than one who never opened it: they come away believing a command runs
+    with the embedding program's full privileges, which has not been the default for fifteen releases.
+    That is the one class of documentation defect that costs more than silence.
+
+
+    It is also the cheapest thing on the audit's list to close, and the only one on it that changes no
+    behaviour — so it ships first and alone, ahead of five releases that each change something. Every
+    later entry in this roadmap edits documentation as part of its own work; doing that on top of a
+    file that already contradicts itself means every one of them has to decide which paragraph is
+    current before it can add to it.
+
+
+    The tests are the part that compounds. 0.60.1 closed three doc gaps and gave each a test precisely
+    because a gap a reviewer found once and nothing checks is a gap that reopens — and this release
+    exists because the sweep 0.60.1 performed over `docs/CONTRACT.md` did not reach these. Extending
+    the same suites is what stops a third sweep being necessary.
+  evidence_of_value: >
+    The functional criteria are the evidence: after this release `docs/CONTRACT.md` cannot hold the
+    pre-0.45.0 exec sentence, the `exec_sandbox` rustdoc cannot hold the sentence 0.48.0 retired, and
+    the tools-and-skills reserved-name bullet cannot drift from `RESERVED_TOOL_NAMES` — each asserted
+    by a test with a named sabotage that makes exactly that test fail and no other.
+
+
+    Beside them the manual evidence a test cannot carry: the containment section of
+    `docs/CONTRACT.md` read end to end against `src/sandbox.rs` and `src/run.rs`, confirming that
+    every remaining statement about what a spawn is confined to is one the source still makes, at the
+    same strength, on the same platforms.
+scope:
+  included:
+  - >
+    **The pre-0.45.0 exec paragraph is rewritten.** `docs/CONTRACT.md` lines 2536-2548 currently open
+    "A command runs in the workspace root with the embedding program's privileges, outside the
+    sandbox" and then draw three consequences from it. The paragraph is rewritten to state today's
+    boundary: `ExecMode::WorkspaceWrite` is the default, `FullAccess` is what
+    `TaskContract::with_full_access` asks for explicitly, and the three consequences are re-derived
+    against whichever mode is in force rather than asserted unconditionally. The consequence that
+    survives unchanged in every mode — that a timeout kills the direct child only — stays and is
+    marked as the one that does.
+  - >
+    **The `exec_sandbox` rustdoc drops the retired sentence.** `src/contract.rs:405-407` stops saying
+    the `shell_start` / `shell_poll` / `shell_kill` handles are not contained, and says what
+    `docs/CONTRACT.md:1222-1243` says instead: a handle takes the containment every other spawn takes,
+    its restriction lives with its processes, and the wall clock reaches neither — which is a
+    deliberate property, not a gap, because a dev server killed at the sandbox ceiling would be
+    containment deleting the tool's purpose. A doc comment only; no code on either side of it moves.
+  - >
+    **The tools-and-skills reserved-name bullet is corrected in both directions.** The claim that
+    feature-gated built-ins are not reserved is removed. The hand-typed list of reserved names is
+    replaced by a statement that defers to `RESERVED_TOOL_NAMES` rather than restating it, because a
+    list retyped into prose is a list that goes stale — which is exactly what happened here.
+  - >
+    **The reserved-set doc comment is corrected.** `src/tools/custom.rs:497` claims "Feature-gated
+    built-ins are reserved in every build, including builds that do not contain them." Six
+    feature-gated `browser_*` names and five `lsp_*` names are not in the set, so the sentence is
+    false as written. It is narrowed to what is true today and the gap is named as a known limitation
+    pointing at 0.61.0, which closes it. **The set itself is not touched in this release** — adding a
+    name to it changes what `Toolbox::validate` accepts, which is `src/` behaviour and therefore a
+    different release.
+  - >
+    **A sweep of `docs/CONTRACT.md` for any other claim a release has outlived.** Every
+    version-numbered assertion in the file is checked against the release that was supposed to have
+    satisfied it, the same sweep 0.60.1 ran and the same one that did not reach these three. Anything
+    found that is a stale claim is fixed here; anything found that is a real gap is recorded as a
+    finding for a later release, not fixed here.
+  - >
+    **Three new drift tests**, each in the file that already owns its class of claim, and each
+    failing on today's tree — a test that passes before the fix checks nothing.
+  - >
+    **The CHANGELOG entry, and the version bump.** `0.60.2` in Cargo.toml and Cargo.lock, and a
+    `## [0.60.2]` section written under the structure `docs/CHANGELOG_STRUCTURE.md` requires.
+  excluded:
+  - >
+    **Any behavioural change under `src/`.** Doc comments may change; nothing else may.
+    `docs/public-api.txt` must not move. This is the line that makes the release a patch, and it is
+    asserted rather than intended — see N1.
+  - >
+    **Adding the eighteen missing names to `RESERVED_TOOL_NAMES`.** That is 0.61.0. It changes what
+    `Toolbox::validate` accepts, which breaks a program that registers a tool called `check` — loudly,
+    correctly, and not in a patch. The temptation to fix it here, three lines from the doc comment
+    that describes it, is the specific thing this exclusion exists to refuse.
+  - >
+    **Restructuring `docs/CONTRACT.md`.** The audit that produced this release also recommends the
+    contract stop being chronological — that a reader should never have to work out which paragraph
+    supersedes another. That is a real finding and it is not this release: rewriting a 2,949-line
+    contract's structure while also correcting its claims makes the diff unreviewable and puts the
+    correction at risk. This release fixes what is false. Structure is a later entry.
+  - >
+    **New guide pages, and new measurements.** Neither is a stale claim.
+  - >
+    **Any change to `product.yaml`.** Planning does not own the product definition; if the sweep
+    reveals the definition is wrong, that is `/ultraship:iterate`.
+  fallback_scope:
+  - >
+    The `docs/CONTRACT.md` exec paragraph and the `exec_sandbox` rustdoc corrected, with F1 and F2.
+    That is still a coherent release: the two places the crate is wrong about its own security
+    boundary are closed and neither can reopen. The security claim is the whole reason this release is
+    first, and it is the half that must not drop.
+  - >
+    The tools-and-skills bullet and the reserved-set doc comment drop first if the release must
+    shrink. They are wrong, but wrong about which names a registered tool may take — a developer who
+    trips over it gets a `Error::Config` naming the problem in the cases that are reserved, and
+    0.61.0 closes the rest three weeks later. Nobody is misled about a security boundary by them.
+  - >
+    The full `docs/CONTRACT.md` sweep drops second, to a grep for version-numbered assertions with
+    findings recorded rather than resolved. The three known contradictions are fixed either way; the
+    sweep is what might find a fourth.
+acceptance:
+  functional:
+  - >
+    **F1 — the contract states one exec boundary.** A test asserts `docs/CONTRACT.md` does not contain
+    the phrase "outside the sandbox" in the command-execution section, and does contain a statement
+    naming `ExecMode::WorkspaceWrite` as the default. It must fail on today's file, which contains the
+    phrase at line 2536. Sabotage: restore the pre-0.45.0 sentence, under which only F1 fails.
+  - >
+    **F2 — the `exec_sandbox` rustdoc does not carry the retired sentence.** A test asserts
+    `src/contract.rs` does not contain "not contained" within the `exec_sandbox` doc block. It must
+    fail on today's source, which contains it at line 406. Sabotage: restore the 0.47.0-era clause,
+    under which only F2 fails. This is a doc-comment assertion over a source file, which
+    `tests/docs_drift.rs` does not currently do for `src/` — the one genuinely new shape of check in
+    this release.
+  - >
+    **F3 — the guide's reserved-name claim matches the source.** A test asserts
+    `docs/guide/tools-and-skills.md` does not contain the phrase "are *not* in the reserved set", and
+    does not hand-list reserved names that `RESERVED_TOOL_NAMES` does not hold. It must fail on
+    today's file, which claims the opposite of the source and names `forget`. Sabotage: reinstate
+    `forget` in the guide's list, under which only F3 fails and names it.
+  - >
+    **F4 — every existing docs gate stays green.** `tests/docs_drift.rs`, `tests/guide_pages.rs`,
+    `tests/readme.rs`, and the `public_api` and `changelog` suites. Two to watch specifically.
+    `readme_dependency_version_matches_cargo_toml` pins the README install snippet to Cargo.toml's
+    major.minor precisely so a patch does not churn it, so `io-harness = "0.60"` stays exactly as it
+    is while Cargo.toml goes to 0.60.2. And `tests/readme.rs` requires the MSRV inside the first 60
+    lines — the gate 0.60.1's rewrite tripped because nobody had read it — so any edit that moves the
+    README's opening re-trips it.
+  - >
+    **F5 — the sweep is recorded, not just performed.** Every version-numbered assertion checked in
+    `docs/CONTRACT.md` is listed in the release evidence with the release it was checked against and
+    the verdict: current, corrected here, or recorded as a finding. A sweep whose output is "I looked"
+    is not evidence, and this is the criterion that distinguishes the two.
+  non_functional:
+  - >
+    **N1 — nothing under `src/` changes except documentation.** `git diff develop -- src/` shows only
+    lines inside `//!` or `///` comments, and `docs/public-api.txt` is byte-identical to the 0.60.1
+    snapshot. Asserted by reading the diff and by `public_api.rs` staying green with no snapshot
+    regeneration. This is what makes 0.60.2 a patch, and it is the criterion the release fails on if
+    the eighteen reserved names are smuggled in beside the doc comment that describes them.
+  - >
+    **N2 — the version moves in exactly two files.** `Cargo.toml` and `Cargo.lock`, 0.60.1 → 0.60.2.
+  - >
+    **N3 — no claim is widened.** Every containment sentence surviving the rewrite is at most as
+    strong as what `src/sandbox.rs` and `src/run.rs` implement, per platform. The correction being
+    made here is a claim that was too weak in one place and too strong in another; the failure mode of
+    fixing it is overshooting into a guarantee the portable floor cannot keep. Evidenced by the
+    review, section against source.
+  operational:
+  - >
+    **O1 — CI is green on all three platforms** on the feature branch and again on the merge to
+    develop. A docs-only release still runs the whole suite, because the suite is where the docs gates
+    live.
+  - >
+    **O2 — the nightly rustdoc gate is green.** `RUSTDOCFLAGS` under nightly catches what stable
+    `cargo doc` cannot see, and it has caught something in four of the last five releases. This
+    release edits two rustdoc blocks, so it is exactly the one that must not skip it.
+  - >
+    **O3 — the published crate carries the corrected contract.** Verified after publish by reading the
+    docs.rs rendering of `TaskContract::exec_sandbox`, not by reading the local file.
+delivery:
+  target_mode: published
+  environment: >
+    crates.io for the crate, GitHub for the Release and the rendered documentation, docs.rs for the
+    rendered rustdoc O3 verifies. No service, no deployment target, no migration — the artifact is a
+    documentation change inside a published library.
+  deployment_method: >
+    One feature branch off develop, one PR into develop, merged with the PR button. The release commit
+    bumps Cargo.toml and Cargo.lock and writes the CHANGELOG section; the UltraShip record is sealed
+    and the lock pinned in a commit on top. develop merges to main by PR, and the tag `v0.60.2` is
+    pushed on its own — pushing the tag is what cuts the GitHub Release, and creating the Release by
+    hand ships it with no assets. `cargo publish` is run manually, last, after the Release exists,
+    with the registry token sourced from the repo-local `.env`.
+  migrations:
+  - >
+    None. No schema, no checkpoint format, no configuration key, and no public item added, renamed or
+    removed. A program on 0.60.1 upgrading to 0.60.2 recompiles unchanged.
+  observability:
+  - >
+    The evidence for this release is the test suite and the rendered pages; there is no runtime
+    behaviour to observe. The one post-publish check is O3 — docs.rs showing the corrected
+    `exec_sandbox` documentation.
+  rollback: >
+    A documentation defect is fixed forward as 0.60.3, not rolled back. `cargo yank` removes 0.60.2
+    from resolution for new dependents and **does not delete it**: the version stays downloadable and
+    its rendered docs stay on docs.rs, so yanking answers nothing a docs defect asks. The GitHub
+    Release and tag can be deleted; the crates.io publish cannot. That asymmetry is the reason O3 is a
+    criterion and not a courtesy.
+dependencies:
+  products: []
+  services:
+  - crates.io, for the publish
+  - docs.rs, for the rendered rustdoc O3 verifies
+  - GitHub Actions, for CI on the three platforms and for the Release the tag cuts
+  human_approvals:
+  - >
+    The owner approves the rewritten containment paragraph before it is published. It is a statement
+    about the crate's security boundary on its most-cited page, and it is the one artifact here that
+    cannot be un-published.
+resource_profile:
+  complexity: small
+  uncertainty: low
+  likely_cost_drivers:
+  - >
+    **The `docs/CONTRACT.md` sweep.** 2,949 lines with version-numbered assertions throughout. The
+    three contradictions in scope were found by grep; the rest of the sweep is a read, and F5 requires
+    its output recorded rather than asserted.
+  - >
+    **Getting the replacement paragraph right per platform.** The correction is not "commands are
+    sandboxed" — macOS and Linux confine writes and deny egress, a Windows AppContainer does both when
+    asked, and a Windows Job Object and the portable floor apply resource caps and have no filesystem
+    facility at all. A replacement that flattens that into one sentence has traded a false claim for a
+    different false claim, which N3 exists to catch.
+  - >
+    **F2 is a new shape of test.** Asserting over a rustdoc block inside `src/` rather than over a
+    markdown file is not something `tests/docs_drift.rs` does today, so the first one costs more than
+    the two markdown assertions beside it.
+  preferred_tools:
+  - Grep over `docs/`, `docs/guide/` and `src/` for version-numbered assertions and superseded phrasing
+  - '`tests/docs_drift.rs` and `tests/guide_pages.rs` as the pattern every new test follows'
+  - '`git log -S` on the superseded phrases, to confirm which release actually retired each one'
+  constraints:
+  - >
+    No `src/` behaviour change. The moment a fix is tempting — and it will be, because the reserved-set
+    doc comment sits three lines from the list it describes — it is a different release.
+  - >
+    Nothing in this release may assert a duration or a timing. This project has paid for a timing
+    assertion on a CI runner more times than for anything else, and 0.60.1 shipped with a known
+    wall-clock flake still open.
+  - >
+    The contract stays a contract. Depth belongs in `docs/guide/`, history in CHANGELOG.md. A
+    correction that explains what changed in 0.45.0 and 0.48.0 in the contract's own prose has
+    recreated the chronological diary the audit asked it to stop being.
+risks:
+- >
+  **The correction overshoots into a guarantee the platform cannot keep.** The stale sentence is too
+  weak; the natural replacement — "commands run under the sandbox" — is too strong on the Windows Job
+  Object and the portable floor, which have no filesystem facility at all. This is the most likely way
+  this release ships a new defect while fixing an old one. N3 is the criterion; the platform table
+  already in `docs/CONTRACT.md` is the source it is checked against.
+- >
+  **The reserved-names fix leaks into this release.** The doc comment being corrected in
+  `src/tools/custom.rs` sits immediately above the list that is missing eighteen names. Adding them is
+  a three-line diff and it would make this release a breaking minor. N1 is asserted by diff and by the
+  unchanged public-API snapshot for exactly this reason.
+- >
+  **The sweep finds a fourth contradiction that is not cheap.** A stale claim that cannot be corrected
+  without a behaviour change is a finding for a later release, not a reason to grow this one. Recording
+  it is the whole of the obligation.
+- >
+  **A documentation release is treated as a low-risk release.** It publishes to crates.io irreversibly.
+  The full suite, all three platforms, and the nightly rustdoc gate run exactly as they do for a
+  release that ships code.
+open_questions:
+- >
+  **Whether the sweep belongs in this release or its own.** F5 requires every version-numbered
+  assertion in a 2,949-line file checked and recorded. If the sweep turns up more than a handful of
+  stale claims, the honest split is: correct the three known contradictions here, and make the sweep
+  its own entry rather than letting an unbounded read hold up a security correction. Decide when the
+  sweep's size is known, not now.
+- >
+  **Whether `docs/CONTRACT.md` needs the structural fix sooner than planned.** The audit's finding is
+  that a current contract should never require a reader to work out which paragraph supersedes
+  another — and this release exists because that is exactly what it required. Fixing the claims does
+  not fix the shape that let two of them coexist for fifteen releases. Excluded here deliberately;
+  whether it becomes an entry of its own is a question for after the sweep.
+- >
+  **Whether the sealed 0.60.1 record's `next_recommended_version: 0.61.0` needs a note.** That record
+  is immutable and recommends 0.61.0, which this release supersedes by arriving first. It is a
+  recommendation made before the audit existed rather than a published capability claim, so nothing is
+  wrong on the page — but a reader comparing the record to the roadmap will notice, and a one-line
+  note in this release's CHANGELOG entry may be worth more than leaving it to be rediscovered.

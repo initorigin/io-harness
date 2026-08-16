@@ -11,8 +11,8 @@ itself, and that is precisely when a dependent needs the explanation most.
 The public surface is everything re-exported from the crate root plus the items
 reachable through the public modules it names.
 
-The re-exported half — the 150 items a caller reaches as `io_harness::Thing` —
-is enumerated in [public-api.txt](public-api.txt), which a test compares against
+The re-exported half — everything a caller reaches as `io_harness::Thing` — is
+enumerated in [public-api.txt](public-api.txt), which a test compares against
 the live crate on every run. That is the surface the deprecation cycle below
 covers and the surface every item of which carries a worked example.
 
@@ -585,11 +585,15 @@ the rest are untouched. `Act::Net` is untouched too, for a blunter reason: the
 provider is reached over the network, and denying it would stop the run asking
 for the plan in the first place.
 
-**`remember` and `forget` are the two writes the policy cannot see**, because
-they land in this crate's own store rather than in the workspace. Both are
-refused explicitly for the duration of the phase — a withdrawal changes what
-later runs know exactly as a write does. `todo_write` and `ask_question` are not:
-neither changes anything outside the run's own record of itself.
+**`remember`, `forget` and `send_message` are the writes the policy cannot
+see**, because they land in this crate's own store rather than in the workspace.
+`remember` and `forget` are refused explicitly for the duration of the phase — a
+withdrawal changes what later runs know exactly as a write does. `send_message`
+(0.60.0) is not refused and does not need to be: the gate is one gate at the
+root, a spawn during the phase is an `Act::Exec` the `plan-gate` layer refuses,
+and an address naming no live agent is refused by the tool — so during the phase
+there is nobody in the tree to send to. `todo_write` and `ask_question` are
+neither: neither changes anything outside the run's own record of itself.
 
 **What the phase is not:** it is not a sandbox, and it does not undo. A tool that
 reads a file and has a side effect the crate cannot see — a registered `Tool`
@@ -686,9 +690,11 @@ genuinely live is not detected either: `resume_*` will refuse a request that has
 already been decided, but it will not refuse one that is still being held by a
 process that is still running.
 
-**`run_events` is never pruned.** A long run's stream grows without bound. Deleting
-it is the application's call; the crate has never pruned anything in the trace and
-did not start with its newest table.
+**`run_events` never prunes itself.** A long run's stream grows without bound
+while the run lives, and nothing expires on a clock. Deleting it is still the
+application's call, but since 0.58.0 the crate gives it one: `run_events` is one
+of the run-keyed tables `Store::delete_session` removes and
+`Store::archive_session` empties.
 
 **A row in `pending_approvals` no longer means the run is waiting (0.33.0).** The
 row is now written *before* the in-process approver is consulted, so one exists for
@@ -1165,19 +1171,22 @@ remounts degrades to `PortableFloor` and **reports the floor** rather than namin
 an isolation that was never applied — the recorded backend is the one that
 applied, which is the point of recording it.
 
-**On Linux the "Yes" in that table depends on the host's kernel policy, and one
-common distribution says no by default.** The backend needs an unprivileged user
-namespace. Ubuntu 24.04 ships
-`kernel.apparmor_restrict_unprivileged_userns=1`, which refuses one, so on a
-stock Ubuntu 24.04 host a contained command takes `PortableFloor`: the resource
-caps still apply, and **the filesystem confinement and the egress denial do
-not**. Nothing is hidden — `select().backend()` answers `PortableFloor` before
-the run and the `SandboxEvent` rows record it afterwards — but a caller who
-assumes the table's Linux row without reading the backend will not get what it
-says. An operator who wants the real backend sets
-`kernel.apparmor_restrict_unprivileged_userns=0`, which is what most other
-distributions already ship; this repository's own CI does exactly that so its
-Linux legs exercise the backend rather than the fallback.
+**On Linux the "Yes" in that table depends on which rung of the chain the host
+admits.** Three of the four rungs need an unprivileged user namespace, and Ubuntu
+24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, which refuses one.
+That is the reason the Landlock rung exists and is tried first: it needs no
+namespace at all, so a stock Ubuntu 24.04 host takes `Backend::LinuxLandlock` and
+**does** get the filesystem confinement — with egress denied only where the
+kernel's Landlock ABI carries the network rules (4 and later, kernel 6.7). A host
+admitting neither Landlock nor a namespace takes `PortableFloor`, where the
+resource caps still apply and **the filesystem confinement and the egress denial
+do not**. Nothing is hidden — `select().backend()` answers before the run and the
+`SandboxEvent` rows record it afterwards — but a caller who assumes the table's
+Linux row without reading the backend is assuming a rung. Setting
+`kernel.apparmor_restrict_unprivileged_userns=0` makes the namespace rungs
+available too, which is what most other distributions already ship; this
+repository's own CI does exactly that so its Linux legs exercise them rather than
+only the rung that needs nothing.
 
 **Egress under containment follows the policy's own host rules (0.48.0).** Up to
 0.47.0 this was all hosts or none: the backends take one boolean, so a policy
@@ -1219,11 +1228,24 @@ removes that cost for a project whose ecosystem this crate can name. For one it
 cannot — or for a build that writes to a path the *caller* configured outside the
 workspace — the answer is `with_full_access()`, said once at the call site.
 
-**Everything a run starts is contained (0.48.0).** Up to 0.47.0 this paragraph
-said the `shell_start` / `shell_poll` / `shell_kill` handles were not, and it did
-not mention that the git built-ins were not either — so which tool the model
-happened to pick decided whether the boundary applied. Both now take the same
-containment every other spawn takes, per stage.
+**Every spawn the run's own command tools make is contained (0.48.0).** Up to
+0.47.0 this paragraph said the `shell_start` / `shell_poll` / `shell_kill`
+handles were not, and it did not mention that the git built-ins were not either —
+so which tool the model happened to pick decided whether the boundary applied.
+Both now take the same containment every other spawn takes, per stage.
+
+**That is not every process the crate starts, and three later releases each added
+one.** The automatic post-edit checker and the `check` tool build their own
+uncontained `Exec` (0.51.0); a language server named in `[[lsp]]` is spawned
+directly (0.52.0); and on unix the browser child is spawned directly (0.53.0).
+None of the three is wrapped by the backend `select` chose, so on those paths the
+filesystem boundary is the policy's alone. What each still passes through is
+stated where it is specified: starting a language server is an `Act::Exec` check,
+`check` is an `Act::Exec` check on program and argv, the post-edit checker is
+deliberately ungated as the crate's own reflex after a write the policy already
+allowed, and every navigation the browser makes is an `Act::Net` check whose
+egress takes the run's own proxy. Wrapping them is a later release's work, and it
+is recorded here rather than left to be discovered.
 
 The design question that paragraph deferred — what a resumed run does with a
 handle whose sandbox no longer exists — is answered by construction rather than
@@ -1252,6 +1274,12 @@ naming both modes instead of decoding an errno. A registered `Tool` may declare
 one too, and there the declaration is a **refusal** mechanism and not a
 confinement one: the crate does not see that tool's own spawn and does not claim
 to govern it.
+
+The three paths above that no backend wraps declare nothing either, and a
+declaration would have nothing to apply to: `check`, the `lsp_*` tools and the
+`browser_*` tools fall through to the toolbox's own arm, which holds no entry for
+a built-in, so they run under the contract's own mode with nothing narrowing
+it.
 
 **A contained `shell` stage is contained slightly less than an `exec` command.**
 `shell` pipes its stages into one another, so it owns every child process and
@@ -1285,7 +1313,10 @@ that as the defect it would be.
 and `read_file`. Everything else built in runs one at a time, in order, exactly as
 it did before — `write_file`, `edit_file`, `exec`, the four shell tools, the git
 built-ins, `list_dir`, `view_image`, spawn, `remember`, `todo_write`,
-`ask_question` and `propose_plan`. That includes the git readers and `list_dir`,
+`ask_question`, `propose_plan`, and every built-in added since. That list names
+the tools this paragraph was written against and is deliberately not maintained
+as an enumeration: the rule is the enumeration — three names are read-only and
+everything else built in is not. That includes the git readers and `list_dir`,
 which change nothing: `list_dir` is outside the set the release measured, and the
 git readers reach the world through a process, which a later release will decide
 about with its own evidence rather than by extension.
@@ -1567,8 +1598,10 @@ rather than appearing as empty, because a reviewer told a rewritten file was emp
 would read every line as an addition. A file the run never wrote is not in the
 list.
 
-**It is not a diff, and nothing new is stored.** Both texts are what the store
-already holds; computing and keeping hunks is a later release's work. A file the
+**It is not a diff, and nothing new is stored for it.** Both texts are what the
+store already holds. Hunks are no longer future work — 0.51.0 computes one per
+write and keeps it in `edits.hunk` — but a `ChangeReview` still carries the two
+texts rather than the hunk. A file the
 run wrote and something then removed is omitted rather than reported as empty.
 
 ## What compaction folds, what it costs, and what it never loses (0.43.0)
@@ -1658,7 +1691,9 @@ in a fixed order:
 4. the caller's own text, when `TaskContract::prompt` is `SystemPrompt::Append`;
 5. the repository's own guidance, when `[instructions]` discovered any;
 6. the boundary section, when the run enforces a policy or is contained — which since 0.46.0 is every run that has not asked for `ExecMode::FullAccess`;
-7. **the crate's ending sentence, last, always.**
+7. **the crate's ending sentence, last, always** — in the workspace loop. The
+   single-file loop composes without one, because there is no turn to classify
+   there.
 
 **Nothing a caller or a repository supplies is emitted after step 7.** The ending
 of a classifying turn's opening is the sentence that lets a turn answer instead of
@@ -1666,9 +1701,9 @@ working, and the guarantee it produces — a `TurnKind::Reply` stages no step, n
 gate, no checkpoint, no snapshot and no approval (0.37.0) — is one this document
 makes to a reader who never sees the embedder's prompt. A composable prompt that
 could contradict its own runtime's contract would not be a feature. What this
-crate asserts is the composition: the sentence is present, byte-exact, and last,
-under every `SystemPrompt` including `Replace("")`, and under any text a
-repository carries. **What a model then does with a prompt is not a claim this
+crate asserts is the composition: in the workspace loop the sentence is present,
+byte-exact, and last, under every `SystemPrompt` including `Replace("")`, and
+under any text a repository carries. **What a model then does with a prompt is not a claim this
 crate can make.**
 
 **The ending moved in 0.45.0.** Until 0.44.0 it sat inside the base description,
@@ -1689,9 +1724,12 @@ rule on, grouped by what `Policy::explain` returns for each and attributed, on a
 refusal, to the layer that produced it. It is the same vocabulary a `Refused`
 event carries, so the prompt and the refusal name the same thing.
 
-- **A permissive policy renders nothing**, and single-file mode never renders it,
-  because single-file mode enforces no policy. A section describing an
-  enforcement that does not happen would be worse than silence.
+- **A permissive policy renders nothing *when the run is not contained*.** Since
+  0.46.0 a run is contained unless it asked for `ExecMode::FullAccess`, so a
+  permissive contained run still gets the one line naming its mode and backend.
+  Single-file mode renders no section at all, because it enforces no policy. A
+  section describing an enforcement that does not happen would be worse than
+  silence.
 - **At most 24 patterns per act are named**, and the line says how many it did not
   name. The unnamed rules are enforced exactly the same.
 - **`Effect::Ask` is rendered as itself** — allowed once a human or an approver
@@ -1708,8 +1746,9 @@ event carries, so the prompt and the refusal name the same thing.
 One further line names the run's `ExecMode` and the backend `sandbox::select`
 **actually returned** on this host — not the one that was asked for. Where that is
 the portable floor or a Windows Job Object, the line says the resource caps apply
-and filesystem and outbound-network confinement do not, which on a stock Ubuntu
-24.04 is the truth an agent would otherwise have to discover (0.40.0). A run under
+and filesystem and outbound-network confinement do not — the truth an agent would
+otherwise have to discover (0.40.0). A stock Ubuntu 24.04 is no longer an example
+of it: that host takes the Landlock rung, which needs no namespace. A run under
 `ExecMode::FullAccess` gets the line too, saying it is not contained: since 0.46.0
 that is a decision the caller made, and an agent that may write anywhere should
 know it rather than infer it from a write that happened to succeed.
@@ -1906,8 +1945,10 @@ not a tool: no model can call it.
 
 ## Limits that hold today
 
-Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.35.0.
+Stated here rather than discovered later. Each is real, each is known, and each
+is open at the release named beside it. The list is maintained rather than
+stamped — it carried an "as of 0.35.0" for twenty-five releases while entries
+dated 0.49.0, 0.56.0, 0.57.0 and 0.60.0 were added below it.
 
 **The concurrency cap is per tier, not per tree (0.32.0).**
 `Containment::max_concurrent_agents` bounds how many agents work at once *at one
@@ -1959,7 +2000,10 @@ which is asserted on the query plan rather than on a clock. What they are *not*
 is independent of how much history the store holds: counting every row is what
 the answer is, so the cost is linear in rows however it is served. Measured on a
 debug build over an in-memory store, at 20,000 finished runs: 1.8ms, 2.5ms,
-7.6ms and 1.2ms respectively — roughly 90 to 380 nanoseconds per run. A caller
+7.6ms and 1.2ms — four figures for the five queries named above, which is how
+this sentence has read since 0.30.0. Which query the missing figure belongs to
+was never recorded, so no pairing is claimed here; the spread is roughly 90 to
+380 nanoseconds per run. A caller
 refreshing a panel every second over a very large trace should cache the answer;
 this crate does not cache it for them.
 
@@ -2122,10 +2166,12 @@ with an invented id — a `tool_result` correlating with nothing is a 400 on at
 least one vendor. A message that would carry no blocks at all is dropped whole,
 for the same reason.
 
-**`user` is derived and kept for one release.** The loop fills it with exactly the
+**`user` is derived and still carried.** The loop fills it with exactly the
 string it filled before 0.49.0, so a `Provider` that reads it receives what it
 always received and is honestly non-conversational; a built-in wire ignores it
-whenever `messages` is non-empty. It will be removed in a later version. The two
+whenever `messages` is non-empty. 0.49.0 described it as kept for one release;
+eleven minors later it is still here and no removal is scheduled, and when one is
+it will be a marked break carrying a migration note. The two
 are not built separately: the assembler emits one sequence of pieces, the flat
 string is those pieces concatenated, and the conversation is those same pieces
 interleaved with the assistant turns — which is why they cannot drift into two
@@ -2191,8 +2237,9 @@ completion:
   one.
 - **A paused turn resumes as a fresh request and may repeat a search.** A
   `pause_turn` stop reason is a continuation, so the loop takes another step — but
-  the request has been one flattened user turn since 0.1.0 and the crate does not
-  echo the vendor's partial assistant blocks back. The provider may therefore
+  the crate does not echo the vendor's partial assistant blocks back. (The request
+  was one flattened user turn from 0.1.0 to 0.48.0 and carries `messages` since
+  0.49.0; neither shape carries those blocks.) The provider may therefore
   re-run, and re-charge for, a search it already performed. `WebAccess::max_uses`
   is the only lever against it.
 - **A spawned child inherits the root's declaration and cannot ask for its own.**
@@ -2300,9 +2347,9 @@ a projection onto the typed API and never a second path into the run loop:
   release later, and a hook that appends is a write to a path a stranger chose, which
   is the same hazard by a shorter route. Each is accepted unchanged in
   `io.local.toml` and in the user scope, and the narrowing value of each of the four
-  keys stays legal in `io.toml`. **A number has no widening value, so four keys are
-  held to the lower of the two instead** — `run.max_read_chars` (0.55.0) and the
-  three `[memory]` caps (0.56.0): a project file may tighten an operator's ceiling
+  keys stays legal in `io.toml`. **A number has no widening value, so five keys are
+  held to the lower of the two instead** — `run.max_read_chars` (0.55.0),
+  `run.max_wait_secs` (0.60.0) and the three `[memory]` caps (0.56.0): a project file may tighten an operator's ceiling
   and may not loosen it, while `io.local.toml` and the user scope set it outright. **This does not claim that a cloned repository is
   safe** — `[[mcp]]` still names a command, `[toolchain]` still names an argv, and a
   policy layer can still allow what the defaults did not. It is a specific narrowing
@@ -2325,8 +2372,9 @@ a projection onto the typed API and never a second path into the run loop:
   caller's own privileges, before any run exists.
 - **`[instructions]` is discovery, and the one place "resolve or fail" does not
   apply (0.27.0).** A named file that is absent is skipped rather than failing the
-  load. What it finds lands in `TaskContract::constraints` — no new public field —
-  and it is **untrusted text from the repository**: it reaches the model verbatim
+  load. What it finds lands in `TaskContract::instructions` — its own public field since
+  0.45.0, having landed in `constraints` from 0.27.0 to 0.44.0 — and it is
+  **untrusted text from the repository**: it reaches the model verbatim
   and grants nothing.
 - **The `[toolchain]` override does not reach this crate's own run loop.** The
   harness detects for itself; `Config::toolchain(detected)` gives the embedding
@@ -2414,7 +2462,10 @@ matters more than the figure:
 to the state it was in before *this run* first wrote it.
 
 - **One restore point per file per run**, taken at the first write. Not a per-step
-  history: there is no undo of the last edit, no rewind to step 4, and no redo.
+  history of contents: there is no redo, and a restore returns the file to the
+  state before this run's first write. Reversing one step's change is a different
+  mechanism with its own answers — `rewind_step` (0.51.0), which reverse-applies
+  that step's hunks.
 - **It is durable, and it is a new table.** `CHECKPOINT_FORMAT` stays 7, an older
   store opens and resumes unchanged, and a run that predates the release answers
   `NotRecorded` rather than restoring nothing quietly.
@@ -2424,8 +2475,9 @@ to the state it was in before *this run* first wrote it.
   and `NotRecorded` change nothing at all, and a `NotKept` file is left exactly as
   the run left it — never truncated. Collapsing the two would tell a caller a file
   was untouched when the run had rewritten it and the harness cannot undo that.
-- **Only `write_file` and `edit_file` snapshot.** A file changed by `shell`, by
-  `exec`, or by a git built-in has no restore point. So does one whose bookkeeping
+- **Only the write tools snapshot** — `write_file`, `edit_file` and `patch_file`
+  (0.51.0). A file changed by `shell`, by `exec`, or by a git built-in has no
+  restore point. So does one whose bookkeeping
   row could not be written, which is warned about and swallowed exactly as an edit
   row is — `NotRecorded` means "no restore point", not "the run did not write it".
 - **It obeys the policy the edit obeyed.** Restoring goes through
@@ -2533,18 +2585,36 @@ decision, land in `policy_events` attributed to the rule and layer; a silent
 allow does not write a row, exactly as it does not for a read or a write. What
 the policy does **not** decide is what the command then does.
 
-A command runs **in the workspace root with the embedding program's privileges,
-outside the sandbox**. That is the same bound already stated above for a
-registered `Tool` and a stdio MCP server, and it is deliberate: the sandbox
-denies network egress and confines writes to its own workdir, which is right for
-a verification gate and makes `npm install` impossible. Three consequences worth
-naming. A policy written for file access does not constrain command execution —
-`Act::Read`/`Act::Write` rules say nothing about `exec`, and the tier default
-decides everything unnamed. A command can reach what the agent's own file rules
-would have refused, because `cat secrets/prod.env` is a command and not a read.
-And a timeout kills the **direct child only**: a process that child started
-itself may outlive it, on every platform this crate supports — the same gap the
-sandbox reports for its own wall-clock kill on the portable floor. See the
+A command runs with the **workspace root as its working directory**, and since
+0.46.0 it runs **contained by default**: `ExecMode::WorkspaceWrite` is the
+default `exec_sandbox` mode, so `exec` and every `shell` tool is wrapped by the
+backend `sandbox::select` chooses and may write inside the workspace root, the
+system temporary directory and the detected toolchain's own cache directories —
+and nowhere else. The grant every release up to 0.45.0 gave by default is still
+available and is now a sentence rather than an omission:
+`TaskContract::with_full_access`. This is where a command differs from a
+registered `Tool` and a stdio MCP server, which do run unwrapped at the
+embedding program's privileges: the harness starts the command's process itself,
+so it can wrap it, and it does not start theirs. What the containment is worth is
+per platform and the platform table above is the statement of it — macOS and
+Linux confine writes and deny egress, a Windows AppContainer does both when the
+run asked for access confinement (0.59.0), and the Windows default Job Object
+and the portable floor apply the resource caps and have no filesystem facility at
+all, so there the mode is routed and reported and enforces nothing for the
+filesystem.
+
+Three consequences worth naming. The mode changes none of them; the second one
+varies by platform. A policy written for file access does not constrain command
+execution — `Act::Read`/`Act::Write` rules say nothing about `exec`, and the tier
+default decides everything unnamed. A command can read what the agent's own file
+rules would have refused, because `cat secrets/prod.env` is a command and not a
+read: containment confines *writes*, and on macOS and Linux the tree is bound or
+remounted read-only rather than unreadable, so it takes nothing away from that.
+The one platform where it does is a Windows AppContainer, which is default-deny
+for reads and so bounds the read to the derived grant set as well. And a timeout
+kills the **direct child only**: a process that child started itself may outlive
+it, on every platform this crate supports — the same gap the sandbox reports for
+its own wall-clock kill on the portable floor. See the
 [command execution guide](guide/command-execution.md).
 
 **Toolchain detection is a default, and it will be wrong for someone.** The
@@ -2558,12 +2628,21 @@ overridable until 0.19.0 puts a configuration file under it.
 **Closed in 0.17.0: a registered tool could be silently shadowed.** The reserved
 set named only the original seven built-ins while dispatch grew to twenty-six, so
 a registered tool called `git_status` or `xlsx_read` passed `Toolbox::validate`
-and was then permanently unreachable — the built-in answered every call. It now
-names every built-in, in every build regardless of feature flags, and a
-registered tool taking one of those names fails the run before the first
-completion. The names of feature-gated built-ins are reserved even where the tool
-itself is not compiled in, so enabling a feature can never take away a tool that
-was working.
+and was then permanently unreachable — the built-in answered every call. It named
+every built-in as of that release, in every build regardless of feature flags,
+and a registered tool taking one of those names fails the run before the first
+completion. The names it holds are reserved even where the tool itself is not
+compiled in, so enabling a feature can never take away a tool that was working.
+
+**And it has reopened, because the fix was a list rather than an invariant.**
+Eighteen names dispatch answers today are absent from the set — `forget`,
+`check`, `patch_file`, `git_branch`, `git_worktree`, the five `lsp_*` tools, the
+six `browser_*` tools, `send_message` and `read_messages` — so every built-in
+added after 0.17.0 reopened the defect by one name. A registered tool taking one
+of those validates and is then unreachable, exactly as before. It is stated here
+rather than fixed here because adding a name to the set changes what
+`Toolbox::validate` accepts, which is a break and not a patch: **0.61.0** closes
+it as one const every dispatch arm reads.
 
 **Windows resource caps.** See the platform table above.
 
@@ -2611,15 +2690,22 @@ second consecutive release in which this document has done it.
 The run-end sweep and the drop backstop go through the same kill, so both inherit
 the guarantee.
 
-**No seccomp filter is installed.** The Linux backend is namespaces and rlimits.
-Whatever syscall restriction applies is the kernel's own default under an
-unprivileged user namespace, not a filter this crate installed.
+**The seccomp filter is a deny-list, not a jail (0.46.0).** The Landlock rung
+installs one alongside its rule set: a short list of syscalls that would let a
+payload undo its own confinement or reach into another process is refused with
+`EPERM`, and it says nothing about the thousands it does not name. An allow-list
+a real toolchain survives is a research problem whose failure mode is a broken
+build, and that trade was made at specification time. On the namespace rungs
+whatever else applies is the kernel's own default under an unprivileged user
+namespace, not a filter this crate installed.
 
 **A native backend can silently become the floor.** `select` chooses its
 candidate at compile time, and a backend whose primitive is unavailable at
-runtime degrades to the portable floor — this is live on Ubuntu 24.04, where
-`apparmor_restrict_unprivileged_userns=1` makes every `unshare` fail. It reports
-the floor honestly in the returned `Selected`, so read that value rather than
+runtime degrades to the next rung and ultimately to the portable floor. Ubuntu
+24.04's `apparmor_restrict_unprivileged_userns=1` makes every `unshare` fail,
+which rules out three of the four Linux rungs — that host lands on Landlock, not
+on the floor, and the floor is where a host without Landlock either ends up. It
+reports what ran honestly in the returned `Selected`, so read that value rather than
 assuming the platform's native backend is what ran.
 
 **What the trace says a tree ran under.** `run_tree`, `resume_tree` and the
@@ -2783,8 +2869,9 @@ resumable session — a run whose words are gone can still be resumed.
 
 **An archived restore point can no longer restore.** The `snapshots` row stays
 and records that its content was archived, and a restore reaching it reports
-`Reverted::Stale` naming the archive rather than writing an empty file over a
-real one.
+`Rewind::NotKept` naming the archive rather than writing an empty file over a
+real one. (`Reverted::Stale` is `rewind_step`'s answer to a hunk that no longer
+applies — a different question with a different type.)
 
 **A session's size is content bytes; a store's size is pages.**
 `Store::session_size` reports the summed `length()` of the session's own text and

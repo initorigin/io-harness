@@ -26,6 +26,80 @@ notes are produced from it.
 
 ### Security
 
+## [0.60.2] - 2026-08-16
+
+Documentation only. Nothing under `src/` changes except doc comments,
+`docs/public-api.txt` is byte-identical to 0.60.1's, and a program on 0.60.1
+recompiles unchanged.
+
+### Fixed
+
+- **`docs/CONTRACT.md` gave two opposite answers about what a command the agent
+  runs is bounded by, and the wrong one was the reassuring one.** The
+  command-execution block said a command runs "in the workspace root with the
+  embedding program's privileges, outside the sandbox" — true up to 0.44.0 —
+  while the same file stated 1,300 lines earlier that everything a run starts is
+  contained (0.48.0), with nothing telling a reader which superseded which. The
+  block now states today's boundary: `ExecMode::WorkspaceWrite` is the default,
+  `TaskContract::with_full_access` is how the pre-0.45.0 grant is asked for by
+  name, and what containment is worth is given per platform rather than
+  flattened into one sentence. A reader who checked the contract before trusting
+  the harness with sensitive work was worse off than one who never opened it.
+
+- **`TaskContract::exec_sandbox`'s documentation carried a sentence 0.48.0
+  retired.** It told a caller the `shell_start` / `shell_poll` / `shell_kill`
+  handles "are not contained because a handle outlives the call that made it".
+  They have taken the same containment every other spawn takes, per stage, since
+  0.48.0. It now says so, along with the half that was true and had never been
+  written here: a handle's restriction lives with its processes, and
+  `SandboxLimits::max_wall_secs` deliberately does not reach one.
+
+- **The reserved-tool-name claims disagreed with the source in three places, in
+  both directions.** `docs/guide/tools-and-skills.md` said the feature-gated
+  built-ins are *not* in the reserved set, which 0.17.0 made false, and its
+  hand-typed list named `forget`, which is not reserved, while omitting
+  `edit_file`, `shell_start`, `shell_poll`, `shell_kill`, `todo_write`,
+  `ask_question` and `propose_plan`, which are. The page now refers to
+  `RESERVED_TOOL_NAMES` instead of restating it. In the other direction, that
+  set's own doc comment and the contract's 0.17.0 paragraph both claimed it names
+  every built-in: eighteen dispatched names are absent from it — `forget`,
+  `check`, `patch_file`, `git_branch`, `git_worktree`, the five `lsp_*` tools,
+  the six `browser_*` tools, `send_message` and `read_messages` — because
+  0.17.0's fix was a hand-maintained list rather than an invariant, so each
+  built-in added since reopened the defect by one name. All three places now say
+  that. Closing it changes what `Toolbox::validate` accepts, so it is 0.61.0's
+  work and not a patch's.
+
+- **A sweep of every version-numbered assertion in `docs/CONTRACT.md` corrected
+  nineteen more claims a release had outlived**, in twenty-two places. Three are
+  worth naming. On a stock Ubuntu 24.04 — the commonest Linux CI image — the file
+  said a contained command takes the portable floor and gets **no filesystem
+  confinement and no egress denial**, in three separate places; the Landlock rung
+  needs no namespace and exists precisely because that host refuses one, so it
+  gets confinement. "Everything a run starts is contained (0.48.0)" declared a
+  class closed, and 0.51.0, 0.52.0 and 0.53.0 then each opened one — the
+  post-edit checker, a language server, and the browser child on unix all spawn
+  outside the backend `sandbox::select` chose; the claim is narrowed, the three
+  are named with what each still passes through, and wrapping them is left to a
+  later release. And "No seccomp filter is installed" has been false since the
+  Landlock rung shipped one. The rest are of a kind: a deferral that shipped nine
+  releases ago, a field "kept for one release" eleven minors ago, a rewind that
+  exists, a third write tool that snapshots, four narrowing keys that are five,
+  an as-of stamp twenty-five releases stale, and a restore that reports a
+  different type than the one named.
+
+### Added
+
+- **Three documentation-drift tests**, so none of the three claims above can
+  silently reopen: the contract's command-execution block may not carry the
+  pre-0.45.0 sentence and must name the default mode; the `exec_sandbox` rustdoc
+  may not carry the retired clause and must state what replaced it; and the tools
+  guide may not hand-list a reserved name that `RESERVED_TOOL_NAMES` does not
+  hold. The third resolves the set through the crate's own constants rather than
+  comparing prose to prose, and the second is the first check in
+  `tests/docs_drift.rs` to read a doc comment inside `src/` rather than a
+  markdown page.
+
 ## [0.60.1] - 2026-08-16
 
 ### Added
