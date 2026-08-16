@@ -10,20 +10,27 @@ tasks:
   status: todo
   depends_on: []
   acceptance_criteria:
-  - '**F1 — a plan-gated classifying turn is not ordered to plan before it may answer.** A test composes
-    the classifying opening under a contract with a plan gate, in both loops, and asserts the composed
-    block does not contain the unconditional sentence "Before you do anything else you must call `propose_plan`"
-    while still naming `propose_plan` and still ending with `CONVERSATIONAL_ENDING`. It must fail on today''s
+  - '**F1 — a plan-gated classifying turn is not ordered to plan before it may answer.** An end-to-end
+    test in `tests/prompt.rs` composes the classifying opening through `Session::turn_bounded` under a
+    contract carrying a plan gate, and asserts the composed block does not contain the unconditional sentence
+    "Before you do anything else you must call `propose_plan`" while still naming `propose_plan` and still
+    ending with `CONVERSATIONAL_ENDING`. Its control is the same contract''s non-classifying `system`
+    block, which must still carry the unconditional form — that is what says the change is confined to
+    the classifying path. A unit test in `src/run.rs`''s `mod tests` asserts the same of the tree loop''s
+    composition, which no caller can reach (see `US-IO-HARNESS-0.60.3-I01`). Both must fail on today''s
     tree, which composes the unconditional form at `src/run.rs:4098`. Sabotage: restore the unconditional
     directive on the classifying path, under which only F1 fails.
 
     '
-  - '**F2 — a plan-gated classifying turn reads the boundary that will refuse it.** A test composes the
-    classifying opening under a plan gate with a policy that allows writes, in both loops, and asserts
-    the boundary section it carries is the one `plan_lock()` produces — writes and commands refused —
-    and is byte-identical to the section the same turn''s `system` block carries on its planning arm.
-    It must fail on today''s tree, where `after_planning` is passed at `src/run.rs:4539` and `src/run.rs:7255`.
-    Sabotage: pass `after_planning` on the classifying path again, under which only F2 fails.
+  - '**F2 — a plan-gated classifying turn reads the boundary that will refuse it.** An end-to-end test
+    composes the classifying opening under a plan gate through `Session::turn_bounded` and asserts the
+    boundary section it carries is the one `plan_lock()` produces — writes and commands refused, named
+    against the `plan-gate` layer — and is byte-identical to the section the same contract''s `system`
+    block carries on its planning arm. Under a permissive policy today the classifying turn carries no
+    boundary section at all while the `system` block carries one, which is the starkest form of the defect.
+    A unit test covers the tree loop''s composition at the same site. Both must fail on today''s tree,
+    where `after_planning` is passed at `src/run.rs:4539` and `src/run.rs:7255`. Sabotage: pass `after_planning`
+    on the classifying path again, under which only F2 fails.
 
     '
   files:
@@ -38,10 +45,14 @@ tasks:
   depends_on:
   - US-IO-HARNESS-0.60.3-T01
   acceptance_criteria:
-  - '**F1 — a plan-gated classifying turn is not ordered to plan before it may answer.** A test composes
-    the classifying opening under a contract with a plan gate, in both loops, and asserts the composed
-    block does not contain the unconditional sentence "Before you do anything else you must call `propose_plan`"
-    while still naming `propose_plan` and still ending with `CONVERSATIONAL_ENDING`. It must fail on today''s
+  - '**F1 — a plan-gated classifying turn is not ordered to plan before it may answer.** An end-to-end
+    test in `tests/prompt.rs` composes the classifying opening through `Session::turn_bounded` under a
+    contract carrying a plan gate, and asserts the composed block does not contain the unconditional sentence
+    "Before you do anything else you must call `propose_plan`" while still naming `propose_plan` and still
+    ending with `CONVERSATIONAL_ENDING`. Its control is the same contract''s non-classifying `system`
+    block, which must still carry the unconditional form — that is what says the change is confined to
+    the classifying path. A unit test in `src/run.rs`''s `mod tests` asserts the same of the tree loop''s
+    composition, which no caller can reach (see `US-IO-HARNESS-0.60.3-I01`). Both must fail on today''s
     tree, which composes the unconditional form at `src/run.rs:4098`. Sabotage: restore the unconditional
     directive on the classifying path, under which only F1 fails.
 
@@ -65,12 +76,15 @@ tasks:
   depends_on:
   - US-IO-HARNESS-0.60.3-T01
   acceptance_criteria:
-  - '**F2 — a plan-gated classifying turn reads the boundary that will refuse it.** A test composes the
-    classifying opening under a plan gate with a policy that allows writes, in both loops, and asserts
-    the boundary section it carries is the one `plan_lock()` produces — writes and commands refused —
-    and is byte-identical to the section the same turn''s `system` block carries on its planning arm.
-    It must fail on today''s tree, where `after_planning` is passed at `src/run.rs:4539` and `src/run.rs:7255`.
-    Sabotage: pass `after_planning` on the classifying path again, under which only F2 fails.
+  - '**F2 — a plan-gated classifying turn reads the boundary that will refuse it.** An end-to-end test
+    composes the classifying opening under a plan gate through `Session::turn_bounded` and asserts the
+    boundary section it carries is the one `plan_lock()` produces — writes and commands refused, named
+    against the `plan-gate` layer — and is byte-identical to the section the same contract''s `system`
+    block carries on its planning arm. Under a permissive policy today the classifying turn carries no
+    boundary section at all while the `system` block carries one, which is the starkest form of the defect.
+    A unit test covers the tree loop''s composition at the same site. Both must fail on today''s tree,
+    where `after_planning` is passed at `src/run.rs:4539` and `src/run.rs:7255`. Sabotage: pass `after_planning`
+    on the classifying path again, under which only F2 fails.
 
     '
   - '**N3 — no framing is weakened and no boundary claim is widened.** The boundary section a classifying
@@ -99,18 +113,20 @@ tasks:
   depends_on:
   - US-IO-HARNESS-0.60.3-T01
   acceptance_criteria:
-  - '**F3 — a preset never introduces a success criterion onto a turn that has none.** A test composes
-    a classifying turn with `SystemPrompt::Preset(Preset::Concise)` and with `Preset::Careful`, in the
-    flat loop, and asserts the result contains neither "to meet a stated specification" nor "checked against
-    the success criterion", contains `CONVERSATION_PROMPT`''s own framing, and still carries the preset''s
-    marker clause. It must fail on today''s tree, where `compose` returns `preset.describe()` alone. Sabotage:
-    restore the replacing arm in `compose`, under which F3 and F4 fail and no other.
+  - '**F3 — a preset never introduces a success criterion onto a turn that has none.** An end-to-end test
+    composes a classifying turn with `SystemPrompt::Preset(Preset::Concise)` and with `Preset::Careful`
+    through `Session::turn_bounded`, and asserts the result contains neither "to meet a stated specification"
+    nor "checked against the success criterion", contains `CONVERSATION_PROMPT` itself, and still carries
+    the preset''s marker clause. It must fail on today''s tree, where `compose` returns `preset.describe()`
+    alone. Sabotage: restore the replacing arm in `compose`, under which F3 and F4 fail and no other.
 
     '
-  - '**F4 — a preset on a contained turn keeps the world it is in.** The same shape as F3 over the tree
-    loop: a preset on a classifying contained turn still carries `spawn_agent` and the sentence that a
-    sub-agent inherits its permissions, which today''s replacement discards. It must fail on today''s
-    tree.
+  - '**F4 — a preset on a contained turn keeps the world it is in.** The same claim as F3 over the tree
+    loop''s framings: a preset composed over `CONVERSATION_TREE_PROMPT` still carries `spawn_agent` and
+    the sentence that a sub-agent inherits its permissions, and one composed over `TREE_PROMPT` keeps
+    both as well — which today''s replacement discards in both cases. Asserted as a unit test over `compose`
+    in `src/run.rs`''s `mod tests`, because no public entry point can build a contained turn from a caller''s
+    contract (`US-IO-HARNESS-0.60.3-I01`). It must fail on today''s tree.
 
     '
   - '**F6 — the one prompt-text change is stated, not discovered.** Today `Preset::describe`''s bodies
@@ -140,12 +156,12 @@ tasks:
   depends_on:
   - US-IO-HARNESS-0.60.3-T04
   acceptance_criteria:
-  - '**F3 — a preset never introduces a success criterion onto a turn that has none.** A test composes
-    a classifying turn with `SystemPrompt::Preset(Preset::Concise)` and with `Preset::Careful`, in the
-    flat loop, and asserts the result contains neither "to meet a stated specification" nor "checked against
-    the success criterion", contains `CONVERSATION_PROMPT`''s own framing, and still carries the preset''s
-    marker clause. It must fail on today''s tree, where `compose` returns `preset.describe()` alone. Sabotage:
-    restore the replacing arm in `compose`, under which F3 and F4 fail and no other.
+  - '**F3 — a preset never introduces a success criterion onto a turn that has none.** An end-to-end test
+    composes a classifying turn with `SystemPrompt::Preset(Preset::Concise)` and with `Preset::Careful`
+    through `Session::turn_bounded`, and asserts the result contains neither "to meet a stated specification"
+    nor "checked against the success criterion", contains `CONVERSATION_PROMPT` itself, and still carries
+    the preset''s marker clause. It must fail on today''s tree, where `compose` returns `preset.describe()`
+    alone. Sabotage: restore the replacing arm in `compose`, under which F3 and F4 fail and no other.
 
     '
   - '**O2 — the nightly rustdoc gate is green.** `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly

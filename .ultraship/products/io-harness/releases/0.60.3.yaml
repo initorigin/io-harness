@@ -22,6 +22,17 @@ outcome:
     `src/run.rs:7254`.
 
 
+    **On the tree loop all three defects are latent, and this release says so
+    (`US-IO-HARNESS-0.60.3-I01`).** `Session::turn_contained` and `Session::turn_contained_observed`
+    (`src/session.rs:582-603`, `src/session.rs:652-677`) build their contract from text via
+    `default_contract` (`src/session.rs:731-733`) and are the only two callers that reach the tree loop
+    as a turn, so a contained classifying turn can carry neither a plan gate nor a preset. The
+    composition is wrong at `src/run.rs:7254-7255` and at `compose`; no caller can currently make it
+    fire. It is fixed here because the fix is the same one edit — both loops share
+    `conversational_opening` and `compose` — and asserted at unit level rather than end to end, which is
+    the only level it can be asserted at. Making it reachable is roadmap entry 0.66.0.
+
+
     **The same turn is told a boundary that is not in force.** The rule this crate states for itself
     is that the boundary an agent reads is the one that will refuse it — written out at
     `src/run.rs:4474-4478`, and honoured by the `system` block, whose planning arm composes from the
@@ -116,11 +127,13 @@ scope:
     "names the same tools as `SystemPrompt::Builtin` because it describes the same agent" — after this
     release it names no tools at all, because it no longer describes the agent.
   - >
-    **Four new assertions in `tests/prompt.rs`**, each failing on today's tree, covering both loops:
-    the directive under a plan gate, the boundary under a plan gate, a preset on a classifying turn,
-    and a preset on a contained turn. The file's existing helpers `conversational_system` and
-    `tree_system` gain plan-gated and policy-bearing variants; every existing baseline assertion stays
-    exactly as it is.
+    **New assertions at the level each claim is reachable at**, every one of them failing on today's
+    tree. In `tests/prompt.rs`, end to end through `Session::turn_bounded`: the directive under a plan
+    gate, the boundary under a plan gate, and a preset on a classifying turn — its existing
+    `conversational_system` helper gains plan-gated and policy-bearing variants, and every existing
+    baseline assertion stays exactly as it is. In `src/run.rs`'s existing `mod tests`, over `compose`
+    and `conversational_opening` directly: the same three claims for the tree loop's framings, which no
+    public entry point can reach (`US-IO-HARNESS-0.60.3-I01`).
   - >
     **`docs/CONTRACT.md` gains one paragraph** stating the design the classification rule comes from:
     the one-shot API is task-framed because its caller declared work in code, and the session API is
@@ -178,34 +191,41 @@ scope:
 acceptance:
   functional:
   - >
-    **F1 — a plan-gated classifying turn is not ordered to plan before it may answer.** A test
-    composes the classifying opening under a contract with a plan gate, in both loops, and asserts the
-    composed block does not contain the unconditional sentence "Before you do anything else you must
-    call `propose_plan`" while still naming `propose_plan` and still ending with
-    `CONVERSATIONAL_ENDING`. It must fail on today's tree, which composes the unconditional form at
-    `src/run.rs:4098`. Sabotage: restore the unconditional directive on the classifying path, under
-    which only F1 fails.
+    **F1 — a plan-gated classifying turn is not ordered to plan before it may answer.** An end-to-end
+    test in `tests/prompt.rs` composes the classifying opening through `Session::turn_bounded` under a
+    contract carrying a plan gate, and asserts the composed block does not contain the unconditional
+    sentence "Before you do anything else you must call `propose_plan`" while still naming
+    `propose_plan` and still ending with `CONVERSATIONAL_ENDING`. Its control is the same contract's
+    non-classifying `system` block, which must still carry the unconditional form — that is what says
+    the change is confined to the classifying path. A unit test in `src/run.rs`'s `mod tests` asserts
+    the same of the tree loop's composition, which no caller can reach (see `US-IO-HARNESS-0.60.3-I01`).
+    Both must fail on today's tree, which composes the unconditional form at `src/run.rs:4098`.
+    Sabotage: restore the unconditional directive on the classifying path, under which only F1 fails.
   - >
-    **F2 — a plan-gated classifying turn reads the boundary that will refuse it.** A test composes the
-    classifying opening under a plan gate with a policy that allows writes, in both loops, and asserts
-    the boundary section it carries is the one `plan_lock()` produces — writes and commands refused —
-    and is byte-identical to the section the same turn's `system` block carries on its planning arm.
-    It must fail on today's tree, where `after_planning` is passed at `src/run.rs:4539` and
-    `src/run.rs:7255`. Sabotage: pass `after_planning` on the classifying path again, under which only
-    F2 fails.
+    **F2 — a plan-gated classifying turn reads the boundary that will refuse it.** An end-to-end test
+    composes the classifying opening under a plan gate through `Session::turn_bounded` and asserts the
+    boundary section it carries is the one `plan_lock()` produces — writes and commands refused, named
+    against the `plan-gate` layer — and is byte-identical to the section the same contract's `system`
+    block carries on its planning arm. Under a permissive policy today the classifying turn carries no
+    boundary section at all while the `system` block carries one, which is the starkest form of the
+    defect. A unit test covers the tree loop's composition at the same site. Both must fail on today's
+    tree, where `after_planning` is passed at `src/run.rs:4539` and `src/run.rs:7255`. Sabotage: pass
+    `after_planning` on the classifying path again, under which only F2 fails.
   - >
-    **F3 — a preset never introduces a success criterion onto a turn that has none.** A test composes
-    a classifying turn with `SystemPrompt::Preset(Preset::Concise)` and with `Preset::Careful`, in the
-    flat loop, and asserts the result contains neither "to meet a stated specification" nor "checked
-    against the success criterion", contains `CONVERSATION_PROMPT`'s own framing, and still carries
-    the preset's marker clause. It must fail on today's tree, where `compose` returns
-    `preset.describe()` alone. Sabotage: restore the replacing arm in `compose`, under which F3 and F4
-    fail and no other.
+    **F3 — a preset never introduces a success criterion onto a turn that has none.** An end-to-end
+    test composes a classifying turn with `SystemPrompt::Preset(Preset::Concise)` and with
+    `Preset::Careful` through `Session::turn_bounded`, and asserts the result contains neither "to meet
+    a stated specification" nor "checked against the success criterion", contains `CONVERSATION_PROMPT`
+    itself, and still carries the preset's marker clause. It must fail on today's tree, where `compose`
+    returns `preset.describe()` alone. Sabotage: restore the replacing arm in `compose`, under which F3
+    and F4 fail and no other.
   - >
-    **F4 — a preset on a contained turn keeps the world it is in.** The same shape as F3 over the tree
-    loop: a preset on a classifying contained turn still carries `spawn_agent` and the sentence that a
-    sub-agent inherits its permissions, which today's replacement discards. It must fail on today's
-    tree.
+    **F4 — a preset on a contained turn keeps the world it is in.** The same claim as F3 over the tree
+    loop's framings: a preset composed over `CONVERSATION_TREE_PROMPT` still carries `spawn_agent` and
+    the sentence that a sub-agent inherits its permissions, and one composed over `TREE_PROMPT` keeps
+    both as well — which today's replacement discards in both cases. Asserted as a unit test over
+    `compose` in `src/run.rs`'s `mod tests`, because no public entry point can build a contained turn
+    from a caller's contract (`US-IO-HARNESS-0.60.3-I01`). It must fail on today's tree.
   - >
     **F5 — every existing prompt baseline is untouched.** `V0440_WORKSPACE`, `V0490_CONVERSATIONAL`
     and `V0440_TREE` still pass byte-exact prefix plus byte-exact suffix for `Builtin`, `Append` and
@@ -307,8 +327,11 @@ resource_profile:
   - >
     **The test helpers do not exist yet.** `conversational_system` and `tree_system`
     (`tests/prompt.rs:127-158`) both compose under `Policy::permissive()` with no plan gate, which is
-    precisely why none of these three defects was caught. F1 and F2 need plan-gated, policy-bearing
-    variants of both, and a plan-gated turn needs the store to hold no approved plan.
+    precisely why none of these three defects was caught. F1 and F2 need a plan-gated, policy-bearing
+    variant of `conversational_system`, and a plan-gated turn needs the store to hold no approved plan.
+    `tree_system` gets no such variant, because no public entry point can build a contained turn from a
+    caller's contract — the tree loop's half is asserted in `src/run.rs`'s `mod tests` instead
+    (`US-IO-HARNESS-0.60.3-I01`).
   - >
     **The full suite on a contended machine.** `target/` is 26 G against 29 G free at planning time;
     `target/debug/deps`, `build` and `incremental` are cleared before any full run, and the
