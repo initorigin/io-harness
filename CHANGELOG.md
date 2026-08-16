@@ -26,6 +26,75 @@ notes are produced from it.
 
 ### Security
 
+## [0.60.3] - 2026-08-16
+
+Every block a classifying turn is composed from now says something true of that
+turn. Three did not. No public item is added, renamed or removed and
+`docs/public-api.txt` is byte-identical to 0.60.2's, so a program on 0.60.2
+recompiles unchanged — but this release does change composed prompt text, which
+0.60.1 and 0.60.2 did not, and the changes are named below.
+
+### Fixed
+
+- **A plan-gated session turn was ordered to propose a plan before it was
+  permitted to answer.** The classifying opening composed the planning directive
+  — "Before you do anything else you must call `propose_plan` … and wait" —
+  immediately above the crate's own ending, which says "if a plain answer is the
+  whole of what is wanted, write that answer and call no tool". An operator who
+  typed a greeting into a gated session got a plan proposed for the greeting and
+  a human asked to approve it. The directive now binds the *work* reading on that
+  one block: if any part of the turn needs the repository written to or a command
+  run, the plan comes first. **The gate is not weakened.** The sentence naming
+  what is refused is identical in both forms, and the policy layer that refuses a
+  write during the phase is unchanged; a turn already decided to be work still
+  reads the unconditional form.
+
+- **A plan-gated turn was told a boundary that was not the one holding it.** The
+  system block described the plan-narrowed policy while the classifying opening
+  was handed the post-plan one, at both call sites — so a turn under the gate
+  read that writes were allowed while the gate refused every one of them. Both
+  blocks of a gated turn now describe the same narrowed policy, and the selection
+  is made in the one function both loops share rather than at each call site.
+
+- **A `SystemPrompt::Preset` discarded the framing the loop had chosen.**
+  `Preset::Concise` and `Preset::Careful` each carried a whole agent description
+  and were composed *instead of* the run's own, so an embedder who selected one
+  had the conversational framing thrown away on a session turn — putting back the
+  two claims 0.49.0 removed, "to meet a stated specification" and "checked against
+  the success criterion", on every greeting — and had the tree framing thrown away
+  on a contained turn, dropping the paragraph that says the agent may spawn. A
+  preset is now a working style appended to whichever framing the loop chose,
+  which makes `Preset`'s own documented promise — it shapes how the work is done
+  and reported, never what the agent can reach — true as written.
+
+### Changed
+
+- **One composed prompt string moves, and only for a caller who selected a
+  preset.** The old preset bodies omitted the sentence "You may edit several
+  files." that `WORKSPACE_PROMPT` carries; a preset is now that framing plus the
+  style clause, so the sentence is present. An embedder who snapshots composed
+  system prompts and uses `SystemPrompt::Preset` will see this one difference. No
+  other `SystemPrompt` variant's output moves: the `Builtin`, `Append` and
+  `Replace` baselines are byte-identical to 0.60.2's.
+
+- **`docs/CONTRACT.md` records the design the classification rule comes from** —
+  the one-shot API is task-framed because its caller declared work in code, the
+  session API is conversation-framed because its operator did not, and every block
+  composed for such a turn is held to being true of it. That rule is the common
+  cause of 0.48.0's, 0.49.0's and this release's fixes, and it was the one thing
+  the contract never stated.
+
+- **`docs/STYLE.md` is new**, documenting the register the crate's prose already
+  follows. It changes no existing file and no test enforces it.
+
+### Added
+
+- Seven assertions covering the classifying turn's composition: four in
+  `tests/prompt.rs`, end to end through `Session::turn_bounded` under a real plan
+  gate, and three in `src/run.rs`'s own tests for the tree loop's framings.
+  `tests/prompt.rs` composed only under a permissive, ungated policy before this
+  release, which is why all three defects survived it.
+
 ## [0.60.2] - 2026-08-16
 
 Documentation only. Nothing under `src/` changes except doc comments,
