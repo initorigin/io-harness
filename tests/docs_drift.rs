@@ -990,3 +990,113 @@ fn marker_parse_reads_the_list_and_not_the_whole_file() {
         "parsed beyond the list: {found:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// One exec boundary, stated once — F1 of 0.60.2
+// ---------------------------------------------------------------------------
+//
+// `docs/CONTRACT.md` carried two answers to "what is a command bounded by" for
+// fifteen releases. One paragraph said a command runs outside the sandbox with
+// the embedding program's privileges — true up to 0.44.0 — and another, 1,300
+// lines earlier, said everything a run starts is contained. Nothing told a
+// reader which superseded which, and the stale one was the reassuring one.
+
+/// The `**What a command the agent runs is bounded by.**` block of the contract.
+///
+/// A bold lead opens each claim in that part of the file and the next one closes
+/// this block, so the window is the marker up to the next blank line followed by
+/// a bold lead. Scoping the assertion to the block is the point: the retired
+/// phrasing is quoted elsewhere in the file *as* retired, and a whole-file
+/// search could not tell a quotation from a claim.
+fn command_execution_section(contract: &str) -> String {
+    const LEAD: &str = "**What a command the agent runs is bounded by.**";
+    let start = contract
+        .find(LEAD)
+        .unwrap_or_else(|| panic!("docs/CONTRACT.md no longer opens a block with {LEAD:?}"));
+    let rest = &contract[start + LEAD.len()..];
+    let end = rest.find("\n\n**").unwrap_or(rest.len());
+    format!("{LEAD}{}", &rest[..end])
+}
+
+/// Backticks and line breaks removed, so an assertion is about the sentence and
+/// not about where the paragraph happened to wrap.
+fn flatten(text: &str) -> String {
+    text.replace('`', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn states_one_exec_boundary(section: &str) -> Result<(), String> {
+    let flat = flatten(section);
+    if flat.contains("outside the sandbox") {
+        return Err(
+            "the command-execution block still says a command runs outside the sandbox. That \
+             was true up to 0.44.0; ExecMode::WorkspaceWrite has been the default since 0.45.0 \
+             and docs/CONTRACT.md states 1,300 lines earlier that everything a run starts is \
+             contained."
+                .to_string(),
+        );
+    }
+    if !flat.contains("ExecMode::WorkspaceWrite is the default") {
+        return Err(
+            "the command-execution block does not name ExecMode::WorkspaceWrite as the default. \
+             A reader who reaches this block must be told today's boundary here, not left to \
+             find it in the containment section."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn contract_states_one_exec_boundary() {
+    if let Err(why) =
+        states_one_exec_boundary(&command_execution_section(&read("docs/CONTRACT.md")))
+    {
+        panic!("{why}");
+    }
+}
+
+#[test]
+fn exec_boundary_checker_rejects_the_pre_0_45_0_sentence() {
+    let fixture = "**What a command the agent runs is bounded by.** A command runs **in the \
+                   workspace root with the embedding program's privileges, outside the \
+                   sandbox**.\n\n**Toolchain detection is a default.**";
+    let err = states_one_exec_boundary(&command_execution_section(fixture)).unwrap_err();
+    assert!(err.contains("outside the sandbox"), "{err}");
+}
+
+#[test]
+fn exec_boundary_checker_rejects_silence_about_the_default() {
+    // Removing the false sentence without stating the true one is not a fix:
+    // the block would then say nothing at all about what contains a command.
+    let fixture = "**What a command the agent runs is bounded by.** Every call is an `Act::Exec` \
+                   check on the program and on the whole argv.\n\n**Toolchain detection is a \
+                   default.**";
+    let err = states_one_exec_boundary(&command_execution_section(fixture)).unwrap_err();
+    assert!(err.contains("ExecMode::WorkspaceWrite"), "{err}");
+}
+
+#[test]
+fn exec_boundary_checker_accepts_the_corrected_paragraph() {
+    let fixture = "**What a command the agent runs is bounded by.** Since 0.46.0 it runs\n\
+                   contained by default: `ExecMode::WorkspaceWrite` is the default\n\
+                   `exec_sandbox` mode.\n\n**Toolchain detection is a default.**";
+    assert!(states_one_exec_boundary(&command_execution_section(fixture)).is_ok());
+}
+
+#[test]
+fn command_execution_section_stops_at_the_next_claim() {
+    // The window must not run on into the rest of the file. If it did, the
+    // retired phrasing quoted elsewhere as retired would fail this test.
+    let section = command_execution_section(&read("docs/CONTRACT.md"));
+    assert!(
+        !section.contains("Toolchain detection"),
+        "the window ran past the block it is scoped to:\n{section}"
+    );
+    assert!(
+        section.contains("Act::Exec"),
+        "the window did not reach the block's own body:\n{section}"
+    );
+}

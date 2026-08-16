@@ -2533,18 +2533,36 @@ decision, land in `policy_events` attributed to the rule and layer; a silent
 allow does not write a row, exactly as it does not for a read or a write. What
 the policy does **not** decide is what the command then does.
 
-A command runs **in the workspace root with the embedding program's privileges,
-outside the sandbox**. That is the same bound already stated above for a
-registered `Tool` and a stdio MCP server, and it is deliberate: the sandbox
-denies network egress and confines writes to its own workdir, which is right for
-a verification gate and makes `npm install` impossible. Three consequences worth
-naming. A policy written for file access does not constrain command execution —
-`Act::Read`/`Act::Write` rules say nothing about `exec`, and the tier default
-decides everything unnamed. A command can reach what the agent's own file rules
-would have refused, because `cat secrets/prod.env` is a command and not a read.
-And a timeout kills the **direct child only**: a process that child started
-itself may outlive it, on every platform this crate supports — the same gap the
-sandbox reports for its own wall-clock kill on the portable floor. See the
+A command runs with the **workspace root as its working directory**, and since
+0.46.0 it runs **contained by default**: `ExecMode::WorkspaceWrite` is the
+default `exec_sandbox` mode, so `exec` and every `shell` tool is wrapped by the
+backend `sandbox::select` chooses and may write inside the workspace root, the
+system temporary directory and the detected toolchain's own cache directories —
+and nowhere else. The grant every release up to 0.45.0 gave by default is still
+available and is now a sentence rather than an omission:
+`TaskContract::with_full_access`. This is where a command differs from a
+registered `Tool` and a stdio MCP server, which do run unwrapped at the
+embedding program's privileges: the harness starts the command's process itself,
+so it can wrap it, and it does not start theirs. What the containment is worth is
+per platform and the platform table above is the statement of it — macOS and
+Linux confine writes and deny egress, a Windows AppContainer does both when the
+run asked for access confinement (0.59.0), and the Windows default Job Object
+and the portable floor apply the resource caps and have no filesystem facility at
+all, so there the mode is routed and reported and enforces nothing for the
+filesystem.
+
+Three consequences worth naming. The mode changes none of them; the second one
+varies by platform. A policy written for file access does not constrain command
+execution — `Act::Read`/`Act::Write` rules say nothing about `exec`, and the tier
+default decides everything unnamed. A command can read what the agent's own file
+rules would have refused, because `cat secrets/prod.env` is a command and not a
+read: containment confines *writes*, and on macOS and Linux the tree is bound or
+remounted read-only rather than unreadable, so it takes nothing away from that.
+The one platform where it does is a Windows AppContainer, which is default-deny
+for reads and so bounds the read to the derived grant set as well. And a timeout
+kills the **direct child only**: a process that child started itself may outlive
+it, on every platform this crate supports — the same gap the sandbox reports for
+its own wall-clock kill on the portable floor. See the
 [command execution guide](guide/command-execution.md).
 
 **Toolchain detection is a default, and it will be wrong for someone.** The

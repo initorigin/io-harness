@@ -8,7 +8,7 @@ tasks:
     currently tells a reader that a command runs outside the sandbox with the embedding program's privileges,
     which stopped being true at 0.45.0 and is contradicted 1,300 lines earlier in the same file. Without
     this the release closes nothing that matters.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - >
@@ -25,7 +25,38 @@ tasks:
   files:
   - docs/CONTRACT.md
   - tests/docs_drift.rs
-  evidence: []
+  evidence:
+  - >
+    `docs/CONTRACT.md` lines 2536-2548 rewritten. The block now states that a command runs with the
+    workspace root as its working directory and, since 0.46.0, contained by default under
+    `ExecMode::WorkspaceWrite`, with `TaskContract::with_full_access` named as the way to ask for the
+    pre-0.45.0 grant back.
+  - >
+    The claim that a command carries "the same bound already stated above for a registered `Tool` and
+    a stdio MCP server" is not merely deleted but inverted into the reason the two differ: the harness
+    starts the command's process itself and can wrap it, and does not start theirs. `src/lib.rs:333`
+    still makes the `Tool` / MCP claim and is correct in doing so — it was checked, not assumed.
+  - >
+    N3 — the replacement does not flatten the platform difference. It reproduces the platform table's
+    own four rows in prose (macOS and Linux confine writes and deny egress; a Windows AppContainer does
+    both when the run asked for access confinement, 0.59.0; the Windows default Job Object and the
+    portable floor apply the resource caps and have no filesystem facility at all).
+  - >
+    N3 — the second of the three consequences was checked against the source rather than reasoned from
+    the table, and it survives. `src/sandbox/landlock.rs:40` records that a mount namespace remounts
+    `/` read-only rather than unreadable, so `cat secrets/prod.env` still reaches what the agent's file
+    rules would have refused on macOS and Linux. The one platform where it does not is the Windows
+    AppContainer, default-deny for reads (`docs/CONTRACT.md:285`), and the paragraph now says exactly
+    that instead of claiming containment closes the hole everywhere.
+  - >
+    F1 — `contract_states_one_exec_boundary` in `tests/docs_drift.rs`, over a window scoped to the
+    block rather than the whole file, because the retired phrasing is quoted elsewhere in the file *as*
+    retired. Three control tests beside it (the pre-0.45.0 sentence, silence about the default, the
+    corrected paragraph) plus one asserting the window stops at the next claim.
+  - >
+    F1 sabotage, run: `git stash push docs/CONTRACT.md` restores the pre-0.45.0 sentence.
+    `cargo test --test docs_drift` then reports `test result: FAILED. 35 passed; 1 failed`, the single
+    failure being `contract_states_one_exec_boundary`. 36 of 36 pass with the fix in place.
 - id: US-IO-HARNESS-0.60.2-T02
   summary: Drop the retired sentence from the exec_sandbox rustdoc, and add F2.
   why_required: >-
