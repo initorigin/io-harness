@@ -937,3 +937,56 @@ fn format_source_parse_finds_the_accepted_the_converted_and_the_refused() {
         );
     }
 }
+
+/// Every marker file `src/toolchain.rs` detects, read out of the source.
+///
+/// The `.NET` marker is a pattern rather than a filename, so it is added
+/// explicitly — it is the one entry `MARKERS` does not hold.
+fn markers_in_source(toolchain_rs: &str) -> BTreeSet<String> {
+    let list = Regex::new(r"(?s)const MARKERS: &\[&str\] = &\[(.*?)\];").unwrap();
+    let entry = Regex::new(r#""([^"]+)""#).unwrap();
+    let body = list
+        .captures(toolchain_rs)
+        .map(|c| c[1].to_string())
+        .unwrap_or_default();
+    let mut out: BTreeSet<String> = entry
+        .captures_iter(&body)
+        .map(|c| c[1].to_string())
+        .collect();
+    out.insert(".csproj".to_string());
+    out
+}
+
+#[test]
+fn readme_lists_every_toolchain_marker() {
+    let markers = markers_in_source(&read("src/toolchain.rs"));
+    assert!(
+        markers.len() >= 16,
+        "the MARKERS parse found only {} entries, so it has stopped reading the table it \
+         was written for: {markers:?}",
+        markers.len()
+    );
+
+    let readme = read("README.md");
+    let missing: Vec<&String> = markers.iter().filter(|m| !readme.contains(*m)).collect();
+    assert!(
+        missing.is_empty(),
+        "the README's toolchain table does not name {missing:?}. That table is what tells a \
+         reader whether their project is one the harness already knows how to build and \
+         test, and a row missing from it reads as an ecosystem that is not supported."
+    );
+}
+
+#[test]
+fn marker_parse_reads_the_list_and_not_the_whole_file() {
+    // The guard: a parse that matched every quoted string in the file would
+    // "find" hundreds of markers and pass against any README at all.
+    let fixture = "const MARKERS: &[&str] = &[\n    \"Cargo.toml\",\n    \"go.mod\",\n];\n\
+                   const OTHER: &str = \"not-a-marker\";\n";
+    let found = markers_in_source(fixture);
+    assert!(found.contains("Cargo.toml") && found.contains("go.mod"));
+    assert!(
+        !found.contains("not-a-marker"),
+        "parsed beyond the list: {found:?}"
+    );
+}

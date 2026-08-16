@@ -234,6 +234,13 @@ acceptance:
     the README, under which only F9 fails and names `image/tiff`. This criterion exists because a
     format table is exactly the kind of page that is right on the day it is written and wrong two
     releases later.
+  - >
+    **F10 — the toolchain table names every marker the crate detects.** A test parses `MARKERS` out
+    of `src/toolchain.rs` — the list itself, not every quoted string in the file — and asserts each
+    entry appears on the README, with the `.csproj` pattern added explicitly because it is the one
+    marker the constant does not hold. Sabotage: drop the `mix.exs` row, under which only F10 fails
+    and names it. A row missing from that table reads as an ecosystem the harness does not support,
+    which is a worse error than an absent table.
   non_functional:
   - >
     **N1 — nothing under `src/` changes except documentation.** `git diff main -- src/` shows only

@@ -262,7 +262,8 @@ tasks:
   - docs/public-api.txt
   evidence: []
 - id: US-IO-HARNESS-0.60.1-T07
-  summary: Add the supported-file-formats section to the README, and the checker that keeps it complete.
+  summary: Add the supported-files-and-languages section to the README, and the checkers that keep it
+    complete.
   why_required: Scope added mid-release by US-IO-HARNESS-0.60.1-I01. The page names the cargo features
     that carry each file type and never the file types themselves, so the question a prospective user
     actually asks — can it open this file, and what happens if it cannot — is answerable nowhere on the
@@ -278,6 +279,14 @@ tasks:
     crate and not to the page fails the build. Sabotage: drop the TIFF row from the README, under which
     only F9 fails and names `image/tiff`. This criterion exists because a format table is exactly the
     kind of page that is right on the day it is written and wrong two releases later.
+
+    '
+  - '**F10 — the toolchain table names every marker the crate detects.** A test parses `MARKERS` out of
+    `src/toolchain.rs` — the list itself, not every quoted string in the file — and asserts each entry
+    appears on the README, with the `.csproj` pattern added explicitly because it is the one marker the
+    constant does not hold. Sabotage: drop the `mix.exs` row, under which only F10 fails and names it.
+    A row missing from that table reads as an ecosystem the harness does not support, which is a worse
+    error than an absent table.
 
     '
   files:
@@ -299,3 +308,22 @@ tasks:
   - '`format_checker_reports_a_dropped_row` is the sabotage arm: TIFF removed from the table is reported
     by name.'
   - 'cargo test --test docs_drift --test readme --test guide_pages: 29 + 8 + 10 = 47 passed, 0 failed.'
+  - 'Widened per the same iteration record: the section now opens by stating there is NO source-extension
+    allowlist and why that is the design — read_file/write_file/edit_file/patch_file are extension-agnostic,
+    so .md, .txt, .rs, .py, a Dockerfile and a file with no extension are all the same to them. Publishing
+    a list of supported code formats would have been fiction.'
+  - 'The toolchain table published from src/toolchain.rs:349: 16 markers, 14 ecosystems, the lockfile-chosen
+    drivers for node (bun/pnpm/yarn/npm) and python (uv/poetry/pip), and the two deliberate orderings
+    (deno.json before package.json; Makefile last).'
+  - The five post-write type-check commands published with the reason the other nine ecosystems are skipped
+    — no cheap checker separate from their build.
+  - 'A language-server section stating there is no built-in language list either: name a server and its
+    extensions and the five lsp_ tools appear; configure none and the schemas are absent from the catalogue.
+    The two bounds are carried over — a server indexes files a deny_read rule covers, and it runs at the
+    harness''s own privilege.'
+  - 'F10 green: `readme_lists_every_toolchain_marker` parses MARKERS out of the source with a guard asserting
+    at least 16 entries, and `marker_parse_reads_the_list_and_not_the_whole_file` proves the parse does
+    not match every quoted string in the file — which would have ''found'' hundreds of markers and passed
+    against any README at all.'
+  - 'cargo test --test docs_drift --test readme --test guide_pages: 31 + 8 + 10 = 49 passed, 0 failed.
+    README table-of-contents: 15 links, 34 headings, none dangling.'

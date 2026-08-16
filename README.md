@@ -30,6 +30,7 @@ trace you can read afterwards.
 - [Measured cost](#measured-cost)
 - [Capabilities in depth](#capabilities-in-depth)
 - [Guides](#guides)
+- [Supported files and languages](#supported-files-and-languages)
 - [Feature flags](#feature-flags)
 - [Platform support](#platform-support)
 - [Stability](#stability)
@@ -601,15 +602,27 @@ limits that capability actually has.
 each capability arrived in. [docs/CONTRACT.md](docs/CONTRACT.md) is the public
 contract: what is stable, what may change, and the limits that hold today.
 
-## Supported file formats
+## Supported files and languages
 
-Text is the default and needs no feature: the workspace tools read and write any
-text file, and a read of a binary returns a refusal saying so rather than an
-empty string wearing the shape of a file. Everything below is behind an opt-in
-feature, and each format is listed by what the agent can actually *do* with it —
-read, generate, or edit in place — because those are three different answers.
+### Text and source: everything, and no list
 
-**Documents**, behind `documents` or the per-format feature:
+There is no allowlist of source extensions, and that is the design rather than an
+omission. `read_file`, `write_file`, `edit_file` and `patch_file` treat any text
+file the same way — `.md`, `.txt`, `.rs`, `.py`, `.ts`, `.go`, `.java`, `.rb`,
+`.sql`, `.yaml`, `.toml`, `.json`, a `Dockerfile`, a shell script, a file with no
+extension at all. A harness that shipped a list of the languages it could edit
+would be wrong about your repository the first week, so it ships none.
+
+What the tools do enforce is the boundary and the honesty of the answer: a read
+returns the file, the line range it asked for, or a refusal naming the size and
+the ceiling — never a shortened file wearing the shape of a whole one. A read of a
+binary is a refusal saying so, not an empty string.
+
+The formats below are the ones that need more than reading text, and each is
+listed by what the agent can actually *do* with it — read, generate, or edit in
+place — because those are three different answers.
+
+### Documents, behind `documents` or the per-format feature
 
 | Format | Feature | Read | Generate | Edit in place |
 | --- | --- | --- | --- | --- |
@@ -652,10 +665,82 @@ the smaller of the two vendor limits and therefore the honest one, and
 **50,000,000 pixels**, which is checked from the header before anything is
 decoded.
 
-**Files the harness itself reads**, with no feature and no model involved: one
-`io.toml` across four scopes, the `AGENTS.md` a repository already carries,
-markdown skill files, a bundle's `plugin.toml`, and unified diffs for
-`patch_file` — applied as a unit or not at all.
+### Files the harness itself reads
+
+With no feature and no model involved: one `io.toml` across four scopes, the
+`AGENTS.md` a repository already carries, markdown skill files, a bundle's
+`plugin.toml`, and unified diffs for `patch_file` — applied as a unit or not at
+all.
+
+### Languages and toolchains
+
+Language support here is not a set of parsers. It is command execution, plus a
+shipped table mapping a marker file to that ecosystem's own commands, plus a
+verification criterion that runs whatever command the project uses. That is why
+the agent can work in a language this crate has never heard of: it runs *your*
+toolchain.
+
+The table is the default, and every command in it is overridable in `io.toml`.
+Markers are tried in order and the first match wins:
+
+| Marker in the root | Ecosystem | Driver | Test command |
+| --- | --- | --- | --- |
+| `Cargo.toml` | cargo | `cargo` | `cargo test` |
+| `deno.json`, `deno.jsonc` | deno | `deno` | `deno test` |
+| `package.json` | node | `bun`, `pnpm`, `yarn` or `npm`, chosen by the lockfile present | `<driver> test` |
+| `go.mod` | go | `go` | `go test ./...` |
+| `pyproject.toml`, `requirements.txt` | python | `uv`, `poetry` or `pip`, chosen by the lockfile present | `uv run pytest`, `poetry run pytest`, or `python -m pytest` |
+| `pom.xml` | maven | `mvn` | `mvn -B test` |
+| `build.gradle`, `build.gradle.kts` | gradle | `gradle` | `gradle test` |
+| `mix.exs` | elixir | `mix` | `mix test` |
+| `Gemfile` | ruby | `bundler` | `bundle exec rake test` |
+| `composer.json` | php | `composer` | `composer test` |
+| `Package.swift` | swift | `swift` | `swift test` |
+| `CMakeLists.txt` | cmake | `cmake` | `ctest --test-dir build` |
+| `*.csproj`, `*.fsproj`, `*.sln` | dotnet | `dotnet` | `dotnet test` |
+| `Makefile` | make | `make` | `make test` |
+
+Each row also carries install, build, lint, format and run commands. Two
+orderings are deliberate: `deno.json` is tried before `package.json`, because a
+Deno project may carry both and `npm test` is wrong for it; `Makefile` is tried
+last, because a great many projects have one *beside* their real build system. A
+root with no marker reports nothing rather than guessing.
+
+**A write is type-checked where a cheap checker exists.** After a successful
+write, five ecosystems run their own check and attach what it found, so a mistake
+arrives with the edit rather than twenty steps later:
+
+| Ecosystem | Check after a write |
+| --- | --- |
+| cargo | `cargo check --message-format=json` |
+| deno | `deno check .` |
+| node | `tsc --noEmit` |
+| go | `go build ./...` |
+| python | `pyright` |
+
+The other nine are skipped on purpose. They have no type-check step separate from
+their build, and running a build after every single edit would make editing
+unusable. An ecosystem with no cheap checker is a fact about the ecosystem, not a
+gap in the harness: nothing runs, and nothing is said to the model.
+
+### Language servers
+
+There is no built-in list of languages here either. Name a server in `io.toml` or
+on the contract — its command, and the extensions it answers for — and the agent
+gains five tools for that language: `lsp_definition`, `lsp_references`,
+`lsp_symbols`, `lsp_hover` and `lsp_rename`. `rust-analyzer`, `gopls`,
+`typescript-language-server`, `pyright`, `clangd` and anything else speaking LSP
+work the same way, because the crate speaks the protocol rather than the language.
+
+Configure no server and nothing changes: the five schemas are absent from the
+catalogue entirely. Starting one is an `Act::Exec` check on the binary the
+operator named, and `lsp_rename` writes nothing — it answers with a patch series
+you apply with `patch_file`, one gate check per file.
+
+Two bounds worth knowing before turning one on: a server indexes the whole root,
+including files a `deny_read` rule covers, and it runs at the harness's own
+privilege — like an MCP stdio server. The
+[language support guide](docs/guide/language-support.md) states both in full.
 
 ## Feature flags
 
