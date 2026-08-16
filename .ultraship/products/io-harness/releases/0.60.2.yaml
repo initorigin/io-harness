@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.60.2
-status: planned
+status: released
 release_type: patch
 outcome:
   user_can: >
@@ -319,3 +319,160 @@ open_questions:
   recommendation made before the audit existed rather than a published capability claim, so nothing is
   wrong on the page — but a reader comparing the record to the roadmap will notice, and a one-line
   note in this release's CHANGELOG entry may be worth more than leaving it to be rediscovered.
+released_at: 2026-08-16 14:53:00+00:00
+mode: published
+delivered: >
+  A developer reading this crate's own documentation gets one answer about what a command and a shell
+  handle can reach, and one answer about which tool names are reserved. `docs/CONTRACT.md` no longer
+  says a command runs outside the sandbox with the embedding program's privileges — it states
+  `ExecMode::WorkspaceWrite` as the default and gives what containment is worth per platform.
+  `TaskContract::exec_sandbox`'s rustdoc no longer carries the sentence 0.48.0 retired about the
+  `shell_start` / `shell_poll` / `shell_kill` handles. The tools guide defers to
+  `RESERVED_TOOL_NAMES` instead of restating it, and the three places that claimed the set is
+  complete now say that eighteen dispatched names are absent and that 0.61.0 closes it. Each of the
+  three is asserted by a test with a named sabotage that kills exactly that test.
+
+
+  Beyond the three the release was written for, the F5 sweep corrected nineteen further claims a
+  release had outlived, in twenty-two places. Nothing under `src/` changes except doc comments.
+evidence:
+  tests:
+  - >
+    'cargo test' on the development machine — exit 0, 88 test binaries plus the doctest run, **1,866
+    passed**, of which 457 doctests, 0 failed.
+  - >
+    'cargo test --test docs_drift --test guide_pages --test changelog --test public_api --test readme'
+    re-run AFTER the version bump — 45 + 10 + 5 + 9 + 8 green. Run in that order deliberately: the
+    bump is what made 0.60.2 a released version, and that is what turned
+    `the_capabilities_release_table_covers_every_released_version` red for a missing row. 0.57.0's
+    lesson, paid again.
+  - >
+    'cargo test --test cross_version_0_29_0 -- --ignored --exact a_current_store_is_read_by_a_0_29_0_binary'
+    — 1 passed, after building the pinned 0.29.0 generator.
+  - >
+    Four sabotage arms, all four killing their named test and nothing else. F1 (restore the
+    pre-0.45.0 sentence) — 35 passed, 1 failed. F2 (restore the 0.47.0-era clause) — 38 passed, 1
+    failed. F3a (restore the whole pre-fix guide bullet) — 43 passed, 1 failed, `guide_pages` still
+    10 of 10. F3b (reinstate `forget` alone) — the same single test fails and names it, while `mcp__`
+    in the same sentence is correctly not reported. **No arm survived.**
+  - >
+    Feature PR #177 — 19 of 19 checks green, across macOS, Linux and Windows, after the CRLF fix and
+    two recorded flakes were rerun.
+  - >
+    Release-commit PR #178 — 19 of 19 green.
+  - >
+    Release PR #179 (develop -> main) — **35 of 35 green, first try.**
+  builds:
+  - >
+    'cargo fmt --check' exit 0; 'cargo clippy --all-targets --all-features -- -D warnings' clean;
+    'cargo clippy --all-targets -- -D warnings' clean.
+  - >
+    'RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps' — clean,
+    run **twice**, once after each of the two tasks that edited a rustdoc block. A gate that ran
+    before the last edit to the surface it gates has not run.
+  - >
+    'cargo package --locked' — Packaged 259 files, 7.5MiB compressed to **2,010,203 bytes** locally.
+  - >
+    release.yml run 31954019452 on the tagged commit — all seven jobs success (checks, lint,
+    test-default, test-all-features, package, contained-linux, release), **no rerun**.
+  reviews:
+  - >
+    N3, by hand: the rewritten containment paragraph checked section against source. The platform
+    table's four rows are reproduced in prose rather than flattened, and the consequence about
+    reading past the agent's file rules was checked against `src/sandbox/landlock.rs:40` — a mount
+    namespace remounts `/` read-only rather than unreadable, so that consequence survives on macOS
+    and Linux and is bounded only on a Windows AppContainer, which is default-deny for reads.
+  - >
+    N1, by diff: 'git diff develop -- src/' filtered to lines that are not `///` comments is
+    **empty** across both source files the release touches, and 'git diff develop --stat --
+    docs/public-api.txt' is empty. The eighteen reserved names were deliberately NOT added.
+  - >
+    The owner approved the rewritten containment paragraph before publication, which
+    `dependencies.human_approvals` requires. It was presented in full and approved without change.
+  - >
+    Every sweep row whose verdict was not `current` was re-verified by hand against the named source
+    before any edit. Two reported items did not survive that check and were not acted on — the
+    `libsqlite3-sys 0.38.1` sentence at line 80 (it is about which version introduced the 1.95 floor,
+    and that is still 0.38.1 whatever the lock resolves) and the `## Related` heading's position
+    (structural, excluded by scope).
+  deployments:
+  - >
+    Tag v0.60.2 pushed alone at `c5b03ca`; release.yml cut the GitHub Release with both assets.
+    https://github.com/initorigin/io-harness/releases/tag/v0.60.2
+  - >
+    'cargo publish --locked' — Published io-harness v0.60.2 at registry `crates-io`.
+  health_checks:
+  - >
+    crates.io API, read independently after the publish: `newest_version` **0.60.2**, crate_size
+    **2,010,198 bytes**, yanked **false**, rust_version **1.95**. The published bytes match the
+    GitHub Release asset **exactly**; the locally packaged crate was 2,010,203, a **5-byte** gzip
+    drift.
+  - >
+    'cargo tree' still **402**. `CHECKPOINT_FORMAT` unmoved at **7**. No DDL, no migration, no
+    configuration key, no public item.
+known_limitations:
+- >
+  **O3 is met, and the record waited for it rather than claiming it.** The criterion asks for the
+  corrected `TaskContract::exec_sandbox` documentation to be verified by reading the docs.rs
+  rendering rather than the local file. docs.rs answered 404 and then redirected to the crate
+  overview for some minutes after the publish while its build was queued; sealing was held until the
+  page existed. Verified on
+  `https://docs.rs/io-harness/0.60.2/io_harness/struct.TaskContract.html`: the phrase "not
+  contained" does **not** appear anywhere in the rendered `exec_sandbox` documentation, and the
+  replacement does — "The `shell_start` / `shell_poll` / `shell_kill` handles take the same
+  containment every other spawn takes, per stage (0.48.0.)", followed by the restriction-lives-with-
+  its-processes paragraph and the `max_wall_secs` exception. The rendered page is the artifact a
+  caller actually reads, and it is the one that was checked.
+- >
+  **The F5 sweep corrected far more than the contract's first open question anticipated, and the
+  question is answered here rather than silently.** That question set "more than a handful of stale
+  claims" as the threshold for splitting the sweep into its own release. The sweep found nineteen.
+  They were kept here because every one is a one-or-two-sentence replacement in the same class as the
+  three the release was written for, none touches `src/` behaviour, and leaving twenty-two
+  known-false statements standing in the file this release exists to correct would have been the
+  worse outcome. The structural work the audit also wants is still excluded and is still a candidate
+  entry of its own — which answers the contract's second open question the same way: not yet.
+- >
+  **The release found a real defect in `docs/CONTRACT.md` that it does not fix, and it is the most
+  consequential thing on this page.** "Everything a run starts is contained (0.48.0)" declared a
+  class closed; 0.51.0, 0.52.0 and 0.53.0 then each opened one. The post-edit checker and the `check`
+  tool build their own uncontained `Exec` (`src/tools/diagnostics.rs:271` says so in a code comment),
+  a language server named in `[[lsp]]` is spawned directly (`src/lsp.rs:321`), and on unix the
+  browser child is spawned directly (`src/browser.rs:856`). None is wrapped by the backend
+  `sandbox::select` chose, so on those three paths the filesystem boundary is the policy's alone. The
+  documentation now says so; **wrapping them is behaviour under `src/` and therefore a later
+  release**.
+- >
+  **`docs/CONTRACT.md:1961` states four timings for five aggregate queries, and always has.** `git
+  show 3856084` shows the sentence has read that way since the 0.30.0 commit that wrote it — this is
+  a defect in the original prose, not drift. The false "respectively" pairing is removed and no
+  timing was re-measured, because this release's own constraints forbid asserting one. Which query
+  the missing figure belongs to is unrecoverable.
+- >
+  **The `RESERVED_TOOL_NAMES` gap is documented and open.** Eighteen dispatched names are absent from
+  the set, so a registered tool taking one of them still validates and is then unreachable. This
+  release states that in all three places that were claiming otherwise; 0.61.0 closes it, and closing
+  it is a break because it changes what `Toolbox::validate` accepts.
+- >
+  **Windows claims in the rewritten paragraph were not verified on Windows by this release.** They
+  are taken from `docs/CONTRACT.md`'s own platform table, which 0.59.0 established across ten CI
+  rounds. The sweep marks every Windows-only assertion `unverifiable` from this machine rather than
+  claiming it was checked.
+- >
+  **`cargo test --all-features` ran on CI rather than locally**, which is this repository's standing
+  arrangement for that one gate. It passed on all three platforms on PRs #177, #178 and #179, and in
+  release.yml on the tagged commit.
+- >
+  **Four Windows CI failures across the release were classified as environmental and rerun, not
+  investigated as defects.** Each was a single test of ~1,400 in a job whose own log carried
+  `install-action: installation failed due to bash startup failure`
+  (actions/partner-runner-images#169): `f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin`
+  (a recorded trap), `a_plan_survives_a_real_sigkill_and_is_approved_by_a_second_process`,
+  `what_the_container_actually_permits_on_this_host` (rustup answering os error 183 for a `.rustup`
+  that already exists), and on Linux `two_concurrent_children_with_their_own_worktrees_do_not_collide`
+  (open since 0.58.0). In each case `src/` and `tests/` were byte-identical to a commit that had
+  passed that same job, which is what justified the rerun rather than an investigation. **A release
+  that changes no `src/` behaviour cannot reach any of them.**
+supersedes: 0.60.1
+next_recommended_version: 0.61.0
+immutable: true
