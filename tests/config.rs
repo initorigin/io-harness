@@ -2548,3 +2548,87 @@ fn a_project_scoped_file_may_lower_a_memory_cap_and_may_not_raise_it() {
         .apply_to(TaskContract::workspace("learn things", project.path()));
     assert_eq!(local.memory.max_entries, 128);
 }
+
+// ---------------------------------------------------------------------------
+// 0.60.0 — the ceiling on a blocking mailbox read.
+
+/// The key reaches the typed API, for the reason `max_read_chars` has its own
+/// version of this test: the run loop reads `TaskContract` and never the
+/// configuration, so a key that stopped at `Config` would be a setting an
+/// operator can write and nothing obeys.
+#[test]
+fn max_wait_secs_reaches_the_contract_through_the_ordinary_projection() {
+    let config = Config::from_toml("[run]\nmax_wait_secs = 5\n").unwrap();
+    let contract = config.apply_to(TaskContract::workspace("coordinate", "/repo"));
+
+    assert_eq!(contract.max_wait_secs, Some(5));
+    // Unset is the crate's own ceiling, applied in the run loop — never
+    // "forever", which is the one value this key deliberately cannot express.
+    let plain = Config::from_toml("").unwrap();
+    assert_eq!(
+        plain
+            .apply_to(TaskContract::workspace("coordinate", "/repo"))
+            .max_wait_secs,
+        None,
+    );
+}
+
+/// A misspelling beside it is refused by name, which is what makes a narrowing
+/// key worth trusting: the failure mode it guards against is a boundary that
+/// silently did not apply because it was typed wrong.
+#[test]
+fn a_misspelled_wait_ceiling_is_refused_by_name() {
+    let err = Config::from_toml("[run]\nmax_wait_sec = 5\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("max_wait_sec"), "{err}");
+}
+
+/// **F14 — a project scope may lower the wait ceiling and may not raise it.**
+///
+/// The same mechanism 0.55.0 built for `max_read_chars` and for the same reason:
+/// this is a number, so there is no single widening *value* to refuse the way
+/// `exec = "allow"` is refused. `NARROWING` takes the lower of the two.
+#[test]
+fn a_project_scoped_file_may_lower_the_wait_ceiling_and_may_not_raise_it() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(user_dir.path(), "io.toml", "[run]\nmax_wait_secs = 30\n");
+
+    write(project.path(), "io.toml", "[run]\nmax_wait_secs = 5\n");
+    let narrowed = Config::discover(project.path()).unwrap();
+    assert_eq!(
+        narrowed
+            .apply_to(TaskContract::workspace("coordinate", project.path()))
+            .max_wait_secs,
+        Some(5),
+        "a project file may tighten the operator's ceiling",
+    );
+
+    write(project.path(), "io.toml", "[run]\nmax_wait_secs = 600\n");
+    let widened = Config::discover(project.path()).unwrap();
+    assert_eq!(
+        widened
+            .apply_to(TaskContract::workspace("coordinate", project.path()))
+            .max_wait_secs,
+        Some(30),
+        "a project file may not loosen it — an agent that blocks holds a slot",
+    );
+
+    // Control: the operator's own local file is not held to that rule, because
+    // it is the operator's file.
+    write(
+        project.path(),
+        "io.local.toml",
+        "[run]\nmax_wait_secs = 600\n",
+    );
+    let local = Config::discover(project.path()).unwrap();
+    assert_eq!(
+        local
+            .apply_to(TaskContract::workspace("coordinate", project.path()))
+            .max_wait_secs,
+        Some(600),
+    );
+}

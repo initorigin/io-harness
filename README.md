@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.59"
+io-harness = "0.60"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -454,6 +454,23 @@ the memory entries it wrote, and the spawn backlog it left queued, in one call �
 while the steps, the events and the ledger stay exactly as they were, because the
 spend happened and an undo that erased them would make the trace lie.
 
+**Agents talking to each other.** A tree could nest, share one ledger and hand a
+child's report up — all of them vertical edges. Two children investigating two
+subsystems could not tell each other what they found, and a coordinator could not
+wait on one named child. Now every agent in a tree has an address: `spawn_agent`
+takes an `as`, unique within the tree, and one is derived when it is omitted. That
+address names **one** agent, unlike a configured agent's name, which is a role
+several may share. `send_message` tells a named agent something; `read_messages`
+returns what was sent to you, oldest first, exactly once, and may block for a
+stated number of seconds. Every wait is bounded — `[run] max_wait_secs`, 30
+seconds by default, lowerable by a project scope and never raisable — because an
+agent that blocks holds its concurrency slot and the sibling that would answer it
+may be queued behind that slot. A finishing agent posts one short line to its
+parent, so waiting for a named child and waiting for a message are the same call.
+Messages are rows: a resumed tree reads the same ones in the same order, once.
+Nothing is delivered unbidden, an address reaches inside its own tree and nowhere
+else, and a message grants nothing — the boundary is still the policy.
+
 **Deciding what the store keeps.** Nothing expires on its own — there is no
 background job, no default retention window, and how long an audit record
 survives is not a library's decision. What the store does offer is the
@@ -496,6 +513,7 @@ crate, and none of it is reachable by a model.
 | [Providers](docs/guide/providers.md) | One compatible provider, the 21 vendor presets, running a model locally, what a model costs, and asking one to think harder |
 | [Capability bundles](docs/guide/plugins.md) | A directory that contributes skills, templates, agents, MCP servers, hooks and deny rules at once, what a cloned repository may not hand you, and how a contribution names its bundle |
 | [Retention](docs/guide/retention.md) | What a store is holding, removing a session whole, sweeping to a date and what it refuses, archiving the words while keeping the numbers, and reclaiming the space |
+| [The mailbox](docs/guide/mailbox.md) | Giving each agent in a tree an address, sending a finding to a named sibling, an inbox read oldest-first exactly once, and a bounded wait |
 
 [docs/CAPABILITIES.md](docs/CAPABILITIES.md) indexes them.
 [docs/CONTRACT.md](docs/CONTRACT.md) is the public contract: what is stable, what

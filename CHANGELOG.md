@@ -26,6 +26,105 @@ notes are produced from it.
 
 ### Security
 
+## [0.60.0] - 2026-08-16
+
+### Added
+
+- **Agents in a tree can talk to each other.** A tree could already nest, share
+  one ledger, queue past its concurrency cap and hand a child's report up to its
+  parent — every one of those a *vertical* edge. Two children investigating two
+  subsystems had no way to tell each other what they found: the only channel
+  between them was a file one wrote and the other happened to read, which is
+  unaddressed, unordered, invisible to the trace and indistinguishable from
+  ordinary workspace churn.
+
+  Two tools, offered inside a tree and in no flat run. `send_message { to, body }`
+  tells one named agent something. `read_messages { from, wait_secs }` returns
+  what has been sent to you, oldest first, exactly once, optionally narrowed to
+  one sender and optionally blocking until something arrives.
+
+- **Every agent in a tree has an address, and it names one agent.** `spawn_agent`
+  takes an optional `as`: the instance name this child answers to. Nothing in
+  this crate could name one agent before — `AgentDef::name` is a *role*, and two
+  children of one definition spawned in the same step are the ordinary shape of a
+  fan-out. An address is unique within a tree, is letters, digits, `-` and `_` up
+  to 64 characters, and may not be `root`, which is the agent at the top. Omitted,
+  one is derived as `<role>#<run id>`, so every spawn written against 0.59.0 gets
+  an addressable child rather than merely continuing to work. The address is
+  durable in a new `spawns.as_name` column, so a resumed tree re-adopts its
+  children under the names they already had.
+
+- **A bounded wait, and it is never unbounded.** `wait_secs` blocks until a
+  message arrives or the clock runs out. `[run] max_wait_secs` and
+  `TaskContract::with_max_wait_secs` are the operator's ceiling — 30 seconds when
+  neither is set — and an agent asking for longer is given the cap and told so on
+  the same observation. It is a narrowing key: a project-scoped `io.toml` may
+  lower it and may not raise it. There is deliberately no way to say "forever": an
+  agent that blocks holds its concurrency slot, and the sibling that would answer
+  it may be the one queued behind that slot.
+
+- **A terminating agent posts one short line to its parent** — `[finished]` and
+  its outcome, never its report. That is what makes "wait for a named child" and
+  "wait for a message" one mechanism: a parent blocked on `from: "scout"`
+  unblocks when the scout answers *or* when the scout finishes having answered
+  nothing. The composed report still travels the path it has since 0.50.0, so
+  nothing is delivered twice. And a wait on an agent that has already finished
+  without sending returns immediately rather than at the clock.
+
+- **`AgentMessage`, `Store::send_message`, `Store::read_messages` and
+  `Store::messages_for`.** The read is the agent's own call and consumes what it
+  returns; `messages_for` is the audit read and delivers nothing. Delivery is
+  marked in a `read_at` column inside the same transaction as the select, which
+  is what makes exactly-once survive a process boundary — a set of delivered ids
+  in memory passes every in-process test and re-delivers everything the first
+  time a tree is resumed. Sends and reads are also `agent_events` rows, so "who
+  told whom, and when" is one query; the body is not in that table, because a
+  second copy of the mailbox is one no retention call knows to delete.
+
+- **`ROOT_ADDRESS`, `SEND_MESSAGE_TOOL`, `READ_MESSAGES_TOOL`, `DEFAULT_MAX_WAIT`**
+  and a new guide page, [docs/guide/mailbox.md](docs/guide/mailbox.md).
+
+### Fixed
+
+- **`spawn_agent` no longer refuses `"wait": false` beside
+  `"background_after_secs": 0`.** 0.50.0 wrote the rule that a zero-second wall
+  clock and "do not wait" are the same request, and applied it to only one of the
+  two spellings: `wait: true` with a zero clock detached, and `wait: false` with
+  the same zero was refused as a contradiction. Filling every property of a tool
+  schema with its zero value is ordinary model behaviour, not exotic — the live
+  run that found this sent `"agent": ""`, `"deny_write": []`, `"deny_net": []`
+  and `"background_after_secs": 0` on every call, and every other one of those
+  was already read as "unset". Such a model could not spawn a detached child at
+  all, and no fixture noticed because a fixture writes only the arguments it
+  means. A contradiction is now a clock that is actually asked to elapse.
+
+- **A blocked agent no longer starves the children it is waiting for.** A
+  detached child is a future driven by its parent's own loop and by nothing else,
+  so the first implementation of the wait — which slept — stopped the very
+  siblings whose message it was waiting for. Every wait ran to its full clock and
+  then succeeded on the step after, with a green suite throughout. The wait is now
+  driven against the in-flight set the same way a provider call is. A two-child
+  fan-out where one waits on the other went from 20 seconds to under one.
+
+### Changed
+
+- **`Store::record_spawn` takes the child's address as a ninth argument, and
+  `SpawnRow` carries `as_name`.** Both are `pub` on `Store`, so a program calling
+  them directly needs the extra argument; every caller inside the crate is
+  updated. Rows written before 0.60.0 read back with an empty address, which is
+  the honest answer for a spawn made by a release that had none.
+
+- **A spawn's `agent_events` detail now leads with the child's address** —
+  `scout as searcher: <goal>` where it was `as searcher: <goal>`. The role answers
+  *what kind of agent this was*; only the address answers *which one*.
+
+### Schema
+
+- One additive table, `agent_messages`, and its index `agent_messages_to`. One
+  additive column, `spawns.as_name`, `NOT NULL DEFAULT ''`. No
+  `CHECKPOINT_FORMAT` move: no checkpoint layout changed, and a 0.59.0 binary
+  opens a store this release wrote and never names either.
+
 ## [0.59.0] - 2026-08-16
 
 ### Added
