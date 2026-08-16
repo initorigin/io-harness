@@ -1,322 +1,264 @@
 product: io-harness
-version: 0.58.0
+version: 0.60.0
 tasks:
-  - id: US-IO-HARNESS-0.58.0-T01
-    summary: The size half — `SessionSize`, `StoreSize`, and the one additive index every retention
-      call enters through.
-    why_required: >
-     Two later criteria are equalities against these numbers rather than assertions of their own —
-     `Pruned::bytes` is checked against the size read immediately before the deletion, and the
-     compaction is proved by three reads of the same store size. If the size call is wrong the
-     deletion and the compaction cannot be proved at all. It is also the half that delivers "an
-     operator can see what a store is holding" on its own.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        **F13 — the size call is exact about what it counts.** For a store built with known content,
-        `SessionSize::bytes` equals the summed `length()` of the seeded values, computed independently in
-        the test, and `rows` equals the seeded row count. `StoreSize::file_bytes` equals
-        `page_size × page_count` read directly. Sabotage: count only the tables with an obvious text
-        column, under which the independent sum disagrees and only F13 fails.
-    evidence:
-    - "`the_size_of_a_session_is_the_bytes_of_its_own_rows`,
-      `the_size_of_a_store_is_the_files_own_page_arithmetic`,
-      `the_size_of_a_session_that_is_not_there_is_none` and
-      `a_seeded_run_can_be_put_into_every_status_the_sweep_reads` in `tests/retention.rs` — 4 passed."
-    - "The independence F13 claims is real on the dimension that can actually go wrong: the crate sums
-      over a static `RUN_TABLES` list, and the test sums over `sqlite_master`, so a table missing from
-      the crate's list makes the two disagree. Both read columns from `PRAGMA table_info`, which is
-      what keeps a column added by a later release counted without anyone remembering to."
-    - "`dbstat` answers on this build, as the premise check predicted — the per-table breakdown is
-      non-empty and sums to no more than the file's own bytes."
-    files:
-      - src/state.rs
-      - src/lib.rs
-      - tests/retention.rs
+- id: US-IO-HARNESS-0.60.0-T01
+  summary: The store half — `agent_messages`, `AgentMessage`, the three `Store` methods, and `spawns.as_name`.
+  why_required: 'Every other task in this release reads or writes these rows. It is also where the two
+    properties that cannot be retrofitted live: the read and the mark happen in one transaction, and
+    the new table is in `RUN_TABLES` so a session delete accounts for it. A table missed by that list
+    produces a silent orphan and no error — 0.58.0 paid for that lesson.'
+  status: todo
+  depends_on: []
+  acceptance_criteria:
+  - '**F5 — reads are ordered, exactly-once, and marked in the same transaction as they are returned.**
+    Ten messages from three senders are read back in row-id order; a second read returns nothing; and
+    a read that fails after selecting leaves every message still unread. Sabotage: mark read in a separate
+    statement outside the transaction and fail between them, under which the messages are lost and only
+    F5 fails.
 
-  - id: US-IO-HARNESS-0.58.0-T02
-    summary: Deletion — the transitive run set, the cascade over every table, one transaction, and
-      the schema-driven guard that a table was not missed.
-    why_required: >
-     This is the instrument the release exists for, and the guard is the release's central risk:
-     the schema declares one foreign key and never enables `PRAGMA foreign_keys`, so a forgotten
-     table produces unreachable rows and no error at all.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.58.0-T01
-    acceptance_criteria:
-      - >
-        **F1 — a deleted session leaves no row anywhere, and the check is driven from the schema.** A
-        store holding three sessions loses one. Every table named by
-        `SELECT name FROM sqlite_master WHERE type='table'` is then queried for rows belonging to that
-        session's runs, and every one is empty. The test enumerates the schema at run time, so a table
-        added by a later release fails this test until its deletion is written. Sabotage: drop any one
-        table from the cascade, under which only F1 fails — and it must fail for that table by name.
-      - >
-        **F2 — the sibling sessions are untouched, row for row.** Before and after the deletion, a
-        per-table row count for the surviving sessions is identical, and `Store::session_size` returns
-        the same numbers for them. Sabotage: delete by run id without constraining to the session's own
-        run set, under which the siblings lose rows and only F2 fails.
-      - >
-        **F3 — a spawned child goes with the parent that spawned it.** A session whose turn drove a run
-        that spawned two children, one of which spawned a third, loses all four runs and every row under
-        them. Asserted on the run ids from the tree rather than on a count. Sabotage: take the run set
-        from `session_turns.run_id` alone without the recursive walk, under which the three children
-        survive as orphans and only F3 fails.
-      - >
-        **F4 — the deletion is one transaction.** A failure injected partway through the cascade leaves
-        the store exactly as it was — every table's row count unchanged, the session still readable.
-        Asserted by driving the failure, not by reading the code for a `tx`. Sabotage: commit per table,
-        under which the store is left half-deleted and only F4 fails.
-      - >
-        **F5 — `Pruned` reports what actually went.** Its counts equal the row counts measured before
-        the deletion, and its `bytes` equals the `SessionSize::bytes` read immediately before. The
-        restore-point count equals the `snapshots` rows the session held. Sabotage: report the number of
-        tables touched rather than the rows removed, under which the equality fails and only F5 fails.
-      - >
-        **F14 — a session that is not in the store is `None`, not an error and not a zero.** A size call
-        for an unknown id returns `None`; a deletion for an unknown id returns a `Pruned` whose counts
-        are all zero and does not fail. The two answers differ on purpose: asking the size of nothing has
-        no answer, and deleting nothing succeeds. Sabotage: return `Some` with zeroes, under which the
-        distinction collapses and only F14 fails.
-    evidence:
-    - "`a_deleted_session_leaves_no_row_in_any_table_the_schema_names` (F1),
-      `deleting_one_session_leaves_the_others_row_for_row` (F2),
-      `a_spawned_child_goes_with_the_parent_that_spawned_it` (F3),
-      `a_deletion_that_fails_partway_leaves_the_store_exactly_as_it_was` (F4),
-      `the_pruned_report_equals_what_the_store_held_a_moment_earlier` (F5) and
-      `deleting_a_session_that_is_not_there_succeeds_and_reports_nothing` (F14) in
-      `tests/retention.rs` — 10 passed with T01's four."
-    - "F4 injects its failure with a `BEFORE DELETE` trigger on `summaries` that RAISEs — a real abort
-      from inside the cascade rather than a mock, and the store is asserted whole afterwards."
-    - "F5 caught a real inconsistency before it shipped: `Pruned` counted the session row and
-      `SessionSize` did not, so the two figures for one session differed by one. They are now the same
-      measure, which is the only way F5's equality means anything."
-    - "F3 drives real spawned children through `start_child_run`, two levels deep, and asserts on the
-      run ids from the tree rather than on a count."
-    files:
-      - src/state.rs
-      - src/lib.rs
-      - tests/retention.rs
+    '
+  - '**N1 — one additive table and one additive column, and no `CHECKPOINT_FORMAT` move.** `agent_messages`
+    with its index, and `spawns.as_name`. `git diff main -- src/state.rs` shows a `CREATE TABLE IF NOT
+    EXISTS`, a `CREATE INDEX IF NOT EXISTS` and one `ALTER TABLE ADD COLUMN`, and `CHECKPOINT_FORMAT`
+    is still 7. No checkpoint layout changes, so a bump would refuse a store this release can read.
 
-  - id: US-IO-HARNESS-0.58.0-T03
-    summary: The sweep — one cutoff, one pass over the schema, and a resumable run refused by name.
-    why_required: >
-     "Keep ninety days" is the shape the retention decision actually takes, and the refusal is the
-     rule that stops this release destroying a crash-resumable tree because it was old. The
-     one-pass requirement forbids the natural implementation, so it has to be built in rather than
-     optimised later.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.58.0-T02
-    acceptance_criteria:
-      - >
-        **F6 — a sweep refuses a session holding a resumable run and names it.** Three sessions older
-        than the cutoff, one of which holds a run in `Paused` and another a run in `Running`. Both are
-        in `Pruned::refused`, both are still readable afterwards with identical row counts, and the third
-        is gone. A session holding only `Completed` and `Failed` runs is swept. Sabotage: filter on
-        `Running` alone, under which the paused session is deleted and only F6 fails.
-      - >
-        **F7 — a session newer than the cutoff is not swept, and the boundary is asserted exactly.** A
-        session whose `created_at` equals the cutoff string survives, because the comparison is strictly
-        before. Asserted with a pair of sessions one millisecond apart around the cutoff, not with a
-        pair a day apart. Sabotage: `<=`, under which the boundary session goes and only F7 fails.
-      - >
-        **F8 — a sweep of many sessions is one pass over the schema.** Asserted structurally, not on a
-        clock: the number of `DELETE` statements executed for a sweep of ten sessions equals the number
-        executed for a sweep of one, counted through the connection's own trace hook. This is the
-        criterion that forbids the natural implementation — loop over the sessions calling
-        `delete_session` — and it is the reason `Pruned` accumulates rather than being returned per
-        session. Sabotage: loop per session, under which the statement count scales with the sessions
-        and only F8 fails.
-    evidence:
-    - "`a_sweep_refuses_a_session_holding_a_resumable_run_and_names_it` (F6) and
-      `the_sweeps_cutoff_is_strictly_before_and_the_boundary_is_the_assertion` (F7) in
-      `tests/retention.rs`; `a_sweep_of_many_sessions_issues_the_same_statements_as_a_sweep_of_one`
-      (F8) in `src/state.rs`."
-    - "F8 IS MET IN A DIFFERENT FORM AND THIS IS RECORDED RATHER THAN ABSORBED. The criterion names
-      `rusqlite`'s trace hook; that needs the `trace` feature and a connection the test owns, and
-      `Store::from_conn` is private. The count is instead returned by a `pub(crate) prune_counted`,
-      asserted equal for a sweep of ten sessions and of one, AND asserted equal to
-      `RUN_TABLES.len() + 3` — which is a stronger claim than the criterion made, since it pins the
-      count to the schema rather than only to its own invariance."
-    - "F7 asserts one millisecond either side of the cutoff, not a day, and a session created at
-      exactly the cutoff survives."
-    - "F6 asserts a `failed` run is swept: finished is finished, and only `running`/`paused` refuse."
-    files:
-      - src/state.rs
-      - tests/retention.rs
+    '
+  - '**N2 — the cross-version gate passes with both declared.** `agent_messages` and its index join
+    `ADDED_SINCE_0_22_0`, and `as_name` joins `COLUMNS_ADDED_SINCE_0_22_0` under `spawns`, in `tests/cross_version.rs`.
+    A real 0.29.0 binary opens a store this build wrote and never names either, executed rather than
+    asserted on paper. This criterion is written down because 0.58.0''s additive index was refused by
+    this same gate.
 
-  - id: US-IO-HARNESS-0.58.0-T04
-    summary: Archiving — every row kept, every column holding words emptied, and a restore point that
-      says so instead of writing an empty file.
-    why_required: >
-     This is the half that cannot be assembled from outside the crate, because it needs to know
-     which of a hundred and forty columns hold words. It is also the half with a way to destroy
-     something outside the database, which F11 is the guard against.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.58.0-T02
-    acceptance_criteria:
-      - >
-        **F9 — an archived session keeps every row and every number, and holds no words.** After
-        archiving: the per-table row counts are unchanged; `provider_calls` still answers the same token
-        and cost totals; `edits` still names the same paths with the same line counts; `run_outcomes`
-        still holds the same verdicts. Then a needle sweep — for every table and every `TEXT` or `BLOB`
-        column named by `PRAGMA table_info`, no value contains any of the fixture's distinctive phrases,
-        which are seeded into the prompt, the reply, a tool result, a summary, a snapshot's content and
-        an edit's hunk. Sabotage: empty `session_turns` only, under which the needles survive in
-        `steps.prompt` and only F9's second half fails.
-      - >
-        **F10 — archiving is idempotent and reports honestly the second time.** Archiving an
-        already-archived session clears zero rows and zero bytes and returns without error. Sabotage:
-        report the same counts on both calls, under which the second assertion fails and only F10 fails.
-      - >
-        **F11 — an archived restore point says so rather than restoring nothing.** A run whose snapshot
-        content was archived, reached by a restore path, reports `Reverted::Stale` with a reason naming
-        the archive, and the file on disk is byte-identical to what it was before the attempt. This is
-        the criterion that makes archiving safe to offer at all: writing an empty string over a real
-        file is the one way this release could destroy something outside the database. Sabotage: leave
-        `snapshots.state` unchanged on archive, under which the empty content is written and only F11
-        fails.
-    evidence:
-    - "`an_archived_session_keeps_its_numbers_and_holds_none_of_its_words` (F9),
-      `archiving_twice_clears_nothing_the_second_time` (F10) and
-      `an_archived_restore_point_reports_itself_rather_than_writing_an_empty_file` (F11) in
-      `tests/retention.rs`; `a_column_the_archive_has_never_heard_of_is_treated_as_words` in
-      `src/state.rs`."
-    - "THE NEEDLE SWEEP FOUND THREE DEFECTS THAT REVIEW DID NOT, and all three would have shipped an
-      archive that reported a removal it had not performed. (1) `runs.goal` was classified as a fact
-      — but for a run driving a session turn the goal IS the user's prompt, so the question survived
-      in the trace after the conversation lost it. (2) `decision` was in the universal fact list
-      because it is a verdict in `policy_events`; in `steps` it is the model's own words, which is
-      why the judgement had to become per-table. (3) `sum_of` had to be split out of `sum_text`:
-      summing every text column counted the kinds and paths the archive deliberately keeps, so a
-      SECOND archive reported clearing 148 bytes it never cleared — F10 caught that one."
-    - "F11 goes through the real `rewind_run`, not a stub: an archived snapshot returns
-      `Rewind::NotKept` naming the archive, and the file on disk is asserted byte-identical
-      afterwards. No new variant was needed — `Kept::Unkept` already carries the reason."
-    files:
-      - src/state.rs
-      - src/lib.rs
-      - src/run.rs
-      - tests/retention.rs
+    '
+  - '**N3 — the new table is accounted for by every run-keyed operation.** `agent_messages` is in `RUN_TABLES`,
+    and deleting a whole tree''s session leaves **zero** rows in it — asserted by counting the table
+    directly after the delete, not by enumerating `sqlite_master`, which 0.58.0 proved cannot fail.
+    A message has two run columns and only one may key the list; the criterion asserts both ends are
+    gone.
 
-  - id: US-IO-HARNESS-0.58.0-T05
-    summary: Compaction — `VACUUM` as a call an operator makes knowingly, returning what the file
-      actually shrank by.
-    why_required: >
-     SQLite frees pages into the file rather than out of it, so a prune that leaves the file the
-     size it was has not done what the operator asked. Without this the release's own instrument
-     looks broken to the person using it.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.58.0-T02
-    acceptance_criteria:
-      - >
-        **F12 — a prune alone does not shrink the file and a compaction does.** `Store::store_size` read
-        three times: before the deletion, after it, and after `Store::compact`. The file's bytes are
-        unchanged by the deletion and the free bytes rise; after the compaction the file's bytes have
-        fallen and the free bytes are near zero. `Store::compact` returns the difference. This is the
-        assertion that justifies compaction being in the release rather than a note in the guide.
-        Sabotage: return the freelist figure instead of the measured difference, under which the returned
-        value disagrees with the two reads and only F12 fails.
-    evidence:
-    - "`a_prune_frees_pages_into_the_file_and_a_compaction_returns_them` (F12) in
-      `tests/retention.rs` — the three store-size reads, plus a fourth assertion against
-      `std::fs::metadata`, so the filesystem agrees and not only SQLite's opinion of the file."
-    - "`compact` returns the measured difference between the file's size before and after, not the
-      freelist figure, which is what F12's equality pins."
-    files:
-      - src/state.rs
-      - tests/retention.rs
+    '
+  - '**N5 — the cost of a read is measured and stated, and it is the mailbox that is measured.** Median
+    of 20 on this machine, stores on disk, for a drain at 1 / 100 / 1,000 unread messages and for a
+    bounded wait that returns on the first message. The read must be an index seek on `(to_run_id, id)`
+    rather than a scan: `EXPLAIN QUERY PLAN` over the statement the crate actually issues asserts the
+    index by name, and the recipient column is the leading one.
 
-  - id: US-IO-HARNESS-0.58.0-T06
-    summary: The checked-in surfaces, the measurements, and every gate the release is judged on.
-    why_required: >
-     The contract makes the docs and the gates part of this release rather than the next one, and
-     two of them are load-bearing this time: the cross-version gate is what proves an index and
-     thirty-three cascades did not break a binary reading the same file, and the doc gates have to
-     run again after the version bump because 0.57.0 shipped five red jobs by not doing that.
-    status: todo
-    depends_on:
-      - US-IO-HARNESS-0.58.0-T03
-      - US-IO-HARNESS-0.58.0-T04
-      - US-IO-HARNESS-0.58.0-T05
-    acceptance_criteria:
-      - >
-        **N1 — no new dependency.** `cargo tree` stays at **402** lines on the default build. This
-        release is SQL, one recursive CTE the crate already writes, and `dbstat`, which is compiled into
-        the bundled SQLite the crate already links.
-      - >
-        **N2 — the public surface addition is stated in advance.** `docs/public-api.txt` tracks
-        crate-root re-exports. The prediction is **+4 lines** — `SessionSize`, `StoreSize`, `Pruned`,
-        `Archived`. The six methods are on `Store`, which is already exported, and add nothing to the
-        snapshot. Any difference is explained in the record rather than absorbed.
-      - >
-        **N3 — the schema change is one index and nothing else.** `git diff main -- src/state.rs` shows
-        `CREATE INDEX IF NOT EXISTS session_turns_session ON session_turns (session_id)` and **no new
-        table, no new column, no dropped column and no `CHECKPOINT_FORMAT` movement**. A 0.57.0 binary
-        reads a 0.58.0 store and a 0.58.0 binary reads a 0.57.0 store.
-      - >
-        **N4 — zero compile breaks.** Four new types, six new methods, one new index, one new value in an
-        existing `TEXT` column. No existing signature changes shape and no enum gains a variant —
-        `Reverted::Stale` already carries a `String`, which is what F11 rests on.
-      - >
-        **N5 — the cost of a deletion is measured and recorded, never asserted.** The time to delete one
-        session is measured at three store sizes — a session of 10, 100 and 1,000 steps, in a store
-        holding ten such sessions — on a named machine, in `docs/MEASUREMENTS.md` with the method. The
-        shape to expect is stated in advance: **linear in the rows removed and linear in the number of
-        tables, with a full scan of each table that carries no `run_id` index**, which is most of them.
-        A timing that does not move when the rows grow tenfold is a defect report and not a pass — the
-        standing lesson of 0.56.0's N5. The sweep is measured at ten sessions beside it, and F8 is what
-        makes that number meaningful rather than accidental.
-      - >
-        **N6 — the compaction's cost and its space requirement are recorded.** The time to `VACUUM` a
-        store of a stated size, and the peak extra disk the operation takes, measured and written where
-        the operator decides whether to call it. This is a number an operator needs before running it on
-        a large file, and it is the reason the call is separate.
-      - >
-        **O1 — the three-platform matrix is green**, `--all-features` included.
-      - >
-        **O2 — nothing in the suite gates on a wall clock.** N5 and N6 are recorded, never asserted. F8
-        asserts a statement count rather than a duration, which is the whole reason it is written that
-        way. Stores are built by construction rather than by driving providers.
-      - >
-        **O3 — the cross-version gate runs, and it is the gate that matters most this release.**
-        `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` then
-        `cargo test --test cross_version_0_29_0 -- --ignored`. A release that deletes rows across
-        thirty-three tables and adds an index is exactly the shape that breaks a binary reading the same
-        file, and the gate is what proves it did not.
-      - >
-        **O4 — `docs/CONTRACT.md` gains a retention section, by name.** What a deletion takes, what it
-        leaves (notes, and anything reachable from no session), what an archive keeps, what refuses to
-        be swept, and the statement that nothing expires on its own. The contract has never spoken about
-        removal because there was nothing to say.
-      - >
-        **O5 — the nightly rustdoc gate passes with `-D warnings`.**
-        `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`, run
-        **after** the version bump as well as before it. It has found something in seven of the last
-        nine releases.
-      - >
-        **O6 — the checked-in doc surfaces are updated in this release.** A retention page in
-        `docs/guide/`, `docs/CAPABILITIES.md`, `docs/MEASUREMENTS.md`, `docs/CONTRACT.md`, the README's
-        description of what the store holds, and the changelog. Every new public item carries a worked
-        example; `cargo test --doc` and `tests/public_api.rs` pass.
-      - >
-        **O7 — clippy on all three feature polarities**, default, one feature on, and `--all-features`.
-      - >
-        **O8 — the doc gates are re-run after the version bump.** 0.57.0 shipped a first CI round with
-        five red jobs because `readme_dependency_version_matches_cargo_toml` compares the README's pin to
-        `Cargo.toml` and the bump happens during `complete`, after the doc gates ran. The gates run
-        again on the bumped tree before the PR is opened.
-    evidence: []
-    files:
-      - docs/CONTRACT.md
-      - docs/CAPABILITIES.md
-      - docs/MEASUREMENTS.md
-      - docs/public-api.txt
-      - docs/guide/retention.md
-      - README.md
-      - CHANGELOG.md
+    '
+  evidence: []
+  files:
+  - src/state.rs
+  - src/lib.rs
+  - tests/mailbox.rs
+  - tests/cross_version.rs
+- id: US-IO-HARNESS-0.60.0-T02
+  summary: The address — an instance name per agent, assigned at spawn, durable, unique in the tree.
+  why_required: 'There is no mailbox without an address, and the roadmap''s `by name` did not name one:
+    a roster name is a role two children share. Nothing in this crate has ever identified one agent.
+    Every send and every read resolves through what this task builds.'
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.60.0-T01
+  acceptance_criteria:
+  - '**F2 — a name addresses one agent, not a role.** Two children of the *same* roster definition,
+    spawned in the same step with `as` names `a` and `b`, receive only their own messages. Sabotage:
+    resolve an address by the roster definition''s name instead of the instance name, under which both
+    children read both messages and only F2 fails. This criterion exists because it is the premise the
+    roadmap entry got wrong.
+
+    '
+  - '**F3 — a duplicate name is refused before anything is allocated.** A spawn asking for a name already
+    held in this tree produces a typed observation naming it, and the tree''s run count, slot tally
+    and queue depth are all unchanged afterwards — asserted as three numbers taken before and after,
+    not as the absence of a child. Sabotage: allocate the run row before the name is checked, under
+    which the counts move and only F3 fails.
+
+    '
+  - '**F4 — `root` is reserved.** A spawn asking for `as: "root"` is refused the same way. Sabotage:
+    drop the reserved-name check, under which a child shadows the root''s address and messages intended
+    for the root reach the child; only F4 fails.
+
+    '
+  evidence: []
+  files:
+  - src/run.rs
+  - src/state.rs
+  - tests/mailbox.rs
+- id: US-IO-HARNESS-0.60.0-T03
+  summary: The two tools, non-blocking — `send_message`, `read_messages` as a drain, and the refusals
+    that name what is addressable.
+  why_required: 'This is the release''s vertical slice and its declared fallback scope: after it a child
+    can tell a sibling what it found and the sibling reads it on its next step. Everything after it
+    is about when a read returns, not about whether the channel exists.'
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.60.0-T02
+  acceptance_criteria:
+  - '**F1 — a child tells a sibling what it found, and the sibling could not have found it otherwise.**
+    A two-child fan-out where the `scout` locates a line and the `author` is denied every means of locating
+    it itself, and the author''s edit lands on the line the scout named. Sabotage: make `send_message`
+    append nothing while still reporting success, under which the author''s read is empty and only F1
+    fails.
+
+    '
+  - '**F10 — an unknown address is refused with the names that are addressable.** The observation lists
+    them, so the model recovers in one step. Sabotage: refuse without listing, under which only F10
+    fails.
+
+    '
+  - '**F11 — an address resolves inside this tree and nowhere else.** Two independent trees over one
+    store, each with a child named `worker`; neither can address the other''s, and the refusal reads
+    the same as any unknown name rather than leaking that a `worker` exists elsewhere. Sabotage: resolve
+    by name over the whole store, under which the cross-tree send succeeds and only F11 fails.
+
+    '
+  - '**F15 — a flat run has neither tool.** `workspace_tools()` offers no mailbox tool, and a run outside
+    a tree that calls one gets the ordinary unknown-tool observation. Sabotage: add the tools to `workspace_tools`,
+    under which a flat run''s tool count moves and only F15 fails.
+
+    '
+  - '**N7 — a run that never sends a message is byte-identical in what it costs.** The tools are two
+    more `ToolSpec`s in a tree''s request and nothing else: no prompt block, no fold, no per-step query.
+    Asserted as a step''s assembled prompt being unchanged against the same run on the release base
+    except for the two tool schemas.
+
+    '
+  evidence: []
+  files:
+  - src/run.rs
+  - src/observe.rs
+  - tests/mailbox.rs
+- id: US-IO-HARNESS-0.60.0-T04
+  summary: The bounded wait — `wait_secs`, the operator's `max_wait_secs` ceiling, and the early return
+    for a sender that cannot answer.
+  why_required: Without it the third verb the entry names is missing and a coordinator still cannot
+    wait on a named child. It is also the release's one genuinely open shape, so it is built after the
+    slice that survives without it.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.60.0-T03
+  acceptance_criteria:
+  - '**F6 — a bounded wait returns on the message.** An agent reading with `wait_secs: 30` returns as
+    soon as a sibling sends, not at the clock, and the elapsed time is asserted as *less than* the clock
+    rather than as a duration. Sabotage: sleep the full clock before checking the mailbox, under which
+    the read still succeeds but takes the whole clock and only F6 fails.
+
+    '
+  - '**F7 — a bounded wait returns at the clock when nothing arrives, and says so.** The observation
+    distinguishes "nothing was sent" from "nothing was sent yet and I stopped waiting", because a model
+    that cannot tell them apart cannot decide whether to wait again. Sabotage: return the same text
+    for both, under which only F7 fails.
+
+    '
+  - '**F8 — a wait on an agent that has already finished and said nothing returns immediately.** Asserted
+    on elapsed time against a clock of 30 seconds, and on the text naming that the agent finished. Sabotage:
+    remove the terminal check, under which the read burns the full clock and only F8 fails.
+
+    '
+  - '**F13 — the operator''s cap narrows the agent''s request, and the agent is told.** A run with `max_wait_secs
+    = 5` and an agent asking for 60 waits at most 5 and reads a line saying its request was narrowed.
+    The boundary pair is asserted **exactly**: a request of 5 is not narrowed and a request of 6 is,
+    so `>` in place of `>=` fails. Sabotage: apply the cap silently, under which the wait is correct
+    and the notice is absent; only F13''s second half fails, which is the point of asserting both.
+
+    '
+  - '**F14 — a project scope cannot widen the cap.** `max_wait_secs` in a `Project`-scoped `io.toml`
+    takes the lower of the two values. Sabotage: omit the key from `NARROWING`, under which the project
+    scope raises the ceiling and only F14 fails.
+
+    '
+  evidence: []
+  files:
+  - src/run.rs
+  - src/config.rs
+  - src/contract.rs
+  - tests/mailbox.rs
+- id: US-IO-HARNESS-0.60.0-T05
+  summary: The terminal post to the parent, and exactly-once delivery across a resume.
+  why_required: 'These are one task because they are the same claim from two sides: a wait unblocks
+    on the sender terminating, and a resumed tree must not re-deliver what it already delivered. Both
+    are properties of the `read_at` column rather than of anything in memory.'
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.60.0-T04
+  acceptance_criteria:
+  - '**F9 — a terminating agent posts to its parent, and the report is not duplicated.** After a child
+    finishes, its parent''s mailbox holds exactly one row from it, that row is the short terminal line
+    and not the composed report, and the composed report still reaches the parent through 0.50.0''s
+    path. Sabotage: post the whole report as the message body, under which the parent reads the report
+    twice and only F9 fails.
+
+    '
+  - '**F12 — a resumed tree reads the same messages in the same order, once.** A tree killed with messages
+    sent and unread, resumed in a new process, delivers each exactly once in row-id order; and a message
+    already read before the kill is not delivered again. Sabotage: key delivery on an in-process set
+    rather than the `read_at` column, under which the resume re-delivers and only F12 fails.
+
+    '
+  evidence: []
+  files:
+  - src/run.rs
+  - src/state.rs
+  - tests/mailbox.rs
+- id: US-IO-HARNESS-0.60.0-T06
+  summary: The surfaces — guide page, CONTRACT, CHANGELOG, README, `docs/public-api.txt`, rustdoc.
+  why_required: The contract's own risk register says the role/address confusion lives in the prose
+    more than in the code, and the standing rule is that documentation ships in the release that changes
+    the behaviour, never later.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.60.0-T05
+  acceptance_criteria:
+  - '**N4 — `docs/public-api.txt` gains exactly one line**, `struct AgentMessage`. The store methods
+    and the contract builder are methods on existing types, and that file tracks root-level types —
+    which is why 0.59.0''s prediction of movement there was wrong.
+
+    '
+  - '**N6 — no new runtime dependency.** `cargo tree` is still 402 on this machine. The wait is `tokio::time`
+    and a poll of a table this crate already opens; nothing is added for it.
+
+    '
+  evidence: []
+  files:
+  - docs/CONTRACT.md
+  - docs/public-api.txt
+  - docs/guide/mailbox.md
+  - CHANGELOG.md
+  - README.md
+  - src/lib.rs
+  - tests/guide_pages.rs
+- id: US-IO-HARNESS-0.60.0-T07
+  summary: The gates and the sabotage pass, run against the tree that ships.
+  why_required: A criterion with no evidence behind it is prose, and a guard whose sabotage kills nothing
+    is a test that never built the case the guard exists for. This is the task that turns the fifteen
+    functional criteria into the record's evidence.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.60.0-T06
+  acceptance_criteria:
+  - '**O1 — green on all three platforms.** `cargo test` and `cargo test --all-features` on ubuntu,
+    macos and windows through the release PRs. The wait has a clock in it and Windows runners are roughly
+    three times slower, so every timing assertion is written as a comparison against the clock it was
+    given, never as an absolute duration.
+
+    '
+  - '**O2 — the gates, in the order the ledger requires.** `cargo fmt --check`, `cargo clippy --all-targets
+    --all-features -D warnings`, both test invocations, the nightly `RUSTDOCFLAGS="--cfg docsrs -D warnings"
+    cargo +nightly doc --all-features --no-deps`, the cross-version generator gate, and `cargo package
+    --locked`. The doc gates are re-run **after** the version bump, because the bump invalidates `readme_dependency_version_matches_cargo_toml`
+    and cost five red jobs in 0.57.0.
+
+    '
+  - '**O3 — a sabotage arm per functional criterion, run before the record is sealed.** An arm that
+    fails nothing is a finding about the test, recorded as such and fixed in the test or the product,
+    never propped up.
+
+    '
+  - '**O4 — the live instrument runs.** The two-child fan-out is an example in `examples/`, run against
+    a real provider before sealing, not only as a fixture. A fixture proves the plumbing and cannot
+    prove a model can use the tools it was given.
+
+    '
+  evidence: []
+  files:
+  - examples/mailbox_live.rs
+  - tests/mailbox.rs
