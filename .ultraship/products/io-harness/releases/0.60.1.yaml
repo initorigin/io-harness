@@ -106,6 +106,15 @@ scope:
     the evidence; each claim is re-read against the project's current documentation or source before
     it is published.
   - >
+    **A supported-file-formats section on the README** (added by `US-IO-HARNESS-0.60.1-I01`). One
+    table per direction: the image types every provider accepts, the ones this crate converts to PNG
+    at the door, the ones it refuses by name with the conversion that fixes them, and the two bounds
+    that decide whether an image attaches at all. Beside it the document formats, each stated by
+    direction rather than by feature — read, generate, edit in place, or not at all — because read
+    from the feature table alone `pptx` and `barcode` both look bidirectional and neither is. The
+    refused formats are named deliberately: a list that omits what is unsupported reads as a claim
+    that everything else works.
+  - >
     **The README guide table lists all twenty-five pages.** It lists twenty-four; `browser.md` is
     linked in prose and absent from the table. Fixed, and given a test.
   - >
@@ -216,6 +225,15 @@ acceptance:
     not churn it, so `io-harness = "0.60"` stays exactly as it is while Cargo.toml goes to 0.60.1. A
     rewrite that "helpfully" writes `"0.60.1"` into that snippet fails the gate, which is what the
     gate was written for after the line sat at `"0.25"` for eleven releases.
+  - >
+    **F9 — the format list is complete, and stays complete.** A test asserts the README names every
+    media type in `IMAGE_MEDIA_TYPES`, every media type `decodable` converts, every media type the
+    extension map can produce but the crate refuses, and every one of the five document features.
+    The lists are read from `src/provider/mod.rs` by the test rather than retyped into it, so a
+    format added to the crate and not to the page fails the build. Sabotage: drop the TIFF row from
+    the README, under which only F9 fails and names `image/tiff`. This criterion exists because a
+    format table is exactly the kind of page that is right on the day it is written and wrong two
+    releases later.
   non_functional:
   - >
     **N1 — nothing under `src/` changes except documentation.** `git diff main -- src/` shows only

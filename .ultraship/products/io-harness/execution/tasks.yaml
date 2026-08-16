@@ -102,6 +102,15 @@ tasks:
     of the links on the page.'
   - 'cargo test --test docs_drift --test guide_pages: 24 passed, 1 failed, the failure being F5''s release
     table, which task T05 writes.'
+  - 'One defect the local doc gates could not see, found by CI: `tests/readme.rs::readme_opens_as_a_landing_page`
+    asserts the first 60 lines carry a prose sentence, a runnable fence AND the MSRV. The new table of
+    contents listed all fourteen subsections of the capability section and pushed the MSRV past line 60.
+    The landing page''s own gate caught the landing page. Fixed by stopping the contents list at the section;
+    readme.rs is 8 of 8 green.'
+  - 'After that, every test file that reads README.md, docs/CONTRACT.md or docs/CAPABILITIES.md was enumerated
+    rather than assumed: readme.rs, docs_drift.rs, guide_pages.rs and cache_boundary.rs read the real
+    files; git.rs, list_dir.rs, skills.rs and worktree.rs write their own fixtures. cache_boundary.rs
+    asserts four stale caching phrases appear in neither README nor CONTRACT — checked, all zero.'
 - id: US-IO-HARNESS-0.60.1-T03
   summary: Correct the AppContainer claim in docs/CONTRACT.md, sweep the file for other outlived claims,
     and add the F4 test.
@@ -252,3 +261,41 @@ tasks:
   files:
   - docs/public-api.txt
   evidence: []
+- id: US-IO-HARNESS-0.60.1-T07
+  summary: Add the supported-file-formats section to the README, and the checker that keeps it complete.
+  why_required: Scope added mid-release by US-IO-HARNESS-0.60.1-I01. The page names the cargo features
+    that carry each file type and never the file types themselves, so the question a prospective user
+    actually asks — can it open this file, and what happens if it cannot — is answerable nowhere on the
+    landing page.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.60.1-T02
+  acceptance_criteria:
+  - '**F9 — the format list is complete, and stays complete.** A test asserts the README names every media
+    type in `IMAGE_MEDIA_TYPES`, every media type `decodable` converts, every media type the extension
+    map can produce but the crate refuses, and every one of the five document features. The lists are
+    read from `src/provider/mod.rs` by the test rather than retyped into it, so a format added to the
+    crate and not to the page fails the build. Sabotage: drop the TIFF row from the README, under which
+    only F9 fails and names `image/tiff`. This criterion exists because a format table is exactly the
+    kind of page that is right on the day it is written and wrong two releases later.
+
+    '
+  files:
+  - README.md
+  - tests/docs_drift.rs
+  evidence:
+  - 'Three tables added: documents by direction (read / generate / edit in place, so pptx and barcode
+    stop looking bidirectional), images by media type with extensions and whether each is passed through,
+    converted to PNG, or refused by name, and the files the harness reads itself. The two bounds are stated:
+    5 MiB per image and 50,000,000 pixels checked from the header before any decode.'
+  - 'Every fact was read from source rather than from the guides: IMAGE_MEDIA_TYPES at src/provider/mod.rs:218,
+    the convertible set in `decodable` at src/provider/mod.rs:255, the extension map at src/provider/mod.rs:435
+    (which is where SVG, HEIC/HEIF and AVIF exist so a refusal can name them), MAX_IMAGE_BYTES and MAX_IMAGE_PIXELS,
+    and the twelve document tool descriptions in src/run.rs.'
+  - 'F9 green: `readme_lists_every_media_type_the_crate_names` parses the media types out of src/provider/mod.rs
+    rather than retyping them, so a format added to the crate and not to the page fails the build. Its
+    guard asserts the parse finds at least 12 types, and `format_source_parse_finds_the_accepted_the_converted_and_the_refused`
+    pins one type from each of the three sets so the parse cannot quietly narrow to the constant alone.'
+  - '`format_checker_reports_a_dropped_row` is the sabotage arm: TIFF removed from the table is reported
+    by name.'
+  - 'cargo test --test docs_drift --test readme --test guide_pages: 29 + 8 + 10 = 47 passed, 0 failed.'

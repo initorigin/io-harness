@@ -844,3 +844,96 @@ fn release_table_checker_does_not_count_a_version_named_in_prose() {
     let prose_only = "0.1.0 was the first release.\n";
     assert!(release_table_covers(changelog, prose_only).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// The format list is complete, and the source is what says so
+// ---------------------------------------------------------------------------
+
+/// The media types `src/provider/mod.rs` names, read out of the source rather
+/// than retyped here.
+///
+/// Retyping them would make this test agree with itself: a format added to the
+/// crate and to neither the README nor the fixture would pass. Everything the
+/// crate can accept, convert, or refuse by name appears in one of the three
+/// places this parses.
+fn media_types_in_source(provider_rs: &str) -> BTreeSet<String> {
+    let quoted = Regex::new(r#""(image/[a-z0-9.+-]+)""#).unwrap();
+    quoted
+        .captures_iter(provider_rs)
+        .map(|c| c[1].to_string())
+        .collect()
+}
+
+/// Media types the README does not account for.
+fn formats_missing_from(readme: &str, types: &BTreeSet<String>) -> Vec<String> {
+    types
+        .iter()
+        .filter(|t| !readme.contains(t.as_str()))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn readme_lists_every_media_type_the_crate_names() {
+    let types = media_types_in_source(&read("src/provider/mod.rs"));
+    assert!(
+        types.len() >= 12,
+        "the source parse found only {} media types, so it has stopped matching what it \
+         was written to read: {types:?}",
+        types.len()
+    );
+
+    let missing = formats_missing_from(&read("README.md"), &types);
+    assert!(
+        missing.is_empty(),
+        "the README's format tables do not account for {missing:?}. Every type the crate \
+         accepts, converts, or refuses by name belongs on that page — a list that omits a \
+         format reads as a claim that it does not exist, and a refusal a reader could not \
+         have anticipated is the worst of the three outcomes."
+    );
+}
+
+#[test]
+fn readme_lists_every_document_feature() {
+    let readme = read("README.md");
+    let documented = documented_features(&readme);
+    let missing: Vec<&str> = ["xlsx", "docx", "pptx", "pdf", "barcode", "media"]
+        .into_iter()
+        .filter(|f| !documented.contains(*f))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the README does not name the format features {missing:?}, so a reader cannot tell \
+         which cargo feature carries the file type they came for"
+    );
+}
+
+#[test]
+fn format_checker_reports_a_dropped_row() {
+    // Exactly the drift this guards: TIFF leaves the table while the rest stays.
+    let types: BTreeSet<String> = ["image/png", "image/tiff"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let readme = "| `image/png` | `.png` | passed through |\n";
+    assert_eq!(formats_missing_from(readme, &types), vec!["image/tiff"]);
+}
+
+#[test]
+fn format_source_parse_finds_the_accepted_the_converted_and_the_refused() {
+    // The parse must reach all three sets, not just the constant. If it ever
+    // matched only `IMAGE_MEDIA_TYPES`, the README could drop every converted
+    // and refused format and stay green.
+    let types = media_types_in_source(&read("src/provider/mod.rs"));
+    for expected in [
+        "image/png",               // accepted
+        "image/tiff",              // converted
+        "image/x-portable-anymap", // converted, and the easiest to mistype
+        "image/heic",              // refused by name
+    ] {
+        assert!(
+            types.contains(expected),
+            "the source parse missed {expected}, so it is no longer reading what it claims"
+        );
+    }
+}

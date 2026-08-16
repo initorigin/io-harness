@@ -601,6 +601,62 @@ limits that capability actually has.
 each capability arrived in. [docs/CONTRACT.md](docs/CONTRACT.md) is the public
 contract: what is stable, what may change, and the limits that hold today.
 
+## Supported file formats
+
+Text is the default and needs no feature: the workspace tools read and write any
+text file, and a read of a binary returns a refusal saying so rather than an
+empty string wearing the shape of a file. Everything below is behind an opt-in
+feature, and each format is listed by what the agent can actually *do* with it —
+read, generate, or edit in place — because those are three different answers.
+
+**Documents**, behind `documents` or the per-format feature:
+
+| Format | Feature | Read | Generate | Edit in place |
+| --- | --- | --- | --- | --- |
+| Excel workbook, `.xlsx` | `xlsx` | Yes, one sheet at a time, plus a sheet listing | Yes, a new workbook | Yes — a single cell, keeping the rest of the workbook |
+| Word document, `.docx` | `docx` | Yes, the text | Yes, a new document from paragraphs | **No, deliberately** — the round trip drops OOXML this crate does not model, which for someone's real document is data loss |
+| PowerPoint deck, `.pptx` | `pptx` | Yes, slide by slide | **No** — there is no writer | **No** |
+| PDF, `.pdf` | `pdf` | Yes, text extraction, best effort across columns and tables | Yes, one page per string | Partly — stamp a watermark across every page, and fill AcroForm fields by name, both keeping the existing content |
+| Barcode and QR, in a `.png` or `.jpg` | `barcode` | Yes, decode | **No** — decoding only, no encoder | — |
+
+Spreadsheet edits do round-trip a workbook the harness did not create, but
+preservation is not a guarantee: charts, drawings, pivots and macros are where it
+is likeliest to cost something.
+
+**Images**, behind `media`, passed to any provider whose model accepts one:
+
+| Media type | Extensions | What happens |
+| --- | --- | --- |
+| `image/jpeg` | `.jpg`, `.jpeg` | Passed through byte-identically |
+| `image/png` | `.png` | Passed through byte-identically |
+| `image/gif` | `.gif` | Passed through byte-identically |
+| `image/webp` | `.webp` | Passed through byte-identically |
+| `image/bmp` | `.bmp` | Decoded and re-encoded to PNG at the door |
+| `image/tiff` | `.tif`, `.tiff` | Decoded and re-encoded to PNG at the door |
+| `image/x-icon` | `.ico` | Decoded and re-encoded to PNG at the door |
+| `image/x-tga` | `.tga` | Decoded and re-encoded to PNG at the door |
+| `image/x-portable-anymap` | `.pnm`, `.pbm`, `.pgm`, `.ppm` | Decoded and re-encoded to PNG at the door |
+| `image/svg+xml` | `.svg` | **Refused by name**, with the conversion that fixes it |
+| `image/heic` | `.heic`, `.heif` | **Refused by name**, with the conversion that fixes it |
+| `image/avif` | `.avif` | **Refused by name**, with the conversion that fixes it |
+
+The first four are the types every vendor documents. The next five need a decoder
+this crate already carries, so they are converted rather than refused — which
+costs single-digit milliseconds on an image the size a model actually looks at,
+and often moves the file *under* the size bound on the way. The last three would
+need a decoder this crate does not carry, so they are named in the refusal along
+with the conversion, rather than reported as "unsupported media type".
+
+Two bounds decide whether an image attaches at all: **5 MiB** per image, which is
+the smaller of the two vendor limits and therefore the honest one, and
+**50,000,000 pixels**, which is checked from the header before anything is
+decoded.
+
+**Files the harness itself reads**, with no feature and no model involved: one
+`io.toml` across four scopes, the `AGENTS.md` a repository already carries,
+markdown skill files, a bundle's `plugin.toml`, and unified diffs for
+`patch_file` — applied as a unit or not at all.
+
 ## Feature flags
 
 Everything below is off by default. The default build compiles no optional
