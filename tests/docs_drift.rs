@@ -637,7 +637,10 @@ fn present_tense_checker_rejects_a_reinstated_sentence() {
     let fixture = "**0.47.0 closed the Linux hole in this table**, which was the easiest \
                    thing on this page to over-read.\n";
     let err = states_the_present(fixture).expect_err("the archaeology must be reported");
-    assert!(err.contains("0.47.0"), "must quote the version it found: {err}");
+    assert!(
+        err.contains("0.47.0"),
+        "must quote the version it found: {err}"
+    );
     assert!(err.contains("line 1"), "must say where: {err}");
 }
 
@@ -786,9 +789,11 @@ fn release_table_versions(index: &str) -> BTreeSet<String> {
 fn release_table_covers(changelog: &str, index: &str) -> Result<(), String> {
     let declared = changelog_versions(changelog);
     if declared.is_empty() {
-        return Err("CHANGELOG.md declares no versions at all, so this check is vacuous \
+        return Err(
+            "CHANGELOG.md declares no versions at all, so this check is vacuous \
                     and the parser is wrong"
-            .to_string());
+                .to_string(),
+        );
     }
     let recorded = release_table_versions(index);
     let missing: Vec<&String> = declared.difference(&recorded).collect();
@@ -825,7 +830,10 @@ fn release_table_checker_reports_a_dropped_row() {
 
     let dropped = "| Version | What |\n| --- | --- |\n| [0.2.0](x) | b |\n";
     let err = release_table_covers(changelog, dropped).expect_err("must be reported");
-    assert!(err.contains("0.1.0"), "must name the missing version: {err}");
+    assert!(
+        err.contains("0.1.0"),
+        "must name the missing version: {err}"
+    );
 }
 
 #[test]
