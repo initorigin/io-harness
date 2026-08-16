@@ -2576,12 +2576,21 @@ overridable until 0.19.0 puts a configuration file under it.
 **Closed in 0.17.0: a registered tool could be silently shadowed.** The reserved
 set named only the original seven built-ins while dispatch grew to twenty-six, so
 a registered tool called `git_status` or `xlsx_read` passed `Toolbox::validate`
-and was then permanently unreachable — the built-in answered every call. It now
-names every built-in, in every build regardless of feature flags, and a
-registered tool taking one of those names fails the run before the first
-completion. The names of feature-gated built-ins are reserved even where the tool
-itself is not compiled in, so enabling a feature can never take away a tool that
-was working.
+and was then permanently unreachable — the built-in answered every call. It named
+every built-in as of that release, in every build regardless of feature flags,
+and a registered tool taking one of those names fails the run before the first
+completion. The names it holds are reserved even where the tool itself is not
+compiled in, so enabling a feature can never take away a tool that was working.
+
+**And it has reopened, because the fix was a list rather than an invariant.**
+Eighteen names dispatch answers today are absent from the set — `forget`,
+`check`, `patch_file`, `git_branch`, `git_worktree`, the five `lsp_*` tools, the
+six `browser_*` tools, `send_message` and `read_messages` — so every built-in
+added after 0.17.0 reopened the defect by one name. A registered tool taking one
+of those validates and is then unreachable, exactly as before. It is stated here
+rather than fixed here because adding a name to the set changes what
+`Toolbox::validate` accepts, which is a break and not a patch: **0.61.0** closes
+it as one const every dispatch arm reads.
 
 **Windows resource caps.** See the platform table above.
 

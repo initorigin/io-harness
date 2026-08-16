@@ -146,7 +146,48 @@ tasks:
   - docs/CONTRACT.md
   - src/tools/custom.rs
   - tests/docs_drift.rs
-  evidence: []
+  evidence:
+  - >
+    The eighteen missing names were computed from the tree rather than taken from the audit: 53
+    `const *_TOOL: &str` declarations exist under `src/`, `RESERVED_TOOL_NAMES` holds 35 of them, and
+    the difference is exactly `forget`, `check`, `patch_file`, `git_branch`, `git_worktree`, the five
+    `lsp_*`, the six `browser_*`, `send_message` and `read_messages`. The number in the audit and the
+    number in the tree agree, and the release states the one it checked.
+  - >
+    `docs/guide/tools-and-skills.md` — the shadowing bullet no longer hand-lists reserved names and no
+    longer claims the feature-gated built-ins are not reserved. It names `RESERVED_TOOL_NAMES` as the
+    statement of the set, says the set is not yet complete, and points at 0.61.0.
+  - >
+    `src/tools/custom.rs:497` — "Feature-gated built-ins are reserved in every build" narrowed to the
+    ones this set names, with the eighteen absent names listed and the reason recorded: 0.17.0's fix
+    was a hand-maintained list rather than an invariant, so each built-in added since reopened the
+    defect by one name. It also states why the fix is not here — adding a name changes what
+    `Toolbox::validate` accepts.
+  - >
+    `docs/CONTRACT.md` — the 0.17.0 paragraph said "It now names every built-in, in every build
+    regardless of feature flags", which is false today. Past tense for what 0.17.0 did, plus a new
+    paragraph naming the reopening and 0.61.0. Found by this task rather than by the sweep, and fixed
+    here because it is the same class of claim.
+  - >
+    F3 — `the_guide_reserved_name_claim_matches_the_source` in `tests/docs_drift.rs`. It resolves the
+    reserved set through the constants (`reserved_tool_names` over every `.rs` file under `src/`)
+    rather than comparing prose to prose, asserts the retired sentence is absent, asserts the page
+    still defers to `RESERVED_TOOL_NAMES`, and flags any backticked lowercase name in the bullet that
+    the set does not hold. A trailing underscore is treated as a prefix, so `mcp__` is not a name.
+  - >
+    F3 sabotage, two arms, both run. Arm A restores the whole pre-fix bullet: `cargo test --test
+    docs_drift` reports `43 passed; 1 failed`, the failure being
+    `the_guide_reserved_name_claim_matches_the_source`, and `guide_pages` stays 10 of 10 green. Arm B
+    reinstates `forget` alone in the corrected bullet: the same single test fails and names it — "the
+    guide names [\"forget\"] as reserved and RESERVED_TOOL_NAMES does not hold them" — while `mcp__`
+    in the same sentence is correctly not reported.
+  - >
+    N1 — `git diff develop -- src/` filtered to lines that are not `///` comments is still **empty**
+    across both source files this release touches.
+  - >
+    A control test beside the parse (`reserved_set_parse_resolves_names_and_not_idents`) asserts
+    `write_file` and `view_image` are in the resolved set and `browser_click` is not, so a parse that
+    silently stopped resolving would fail rather than pass everything.
 - id: US-IO-HARNESS-0.60.2-T04
   summary: >-
     Sweep docs/CONTRACT.md for every version-numbered assertion and record the verdict per claim.

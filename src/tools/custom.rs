@@ -494,9 +494,21 @@ impl Toolbox {
 /// never runs is the exact silent shadowing this set exists to prevent, and it
 /// was recorded as an open defect in `docs/CONTRACT.md` from 0.15.0.
 ///
-/// Feature-gated built-ins are reserved in every build, including builds that do
-/// not contain them — see [`VIEW_IMAGE_TOOL`](super::VIEW_IMAGE_TOOL) for why
-/// the alternative is worse.
+/// The feature-gated built-ins this set names are reserved in every build,
+/// including builds that do not contain them — see
+/// [`VIEW_IMAGE_TOOL`](super::VIEW_IMAGE_TOOL) for why the alternative is worse.
+///
+/// **The set is not complete, and the 0.17.0 defect is open again for the names
+/// it omits.** Eighteen names dispatch answers today are absent from it:
+/// `forget`, `check`, `patch_file`, `git_branch`, `git_worktree`, the five
+/// `lsp_*` tools, the six `browser_*` tools, `send_message` and `read_messages`.
+/// Every one of those arms precedes the `custom.owns(name)` arm, so a registered
+/// tool taking one of them validates and is then unreachable — the same silent
+/// shadowing described above. It reopened because 0.17.0's fix was a
+/// hand-maintained list rather than an invariant, so each built-in added since
+/// reopened it by one name. 0.61.0 closes it as one const every dispatch arm
+/// reads, which is a change to what `Toolbox::validate` accepts and therefore
+/// not a patch.
 ///
 /// The one name here that is not a dispatch arm is
 /// [`SPAWN_TOOL`](crate::SPAWN_TOOL), which the tree loop intercepts before

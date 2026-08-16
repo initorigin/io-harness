@@ -1180,3 +1180,167 @@ fn doc_block_extractor_stops_at_the_previous_item() {
         "the extractor swallowed the previous item's block:\n{block}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The guide's reserved-name claim matches the source — F3 of 0.60.2
+// ---------------------------------------------------------------------------
+//
+// `docs/guide/tools-and-skills.md` was stale in both directions at once. It said
+// the feature-gated built-ins are *not* in the reserved set, which 0.17.0 made
+// false, and its hand-typed list of reserved names held `forget`, which is not
+// reserved, while omitting seven that are. A list retyped into prose is a list
+// that goes stale, so the page now defers to `RESERVED_TOOL_NAMES` and this
+// check exists to keep it deferring.
+
+/// Every `pub const NAME_TOOL: &str = "…"` in the crate, ident to tool name.
+fn tool_name_consts(sources: &str) -> std::collections::BTreeMap<String, String> {
+    let re = Regex::new(r#"const ([A-Z0-9_]+_TOOL): &str = "([a-z0-9_]+)""#).unwrap();
+    re.captures_iter(sources)
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .collect()
+}
+
+/// The tool names `RESERVED_TOOL_NAMES` actually holds, resolved through the
+/// constants rather than read off a list in prose.
+fn reserved_tool_names(custom_rs: &str, sources: &str) -> BTreeSet<String> {
+    let block = Regex::new(r"(?s)const RESERVED_TOOL_NAMES: &\[&str\] = &\[(.*?)\];").unwrap();
+    let body = block
+        .captures(custom_rs)
+        .map(|c| c[1].to_string())
+        .unwrap_or_else(|| {
+            panic!("RESERVED_TOOL_NAMES is no longer a slice literal in src/tools/custom.rs")
+        });
+    let consts = tool_name_consts(sources);
+    Regex::new(r"([A-Z0-9_]+_TOOL)")
+        .unwrap()
+        .captures_iter(&body)
+        .filter_map(|c| consts.get(&c[1]).cloned())
+        .collect()
+}
+
+/// Every `.rs` file under `src/`, concatenated. The constants are spread across
+/// the tool modules and `src/run.rs`, so resolving one file is not enough.
+fn rust_sources() -> String {
+    fn walk(dir: &Path, out: &mut String) {
+        let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            .map(|e| e.expect("dir entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push_str(&fs::read_to_string(&path).expect("read source"));
+                out.push('\n');
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(&repo_root().join("src"), &mut out);
+    out
+}
+
+/// The `**Nothing may shadow anything**` bullet of the tools guide.
+fn shadowing_bullet(guide: &str) -> String {
+    const LEAD: &str = "- **Nothing may shadow anything**";
+    let start = guide
+        .find(LEAD)
+        .unwrap_or_else(|| panic!("docs/guide/tools-and-skills.md no longer carries {LEAD:?}"));
+    let rest = &guide[start + LEAD.len()..];
+    let end = rest.find("\n- **").unwrap_or(rest.len());
+    format!("{LEAD}{}", &rest[..end])
+}
+
+fn guide_defers_to_the_reserved_set(
+    bullet: &str,
+    reserved: &BTreeSet<String>,
+) -> Result<(), String> {
+    if bullet.contains("are *not* in the reserved set") {
+        return Err(
+            "the guide still says the feature-gated built-ins are not in the reserved set. 0.17.0 \
+             put them in it, under `### Breaking changes`."
+                .to_string(),
+        );
+    }
+    if !bullet.contains("RESERVED_TOOL_NAMES") {
+        return Err(
+            "the guide no longer defers to RESERVED_TOOL_NAMES. Naming the set is what keeps this \
+             page from carrying a second copy of it that nothing checks."
+                .to_string(),
+        );
+    }
+    // A backticked lowercase identifier in this bullet reads as a reserved name.
+    // A trailing underscore is a prefix (`mcp__`) and a `*` never matches, so
+    // the two things the page names that are not tool names are not caught here.
+    let named = Regex::new(r"`([a-z][a-z0-9_]*)`").unwrap();
+    let wrong: Vec<String> = named
+        .captures_iter(bullet)
+        .map(|c| c[1].to_string())
+        .filter(|n| !n.ends_with('_') && !reserved.contains(n))
+        .collect();
+    if !wrong.is_empty() {
+        return Err(format!(
+            "the guide names {wrong:?} as reserved and RESERVED_TOOL_NAMES does not hold them. \
+             This page had `forget` in its list for four releases; do not restate the set here, \
+             refer to it."
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn the_guide_reserved_name_claim_matches_the_source() {
+    let reserved = reserved_tool_names(&read("src/tools/custom.rs"), &rust_sources());
+    assert!(
+        reserved.len() >= 30,
+        "the reserved-set parse resolved only {} names, so it has stopped reading what it was \
+         written for: {reserved:?}",
+        reserved.len()
+    );
+    let bullet = shadowing_bullet(&read("docs/guide/tools-and-skills.md"));
+    if let Err(why) = guide_defers_to_the_reserved_set(&bullet, &reserved) {
+        panic!("{why}");
+    }
+}
+
+#[test]
+fn reserved_set_parse_resolves_names_and_not_idents() {
+    let reserved = reserved_tool_names(&read("src/tools/custom.rs"), &rust_sources());
+    assert!(reserved.contains("write_file"), "{reserved:?}");
+    assert!(reserved.contains("view_image"), "{reserved:?}");
+    assert!(
+        !reserved.contains("browser_click"),
+        "browser_click is dispatched and not reserved; a parse that finds it there is reading \
+         the wrong list: {reserved:?}"
+    );
+}
+
+#[test]
+fn guide_checker_rejects_the_claim_0_17_0_made_false() {
+    let fixture = "- **Nothing may shadow anything** — RESERVED_TOOL_NAMES holds them. The \
+                   feature-gated built-ins are *not* in the reserved set.\n- **Next bullet**";
+    let reserved = BTreeSet::from(["write_file".to_string()]);
+    let err = guide_defers_to_the_reserved_set(&shadowing_bullet(fixture), &reserved).unwrap_err();
+    assert!(err.contains("not in the reserved set"), "{err}");
+}
+
+#[test]
+fn guide_checker_rejects_a_reinstated_hand_list() {
+    // The sabotage the contract names: `forget` back in the guide's list.
+    let fixture = "- **Nothing may shadow anything** — see RESERVED_TOOL_NAMES: `write_file`, \
+                   `forget`, `mcp__`.\n- **Next bullet**";
+    let reserved = BTreeSet::from(["write_file".to_string()]);
+    let err = guide_defers_to_the_reserved_set(&shadowing_bullet(fixture), &reserved).unwrap_err();
+    assert!(err.contains("forget"), "{err}");
+    assert!(!err.contains("mcp__"), "a prefix is not a name: {err}");
+}
+
+#[test]
+fn guide_checker_accepts_a_bullet_that_defers() {
+    let fixture = "- **Nothing may shadow anything** — the reserved set is `RESERVED_TOOL_NAMES` \
+                   in `src/tools/custom.rs`, and the `browser_*` tools are not in it.\n\
+                   - **Next bullet**";
+    let reserved = BTreeSet::from(["write_file".to_string()]);
+    assert!(guide_defers_to_the_reserved_set(&shadowing_bullet(fixture), &reserved).is_ok());
+}
