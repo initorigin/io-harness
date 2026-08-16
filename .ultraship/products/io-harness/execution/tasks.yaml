@@ -350,7 +350,7 @@ tasks:
   why_required: A criterion with no evidence behind it is prose, and a guard whose sabotage kills nothing
     is a test that never built the case the guard exists for. This is the task that turns the fifteen
     functional criteria into the record's evidence.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.60.0-T06
   acceptance_criteria:
@@ -377,7 +377,67 @@ tasks:
     prove a model can use the tools it was given.
 
     '
-  evidence: []
+  evidence:
+  - O3 — **15 sabotage arms, one per functional criterion, and all 15 kill the test they are aimed at**
+    on the tree that ships. Run by a script that applies one change, runs `cargo test --no-fail-fast
+    --test mailbox --test config --lib`, records every test that died, and reverts with `git checkout
+    -- src/`.
+  - '**One arm SURVIVED its first run, and it was a defect in this release''s own test.** F9 replaces
+    the terminal post''s body with the child''s own conclusion — the exact defect the criterion forbids
+    — and failed nothing, because `child_conclusion` reads the last `said` row and the fixture''s child
+    never said anything, so the arm fell back to the very line it was meant to replace. **A test asserting
+    "the body is the terminal line and NOT the report" cannot fail when its child has no report.** The
+    child now speaks, the assertion names the sentence the body must not carry, and the arm kills it.
+    Fixing it needed the scripted provider''s step type to return a whole `CompletionResponse` rather
+    than a list of tool calls — a scripted agent could not say anything at all before, a gap the older
+    tree suites share.'
+  - '**One arm was INERT rather than a finding, and the distinction matters.** F5''s first shape committed
+    the transaction and opened a second one before the marks. That fails identically under `PRAGMA query_only`,
+    so it could not express the defect at all — the same family as 0.58.0''s "both are the same connection".
+    The arm that does express it returns the rows and marks them afterwards outside any transaction,
+    ignoring the error, and it kills the test.'
+  - '**Fail-fast hid whole test targets and made one arm read as a survivor.** `cargo test --test a
+    --test b` stops at the first failing target, so an arm that killed a lib test never ran the integration
+    tests at all. `--no-fail-fast` is what makes a sabotage table mean anything. A second matcher defect
+    had the same shape: a lib test reports as `state::tests::name` and an integration test as `name`,
+    so comparing the two spellings reported F5 as a survivor when it had killed exactly the test it
+    was aimed at.'
+  - '**Three arms kill more than their named test, and that is expected rather than noise.** F1 (send
+    writes nothing) also kills F2 and F6, which both depend on a message arriving. F10 (refuse without
+    listing) also kills F11, whose refusal asserts the same listing. F12 (never write `read_at`) kills
+    four, because exactly-once is what three other tests rest on.'
+  - 'O4 — **the live example found a real defect and then passed.** `examples/mailbox_live.rs` against
+    a real provider: a per-run secret is written into a file, the `scout` reads it and messages the
+    `author`, the `author` blocks on `read_messages { from: "scout", wait_secs: 20 }` and writes what
+    it was told. Final run: `outcome: Success { steps: 3 }`, `answer.txt` carries `OTTER-24495`, and
+    the store shows the message from `scout` to the author plus both children''s terminal posts to the
+    root. The author had no other route to the value.'
+  - '**THE DEFECT ONLY THE LIVE RUN COULD FIND, and it is 0.50.0''s.** The model filled every property
+    of the spawn schema with its zero value — `"agent": ""`, `"deny_write": []`, `"deny_net": []`, `"background_after_secs":
+    0` — and `spawn_return` refused `wait: false` beside a zero clock as a contradiction. Six steps
+    in a row, never recovering, no detached child, therefore no concurrent siblings and no sibling messaging:
+    **0.60.0''s headline flow was unreachable for such a model.** 0.50.0 wrote the rule itself ("wait
+    zero seconds for it" and "do not wait for it" are the same request) and applied it to `wait: true`
+    only. Every OTHER zero-valued property in the same call was already read as "unset", which is what
+    makes the clock the odd one out rather than the model. Fixed, with the boundary asserted: zero detaches,
+    one is refused.'
+  - '**Two faults in the example''s own design, both found by running it.** (1) The scout''s first gate
+    was `secret.txt` contains `release` — satisfied before the scout did anything, so it "succeeded"
+    in one step having sent nothing. (2) A child copies the literal it is handed: given `verify_contains
+    "-"` the author wrote `-`; given `"OTTER-"` it wrote `OTTER-`. The fix is to stop the child''s own
+    gate competing with the work — its criterion is now `done.txt` containing `DONE`, and the release''s
+    actual claim is the ROOT''s gate, `answer.txt` containing the full per-run secret.'
+  - '**An empty `verify_contains` makes any run succeed immediately**, including one that wrote nothing:
+    a missing file reads as empty since 0.1.0 and `"".contains("")` is true. Pre-existing, not this
+    release''s business, recorded because it was hit while building the instrument.'
+  - '**Unprompted, the coordinator used the mailbox itself** — on a failed intermediate run it sent
+    `Please resend the release word to author` to the scout and a retry instruction to the author. Nothing
+    in its goal told it to; the tool descriptions were enough.'
+  - 'O2 — `cargo fmt --check` exit 0. `cargo clippy --all-targets --all-features -- -D warnings` exit
+    0. Default suite **88 binaries / 1,377 passed** and **457 doctests**, 0 failed. Nightly `RUSTDOCFLAGS="--cfg
+    docsrs -D warnings" cargo +nightly doc --all-features --no-deps` exit 0 **after catching two unresolved
+    links stable `cargo doc` cannot see** — ninth of the last eleven releases. Cross-version generator
+    gate: `gen-0.29.0` built and `cargo test --test cross_version_0_29_0 -- --ignored` 1 passed.'
   files:
   - examples/mailbox_live.rs
   - tests/mailbox.rs
