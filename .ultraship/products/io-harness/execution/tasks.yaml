@@ -1,343 +1,216 @@
 product: io-harness
-version: 0.60.2
+version: 0.60.3
 tasks:
-- id: US-IO-HARNESS-0.60.2-T01
-  summary: Rewrite the pre-0.45.0 exec paragraph in docs/CONTRACT.md, and add F1.
-  why_required: >-
-    This is the reason the release is first and the half the fallback scope refuses to drop. The contract
-    currently tells a reader that a command runs outside the sandbox with the embedding program's privileges,
-    which stopped being true at 0.45.0 and is contradicted 1,300 lines earlier in the same file. Without
-    this the release closes nothing that matters.
-  status: done
+- id: US-IO-HARNESS-0.60.3-T01
+  summary: Add the failing assertions for the plan-gated classifying turn (F1, F2), both loops.
+  why_required: F1 and F2 are the fallback scope — the half that must not drop. tests/prompt.rs composes
+    only under Policy::permissive() with no plan gate today, which is exactly why neither defect was caught,
+    so the helpers have to exist before either fix can be shown to work. A test written after the fix
+    checks nothing.
+  status: todo
   depends_on: []
   acceptance_criteria:
-  - >
-    **F1 — the contract states one exec boundary.** A test asserts `docs/CONTRACT.md` does not contain
-    the phrase "outside the sandbox" in the command-execution section, and does contain a statement
-    naming `ExecMode::WorkspaceWrite` as the default. It must fail on today's file, which contains the
-    phrase at line 2536. Sabotage: restore the pre-0.45.0 sentence, under which only F1 fails.
-  - >
-    **N3 — no claim is widened.** Every containment sentence surviving the rewrite is at most as strong
-    as what `src/sandbox.rs` and `src/run.rs` implement, per platform. The correction being made here
-    is a claim that was too weak in one place and too strong in another; the failure mode of fixing
-    it is overshooting into a guarantee the portable floor cannot keep. Evidenced by the review, section
-    against source.
+  - '**F1 — a plan-gated classifying turn is not ordered to plan before it may answer.** A test composes
+    the classifying opening under a contract with a plan gate, in both loops, and asserts the composed
+    block does not contain the unconditional sentence "Before you do anything else you must call `propose_plan`"
+    while still naming `propose_plan` and still ending with `CONVERSATIONAL_ENDING`. It must fail on today''s
+    tree, which composes the unconditional form at `src/run.rs:4098`. Sabotage: restore the unconditional
+    directive on the classifying path, under which only F1 fails.
+
+    '
+  - '**F2 — a plan-gated classifying turn reads the boundary that will refuse it.** A test composes the
+    classifying opening under a plan gate with a policy that allows writes, in both loops, and asserts
+    the boundary section it carries is the one `plan_lock()` produces — writes and commands refused —
+    and is byte-identical to the section the same turn''s `system` block carries on its planning arm.
+    It must fail on today''s tree, where `after_planning` is passed at `src/run.rs:4539` and `src/run.rs:7255`.
+    Sabotage: pass `after_planning` on the classifying path again, under which only F2 fails.
+
+    '
   files:
-  - docs/CONTRACT.md
-  - tests/docs_drift.rs
-  evidence:
-  - >
-    `docs/CONTRACT.md` lines 2536-2548 rewritten. The block now states that a command runs with the
-    workspace root as its working directory and, since 0.46.0, contained by default under
-    `ExecMode::WorkspaceWrite`, with `TaskContract::with_full_access` named as the way to ask for the
-    pre-0.45.0 grant back.
-  - >
-    The claim that a command carries "the same bound already stated above for a registered `Tool` and
-    a stdio MCP server" is not merely deleted but inverted into the reason the two differ: the harness
-    starts the command's process itself and can wrap it, and does not start theirs. `src/lib.rs:333`
-    still makes the `Tool` / MCP claim and is correct in doing so — it was checked, not assumed.
-  - >
-    N3 — the replacement does not flatten the platform difference. It reproduces the platform table's
-    own four rows in prose (macOS and Linux confine writes and deny egress; a Windows AppContainer does
-    both when the run asked for access confinement, 0.59.0; the Windows default Job Object and the
-    portable floor apply the resource caps and have no filesystem facility at all).
-  - >
-    N3 — the second of the three consequences was checked against the source rather than reasoned from
-    the table, and it survives. `src/sandbox/landlock.rs:40` records that a mount namespace remounts
-    `/` read-only rather than unreadable, so `cat secrets/prod.env` still reaches what the agent's file
-    rules would have refused on macOS and Linux. The one platform where it does not is the Windows
-    AppContainer, default-deny for reads (`docs/CONTRACT.md:285`), and the paragraph now says exactly
-    that instead of claiming containment closes the hole everywhere.
-  - >
-    F1 — `contract_states_one_exec_boundary` in `tests/docs_drift.rs`, over a window scoped to the
-    block rather than the whole file, because the retired phrasing is quoted elsewhere in the file *as*
-    retired. Three control tests beside it (the pre-0.45.0 sentence, silence about the default, the
-    corrected paragraph) plus one asserting the window stops at the next claim.
-  - >
-    F1 sabotage, run: `git stash push docs/CONTRACT.md` restores the pre-0.45.0 sentence.
-    `cargo test --test docs_drift` then reports `test result: FAILED. 35 passed; 1 failed`, the single
-    failure being `contract_states_one_exec_boundary`. 36 of 36 pass with the fix in place.
-- id: US-IO-HARNESS-0.60.2-T02
-  summary: Drop the retired sentence from the exec_sandbox rustdoc, and add F2.
-  why_required: >-
-    The same false boundary in the second place a caller reads it, and the only one that renders on
-    docs.rs. `TaskContract::exec_sandbox` still carries the clause `docs/CONTRACT.md:1222` names as
-    the one 0.48.0 retired, so a caller who reads the API docs rather than the contract is told the
-    shell handles escape containment.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.60.2-T01
-  acceptance_criteria:
-  - >
-    **F2 — the `exec_sandbox` rustdoc does not carry the retired sentence.** A test asserts `src/contract.rs`
-    does not contain "not contained" within the `exec_sandbox` doc block. It must fail on today's source,
-    which contains it at line 406. Sabotage: restore the 0.47.0-era clause, under which only F2 fails.
-    This is a doc-comment assertion over a source file, which `tests/docs_drift.rs` does not currently
-    do for `src/` — the one genuinely new shape of check in this release.
-  - >
-    **N1 — nothing under `src/` changes except documentation.** `git diff develop -- src/` shows only
-    lines inside `//!` or `///` comments, and `docs/public-api.txt` is byte-identical to the 0.60.1
-    snapshot. Asserted by reading the diff and by `public_api.rs` staying green with no snapshot regeneration.
-    This is what makes 0.60.2 a patch, and it is the criterion the release fails on if the eighteen
-    reserved names are smuggled in beside the doc comment that describes them.
-  files:
-  - src/contract.rs
-  - tests/docs_drift.rs
-  evidence:
-  - >
-    `src/contract.rs:402` — the clause "the `shell_start` / `shell_poll` / `shell_kill` handles, which
-    are not contained because a handle outlives the call that made it" is removed from the list of
-    things the mode does not decide, and replaced by a paragraph of its own stating what 0.48.0
-    actually did: a handle takes the same containment every other spawn takes, per stage, and its
-    restriction lives with its processes.
-  - >
-    The paragraph also carries the half `docs/CONTRACT.md:1236` states and the rustdoc did not — that
-    `SandboxLimits::max_wall_secs` reaches no `shell` path, deliberately, because a dev server killed
-    at the sandbox ceiling would be containment deleting the tool's purpose, while the CPU and
-    open-file rlimits do apply.
-  - >
-    F2 — `exec_sandbox_rustdoc_does_not_carry_the_retired_sentence` in `tests/docs_drift.rs`. It is
-    the first check in that file to read a doc comment inside `src/` rather than a markdown page, so
-    it comes with `doc_block_above`, an extractor that walks back from the item and stops at the first
-    line that is not a `///`, plus a control asserting it does not swallow the previous item's block.
-    The test asserts both directions: the retired sentence is absent AND the replacement claim is
-    present, so deleting the paragraph outright does not pass.
-  - >
-    F2 sabotage, run: `git stash push src/contract.rs` restores the 0.47.0-era clause.
-    `cargo test --test docs_drift` then reports `test result: FAILED. 38 passed; 1 failed`, the single
-    failure being `exec_sandbox_rustdoc_does_not_carry_the_retired_sentence`. 39 of 39 pass with the
-    fix in place.
-  - >
-    N1 — `git diff develop -- src/` filtered to lines that are not `///` comments is **empty**, and the
-    diff touches one file. No behaviour, no public item, no snapshot regeneration.
-  - >
-    O2, early — `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`
-    is clean. Run here rather than only at the gate stage because this task adds an intra-doc link
-    (`crate::sandbox::SandboxLimits::max_wall_secs`) and that gate is what catches a bad one; stable
-    `cargo doc` cannot see it.
-- id: US-IO-HARNESS-0.60.2-T03
-  summary: >-
-    Correct the reserved-name claims in the guide, in the contract and in the set's own doc comment,
-    and add F3.
-  why_required: >-
-    The guide's bullet is wrong in both directions at once — it says the feature-gated built-ins are
-    not reserved, which 0.17.0 made false, and its hand-typed list names `forget`, which is not reserved,
-    while omitting seven names that are. The doc comment over `RESERVED_TOOL_NAMES` and the 0.17.0 paragraph
-    in `docs/CONTRACT.md` make the same over-strong claim from the other side. One class of claim, three
-    places, one task.
+  - tests/prompt.rs
+  evidence: []
+- id: US-IO-HARNESS-0.60.3-T02
+  summary: State the plan gate conditionally on the classifying path (F1).
+  why_required: Without this a greeting typed into a plan-gated session gets a plan proposed for it and
+    a human asked to approve one. It is 0.48.0's I03 restored on the one path that composes a directive
+    above the ending.
   status: todo
   depends_on:
-  - US-IO-HARNESS-0.60.2-T01
+  - US-IO-HARNESS-0.60.3-T01
   acceptance_criteria:
-  - >
-    **F3 — the guide's reserved-name claim matches the source.** A test asserts `docs/guide/tools-and-skills.md`
-    does not contain the phrase "are *not* in the reserved set", and does not hand-list reserved names
-    that `RESERVED_TOOL_NAMES` does not hold. It must fail on today's file, which claims the opposite
-    of the source and names `forget`. Sabotage: reinstate `forget` in the guide's list, under which
-    only F3 fails and names it.
-  - >
-    **N1 — nothing under `src/` changes except documentation.** `git diff develop -- src/` shows only
-    lines inside `//!` or `///` comments, and `docs/public-api.txt` is byte-identical to the 0.60.1
-    snapshot. Asserted by reading the diff and by `public_api.rs` staying green with no snapshot regeneration.
-    This is what makes 0.60.2 a patch, and it is the criterion the release fails on if the eighteen
-    reserved names are smuggled in beside the doc comment that describes them.
+  - '**F1 — a plan-gated classifying turn is not ordered to plan before it may answer.** A test composes
+    the classifying opening under a contract with a plan gate, in both loops, and asserts the composed
+    block does not contain the unconditional sentence "Before you do anything else you must call `propose_plan`"
+    while still naming `propose_plan` and still ending with `CONVERSATIONAL_ENDING`. It must fail on today''s
+    tree, which composes the unconditional form at `src/run.rs:4098`. Sabotage: restore the unconditional
+    directive on the classifying path, under which only F1 fails.
+
+    '
+  - '**N4 — the composition rule stays in one place.** After this release `conversational_opening` still
+    has exactly one definition and the directive and the boundary are each selected inside it, not at
+    its call sites. A fix that made each loop choose for itself would restore the shape that produced
+    two of these three defects.
+
+    '
   files:
-  - docs/guide/tools-and-skills.md
-  - docs/CONTRACT.md
-  - src/tools/custom.rs
-  - tests/docs_drift.rs
-  evidence:
-  - >
-    The eighteen missing names were computed from the tree rather than taken from the audit: 53
-    `const *_TOOL: &str` declarations exist under `src/`, `RESERVED_TOOL_NAMES` holds 35 of them, and
-    the difference is exactly `forget`, `check`, `patch_file`, `git_branch`, `git_worktree`, the five
-    `lsp_*`, the six `browser_*`, `send_message` and `read_messages`. The number in the audit and the
-    number in the tree agree, and the release states the one it checked.
-  - >
-    `docs/guide/tools-and-skills.md` — the shadowing bullet no longer hand-lists reserved names and no
-    longer claims the feature-gated built-ins are not reserved. It names `RESERVED_TOOL_NAMES` as the
-    statement of the set, says the set is not yet complete, and points at 0.61.0.
-  - >
-    `src/tools/custom.rs:497` — "Feature-gated built-ins are reserved in every build" narrowed to the
-    ones this set names, with the eighteen absent names listed and the reason recorded: 0.17.0's fix
-    was a hand-maintained list rather than an invariant, so each built-in added since reopened the
-    defect by one name. It also states why the fix is not here — adding a name changes what
-    `Toolbox::validate` accepts.
-  - >
-    `docs/CONTRACT.md` — the 0.17.0 paragraph said "It now names every built-in, in every build
-    regardless of feature flags", which is false today. Past tense for what 0.17.0 did, plus a new
-    paragraph naming the reopening and 0.61.0. Found by this task rather than by the sweep, and fixed
-    here because it is the same class of claim.
-  - >
-    F3 — `the_guide_reserved_name_claim_matches_the_source` in `tests/docs_drift.rs`. It resolves the
-    reserved set through the constants (`reserved_tool_names` over every `.rs` file under `src/`)
-    rather than comparing prose to prose, asserts the retired sentence is absent, asserts the page
-    still defers to `RESERVED_TOOL_NAMES`, and flags any backticked lowercase name in the bullet that
-    the set does not hold. A trailing underscore is treated as a prefix, so `mcp__` is not a name.
-  - >
-    F3 sabotage, two arms, both run. Arm A restores the whole pre-fix bullet: `cargo test --test
-    docs_drift` reports `43 passed; 1 failed`, the failure being
-    `the_guide_reserved_name_claim_matches_the_source`, and `guide_pages` stays 10 of 10 green. Arm B
-    reinstates `forget` alone in the corrected bullet: the same single test fails and names it — "the
-    guide names [\"forget\"] as reserved and RESERVED_TOOL_NAMES does not hold them" — while `mcp__`
-    in the same sentence is correctly not reported.
-  - >
-    N1 — `git diff develop -- src/` filtered to lines that are not `///` comments is still **empty**
-    across both source files this release touches.
-  - >
-    A control test beside the parse (`reserved_set_parse_resolves_names_and_not_idents`) asserts
-    `write_file` and `view_image` are in the resolved set and `browser_click` is not, so a parse that
-    silently stopped resolving would fail rather than pass everything.
-- id: US-IO-HARNESS-0.60.2-T04
-  summary: >-
-    Sweep docs/CONTRACT.md for every version-numbered assertion and record the verdict per claim.
-  why_required: >-
-    F5 is satisfied by the recorded output, not by the reading. This release exists because 0.60.1's
-    sweep over the same file did not reach three contradictions; a sweep whose evidence is 'I looked'
-    is the thing that lets a fourth survive into 0.63.0.
-  status: done
+  - src/run.rs
+  - tests/prompt.rs
+  evidence: []
+- id: US-IO-HARNESS-0.60.3-T03
+  summary: Hand the classifying opening the boundary in force (F2).
+  why_required: The boundary block is the crate's own answer to "what will refuse me". A gated turn that
+    reads the post-plan boundary is told the opposite of what plan_lock enforces, and that is the one
+    class of prompt defect this project has declared costs more than silence.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.60.2-T01
-  - US-IO-HARNESS-0.60.2-T02
-  - US-IO-HARNESS-0.60.2-T03
+  - US-IO-HARNESS-0.60.3-T01
   acceptance_criteria:
-  - >
-    **F5 — the sweep is recorded, not just performed.** Every version-numbered assertion checked in
-    `docs/CONTRACT.md` is listed in the release evidence with the release it was checked against and
-    the verdict: current, corrected here, or recorded as a finding. A sweep whose output is "I looked"
-    is not evidence, and this is the criterion that distinguishes the two.
+  - '**F2 — a plan-gated classifying turn reads the boundary that will refuse it.** A test composes the
+    classifying opening under a plan gate with a policy that allows writes, in both loops, and asserts
+    the boundary section it carries is the one `plan_lock()` produces — writes and commands refused —
+    and is byte-identical to the section the same turn''s `system` block carries on its planning arm.
+    It must fail on today''s tree, where `after_planning` is passed at `src/run.rs:4539` and `src/run.rs:7255`.
+    Sabotage: pass `after_planning` on the classifying path again, under which only F2 fails.
+
+    '
+  - '**N3 — no framing is weakened and no boundary claim is widened.** The boundary section a classifying
+    turn now reads is produced by the same `boundary_section` call the `system` block''s planning arm
+    already uses, from the same `effective` policy — not a new string, and not a stronger claim. Evidenced
+    by F2''s byte-identity assertion between the two blocks rather than by review alone.
+
+    '
+  - '**N4 — the composition rule stays in one place.** After this release `conversational_opening` still
+    has exactly one definition and the directive and the boundary are each selected inside it, not at
+    its call sites. A fix that made each loop choose for itself would restore the shape that produced
+    two of these three defects.
+
+    '
   files:
-  - .ultraship/products/io-harness/evidence/0.60.2/contract-sweep.md
-  - docs/CONTRACT.md
-  evidence:
-  - >
-    The sweep is recorded per claim in
-    `.ultraship/products/io-harness/evidence/0.60.2/contract-sweep.md` — the population (222
-    version-numbered lines, ~150 distinct claims), the method, and a row per claim with its verdict
-    and the source file:line it was checked against. Evidence is untracked by design.
-  - >
-    **The sweep found nineteen further stale claims, and they are fixed here: 24 corrections in 22
-    places.** That is far past the "handful" the contract's first open question set as the threshold
-    for splitting the sweep into its own release. The judgement is recorded rather than made
-    silently: every correction is a one-or-two-sentence replacement in the same class as the three
-    the release was written for, none touches `src/` behaviour, and leaving twenty-two known-false
-    statements standing in the file this release exists to correct would have been the worse outcome.
-    The structural work the audit also wants stays excluded.
-  - >
-    **The sharpest one was wrong in the safe direction, which is why nobody caught it.**
-    `docs/CONTRACT.md:1168` told a reader that on a stock Ubuntu 24.04 — the commonest Linux CI image
-    — a contained command takes `PortableFloor` and gets **no filesystem confinement and no egress
-    denial**. The Landlock rung needs no namespace and exists precisely because that host refuses
-    one, so it gets confinement. The claim appeared in three places (1168, 1707, 2645) and each said
-    the same false thing.
-  - >
-    **`docs/CONTRACT.md:1222` was the same shape as the paragraph this release was written for.**
-    "Everything a run starts is contained (0.48.0)" declared a class closed; 0.51.0, 0.52.0 and
-    0.53.0 then each opened one — the post-edit checker and `check` build their own uncontained
-    `Exec` (`src/tools/diagnostics.rs:271` says so in a code comment), a language server is spawned
-    directly (`src/lsp.rs:321`), and on unix the browser child is spawned directly
-    (`src/browser.rs:856`). The heading is narrowed, the three are named with what each still passes
-    through, and wrapping them is recorded as a finding for a later release rather than smuggled in.
-  - >
-    Verification discipline held: **every row whose verdict was not `current` was re-checked by hand
-    against the named source before anything was edited.** Two reported items did not survive that
-    check and were not acted on — `libsqlite3-sys 0.38.1` at line 80 (the sentence is about which
-    version introduced the 1.95 floor, and that is still 0.38.1, whatever the lock now resolves) and
-    the `## Related` heading's position (structural, and excluded by scope). Both are recorded in the
-    evidence so a later sweep does not reopen them.
-  - >
-    One correction is a defect that was never drift: `docs/CONTRACT.md:1961` names five aggregate
-    queries and gives four timings "respectively". `git show 3856084` shows it has read that way
-    since the 0.30.0 commit that wrote it. The false pairing is removed and no timing is
-    re-measured — this release forbids asserting one.
-  - >
-    F4 after the sweep edits: `docs_drift` 44 of 44, `guide_pages` 10 of 10, `changelog` 5 of 5,
-    `public_api` 9 of 9, all green.
-- id: US-IO-HARNESS-0.60.2-T05
-  summary: >-
-    Run every docs gate, the lint polarities and the nightly rustdoc gate, and record the sabotage arms.
-  why_required: >-
-    Three new tests that must each fail on today's tree and each be killed by exactly one sabotage arm,
-    plus the existing suites that read the same files. F4 and O2 are this task; without it the release
-    ships three assertions nobody has watched fail.
-  status: done
+  - src/run.rs
+  - tests/prompt.rs
+  evidence: []
+- id: US-IO-HARNESS-0.60.3-T04
+  summary: Make a preset a manner appended to a framing (F3, F4, F6).
+  why_required: Preset::describe replaces the framing, so an embedder who selected Concise or Careful
+    has CONVERSATION_PROMPT thrown away and gets back the two claims 0.49.0 removed on every greeting
+    — and on a contained turn loses the guidance that it may spawn. It also retires the duplicated tool
+    sentences the collapse forced.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.60.2-T01
-  - US-IO-HARNESS-0.60.2-T02
-  - US-IO-HARNESS-0.60.2-T03
+  - US-IO-HARNESS-0.60.3-T01
   acceptance_criteria:
-  - >
-    **F4 — every existing docs gate stays green.** `tests/docs_drift.rs`, `tests/guide_pages.rs`, `tests/readme.rs`,
-    and the `public_api` and `changelog` suites. Two to watch specifically. `readme_dependency_version_matches_cargo_toml`
-    pins the README install snippet to Cargo.toml's major.minor precisely so a patch does not churn
-    it, so `io-harness = "0.60"` stays exactly as it is while Cargo.toml goes to 0.60.2. And `tests/readme.rs`
-    requires the MSRV inside the first 60 lines — the gate 0.60.1's rewrite tripped because nobody had
-    read it — so any edit that moves the README's opening re-trips it.
-  - >
-    **O1 — CI is green on all three platforms** on the feature branch and again on the merge to develop.
-    A docs-only release still runs the whole suite, because the suite is where the docs gates live.
-  - >
-    **O2 — the nightly rustdoc gate is green.** `RUSTDOCFLAGS` under nightly catches what stable `cargo
-    doc` cannot see, and it has caught something in four of the last five releases. This release edits
-    two rustdoc blocks, so it is exactly the one that must not skip it.
+  - '**F3 — a preset never introduces a success criterion onto a turn that has none.** A test composes
+    a classifying turn with `SystemPrompt::Preset(Preset::Concise)` and with `Preset::Careful`, in the
+    flat loop, and asserts the result contains neither "to meet a stated specification" nor "checked against
+    the success criterion", contains `CONVERSATION_PROMPT`''s own framing, and still carries the preset''s
+    marker clause. It must fail on today''s tree, where `compose` returns `preset.describe()` alone. Sabotage:
+    restore the replacing arm in `compose`, under which F3 and F4 fail and no other.
+
+    '
+  - '**F4 — a preset on a contained turn keeps the world it is in.** The same shape as F3 over the tree
+    loop: a preset on a classifying contained turn still carries `spawn_agent` and the sentence that a
+    sub-agent inherits its permissions, which today''s replacement discards. It must fail on today''s
+    tree.
+
+    '
+  - '**F6 — the one prompt-text change is stated, not discovered.** Today `Preset::describe`''s bodies
+    omit "You may edit several files.", which `WORKSPACE_PROMPT` carries; composing manner onto framing
+    restores that sentence for a preset user on the workspace loop. The CHANGELOG says so under the heading
+    `docs/CHANGELOG_STRUCTURE.md` gives that class, and a test asserts the composed preset prompt is exactly
+    `WORKSPACE_PROMPT` plus the manner clause, so the change is one a reader can reproduce rather than
+    one they find in a diff of their own snapshots.
+
+    '
+  - '**N1 — no public item moves.** `docs/public-api.txt` is byte-identical to the 0.60.2 snapshot, with
+    no regeneration. Asserted by the `public_api` suite staying green and by reading `git diff develop
+    -- docs/public-api.txt` as empty. This is what makes 0.60.3 a patch.
+
+    '
   files:
-  - .ultraship/products/io-harness/evidence/0.60.2/gates.md
-  evidence:
-  - >
-    Every gate command and its result is recorded in
-    `.ultraship/products/io-harness/evidence/0.60.2/gates.md`. Green locally: `cargo fmt --check`,
-    `cargo clippy --all-targets --all-features -- -D warnings`, `cargo clippy --all-targets -- -D
-    warnings`, `cargo test` (exit 0 — 88 test binaries plus the doctest run, **1,866 passed**, of
-    which 457 doctests), the nightly rustdoc gate, and the cross-version generator plus
-    `a_current_store_is_read_by_a_0_29_0_binary`.
-  - >
-    O2 — the nightly rustdoc gate was run **twice**, not once, because this release edits two rustdoc
-    blocks in separate tasks. The first run followed `exec_sandbox` gaining an intra-doc link to
-    `SandboxLimits::max_wall_secs`; the second followed `src/tools/custom.rs`'s doc comment changing.
-    A gate that ran before the last edit to the surface it gates has not run. Clean both times.
-  - >
-    F4 — every existing docs gate stays green: `docs_drift` 44 of 44, `guide_pages` 10 of 10,
-    `changelog` 5 of 5, `public_api` 9 of 9, and the whole default suite is green with them.
-    `readme_dependency_version_matches_cargo_toml` is the one to re-check after the version bump, not
-    before it, and that happens at `complete`.
-  - >
-    **Four sabotage arms, all four killed their named test and nothing else.** F1 restores the
-    pre-0.45.0 sentence (35 passed, 1 failed); F2 restores the 0.47.0-era clause (38 passed, 1
-    failed); F3a restores the whole pre-fix guide bullet (43 passed, 1 failed, and `guide_pages`
-    stays 10 of 10); F3b reinstates `forget` alone in the corrected bullet and the failure **names
-    it**, while `mcp__` in the same sentence is correctly not reported. No arm survived, so there is
-    no "a sabotage that failed nothing" finding for this release.
-  - >
-    O1 — `cargo test --all-features` is handed to the PR matrix on three platforms rather than run
-    locally, which is this repository's standing arrangement for that one gate. Stated plainly rather
-    than implied: it ran on CI, not here.
-  - >
-    **The PR matrix found a defect neither the local suite nor macOS could see, and what caught it
-    was a control test rather than an assertion.** Both Windows legs failed on exactly one test of
-    1,383 (1,500 with all features): `command_execution_section_stops_at_the_next_claim`.
-    `.gitattributes` pins `eol=lf` for `tests/fixtures/**` and nothing else, so `docs/CONTRACT.md`
-    checks out CRLF on Windows and the window helper's `"\n\n**"` marker matches nothing in
-    `"\r\n\r\n**"` — the window ran to the end of the file.
-  - >
-    **The failure mode is the part worth keeping: the assertion it guards would have passed anyway,
-    for the wrong reason.** With the window running to EOF, `contract_states_one_exec_boundary` was
-    searching the whole file for a phrase this release had already removed everywhere, so F1 was
-    green on Windows while checking nothing. A checker whose scope silently widens is
-    indistinguishable from one that works — which is exactly why the control asserting "the window
-    stops at the next claim" was written beside it.
-  - >
-    Fixed in `read()` rather than in the two helpers, so a checker added later cannot reintroduce it,
-    with the reason in its rustdoc. `the_section_window_survives_a_crlf_checkout` is the regression
-    test. Local after the fix: `docs_drift` 45 of 45, `guide_pages` 10 of 10, clippy all-features
-    clean.
-  - >
-    O1 — the round after the fix confirmed it: `test (windows-latest, default)` **passes**, which is
-    the leg the CRLF defect owned. Two other legs failed on that round and **both are recorded
-    environmental flakes, matched by signature before being rerun rather than after**:
-    `test (windows-latest, all)` on `f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin`
-    at `tests/hooks.rs:349`, in a job whose own log carries
-    `install-action: installation failed due to bash startup failure`
-    (actions/partner-runner-images#169) — the documented pair, not one half of it; and
-    `test (ubuntu-latest, default)` on `two_concurrent_children_with_their_own_worktrees_do_not_collide`,
-    open since 0.58.0, which had passed on the previous round of this same tree. Neither is reachable
-    from a release that changes no `src/` behaviour. Cleared with `gh run rerun --failed`.
+  - src/run.rs
+  - src/contract.rs
+  - tests/prompt.rs
+  evidence: []
+- id: US-IO-HARNESS-0.60.3-T05
+  summary: Correct the rustdoc that describes the replaced shape.
+  why_required: SystemPrompt::Preset says a preset is composed where Replace's text is, and Preset says
+    it names the same tools as Builtin. Both stop being true in T04. A release that fixes the code and
+    leaves the doc comment describing the old shape has moved the defect rather than closed it.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.60.3-T04
+  acceptance_criteria:
+  - '**F3 — a preset never introduces a success criterion onto a turn that has none.** A test composes
+    a classifying turn with `SystemPrompt::Preset(Preset::Concise)` and with `Preset::Careful`, in the
+    flat loop, and asserts the result contains neither "to meet a stated specification" nor "checked against
+    the success criterion", contains `CONVERSATION_PROMPT`''s own framing, and still carries the preset''s
+    marker clause. It must fail on today''s tree, where `compose` returns `preset.describe()` alone. Sabotage:
+    restore the replacing arm in `compose`, under which F3 and F4 fail and no other.
+
+    '
+  - '**O2 — the nightly rustdoc gate is green.** `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly
+    doc --all-features --no-deps`. This release edits two rustdoc blocks in `src/contract.rs` and renames
+    a `pub(crate)` item that one of them links to, which is exactly the shape of intra-doc breakage the
+    gate has caught in four of the last five releases.
+
+    '
+  files:
+  - src/contract.rs
+  evidence: []
+- id: US-IO-HARNESS-0.60.3-T06
+  summary: Write the design paragraph in docs/CONTRACT.md and add docs/STYLE.md.
+  why_required: docs/CONTRACT.md records the classification rule but never the design it comes from, which
+    is why three separate releases have had to rediscover that a classifying turn is framed differently.
+    docs/STYLE.md writes down the register the prose already follows so a later release cannot drift out
+    of it by imitation.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.60.3-T02
+  - US-IO-HARNESS-0.60.3-T03
+  - US-IO-HARNESS-0.60.3-T04
+  acceptance_criteria:
+  - '**F7 — every existing docs gate stays green.** `tests/docs_drift.rs`, `tests/guide_pages.rs`, `tests/readme.rs`,
+    `public_api` and the `changelog` suite. Two to watch, both of which have cost a round before: `readme_dependency_version_matches_cargo_toml`
+    pins the README snippet at major.minor, so `io-harness = "0.60"` must stay exactly as it is while
+    `Cargo.toml` goes to 0.60.3; and `the_capabilities_release_table_covers_every_released_version` needs
+    its `docs/CAPABILITIES.md` row, which can only be checked after the version bump.
+
+    '
+  files:
+  - docs/CONTRACT.md
+  - docs/STYLE.md
+  evidence: []
+- id: US-IO-HARNESS-0.60.3-T07
+  summary: Bump the version and write the CHANGELOG and CAPABILITIES entries.
+  why_required: 'The release is not shippable without the bump, and two gates can only be checked after
+    it: the README dependency pin at major.minor and the CAPABILITIES row that must exist for every released
+    version. F6 also requires the one moved prompt string named in the CHANGELOG rather than left in a
+    diff.'
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.60.3-T06
+  acceptance_criteria:
+  - '**F6 — the one prompt-text change is stated, not discovered.** Today `Preset::describe`''s bodies
+    omit "You may edit several files.", which `WORKSPACE_PROMPT` carries; composing manner onto framing
+    restores that sentence for a preset user on the workspace loop. The CHANGELOG says so under the heading
+    `docs/CHANGELOG_STRUCTURE.md` gives that class, and a test asserts the composed preset prompt is exactly
+    `WORKSPACE_PROMPT` plus the manner clause, so the change is one a reader can reproduce rather than
+    one they find in a diff of their own snapshots.
+
+    '
+  - '**F7 — every existing docs gate stays green.** `tests/docs_drift.rs`, `tests/guide_pages.rs`, `tests/readme.rs`,
+    `public_api` and the `changelog` suite. Two to watch, both of which have cost a round before: `readme_dependency_version_matches_cargo_toml`
+    pins the README snippet at major.minor, so `io-harness = "0.60"` must stay exactly as it is while
+    `Cargo.toml` goes to 0.60.3; and `the_capabilities_release_table_covers_every_released_version` needs
+    its `docs/CAPABILITIES.md` row, which can only be checked after the version bump.
+
+    '
+  - '**N2 — the version moves in exactly two files.** `Cargo.toml` and `Cargo.lock`, 0.60.2 → 0.60.3.
+
+    '
+  files:
+  - Cargo.toml
+  - Cargo.lock
+  - CHANGELOG.md
+  - docs/CAPABILITIES.md
+  evidence: []

@@ -1,0 +1,56 @@
+product: io-harness
+version: 0.60.3
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: high
+  reasons:
+    - >
+      No constraint of any kind is recorded for this release — `ultraship constraints` reports no
+      active release to hold one, and `.ultraship/ultraship.yaml` leaves every figure under
+      `resource_profile.available` null. The one recorded preference that bears on the work is
+      `minimize_cost: true`, and this release is small by that measure: three composition sites in
+      one file, one `pub(crate)` rename, four assertions in a suite that already exists, and two
+      prose files.
+    - >
+      Every defect is already located by file and line, and each was verified against the source
+      before the contract was written rather than taken from the roadmap entry — `src/run.rs:4098`,
+      `src/run.rs:4539` and `src/run.rs:7255`, `src/run.rs:14804-14810` with
+      `src/contract.rs:116-125`. No task begins with a search. The roadmap entry's one wrong premise
+      (that `tests/prompt.rs` asserts nothing about the conversational opening) was found by that
+      check and is corrected in the entry itself.
+    - >
+      The whole class of risk a feature release carries is absent by construction: no schema, no
+      checkpoint format, no configuration key, no new dependency, and no public item — `Preset::
+      describe` and its replacement are both `pub(crate)`, so there is no cross-version gate to
+      satisfy. N1 asserts that by the unchanged `docs/public-api.txt` snapshot rather than trusting
+      it.
+    - >
+      `tests/prompt.rs` already carries every pattern the four new assertions need: byte-exact
+      baselines, the `relocated` prefix-plus-suffix helper, per-loop composition helpers, and a
+      `boundary_line_for` helper that already splits a composed prompt on "Your boundary.". What is
+      missing is only that the two composition helpers compose under `Policy::permissive()` with no
+      plan gate — which is precisely why none of these three defects was caught, and precisely what
+      T01 adds.
+  major_cost_drivers:
+    - >
+      Wording the conditional plan directive. `plan_lock()` is what actually refuses a write, so a
+      badly worded directive costs a wasted step and a refusal rather than an ungated write — but a
+      directive that reads as optional invites that wasted step on every gated turn. It must bind the
+      work reading as hard as today's binds every reading, and it is prose a model reads, so a test
+      name is not review. The record quotes it in full.
+    - >
+      `src/run.rs` is 16,620 lines and all three sites are inside it. Reading enough around each to
+      change composition safely is the bulk of the work, and it is why this entry is ordered before
+      0.63.0 decomposes the file.
+    - >
+      The full suite on a contended machine. `target/` was 26 G against 29 G free when this release
+      was planned; `target/debug/deps`, `build` and `incremental` are cleared before any full run,
+      and the all-features suite goes to the PR matrix rather than being run locally.
+    - >
+      Two gates can only be checked after the version bump — the README dependency pin at
+      major.minor and `the_capabilities_release_table_covers_every_released_version`, which needs a
+      `docs/CAPABILITIES.md` row for the version being released. Both have cost a red CI round
+      before.
+  recommended_scope_change: null
