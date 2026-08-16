@@ -26,8 +26,10 @@ tasks:
     composes the classifying opening under a plan gate through `Session::turn_bounded` and asserts the
     boundary section it carries is the one `plan_lock()` produces — writes and commands refused, named
     against the `plan-gate` layer — and is byte-identical to the section the same contract''s `system`
-    block carries on its planning arm. Under a permissive policy today the classifying turn carries no
-    boundary section at all while the `system` block carries one, which is the starkest form of the defect.
+    block carries on its planning arm. Under a permissive policy the difference is at its starkest: the
+    classifying turn carries only the containment line — which `boundary_section` renders for any contained
+    run — while the `system` block additionally carries the four act lines, two of them reading `Refused:
+    * (plan-gate)`. So the gated turn is told nothing about the layer refusing every write it might make.
     A unit test covers the tree loop''s composition at the same site. Both must fail on today''s tree,
     where `after_planning` is passed at `src/run.rs:4539` and `src/run.rs:7255`. Sabotage: pass `after_planning`
     on the classifying path again, under which only F2 fails.
@@ -112,8 +114,10 @@ tasks:
     composes the classifying opening under a plan gate through `Session::turn_bounded` and asserts the
     boundary section it carries is the one `plan_lock()` produces — writes and commands refused, named
     against the `plan-gate` layer — and is byte-identical to the section the same contract''s `system`
-    block carries on its planning arm. Under a permissive policy today the classifying turn carries no
-    boundary section at all while the `system` block carries one, which is the starkest form of the defect.
+    block carries on its planning arm. Under a permissive policy the difference is at its starkest: the
+    classifying turn carries only the containment line — which `boundary_section` renders for any contained
+    run — while the `system` block additionally carries the four act lines, two of them reading `Refused:
+    * (plan-gate)`. So the gated turn is told nothing about the layer refusing every write it might make.
     A unit test covers the tree loop''s composition at the same site. Both must fail on today''s tree,
     where `after_planning` is passed at `src/run.rs:4539` and `src/run.rs:7255`. Sabotage: pass `after_planning`
     on the classifying path again, under which only F2 fails.

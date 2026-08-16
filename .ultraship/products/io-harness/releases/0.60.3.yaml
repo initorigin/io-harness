@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.60.3
-status: planned
+status: released
 release_type: patch
 outcome:
   user_can: >
@@ -391,3 +391,149 @@ open_questions:
   **Whether `docs/STYLE.md` belongs in `docs/` or `docs/guide/`.** `tests/guide_pages.rs` governs the
   guide directory and may require registration; `docs/` holds the contract-adjacent files. Decide by
   reading that test rather than by preference.
+released_at: 2026-08-16 23:05:00+00:00
+mode: published
+delivered: >
+  Every block a classifying turn is composed from now says something true of that turn.
+
+
+  **The plan gate no longer orders a turn that may answer.** `planning_directive` takes a
+  `classifying` flag; on the one block composed above `CONVERSATIONAL_ENDING` the gate binds the work
+  reading — "If any part of this needs the repository written to or a command run, then before you do
+  that or anything else you must call `propose_plan` … and wait." The sentence naming what is refused
+  and the roster clause are byte-identical in both forms, and `plan_lock()` is untouched, so nothing
+  about what the gate enforces moved. A turn already decided to be work still reads the unconditional
+  form, which the test asserts as its control.
+
+
+  **Both blocks of a gated turn describe the same boundary.** `conversational_opening` takes
+  `after_planning` and `while_planning` and selects on the `planning` flag it already had, so the rule
+  lives in the one function both loops share rather than at two call sites that had each chosen wrong.
+  The flat loop hoists its `while_planning` binding to match the shape the tree loop has had since
+  0.45.0.
+
+
+  **A preset is a manner appended to a framing.** `Preset::describe` is replaced by `Preset::manner`,
+  returning the working-style clause alone, and `compose` appends it to `spec.base` instead of
+  standing in for it. An embedder who selects `Concise` on a session turn keeps `CONVERSATION_PROMPT`
+  and no longer gets back "to meet a stated specification" or "checked against the success criterion"
+  on a greeting; one who selects it on a contained turn keeps the paragraph that says the agent may
+  spawn. Both items are `pub(crate)`; `docs/public-api.txt` is byte-identical to 0.60.2's.
+
+
+  **On the tree loop the three defects were latent rather than reachable** — recorded mid-release as
+  `US-IO-HARNESS-0.60.3-I01` and fixed anyway, because both loops share the two functions that were
+  wrong. `Session::turn_contained` and `turn_contained_observed` build their contract from text, so no
+  caller can hand a contained turn a plan gate or a preset. Making that reachable is roadmap entry
+  0.66.0, added by the same iteration.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — **89 test binaries, 1,874 passed, 0 failed, 6 ignored**, exit 0.
+    Run with `XDG_CONFIG_HOME` redirected to a scratch directory, which is standing procedure here:
+    `tests/plugin.rs` otherwise reads this machine's real `~/.config/io/io.toml` and fails 11 tests
+    for a reason that has nothing to do with the release.
+  - >
+    `cargo test --test prompt` — 25 passed, 0 failed. Four of those are this release's: F1
+    `a_plan_gated_classifying_turn_may_still_answer`, F2
+    `a_plan_gated_classifying_turn_reads_the_boundary_in_force`, F3
+    `a_preset_does_not_reframe_a_classifying_turn_as_work`, F6
+    `a_preset_is_the_framing_plus_its_manner_and_nothing_else`.
+  - >
+    **All four failed on the pre-fix tree** — `test result: FAILED. 21 passed; 4 failed` — which is
+    what makes them assertions rather than descriptions. The F2 failure is the release's sharpest
+    evidence: the classifying opening carried only `- Commands you run are contained (mode:
+    workspace-write, backend: macos-sandbox-exec)`, while the `system` block for the same contract
+    additionally carried `- Writing files: allowed by default. Refused: * (plan-gate).` and `- Running
+    a command: allowed by default. Refused: * (plan-gate).` A turn under the gate was told nothing
+    about the layer refusing every write it might make.
+  - >
+    `cargo test --lib run::tests` — 6 passed, 1 ignored. Three are this release's, covering the tree
+    loop's framings, which no public entry point can reach. Two of the three failed on the pre-fix
+    tree; the third is the finding recorded under `known_limitations`.
+  - >
+    `cargo test --test plan_gate` — 16 passed, 0 failed. The gate's own behaviour is unchanged, which
+    is the claim that matters beside a change to what the gate *says*.
+  - >
+    `cargo test --doc contract` — 28 passed, 0 failed, after the two rustdoc blocks were rewritten.
+  - >
+    Docs gates, all green after the version bump: `docs_drift` 45, `guide_pages` 10, `readme` 9,
+    `public_api` 8, `changelog` 5. The two that can only be checked post-bump both pass —
+    `readme_dependency_version_matches_cargo_toml` (the README pin stays `io-harness = "0.60"`) and
+    `the_capabilities_release_table_covers_every_released_version`.
+  - >
+    **Sabotage pass, six arms, run against the shipped tree and restored after each.** A1 restoring
+    the unconditional directive on the classifying path failed exactly F1's two tests. A2 passing
+    `after_planning` again failed exactly F2's two. A3 making `compose` replace rather than append
+    failed four — F3, F4, F6, and 0.49.0's `a_preset_is_opt_in_and_the_builtin_does_not_move`, which
+    is correct: replacing moves the composed builtin output that test controls. A4 dropping the
+    separator between framing and manner failed exactly F6, the byte-exact assertion. A5 deleting the
+    `docs/CAPABILITIES.md` row failed exactly the release-table gate. **A6 failed nothing** — see
+    `known_limitations`.
+  builds:
+  - '`cargo fmt --check` — exit 0.'
+  - '`cargo clippy --all-targets -- -D warnings` — exit 0.'
+  - '`cargo clippy --all-targets --features documents -- -D warnings` — exit 0.'
+  - '`cargo clippy --all-targets --features media -- -D warnings` — exit 0.'
+  - '`cargo clippy --all-targets --all-features -- -D warnings` — exit 0.'
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0.
+    Mandatory here rather than customary: this release rewrites two rustdoc blocks in
+    `src/contract.rs` and renames a `pub(crate)` item one of them refers to.
+  - >
+    `cargo package --locked` — exit 0, **260 files, 2,019,152 bytes** (0.60.2 was 2,010,203).
+  - '`cargo tree | wc -l` — **402**, unchanged. No dependency was added.'
+  reviews:
+  - >
+    `git diff develop -- docs/public-api.txt` is empty, and the `public_api` suite is green with no
+    snapshot regeneration. N1 holds.
+  - >
+    The conditional plan directive read as prose rather than inferred from a test name, as
+    `human_approvals` requires. Both forms carry the same refusal sentence; only the ordering clause
+    differs, and the classifying form still says the plan comes before any write or command.
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **The record is sealed before the crates.io upload.** `mode: published` states the authorized
+  target; the sequence makes it true — this record rides the `feat/0.60.3` branch into develop, then
+  develop merges to main, then the tag cuts the Release, then `cargo publish` runs last. The
+  published byte size and the release URL belong in the final report, not in a later amendment to a
+  sealed record.
+- >
+  **A6 is a sabotage that failed nothing, and it is a real gap in a checker rather than in this
+  release.** Making `Preset::manner` `pub` — a genuine addition to the public surface — left
+  `tests/public_api.rs` green. `docs/public-api.txt` enumerates the items re-exported from
+  `src/lib.rs` (`enum Preset src/contract.rs`) and never their inherent methods, so a new `pub fn` on
+  an existing public type does not move the snapshot at all. Nothing in this release is affected —
+  `manner` is `pub(crate)`, verified in the source and by the unchanged snapshot — but N1's evidence
+  is honestly "the diff and the source", not "the snapshot would have caught it". Pre-existing since
+  the checker was written; recorded here because this is where it was found.
+- >
+  **The tree loop's F2 unit assertion could not fail before the fix.** The pre-fix
+  `conversational_opening` took one boundary and had no second value to choose wrongly between, so
+  the assertion could not be expressed against it. It was written after the fix, asserts the
+  selection in both directions, and dies under sabotage arm A2. Its failing-first evidence is the
+  flat loop's end-to-end assertion, which did fail. Stated rather than glossed: a test written after
+  the code is weaker evidence than one written before it, whatever it asserts now.
+- >
+  **The `--all-features` suite ran on CI, not locally.** Every other gate above ran on this macOS
+  host. The all-features leg is handed to the PR matrix, which runs it on three platforms in
+  parallel — the standing arrangement since 0.53.0, restated here rather than left implicit.
+- >
+  **Three of the defects this release fixes are unreachable on the tree loop** and stay that way
+  until 0.66.0 gives a contained session turn a contract. Fixed at the shared composition site
+  regardless, because leaving a known-wrong composition in place until its entry point arrives is how
+  0.37.0's half-written classification survived eleven releases.
+- >
+  **One composed prompt string changes.** A caller who selected `SystemPrompt::Preset` and snapshots
+  composed system prompts will see "You may edit several files." present where the old preset bodies
+  omitted it. Named in the CHANGELOG under Changed, asserted byte for byte by F6, and stated in
+  `migrations`. No other `SystemPrompt` variant's output moves.
+- >
+  **`docs/STYLE.md` is enforced by nothing.** It documents a register the prose already follows, and
+  the file says so itself. A checker for prose this small would reject good sentences more often than
+  it caught bad ones — which is a judgement, not a measurement.
+supersedes: 0.60.2
+next_recommended_version: 0.61.0
+immutable: true

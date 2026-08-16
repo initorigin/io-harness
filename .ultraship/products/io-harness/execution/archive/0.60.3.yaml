@@ -37,9 +37,9 @@ release_fit:
     - >
       Wording the conditional plan directive. `plan_lock()` is what actually refuses a write, so a
       badly worded directive costs a wasted step and a refusal rather than an ungated write — but a
-      directive that reads as optional invites that wasted step on every gated turn. It must bind the
-      work reading as hard as today's binds every reading, and it is prose a model reads, so a test
-      name is not review. The record quotes it in full.
+      directive that reads as optional invites that wasted step on every gated turn. It must bind
+      the work reading as hard as today's binds every reading, and it is prose a model reads, so a
+      test name is not review. The record quotes it in full.
     - >
       `src/run.rs` is 16,620 lines and all three sites are inside it. Reading enough around each to
       change composition safely is the bulk of the work, and it is why this entry is ordered before
