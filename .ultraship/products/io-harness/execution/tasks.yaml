@@ -1,443 +1,329 @@
 product: io-harness
-version: 0.60.0
+version: 0.60.1
 tasks:
-- id: US-IO-HARNESS-0.60.0-T01
-  summary: The store half — `agent_messages`, `AgentMessage`, the three `Store` methods, and `spawns.as_name`.
-  why_required: 'Every other task in this release reads or writes these rows. It is also where the two
-    properties that cannot be retrofitted live: the read and the mark happen in one transaction, and
-    the new table is in `RUN_TABLES` so a session delete accounts for it. A table missed by that list
-    produces a silent orphan and no error — 0.58.0 paid for that lesson.'
+- id: US-IO-HARNESS-0.60.1-T01
+  summary: Re-verify the compared harnesses against their current sources, and record the citations.
+  why_required: The comparison table is the one part of this release that makes a public claim about someone
+    else's project, and the 2026-07-28 audit in `product.yaml` is three weeks old and was never written
+    for publication. Without a current, cited claim set there is no table to write, and the release falls
+    back to a capability table naming nobody. It runs first because it is the longest pole and the only
+    task whose outcome can change the shape of another.
   status: done
   depends_on: []
   acceptance_criteria:
-  - '**F5 — reads are ordered, exactly-once, and marked in the same transaction as they are returned.**
-    Ten messages from three senders are read back in row-id order; a second read returns nothing; and
-    a read that fails after selecting leaves every message still unread. Sabotage: mark read in a separate
-    statement outside the transaction and fail between them, under which the messages are lost and only
-    F5 fails.
+  - '**F6 — every comparison row is sourced and dated.** A test asserts each row of the comparison table
+    carries a link and a check date in ISO form, and that no date is older than this release''s own work.
+    Sabotage: remove one row''s citation, under which only F6 fails. A claim about another project with
+    no source is the one thing on this page that could be actionably wrong.
 
     '
-  - '**N1 — one additive table and one additive column, and no `CHECKPOINT_FORMAT` move.** `agent_messages`
-    with its index, and `spawns.as_name`. `git diff main -- src/state.rs` shows a `CREATE TABLE IF NOT
-    EXISTS`, a `CREATE INDEX IF NOT EXISTS` and one `ALTER TABLE ADD COLUMN`, and `CHECKPOINT_FORMAT`
-    is still 7. No checkpoint layout changes, so a bump would refuse a store this release can read.
-
-    '
-  - '**N2 — the cross-version gate passes with both declared.** `agent_messages` and its index join
-    `ADDED_SINCE_0_22_0`, and `as_name` joins `COLUMNS_ADDED_SINCE_0_22_0` under `spawns`, in `tests/cross_version.rs`.
-    A real 0.29.0 binary opens a store this build wrote and never names either, executed rather than
-    asserted on paper. This criterion is written down because 0.58.0''s additive index was refused by
-    this same gate.
-
-    '
-  - '**N3 — the new table is accounted for by every run-keyed operation.** `agent_messages` is in `RUN_TABLES`,
-    and deleting a whole tree''s session leaves **zero** rows in it — asserted by counting the table
-    directly after the delete, not by enumerating `sqlite_master`, which 0.58.0 proved cannot fail.
-    A message has two run columns and only one may key the list; the criterion asserts both ends are
-    gone.
-
-    '
-  - '**N5 — the cost of a read is measured and stated, and it is the mailbox that is measured.** Median
-    of 20 on this machine, stores on disk, for a drain at 1 / 100 / 1,000 unread messages and for a
-    bounded wait that returns on the first message. The read must be an index seek on `(to_run_id, id)`
-    rather than a scan: `EXPLAIN QUERY PLAN` over the statement the crate actually issues asserts the
-    index by name, and the recipient column is the leading one.
-
-    '
-  evidence:
-  - 'F5, first two clauses — `messages_are_delivered_oldest_first_across_interleaved_senders`, `a_message_is_delivered_exactly_once`,
-    `a_from_filter_delivers_only_that_senders_messages`, `an_audit_read_does_not_deliver` and `a_body_survives_being_arbitrary_text`
-    in `tests/mailbox.rs` — 6 passed (the sixth is N5''s measurement, ignored by default). The ordering
-    test round-robins three senders so no sender''s messages are adjacent: a per-sender order would
-    pass a contiguous fixture and reorder a real tree.'
-  - F5, third clause — `a_read_that_fails_after_selecting_marks_nothing` in `src/state.rs`, 491 lib
-    tests passed. It lives in the crate rather than in `tests/` because the only lever that fails the
-    write half while the read half succeeds is `PRAGMA query_only`, and the connection is private. A
-    read-then-mark in two statements loses the batch here.
-  - 'N1 — one `CREATE TABLE IF NOT EXISTS agent_messages`, one `CREATE INDEX IF NOT EXISTS agent_messages_to`,
-    one `ALTER TABLE spawns ADD COLUMN as_name`. `CHECKPOINT_FORMAT` unmoved at 7: no checkpoint layout
-    changed, and a bump would make `check_resumable` refuse every 0.59.0 store over a table it does
-    not read.'
-  - N2 — `agent_messages` and `agent_messages_to` in `ADDED_SINCE_0_22_0`, and `spawns` with `as_name
-    TEXT NOT NULL DEFAULT ''` in `COLUMNS_ADDED_SINCE_0_22_0`. `cargo test --test cross_version` — 7
-    passed. The real-0.29.0-binary half runs in T07 with the generator built.
-  - N3 — `a_deleted_session_leaves_no_message_at_either_end` in `tests/mailbox.rs`. Messages are sent
-    in BOTH directions before the delete, so a cascade covering only the recipient end still fails,
-    and the count is taken straight off `agent_messages` through a second connection rather than through
-    either run id — a row orphaned by a missed cascade is exactly a row no run id reaches.
-  - 'N5, plan half — `a_mailbox_read_reaches_its_rows_through_the_recipient_index` in `src/state.rs`.
-    The statement asserted is the one `read_messages` prepares, copied rather than paraphrased. Asserts
-    the index by name, no fallback scan, and no `TEMP B-TREE`: delivery order is the index''s own order
-    rather than a sort built per read. The fixture writes traffic addressed elsewhere too, so seeking
-    to one recipient''s rows is a real saving rather than the whole table under another name.'
-  - N5, measurement half — `n5_what_a_drain_costs`, release build, on-disk stores, median of 20. **0.152
-    / 0.727 / 3.612 ms at 1 / 100 / 1,000 unread.** A thousandfold more messages for about twenty-four
-    times the cost, because the transaction commit is paid once per read whatever the size and only
-    the per-row `UPDATE` scales.
   files:
-  - src/state.rs
-  - src/lib.rs
-  - tests/mailbox.rs
-  - tests/cross_version.rs
-- id: US-IO-HARNESS-0.60.0-T02
-  summary: The address — an instance name per agent, assigned at spawn, durable, unique in the tree.
-  why_required: 'There is no mailbox without an address, and the roadmap''s `by name` did not name one:
-    a roster name is a role two children share. Nothing in this crate has ever identified one agent.
-    Every send and every read resolves through what this task builds.'
+  - .ultraship/products/io-harness/evidence/0.60.1/comparison-audit.md
+  evidence:
+  - Eight projects re-verified against their own current documentation or repository on 2026-08-16 — Claude
+    Code, Codex CLI, opencode, Goose, pi, rig, swiftide, langchain-rust — recorded with per-claim citations
+    in .ultraship/products/io-harness/evidence/0.60.1/comparison-audit.md
+  - 'The audit corrected two claims the 2026-07-28 record in product.yaml had too strong: Claude Code
+    does have a checkpoint (per user prompt, over files and conversation, not per step) and does have
+    a real sandbox with network allow-listing. Both corrections are carried into the published table rather
+    than the older, easier claim.'
+  - Every cell that a project does not state reads 'not documented' rather than 'no'; pi is the only project
+    that documents the absence itself.
+- id: US-IO-HARNESS-0.60.1-T02
+  summary: Rewrite README.md in the present tense, and add the three README drift tests.
+  why_required: This is the release. Every other task closes a gap the audit found beside it; this one
+    is the outcome the contract states. The tests are written in the same task because F2 and F3 must
+    fail against today's README — a docs test that passes before the fix checks nothing, and writing it
+    afterwards is how that happens.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.60.0-T01
+  - US-IO-HARNESS-0.60.1-T01
   acceptance_criteria:
-  - '**F2 — a name addresses one agent, not a role.** Two children of the *same* roster definition,
-    spawned in the same step with `as` names `a` and `b`, receive only their own messages. Sabotage:
-    resolve an address by the roster definition''s name instead of the instance name, under which both
-    children read both messages and only F2 fails. This criterion exists because it is the premise the
-    roadmap entry got wrong.
+  - '**F1 — the README carries no release-version reference outside the two pinned lines.** A test scans
+    README.md for a `\d+\.\d+\.\d+` literal and for the `X.YY.0` form the prose uses, and fails on any
+    occurrence outside the `[dependencies]` snippet and the MSRV sentence that `tests/docs_drift.rs` already
+    pins. Sabotage: reinstate one removed sentence — "**0.47.0 closed the Linux hole in this table**"
+    — under which only F1 fails. The control the same test carries: the two permitted lines, present,
+    must not trip it.
 
     '
-  - '**F3 — a duplicate name is refused before anything is allocated.** A spawn asking for a name already
-    held in this tree produces a typed observation naming it, and the tree''s run count, slot tally
-    and queue depth are all unchanged afterwards — asserted as three numbers taken before and after,
-    not as the absence of a child. Sabotage: allocate the run row before the name is checked, under
-    which the counts move and only F3 fails.
+  - '**F2 — every guide page has a README row.** A test reads `docs/guide/*.md` and asserts each file
+    name appears in a table row of README.md, which is the check `guide_pages.rs` performs against `docs/CAPABILITIES.md`
+    and has never performed against the README. It must fail on today''s README, which is missing `browser.md`
+    — a test that passes before the fix is a test that checks nothing. Sabotage: delete a different row,
+    `mailbox.md`, under which only F2 fails and names it.
 
     '
-  - '**F4 — `root` is reserved.** A spawn asking for `as: "root"` is refused the same way. Sabotage:
-    drop the reserved-name check, under which a child shadows the root''s address and messages intended
-    for the root reach the child; only F4 fails.
+  - '**F3 — the README links the measurements.** A test asserts README.md contains a relative link to
+    `docs/MEASUREMENTS.md`. It must fail on today''s README, which contains zero. Sabotage: remove the
+    link, under which only F3 fails.
 
     '
-  evidence:
-  - 'F2 — `two_children_of_one_definition_are_two_addresses` in `tests/mailbox.rs`. Two children of
-    ONE roster definition, spawned in the same step with `as` names `a` and `b`, each write down every
-    message they saw: `a` sees only "for a only" and `b` only "for b only". Under a resolution that
-    went by the definition''s name they would be one address and both would see both.'
-  - 'F3 — `a_duplicate_address_costs_no_run_no_slot_and_no_queue_place`. The three numbers are compared
-    against a CONTROL run identical except that the second spawn asks for a free address: (children,
-    agent_count_tree, queued) is (1, 2, 0) refused against (2, 3, 0) allowed. Asserting them against
-    themselves would have passed for a refusal that allocated and rolled back, which is not what the
-    criterion claims.'
-  - F4 — `a_child_cannot_take_the_roots_address`. The refusal names the reason, and `store.children(root)`
-    is empty afterwards.
-  - 'The address is durable: `spawns.as_name`, added by `ALTER TABLE`, read back by `find_spawn`, and
-    taken by the adopt path in `spawn_child` rather than re-derived. The adoption key `(parent_run_id,
-    step, goal)` is unchanged, so a resumed tree re-adopts the same children under the names they already
-    had.'
-  - An assigned address may not contain `#`, which is the character a derived one uses (`<role>#<run
-    id>`). That is what makes the two namespaces disjoint by one rule rather than by a collision check
-    that would have to be right about a run id nobody has allocated yet — `address_is_assignable` in
-    `src/run.rs`.
+  - '**F6 — every comparison row is sourced and dated.** A test asserts each row of the comparison table
+    carries a link and a check date in ISO form, and that no date is older than this release''s own work.
+    Sabotage: remove one row''s citation, under which only F6 fails. A claim about another project with
+    no source is the one thing on this page that could be actionably wrong.
+
+    '
+  - '**F7 — every relative link in the README and `docs/` resolves.** The existing `relative_links_in_readme_and_docs_resolve`
+    stays green across a rewrite that moves most of the links on the page. No new test; this is the criterion
+    that the rewrite did not break what was already checked.
+
+    '
+  - '**N3 — no claim is widened.** Every capability sentence surviving into the rewritten README is at
+    most as strong as what `docs/CONTRACT.md` says about the same capability. Evidenced by the review,
+    page against contract, section by section — this is the criterion a test cannot carry and the one
+    a rewrite most easily fails.
+
+    '
+  - '**N4 — the page renders.** The README renders correctly on GitHub and on crates.io: every table,
+    every relative link resolved against the raw URL crates.io uses rather than a repo path, and the logo
+    image still loading. crates.io does not resolve repository-relative links the way GitHub does, which
+    is why the current README already uses an absolute raw URL for the logo.
+
+    '
   files:
-  - src/run.rs
-  - src/state.rs
-  - tests/mailbox.rs
-- id: US-IO-HARNESS-0.60.0-T03
-  summary: The two tools, non-blocking — `send_message`, `read_messages` as a drain, and the refusals
-    that name what is addressable.
-  why_required: 'This is the release''s vertical slice and its declared fallback scope: after it a child
-    can tell a sibling what it found and the sibling reads it on its next step. Everything after it
-    is about when a read returns, not about whether the channel exists.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.60.0-T02
-  acceptance_criteria:
-  - '**F1 — a child tells a sibling what it found, and the sibling could not have found it otherwise.**
-    A two-child fan-out where the `scout` locates a line and the `author` is denied every means of locating
-    it itself, and the author''s edit lands on the line the scout named. Sabotage: make `send_message`
-    append nothing while still reporting success, under which the author''s read is empty and only F1
-    fails.
-
-    '
-  - '**F10 — an unknown address is refused with the names that are addressable.** The observation lists
-    them, so the model recovers in one step. Sabotage: refuse without listing, under which only F10
-    fails.
-
-    '
-  - '**F11 — an address resolves inside this tree and nowhere else.** Two independent trees over one
-    store, each with a child named `worker`; neither can address the other''s, and the refusal reads
-    the same as any unknown name rather than leaking that a `worker` exists elsewhere. Sabotage: resolve
-    by name over the whole store, under which the cross-tree send succeeds and only F11 fails.
-
-    '
-  - '**F15 — a flat run has neither tool.** `workspace_tools()` offers no mailbox tool, and a run outside
-    a tree that calls one gets the ordinary unknown-tool observation. Sabotage: add the tools to `workspace_tools`,
-    under which a flat run''s tool count moves and only F15 fails.
-
-    '
-  - '**N7 — a run that never sends a message is byte-identical in what it costs.** The tools are two
-    more `ToolSpec`s in a tree''s request and nothing else: no prompt block, no fold, no per-step query.
-    Asserted as a step''s assembled prompt being unchanged against the same run on the release base
-    except for the two tool schemas.
-
-    '
+  - README.md
+  - tests/docs_drift.rs
+  - tests/guide_pages.rs
   evidence:
-  - 'F1 — `a_child_tells_a_sibling_what_it_found` in `tests/mailbox.rs`. The author''s script does NOT
-    contain the answer: it writes whatever follows `FOUND ` in its own prompt, so `edited.txt` holding
-    `src/auth.rs:210` is evidence the message arrived. With nothing delivered it writes `nothing`, so
-    the negative half is built into the same run.'
-  - 'F10 — `an_unknown_address_is_refused_with_what_is_reachable`. The observation carries both the
-    address that failed and `Reachable from here: root, scout`, so a mistyped address recovers in one
-    step.'
-  - F11 — `an_address_does_not_reach_out_of_its_own_tree`. Two trees over ONE store; the second cannot
-    address the first's `alpha`, and the refusal reads like any other unknown name — the listing does
-    not mention it either, so the other tree's shape does not leak to an agent that cannot reach it.
-  - F15 — `a_flat_run_is_offered_no_mailbox`. Read off the tool schemas the provider was actually SENT,
-    not off `workspace_tools`, with `spawn_agent`'s absence as the control.
-  - 'N7 — the tools are two more `ToolSpec`s in a tree''s request and nothing else: no prompt block,
-    no per-step query, no fold. `Addressing::resolve` runs inside the tool call rather than at the top
-    of the agent loop, so a run whose agents never message pays nothing for the mailbox existing.'
-  files:
-  - src/run.rs
-  - src/observe.rs
-  - tests/mailbox.rs
-- id: US-IO-HARNESS-0.60.0-T04
-  summary: The bounded wait — `wait_secs`, the operator's `max_wait_secs` ceiling, and the early return
-    for a sender that cannot answer.
-  why_required: Without it the third verb the entry names is missing and a coordinator still cannot
-    wait on a named child. It is also the release's one genuinely open shape, so it is built after the
-    slice that survives without it.
+  - 'README.md rewritten: 618 -> 695 lines, present tense, table of contents, capability matrix above
+    the prose, measured-cost section, two sourced comparison tables, and a guide table carrying all 25
+    pages.'
+  - 'F1 green: `readme_states_no_release_version_outside_the_pinned_lines` passes, and `grep -nE ''\b[0-9]+\.[0-9]+\.[0-9]+\b''
+    README.md` returns nothing. The control test `present_tense_checker_rejects_a_reinstated_sentence`
+    reinstates the real 0.47.0 sentence verbatim and is reported.'
+  - 'F2 green: `every_guide_page_has_a_readme_row` passes. Its control `control_a_page_linked_only_from_prose_is_reported`
+    reproduces the exact defect — browser.md linked in a sentence, absent from the table — and reports
+    it.'
+  - 'F3 green: `readme_links_the_measurements` passes; `measurements_link_checker_reports_silence` rejects
+    a README with no link.'
+  - 'F7 green: `relative_links_in_readme_and_docs_resolve` still passes across a rewrite that moved most
+    of the links on the page.'
+  - 'cargo test --test docs_drift --test guide_pages: 24 passed, 1 failed, the failure being F5''s release
+    table, which task T05 writes.'
+  - 'One defect the local doc gates could not see, found by CI: `tests/readme.rs::readme_opens_as_a_landing_page`
+    asserts the first 60 lines carry a prose sentence, a runnable fence AND the MSRV. The new table of
+    contents listed all fourteen subsections of the capability section and pushed the MSRV past line 60.
+    The landing page''s own gate caught the landing page. Fixed by stopping the contents list at the section;
+    readme.rs is 8 of 8 green.'
+  - 'After that, every test file that reads README.md, docs/CONTRACT.md or docs/CAPABILITIES.md was enumerated
+    rather than assumed: readme.rs, docs_drift.rs, guide_pages.rs and cache_boundary.rs read the real
+    files; git.rs, list_dir.rs, skills.rs and worktree.rs write their own fixtures. cache_boundary.rs
+    asserts four stale caching phrases appear in neither README nor CONTRACT — checked, all zero.'
+- id: US-IO-HARNESS-0.60.1-T03
+  summary: Correct the AppContainer claim in docs/CONTRACT.md, sweep the file for other outlived claims,
+    and add the F4 test.
+  why_required: '`docs/CONTRACT.md` is what a caller may depend on, and it currently tells a reader that
+    nothing selects the Windows AppContainer — false since 0.59.0 shipped `SandboxConfig::with_access_confinement()`.
+    A contract that is wrong about the security boundary is worse than one that is silent, because a reader
+    who checks is misinformed rather than uninformed.'
   status: done
-  depends_on:
-  - US-IO-HARNESS-0.60.0-T03
+  depends_on: []
   acceptance_criteria:
-  - '**F6 — a bounded wait returns on the message.** An agent reading with `wait_secs: 30` returns as
-    soon as a sibling sends, not at the clock, and the elapsed time is asserted as *less than* the clock
-    rather than as a duration. Sabotage: sleep the full clock before checking the mailbox, under which
-    the read still succeeds but takes the whole clock and only F6 fails.
+  - '**F4 — the contract no longer claims the AppContainer is unselected.** A test asserts `docs/CONTRACT.md`
+    contains `with_access_confinement` and does not contain the phrase "nothing selects it". Sabotage:
+    restore the 0.26.0-era sentence, under which only F4 fails. This is the narrow, checkable half of
+    the manual sweep; the sweep itself is evidenced by the review.
 
     '
-  - '**F7 — a bounded wait returns at the clock when nothing arrives, and says so.** The observation
-    distinguishes "nothing was sent" from "nothing was sent yet and I stopped waiting", because a model
-    that cannot tell them apart cannot decide whether to wait again. Sabotage: return the same text
-    for both, under which only F7 fails.
-
-    '
-  - '**F8 — a wait on an agent that has already finished and said nothing returns immediately.** Asserted
-    on elapsed time against a clock of 30 seconds, and on the text naming that the agent finished. Sabotage:
-    remove the terminal check, under which the read burns the full clock and only F8 fails.
-
-    '
-  - '**F13 — the operator''s cap narrows the agent''s request, and the agent is told.** A run with `max_wait_secs
-    = 5` and an agent asking for 60 waits at most 5 and reads a line saying its request was narrowed.
-    The boundary pair is asserted **exactly**: a request of 5 is not narrowed and a request of 6 is,
-    so `>` in place of `>=` fails. Sabotage: apply the cap silently, under which the wait is correct
-    and the notice is absent; only F13''s second half fails, which is the point of asserting both.
-
-    '
-  - '**F14 — a project scope cannot widen the cap.** `max_wait_secs` in a `Project`-scoped `io.toml`
-    takes the lower of the two values. Sabotage: omit the key from `NARROWING`, under which the project
-    scope raises the ceiling and only F14 fails.
-
-    '
-  evidence:
-  - F6 — `a_wait_returns_when_the_message_arrives`. Asserted as elapsed < the clock the test itself
-    supplied (20s), never as an absolute duration. **This is the guard that caught the release's central
-    defect** — see the note below.
-  - 'F7 — `waiting_out_the_clock_reads_differently_from_finding_nothing`. Both sentences produced in
-    ONE run and compared: `[messages] nothing waiting` for a drain against `nothing arrived in 1s` for
-    a wait that expired.'
-  - 'F8 — `waiting_on_an_agent_that_has_finished_returns_at_once`. Sibling to sibling, and it has to
-    be: a PARENT waiting on its own child never reaches this path, because F9''s terminal post means
-    a finished child has always said exactly one thing to its parent. Elapsed asserted against a 30s
-    clock.'
-  - 'F13 — `the_operators_cap_narrows_the_request_and_says_so`. The boundary pair is exact: cap 5, a
-    request of 5 is NOT narrowed and a request of 6 IS, so `>` in place of `>=` fails. No arm of this
-    test spends a clock — a message (the child''s own terminal post) is already waiting, and the narrowing
-    is decided from the request and the cap before anything is read.'
-  - F14 — `a_project_scoped_file_may_lower_the_wait_ceiling_and_may_not_raise_it` in `tests/config.rs`,
-    plus `max_wait_secs_reaches_the_contract_through_the_ordinary_projection` and `a_misspelled_wait_ceiling_is_refused_by_name`.
-    60 config tests passed.
-  - '**A DEFECT NO TEST WOULD HAVE REPORTED, found by the clock.** The first implementation of the wait
-    slept. A detached child is a future in its parent''s own `inflight` set and nothing else polls it,
-    so a sleeping parent stopped the very siblings whose message it was waiting for: every wait ran
-    to its FULL clock and then succeeded on the step after. The suite was green throughout — 13 of 13
-    — and the only visible symptom was that the mailbox tests took 40 seconds. The fix is one call:
-    the wait is passed through `driving`, the helper 0.50.0 already wrote for the provider call. The
-    suite went from 40.24s to 0.65s. F6''s elapsed assertion is what makes this a test rather than an
-    anecdote.'
-  files:
-  - src/run.rs
-  - src/config.rs
-  - src/contract.rs
-  - tests/mailbox.rs
-- id: US-IO-HARNESS-0.60.0-T05
-  summary: The terminal post to the parent, and exactly-once delivery across a resume.
-  why_required: 'These are one task because they are the same claim from two sides: a wait unblocks
-    on the sender terminating, and a resumed tree must not re-deliver what it already delivered. Both
-    are properties of the `read_at` column rather than of anything in memory.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.60.0-T04
-  acceptance_criteria:
-  - '**F9 — a terminating agent posts to its parent, and the report is not duplicated.** After a child
-    finishes, its parent''s mailbox holds exactly one row from it, that row is the short terminal line
-    and not the composed report, and the composed report still reaches the parent through 0.50.0''s
-    path. Sabotage: post the whole report as the message body, under which the parent reads the report
-    twice and only F9 fails.
-
-    '
-  - '**F12 — a resumed tree reads the same messages in the same order, once.** A tree killed with messages
-    sent and unread, resumed in a new process, delivers each exactly once in row-id order; and a message
-    already read before the kill is not delivered again. Sabotage: key delivery on an in-process set
-    rather than the `read_at` column, under which the resume re-delivers and only F12 fails.
-
-    '
-  evidence:
-  - F9 — `a_finished_child_posts_once_and_the_report_still_arrives`. The parent's mailbox holds EXACTLY
-    one row from the child, its body starts `[finished] ` and is under 120 bytes, and 0.50.0's composed
-    report still reaches the parent's ledger. A report in the body would deliver it twice.
-  - 'F12 — `a_reopened_store_delivers_what_is_left_and_nothing_twice`. The store is closed and reopened
-    between the two reads, so a delivery marked anywhere but the row does not survive: three messages
-    read, two more sent, and the reopened store delivers exactly `finding 3` and `finding 4` in that
-    order and nothing a third time. The audit read then shows all five marked, so nothing was re-delivered
-    rather than merely not re-returned.'
-  - The terminal post is NOT made for a pause. A child stopped for a human has not terminated, and saying
-    it has would tell a waiting sibling to stop waiting for an agent that is about to carry on.
-  files:
-  - src/run.rs
-  - src/state.rs
-  - tests/mailbox.rs
-- id: US-IO-HARNESS-0.60.0-T06
-  summary: The surfaces — guide page, CONTRACT, CHANGELOG, README, `docs/public-api.txt`, rustdoc.
-  why_required: The contract's own risk register says the role/address confusion lives in the prose
-    more than in the code, and the standing rule is that documentation ships in the release that changes
-    the behaviour, never later.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.60.0-T05
-  acceptance_criteria:
-  - '**N4 — `docs/public-api.txt` gains exactly one line**, `struct AgentMessage`. The store methods
-    and the contract builder are methods on existing types, and that file tracks root-level types —
-    which is why 0.59.0''s prediction of movement there was wrong.
-
-    '
-  - '**N6 — no new runtime dependency.** `cargo tree` is still 402 on this machine. The wait is `tokio::time`
-    and a poll of a table this crate already opens; nothing is added for it.
-
-    '
-  evidence:
-  - 'N4 — **MET IN A DIFFERENT FORM, and the difference is the criterion''s own number.** `docs/public-api.txt`
-    gains **FIVE** lines, not the one the contract predicted: `struct AgentMessage`, `const ROOT_ADDRESS`,
-    `const SEND_MESSAGE_TOOL`, `const READ_MESSAGES_TOOL`, `const DEFAULT_MAX_WAIT`. The prediction
-    applied 0.59.0''s lesson too literally — that file tracks every NAME re-exported from `src/lib.rs`,
-    consts included (`SPAWN_TOOL` has been in it since 0.12.0), not root-level types only. The three
-    tool/address consts are `pub` for exactly the reason `SPAWN_TOOL` is: an `Observer` matching on
-    `EventKind::ToolCall` needs the string, and a literal typed into an embedder''s match arm goes stale
-    silently. Carried as a `known_limitations` line rather than glossed.'
-  - 'The insertion was made in place rather than by re-sorting the file: `docs/public-api.txt` is not
-    perfectly sorted, and a wholesale sort produced a 12-insertion/7-deletion diff of unrelated churn.
-    `git diff --stat` reads **5 insertions, 0 deletions**.'
-  - N6 — no new runtime dependency. The wait is `tokio::time` and a poll of a table this crate already
-    opens; nothing was added for it.
-  - 'Surfaces, all in this release rather than later: `docs/guide/mailbox.md` (new, with its limits
-    block), its rows in `docs/CAPABILITIES.md` and the README table, a README prose paragraph, a `##
-    What an address reaches, and what a message is not (0.60.0)` section in `docs/CONTRACT.md` with
-    eight "stated plainly" bullets, a CHANGELOG entry with Added/Fixed/Changed/Schema, the crate-root
-    paragraph in `src/lib.rs`, and rustdoc with a worked example on every new public item.'
-  - '`tests/guide_pages.rs` has three gates a new page has to satisfy and they are easy to miss: the
-    page must be in `GUIDES` with its limits flag, it must be named in `docs/CAPABILITIES.md`, and nothing
-    unlisted may sit in `docs/guide/`.'
   files:
   - docs/CONTRACT.md
-  - docs/public-api.txt
-  - docs/guide/mailbox.md
+  - tests/docs_drift.rs
+  evidence:
+  - 'docs/CONTRACT.md:233 no longer says the AppContainer is built with nothing selecting it; it names
+    `SandboxConfig::with_access_confinement()` as the selector. F4''s test `contract_states_the_appcontainer_selector`
+    passes: the file contains `with_access_confinement` 4 times and `nothing selects it` 0 times.'
+  - 'The sweep found eight further outlived claims beyond the known defect, each corrected against the
+    source rather than the CHANGELOG''s prose: the browser''s ''Windows is not supported'' bullet, the
+    platform table''s single Windows row (now two backends), the unqualified ''sandboxed on Windows means
+    resource-capped'', the 0.47.0 rescheduling note, two open questions that 0.59.0 answered, the per-platform
+    enforcement table, the ExecMode ''enforces nothing for the filesystem'' claim, and the proxy-per-backend
+    table which had no AppContainer row.'
+  - 'One claim was verified in the source by the main thread rather than taken from the agent: `Sandbox::select`
+    at src/sandbox.rs:1112 selects the AppContainer only when `config.access_confinement && config.mode
+    != ExecMode::FullAccess`. That bound is narrower than the CHANGELOG''s prose, and the README was corrected
+    to carry it so N3 holds — no claim on the landing page is stronger than the contract''s.'
+  - 'Four items were found suspicious and deliberately left, with reasons recorded: a forward-looking
+    removal note for `user`, an unslotted `rusqlite::Error` variant, a ''named roadmap work'' phrase,
+    and a spawn-argument count that may have drifted by one. None is false today.'
+- id: US-IO-HARNESS-0.60.1-T04
+  summary: Bump the version to 0.60.1 and write the CHANGELOG section.
+  why_required: 'F5 requires the new release table to cover every version CHANGELOG.md declares, 0.60.1
+    included, so the CHANGELOG section must exist before that table can be complete. It also carries the
+    gate that most easily goes wrong on a patch: the README install snippet is pinned to major.minor and
+    must NOT move while Cargo.toml does.'
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - '**F8 — the existing docs gates stay green.** `msrv_is_stated_and_matches_cargo_toml`, `readme_dependency_version_matches_cargo_toml`,
+    `documented_feature_list_matches_cargo_toml`, `every_capability_has_a_guide_page`, `no_guide_page_is_orphaned_from_the_index`,
+    `the_guide_directory_holds_nothing_unlisted`, and the `public_api` and `changelog` suites. The dependency-version
+    gate is the one to watch, and on a patch it is the side that must **not** move: it pins the README''s
+    install snippet to Cargo.toml''s major.minor precisely so a patch does not churn it, so `io-harness
+    = "0.60"` stays exactly as it is while Cargo.toml goes to 0.60.1. A rewrite that "helpfully" writes
+    `"0.60.1"` into that snippet fails the gate, which is what the gate was written for after the line
+    sat at `"0.25"` for eleven releases.
+
+    '
+  - '**N2 — the version moves in exactly two files.** `Cargo.toml` and `Cargo.lock`, 0.60.0 → 0.60.1.
+
+    '
+  files:
+  - Cargo.toml
+  - Cargo.lock
   - CHANGELOG.md
-  - README.md
-  - src/lib.rs
-  - tests/guide_pages.rs
-- id: US-IO-HARNESS-0.60.0-T07
-  summary: The gates and the sabotage pass, run against the tree that ships.
-  why_required: A criterion with no evidence behind it is prose, and a guard whose sabotage kills nothing
-    is a test that never built the case the guard exists for. This is the task that turns the fifteen
-    functional criteria into the record's evidence.
+  evidence:
+  - 'Cargo.toml:3 and the io-harness entry in Cargo.lock both read 0.60.1; `grep 0.60.0 Cargo.toml Cargo.lock`
+    returns nothing. N2 satisfied: the version moved in exactly two files.'
+  - CHANGELOG.md gained `## [0.60.1] - 2026-08-16` between Unreleased and 0.60.0, written against docs/CHANGELOG_STRUCTURE.md
+    — categories in the mandated order with the empty ones omitted per its rule 3, and no breaking marker,
+    so tests/changelog.rs has nothing to enforce. The file keeps no bottom link-reference section, so
+    none was added.
+  - 'F8''s sharpest half green: `readme_dependency_version_matches_cargo_toml` passes with Cargo.toml
+    at 0.60.1 and the README snippet still reading `io-harness = "0.60"` — the patch did not churn the
+    install line, which is what that gate exists for.'
+- id: US-IO-HARNESS-0.60.1-T05
+  summary: 'Refresh docs/CAPABILITIES.md: the capabilities shipped since it was last touched, the pillars
+    table carried forward, the release table, and the F5 test.'
+  why_required: This is where the release-anchored facts removed from the README land, so the README rewrite
+    is only lossless if this task lands with it. The file also stops short of the browser, LSP and the
+    mailbox, which means the index a reader arriving at `docs/` is pointed at does not know about three
+    shipped capabilities.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.60.0-T06
+  - US-IO-HARNESS-0.60.1-T04
   acceptance_criteria:
-  - '**O1 — green on all three platforms.** `cargo test` and `cargo test --all-features` on ubuntu,
-    macos and windows through the release PRs. The wait has a clock in it and Windows runners are roughly
-    three times slower, so every timing assertion is written as a comparison against the clock it was
-    given, never as an absolute duration.
+  - '**F5 — the capabilities release table covers every released version.** A test parses the version
+    column of the new table in `docs/CAPABILITIES.md` and asserts it holds every version CHANGELOG.md
+    declares a `## [x.y.z]` section for, 0.60.1 included. Sabotage: drop the 0.53.0 row, under which only
+    F5 fails and names the missing version. This is what makes the table a list rather than a snapshot.
 
     '
-  - '**O2 — the gates, in the order the ledger requires.** `cargo fmt --check`, `cargo clippy --all-targets
-    --all-features -D warnings`, both test invocations, the nightly `RUSTDOCFLAGS="--cfg docsrs -D warnings"
-    cargo +nightly doc --all-features --no-deps`, the cross-version generator gate, and `cargo package
-    --locked`. The doc gates are re-run **after** the version bump, because the bump invalidates `readme_dependency_version_matches_cargo_toml`
-    and cost five red jobs in 0.57.0.
-
-    '
-  - '**O3 — a sabotage arm per functional criterion, run before the record is sealed.** An arm that
-    fails nothing is a finding about the test, recorded as such and fixed in the test or the product,
-    never propped up.
-
-    '
-  - '**O4 — the live instrument runs.** The two-child fan-out is an example in `examples/`, run against
-    a real provider before sealing, not only as a fixture. A fixture proves the plumbing and cannot
-    prove a model can use the tools it was given.
-
-    '
-  evidence:
-  - O3 — **15 sabotage arms, one per functional criterion, and all 15 kill the test they are aimed at**
-    on the tree that ships. Run by a script that applies one change, runs `cargo test --no-fail-fast
-    --test mailbox --test config --lib`, records every test that died, and reverts with `git checkout
-    -- src/`.
-  - '**One arm SURVIVED its first run, and it was a defect in this release''s own test.** F9 replaces
-    the terminal post''s body with the child''s own conclusion — the exact defect the criterion forbids
-    — and failed nothing, because `child_conclusion` reads the last `said` row and the fixture''s child
-    never said anything, so the arm fell back to the very line it was meant to replace. **A test asserting
-    "the body is the terminal line and NOT the report" cannot fail when its child has no report.** The
-    child now speaks, the assertion names the sentence the body must not carry, and the arm kills it.
-    Fixing it needed the scripted provider''s step type to return a whole `CompletionResponse` rather
-    than a list of tool calls — a scripted agent could not say anything at all before, a gap the older
-    tree suites share.'
-  - '**One arm was INERT rather than a finding, and the distinction matters.** F5''s first shape committed
-    the transaction and opened a second one before the marks. That fails identically under `PRAGMA query_only`,
-    so it could not express the defect at all — the same family as 0.58.0''s "both are the same connection".
-    The arm that does express it returns the rows and marks them afterwards outside any transaction,
-    ignoring the error, and it kills the test.'
-  - '**Fail-fast hid whole test targets and made one arm read as a survivor.** `cargo test --test a
-    --test b` stops at the first failing target, so an arm that killed a lib test never ran the integration
-    tests at all. `--no-fail-fast` is what makes a sabotage table mean anything. A second matcher defect
-    had the same shape: a lib test reports as `state::tests::name` and an integration test as `name`,
-    so comparing the two spellings reported F5 as a survivor when it had killed exactly the test it
-    was aimed at.'
-  - '**Three arms kill more than their named test, and that is expected rather than noise.** F1 (send
-    writes nothing) also kills F2 and F6, which both depend on a message arriving. F10 (refuse without
-    listing) also kills F11, whose refusal asserts the same listing. F12 (never write `read_at`) kills
-    four, because exactly-once is what three other tests rest on.'
-  - 'O4 — **the live example found a real defect and then passed.** `examples/mailbox_live.rs` against
-    a real provider: a per-run secret is written into a file, the `scout` reads it and messages the
-    `author`, the `author` blocks on `read_messages { from: "scout", wait_secs: 20 }` and writes what
-    it was told. Final run: `outcome: Success { steps: 3 }`, `answer.txt` carries `OTTER-24495`, and
-    the store shows the message from `scout` to the author plus both children''s terminal posts to the
-    root. The author had no other route to the value.'
-  - '**THE DEFECT ONLY THE LIVE RUN COULD FIND, and it is 0.50.0''s.** The model filled every property
-    of the spawn schema with its zero value — `"agent": ""`, `"deny_write": []`, `"deny_net": []`, `"background_after_secs":
-    0` — and `spawn_return` refused `wait: false` beside a zero clock as a contradiction. Six steps
-    in a row, never recovering, no detached child, therefore no concurrent siblings and no sibling messaging:
-    **0.60.0''s headline flow was unreachable for such a model.** 0.50.0 wrote the rule itself ("wait
-    zero seconds for it" and "do not wait for it" are the same request) and applied it to `wait: true`
-    only. Every OTHER zero-valued property in the same call was already read as "unset", which is what
-    makes the clock the odd one out rather than the model. Fixed, with the boundary asserted: zero detaches,
-    one is refused.'
-  - '**Two faults in the example''s own design, both found by running it.** (1) The scout''s first gate
-    was `secret.txt` contains `release` — satisfied before the scout did anything, so it "succeeded"
-    in one step having sent nothing. (2) A child copies the literal it is handed: given `verify_contains
-    "-"` the author wrote `-`; given `"OTTER-"` it wrote `OTTER-`. The fix is to stop the child''s own
-    gate competing with the work — its criterion is now `done.txt` containing `DONE`, and the release''s
-    actual claim is the ROOT''s gate, `answer.txt` containing the full per-run secret.'
-  - '**An empty `verify_contains` makes any run succeed immediately**, including one that wrote nothing:
-    a missing file reads as empty since 0.1.0 and `"".contains("")` is true. Pre-existing, not this
-    release''s business, recorded because it was hit while building the instrument.'
-  - '**Unprompted, the coordinator used the mailbox itself** — on a failed intermediate run it sent
-    `Please resend the release word to author` to the scout and a retry instruction to the author. Nothing
-    in its goal told it to; the tool descriptions were enough.'
-  - 'O2 — `cargo fmt --check` exit 0. `cargo clippy --all-targets --all-features -- -D warnings` exit
-    0. Default suite **88 binaries / 1,377 passed** and **457 doctests**, 0 failed. Nightly `RUSTDOCFLAGS="--cfg
-    docsrs -D warnings" cargo +nightly doc --all-features --no-deps` exit 0 **after catching two unresolved
-    links stable `cargo doc` cannot see** — ninth of the last eleven releases. Cross-version generator
-    gate: `gen-0.29.0` built and `cargo test --test cross_version_0_29_0 -- --ignored` 1 passed.'
   files:
-  - examples/mailbox_live.rs
-  - tests/mailbox.rs
+  - docs/CAPABILITIES.md
+  - tests/guide_pages.rs
+  evidence:
+  - 'docs/CAPABILITIES.md 125 -> 239 lines. New `## What shipped when` table: CHANGELOG.md declares 66
+    versions (0.1.0 through 0.60.1, the five historical patch releases included) and the table has 66
+    rows, verified set-equal in both directions with zero missing and zero extra.'
+  - 'F5 green: `the_capabilities_release_table_covers_every_released_version` passes. Its control `release_table_checker_reports_a_dropped_row`
+    names the dropped version, and `release_table_checker_does_not_count_a_version_named_in_prose` proves
+    a table row is required rather than a mention.'
+  - 'Eight capabilities added to ''Beyond the pillars'', each verified against its own guide page rather
+    than against the CHANGELOG: sessions, the mailbox, speculative read-ahead, the browser, LSP navigation,
+    configuration, hooks and undo.'
+  - The twelve-pillars table was deliberately NOT advanced. 0.58.0 (retention), 0.59.0 (Windows browser
+    and access confinement) and 0.60.0 (the mailbox) each extend a beyond-pillar capability rather than
+    a pillar, and no release contract for those versions claims one. The newest citation stays 0.57.0,
+    which is the honest answer rather than the flattering one.
+  - Every relative link in the file resolves, and the CHANGELOG anchors were generated by the GitHub rule
+    and machine-checked against each heading's real text.
+- id: US-IO-HARNESS-0.60.1-T06
+  summary: 'Run the full gate: the suite on all three platforms, the nightly rustdoc gate, and the documentation-only
+    diff assertion.'
+  why_required: N1 is the criterion that keeps this release what it says it is, and it can only be asserted
+    once every other task has landed its diff. The docs gates live inside the suite, so a documentation
+    release is exactly the one that must run all of it rather than less of it.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.60.1-T02
+  - US-IO-HARNESS-0.60.1-T03
+  - US-IO-HARNESS-0.60.1-T04
+  - US-IO-HARNESS-0.60.1-T05
+  acceptance_criteria:
+  - '**F8 — the existing docs gates stay green.** `msrv_is_stated_and_matches_cargo_toml`, `readme_dependency_version_matches_cargo_toml`,
+    `documented_feature_list_matches_cargo_toml`, `every_capability_has_a_guide_page`, `no_guide_page_is_orphaned_from_the_index`,
+    `the_guide_directory_holds_nothing_unlisted`, and the `public_api` and `changelog` suites. The dependency-version
+    gate is the one to watch, and on a patch it is the side that must **not** move: it pins the README''s
+    install snippet to Cargo.toml''s major.minor precisely so a patch does not churn it, so `io-harness
+    = "0.60"` stays exactly as it is while Cargo.toml goes to 0.60.1. A rewrite that "helpfully" writes
+    `"0.60.1"` into that snippet fails the gate, which is what the gate was written for after the line
+    sat at `"0.25"` for eleven releases.
+
+    '
+  - '**N1 — nothing under `src/` changes except documentation.** `git diff main -- src/` shows only lines
+    inside `//!` or `///` comments, and `docs/public-api.txt` is byte-identical to the 0.60.0 snapshot.
+    Asserted by reading the diff, and by `public_api.rs` staying green with no snapshot regeneration.
+    This is what makes 0.60.1 a documentation release rather than a feature one, and it is the criterion
+    the release fails on if a "small fix" is smuggled in beside the docs.
+
+    '
+  - '**O1 — CI is green on all three platforms** on the feature branch and again on the merge to develop.
+    A docs-only release still runs the whole suite, because the suite is where the docs gates live.
+
+    '
+  - '**O2 — the nightly rustdoc gate is green.** `RUSTDOCFLAGS` under nightly catches what stable `cargo
+    doc` cannot see, and it has caught something in four of the last five releases. A release that edits
+    doc comments is precisely the one that should not skip it.
+
+    '
+  files:
+  - docs/public-api.txt
+  evidence: []
+- id: US-IO-HARNESS-0.60.1-T07
+  summary: Add the supported-files-and-languages section to the README, and the checkers that keep it
+    complete.
+  why_required: Scope added mid-release by US-IO-HARNESS-0.60.1-I01. The page names the cargo features
+    that carry each file type and never the file types themselves, so the question a prospective user
+    actually asks — can it open this file, and what happens if it cannot — is answerable nowhere on the
+    landing page.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.60.1-T02
+  acceptance_criteria:
+  - '**F9 — the format list is complete, and stays complete.** A test asserts the README names every media
+    type in `IMAGE_MEDIA_TYPES`, every media type `decodable` converts, every media type the extension
+    map can produce but the crate refuses, and every one of the five document features. The lists are
+    read from `src/provider/mod.rs` by the test rather than retyped into it, so a format added to the
+    crate and not to the page fails the build. Sabotage: drop the TIFF row from the README, under which
+    only F9 fails and names `image/tiff`. This criterion exists because a format table is exactly the
+    kind of page that is right on the day it is written and wrong two releases later.
+
+    '
+  - '**F10 — the toolchain table names every marker the crate detects.** A test parses `MARKERS` out of
+    `src/toolchain.rs` — the list itself, not every quoted string in the file — and asserts each entry
+    appears on the README, with the `.csproj` pattern added explicitly because it is the one marker the
+    constant does not hold. Sabotage: drop the `mix.exs` row, under which only F10 fails and names it.
+    A row missing from that table reads as an ecosystem the harness does not support, which is a worse
+    error than an absent table.
+
+    '
+  files:
+  - README.md
+  - tests/docs_drift.rs
+  evidence:
+  - 'Three tables added: documents by direction (read / generate / edit in place, so pptx and barcode
+    stop looking bidirectional), images by media type with extensions and whether each is passed through,
+    converted to PNG, or refused by name, and the files the harness reads itself. The two bounds are stated:
+    5 MiB per image and 50,000,000 pixels checked from the header before any decode.'
+  - 'Every fact was read from source rather than from the guides: IMAGE_MEDIA_TYPES at src/provider/mod.rs:218,
+    the convertible set in `decodable` at src/provider/mod.rs:255, the extension map at src/provider/mod.rs:435
+    (which is where SVG, HEIC/HEIF and AVIF exist so a refusal can name them), MAX_IMAGE_BYTES and MAX_IMAGE_PIXELS,
+    and the twelve document tool descriptions in src/run.rs.'
+  - 'F9 green: `readme_lists_every_media_type_the_crate_names` parses the media types out of src/provider/mod.rs
+    rather than retyping them, so a format added to the crate and not to the page fails the build. Its
+    guard asserts the parse finds at least 12 types, and `format_source_parse_finds_the_accepted_the_converted_and_the_refused`
+    pins one type from each of the three sets so the parse cannot quietly narrow to the constant alone.'
+  - '`format_checker_reports_a_dropped_row` is the sabotage arm: TIFF removed from the table is reported
+    by name.'
+  - 'cargo test --test docs_drift --test readme --test guide_pages: 29 + 8 + 10 = 47 passed, 0 failed.'
+  - 'Widened per the same iteration record: the section now opens by stating there is NO source-extension
+    allowlist and why that is the design — read_file/write_file/edit_file/patch_file are extension-agnostic,
+    so .md, .txt, .rs, .py, a Dockerfile and a file with no extension are all the same to them. Publishing
+    a list of supported code formats would have been fiction.'
+  - 'The toolchain table published from src/toolchain.rs:349: 16 markers, 14 ecosystems, the lockfile-chosen
+    drivers for node (bun/pnpm/yarn/npm) and python (uv/poetry/pip), and the two deliberate orderings
+    (deno.json before package.json; Makefile last).'
+  - The five post-write type-check commands published with the reason the other nine ecosystems are skipped
+    — no cheap checker separate from their build.
+  - 'A language-server section stating there is no built-in language list either: name a server and its
+    extensions and the five lsp_ tools appear; configure none and the schemas are absent from the catalogue.
+    The two bounds are carried over — a server indexes files a deny_read rule covers, and it runs at the
+    harness''s own privilege.'
+  - 'F10 green: `readme_lists_every_toolchain_marker` parses MARKERS out of the source with a guard asserting
+    at least 16 entries, and `marker_parse_reads_the_list_and_not_the_whole_file` proves the parse does
+    not match every quoted string in the file — which would have ''found'' hundreds of markers and passed
+    against any README at all.'
+  - 'cargo test --test docs_drift --test readme --test guide_pages: 31 + 8 + 10 = 49 passed, 0 failed.
+    README table-of-contents: 15 links, 34 headings, none dangling.'

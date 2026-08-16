@@ -1,0 +1,401 @@
+product: io-harness
+version: 0.60.1
+status: planned
+release_type: patch
+
+outcome:
+  user_can: >
+    A developer deciding whether to embed this crate can read the landing page once and come away
+    knowing three things: what the harness does today, what the parts of it that cost anything
+    actually cost on a named machine, and which guarantees it holds that the harness they would
+    otherwise reach for does not.
+
+    **What the landing page is today.** 618 lines, of which 366 are one flat section — thirty-one
+    bold-led paragraphs with no index, no ordering a reader can predict, and no summary above them.
+    Every paragraph is accurate; density is not the problem. The problem is that most of them are
+    written as the release that added them rather than as the capability they are: "Since 0.46.0
+    every command `exec` ... runs inside the sandbox", "**0.47.0 closed the Linux hole in this
+    table**", "Through 0.48.0 a request held one system string", "Through 0.49.0 a child came back
+    as `[child 7 ...]`", "**0.59.0 closed the Windows hole**". A reader who has never run this crate
+    is being handed the diff between two releases they have never used, and has to reconstruct the
+    present state from it. That is CHANGELOG.md's job, and CHANGELOG.md does it — 6,301 lines of it.
+
+    **After this release** the README is present tense throughout. It opens with what the crate is
+    and a table of contents, states the capability matrix in one table before any prose, keeps the
+    prose that carries real depth, links the five measurements this repository has taken with the
+    machine named on each, and carries a comparison against the harnesses a reader is choosing
+    between — re-verified this release against each project's current sources and dated in the
+    table, so a reader can tell how old the claim is and check it.
+
+    **And no fact is lost.** Every release-anchored statement removed from the README lands in the
+    release table `docs/CAPABILITIES.md` already carries — a file already keyed by release, so the
+    project still has exactly one version history rather than a second one competing with the
+    CHANGELOG.
+  business_value: >
+    This crate is published. Its README is the crates.io page, and the crates.io page is where the
+    decision to embed it is made or lost. Sixty releases of work are behind a page that reads as an
+    internal engineering log, and the two things a reader most wants — what it costs, and why this
+    one rather than that one — are on it nowhere: `docs/MEASUREMENTS.md` holds five measured
+    benchmark sets and the README links it zero times, and the competitive position exists only in
+    `.ultraship/products/io-harness/product.yaml`, which is not published and is not read by anyone
+    outside this repository.
+
+    The doc audit that produced this release also found the landing page's neighbours drifting.
+    `docs/CONTRACT.md` — the file that says what a caller may depend on — still tells a reader that
+    the Windows AppContainer is built and that **nothing selects it**, which 0.59.0 made false by
+    shipping `SandboxConfig::with_access_confinement()`. A contract that is wrong about the
+    security boundary is worse than one that is silent, because a reader who checks is now
+    misinformed rather than uninformed.
+
+    The tests are the part that compounds. Three of the four gaps found here are the kind a reviewer
+    catches once and nothing catches again: a table with twenty-four rows where twenty-five pages
+    exist, a landing page that stops linking a document, a contract sentence outlived by a release.
+    `tests/docs_drift.rs` and `tests/guide_pages.rs` already exist and already convert this class of
+    claim into a build failure — this release extends them rather than trusting the next reviewer.
+  evidence_of_value: >
+    The functional criteria are the evidence: after this release a version number cannot appear in
+    the README's prose without a test failing, a guide page cannot exist without a README row, the
+    landing page cannot stop linking the measurements, and the contract cannot keep a claim a
+    release has outlived — each asserted by a test with a named sabotage that makes exactly that
+    test fail.
+
+    Beside them the manual evidence a reader's experience actually turns on: the rendered README
+    read top to bottom against `docs/CONTRACT.md`, confirming that every capability claim on the
+    landing page is one the contract also makes, at the same strength, with no claim widened in the
+    rewrite.
+
+scope:
+  included:
+  - >
+    **The README is rewritten in the present tense, and indexed.** A table of contents; an opening
+    that states what the crate is and who it is for before any capability; a capability matrix as
+    one table above the prose, so a reader who wants the shape gets it in one screen and a reader
+    who wants the depth reads on; the existing prose kept where it carries real depth and cut where
+    it narrates history. Every heading is reachable from the table of contents.
+  - >
+    **No release-version archaeology in the README prose.** The version references removed are the
+    narrative ones — "since 0.46.0", "0.47.0 closed", "through 0.48.0", "through 0.49.0", "0.59.0
+    closed", "**0.48.0 made egress per-host**", "by default as of 0.45.0", and the rest. The
+    version references *kept* are the two a landing page needs and a test must therefore permit: the
+    `[dependencies]` snippet, which `tests/docs_drift.rs` already pins to Cargo.toml's major.minor,
+    and the MSRV, which the same file already pins. Badges carry no literal version.
+  - >
+    **The removed facts move to the release table in `docs/CAPABILITIES.md`.** That file already
+    carries a table keyed by release — the twelve pillars, whose newest citation is 0.57.0. It gains
+    a companion table covering every release from 0.1.0 to 0.60.1: the version, the capability it
+    introduced in one line, and the CHANGELOG anchor. This is the list, and it is the only new home
+    — no new history file, because CHANGELOG.md is the version history and a second one is competing
+    truth.
+  - >
+    **Measured performance reaches the landing page.** A section summarising the five measurements
+    in `docs/MEASUREMENTS.md` — retention (0.58.0), recall ranking (0.57.0), capped memory write
+    (0.56.0), the image door (0.55.0), and starting a read before the completion ends (0.54.0) — each
+    with its machine named and each stated as what it is: a number this repository measured, on one
+    machine, asserted by no test. The section links the file for the method. No new measurement is
+    taken in this release.
+  - >
+    **A comparison table, re-verified this release and dated.** Two classes, because io-harness is
+    chosen against two different things. Against the agent harnesses a developer would otherwise
+    run — Claude Code, OpenAI Codex, opencode, pi, and Goose — on the four properties the product
+    definition names as the differentiator: a traced permission boundary, durable per-step resume,
+    an execution sandbox, and a spend ceiling shared across a tree of agents. Against the Rust
+    libraries a developer would otherwise embed — rig, swiftide, and langchain-rust — on what a
+    library is chosen for: whether the agent loop, the boundary, the trace and the accounting come
+    with it or are the embedder's to write. Every cell carries a source link and every row carries
+    the date it was checked. The 2026-07-28 audit in `product.yaml` is the starting point and not
+    the evidence; each claim is re-read against the project's current documentation or source before
+    it is published.
+  - >
+    **A supported-file-formats section on the README** (added by `US-IO-HARNESS-0.60.1-I01`). One
+    table per direction: the image types every provider accepts, the ones this crate converts to PNG
+    at the door, the ones it refuses by name with the conversion that fixes them, and the two bounds
+    that decide whether an image attaches at all. Beside it the document formats, each stated by
+    direction rather than by feature — read, generate, edit in place, or not at all — because read
+    from the feature table alone `pptx` and `barcode` both look bidirectional and neither is. The
+    refused formats are named deliberately: a list that omits what is unsupported reads as a claim
+    that everything else works.
+  - >
+    **The README guide table lists all twenty-five pages.** It lists twenty-four; `browser.md` is
+    linked in prose and absent from the table. Fixed, and given a test.
+  - >
+    **`docs/CONTRACT.md` stops claiming nothing selects the AppContainer.** Line 230 reads "The
+    access half is `AppContainer`, 0.26.0 built it, and nothing selects it yet." 0.59.0 shipped
+    `SandboxConfig::with_access_confinement()`. The paragraph is rewritten to state what the caller
+    may depend on today, and the rest of the file is swept for any other claim a release has
+    outlived — every version-numbered assertion in it is checked against the release that was
+    supposed to have satisfied it.
+  - >
+    **`docs/CAPABILITIES.md` covers what shipped after it was last touched.** "Beyond the pillars"
+    names neither the browser (0.53.0), nor LSP navigation (0.52.0), nor the mailbox (0.60.0), nor
+    sessions, hooks, configuration, undo, or speculative reads. All are added, and the pillars table
+    is carried through 0.60.1.
+  - >
+    **Four new drift tests**, each in the file that already owns its class of claim:
+    `readme_states_no_release_version_outside_the_pinned_lines` and
+    `readme_links_the_measurements` in `tests/docs_drift.rs`;
+    `every_guide_page_has_a_readme_row` in `tests/guide_pages.rs`; and
+    `the_capabilities_release_table_covers_every_released_version`, which parses the new table
+    against the versions CHANGELOG.md declares — so the list cannot silently stop being the list.
+  - >
+    **The CHANGELOG entry, and the version bump.** `0.60.1` in Cargo.toml and Cargo.lock, and a
+    `## [0.60.1]` section written under the structure `docs/CHANGELOG_STRUCTURE.md` requires.
+  excluded:
+  - >
+    **New measurements.** The five that exist are surfaced; none is re-run and no new benchmark is
+    written. A benchmark for the core loop — checkpoint cost, policy-check cost, fan-out throughput
+    — is worth having and is a release of its own, because writing one is `src/` work and this
+    release changes no behaviour.
+  - >
+    **Any behavioural change under `src/`.** Doc comments may change; nothing else may.
+    `docs/public-api.txt` must not move. This is the line that makes the release a patch, and it is
+    asserted rather than intended.
+  - >
+    **New guide pages.** The twenty-five that exist are the depth; the README is the index over
+    them. A capability whose page is thin is a finding for a later release, not something this one
+    fixes by writing a twenty-sixth.
+  - >
+    **Running the compared harnesses.** The comparison is a claim about documented guarantees read
+    from each project's own sources, not a benchmark of their behaviour. Publishing timings for
+    another project's software measured in an afternoon would be the least defensible thing on the
+    page.
+  - >
+    **Relicensing, renaming, or any change to `product.yaml`.** Planning does not own the product
+    definition; if the rewrite reveals the definition is wrong, that is `/ultraship:iterate`.
+  fallback_scope:
+  - >
+    The README rewritten to the present tense with its table of contents, capability matrix and
+    complete guide table; the stale `docs/CONTRACT.md` AppContainer paragraph corrected; and the
+    four drift tests. That is still a coherent release: the landing page is professional and the
+    three gaps that produced it cannot reopen.
+  - >
+    The comparison table is what drops first if re-verification cannot be completed honestly — it
+    becomes a capability table stating what io-harness holds, naming no other project. A comparison
+    published without current evidence is worse than none.
+  - >
+    The measurements section drops second, and only to a single link to `docs/MEASUREMENTS.md` from
+    the README, which is still strictly better than the zero links there today.
+
+acceptance:
+  functional:
+  - >
+    **F1 — the README carries no release-version reference outside the two pinned lines.** A test
+    scans README.md for a `\d+\.\d+\.\d+` literal and for the `X.YY.0` form the prose uses, and
+    fails on any occurrence outside the `[dependencies]` snippet and the MSRV sentence that
+    `tests/docs_drift.rs` already pins. Sabotage: reinstate one removed sentence — "**0.47.0 closed
+    the Linux hole in this table**" — under which only F1 fails. The control the same test carries:
+    the two permitted lines, present, must not trip it.
+  - >
+    **F2 — every guide page has a README row.** A test reads `docs/guide/*.md` and asserts each file
+    name appears in a table row of README.md, which is the check `guide_pages.rs` performs against
+    `docs/CAPABILITIES.md` and has never performed against the README. It must fail on today's
+    README, which is missing `browser.md` — a test that passes before the fix is a test that checks
+    nothing. Sabotage: delete a different row, `mailbox.md`, under which only F2 fails and names it.
+  - >
+    **F3 — the README links the measurements.** A test asserts README.md contains a relative link
+    to `docs/MEASUREMENTS.md`. It must fail on today's README, which contains zero. Sabotage: remove
+    the link, under which only F3 fails.
+  - >
+    **F4 — the contract no longer claims the AppContainer is unselected.** A test asserts
+    `docs/CONTRACT.md` contains `with_access_confinement` and does not contain the phrase "nothing
+    selects it". Sabotage: restore the 0.26.0-era sentence, under which only F4 fails. This is the
+    narrow, checkable half of the manual sweep; the sweep itself is evidenced by the review.
+  - >
+    **F5 — the capabilities release table covers every released version.** A test parses the version
+    column of the new table in `docs/CAPABILITIES.md` and asserts it holds every version CHANGELOG.md
+    declares a `## [x.y.z]` section for, 0.60.1 included. Sabotage: drop the 0.53.0 row, under which
+    only F5 fails and names the missing version. This is what makes the table a list rather than a
+    snapshot.
+  - >
+    **F6 — every comparison row is sourced and dated.** A test asserts each row of the comparison
+    table carries a link and a check date in ISO form, and that no date is older than this release's
+    own work. Sabotage: remove one row's citation, under which only F6 fails. A claim about another
+    project with no source is the one thing on this page that could be actionably wrong.
+  - >
+    **F7 — every relative link in the README and `docs/` resolves.** The existing
+    `relative_links_in_readme_and_docs_resolve` stays green across a rewrite that moves most of the
+    links on the page. No new test; this is the criterion that the rewrite did not break what was
+    already checked.
+  - >
+    **F8 — the existing docs gates stay green.** `msrv_is_stated_and_matches_cargo_toml`,
+    `readme_dependency_version_matches_cargo_toml`, `documented_feature_list_matches_cargo_toml`,
+    `every_capability_has_a_guide_page`, `no_guide_page_is_orphaned_from_the_index`,
+    `the_guide_directory_holds_nothing_unlisted`, and the `public_api` and `changelog` suites. The
+    dependency-version gate is the one to watch, and on a patch it is the side that must **not**
+    move: it pins the README's install snippet to Cargo.toml's major.minor precisely so a patch does
+    not churn it, so `io-harness = "0.60"` stays exactly as it is while Cargo.toml goes to 0.60.1. A
+    rewrite that "helpfully" writes `"0.60.1"` into that snippet fails the gate, which is what the
+    gate was written for after the line sat at `"0.25"` for eleven releases.
+  - >
+    **F9 — the format list is complete, and stays complete.** A test asserts the README names every
+    media type in `IMAGE_MEDIA_TYPES`, every media type `decodable` converts, every media type the
+    extension map can produce but the crate refuses, and every one of the five document features.
+    The lists are read from `src/provider/mod.rs` by the test rather than retyped into it, so a
+    format added to the crate and not to the page fails the build. Sabotage: drop the TIFF row from
+    the README, under which only F9 fails and names `image/tiff`. This criterion exists because a
+    format table is exactly the kind of page that is right on the day it is written and wrong two
+    releases later.
+  - >
+    **F10 — the toolchain table names every marker the crate detects.** A test parses `MARKERS` out
+    of `src/toolchain.rs` — the list itself, not every quoted string in the file — and asserts each
+    entry appears on the README, with the `.csproj` pattern added explicitly because it is the one
+    marker the constant does not hold. Sabotage: drop the `mix.exs` row, under which only F10 fails
+    and names it. A row missing from that table reads as an ecosystem the harness does not support,
+    which is a worse error than an absent table.
+  non_functional:
+  - >
+    **N1 — nothing under `src/` changes except documentation.** `git diff main -- src/` shows only
+    lines inside `//!` or `///` comments, and `docs/public-api.txt` is byte-identical to the 0.60.0
+    snapshot. Asserted by reading the diff, and by `public_api.rs` staying green with no snapshot
+    regeneration. This is what makes 0.60.1 a documentation release rather than a feature one, and
+    it is the criterion the release fails on if a "small fix" is smuggled in beside the docs.
+  - >
+    **N2 — the version moves in exactly two files.** `Cargo.toml` and `Cargo.lock`, 0.60.0 → 0.60.1.
+  - >
+    **N3 — no claim is widened.** Every capability sentence surviving into the rewritten README is
+    at most as strong as what `docs/CONTRACT.md` says about the same capability. Evidenced by the
+    review, page against contract, section by section — this is the criterion a test cannot carry
+    and the one a rewrite most easily fails.
+  - >
+    **N4 — the page renders.** The README renders correctly on GitHub and on crates.io: every
+    table, every relative link resolved against the raw URL crates.io uses rather than a repo path,
+    and the logo image still loading. crates.io does not resolve repository-relative links the way
+    GitHub does, which is why the current README already uses an absolute raw URL for the logo.
+  operational:
+  - >
+    **O1 — CI is green on all three platforms** on the feature branch and again on the merge to
+    develop. A docs-only release still runs the whole suite, because the suite is where the docs
+    gates live.
+  - >
+    **O2 — the nightly rustdoc gate is green.** `RUSTDOCFLAGS` under nightly catches what stable
+    `cargo doc` cannot see, and it has caught something in four of the last five releases. A release
+    that edits doc comments is precisely the one that should not skip it.
+  - >
+    **O3 — the published crate carries the new README.** Verified after publish by reading the
+    crates.io page, not by reading the local file.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io for the crate, GitHub for the Release and the rendered landing page. No service, no
+    deployment target, no migration — the artifact is a documentation change inside a published
+    library.
+  deployment_method: >
+    One feature branch off develop, one PR into develop, merged with the PR button. The release
+    commit bumps Cargo.toml and Cargo.lock and writes the CHANGELOG section; the UltraShip record is
+    sealed and the lock pinned in a commit on top. develop merges to main by PR, and the tag
+    `v0.60.1` is pushed on its own — pushing the tag is what cuts the GitHub Release, and creating
+    the Release by hand ships it with no assets. `cargo publish` is run manually, last, after the
+    Release exists, with the registry token sourced from the repo-local `.env`.
+  migrations:
+  - >
+    None. No schema, no checkpoint format, no configuration key, and no public item added, renamed
+    or removed. A program on 0.60.0 upgrading to 0.60.1 recompiles unchanged.
+  observability:
+  - >
+    The evidence for this release is the test suite and the rendered pages; there is no runtime
+    behaviour to observe. The one post-publish check is O3 — the crates.io page showing the new
+    README.
+  rollback: >
+    A documentation defect is fixed forward as 0.60.2, not rolled back. `cargo yank` removes 0.60.1
+    from resolution for new dependents and **does not delete it**: the version stays downloadable
+    and its README stays on the page, so yanking answers nothing a docs defect asks. The GitHub
+    Release and tag can be deleted; the crates.io publish cannot. That asymmetry is the reason O3 is
+    a criterion and not a courtesy.
+
+dependencies:
+  products: []
+  services:
+  - crates.io, for the publish and for the rendered page O3 verifies
+  - GitHub Actions, for CI on the three platforms and for the Release the tag cuts
+  - >
+    The public documentation and source of the compared projects — Claude Code, Codex, opencode, pi,
+    Goose, rig, swiftide, langchain-rust — read at verification time. If a project's documentation
+    cannot be reached or does not state a property clearly, that cell reads "not documented" rather
+    than being inferred, and the row records where that was checked.
+  human_approvals:
+  - >
+    The owner approves the rewritten README before it is published, because it is the crate's public
+    face and the one artifact here that cannot be un-published.
+  - >
+    The owner approves the comparison table specifically. It is the only part of this release that
+    makes a public claim about someone else's project.
+
+resource_profile:
+  complexity: small
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    **Re-verifying eight projects.** This is most of the release's cost and all of its uncertainty.
+    Each of the four properties has to be read out of that project's current documentation or
+    source, and a property that is "not documented" has to be distinguished from one that is absent
+    — which is a slower, more careful read than confirming a feature exists.
+  - >
+    **The rewrite itself against the contract.** N3 means every surviving sentence is checked
+    against `docs/CONTRACT.md`, and the current README is 618 lines of dense, precise prose that was
+    written carefully. Rewriting it is cheap; rewriting it without losing precision is not.
+  - >
+    **Sweeping `docs/CONTRACT.md`.** 2,917 lines, with version-numbered assertions throughout. The
+    AppContainer paragraph was found by grep; the rest of the sweep is a read.
+  preferred_tools:
+  - Grep over README, `docs/`, and `docs/guide/` for version literals and link targets
+  - The existing `tests/docs_drift.rs` and `tests/guide_pages.rs` as the pattern every new test follows
+  - >
+    Web reads of each compared project's own repository and documentation. Not a summary of them,
+    and not a memory of them — the source, at verification time, recorded as the citation the table
+    prints.
+  constraints:
+  - >
+    No `src/` behaviour change. The moment a fix is tempting, it is a different release.
+  - >
+    Nothing in this release may assert a duration or a timing. `docs/MEASUREMENTS.md` is surfaced,
+    not converted into a gate; this project has paid for a timing assertion on a CI runner more
+    times than for anything else.
+  - >
+    The README stays a landing page. Depth belongs in `docs/guide/`, the contract in
+    `docs/CONTRACT.md`, and history in CHANGELOG.md; a rewrite that pulls any of the three back onto
+    the landing page has recreated the file it replaced.
+
+risks:
+- >
+  **A comparison claim is wrong.** The projects compared are active and their documentation moves.
+  A published table saying a harness lacks something it shipped last week is both unfair and a
+  credibility cost on the very page that is arguing for this crate. Mitigated by citation and date
+  on every row, by "not documented" as a first-class cell, by comparing documented guarantees rather
+  than inferred behaviour, and by the owner approving the table before publish. The fallback is a
+  capability table naming nobody.
+- >
+  **The rewrite loses precision.** The current README's qualifications — what a passing gate does
+  not prove, where the boundary is not enforced, what the proxy is advisory about — are the most
+  valuable sentences on the page and the easiest to lose while making it scannable. N3 is the
+  criterion; the review is the mechanism.
+- >
+  **Version literals creep back in.** The archaeology is being removed from a page that is edited
+  every release, and the next release will want to write "new in 0.61.0". F1 is what makes that a
+  build failure rather than a habit.
+- >
+  **A documentation release is treated as a low-risk release.** It publishes to crates.io
+  irreversibly and its README replaces the one sixty releases produced. The full suite, all three
+  platforms, and the nightly rustdoc gate run exactly as they do for a release that ships code.
+- >
+  **The scope grows into the docs it touches.** Sweeping a 2,917-line contract and refreshing the
+  capabilities index invites fixing everything found. Anything that is not a stale claim is a
+  finding recorded for a later release, not work added here.
+
+open_questions:
+- >
+  **Which harnesses the table names.** The list proposed — Claude Code, Codex, opencode, pi, Goose,
+  and the three Rust libraries — comes from the 2026-07-28 audit plus the two obvious additions for
+  an embeddable-library comparison. Verification may show one of them is not a comparison a reader
+  would make, in which case it is dropped rather than kept for symmetry. Settled during the audit,
+  not now.
+- >
+  **Whether the release table lists patch versions.** 0.8.1, 0.9.1, 0.16.1, 0.16.2, 0.36.1 and this
+  release are patches, and a "what shipped when" table is about capability rather than about
+  numbering. F5 currently requires every version CHANGELOG.md declares, patches included, which is
+  the conservative reading and the one a test can check without a judgement call. Revisit only if
+  the table becomes unreadable.
+- >
+  **Whether the crates.io page needs its own README.** crates.io does not resolve
+  repository-relative links the way GitHub does. N4 requires the page to render; if it turns out
+  the guide links are dead on crates.io, the choice between absolute raw URLs everywhere and a
+  `readme = ` pointing at a second file is a decision this release has to make rather than defer.

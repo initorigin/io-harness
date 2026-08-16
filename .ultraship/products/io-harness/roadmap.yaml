@@ -1608,3 +1608,31 @@ versions:
       version.
     detail: specified
     status: released
+  - version: 0.60.1
+    outcome: >
+      The landing page tells the truth about the crate as it stands, in one reading. Sixty releases
+      of capability arrived one release at a time, and the README grew the same way: thirty-odd
+      paragraphs in one flat section, each written as the release that added it — "since 0.46.0",
+      "0.47.0 closed", "through 0.49.0 a child came back as". That is a changelog wearing a landing
+      page's clothes, and CHANGELOG.md is already the changelog. A developer deciding whether to
+      embed this crate reads what it does today, what it costs on a named machine, and how its
+      guarantees differ from the other open harnesses — and reads none of the archaeology.
+
+      This release rewrites the README to the present tense, indexes it, states the capability
+      matrix, surfaces the five measurements this repository has actually taken, and publishes a
+      comparison against the harnesses it is chosen instead of — re-verified against their current
+      sources and dated, not carried over from the 2026-07-28 audit in `product.yaml`. The
+      release-anchored facts are not deleted; they move to the release table in
+      `docs/CAPABILITIES.md`, which is already keyed by release, so nothing is lost and there is
+      still exactly one version history.
+
+      It also closes the doc drift the audit found: `docs/CONTRACT.md` still tells a reader that
+      nothing selects the Windows AppContainer, which 0.59.0 made false; the README's guide table
+      lists twenty-four of twenty-five pages; and nothing on the landing page links
+      `docs/MEASUREMENTS.md` at all. Each of the three is closed and each is given a test, because
+      a gap a reviewer found once and nothing checks is a gap that reopens.
+
+      No `src/` behaviour changes and `docs/public-api.txt` does not move, which is what makes this
+      a patch rather than a minor.
+    detail: specified
+    status: planned
