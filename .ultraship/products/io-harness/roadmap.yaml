@@ -1720,8 +1720,17 @@ versions:
       **Ordered before 0.63.0 deliberately.** That release decomposes `run.rs`, and every site this
       entry touches is inside it. Fixing them afterwards means re-finding the defect in a file that
       no longer has this shape, against tests that were never written.
-    detail: outline
-    status: planned
+
+
+      **One premise of this entry was wrong and is corrected in the contract.** It said
+      `tests/prompt.rs` "carries no assertion about the conversational opening at all — not its
+      ending, not its directive, not its boundary". The ending *is* asserted, in three places
+      (`V0490_CONVERSATIONAL` at line 37, and `ends_with(CONVERSATIONAL_ENDING)` at lines 297 and
+      1019). What the file has no assertion about is the directive, the boundary, and a preset on a
+      classifying turn — because its two helpers compose under `Policy::permissive()` with no plan
+      gate. The gap is real; its shape is narrower than this entry claimed.
+    detail: specified
+    status: released
   - version: 0.61.0
     outcome: >
       A developer who registers a custom tool under a name the harness already dispatches is told so
@@ -1850,5 +1859,26 @@ versions:
       before the journal, after the start, after the effect returned but before completion, and
       after completion — resumed in every case, asserting that an unsafe call is never silently
       duplicated.
+    detail: hypothesis
+    status: planned
+  - version: 0.66.0
+    outcome: >
+      A contained session turn takes the caller's contract, as every other turn entry point already
+      does. Today `Session::turn_contained` and `Session::turn_contained_observed` take a string and
+      build `TaskContract::workspace(text, root)` internally (`src/session.rs:582-603`,
+      `src/session.rs:652-677`, `src/session.rs:731-733`), so an operator whose turn may fan out
+      cannot give it a plan gate, a preset, a replaced or appended system prompt, repository
+      instructions, registered tools, a budget or a verification — every one of which the flat
+      `turn_bounded` accepts. A caller who wants both is told to pick one.
+
+      **Found by 0.60.3, and the reason three of its defects were latent**
+      (`US-IO-HARNESS-0.60.3-I01`). The tree loop reads `planning` from `contract.plan_gate` and its
+      framing from `contract.prompt`, and on a contained turn both are always the default — so
+      composition defects at those sites could not fire, and could not be asserted end to end
+      either. The fix is one contract-taking entry point beside the two that exist, which is new
+      public API and therefore a minor rather than the patch that found it.
+
+      Acceptance is that every claim 0.60.3 asserts at unit level over the tree loop's framings
+      becomes assertable end to end, through a session turn a caller shaped.
     detail: hypothesis
     status: planned
