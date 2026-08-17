@@ -354,6 +354,33 @@ pub enum Error {
         /// Why the run could not be resumed.
         reason: String,
     },
+
+    /// Another live owner holds this run, or holds the value a write expected to
+    /// replace (0.62.0). Typed separately from [`Error::Resume`] because the two
+    /// answer different questions: a resume refusal says the checkpoint cannot be
+    /// continued at all, and a conflict says it can — by somebody else, right now.
+    ///
+    /// It carries what a caller needs to choose between backing off and taking
+    /// over, so that choosing does not mean parsing a sentence. `owner` is the
+    /// opaque id of the holder and `expires_at` is when its lease lapses, after
+    /// which an acquire takes the run over rather than being refused. A conflict
+    /// on a session head carries the session id as `run_id` and an empty `owner`:
+    /// a head has no lease, only a value that moved under the writer.
+    ///
+    /// A conflict is recoverable by construction. Nothing was written when one is
+    /// returned — the losing step leaves no `steps` row and no checkpoint event,
+    /// because the check joins the transaction the commit already opens.
+    #[error("run {run_id} is held by another owner until {expires_at}")]
+    Conflict {
+        /// The run whose lease is held, or the session whose head moved.
+        run_id: i64,
+        /// The opaque id of the owner holding it. Empty for a session-head
+        /// conflict, which has a value that moved rather than a holder.
+        owner: String,
+        /// When the holding lease lapses, as an ISO-8601 UTC timestamp. Empty for
+        /// a session-head conflict, which does not expire.
+        expires_at: String,
+    },
 }
 
 impl Error {

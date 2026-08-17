@@ -48,9 +48,16 @@
 //!
 //! - The attaching process dying changes nothing. It holds no lock, no slot and
 //!   no lease; the owner never learns it was there.
-//! - The owning process dying leaves exactly the resumable run 0.7.0 has always
-//!   left. An approval nobody answered is an unresolved row, and
-//!   [`resume_with_decision`](crate::resume_with_decision) consumes it unchanged.
+//! - The owning process dying leaves the run resumable, and on unix at once: the
+//!   lease is taken over the moment that process is gone, so
+//!   [`resume_with_decision`](crate::resume_with_decision) is refused with
+//!   [`Error::Conflict`](crate::Error::Conflict) only while a *live* owner holds
+//!   an unlapsed lease. Where liveness cannot be answered — an owner id carrying
+//!   no readable pid, and every case on Windows — the owner counts as alive and
+//!   the wait is the ttl ([`TaskContract::lease_ttl`](crate::TaskContract::lease_ttl),
+//!   default [`DEFAULT_LEASE_TTL`](crate::DEFAULT_LEASE_TTL)). The approval nobody
+//!   answered is still an unresolved row, consumed unchanged by the resume that
+//!   does land.
 //!
 //! # First answer wins
 //!

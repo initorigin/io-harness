@@ -397,9 +397,13 @@ before anything is sent.
   decision it has made: the turn may still fall over to another provider, be
   retried, or be interrupted, and text already emitted is not withdrawn. Render
   it; do not act on it. The committed step is what is settled.
-* **One session, one driver.** Two processes taking turns on the same session id
-  at the same time is not supported and not defended against beyond SQLite's own
-  busy timeout. The turns would interleave into one tree in an order nobody chose.
+* **One session, one driver, and the loser is told (0.62.0).** Two processes
+  taking turns on the same session id at the same time still do not both land on
+  the head path. What no longer happens is one of them vanishing: the head moves
+  by compare-and-swap, so the write that loses gets `Error::Conflict` and its turn
+  row stays in `session_turns` exactly as it was — answered, billed, and readable,
+  ready to be rebased onto the head that won. The run behind each turn is leased
+  too, so a second process driving one run is refused before it takes a step.
 * **The tree is append-only.** There is no edit, no delete, and no "compact this
   conversation". A branch abandons turns; it does not remove them. What bounds a
   long conversation is the `ContextBudget`, which elides what the model sees and

@@ -26,6 +26,107 @@ notes are produced from it.
 
 ### Security
 
+## [0.62.0] - 2026-08-17
+
+Two processes can no longer both drive one run. A driver holds a lease with a
+generation, every durable step commit carries it, a second live owner is refused
+with a typed conflict instead of racing, an expired lease can be taken over, and
+a session's head advances by compare-and-swap so a lost update is a returned
+conflict rather than a silently dropped turn.
+
+Before this release nothing in the crate detected a live owner: two processes
+calling `resume` on one run both passed every check and interleaved their steps
+into a single trace, under one run id, each numbered from its own in-memory
+counter. The result read as a coherent run that neither process had performed —
+no error, no event, and nothing in the store afterwards to tell it from a real
+one. For a runtime whose durable trace is the thing it is for, that was the
+sharpest correctness boundary left open.
+
+### Breaking changes
+
+- **BREAKING (compile)** — `Error` gains a `Conflict { run_id, owner,
+  expires_at }` variant. A program matching `Error` exhaustively outside the
+  crate stops compiling until it handles or ignores the new arm. *Migration:*
+  add the arm, or a `_ =>` catch-all. A caller that already has one is
+  unaffected.
+- **BREAKING (behaviour)** — a second process driving a run its owner still
+  holds now gets `Error::Conflict` where it previously got a trace. For every
+  caller that did this by accident — a supervisor restarting a worker before the
+  old one exited, a resume issued from a CLI while a service still holds the
+  run — the previous behaviour was a corrupted trace, so this is a silent
+  failure becoming a loud one. A caller that deliberately drove one run from two
+  processes and tolerated the interleaving must now wait for the holder to finish
+  or its lease to lapse and take the run over. Only a *live* owner refuses a
+  resume: a run whose driver was killed is taken over at once, on unix and on
+  Windows, so `kill -9` and resume is unchanged. *Migration:* handle `Error::Conflict`; it
+  names the holder and when its lease expires.
+- **BREAKING (behaviour)** — a session-head write that lost a race used to
+  succeed silently and now returns `Error::Conflict`. The losing turn row is
+  left exactly as it was; only the head write is refused. *Migration:* where you
+  called `session.turn(...)` and ignored the possibility of a race, match
+  `Err(Error::Conflict { .. })` and either re-read the head with
+  `Store::session_head` and take the turn again, or keep the answer you have and
+  branch from it with `Session::branch_from`. A single-process program never sees
+  it. `Store::set_session_head` is unchanged and still writes unconditionally for
+  a caller that wants the old behaviour outright.
+
+### Added
+
+- `Store::acquire_lease`, `Store::renew_lease`, `Store::release_lease` and
+  `Store::run_lease`, with the `Lease` guard they hand back and the `LeaseRow`
+  they read. An acquire is refused only when the lease belongs to another owner,
+  has not lapsed, *and* that owner's process is still alive — checked against the
+  pid in the owner id with `kill(pid, 0)` on unix and with
+  `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` plus `GetExitCodeProcess` on
+  Windows, neither of them a dependency this crate did not already have — so a
+  `kill -9`'d owner's run is taken over at once rather than at the ttl on both. A
+  process that is there but somebody else's counts as alive: `EPERM` on unix, a
+  handle refused for lack of rights on Windows, where only
+  `ERROR_INVALID_PARAMETER` means no such process. The check errs
+  towards "alive", which is the direction that costs a wait rather than a second
+  driver: an owner id with no readable pid, a platform that is neither unix nor
+  Windows, and a Windows process that exited with code 259 — which is
+  `STILL_ACTIVE` and so cannot be told from a running one — all report the owner
+  as running, and the ttl governs exactly those cases and a recycled pid. A
+  lease is released when its guard drops, so no run-loop exit path had to grow a
+  release call. `Store::owner` is this handle's opaque owner id.
+- `Store::set_session_head_if`, the compare-and-swap behind every in-crate head
+  advance. `Store::set_session_head` is unchanged and still unconditional.
+- `TaskContract::lease_ttl` and `TaskContract::with_lease_ttl`, defaulting to
+  the new `DEFAULT_LEASE_TTL` — twice `DEFAULT_EXEC_TIMEOUT`, because the
+  renewal rides each step commit and so what the ttl must outlast is one step
+  rather than a whole run.
+- One additive table, `run_leases`. No index: `run_id` is its `INTEGER PRIMARY
+  KEY` and therefore a rowid alias, so every lookup the crate makes on it is
+  already a primary-key search. `CHECKPOINT_FORMAT` stays 7, and a 0.61.0 binary
+  opens a store this release wrote without ever naming the table.
+
+### Changed
+
+- `Store::checkpoint_step` verifies the caller's lease generation *inside* the
+  transaction it already opened, when the calling handle holds a lease on that
+  run. A driver whose run was taken over mid-completion therefore writes nothing
+  at all — no `steps` row and no `checkpoint_events` row — rather than writing a
+  step it was no longer entitled to. A handle holding no lease commits exactly as
+  it did before.
+- `Store::delete_session` and `Store::archive_session` now clear `run_leases`
+  along with every other run-keyed table.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **A session turn could be answered, billed, and then dropped without a word.**
+  `set_session_head` was a bare `UPDATE`, so two processes taking a turn on one
+  session both wrote their own turn id and the second won outright; the first
+  process's turn stayed in `session_turns` with its parent intact but off the
+  head path, invisible to every later turn. It is now a compare-and-swap and the
+  loser is told.
+
+### Security
+
 ## [0.61.0] - 2026-08-17
 
 Every name the harness answers is now reserved, and a test derived from the

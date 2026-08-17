@@ -476,10 +476,12 @@ own contract, so a question asked during one pauses the turn for a human rather
 than being answered in-process. Register a `Responder` by giving that turn a
 `TaskContract` through `turn_bounded`.
 
-**One session or run takes one driver.** Two processes answering the same question,
-or taking turns on the same session id, is not supported and not defended against
-beyond SQLite's own busy timeout. Answering an answered question is an error, which
-is a report of the race rather than protection from it.
+**One session or run takes one driver (0.62.0).** A run is driven under a lease, so
+a second process driving the same run is refused with `Error::Conflict` before it
+takes a step. A session head advances by compare-and-swap, so two processes taking
+turns on the same session id do not both land on the head path — the one that loses
+is told, and its turn row is left intact. Answering an answered question is still
+an error, which is a report of the race rather than protection from it.
 
 **A plan and a question belong to one run.** Both are keyed by `run_id`, so every
 turn of a session and every child of a tree has its own plan and its own questions.

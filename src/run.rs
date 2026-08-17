@@ -1270,6 +1270,11 @@ pub(crate) async fn run_with_extras<P: Provider>(
     let skills = contract.discover_skills()?;
     let file_str = contract.file.display().to_string();
     let run_id = store.start_run(&contract.goal, &file_str)?;
+    // The lease, taken the moment the run exists and released when this function
+    // returns however it returns (0.62.0). A fresh run's acquire cannot conflict —
+    // nobody else has this id yet — so the `?` here is for a store that failed to
+    // write, not for a race.
+    let _lease = store.acquire_lease(run_id, contract.lease_ttl.as_secs() as i64)?;
     // A session turn joins the tree here: after the run exists, before the first
     // completion is billed. The order matters — a turn row with no run to point at
     // would be a conversation entry nothing can explain.
@@ -1456,6 +1461,11 @@ pub async fn resume_observed<P: Provider>(
     // typed error, rather than misreading it or panicking. Before the policy
     // gate below, so an unknown run still reports as an unknown run.
     store.check_resumable(run_id)?;
+    // The lease (0.62.0). Taken after the resumability checks so an unknown run
+    // still reports as an unknown run, and before any step is driven so a second
+    // live driver is refused rather than interleaving its steps with the first
+    // one's. Released when this function returns, however it returns.
+    let _lease = store.acquire_lease(run_id, DEFAULT_LEASE_TTL.as_secs() as i64)?;
     // Before the gate, because a finished run is a read and not a resume: it
     // drives no loop, performs no action, and asks no provider, so there is no
     // boundary to drop and refusing it would break the "report, don't re-drive"
@@ -2242,6 +2252,11 @@ pub async fn resume_with_observed<P: Provider>(
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
     store.check_resumable(run_id)?;
+    // The lease (0.62.0). Taken after the resumability checks so an unknown run
+    // still reports as an unknown run, and before any step is driven so a second
+    // live driver is refused rather than interleaving its steps with the first
+    // one's. Released when this function returns, however it returns.
+    let _lease = store.acquire_lease(run_id, contract.lease_ttl.as_secs() as i64)?;
 
     if let Some(o) = finished_outcome(store, run_id)? {
         return Ok(RunResult::new(o, run_id));
@@ -2790,6 +2805,11 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
     observer: &dyn Observer,
 ) -> Result<RunResult> {
     store.check_resumable(run_id)?;
+    // The lease (0.62.0). Taken after the resumability checks so an unknown run
+    // still reports as an unknown run, and before any step is driven so a second
+    // live driver is refused rather than interleaving its steps with the first
+    // one's. Released when this function returns, however it returns.
+    let _lease = store.acquire_lease(run_id, contract.lease_ttl.as_secs() as i64)?;
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
     let pending = store
@@ -5867,6 +5887,39 @@ fn goal_digest(goal: &str) -> u32 {
 /// ```
 pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(30);
 
+/// How long a run's lease outlives its last durable step before another process
+/// may take the run over (0.62.0).
+///
+/// **Derived from this crate's own defaults rather than picked.** The lease is
+/// renewed by every step commit, so what it has to outlast is one step: one
+/// provider completion, plus at most one tool execution — and the crate already
+/// says how long a tool execution may be, at
+/// [`DEFAULT_EXEC_TIMEOUT`](crate::DEFAULT_EXEC_TIMEOUT), which is 900 seconds.
+/// Twice that leaves the same margin again for the completion that asked for the
+/// command and for a retry behind it.
+///
+/// **A killed process does not cost this wait where liveness can be checked.** A
+/// lease whose owner no longer exists is takeable immediately, so `kill -9` and
+/// resume stays immediate; this bounds the cases that cannot be checked — a
+/// recycled pid and an owner id with no readable pid. It is a lease with a ttl
+/// rather than a lock for that residue: a lock a dead process holds is an outage
+/// with no recovery at all.
+///
+/// ```
+/// use io_harness::{TaskContract, Verification, DEFAULT_EXEC_TIMEOUT, DEFAULT_LEASE_TTL};
+///
+/// // Long enough for one step: a command that runs to the exec ceiling, and the
+/// // completion that asked for it.
+/// assert_eq!(DEFAULT_LEASE_TTL, DEFAULT_EXEC_TIMEOUT * 2);
+/// let contract = TaskContract::new("tidy the notes", "NOTES.md", Verification::None);
+/// assert_eq!(contract.lease_ttl, DEFAULT_LEASE_TTL);
+///
+/// // An operator who wants the un-checkable cases to resolve sooner says so.
+/// let brisk = contract.with_lease_ttl(std::time::Duration::from_secs(60));
+/// assert!(brisk.lease_ttl < DEFAULT_LEASE_TTL);
+/// ```
+pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(1_800);
+
 /// How often a blocked read looks again (0.60.0).
 ///
 /// A poll rather than a notification, and the reason is that the mailbox is a
@@ -6448,6 +6501,10 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
     })?;
     let ledger = Arc::new(Ledger::new(containment));
     let run_id = store.start_run(&contract.goal, &root.display().to_string())?;
+    // As in `run_with_extras`. One lease, on the root: a tree is driven by one
+    // process by construction, and a second process is refused at the root before
+    // it can reach any child.
+    let _lease = store.acquire_lease(run_id, contract.lease_ttl.as_secs() as i64)?;
     // A session turn joins the tree here, in the same order and for the same
     // reason `run_with_extras` does it: after the run exists, before the first
     // completion is billed. A turn row with no run to point at would be a
@@ -6651,6 +6708,11 @@ pub async fn resume_tree_observed<P: Provider>(
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
     store.check_resumable(run_id)?;
+    // The lease (0.62.0). Taken after the resumability checks so an unknown run
+    // still reports as an unknown run, and before any step is driven so a second
+    // live driver is refused rather than interleaving its steps with the first
+    // one's. Released when this function returns, however it returns.
+    let _lease = store.acquire_lease(run_id, contract.lease_ttl.as_secs() as i64)?;
 
     // A finished tree is returned as-is — resume is idempotent for the whole tree.
     if store.run_status(run_id)? == Some(RunStatus::Completed) {

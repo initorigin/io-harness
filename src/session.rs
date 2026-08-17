@@ -22,8 +22,11 @@
 //! What a session is not: an authorization channel. An operator's mid-turn
 //! message is text the model reads, exactly as a constraint is; every tool call it
 //! leads to is checked against the same [`Policy`] by the same code. And one
-//! session driven by two processes at once is not supported — the turns would
-//! interleave into one tree with no ordering anybody chose.
+//! session driven by two processes at once no longer interleaves silently: both
+//! head advances here — [`Session::branch_from`] and the one at the end of a turn
+//! — are a compare-and-swap on the head that was read, so the second writer is
+//! told with [`Error::Conflict`] and its turn is left out
+//! of the tree. That reports a dropped turn; it does not make both of them land.
 
 use std::path::{Path, PathBuf};
 
@@ -238,8 +241,12 @@ impl Session {
                 turn.session_id, self.id
             )));
         }
+        // Compare-and-swap against the head this handle believes it is moving
+        // (0.62.0). A branch is a deliberate move to an earlier turn, and it is
+        // still a lost update if another process moved the head while this one was
+        // deciding — the local head is only advanced once the store took the write.
+        store.set_session_head_if(self.id, self.head, Some(turn_id))?;
         self.head = Some(turn_id);
-        store.set_session_head(self.id, self.head)?;
         Ok(())
     }
 
@@ -826,8 +833,19 @@ impl Session {
             .map(|s| s.outcome)
             .unwrap_or_else(|| "running".into());
         store.finish_turn(turn_id, reply.as_deref(), &outcome)?;
+        // Compare-and-swap against the head this turn was taken on (0.62.0). Two
+        // processes taking a turn on one session used to both write their own turn
+        // id and the second won outright, leaving the first process's turn in
+        // `session_turns` with its parent intact but off the head path — answered,
+        // billed, and invisible to the next turn.
+        //
+        // The turn row is deliberately left exactly as it is when this refuses.
+        // This release makes a dropped turn *reported*, not landed: the answer was
+        // produced and paid for, and deleting it would destroy the one copy of what
+        // the model said. The local head is not advanced either, so this handle
+        // does not go on believing it owns a head the store gave to somebody else.
+        store.set_session_head_if(self.id, self.head, Some(turn_id))?;
         self.head = Some(turn_id);
-        store.set_session_head(self.id, self.head)?;
 
         // What the loop decided, read from the row it wrote rather than re-derived
         // here from a step count — the "built from what the run recorded, not from

@@ -652,10 +652,10 @@ caller's own act — so treat a workspace the agent can write as a workspace who
 
 **The `[toolchain]` override is for the embedding application, not for this
 crate's run loop.** The harness detects a project's ecosystem for itself and does
-not consult a config, because reaching it would mean a new `TaskContract` field —
-a break this release does not carry. `Config::toolchain(detected)` gives every
-caller the merged value today; the run loop wiring is a
-later release's job.
+not consult a config. Reaching it would mean a new `TaskContract` field, which is
+an addition rather than a break — the type is `#[non_exhaustive]`, and 0.62.0 added
+`lease_ttl` that way. `Config::toolchain(detected)` gives every caller the merged
+value today; the run loop wiring is a later release's job all the same.
 
 **Two sections do not reject an unknown key, and they are these two.** A
 `[[mcp]]` table does not, because `McpServer` is `#[serde(flatten)]`-based and
