@@ -1483,14 +1483,48 @@ fn the_contracts_ownership_claims_match_the_source() {
     let commit_home = read("src/state/trace.rs");
     let run = read("src/run.rs");
 
-    // Claim: every `run_*` / `resume_*` takes a lease. The source is checked by
-    // counting acquire sites rather than by trusting the sentence: two run starts
-    // and four resume paths, which is every place the crate begins driving.
-    let acquires = run.matches("store.acquire_lease(").count();
-    assert_eq!(
-        acquires, 6,
-        "the contract claims every run and resume path takes a lease; src/run.rs has \
-         {acquires} acquire sites, not the two run starts and four resume paths it should"
+    // Claim: every `run_*` / `resume_*` takes a lease. **Derived, not counted.** A
+    // count of acquire sites is satisfied by six acquires in one function, and this
+    // release has already had one deleted from a path no test covers while the
+    // suite stayed green. The invariant is per function: every function that starts
+    // a run or checks one is resumable — which is every place the crate begins
+    // driving — takes a lease in the same body.
+    let mut missing = Vec::new();
+    for body in run
+        .split("\npub async fn ")
+        .skip(1)
+        .chain(run.split("\npub(crate) async fn ").skip(1))
+    {
+        let name = body
+            .split(['<', '('])
+            .next()
+            .unwrap_or("?")
+            .trim()
+            .to_string();
+        let body = body.split("\npub").next().unwrap_or(body);
+        let drives = body.contains("store.check_resumable(") || body.contains("store.start_run(");
+        if drives && !body.contains("store.acquire_lease(") {
+            missing.push(name);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "every entry point that starts or resumes a run takes a lease, and these do not: {missing:?}"
+    );
+    // The floor: if the parse stops finding entry points at all, the assertion
+    // above passes by finding nothing, which is how a derived test goes blind.
+    let drivers = run
+        .split("\npub async fn ")
+        .skip(1)
+        .filter(|b| {
+            let b = b.split("\npub").next().unwrap_or(b);
+            b.contains("store.check_resumable(") || b.contains("store.start_run(")
+        })
+        .count();
+    assert!(
+        drivers >= 3,
+        "the parse found only {drivers} driving entry points in src/run.rs, so it is \
+         checking almost nothing"
     );
     assert!(
         page.contains("takes a lease on the run it is about to drive"),

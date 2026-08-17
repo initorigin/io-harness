@@ -2256,6 +2256,7 @@ pub async fn resume_with_observed<P: Provider>(
     // still reports as an unknown run, and before any step is driven so a second
     // live driver is refused rather than interleaving its steps with the first
     // one's. Released when this function returns, however it returns.
+    let _lease = store.acquire_lease(run_id, contract.lease_ttl.as_secs() as i64)?;
 
     if let Some(o) = finished_outcome(store, run_id)? {
         return Ok(RunResult::new(o, run_id));
