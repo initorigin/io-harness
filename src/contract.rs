@@ -375,6 +375,19 @@ pub struct TaskContract {
     /// the run's whole time budget and the run reports a budget stop, which is
     /// the wrong diagnosis for what happened.
     pub exec_timeout: Duration,
+    /// How long this run's lease stays valid after its last durable step, before
+    /// another process may take the run over (0.62.0).
+    ///
+    /// Defaults to [`DEFAULT_LEASE_TTL`](crate::DEFAULT_LEASE_TTL). Set it with
+    /// [`TaskContract::with_lease_ttl`].
+    ///
+    /// **This is the fallback, not the primary rule.** A lease whose owning process
+    /// is gone is takeable at once — that is what keeps `kill -9` and resume
+    /// immediate — so the ttl governs only the cases liveness cannot answer: a
+    /// recycled pid, and an owner id with no readable pid.
+    /// The renewal rides each step commit, so what it has to outlast is *one step*,
+    /// a completion plus at most one tool execution, rather than a whole run.
+    pub lease_ttl: Duration,
     /// A wall clock for any child spawned without one of its own (0.50.0).
     ///
     /// `None` — the default — means a spawn that does not name
@@ -605,6 +618,7 @@ impl TaskContract {
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
+            lease_ttl: crate::DEFAULT_LEASE_TTL,
             spawn_background_after: None,
             detached_spawns: true,
             exec_sandbox: crate::sandbox::SandboxConfig {
@@ -680,6 +694,7 @@ impl TaskContract {
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
+            lease_ttl: crate::DEFAULT_LEASE_TTL,
             spawn_background_after: None,
             detached_spawns: true,
             exec_sandbox: crate::sandbox::SandboxConfig {
@@ -1210,6 +1225,26 @@ impl TaskContract {
     #[must_use]
     pub fn with_exec_timeout(mut self, exec_timeout: Duration) -> Self {
         self.exec_timeout = exec_timeout;
+        self
+    }
+
+    /// Set how long this run's lease outlives its last durable step before another
+    /// process may take the run over (0.62.0).
+    ///
+    /// The default, [`DEFAULT_LEASE_TTL`](crate::DEFAULT_LEASE_TTL), is derived
+    /// from this crate's own [`DEFAULT_EXEC_TIMEOUT`](crate::DEFAULT_EXEC_TIMEOUT)
+    /// rather than chosen: the renewal rides each step commit, so what the ttl has
+    /// to outlast is one step.
+    ///
+    /// Shorten it where liveness cannot be checked — a recycled pid, or a process
+    /// that exited with 259 on Windows — and a stuck run must be recoverable
+    /// quickly; lengthen it when a step
+    /// legitimately takes longer than the exec timeout, a provider slow to first
+    /// token behind a long tool call. A ttl shorter than a step is not an error and will not corrupt
+    /// anything: the run simply becomes takeover-able while it is still healthy,
+    /// and its next commit is then refused rather than landing wrongly.
+    pub fn with_lease_ttl(mut self, lease_ttl: Duration) -> Self {
+        self.lease_ttl = lease_ttl;
         self
     }
 

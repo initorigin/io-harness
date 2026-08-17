@@ -42,7 +42,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.61"
+io-harness = "0.62"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -140,6 +140,7 @@ layer.
 | **Verification** | Any language's own test command, a second model against a rubric, or no gate at all | [verification](docs/guide/verification.md) |
 | **Budgets** | Steps, wall-clock and token spend, from one ledger a whole tree of agents shares and no child can raise | [composition](docs/guide/composition.md) |
 | **Durable runs** | Trace, budget draw and checkpoint commit together after every completed step; a crash resumes the whole tree | [durable runs](docs/guide/durable-runs.md) |
+| **One driver per run** | Every run and resume takes a lease on the run it drives; a second driver is refused by name before it can interleave its steps into the trace | [durable runs](docs/guide/durable-runs.md) |
 | **Undo** | Per-file restore points and a whole-run rewind that leaves the ledger and the trace intact | [durable runs](docs/guide/durable-runs.md) |
 | **Agent composition** | Nested sub-agents over a shared workspace, inherit-and-narrow, with refusing and queueing caps | [composition](docs/guide/composition.md) |
 | **The mailbox** | Every agent in a tree has an address; siblings send findings and wait on each other, exactly once, replayed identically | [mailbox](docs/guide/mailbox.md) |
@@ -386,6 +387,28 @@ entries it wrote, and the spawn backlog it left queued, in one call — while th
 steps, the events and the ledger stay exactly as they were, because the spend
 happened and an undo that erased them would make the trace lie.
 
+A run is driven under a **lease**. Every `run_*` and `resume_*` takes one on the
+run it is about to drive and gives it back on the way out, whichever way it
+leaves; no entry point grew a parameter. While a live owner holds it, a second
+driver is refused with `Error::Conflict`, which names the holder and when its
+lease lapses — before it has driven a step. Unleased, both processes drive: their
+steps interleave into one trace under one run id that describes a run neither of
+them performed, with no error and nothing in the store afterwards to tell it from
+a real one.
+
+A crash is not a lock. A dead owner's lease is takeable at once, so `kill -9` and
+resume stays immediate on unix and on Windows alike — `kill(pid, 0)` there,
+`OpenProcess` plus `GetExitCodeProcess` here, neither a dependency the crate did
+not already have. The ttl — `TaskContract::lease_ttl`, `DEFAULT_LEASE_TTL`
+by default — governs only what liveness cannot answer: a recycled pid, an owner id
+with no readable pid, a third kind of platform, and a Windows process that exited
+with code 259, which is `STILL_ACTIVE` and so reads as running. A takeover raises the generation, and the previous owner's next
+durable commit is refused inside the transaction that would have written it, so
+it writes neither a step row nor a checkpoint event. A session head is not leased,
+because a conversation is meant to be branched: it advances by compare-and-swap
+instead, and the losing turn is reported with `Error::Conflict` and its row left
+intact rather than silently dropped.
+
 A run does not belong to the process that started it. `Broadcast` wraps whatever
 `Observer` you already have and writes each event to the store as it passes, so a
 second process can `Attach` to a run that is *still going*, read the same events,
@@ -394,7 +417,8 @@ answer it — without killing it and without resuming it. The first answer wins 
 the loser is told, because the write is a compare-and-swap on the row the run
 already reads. An attaching process reads and decides: there is no method on it
 that starts, resumes or steps a run, so killing the watcher changes nothing and
-killing the owner leaves exactly the resumable run it always did.
+killing the owner leaves a resumable run — its lease is takeable as soon as that
+process is gone, so a resume is refused only while a live owner still holds one.
 
 ### Providers
 
