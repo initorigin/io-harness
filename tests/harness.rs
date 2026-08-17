@@ -176,12 +176,32 @@ async fn a_contract_handed_to_the_harness_is_used_verbatim() {
 // F2 — the facade and the free function produce the same trace
 // ---------------------------------------------------------------------------
 
+/// A boundary that refuses the writes the scripted provider makes.
+///
+/// The permissive/open pair is not enough on its own — see the test below.
+fn closed_policy() -> Policy {
+    Policy::default()
+        .layer("test")
+        .allow_read("*")
+        .deny_write("*")
+}
+
 /// One contract, two stores, two ways in — and the canonical traces are equal.
 ///
 /// The stores are fresh for the reason `tests/determinism.rs` gives: run ids are
 /// `AUTOINCREMENT` and reach the model's own observations, so two runs sharing a
 /// store cannot be compared. Equality here is the whole claim that the `Harness`
 /// is a binding rather than a second implementation.
+///
+/// **Run twice, under two boundaries, and the second pair is the load-bearing
+/// one.** The first draft of this test compared only the open-policy pair, and a
+/// sabotage that made `with_policy` throw the caller's policy away — binding
+/// `Policy::permissive()` instead — **survived it**: the scripted run's writes are
+/// permitted by both, so the two traces matched and the test said nothing about
+/// the binding it exists to check. That is a finding about the test, recorded
+/// rather than quietly patched. The closed pair fixes it: under a policy that
+/// refuses the writes, a harness ignoring its bound policy would succeed where the
+/// free function is refused, and the traces diverge on the first step.
 #[tokio::test]
 async fn the_facade_and_the_free_function_produce_the_same_trace() {
     let contract = |root: &std::path::Path| {
@@ -193,42 +213,50 @@ async fn the_facade_and_the_free_function_produce_the_same_trace() {
             .with_max_steps(4)
     };
 
-    // Through the free function.
-    let dir = workspace();
-    let store = Store::memory().unwrap();
-    let provider = Script::default();
-    let direct = run_with(
-        &contract(dir.path()),
-        &provider,
-        &store,
-        &open_policy(),
-        &ApproveAll,
-    )
-    .await
-    .unwrap();
-    let direct_trace = store.canonical_trace(direct.run_id).unwrap();
+    let mut traces = Vec::new();
+    for (which, policy) in [("open", open_policy()), ("closed", closed_policy())] {
+        // Through the free function.
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let provider = Script::default();
+        let direct = run_with(&contract(dir.path()), &provider, &store, &policy, &ApproveAll)
+            .await
+            .unwrap();
+        let direct_trace = store.canonical_trace(direct.run_id).unwrap();
 
-    // Through the harness, with the same boundary bound instead of passed.
-    let dir = workspace();
-    let store = Store::memory().unwrap();
-    let provider = Script::default();
-    let harness = Harness::new(&provider, &store)
-        .with_policy(open_policy())
-        .with_approver(&ApproveAll);
-    let faced = harness.run(&contract(dir.path())).await.unwrap();
-    let faced_trace = store.canonical_trace(faced.run_id).unwrap();
+        // Through the harness, with the same boundary bound instead of passed.
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let provider = Script::default();
+        let harness = Harness::new(&provider, &store)
+            .with_policy(policy)
+            .with_approver(&ApproveAll);
+        let faced = harness.run(&contract(dir.path())).await.unwrap();
+        let faced_trace = store.canonical_trace(faced.run_id).unwrap();
 
-    assert!(
-        !direct_trace.is_empty(),
-        "an empty trace would make the comparison below vacuous"
-    );
-    assert_eq!(
-        direct_trace, faced_trace,
-        "the harness must drive the loop the free function drives, step for step"
-    );
-    assert_eq!(
-        format!("{:?}", direct.outcome),
-        format!("{:?}", faced.outcome)
+        assert!(
+            !direct_trace.is_empty(),
+            "{which}: an empty trace would make the comparison vacuous"
+        );
+        assert_eq!(
+            direct_trace, faced_trace,
+            "{which}: the harness must drive the loop the free function drives, step for step"
+        );
+        assert_eq!(
+            format!("{:?}", direct.outcome),
+            format!("{:?}", faced.outcome),
+            "{which}: same outcome"
+        );
+        traces.push(direct_trace);
+    }
+
+    // And the two boundaries really do produce different runs — without this, the
+    // closed pair could be a second copy of the open one and would re-prove
+    // nothing. This is what makes the policy binding observable at all.
+    assert_ne!(
+        traces[0], traces[1],
+        "the open and closed boundaries must drive different runs, or the closed pair adds \
+         no information and the sabotage that survived would survive again"
     );
 }
 
