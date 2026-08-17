@@ -3,7 +3,6 @@
 use super::*;
 
 impl Store {
-
     /// Type this run as a session turn that answered, or as one that did work.
     ///
     /// Called twice at most: once when the run row is created for a turn that is

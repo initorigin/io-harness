@@ -3,7 +3,6 @@
 use super::*;
 
 impl Store {
-
     /// This handle's opaque lease owner id (0.62.0).
     ///
     /// Two `Store` handles over one database file are two owners, whether or not

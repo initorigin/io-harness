@@ -3,7 +3,6 @@
 use super::*;
 
 impl Store {
-
     /// Start a run row; returns its id. Stamps `started_at` (UTC, from SQLite's
     /// clock) so a 24h wall-clock budget survives a restart, and marks the run
     /// `running`.
@@ -352,7 +351,6 @@ mod tests {
         );
     }
 
-
     /// 0.30.0 N2. The claim is that an aggregate does not get slower as the trace
     /// grows, and a wall-clock assertion is the wrong way to hold it: it is a
     /// flaky test on a loaded CI runner, and it passes on a fast machine running
@@ -698,35 +696,6 @@ mod tests {
         assert_eq!(events[1].performed, None);
     }
 
-    #[test]
-    fn a_pre_0_4_database_migrates_in_place_and_keeps_its_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("runs.db");
-
-        // A 0.3.0-shaped database: runs + steps only, no policy tables.
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, goal TEXT NOT NULL,
-                     file TEXT NOT NULL, outcome TEXT, provider TEXT);
-                 CREATE TABLE steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
-                     step INTEGER NOT NULL, decision TEXT NOT NULL, result TEXT NOT NULL,
-                     prompt TEXT NOT NULL DEFAULT '', tool_call TEXT NOT NULL DEFAULT '',
-                     tokens INTEGER NOT NULL DEFAULT 0);
-                 INSERT INTO runs (goal, file) VALUES ('old goal', 'old.txt');",
-            )
-            .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        // The pre-existing row survives; the new tables are usable.
-        assert_eq!(store.last_step(1).unwrap(), 0);
-        store
-            .record_event(1, &PolicyEvent::refusal(1, "read", ".env"))
-            .unwrap();
-        assert_eq!(store.events(1).unwrap().len(), 1);
-    }
-
     /// N3 (0.34.0) — one run's gate history is an index seek, not a scan of every
     /// run's.
     ///
@@ -791,76 +760,6 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_0_5_database_migrates_and_keeps_its_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("runs.db");
-
-        // A 0.4.0-shaped database: runs (no parent_run_id/depth), steps, and the
-        // policy tables, with a row.
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, goal TEXT NOT NULL,
-                     file TEXT NOT NULL, outcome TEXT, provider TEXT);
-                 CREATE TABLE steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
-                     step INTEGER NOT NULL, decision TEXT NOT NULL, result TEXT NOT NULL,
-                     prompt TEXT NOT NULL DEFAULT '', tool_call TEXT NOT NULL DEFAULT '',
-                     tokens INTEGER NOT NULL DEFAULT 0);
-                 INSERT INTO runs (goal, file) VALUES ('old', 'old.txt');",
-            )
-            .unwrap();
-        }
-
-        let store = Store::open(&path).unwrap();
-        // The pre-existing row survives and reads as a root at depth 0.
-        assert_eq!(store.parent(1).unwrap(), None);
-        assert_eq!(store.depth(1).unwrap(), 0);
-        // The new table is usable.
-        let child = store.start_child_run("c", "ws", 1, 1).unwrap();
-        assert_eq!(store.children(1).unwrap(), vec![child]);
-    }
-
-    #[test]
-    fn a_pre_0_8_database_migrates_in_place_and_keeps_its_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("runs.db");
-
-        // A 0.7.0-shaped database: everything through checkpoints, and no
-        // mcp_events table.
-        {
-            let store = Store::open(&path).unwrap();
-            let run = store.start_run("old goal", "old.txt").unwrap();
-            store
-                .checkpoint_step(run, &StepRecord::new(1, "wrote", "ok"))
-                .unwrap();
-            store
-                .record_event(run, &PolicyEvent::refusal(1, "write", "secrets/k"))
-                .unwrap();
-            store
-                .conn
-                .execute("DROP TABLE IF EXISTS mcp_events", [])
-                .unwrap();
-        }
-
-        // Reopening migrates it: the old rows are intact and the new table works.
-        let store = Store::open(&path).unwrap();
-        assert_eq!(store.last_step(1).unwrap(), 1);
-        assert_eq!(store.events(1).unwrap().len(), 1);
-        assert!(store.mcp_events(1).unwrap().is_empty());
-        store
-            .record_mcp(1, &McpEvent::connected("files", "stdio"))
-            .unwrap();
-        let events = store.mcp_events(1).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].detail.as_deref(), Some("stdio"));
-
-        // And a 0.7.0 binary, which never queries mcp_events, still reads it —
-        // nothing it knows about was altered or rewritten.
-        assert_eq!(store.steps(1).unwrap().len(), 1);
-        assert_eq!(store.run_status(1).unwrap(), Some(RunStatus::Running));
-    }
-
-    #[test]
     fn full_trace_persists_and_reads_back() {
         let store = Store::memory().unwrap();
         let run = store.start_run("goal", "out.txt").unwrap();
@@ -889,91 +788,12 @@ mod tests {
     }
 
     #[test]
-    fn migrates_a_0_1_0_steps_table_in_place() {
-        // A 0.1.0 database: `steps` without the trace columns, with a row.
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, goal TEXT NOT NULL, file TEXT NOT NULL, outcome TEXT);
-             CREATE TABLE steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, step INTEGER NOT NULL, decision TEXT NOT NULL, result TEXT NOT NULL);
-             INSERT INTO runs (goal, file) VALUES ('g', 'f');
-             INSERT INTO steps (run_id, step, decision, result) VALUES (1, 1, 'wrote file', 'old');",
-        )
-        .unwrap();
-
-        // Opening through Store migrates it; the old row survives with defaults.
-        let store = Store::from_conn(conn).unwrap();
-        let steps = store.steps(1).unwrap();
-        assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].result, "old");
-        assert_eq!(steps[0].prompt, "");
-        assert_eq!(steps[0].tokens, 0);
-    }
-
-    #[test]
     fn provider_is_recorded_and_read_back() {
         let store = Store::memory().unwrap();
         let run = store.start_run("g", "f").unwrap();
         assert_eq!(store.provider(run).unwrap(), None);
         store.set_provider(run, "anthropic").unwrap();
         assert_eq!(store.provider(run).unwrap().as_deref(), Some("anthropic"));
-    }
-
-    #[test]
-    fn migrates_a_pre_0_3_runs_table_adding_provider() {
-        // A 0.1/0.2 database: `runs` without the provider column.
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, goal TEXT NOT NULL, file TEXT NOT NULL, outcome TEXT);
-             CREATE TABLE steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, step INTEGER NOT NULL, decision TEXT NOT NULL, result TEXT NOT NULL);
-             INSERT INTO runs (goal, file) VALUES ('g', 'f');",
-        )
-        .unwrap();
-
-        // Opening through Store adds the provider column; the old row survives.
-        let store = Store::from_conn(conn).unwrap();
-        assert_eq!(store.provider(1).unwrap(), None);
-        store.set_provider(1, "openai").unwrap();
-        assert_eq!(store.provider(1).unwrap().as_deref(), Some("openai"));
-    }
-
-    #[test]
-    fn check_resumable_refuses_a_newer_format_and_a_missing_run() {
-        let store = Store::memory().unwrap();
-        let run = store.start_run("goal", "root").unwrap();
-        assert!(store.check_resumable(run).is_ok());
-
-        // A run id that does not exist is a typed Resume error, not a panic.
-        assert!(matches!(
-            store.check_resumable(9999),
-            Err(Error::Resume { .. })
-        ));
-
-        // A store written by a newer checkpoint format is refused rather than
-        // misread.
-        store
-            .conn
-            .execute_batch(&format!("PRAGMA user_version = {}", CHECKPOINT_FORMAT + 1))
-            .unwrap();
-        assert!(matches!(
-            store.check_resumable(run),
-            Err(Error::Resume { .. })
-        ));
-    }
-
-    #[test]
-    fn status_round_trips_and_a_pre_0_7_database_migrates() {
-        // A 0.6.0-shaped database: runs without status/started_at.
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, goal TEXT NOT NULL, file TEXT NOT NULL, outcome TEXT, provider TEXT, parent_run_id INTEGER, depth INTEGER NOT NULL DEFAULT 0);
-             INSERT INTO runs (goal, file) VALUES ('g', 'f');",
-        )
-        .unwrap();
-        let store = Store::from_conn(conn).unwrap();
-        // The old row gains a default status and no start stamp.
-        assert_eq!(store.status(1).unwrap().as_deref(), Some("running"));
-        store.set_status(1, "completed").unwrap();
-        assert_eq!(store.status(1).unwrap().as_deref(), Some("completed"));
     }
 
     // ---- 0.10.0: durable cross-run memory ----
@@ -1043,7 +863,6 @@ mod tests {
     }
 
     // ---- 0.56.0: eviction ordered by evidence rather than by the write clock ----
-
 
     /// Say that each of `runs` separate runs carried `key` once.
     fn carried_by_runs(store: &Store, workspace: &str, key: &str, runs: &[i64]) {

@@ -3,7 +3,6 @@
 use super::*;
 
 impl Store {
-
     /// Start a child run under `parent_run_id` at `depth`, so the tree records
     /// who spawned whom. Returns the child's run id.
     pub fn start_child_run(

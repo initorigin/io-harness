@@ -3,7 +3,6 @@
 use super::*;
 
 impl Store {
-
     /// Record a policy refusal or a human decision against a run.
     pub fn record_event(&self, run_id: i64, e: &PolicyEvent) -> Result<()> {
         self.conn.execute(

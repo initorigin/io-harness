@@ -1477,7 +1477,10 @@ fn the_undetected_live_owner_checker_rejects_the_retired_sentence() {
 #[test]
 fn the_contracts_ownership_claims_match_the_source() {
     let page = flatten(&read("docs/CONTRACT.md"));
-    let state = read("src/state.rs");
+    // The step commit moved to `src/state/trace.rs` in 0.62.0's split. Named
+    // explicitly rather than searched for: a checker that hunts for its subject
+    // across files is a checker that will one day find nothing and say nothing.
+    let commit_home = read("src/state/trace.rs");
     let run = read("src/run.rs");
 
     // Claim: every `run_*` / `resume_*` takes a lease. The source is checked by
@@ -1497,11 +1500,13 @@ fn the_contracts_ownership_claims_match_the_source() {
     // Claim: the generation is verified inside the transaction that writes the
     // step. Asserted against the order of the real statements: the lease check
     // must appear after the transaction is opened and before the step insert.
-    let commit = state
+    let commit = commit_home
         .split_once("pub fn checkpoint_step(")
-        .expect("checkpoint_step exists")
+        .expect("checkpoint_step is defined in src/state/trace.rs")
         .1;
-    let tx = commit.find("unchecked_transaction()").expect("the transaction");
+    let tx = commit
+        .find("unchecked_transaction()")
+        .expect("the transaction");
     let check = commit
         .find("SELECT generation FROM run_leases")
         .expect("the generation check");

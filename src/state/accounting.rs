@@ -2,7 +2,6 @@
 use super::*;
 
 impl Store {
-
     /// Record one call to a provider (0.18.0).
     ///
     /// Called once per attempt, by the run loop, for a call that answered and
@@ -484,7 +483,13 @@ impl Store {
     ///
     /// `only_nonempty` counts nothing that is already empty, which is what makes
     /// the archive's second run able to report honestly that it cleared nothing.
-    pub(super) fn sum_text(&self, table: &str, key: &str, ids: &str, only_nonempty: bool) -> Result<i64> {
+    pub(super) fn sum_text(
+        &self,
+        table: &str,
+        key: &str,
+        ids: &str,
+        only_nonempty: bool,
+    ) -> Result<i64> {
         let cols = Self::text_columns(&self.conn, table)?;
         self.sum_of(table, key, ids, &cols, only_nonempty)
     }

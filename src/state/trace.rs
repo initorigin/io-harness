@@ -3,7 +3,6 @@
 use super::*;
 
 impl Store {
-
     /// Record one sandbox lifecycle event against a run.
     pub fn record_sandbox_event(&self, e: &SandboxEvent) -> Result<()> {
         self.conn.execute(

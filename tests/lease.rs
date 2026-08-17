@@ -148,7 +148,11 @@ fn an_expired_lease_is_taken_over_and_a_live_one_is_not() {
         "a takeover moves the generation by exactly one"
     );
     assert_eq!(
-        first.run_lease(run).expect("a lease read").expect("a row").owner,
+        first
+            .run_lease(run)
+            .expect("a lease read")
+            .expect("a row")
+            .owner,
         second.owner(),
         "the row names the new holder"
     );
@@ -238,7 +242,10 @@ fn dropping_the_guard_releases_the_lease() {
     let run = first.start_run("port it", "openrouter").expect("a run");
     {
         let _held = first.acquire_lease(run, LIVE).expect("an acquire");
-        assert!(second.acquire_lease(run, LIVE).is_err(), "held while in scope");
+        assert!(
+            second.acquire_lease(run, LIVE).is_err(),
+            "held while in scope"
+        );
     }
     assert!(
         first.run_lease(run).expect("a lease read").is_none(),
@@ -388,9 +395,14 @@ async fn a_single_process_run_never_conflicts_and_releases_what_it_took() {
     );
 
     // And resume on the same store, in the same process, is refused by nothing.
-    let again = resume(&contract, &Script::new(&["SOLUTION\n"]), &store, first.run_id)
-        .await
-        .expect("resume in the same process is not a conflict");
+    let again = resume(
+        &contract,
+        &Script::new(&["SOLUTION\n"]),
+        &store,
+        first.run_id,
+    )
+    .await
+    .expect("resume in the same process is not a conflict");
     assert!(matches!(again.outcome, RunOutcome::Success { .. }));
     assert!(store
         .run_lease(first.run_id)
@@ -432,9 +444,7 @@ fn a_lost_session_head_update_is_reported_and_the_turn_survives() {
         .record_turn(session, Some(first_turn), losing_run, "three")
         .expect("a turn");
     match store.set_session_head_if(session, Some(first_turn), Some(losing_turn)) {
-        Err(Error::Conflict {
-            run_id, owner, ..
-        }) => {
+        Err(Error::Conflict { run_id, owner, .. }) => {
             assert_eq!(run_id, session, "a head conflict names the session");
             assert!(
                 owner.is_empty(),

@@ -3,7 +3,6 @@
 use super::*;
 
 impl Store {
-
     /// Every memory restore point this run wrote (0.36.0).
     ///
     /// Extracted to a `const` and executed as written so the query-plan test can

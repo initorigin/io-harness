@@ -3715,10 +3715,9 @@ mod memory;
 mod runs;
 mod schema;
 mod sessions;
-mod trace;
 #[cfg(test)]
 mod testutil;
-
+mod trace;
 
 /// Row ids as a SQL list. Every caller passes integers this crate minted, so
 /// there is nothing here to escape — the function exists because SQLite has no
@@ -3729,4 +3728,3 @@ pub(crate) fn id_list(ids: &[i64]) -> String {
         .collect::<Vec<_>>()
         .join(",")
 }
-
