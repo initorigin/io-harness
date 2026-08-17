@@ -8,7 +8,7 @@ tasks:
     F1 is the release's own claim and F5 is what keeps the fix from over-reaching. Both must be written
     and watched to fail before RESERVED_TOOL_NAMES grows, because a test written after a list edit only
     asserts that the list was edited.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - >
@@ -25,14 +25,27 @@ tasks:
     (`tests/custom_tools.rs:358`) stays green unedited as 0.17.0's own control.
   files:
   - tests/custom_tools.rs
-  evidence: []
+  evidence:
+  - >-
+    Two tests added to `tests/custom_tools.rs`: `no_name_the_harness_answers_can_be_taken_by_a_registered_tool`
+    over a new `NAMES_0_60_3_MISSED` holding all eighteen names, and the F5 control `a_name_the_harness_does_not_answer_is_still_the_callers_to_take`
+    over nine near-miss names (`browse`, `browser`, `browser_history`, `checker`, `lsp`, `git`, `forget_me`,
+    `message_send`, `my_tool`).
+  - >-
+    Watched F1 fail on the pre-fix tree. `cargo test --test custom_tools`: `test result: FAILED. 16 passed;
+    1 failed`, panicking at the first name — "a tool named after a built-in must be rejected: RunResult
+    { outcome: StepCapReached { steps: 1 }, run_id: 1, remembered: [] }". A registered `forget` did not
+    merely validate; the whole run completed around it.
+  - >-
+    The F5 control passed before the fix and must still pass after it — that is what makes F1 a measurement
+    of the gap rather than of `validate` in general.
 - id: US-IO-HARNESS-0.61.0-T02
   summary: Ungate the six browser name constants and grow RESERVED_TOOL_NAMES to the whole set.
   why_required: >-
     The live defect. The six browser consts are #[cfg(feature = "browser")], so the slice literal cannot
     name them in a default build until they are ungated — the ungate is not cosmetic, it is what makes
     the fix expressible, and it is 0.17.0's own answer for view_image.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.61.0-T01
   acceptance_criteria:
@@ -60,7 +73,22 @@ tasks:
   files:
   - src/tools/mod.rs
   - src/tools/custom.rs
-  evidence: []
+  evidence:
+  - >-
+    `src/tools/mod.rs`: the six `#[cfg(feature = "browser")]` attributes removed from the browser name
+    constants, with the rustdoc stating the 0.17.0 rule and naming the mechanical reason the reserved
+    set could not hold them. The tools stay gated — the dispatch arm at `src/run.rs:11806`, `src/tools/browser.rs`
+    and the catalogue are untouched.
+  - >-
+    `src/tools/custom.rs`: eighteen entries added to `RESERVED_TOOL_NAMES`, which stays a slice literal
+    of name constants and stays `pub(crate)`. 35 entries to 53.
+  - >-
+    `cargo test --test custom_tools`: `test result: ok. 17 passed; 0 failed`. F1 green over all eighteen,
+    F5 still green, and 0.17.0's `no_built_in_name_can_be_taken_by_a_registered_tool` plus its `the_0_16_2_reserved_set_accepted_git_status`
+    control green unedited.
+  - >-
+    `cargo check --features browser --lib` finished clean, which is the check that the ungated constants
+    do not collide with the gated module that reads them.
 - id: US-IO-HARNESS-0.61.0-T03
   summary: Write the source-derived invariant test with its floor and its CRLF parse control.
   why_required: >-

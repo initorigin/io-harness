@@ -497,25 +497,35 @@ impl Toolbox {
 /// The feature-gated built-ins this set names are reserved in every build,
 /// including builds that do not contain them — see
 /// [`VIEW_IMAGE_TOOL`](super::VIEW_IMAGE_TOOL) for why the alternative is worse.
+/// That is true of **every** feature-gated built-in as of 0.61.0, which is what
+/// ungating the six `browser_*` name constants bought: a name the harness owns is
+/// owned in all builds, and a list cannot name a constant a default build does
+/// not compile.
 ///
-/// **The set is not complete, and the 0.17.0 defect is open again for the names
-/// it omits.** Eighteen names dispatch answers today are absent from it:
-/// `forget`, `check`, `patch_file`, `git_branch`, `git_worktree`, the five
-/// `lsp_*` tools, the six `browser_*` tools, `send_message` and `read_messages`.
-/// Every one of those arms precedes the `custom.owns(name)` arm, so a registered
-/// tool taking one of them validates and is then unreachable — the same silent
-/// shadowing described above. It reopened because 0.17.0's fix was a
-/// hand-maintained list rather than an invariant, so each built-in added since
-/// reopened it by one name. 0.61.0 closes it as one const every dispatch arm
-/// reads, which is a change to what `Toolbox::validate` accepts and therefore
-/// not a patch.
+/// **Completed in 0.61.0, as a rule rather than a longer list.** 0.17.0 closed
+/// this once by hand-patching the names it was missing, and every built-in added
+/// afterwards reopened it by one — the worktree tool (0.36.0), `patch_file` and
+/// `check` (0.51.0), LSP navigation (0.52.0), the browser (0.53.0), `forget`
+/// (0.56.0), the mailbox (0.60.0), eighteen names in all. The list that closes it
+/// is not what keeps it closed:
+/// `every_name_the_harness_answers_is_reserved` in `tests/custom_tools.rs`
+/// derives the built-in set from the crate's own `*_TOOL` constants and fails
+/// when this slice does not hold it, in either direction. **Adding a built-in and
+/// not adding it here is a red test, not a defect found by the next audit.**
 ///
-/// The one name here that is not a dispatch arm is
-/// [`SPAWN_TOOL`](crate::SPAWN_TOOL), which the tree loop intercepts before
-/// dispatch. It shadows just as completely.
+/// Three names here are not dispatch arms:
+/// [`SPAWN_TOOL`](crate::SPAWN_TOOL), [`SEND_MESSAGE_TOOL`](crate::SEND_MESSAGE_TOOL)
+/// and [`READ_MESSAGES_TOOL`](crate::READ_MESSAGES_TOOL), which the tree loop
+/// intercepts before `dispatch` is reached. Inside a tree they shadow just as
+/// completely; a flat run is not offered them at all, so reserving them takes a
+/// name a caller could have used rather than one that was quietly broken. That is
+/// deliberate and it is `SPAWN_TOOL`'s own precedent: which run shape a program
+/// happens to start must not decide which names are safe to register.
 pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     super::WRITE_FILE_TOOL,
     super::EDIT_FILE_TOOL,
+    super::PATCH_FILE_TOOL,
+    super::CHECK_TOOL,
     super::EXEC_TOOL,
     super::SHELL_TOOL,
     super::SHELL_START_TOOL,
@@ -527,6 +537,7 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     super::READ_FILE_TOOL,
     super::READ_SKILL_TOOL,
     super::REMEMBER_TOOL,
+    super::FORGET_TOOL,
     super::TODO_WRITE_TOOL,
     super::ASK_QUESTION_TOOL,
     super::PROPOSE_PLAN_TOOL,
@@ -535,6 +546,19 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     super::GIT_DIFF_TOOL,
     super::GIT_ADD_TOOL,
     super::GIT_COMMIT_TOOL,
+    super::GIT_BRANCH_TOOL,
+    super::GIT_WORKTREE_TOOL,
+    super::LSP_DEFINITION_TOOL,
+    super::LSP_REFERENCES_TOOL,
+    super::LSP_SYMBOLS_TOOL,
+    super::LSP_HOVER_TOOL,
+    super::LSP_RENAME_TOOL,
+    super::BROWSER_NAVIGATE_TOOL,
+    super::BROWSER_READ_TOOL,
+    super::BROWSER_SCREENSHOT_TOOL,
+    super::BROWSER_CLICK_TOOL,
+    super::BROWSER_TYPE_TOOL,
+    super::BROWSER_SCROLL_TOOL,
     super::VIEW_IMAGE_TOOL,
     super::XLSX_READ_TOOL,
     super::XLSX_SHEETS_TOOL,
@@ -549,6 +573,8 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     super::PDF_FILL_FORM_TOOL,
     super::BARCODE_DECODE_TOOL,
     crate::run::SPAWN_TOOL,
+    crate::run::SEND_MESSAGE_TOOL,
+    crate::run::READ_MESSAGES_TOOL,
 ];
 
 impl fmt::Debug for Toolbox {

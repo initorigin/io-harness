@@ -378,6 +378,125 @@ fn the_0_16_2_reserved_set_accepted_git_status() {
     );
 }
 
+/// The names 0.60.3's reserved set left out — the same defect as
+/// `NAMES_0_16_2_MISSED` above, reopened once per built-in added since 0.17.0.
+///
+/// Sixteen of them are answered by a `dispatch` arm that precedes `name if
+/// custom.owns(name)`; `send_message` and `read_messages` are intercepted by the
+/// tree loop before `dispatch` is reached at all, which shadows a registered tool
+/// of that name just as completely inside a tree and — because a flat run is not
+/// offered them — is the one pair whose reservation takes away a configuration
+/// that worked. That is `spawn_agent`'s situation, settled the same way in
+/// 0.17.0.
+///
+/// The six `browser_*` names are here in every build, feature flags or not, for
+/// the reason 0.17.0 ungated the document and image names: a name the harness
+/// owns is owned in all builds, so enabling a feature can never take away a tool
+/// the caller had working.
+const NAMES_0_60_3_MISSED: &[&str] = &[
+    "forget",
+    "check",
+    "patch_file",
+    "git_branch",
+    "git_worktree",
+    "lsp_definition",
+    "lsp_references",
+    "lsp_symbols",
+    "lsp_hover",
+    "lsp_rename",
+    "browser_navigate",
+    "browser_read",
+    "browser_screenshot",
+    "browser_click",
+    "browser_type",
+    "browser_scroll",
+    "send_message",
+    "read_messages",
+];
+
+/// F1 — every name the harness answers is refused, by name, before the provider
+/// is called once.
+///
+/// The 0.17.0 test above proves the names *that release* added are still
+/// reserved. This one proves the eighteen added since are, and it is the whole
+/// live defect: each of these validated cleanly and was then unreachable for the
+/// life of the process, with no error, no event and no log line.
+#[tokio::test]
+async fn no_name_the_harness_answers_can_be_taken_by_a_registered_tool() {
+    for reserved in NAMES_0_60_3_MISSED {
+        let dir = ws();
+        let contract =
+            never_passes(dir.path(), 1).with_tools(Toolbox::new().with(Fixed::new(reserved, "x")));
+        let provider = MockScript::new(vec![]);
+        let err = run_with(
+            &contract,
+            &provider,
+            &Store::memory().unwrap(),
+            &open_policy(),
+            &ApproveAll,
+        )
+        .await
+        .expect_err("a tool named after a built-in must be rejected");
+
+        assert!(
+            matches!(err, io_harness::Error::Config(ref m) if m.contains(reserved)),
+            "expected a Config error naming {reserved}, got {err:?}"
+        );
+        assert_eq!(
+            provider.calls(),
+            0,
+            "arbitration must run before the provider is called"
+        );
+    }
+}
+
+/// F5 — a name the harness does **not** own still validates, and this is what
+/// makes the test above a measurement of the fix rather than of `validate` in
+/// general.
+///
+/// Every name here is one character or one word away from a built-in. Without
+/// this control, reserving a prefix — `browser_*`, `lsp_*`, `git_*` — would pass
+/// F1 and F2 while quietly forbidding a caller's whole namespace for a name the
+/// harness has no claim on.
+#[tokio::test]
+async fn a_name_the_harness_does_not_answer_is_still_the_callers_to_take() {
+    for allowed in [
+        "browse",
+        "browser",
+        "browser_history",
+        "checker",
+        "lsp",
+        "git",
+        "forget_me",
+        "message_send",
+        "my_tool",
+    ] {
+        let dir = ws();
+        let contract =
+            never_passes(dir.path(), 1).with_tools(Toolbox::new().with(Fixed::new(allowed, "x")));
+        let provider = MockScript::new(vec![]);
+        let outcome = run_with(
+            &contract,
+            &provider,
+            &Store::memory().unwrap(),
+            &open_policy(),
+            &ApproveAll,
+        )
+        .await;
+
+        if let Err(io_harness::Error::Config(ref m)) = outcome {
+            assert!(
+                !m.contains("takes the name of a built-in tool"),
+                "{allowed} is not a name the harness answers, and it was refused as one: {m}"
+            );
+        }
+        assert!(
+            provider.calls() > 0,
+            "{allowed} must reach the provider; arbitration refused it instead"
+        );
+    }
+}
+
 /// F3 — the `mcp__` prefix belongs to MCP servers and an in-process tool may not
 /// take it, or a server tool could be impersonated by a local one.
 #[tokio::test]
