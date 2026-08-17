@@ -5906,19 +5906,16 @@ pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(30);
 /// process holds is an outage with no recovery at all.
 ///
 /// ```
-/// use io_harness::{TaskContract, DEFAULT_EXEC_TIMEOUT, DEFAULT_LEASE_TTL};
+/// use io_harness::{TaskContract, Verification, DEFAULT_EXEC_TIMEOUT, DEFAULT_LEASE_TTL};
 ///
 /// // Long enough for one step: a command that runs to the exec ceiling, and the
 /// // completion that asked for it.
 /// assert_eq!(DEFAULT_LEASE_TTL, DEFAULT_EXEC_TIMEOUT * 2);
-/// assert_eq!(
-///     TaskContract::new("tidy the notes", "NOTES.md").lease_ttl,
-///     DEFAULT_LEASE_TTL,
-/// );
+/// let contract = TaskContract::new("tidy the notes", "NOTES.md", Verification::None);
+/// assert_eq!(contract.lease_ttl, DEFAULT_LEASE_TTL);
 ///
 /// // An operator who wants the un-checkable cases to resolve sooner says so.
-/// let brisk = TaskContract::new("tidy the notes", "NOTES.md")
-///     .with_lease_ttl(std::time::Duration::from_secs(60));
+/// let brisk = contract.with_lease_ttl(std::time::Duration::from_secs(60));
 /// assert!(brisk.lease_ttl < DEFAULT_LEASE_TTL);
 /// ```
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(1_800);
