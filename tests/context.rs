@@ -1289,6 +1289,103 @@ async fn a_resumed_run_sends_the_conversation_an_uninterrupted_run_would_have() 
     );
 }
 
+/// F3 (0.64.0) — a result that survives an elision keeps the position of the
+/// call it answers, even when its own step's other result did not survive.
+///
+/// **This is the assertion the end-to-end test could not make, and a sabotage is
+/// what showed that.** Counting ordinals only over the results a turn *carries*
+/// leaves every run-level test green: a step's results are elided together, so
+/// within a carried step the positions come out the same either way. The defect
+/// needs one step whose results straddle the boundary — and the way to get one is
+/// to supersede a single read rather than to squeeze a budget.
+///
+/// Step 1 reads `a.txt` and then `b.txt`; step 2 writes `a.txt`, which
+/// invalidates the first read and stubs it. The surviving result is still the
+/// **second** call of step 1, and saying it is the first would answer the wrong
+/// call at the vendor.
+#[tokio::test]
+async fn a_surviving_result_keeps_the_position_of_the_call_it_answers() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "NEW-CONTENT").unwrap();
+
+    let mut ledger = Ledger::new();
+    ledger.push(Observation::new(
+        1,
+        ObsKind::Read,
+        Some("a.txt".into()),
+        "\n[read a.txt]\nOLD-A\n",
+    ));
+    ledger.push(Observation::new(
+        1,
+        ObsKind::Read,
+        Some("b.txt".into()),
+        "\n[read b.txt]\nB-CONTENT\n",
+    ));
+    ledger.push(Observation::new(
+        2,
+        ObsKind::Write,
+        Some("a.txt".into()),
+        "\n[wrote a.txt] (11 chars)\n",
+    ));
+
+    let policy = open_policy().deny_read("a.txt");
+    let workspace = Workspace::with_policy(dir.path(), policy.clone());
+    let out = assemble(
+        &ledger,
+        24_000,
+        &[],
+        &[],
+        Assembly {
+            ws: Some(&workspace),
+            policy: &policy,
+            store: &store,
+            run_id: 1,
+            step: 3,
+        },
+    )
+    .await
+    .unwrap();
+
+    // The fixture must actually straddle: one of step 1's two results carried,
+    // the other not. Without that this asserts nothing about ordinals.
+    assert!(
+        !out.text.contains("OLD-A"),
+        "the superseded read must be stubbed, got:\n{}",
+        out.text
+    );
+    assert!(
+        out.text.contains("B-CONTENT"),
+        "and the other read of the same step must be carried, got:\n{}",
+        out.text
+    );
+
+    let step_one: Vec<&Piece> = out
+        .emitted
+        .iter()
+        .filter(|e| e.step == 1)
+        .map(|e| &e.piece)
+        .collect();
+    assert_eq!(
+        step_one.len(),
+        2,
+        "both of step 1's entries are emitted, the stub included: {:?}",
+        out.emitted
+    );
+
+    let surviving = out
+        .emitted
+        .iter()
+        .find(|e| e.text.contains("B-CONTENT"))
+        .expect("the carried read is emitted");
+    assert_eq!(
+        surviving.ordinal, 1,
+        "the surviving result answers the SECOND call of step 1; calling it the first \
+         would answer the wrong call: {:?}",
+        out.emitted
+    );
+}
+
 /// F3 (0.64.0) — and it still holds once the older observations are elided.
 ///
 /// This is the case a fix that only handles the happy path gets wrong. What a
