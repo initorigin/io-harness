@@ -3551,14 +3551,29 @@ fn apply_routing(
 /// unverified run has exactly the tool surface a verified one has, and a model
 /// that has finished says so by saying something.
 fn finished(contract: &TaskContract, response: &CompletionResponse) -> bool {
-    matches!(contract.verify, Verification::None)
-        && response.tool_calls.is_empty()
-        // 0.22.0 — and the turn actually ended. A provider running a long web
-        // search hands back what it has so far with a *paused* stop reason and no
-        // tool call, which is indistinguishable from a finished answer by the two
-        // conditions above. Ending there would stop an unverified run in the
-        // middle of the search it was told to make.
-        && !paused_turn(response)
+    matches!(contract.verify, Verification::None) && answered(response)
+}
+
+/// Did this completion end the exchange — no tool call, and not a pause?
+///
+/// The half of [`finished`] that is about the *response* rather than about the
+/// contract, split out in 0.63.0 because the two questions had been one function
+/// and a caller who wanted only the second could not ask it.
+///
+/// [`classify_first_completion`] is that caller. It has already decided whether
+/// this turn may answer — `TurnExtras::classify`, which
+/// `TaskContract::conversational` now sets — and asking `finished` re-derived
+/// `Verification::None` a second time, underneath the decision, so an explicit
+/// `conversational: Some(true)` on a judged turn set the flag and then had it
+/// silently overruled. The inference had two homes and the release moved one of
+/// them.
+///
+/// 0.22.0 — the pause. A provider running a long web search hands back what it
+/// has so far with a *paused* stop reason and no tool call, which is
+/// indistinguishable from a finished answer by the tool-call check alone. Ending
+/// there would stop the turn in the middle of the search it was told to make.
+fn answered(response: &CompletionResponse) -> bool {
+    response.tool_calls.is_empty() && !paused_turn(response)
 }
 
 /// Did the provider pause this turn rather than end it?
@@ -4164,13 +4179,18 @@ fn classify_first_completion(
     if !extras.classify || step != start_step {
         return Ok(None);
     }
-    // `finished` and not `tool_calls.is_empty()`: a provider that paused a long
+    // `answered` and not `tool_calls.is_empty()`: a provider that paused a long
     // server-side search hands back text with no call, which is a continuation
     // and not an ending. Reading it as an answer would stop an unverified turn in
-    // the middle of the search it was told to make. It also carries the
-    // `Verification::None` half, which is the same condition `Session`
-    // classifies on.
-    if !finished(contract, response) {
+    // the middle of the search it was told to make.
+    //
+    // `answered` and not `finished` (0.63.0): `finished` also asks
+    // `Verification::None`, which is the *same* question `extras.classify` above
+    // has already answered — and which `TaskContract::conversational` may now
+    // have answered differently. Asking it twice meant an explicit
+    // `conversational: Some(true)` on a judged turn set the flag and was then
+    // silently overruled here.
+    if !answered(response) {
         store.set_turn_kind(run_id, TURN_KIND_RUN)?;
         return Ok(None);
     }

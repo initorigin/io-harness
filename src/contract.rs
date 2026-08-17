@@ -239,6 +239,27 @@ pub struct TaskContract {
     /// [`TaskContract::with_verification`], since most workspace tasks have
     /// nothing to check and should not have to say so.
     pub verify: Verification,
+    /// Whether a session turn's first completion may decide the turn was
+    /// conversation and answer, rather than starting work (0.63.0).
+    ///
+    /// `None` — the default — infers it, as every release since 0.37.0 has: a
+    /// turn classifies exactly when the caller declared no criterion, because a
+    /// caller who said how the turn is judged has said it is work.
+    ///
+    /// The inference is right for the callers it was written for and wrong for
+    /// one real shape. An embedder building a chat surface that attaches a
+    /// criterion to *every* turn loses greeting handling entirely, with no way to
+    /// ask for it back — the turn is judged, so it is work, so "hello" starts a
+    /// run. `Some(true)` is that way back. `Some(false)` is the opposite request,
+    /// from a caller who wants an unverified turn to do the work anyway rather
+    /// than be allowed to answer.
+    ///
+    /// Read at one place — `Session::drive` — so the rule cannot hold at six turn
+    /// entry points and lapse at the seventh. It has no effect on a one-shot
+    /// `run_*` entry point, which never classifies at all.
+    ///
+    /// See [`with_conversational_turns`](TaskContract::with_conversational_turns).
+    pub conversational: Option<bool>,
     /// Step budget: hard cap on loop iterations. The run stops when reached.
     pub max_steps: u32,
     /// Time budget: the run stops if it runs longer than this. `None` = unbounded.
@@ -593,6 +614,7 @@ impl TaskContract {
             prompt: SystemPrompt::Builtin,
             instructions: Vec::new(),
             verify,
+            conversational: None,
             plan_gate: None,
             effort: None,
             reviewer: None,
@@ -669,6 +691,7 @@ impl TaskContract {
             prompt: SystemPrompt::Builtin,
             instructions: Vec::new(),
             verify: Verification::None,
+            conversational: None,
             plan_gate: None,
             reviewer: None,
             tool_hooks: None,
@@ -744,6 +767,45 @@ impl TaskContract {
     #[must_use]
     pub fn with_verification(mut self, verify: Verification) -> Self {
         self.verify = verify;
+        self
+    }
+
+    /// Say outright whether a session turn taken under this contract may decide
+    /// it was conversation and answer, instead of inferring it (0.63.0).
+    ///
+    /// The inference this overrides has been the rule since 0.37.0: a turn
+    /// classifies exactly when the caller declared no criterion. It is right for
+    /// the callers it was written for, and wrong for a chat surface that attaches
+    /// a criterion to every turn — that caller loses greeting handling with no way
+    /// to ask for it back, because a judged turn is work and "hello" starts a run.
+    ///
+    /// `true` restores it; `false` refuses it for an unverified turn that should
+    /// do the work anyway. Not calling this at all leaves the inference in place,
+    /// which is what every existing contract does.
+    ///
+    /// It governs [`Session`](crate::Session) turns only. A one-shot
+    /// [`run_with`](crate::run_with) never classifies, so this changes nothing
+    /// there.
+    ///
+    /// ```
+    /// use io_harness::{TaskContract, Verification};
+    ///
+    /// // A chat surface that judges every turn, and still wants "hello" answered.
+    /// let chat = TaskContract::workspace("hello", "/repo")
+    ///     .with_verification(Verification::Command {
+    ///         argv: vec!["cargo".into(), "test".into()],
+    ///         expect_exit: 0,
+    ///     })
+    ///     .with_conversational_turns(true);
+    /// assert_eq!(chat.conversational, Some(true));
+    ///
+    /// // Untouched, and therefore inferred exactly as before.
+    /// let plain = TaskContract::workspace("do the work", "/repo");
+    /// assert_eq!(plain.conversational, None);
+    /// ```
+    #[must_use]
+    pub fn with_conversational_turns(mut self, allowed: bool) -> Self {
+        self.conversational = Some(allowed);
         self
     }
 

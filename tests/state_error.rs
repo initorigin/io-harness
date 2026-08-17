@@ -54,14 +54,13 @@ fn sources() -> Vec<PathBuf> {
     out
 }
 
-/// No `pub` item's *surface* names `rusqlite`.
+/// Every line of `text` whose public surface names `rusqlite`, as `(line, source)`.
 ///
 /// A line is public surface if it declares a `pub` item or is a field or variant
-/// inside one. The check is deliberately a text parse of the declaration lines
-/// rather than of the whole file: `rusqlite` is used everywhere inside function
-/// bodies in `src/state/`, and that is exactly the difference between a
-/// dependency and a published interface.
-/// Every line of `text` whose public surface names `rusqlite`, as `line:source`.
+/// inside one. Deliberately a parse of the declaration lines rather than of the
+/// whole file: `rusqlite` is used everywhere inside function bodies in
+/// `src/state/`, and that is exactly the difference between a dependency and a
+/// published interface.
 fn storage_leaks(text: &str) -> Vec<(usize, String)> {
     let text = text.replace("\r\n", "\n");
     let mut leaks = Vec::new();
@@ -116,6 +115,7 @@ fn storage_leaks(text: &str) -> Vec<(usize, String)> {
     leaks
 }
 
+/// No `pub` item's surface names `rusqlite`, anywhere under `src/`.
 #[test]
 fn no_public_surface_names_the_storage_library() {
     let mut leaks = Vec::new();
