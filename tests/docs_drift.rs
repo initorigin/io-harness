@@ -1783,10 +1783,27 @@ fn the_contracts_resume_claim_matches_the_source() {
         .split("\n    pub ")
         .next()
         .expect("the commit's body");
+    // The claim is that the turn rides the transaction — so the commit must write
+    // it **through the transaction handle**, not merely mention the writer. This
+    // read the literal INSERT until the encoder was extracted into one function,
+    // and the gate went red on that refactor: the right answer was to assert the
+    // property against its new shape, not to widen the needle until it matched.
     assert!(
-        checkpoint.contains("INSERT OR REPLACE INTO step_turns"),
+        checkpoint.contains("write_step_turn(&tx,"),
         "the CONTRACT says the turn rides the transaction that commits the step; \
-         `checkpoint_step` does not write it"
+         `checkpoint_step` does not write it through `tx`"
+    );
+    // And the writer it calls is the one place the row is made, so there is one
+    // durable encoding rather than two that can drift. A sabotage found exactly
+    // that: the arm made one of two encoders lossy and the round-trip test, which
+    // exercised the other, stayed green.
+    let writers = commit_home
+        .matches("INSERT OR REPLACE INTO step_turns")
+        .count();
+    assert_eq!(
+        writers, 1,
+        "the turn is written from {writers} places in src/state/trace.rs; one durable format \
+         needs one encoder"
     );
 
     let run = run_subsystem();
