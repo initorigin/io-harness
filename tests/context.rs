@@ -1322,8 +1322,9 @@ async fn a_resumed_run_under_a_tight_budget_still_pairs_every_result_with_its_ca
             std::fs::write(dir.join(format!("f{i}.txt")), &filler).unwrap();
         }
     };
-    let tight_contract =
-        |dir: &std::path::Path, steps: u32| never_passes(dir, steps).with_context_budget(tight(1_000));
+    let tight_contract = |dir: &std::path::Path, steps: u32| {
+        never_passes(dir, steps).with_context_budget(tight(1_000))
+    };
 
     let whole_dir = ws();
     seed(whole_dir.path());

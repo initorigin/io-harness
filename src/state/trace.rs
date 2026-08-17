@@ -482,13 +482,12 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (step, text, calls) = row?;
-            let calls: Vec<ToolCall> =
-                serde_json::from_str(&calls).map_err(|e| Error::Resume {
-                    reason: format!(
-                        "run {run_id} step {step} has an assistant turn this binary cannot \
+            let calls: Vec<ToolCall> = serde_json::from_str(&calls).map_err(|e| Error::Resume {
+                reason: format!(
+                    "run {run_id} step {step} has an assistant turn this binary cannot \
                          read: {e}"
-                    ),
-                })?;
+                ),
+            })?;
             out.push(AssistantTurn { step, text, calls });
         }
         Ok(out)
@@ -1380,7 +1379,6 @@ mod tests {
         );
     }
 
-
     /// F2 (0.64.0) — a driver whose run was taken over writes no turn either.
     ///
     /// The whole reason the turn rides `checkpoint_step`'s transaction rather
@@ -1434,7 +1432,6 @@ mod tests {
         );
         drop(lease);
     }
-
 
     /// N4 (0.64.0) — what the durable turn costs per step.
     ///
@@ -1500,5 +1497,4 @@ mod tests {
              steps row + turn        {with:?}"
         );
     }
-
 }

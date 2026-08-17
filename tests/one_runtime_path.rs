@@ -567,10 +567,7 @@ fn every_loop_that_keeps_a_turns_map_restores_it_from_the_one_function() {
 
     // The control: the restore is one function, not one per loop. Two copies
     // would satisfy every assertion above and drift apart on the first fix.
-    let defined = items
-        .iter()
-        .filter(|f| f.name == "restore_turns")
-        .count();
+    let defined = items.iter().filter(|f| f.name == "restore_turns").count();
     assert_eq!(
         defined, 1,
         "`restore_turns` is defined {defined} times — the point of the assertions above is that \

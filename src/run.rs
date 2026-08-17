@@ -70,8 +70,7 @@ use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{
     AgentEvent, AssistantTurn, ContextEvent, GateOutcome, Kept, MemoryEntry, MemoryForget,
-    MemoryKind,
-    MemoryLimits, RunStatus, Snapshot, StepRecord, Store, TodoItem, TodoState,
+    MemoryKind, MemoryLimits, RunStatus, Snapshot, StepRecord, Store, TodoItem, TodoState,
     GLOBAL_MEMORY_WORKSPACE, MAX_SNAPSHOT_BYTES, ROOT_ADDRESS,
 };
 use crate::toolchain::Toolchain;
@@ -4300,7 +4299,9 @@ mod tests {
         });
         let paired = transcript(&user, &assembled, &turns);
         assert!(
-            paired.iter().any(|m| matches!(m, Message::Results(rs) if rs.len() == 2)),
+            paired
+                .iter()
+                .any(|m| matches!(m, Message::Results(rs) if rs.len() == 2)),
             "with both calls present the same results are one batch: {paired:?}"
         );
     }

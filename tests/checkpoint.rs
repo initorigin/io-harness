@@ -1331,10 +1331,16 @@ fn an_assistant_turn_round_trips_through_the_store_whole() {
         "every call survives, including the two a string join would fuse"
     );
     for (i, (want, got)) in calls.iter().zip(back[0].calls.iter()).enumerate() {
-        assert_eq!(&got.name, &want.name, "call {i} keeps its name and its order");
+        assert_eq!(
+            &got.name, &want.name,
+            "call {i} keeps its name and its order"
+        );
         // Compared as JSON, not as a string: two renderings of one object are
         // equal here and unequal as text, and the stored fact is the object.
-        assert_eq!(&got.arguments, &want.arguments, "call {i} keeps its arguments whole");
+        assert_eq!(
+            &got.arguments, &want.arguments,
+            "call {i} keeps its arguments whole"
+        );
     }
 }
 
@@ -1363,7 +1369,10 @@ fn an_absent_assistant_text_is_not_an_empty_one() {
     assert_eq!(back[1].step, 2);
     assert_eq!(back[0].text, None, "wrote nothing");
     assert_eq!(back[1].text.as_deref(), Some(""), "wrote an empty string");
-    assert_ne!(back[0].text, back[1].text, "and the two are not the same row");
+    assert_ne!(
+        back[0].text, back[1].text,
+        "and the two are not the same row"
+    );
 }
 
 /// A step committed twice keeps one turn — the last one it actually took.
@@ -1425,7 +1434,10 @@ async fn a_committed_step_leaves_the_turn_it_took() {
     .unwrap();
 
     let turns = store.step_turns(out.run_id).unwrap();
-    assert!(!turns.is_empty(), "the run committed steps, so it left turns");
+    assert!(
+        !turns.is_empty(),
+        "the run committed steps, so it left turns"
+    );
     let steps = store.steps(out.run_id).unwrap();
     assert!(
         turns.len() <= steps.len(),
@@ -1441,7 +1453,10 @@ async fn a_committed_step_leaves_the_turn_it_took() {
         );
         assert_eq!(turn.calls[0].name, "write_file");
         assert_eq!(
-            turn.calls[0].arguments.get("content").and_then(|v| v.as_str()),
+            turn.calls[0]
+                .arguments
+                .get("content")
+                .and_then(|v| v.as_str()),
             Some("ALPHA"),
             "the arguments are the model's own object, not a rendering of it"
         );
@@ -1485,7 +1500,8 @@ async fn a_store_written_before_the_turn_table_resumes_as_it_did_then() {
     let c = sqlite(&db);
     c.execute_batch("DROP TABLE step_turns;").unwrap();
     assert!(
-        c.query_row("SELECT 1 FROM step_turns", [], |_| Ok(())).is_err(),
+        c.query_row("SELECT 1 FROM step_turns", [], |_| Ok(()))
+            .is_err(),
         "the rewind removed the table"
     );
     drop(c);

@@ -1738,7 +1738,10 @@ fn carries_no_permanent_resume_prose_claim(page: &str) -> Result<(), String> {
 fn no_page_still_says_a_resumed_runs_history_stays_prose() {
     for (name, page) in [
         ("docs/CONTRACT.md", read("docs/CONTRACT.md")),
-        ("docs/guide/durable-runs.md", read("docs/guide/durable-runs.md")),
+        (
+            "docs/guide/durable-runs.md",
+            read("docs/guide/durable-runs.md"),
+        ),
     ] {
         if let Err(why) = carries_no_permanent_resume_prose_claim(&page) {
             panic!("{name}: {why}");
