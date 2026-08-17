@@ -1303,23 +1303,51 @@ async fn a_resumed_run_sends_the_conversation_an_uninterrupted_run_would_have() 
 /// The fixture asserts that elision actually happened before comparing anything.
 /// Under a budget nothing exceeds, this would be the flat test again wearing a
 /// different name.
+///
+/// **Two fixture properties this test cannot do without, and a sabotage found
+/// both.** The first version scripted one call per step, so every ordinal was 0
+/// and no ordinal defect could show; steps here issue two calls each. And the
+/// equality comparison alone is blind to a *systematic* ordinal error, because
+/// both arms run the same code and would be wrong together — so the correlation
+/// is also asserted absolutely, by reading each result's content back against the
+/// path named by the call it says it answers.
 #[tokio::test]
 async fn a_resumed_run_under_a_tight_budget_still_pairs_every_result_with_its_call() {
     // Sized like the ceiling test at the top of this file: each file is under the
     // per-read cap so the read succeeds, and four of them together are well over
     // the assembly budget so the older ones stub.
     let filler = format!("{}TAIL\n", "filler line\n".repeat(150));
+    // Two calls per step, so ordinals 0 and 1 both exist. With one call per step
+    // every ordinal is 0 and an ordinal that is counted wrongly still reads right.
     let script = || {
         MockScript::new(vec![
-            vec![call("read_file", json!({ "path": "f0.txt" }))],
-            vec![call("read_file", json!({ "path": "f1.txt" }))],
-            vec![call("read_file", json!({ "path": "f2.txt" }))],
-            vec![call("read_file", json!({ "path": "f3.txt" }))],
+            vec![
+                call("read_file", json!({ "path": "f0.txt" })),
+                call("read_file", json!({ "path": "f1.txt" })),
+            ],
+            vec![
+                call("read_file", json!({ "path": "f2.txt" })),
+                call("read_file", json!({ "path": "f3.txt" })),
+            ],
+            vec![
+                call("read_file", json!({ "path": "f4.txt" })),
+                call("read_file", json!({ "path": "f5.txt" })),
+            ],
+            vec![
+                call("read_file", json!({ "path": "f6.txt" })),
+                call("read_file", json!({ "path": "f7.txt" })),
+            ],
         ])
     };
     let seed = |dir: &std::path::Path| {
-        for i in 0..4 {
-            std::fs::write(dir.join(format!("f{i}.txt")), &filler).unwrap();
+        for i in 0..8 {
+            // Each file names itself, so a result can be checked against the call
+            // it claims to answer rather than only against the other run.
+            std::fs::write(
+                dir.join(format!("f{i}.txt")),
+                format!("MARKER-f{i}\n{filler}"),
+            )
+            .unwrap();
         }
     };
     let tight_contract = |dir: &std::path::Path, steps: u32| {
@@ -1378,10 +1406,11 @@ async fn a_resumed_run_under_a_tight_budget_still_pairs_every_result_with_its_ca
         "an elided history role-tags the same way whether or not the process died"
     );
 
-    // And the pairing itself, read off the messages rather than inferred from
-    // their equality: every result names a call the assistant turn before it
-    // actually made.
+    // And the pairing itself, absolutely rather than by comparison: every result
+    // names a call the turn before it actually made, AND carries that call's own
+    // answer. Equality alone cannot see an ordinal counted wrongly in both arms.
     let mut pairs = 0;
+    let mut checked = 0;
     for window in resumed.windows(2) {
         if let [Message::Assistant { calls, .. }, Message::Results(results)] = window {
             pairs += 1;
@@ -1392,12 +1421,36 @@ async fn a_resumed_run_under_a_tight_budget_still_pairs_every_result_with_its_ca
                     r.call,
                     calls.len()
                 );
+                let path = calls[r.call]
+                    .arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .expect("every scripted call names a path");
+                let marker = format!("MARKER-{}", path.trim_end_matches(".txt"));
+                // A carried result holds the file it read; an elided one is a stub
+                // naming the read it stands in for. Either way it must be about
+                // the call it says it answers.
+                if r.content.contains("MARKER-") || r.content.contains(".txt") {
+                    checked += 1;
+                    assert!(
+                        r.content.contains(&marker) || r.content.contains(path),
+                        "the result naming call {} of {:?} carries {:?}",
+                        r.call,
+                        calls[r.call].arguments,
+                        r.content
+                    );
+                }
             }
         }
     }
     assert!(
         pairs > 0,
         "the resumed transcript must contain at least one paired turn: {resumed:?}"
+    );
+    assert!(
+        checked >= 2,
+        "at least two results must have been checked against the call they name, or the \
+         correlation assertion is decorative: {resumed:?}"
     );
 }
 

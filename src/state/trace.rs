@@ -418,18 +418,7 @@ impl Store {
     /// did not commit leaves no turn behind — the same ordering rule the ledger
     /// is persisted under.
     pub fn record_step_turn(&self, run_id: i64, turn: &AssistantTurn) -> Result<()> {
-        let calls = serde_json::to_string(&turn.calls).map_err(|e| Error::Resume {
-            reason: format!(
-                "run {run_id} step {} has tool calls that cannot be stored: {e}",
-                turn.step
-            ),
-        })?;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO step_turns (run_id, step, text, calls)
-             VALUES (?1, ?2, ?3, ?4)",
-            (run_id, turn.step as i64, &turn.text, &calls),
-        )?;
-        Ok(())
+        write_step_turn(&self.conn, run_id, turn)
     }
 
     /// Stage the turn this step took, to be written by the commit that ends it
@@ -629,17 +618,7 @@ impl Store {
             .filter(|t| t.step == step.step)
             .cloned();
         if let Some(turn) = staged {
-            let calls = serde_json::to_string(&turn.calls).map_err(|e| Error::Resume {
-                reason: format!(
-                    "run {run_id} step {} has tool calls that cannot be stored: {e}",
-                    turn.step
-                ),
-            })?;
-            tx.execute(
-                "INSERT OR REPLACE INTO step_turns (run_id, step, text, calls)
-                 VALUES (?1, ?2, ?3, ?4)",
-                (run_id, turn.step as i64, &turn.text, &calls),
-            )?;
+            write_step_turn(&tx, run_id, &turn)?;
         }
         // The renewal rides the commit the run is already making. That is why
         // there is no heartbeat thread: a background renewer would need a second
@@ -1150,6 +1129,38 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+
+/// The one place an assistant turn becomes rows (0.64.0).
+///
+/// Two writers reach it — [`Store::record_step_turn`] for a direct caller, and
+/// [`Store::checkpoint_step`] for the run loop, which writes inside the
+/// transaction that commits the step. **A sabotage found this as two encoders**:
+/// changing one to a lossy `name:args` join left the round-trip test green,
+/// because the test exercised the other. Two encoders of one durable format
+/// drift, and the day they do it is the day a resumed run reads back something a
+/// live run never wrote.
+///
+/// Takes anything that can execute, so the transaction and the bare connection
+/// are the same call.
+fn write_step_turn(
+    conn: &rusqlite::Connection,
+    run_id: i64,
+    turn: &AssistantTurn,
+) -> Result<()> {
+    let calls = serde_json::to_string(&turn.calls).map_err(|e| Error::Resume {
+        reason: format!(
+            "run {run_id} step {} has tool calls that cannot be stored: {e}",
+            turn.step
+        ),
+    })?;
+    conn.execute(
+        "INSERT OR REPLACE INTO step_turns (run_id, step, text, calls)
+         VALUES (?1, ?2, ?3, ?4)",
+        (run_id, turn.step as i64, &turn.text, &calls),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
