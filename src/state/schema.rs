@@ -1031,6 +1031,50 @@ impl Store {
              );",
         )?;
 
+        // 0.64.0 — what each step ASKED FOR, so a resumed run can send the model
+        // its own past turns instead of a third-person account of them.
+        //
+        // The results half of a transcript has been durable since 0.13.0 in
+        // `ledger_observations`, and its per-step ordinals are recomputed
+        // positionally on restore, elided entries included. The assistant half was
+        // held only in the run loop's `turns` map and died with the process, which
+        // is why every step a resumed run did not itself drive collapsed into user
+        // prose. This table is that half and nothing more.
+        //
+        // `text` is NULLABLE on purpose: a step whose model wrote nothing beside
+        // its calls carries `None`, and a step whose model wrote an empty string
+        // carries `Some("")`. They are different facts, and a resumed run that
+        // cannot tell them apart emits an assistant turn the live run did not.
+        //
+        // `calls` is the ordered `Vec<ToolCall>` as JSON — the type is already
+        // public and already derives `Serialize`/`Deserialize`, so this stores the
+        // crate's own representation and not a vendor's wire form. **The rendering
+        // is a stored value.** Unifying it with any display or trace form — with
+        // `steps.tool_call`'s human-readable `name:args` join, say — orphans every
+        // persisted turn. That column stays what it is for the same reason: it is
+        // read by people and by the stall signature, never by this.
+        //
+        // `PRIMARY KEY (run_id, step)` is the only index. Every read is
+        // `WHERE run_id = ?1 ORDER BY step ASC`, which searches the implicit index
+        // on its leftmost column and returns in key order — asserted with EXPLAIN
+        // QUERY PLAN rather than believed. A second index would be schema every
+        // future cross-version gate carries for no statement.
+        //
+        // Additive, and deliberately NOT a `CHECKPOINT_FORMAT` bump, for the reason
+        // 0.62.0's lease was not: no checkpoint layout changed, a 0.63.0 binary
+        // never names this table, and bumping the format would make
+        // [`Self::check_resumable`] refuse every 0.63.0 store over a table it does
+        // not read.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS step_turns (
+                 run_id INTEGER NOT NULL,
+                 step   INTEGER NOT NULL,
+                 text   TEXT,
+                 calls  TEXT NOT NULL,
+                 PRIMARY KEY (run_id, step)
+             );",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses

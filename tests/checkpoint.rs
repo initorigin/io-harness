@@ -1282,3 +1282,121 @@ async fn a_detached_child_is_readopted_after_a_restart() {
         "the re-adopted child's report reaches its parent"
     );
 }
+
+// ---------- 0.64.0: the assistant turn is durable ----------
+
+/// F2 — the turn round-trips through the store without loss, including the two
+/// shapes that break a string join.
+///
+/// `steps.tool_call` writes `name:args` joined with ` | `, so a tool name
+/// carrying a `:` and an argument carrying a ` | ` cannot be split back apart
+/// from it. That is why this table exists rather than the existing column being
+/// reused, and asserting it on those exact shapes is what makes the claim
+/// checkable instead of stated.
+#[test]
+fn an_assistant_turn_round_trips_through_the_store_whole() {
+    use io_harness::AssistantTurn;
+
+    let store = Store::memory().unwrap();
+    let run_id = store.start_run("goal", "model").unwrap();
+
+    let calls = vec![
+        ToolCall {
+            name: "ns:read_file".into(),
+            arguments: json!({ "path": "a.txt" }),
+        },
+        ToolCall {
+            name: "write_file".into(),
+            arguments: json!({ "path": "b.txt", "content": "left | right" }),
+        },
+        ToolCall {
+            name: "run_command".into(),
+            arguments: json!({ "argv": ["sh", "-c", "echo a | wc -l"], "n": 3, "deep": { "k": [1, 2] } }),
+        },
+    ];
+    store
+        .record_step_turn(
+            run_id,
+            &AssistantTurn::new(1, Some("I will read, then write."), calls.clone()),
+        )
+        .unwrap();
+
+    let back = store.step_turns(run_id).unwrap();
+    assert_eq!(back.len(), 1, "one step, one turn");
+    assert_eq!(back[0].step, 1);
+    assert_eq!(back[0].text.as_deref(), Some("I will read, then write."));
+    assert_eq!(
+        back[0].calls.len(),
+        3,
+        "every call survives, including the two a string join would fuse"
+    );
+    for (i, (want, got)) in calls.iter().zip(back[0].calls.iter()).enumerate() {
+        assert_eq!(&got.name, &want.name, "call {i} keeps its name and its order");
+        // Compared as JSON, not as a string: two renderings of one object are
+        // equal here and unequal as text, and the stored fact is the object.
+        assert_eq!(&got.arguments, &want.arguments, "call {i} keeps its arguments whole");
+    }
+}
+
+/// F2 — an absent text is not an empty one.
+///
+/// A model that wrote nothing beside its calls and a model that wrote `""` are
+/// different facts. A resumed run that cannot tell them apart emits an assistant
+/// turn the live run did not.
+#[test]
+fn an_absent_assistant_text_is_not_an_empty_one() {
+    use io_harness::AssistantTurn;
+
+    let store = Store::memory().unwrap();
+    let run_id = store.start_run("goal", "model").unwrap();
+
+    store
+        .record_step_turn(run_id, &AssistantTurn::new(1, None::<String>, Vec::new()))
+        .unwrap();
+    store
+        .record_step_turn(run_id, &AssistantTurn::new(2, Some(""), Vec::new()))
+        .unwrap();
+
+    let back = store.step_turns(run_id).unwrap();
+    assert_eq!(back.len(), 2, "oldest step first");
+    assert_eq!(back[0].step, 1);
+    assert_eq!(back[1].step, 2);
+    assert_eq!(back[0].text, None, "wrote nothing");
+    assert_eq!(back[1].text.as_deref(), Some(""), "wrote an empty string");
+    assert_ne!(back[0].text, back[1].text, "and the two are not the same row");
+}
+
+/// A step committed twice keeps one turn — the last one it actually took.
+///
+/// A retry after a tool error writes another `steps` row for the same step. The
+/// primary key is `(run_id, step)`, so this table replaces rather than growing a
+/// second trace of one step.
+#[test]
+fn a_step_recorded_twice_keeps_the_turn_it_last_took() {
+    use io_harness::AssistantTurn;
+
+    let store = Store::memory().unwrap();
+    let run_id = store.start_run("goal", "model").unwrap();
+
+    store
+        .record_step_turn(run_id, &AssistantTurn::new(1, Some("first"), Vec::new()))
+        .unwrap();
+    store
+        .record_step_turn(
+            run_id,
+            &AssistantTurn::new(
+                1,
+                Some("second"),
+                vec![ToolCall {
+                    name: "read_file".into(),
+                    arguments: json!({ "path": "a.txt" }),
+                }],
+            ),
+        )
+        .unwrap();
+
+    let back = store.step_turns(run_id).unwrap();
+    assert_eq!(back.len(), 1, "one row per step, not two");
+    assert_eq!(back[0].text.as_deref(), Some("second"));
+    assert_eq!(back[0].calls.len(), 1);
+}

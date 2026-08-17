@@ -586,7 +586,8 @@ pub use skills::{Skill, Skills};
 // leaving its own audit table reachable only by opening the SQLite file.
 pub use agent::{AgentDef, Agents};
 pub use state::{
-    AgentEvent, AgentMessage, Archived, CheckpointEvent, ContextEvent, Edit, FirstTry, GateAttempt,
+    AgentEvent, AgentMessage, Archived, AssistantTurn, CheckpointEvent, ContextEvent, Edit,
+    FirstTry, GateAttempt,
     GateOutcome, Lease, LeaseRow, McpEvent, MemoryEntry, MemoryForget, MemoryKind, MemoryLimits,
     MemoryRecall, MemoryWrite, Pending, PendingPlan, PendingQuestion, PolicyEvent, ProcessHandle,
     ProviderCall, Pruned, Recovery, RewindRecord, RunStatus, RunSummary, SandboxEvent, SessionSize,

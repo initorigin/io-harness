@@ -406,6 +406,73 @@ impl Store {
         Ok(())
     }
 
+    /// Record what one step asked for, so a resume can send it back (0.64.0).
+    ///
+    /// `INSERT OR REPLACE`: a step number can be committed more than once — a
+    /// retry after a tool error writes another `steps` row for the same step — and
+    /// the turn that matters is the last one the model actually took. The primary
+    /// key is `(run_id, step)`, so replacing is what keeps this table one row per
+    /// step rather than a second, differently-shaped trace.
+    ///
+    /// Called from inside the transaction that commits the step, so a step that
+    /// did not commit leaves no turn behind — the same ordering rule the ledger
+    /// is persisted under.
+    pub fn record_step_turn(&self, run_id: i64, turn: &AssistantTurn) -> Result<()> {
+        let calls = serde_json::to_string(&turn.calls).map_err(|e| Error::Resume {
+            reason: format!(
+                "run {run_id} step {} has tool calls that cannot be stored: {e}",
+                turn.step
+            ),
+        })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO step_turns (run_id, step, text, calls)
+             VALUES (?1, ?2, ?3, ?4)",
+            (run_id, turn.step as i64, &turn.text, &calls),
+        )?;
+        Ok(())
+    }
+
+    /// The one statement [`Self::step_turns`] runs, named so the query-plan
+    /// assertion can `EXPLAIN` the text the crate executes rather than a copy of
+    /// it that can drift.
+    pub(crate) const STEP_TURNS_SQL: &'static str =
+        "SELECT step, text, calls FROM step_turns WHERE run_id = ?1 ORDER BY step ASC";
+
+    /// Every assistant turn recorded for a run, oldest step first (0.64.0).
+    ///
+    /// Empty for a run written before 0.64.0 and for a run that took no step —
+    /// the two are the same to a reader, and both mean "there is nothing to
+    /// restore", which is what a resume of an older store must keep doing rather
+    /// than being told it lost something.
+    ///
+    /// The read is `WHERE run_id = ?1 ORDER BY step ASC`, which searches the
+    /// primary key on its leftmost column and returns in key order — there is no
+    /// second index and no sort step, asserted with `EXPLAIN QUERY PLAN` in
+    /// `tests/checkpoint.rs` rather than assumed here.
+    pub fn step_turns(&self, run_id: i64) -> Result<Vec<AssistantTurn>> {
+        let mut stmt = self.conn.prepare(Self::STEP_TURNS_SQL)?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u32,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (step, text, calls) = row?;
+            let calls: Vec<ToolCall> =
+                serde_json::from_str(&calls).map_err(|e| Error::Resume {
+                    reason: format!(
+                        "run {run_id} step {step} has an assistant turn this binary cannot \
+                         read: {e}"
+                    ),
+                })?;
+            out.push(AssistantTurn { step, text, calls });
+        }
+        Ok(out)
+    }
+
     /// A run's durable ledger, in the order it was observed.
     ///
     /// Empty for a run that recorded nothing and for a run written before 0.13.0
@@ -1192,4 +1259,76 @@ mod tests {
         );
         assert_eq!(store.steps(run).unwrap().len(), 1);
     }
+
+    /// N3 (0.64.0) — the turn read searches the primary key and sorts nothing.
+    ///
+    /// `PRIMARY KEY (run_id, step)` is the only index `step_turns` gets, and the
+    /// argument for that is the plan SQLite produces for the statement the crate
+    /// runs — `EXPLAIN`ed as the `const` itself, not as a copy that can drift.
+    /// The control filters on `text`, a column in **no** index at all: a trailing
+    /// column of the composite key is not a control, because SQLite skip-scans one
+    /// and produces a full read wearing an index's name.
+    ///
+    /// Measured on this fixture (40 runs x 30 steps): the read seeks and the
+    /// control scans. The numbers are recorded, not asserted — a wall-clock
+    /// assertion is flaky on a loaded runner and green on a fast one running a
+    /// full scan.
+    #[test]
+    fn the_turn_read_searches_the_primary_key_and_never_sorts() {
+        let store = Store::memory().unwrap();
+        let mut first = 0;
+        for r in 0..40 {
+            let run = store.start_run(&format!("run {r}"), "/repo").unwrap();
+            if r == 0 {
+                first = run;
+            }
+            for step in 0..30u32 {
+                store
+                    .record_step_turn(
+                        run,
+                        &AssistantTurn::new(step, Some(format!("step {step}")), Vec::new()),
+                    )
+                    .unwrap();
+            }
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let plan = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let n = stmt.parameter_count();
+            let args: Vec<i64> = vec![first][..n].to_vec();
+            stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ")
+        };
+
+        let read = plan(Store::STEP_TURNS_SQL);
+        assert!(
+            read.contains("SEARCH"),
+            "the turn read must seek on the primary key, got {read}"
+        );
+        assert!(
+            !read.contains("SCAN step_turns"),
+            "a resume must not read every run's turns, got {read}"
+        );
+        assert!(
+            !read.contains("TEMP B-TREE"),
+            "the primary key already returns step order, so nothing sorts, got {read}"
+        );
+
+        // The control: `text` is in no index, so this one has to scan. Without it
+        // the assertions above are about a planner that never scans anything
+        // rather than about this table's key.
+        let control = plan("SELECT step FROM step_turns WHERE text = 'step 3'");
+        assert!(
+            control.contains("SCAN step_turns"),
+            "the control must scan, or the assertions above prove nothing, got {control}"
+        );
+    }
+
 }
