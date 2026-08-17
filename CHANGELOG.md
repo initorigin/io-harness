@@ -26,6 +26,107 @@ notes are produced from it.
 
 ### Security
 
+## [0.63.0] - 2026-08-17
+
+Build the harness once and run against it. A `Harness` binds the provider, the
+store, the permission boundary, the approver, the observer, and the host
+configuration that is not a property of any one task — the toolbox, MCP and LSP
+servers, the browser, the skills directory, the plugin bundles, the agent roster,
+the responder and web access. Two tasks then run through it without restating any
+of them.
+
+Before this release a session turn read
+`turn(text, &provider, &store, &policy, &approver)` and the steered variant took
+seven arguments with `#[allow(clippy::too_many_arguments)]` in the source beside
+it; `src/run.rs` exposed thirty-five top-level public functions, every one of them
+taking `&Store` and most taking `&Policy` and `&dyn Approver` too. A caller with
+twenty tasks built the same ten host settings twenty times, and every one of those
+was a place they could be built differently by accident.
+
+The storage library also stops being part of the published contract, and `Error`
+becomes `#[non_exhaustive]`.
+
+### Breaking changes
+
+- **BREAKING (compile)** — `Error` is now `#[non_exhaustive]`. A program matching
+  it exhaustively outside the crate stops compiling until it adds a wildcard arm.
+  *Migration:* add `_ => ...`. A caller that already has one is unaffected.
+
+  This is late rather than new, and saying so is the point: every variant added
+  since 0.23.0 — `Lsp`, `Browser`, `Resume`, and 0.62.0's `Conflict` — was a
+  compile break of exactly this shape, because the attribute was never on this
+  enum. It is paid once here and no future variant costs anyone anything.
+
+### Added
+
+- **`Harness`** — the host, bound once. It borrows rather than owns, because
+  `rusqlite::Connection` is `Send` and not `Sync` and every existing entry point
+  already takes these by reference; it is generic over the provider, because
+  `Provider::complete` returns `impl Future` and the trait is not dyn-compatible,
+  so there is no `Box<dyn Provider>` to be had.
+
+  ```rust,ignore
+  let harness = Harness::new(&provider, &store)
+      .with_policy(policy)
+      .with_approver(&ApproveAll)
+      .with_defaults(TaskContract::workspace("", "/repo").with_skills("/repo/.io/skills"));
+
+  harness.run(&harness.workspace("bring the docs up to date", "/repo")).await?;
+  let mut session = harness.session("/repo")?;
+  harness.turn(&mut session, "what does this crate do?").await?;
+  ```
+
+  The template it holds is a source for `workspace()` and `task()` and for
+  nothing else — a contract handed to `run()` is used verbatim. The rejected
+  alternative, filling in whatever a contract still holds at its default, cannot
+  tell a caller who set a field to its default value from one who never set it,
+  and a rule a caller cannot evaluate at the call site is worse than typing the
+  setting twice.
+
+- **`Error::Storage { kind, message }` and `StorageErrorKind`** — an owned
+  storage failure. `kind` is `Busy`, `Constraint`, `Corrupt` or `Other`, with
+  only `Busy` retryable; `message` is what the storage layer said, kept whole.
+
+- **`TaskContract::with_conversational_turns`** — say outright whether a session
+  turn may decide it was conversation and answer, rather than having it inferred
+  from `Verification::None`. Unset is the default and infers exactly as before.
+
+### Changed
+
+- Nothing a caller wrote before this release behaves differently. The
+  thirty-five free functions and all seven `Session::turn*` methods keep their
+  exact signatures, asserted by a derived test rather than by review, and a
+  `Harness` call reaches the loop by calling the same function a caller would
+  have called themselves — asserted as canonical-trace equality, because outcome
+  equality would pass against a facade that quietly ran a different loop.
+
+### Deprecated
+
+- **`Error::State(rusqlite::Error)`** — replaced by `Error::Storage { kind,
+  message }`. **It is removed in 0.65.0**, the minimum cycle this crate's
+  contract allows, named by version so a caller reading the warning knows exactly
+  how long they have. Nothing in the crate constructs it as of this release, so no
+  failure arrives as that variant any more.
+
+  *Migration:*
+
+  ```rust,ignore
+  // Before
+  Err(Error::State(e)) => report(e.to_string()),
+
+  // After
+  Err(Error::Storage { kind, message }) if kind.is_retryable() => retry(),
+  Err(Error::Storage { message, .. }) => report(message),
+  ```
+
+  From 0.23.0 until now, `rusqlite` was a *public* dependency of this crate: its
+  error type was in `Error`, so a `rusqlite` major bump was a breaking change
+  here whether or not anything behaved differently — which is exactly what
+  0.23.0 itself was. That is over. What it does **not** change is that
+  `libsqlite3-sys` declares `links = "sqlite3"`, so a consumer's graph still
+  holds one version of it; the upgrade stops being a type-level break, not a
+  graph-level constraint.
+
 ## [0.62.0] - 2026-08-17
 
 Two processes can no longer both drive one run. A driver holds a lease with a

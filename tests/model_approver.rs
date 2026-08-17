@@ -474,7 +474,7 @@ async fn a_model_cannot_approve_its_own_call() {
 /// `tests/session_fanout.rs` makes for the session rules and for the same reason.
 #[test]
 fn the_approval_context_is_one_helper_that_both_approval_sites_call() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/run.rs")).unwrap();
+    let src = run_subsystem_source();
     let src = src.replace("\r\n", "\n");
 
     let defs = src.matches("fn approval_context(").count();
@@ -498,4 +498,39 @@ fn the_approval_context_is_one_helper_that_both_approval_sites_call() {
         2,
         "exactly the two approval sites consult the approver"
     );
+}
+
+/// `src/run.rs` and every `src/run/<subject>.rs`, concatenated.
+///
+/// 0.63.0 moved the run subsystem's private machinery into submodules, so a
+/// source-reading checker pointed at the parent alone now sees a fraction of it —
+/// and a count that comes back zero reads exactly like a rule that was deleted.
+/// The floor below is what turns "the walk went blind" into a failure instead of
+/// a silent pass.
+fn run_subsystem_source() -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all = std::fs::read_to_string(root.join("src/run.rs"))
+        .expect("src/run.rs")
+        .replace("\r\n", "\n");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("src/run"))
+        .expect("src/run/")
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    paths.sort();
+    assert!(
+        paths.len() >= 5,
+        "src/run/ holds only {} modules — the split has been undone or this walk is blind, \
+         and either way every count taken from it is meaningless",
+        paths.len()
+    );
+    for path in paths {
+        all.push('\n');
+        all.push_str(
+            &std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\r\n", "\n"),
+        );
+    }
+    all
 }
