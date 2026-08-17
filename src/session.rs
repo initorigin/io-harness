@@ -25,7 +25,7 @@
 //! session driven by two processes at once no longer interleaves silently: both
 //! head advances here — [`Session::branch_from`] and the one at the end of a turn
 //! — are a compare-and-swap on the head that was read, so the second writer is
-//! told with [`Error::Conflict`](crate::Error::Conflict) and its turn is left out
+//! told with [`Error::Conflict`] and its turn is left out
 //! of the tree. That reports a dropped turn; it does not make both of them land.
 
 use std::path::{Path, PathBuf};
