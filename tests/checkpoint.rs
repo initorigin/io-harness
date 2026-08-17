@@ -1400,3 +1400,50 @@ fn a_step_recorded_twice_keeps_the_turn_it_last_took() {
     assert_eq!(back[0].text.as_deref(), Some("second"));
     assert_eq!(back[0].calls.len(), 1);
 }
+
+/// F2 — a committed step leaves the turn it took, and the turn is the model's
+/// own words and arguments rather than a rendering of them.
+///
+/// The write rides the transaction that commits the step, so this is also the
+/// assertion that the two agree about which steps happened — the turns are a
+/// subset of the committed steps, never a step ahead of them.
+#[tokio::test]
+async fn a_committed_step_leaves_the_turn_it_took() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let out = run_with(
+        &out_contract(dir.path(), "ALPHA", 3),
+        &WriteOnce {
+            path: "out.txt",
+            content: "ALPHA",
+        },
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let turns = store.step_turns(out.run_id).unwrap();
+    assert!(!turns.is_empty(), "the run committed steps, so it left turns");
+    let steps = store.steps(out.run_id).unwrap();
+    assert!(
+        turns.len() <= steps.len(),
+        "a turn per committed step at most, never one ahead: {} turns, {} step rows",
+        turns.len(),
+        steps.len()
+    );
+    for turn in &turns {
+        assert_eq!(
+            turn.calls.len(),
+            1,
+            "this provider makes exactly one call per step"
+        );
+        assert_eq!(turn.calls[0].name, "write_file");
+        assert_eq!(
+            turn.calls[0].arguments.get("content").and_then(|v| v.as_str()),
+            Some("ALPHA"),
+            "the arguments are the model's own object, not a rendering of it"
+        );
+    }
+}

@@ -1089,6 +1089,7 @@ impl Store {
             conn,
             owner: new_owner_id(),
             leases: std::cell::RefCell::new(std::collections::HashMap::new()),
+            turn: std::cell::RefCell::new(std::collections::HashMap::new()),
         })
     }
 

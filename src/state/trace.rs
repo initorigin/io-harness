@@ -432,6 +432,27 @@ impl Store {
         Ok(())
     }
 
+    /// Stage the turn this step took, to be written by the commit that ends it
+    /// (0.64.0).
+    ///
+    /// The run loop calls this immediately after the provider answers and before
+    /// anything is dispatched — the point where the turn is known and the step is
+    /// not yet finished. [`Self::checkpoint_step`] writes it inside the same
+    /// transaction as the `steps` row, after the lease check, so a step that never
+    /// commits and a driver that lost its lease both leave nothing behind.
+    ///
+    /// Staged per run, so two runs driven by one handle do not overwrite each
+    /// other, and replaced per step, so a retried step stages the turn it last
+    /// took.
+    pub(crate) fn stage_step_turn(&self, run_id: i64, turn: AssistantTurn) {
+        self.turn.borrow_mut().insert(run_id, turn);
+    }
+
+    /// Drop the turn staged for a run this handle no longer drives (0.64.0).
+    pub(crate) fn forget_staged_turn(&self, run_id: i64) {
+        self.turn.borrow_mut().remove(&run_id);
+    }
+
     /// The one statement [`Self::step_turns`] runs, named so the query-plan
     /// assertion can `EXPLAIN` the text the crate executes rather than a copy of
     /// it that can drift.
@@ -593,6 +614,34 @@ impl Store {
              VALUES (?1, ?2, 'checkpoint', NULL)",
             (run_id, step.step),
         )?;
+        // 0.64.0 — and what this step asked for, in the same transaction, so the
+        // step and the turn it took cannot disagree about which of the two
+        // happened. Taken out of the staging cell rather than passed in, for the
+        // reasons `Store::turn` gives. A direct caller of this method stages
+        // nothing and writes nothing, exactly as before.
+        //
+        // Matched on the step number: a staged turn belongs to the step that
+        // staged it, and a checkpoint of some *other* step — a caller writing its
+        // own trace, or a loop committing a gate attempt — must not adopt it.
+        let staged = self
+            .turn
+            .borrow_mut()
+            .get(&run_id)
+            .filter(|t| t.step == step.step)
+            .cloned();
+        if let Some(turn) = staged {
+            let calls = serde_json::to_string(&turn.calls).map_err(|e| Error::Resume {
+                reason: format!(
+                    "run {run_id} step {} has tool calls that cannot be stored: {e}",
+                    turn.step
+                ),
+            })?;
+            tx.execute(
+                "INSERT OR REPLACE INTO step_turns (run_id, step, text, calls)
+                 VALUES (?1, ?2, ?3, ?4)",
+                (run_id, turn.step as i64, &turn.text, &calls),
+            )?;
+        }
         // The renewal rides the commit the run is already making. That is why
         // there is no heartbeat thread: a background renewer would need a second
         // thread holding a `Connection`, which is `Send` and not `Sync`, to keep
@@ -1329,6 +1378,61 @@ mod tests {
             control.contains("SCAN step_turns"),
             "the control must scan, or the assertions above prove nothing, got {control}"
         );
+    }
+
+
+    /// F2 (0.64.0) — a driver whose run was taken over writes no turn either.
+    ///
+    /// The whole reason the turn rides `checkpoint_step`'s transaction rather
+    /// than being recorded beside it. Written outside, a stale driver would
+    /// replace the winner's turn for the same step, and a resume would compose an
+    /// assistant turn the run never took — the one-driver-per-run guarantee
+    /// 0.62.0 bought, given back at the one table that quotes the model.
+    ///
+    /// Two handles over one store are two drivers as far as a lease is concerned,
+    /// which is how this is written in one process.
+    ///
+    /// The one-second ttl and the sleep past it are a wait, not a deadline: the
+    /// owner id carries this process's pid and this process is alive, so a
+    /// takeover needs the lease to lapse. A slow machine sleeps longer and the
+    /// lease is more lapsed, never less — the direction of error a test is allowed
+    /// to have around a clock.
+    #[test]
+    fn a_driver_that_lost_its_lease_writes_no_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.sqlite3");
+        let first = Store::open(&db).unwrap();
+        let run_id = first.start_run("goal", "/repo").unwrap();
+        let lease = first.acquire_lease(run_id, 1).unwrap();
+
+        // The first driver stages a turn, as the loop does before it dispatches.
+        first.stage_step_turn(
+            run_id,
+            AssistantTurn::new(
+                1,
+                Some("mine"),
+                vec![ToolCall {
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({ "path": "a.txt" }),
+                }],
+            ),
+        );
+
+        // A second handle takes the run over while the first is mid-step.
+        let second = Store::open(&db).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let _taken = second.acquire_lease(run_id, 60).unwrap();
+
+        let refused = first.checkpoint_step(run_id, &StepRecord::new(1, "wrote file", "ok"));
+        assert!(
+            matches!(refused, Err(Error::Conflict { .. })),
+            "the stale driver is refused, got {refused:?}"
+        );
+        assert!(
+            first.step_turns(run_id).unwrap().is_empty(),
+            "and it wrote no turn — not the steps row, not the checkpoint, not this"
+        );
+        drop(lease);
     }
 
 }

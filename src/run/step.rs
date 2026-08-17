@@ -1124,12 +1124,21 @@ pub(super) async fn run_workspace_from<P: Provider>(
         // 0.49.0 — record what this step asked for before anything is dispatched,
         // so the next step sends the model its own turn back instead of a
         // third-person account of it.
+        //
+        // 0.64.0 — and stage it durably, so a resumed run sends it back too. The
+        // write itself rides the transaction that commits this step, which is why
+        // this is a stage and not a record: a step that never commits must leave
+        // no turn, and a driver whose lease was taken from it must write none.
         turns.insert(
             step,
             StepTurn {
                 text: response.text.clone(),
                 calls: response.tool_calls.clone(),
             },
+        );
+        store.stage_step_turn(
+            run_id,
+            AssistantTurn::new(step, response.text.clone(), response.tool_calls.clone()),
         );
 
         // Dispatch every tool call the model made this step, in order, folding

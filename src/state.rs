@@ -411,6 +411,27 @@ pub struct Store {
     /// which is what keeps every existing test and every direct caller of
     /// `checkpoint_step` unchanged.
     leases: std::cell::RefCell<std::collections::HashMap<i64, i64>>,
+    /// The assistant turn this handle is about to commit, per run (0.64.0).
+    ///
+    /// Set by the run loop immediately before the step commits and consumed
+    /// *inside* [`Self::checkpoint_step`]'s transaction, for the same two reasons
+    /// the lease generation above is checked there and not threaded:
+    ///
+    /// - **`checkpoint_step` takes a [`StepRecord`], and the turn is deliberately
+    ///   not part of that type.** `StepRecord` has six public fields and no
+    ///   `#[non_exhaustive]`, so a seventh is a compile break for anyone building
+    ///   one with a struct literal; and adding a parameter breaks every direct
+    ///   caller of a public method.
+    /// - **A turn written outside that transaction is a turn a driver that lost
+    ///   its lease can still write.** It would then replace the winner's turn for
+    ///   the same step, and a resume would compose an assistant turn the run never
+    ///   took — the one-driver-per-run guarantee 0.62.0 bought, given back at the
+    ///   only table that quotes the model.
+    ///
+    /// A step that does not commit leaves no turn behind, because the staged value
+    /// is written by the same transaction that writes the `steps` row or by
+    /// nothing at all.
+    turn: std::cell::RefCell<std::collections::HashMap<i64, AssistantTurn>>,
 }
 
 /// Whether the lease row in hand has lapsed, as SQL (0.62.0).
