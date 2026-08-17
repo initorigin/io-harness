@@ -9,6 +9,32 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What binding the host once costs (0.63.0)
+
+**What is being measured.** 0.63.0 adds a `Harness` that binds the provider, the
+store, the boundary, the approver, the observer and a template `TaskContract`,
+and then calls the same free function a caller would have called themselves. The
+question a reader will have is whether the convenience is paid for per step.
+
+**The shape to expect, stated before it was measured.** Constant, and paid once
+at construction. The `Harness` assembles nothing the entry points do not already
+assemble; it holds five references and a contract, and `Harness::run` is a call to
+`run_with_observed` with them. There is no work inside the loop for it to add, so
+the difference between the two paths should be indistinguishable from the noise of
+running the same scripted run twice.
+
+**Method.** `what_the_facade_costs_per_step` in `tests/harness.rs`, `#[ignore]`d
+because it prints rather than asserts. Twenty-one rounds of a four-step scripted
+run against an in-memory store, one fresh store and one fresh workspace per round,
+medians reported. Run it with
+`cargo test --test harness -- --ignored --nocapture`.
+
+**Numbers.** MEASURED_PLACEHOLDER
+
+**What it does not measure.** Provider latency, which dominates a real run by
+orders of magnitude and is identical on both paths by construction — the same
+`Provider` value is called by the same function.
+
 ## What removing history costs (0.58.0)
 
 **What is being measured.** 0.58.0 gives an operator four instruments — a size,
