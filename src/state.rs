@@ -6,7 +6,7 @@
 //! An existing 0.1.0 database is migrated in place with `ALTER TABLE ADD COLUMN`
 //! (additive — a 0.1.0 binary still reads a migrated database).
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::context::{ObsKind, Observation};
 use crate::error::{Error, Result};
@@ -386,6 +386,247 @@ pub struct RunSummary {
 /// trade only when a failed run is cheaper to restart than to continue.
 pub struct Store {
     conn: Connection,
+    /// This handle's opaque lease owner id (0.62.0). Per **handle**, not per
+    /// process: two `Store`s opened over one file are two drivers as far as a run
+    /// lease is concerned, which is what lets the conflict tests be written with
+    /// two handles in one process instead of two processes over one SQLite file —
+    /// the shape that has failed `release.yml` itself here with `DatabaseBusy`.
+    owner: String,
+    /// The run leases this handle currently holds, as run id to generation
+    /// (0.62.0).
+    ///
+    /// This is what lets [`Self::checkpoint_step`] enforce the lease **without
+    /// changing its signature or the signature of anything that calls it**. The
+    /// alternative was threading a generation from six run-loop entry points down
+    /// through the loop to `commit_step`, which is a large diff whose only failure
+    /// mode is a path that forgot to pass it — and a check that can be forgotten at
+    /// a call site is the shape of defect this release exists to close.
+    ///
+    /// A handle that holds no lease for a run commits exactly as it did before,
+    /// which is what keeps every existing test and every direct caller of
+    /// `checkpoint_step` unchanged.
+    leases: std::cell::RefCell<std::collections::HashMap<i64, i64>>,
+}
+
+/// Whether the lease row in hand has lapsed, as SQL (0.62.0).
+///
+/// Whole seconds, compared as integers. This file's other date arithmetic is
+/// `julianday` in floating point (`:5890`, `:6691`), and that is right for
+/// *reporting* an elapsed duration and wrong here: this expression decides a
+/// takeover at its boundary, and a boundary is the one place a rounding is a
+/// defect. `>=` and not `>`, so a lease is lapsed the instant its ttl is up rather
+/// than a second after — the boundary pair that pins it is written as a test,
+/// because a criterion that claims a boundary and never lands on it is prose.
+///
+/// One definition, named once, because the acquire's `WHERE`, the read-back and
+/// every test share it: two spellings of "expired" is how the write and the read
+/// come to disagree about who holds a run.
+const LEASE_EXPIRED: &str = "CAST(strftime('%s','now') AS INTEGER) \
+                             - CAST(strftime('%s', run_leases.renewed_at) AS INTEGER) \
+                             >= run_leases.ttl_secs";
+
+/// When the lease row in hand lapses, as SQL: `renewed_at + ttl_secs`, in the same
+/// ISO-8601 shape every other timestamp in this store is written in.
+///
+/// Computed by the database and never by the caller, for the reason [`LEASE_EXPIRED`]
+/// is: a conflict's `expires_at` has to be a moment on the clock the acquire will
+/// use, not on the clock of whoever is reading the error.
+const LEASE_EXPIRES_AT: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', run_leases.renewed_at, \
+                                '+' || run_leases.ttl_secs || ' seconds')";
+
+/// The [`Error::Conflict`] a refused lease write reports, from the row that
+/// refused it.
+///
+/// A `None` row is not reachable through either caller — the acquire's `WHERE`
+/// declines only against a row that exists, and a refused renew has just failed to
+/// match one that does. It is still reported rather than unwrapped: a lease that
+/// vanished between the write and the read is a conflict the caller retries, and a
+/// durable runtime does not panic over a race it was written to survive.
+fn conflict_from(run_id: i64, held: Option<LeaseRow>) -> Error {
+    held.map_or_else(
+        || Error::Conflict {
+            run_id,
+            owner: String::new(),
+            expires_at: String::new(),
+        },
+        |row| Error::Conflict {
+            run_id,
+            owner: row.owner,
+            expires_at: row.expires_at,
+        },
+    )
+}
+
+/// A per-process counter mixed into every owner id (0.62.0).
+///
+/// The wall clock alone is not enough. Two `Store::memory()` handles opened in a
+/// tight loop can read the same `SystemTime` on a coarse clock — Windows is the
+/// platform where that is ordinary rather than exotic — and two handles sharing an
+/// owner id do not merely collide: they look like *the same driver*, so the test
+/// that proves a second driver is refused would pass by taking over its own lease.
+/// A counter costs nothing and closes the class.
+static OWNER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A fresh opaque owner id for one [`Store`] handle.
+///
+/// Deliberately built from `std::process::id()`, the wall clock and [`OWNER_SEQ`]
+/// and nothing else: no `uuid`, no `rand`, no `hostname`, because a new runtime
+/// dependency is a criterion failure in this release rather than a trade-off. It
+/// is opaque — nothing parses it back — and it never reaches a filesystem path, so
+/// the stability rules that bind a hashed cache key do not bind here.
+fn new_owner_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = OWNER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{nanos}-{seq}", std::process::id())
+}
+
+/// A run lease held by one [`Store`] handle (0.62.0).
+///
+/// Holding one is what entitles a driver to commit steps against a run. It is
+/// released on drop, so no exit path in the run loop had to grow a release call
+/// and none of the thirty-four public entry points changed signature — an early
+/// return, a `?`, a panic unwinding through the loop and an ordinary finish all
+/// release it the same way.
+///
+/// A dropped lease is released *best-effort*: `Drop` cannot report an error, and
+/// the failure it would report is one a takeover already handles. That is the
+/// whole reason the lease carries a ttl rather than a flag — a driver that dies
+/// without releasing anything, in the way a killed process does, must not lock its
+/// run for good.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run_id = store.start_run("port it", "openrouter")?;
+///
+/// {
+///     let held = store.acquire_lease(run_id, 300)?;
+///     assert_eq!(held.run_id(), run_id);
+///     assert_eq!(held.generation(), 1, "the first acquire of a free run");
+///     assert!(store.run_lease(run_id)?.is_some(), "held while it is in scope");
+/// } // released here, without a call on any exit path.
+///
+/// assert!(store.run_lease(run_id)?.is_none(), "a released lease leaves no row");
+/// # Ok(())
+/// # }
+/// ```
+pub struct Lease<'a> {
+    store: &'a Store,
+    run_id: i64,
+    generation: i64,
+    released: std::cell::Cell<bool>,
+}
+
+/// Written by hand rather than derived because [`Store`] holds a `Connection` and
+/// is not `Debug`. What a reader of a lease wants is which run at which
+/// generation, and the store it came from adds nothing.
+impl std::fmt::Debug for Lease<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lease")
+            .field("run_id", &self.run_id)
+            .field("generation", &self.generation)
+            .field("owner", &self.store.owner)
+            .field("released", &self.released.get())
+            .finish()
+    }
+}
+
+impl Lease<'_> {
+    /// The run this lease is over.
+    pub fn run_id(&self) -> i64 {
+        self.run_id
+    }
+
+    /// The generation this acquire won. It rises by exactly one each time the run
+    /// is taken over from a different owner, and a step committed under an earlier
+    /// generation is refused.
+    pub fn generation(&self) -> i64 {
+        self.generation
+    }
+
+    /// Extend the lease, keeping the generation. Called by the run loop as part of
+    /// each durable step commit, which is what bounds a healthy run's staleness at
+    /// one step rather than at a timer's period.
+    ///
+    /// Refused with [`Error::Conflict`] once another owner has taken the run over:
+    /// renewing is not a way back in, taking over is.
+    pub fn renew(&self) -> Result<()> {
+        self.store.renew_lease(self.run_id, self.generation)
+    }
+
+    /// Release the lease now rather than at drop, and report a failure to do so.
+    ///
+    /// The run becomes immediately acquirable by anybody, which is the difference
+    /// between a released lease and an expired one: a released run has no row, an
+    /// expired one has a row somebody may take over.
+    pub fn release(self) -> Result<()> {
+        self.released.set(true);
+        self.store.release_lease(self.run_id, self.generation)
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if !self.released.get() {
+            let _ = self.store.release_lease(self.run_id, self.generation);
+        }
+    }
+}
+
+/// Who holds a run right now, as [`Store::run_lease`] reads it back (0.62.0).
+///
+/// An operator can ask this instead of inferring liveness from `runs.status`,
+/// which has never distinguished a live process from a crashed one and still does
+/// not.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run_id = store.start_run("port it", "openrouter")?;
+///
+/// // A ttl of zero is a lease that is lapsed as soon as it is written — which is
+/// // how a test, or an operator inspecting a crashed run, sees the expired state
+/// // without waiting for a clock.
+/// let _held = store.acquire_lease(run_id, 0)?;
+/// let row = store.run_lease(run_id)?.expect("the run is held");
+///
+/// assert_eq!(row.run_id, run_id);
+/// assert_eq!(row.owner, store.owner(), "this handle is the holder");
+/// assert_eq!(row.generation, 1);
+/// assert_eq!(row.ttl_secs, 0);
+/// assert!(row.expired, "and it has already lapsed, so anyone may take it over");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LeaseRow {
+    /// The run the lease is over.
+    pub run_id: i64,
+    /// The opaque id of the holder.
+    pub owner: String,
+    /// The generation this holder acquired at.
+    pub generation: i64,
+    /// When this owner first took the run, as an ISO-8601 UTC timestamp. A renewal
+    /// does not move it; a takeover does.
+    pub acquired_at: String,
+    /// When the lease was last extended, as an ISO-8601 UTC timestamp.
+    pub renewed_at: String,
+    /// When the lease lapses — `renewed_at + ttl_secs`, computed by the database
+    /// against the clock an acquire will use.
+    pub expires_at: String,
+    /// How long after `renewed_at` the lease lapses.
+    pub ttl_secs: i64,
+    /// Whether the lease has already lapsed, evaluated by the database against the
+    /// same clock the acquire uses — never by the caller against its own.
+    pub expired: bool,
 }
 
 /// One durable checkpoint-lifecycle event: a step was checkpointed, a run was
@@ -3135,6 +3376,13 @@ pub(crate) const RUN_TABLES: &[(&str, &str)] = &[
     // guarantee, which is why `a_deleted_session_leaves_no_message_at_either_end`
     // asserts the table is empty afterwards instead of trusting it.
     ("agent_messages", "to_run_id"),
+    // 0.62.0 — the lease is run-keyed like everything above it, and 0.58.0's
+    // schema-driven seeder is what said so: deleting a session left three lease
+    // rows behind pointing at runs that no longer existed. A stale lease is worse
+    // than an ordinary orphan, because the run id it holds is one SQLite will
+    // eventually hand to a different run — which would then start life refused by a
+    // driver that died before it existed.
+    ("run_leases", "run_id"),
 ];
 
 /// What one session is holding, in the bytes of its own rows.
@@ -4376,6 +4624,54 @@ impl Store {
             [],
         );
 
+        // 0.62.0 — who is driving a run right now. Until this table there was no
+        // answer at all: `check_resumable` asks the checkpoint format, whether the
+        // run exists and whether it already ended, and `runs.status = 'running'`
+        // has never told a live process from a crashed one — so two processes
+        // could both resume one run and interleave their steps into a single trace
+        // that describes a run neither of them performed.
+        //
+        // `run_id` is the PRIMARY KEY and therefore a rowid alias, so every lookup
+        // the crate makes on this table is a `SEARCH … USING INTEGER PRIMARY KEY`.
+        // There is deliberately **no** second index: no query filters on `owner`,
+        // on `renewed_at` or on any expiry expression — the one read that is not
+        // by run id lists a table holding at most one row per live run — and an
+        // index no statement names is schema that every future cross-version gate
+        // has to carry for nothing.
+        //
+        // `generation` is what makes a stale driver's write refusable rather than
+        // merely late. It starts at 1 and rises by exactly one per *takeover*; a
+        // re-acquire by the same owner keeps it, so a process that reconnects to
+        // its own run does not invalidate the steps it is in the middle of
+        // committing. The step commit verifies it inside the transaction that
+        // writes the step, so a driver whose lease was taken from it writes
+        // nothing at all rather than writing a row it was not entitled to.
+        //
+        // Expiry is `renewed_at + ttl_secs` in whole seconds, compared with
+        // `strftime('%s','now')` — integers, not the float `julianday` arithmetic
+        // this file uses for elapsed *reporting* at `:5890` and `:6691`, because
+        // this comparison decides a takeover at its boundary and a boundary is the
+        // one place float rounding is a defect rather than a rounding. It is a
+        // lease and not a lock for the reason the whole design turns on: a lock
+        // held by a process that died is an outage, and a lease that expires is a
+        // run somebody else can pick up.
+        //
+        // Additive, and deliberately NOT a `CHECKPOINT_FORMAT` bump, for the
+        // reason every addition since 0.13.0 has not been one: no checkpoint
+        // layout changed, a 0.61.0 binary never names this table, and bumping the
+        // format would make [`Self::check_resumable`] refuse every 0.61.0 store
+        // over a table it does not read.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS run_leases (
+                 run_id      INTEGER PRIMARY KEY,
+                 owner       TEXT NOT NULL,
+                 generation  INTEGER NOT NULL,
+                 acquired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                 renewed_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                 ttl_secs    INTEGER NOT NULL
+             );",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -4386,7 +4682,11 @@ impl Store {
             conn.execute_batch(&format!("PRAGMA user_version = {CHECKPOINT_FORMAT}"))?;
         }
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            owner: new_owner_id(),
+            leases: std::cell::RefCell::new(std::collections::HashMap::new()),
+        })
     }
 
     /// Record a policy refusal or a human decision against a run.
@@ -5811,8 +6111,37 @@ impl Store {
     /// checkpoint event are written in a single transaction, so a crash leaves
     /// either both (the step is done) or neither (it replays) — never a torn
     /// half. The committed checkpoint is the step's completion marker.
+    /// **A driver holding a lease on this run commits only while it still holds it
+    /// (0.62.0).** The generation is verified *inside* this transaction, so a
+    /// driver whose run was taken over mid-completion writes nothing at all — no
+    /// `steps` row, no checkpoint event — and gets [`Error::Conflict`] back. A
+    /// check before the transaction would be a strictly weaker guarantee that
+    /// reads identically in a green test: the takeover would simply land in the
+    /// window between the check and the insert, which is the window this closes.
+    ///
+    /// A handle that holds no lease for this run commits exactly as it did before
+    /// the lease existed. That is what keeps a single-process run, and every direct
+    /// caller of this method, unchanged.
     pub fn checkpoint_step(&self, run_id: i64, step: &StepRecord) -> Result<()> {
+        let generation = self.leases.borrow().get(&run_id).copied();
         let tx = self.conn.unchecked_transaction()?;
+        if let Some(generation) = generation {
+            let held: bool = tx
+                .query_row(
+                    "SELECT generation FROM run_leases WHERE run_id = ?1 AND owner = ?2",
+                    (run_id, &self.owner),
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some_and(|current| current == generation);
+            if !held {
+                // Nothing has been written yet, so the rollback this drop performs
+                // has nothing to undo — which is the property F2 asserts on the
+                // store rather than on the returned error.
+                drop(tx);
+                return Err(self.conflict_for(run_id)?);
+            }
+        }
         tx.execute(
             "INSERT INTO steps (run_id, step, decision, result, prompt, tool_call, tokens)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -5831,6 +6160,20 @@ impl Store {
              VALUES (?1, ?2, 'checkpoint', NULL)",
             (run_id, step.step),
         )?;
+        // The renewal rides the commit the run is already making. That is why
+        // there is no heartbeat thread: a background renewer would need a second
+        // thread holding a `Connection`, which is `Send` and not `Sync`, to keep
+        // alive a lease whose staleness this statement already bounds at one step.
+        //
+        // In the same transaction as the step, so a committed step and the lease
+        // that entitled it cannot disagree about which of the two happened.
+        if generation.is_some() {
+            tx.execute(
+                "UPDATE run_leases SET renewed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                  WHERE run_id = ?1 AND owner = ?2",
+                (run_id, &self.owner),
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -6631,6 +6974,187 @@ impl Store {
             });
         }
         Ok(())
+    }
+
+    /// This handle's opaque lease owner id (0.62.0).
+    ///
+    /// Two `Store` handles over one database file are two owners, whether or not
+    /// they are in one process. Nothing parses this value; it is compared for
+    /// equality and printed in a conflict.
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// Take the lease on a run, or be refused (0.62.0).
+    ///
+    /// Succeeds when the run has no lease, when this handle already holds it, or
+    /// when the holding lease has lapsed — in which case this is a *takeover* and
+    /// the generation rises by one, which is what makes the previous holder's next
+    /// step commit refusable. Re-acquiring a lease this handle already holds keeps
+    /// the generation, so a driver reconnecting to its own run does not invalidate
+    /// the work it is in the middle of committing.
+    ///
+    /// Refused with [`Error::Conflict`] while a *different* owner's lease is still
+    /// live. The error names the holder and the moment its lease lapses, so a
+    /// caller can decide between backing off and waiting to take over without
+    /// parsing a message.
+    ///
+    /// The whole decision is one conditional `INSERT … ON CONFLICT DO UPDATE …
+    /// WHERE`, which is the shape [`crate::Attach`]'s three answer methods already
+    /// use to resolve a race: two acquires cannot both land, and the loser reads
+    /// the winner's row back rather than reasoning about who was first.
+    ///
+    /// ```
+    /// use io_harness::{Error, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let dir = std::env::temp_dir().join("io-harness-doc-lease");
+    /// std::fs::create_dir_all(&dir).unwrap();
+    /// let path = dir.join("s.sqlite3");
+    /// let _ = std::fs::remove_file(&path);
+    ///
+    /// let first = Store::open(&path)?;
+    /// let run_id = first.start_run("port it", "openrouter")?;
+    /// let held = first.acquire_lease(run_id, 300)?;
+    ///
+    /// // A second driver over the same store is refused, and told by whom.
+    /// let second = Store::open(&path)?;
+    /// match second.acquire_lease(run_id, 300) {
+    ///     Err(Error::Conflict { owner, .. }) => assert_eq!(owner, first.owner()),
+    ///     other => panic!("a live lease must refuse a second driver, got {other:?}"),
+    /// }
+    ///
+    /// // Released — by hand here, on drop everywhere else — and it is free again.
+    /// held.release()?;
+    /// let taken = second.acquire_lease(run_id, 300)?;
+    /// assert_eq!(taken.generation(), 1, "a released run is acquired, not taken over");
+    /// # let _ = std::fs::remove_file(&path);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn acquire_lease(&self, run_id: i64, ttl_secs: i64) -> Result<Lease<'_>> {
+        // One transaction around the write and the read-back: the generation this
+        // acquire won has to be the one this acquire wrote, not whatever the row
+        // says after somebody else's takeover landed in between.
+        let tx = self.conn.unchecked_transaction()?;
+        let taken = tx.execute(
+            &format!(
+                "INSERT INTO run_leases (run_id, owner, generation, ttl_secs)
+             VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(run_id) DO UPDATE SET
+                 owner       = excluded.owner,
+                 generation  = run_leases.generation
+                             + CASE WHEN run_leases.owner = excluded.owner THEN 0 ELSE 1 END,
+                 acquired_at = CASE WHEN run_leases.owner = excluded.owner
+                                    THEN run_leases.acquired_at
+                                    ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END,
+                 renewed_at  = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                 ttl_secs    = excluded.ttl_secs
+             WHERE run_leases.owner = excluded.owner OR ({LEASE_EXPIRED})"
+            ),
+            (run_id, &self.owner, ttl_secs),
+        )?;
+        if taken == 0 {
+            let held = Self::read_lease(&tx, run_id)?;
+            tx.commit()?;
+            return Err(conflict_from(run_id, held));
+        }
+        let generation: i64 = tx.query_row(
+            "SELECT generation FROM run_leases WHERE run_id = ?1",
+            [run_id],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        self.leases.borrow_mut().insert(run_id, generation);
+        Ok(Lease {
+            store: self,
+            run_id,
+            generation,
+            released: std::cell::Cell::new(false),
+        })
+    }
+
+    /// Extend a lease this handle holds at `generation`, keeping the generation.
+    ///
+    /// Refused with [`Error::Conflict`] once the run has been taken over — the
+    /// generation moved, so this owner is no longer entitled to the run and
+    /// renewing must not be a way back in.
+    pub fn renew_lease(&self, run_id: i64, generation: i64) -> Result<()> {
+        let renewed = self.conn.execute(
+            "UPDATE run_leases
+                SET renewed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              WHERE run_id = ?1 AND owner = ?2 AND generation = ?3",
+            (run_id, &self.owner, generation),
+        )?;
+        if renewed == 0 {
+            return Err(self.conflict_for(run_id)?);
+        }
+        Ok(())
+    }
+
+    /// Release a lease this handle holds at `generation`.
+    ///
+    /// Deleting the row rather than marking it expired is what makes "released"
+    /// and "expired" two distinguishable states: a released run has no lease row
+    /// at all, and an expired one has a row a takeover reads and increments.
+    ///
+    /// Releasing a lease this handle no longer holds is a no-op and not an error:
+    /// the run has already moved on, and the drop that calls this must not turn a
+    /// takeover somebody else performed correctly into a failure here.
+    pub fn release_lease(&self, run_id: i64, generation: i64) -> Result<()> {
+        // The handle stops enforcing before the row goes, not after: if the delete
+        // fails, this handle has still given the run up, and going on checking a
+        // generation it no longer claims would refuse its own later commits.
+        if self.leases.borrow().get(&run_id) == Some(&generation) {
+            self.leases.borrow_mut().remove(&run_id);
+        }
+        self.conn.execute(
+            "DELETE FROM run_leases WHERE run_id = ?1 AND owner = ?2 AND generation = ?3",
+            (run_id, &self.owner, generation),
+        )?;
+        Ok(())
+    }
+
+    /// Who holds a run right now, and whether that lease has lapsed (0.62.0).
+    ///
+    /// `None` when the run has no lease — it was never driven under one, or its
+    /// driver released it. Expiry is evaluated by the database, against the same
+    /// clock every acquire uses, so a caller never compares two clocks.
+    pub fn run_lease(&self, run_id: i64) -> Result<Option<LeaseRow>> {
+        Self::read_lease(&self.conn, run_id)
+    }
+
+    /// The shared read behind [`Self::run_lease`] and the conflict a refused write
+    /// reports, so both see one row shape and one expiry rule.
+    fn read_lease(conn: &Connection, run_id: i64) -> Result<Option<LeaseRow>> {
+        let row = conn
+            .query_row(
+                &format!(
+                    "SELECT owner, generation, acquired_at, renewed_at, ttl_secs,
+                            ({LEASE_EXPIRES_AT}), ({LEASE_EXPIRED})
+                       FROM run_leases WHERE run_id = ?1"
+                ),
+                [run_id],
+                |r| {
+                    Ok(LeaseRow {
+                        run_id,
+                        owner: r.get(0)?,
+                        generation: r.get(1)?,
+                        acquired_at: r.get(2)?,
+                        renewed_at: r.get(3)?,
+                        ttl_secs: r.get(4)?,
+                        expires_at: r.get(5)?,
+                        expired: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The [`Error::Conflict`] describing whoever holds `run_id` now.
+    fn conflict_for(&self, run_id: i64) -> Result<Error> {
+        Ok(conflict_from(run_id, Self::read_lease(&self.conn, run_id)?))
     }
 
     /// Record which provider ran this run, for the audit trace.
@@ -7967,6 +8491,47 @@ impl Store {
             "UPDATE sessions SET head_turn_id = ?1 WHERE id = ?2",
             (turn_id, session_id),
         )?;
+        Ok(())
+    }
+
+    /// Move a session's head, but only if it still holds `expected` (0.62.0).
+    ///
+    /// The unconditional [`Self::set_session_head`] is a lost update when two
+    /// processes take a turn on one session: both write their own turn id, the
+    /// second wins outright, and the first process's turn stays in `session_turns`
+    /// with its parent intact but off the head path — answered, billed, and
+    /// invisible to the next turn. Nothing errored and nothing recorded it.
+    ///
+    /// This does not make both turns land, and it is not meant to. It makes the
+    /// dropped one **reported**: the loser gets [`Error::Conflict`] and its turn
+    /// row is left exactly as it was, so a caller can rebase onto the head that
+    /// won rather than discovering weeks later that a turn it paid for is not in
+    /// the conversation.
+    ///
+    /// `expected` is what the caller believed it was replacing — `None` for the
+    /// first turn of a session, which is a distinct expectation from "some head,
+    /// any head" and is compared as one: SQL's `=` is never true of `NULL`, so the
+    /// comparison is written with `IS`.
+    pub fn set_session_head_if(
+        &self,
+        session_id: i64,
+        expected: Option<i64>,
+        turn_id: Option<i64>,
+    ) -> Result<()> {
+        let moved = self.conn.execute(
+            "UPDATE sessions SET head_turn_id = ?1 WHERE id = ?2 AND head_turn_id IS ?3",
+            (turn_id, session_id, expected),
+        )?;
+        if moved == 0 {
+            // A head has no lease and no expiry — there is a value that moved, not
+            // a holder. The empty `owner` says so rather than naming a process that
+            // has nothing to do with it.
+            return Err(Error::Conflict {
+                run_id: session_id,
+                owner: String::new(),
+                expires_at: String::new(),
+            });
+        }
         Ok(())
     }
 
@@ -11648,5 +12213,65 @@ mod tests {
             before.file_bytes / 1024,
         );
         let _ = std::fs::metadata(&path).unwrap();
+    }
+
+    /// **N4** — the lease lookup the step commit adds is a primary-key search, and
+    /// the query plan says so rather than a comment saying so.
+    ///
+    /// The statements are the ones the crate runs, character for character: the
+    /// read-back inside [`Store::acquire_lease`] and the generation check inside
+    /// the step commit's transaction. `run_id` is `INTEGER PRIMARY KEY` and so a
+    /// rowid alias, which is what makes both a `SEARCH`.
+    ///
+    /// The negative half matters as much: a `SCAN` of this table is a defect and
+    /// not a slow path, because it would be paid once per step for the life of
+    /// every run.
+    #[test]
+    fn the_lease_lookups_are_primary_key_searches_and_never_scans() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "NOTES.md").unwrap();
+        let _held = store.acquire_lease(run, 3_600).unwrap();
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        // The parameters are bound rather than inlined: `EXPLAIN QUERY PLAN` still
+        // *prepares* the statement, so a placeholder left unbound is a
+        // `InvalidParameterCount` and an inlined literal would be explaining a
+        // statement the crate does not run.
+        let plan = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let rows = stmt
+                .query_map(params, |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows.join(" | ")
+        };
+
+        let owner = store.owner().to_string();
+        for (what, sql, params) in [
+            (
+                "the acquire's read-back",
+                "SELECT generation FROM run_leases WHERE run_id = ?1",
+                vec![&run as &dyn rusqlite::ToSql],
+            ),
+            (
+                "the step commit's generation check",
+                "SELECT generation FROM run_leases WHERE run_id = ?1 AND owner = ?2",
+                vec![&run as &dyn rusqlite::ToSql, &owner],
+            ),
+        ] {
+            let plan = plan(sql, &params);
+            assert!(
+                plan.contains("SEARCH") && plan.contains("run_leases"),
+                "{what} must be a search: {plan}"
+            );
+            assert!(
+                !plan.contains("SCAN"),
+                "{what} must never be a scan: {plan}"
+            );
+        }
     }
 }

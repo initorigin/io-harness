@@ -72,6 +72,7 @@ into it.
 
 | Version | What it introduced | Entry |
 | --- | --- | --- |
+| 0.62.0 | One driver per run: a lease with a generation, a typed conflict for a second live owner, takeover of a lapsed lease, and a session head that advances by compare-and-swap | [2026-08-17](../CHANGELOG.md#0620---2026-08-17) |
 | 0.61.0 | Every name the harness answers is reserved, and a test derived from the crate's own tool constants keeps the set complete | [2026-08-17](../CHANGELOG.md#0610---2026-08-17) |
 | 0.60.3 | Every block a classifying turn is composed from is true of that turn — the plan gate, the boundary in force, and a preset that shapes rather than replaces | [2026-08-16](../CHANGELOG.md#0603---2026-08-16) |
 | 0.60.2 | The contract tells one truth about the sandbox boundary — twenty-two claims a release had outlived, corrected and given tests | [2026-08-16](../CHANGELOG.md#0602---2026-08-16) |

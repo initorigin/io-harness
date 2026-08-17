@@ -46,6 +46,7 @@ const ASK_QUESTION_TOOL src/tools/mod.rs
 const BUSY_TIMEOUT src/state.rs
 const CHECKPOINT_FORMAT src/state.rs
 const DEFAULT_EXEC_TIMEOUT src/tools/exec.rs
+const DEFAULT_LEASE_TTL src/run.rs
 const DEFAULT_MAX_WAIT src/run.rs
 const GLOBAL_MEMORY_WORKSPACE src/state.rs
 const IMAGE_MEDIA_TYPES src/provider/mod.rs (feature = "media")
@@ -149,6 +150,8 @@ struct Identity src/tools/git.rs
 struct Ignore src/observe.rs
 struct Layer src/policy.rs
 struct Ledger src/containment.rs
+struct Lease src/state.rs
+struct LeaseRow src/state.rs
 struct LspServer src/lsp.rs
 struct McpEvent src/state.rs
 struct McpServer src/mcp.rs

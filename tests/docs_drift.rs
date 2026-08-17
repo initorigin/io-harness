@@ -1417,3 +1417,120 @@ fn the_section_window_survives_a_crlf_checkout() {
         "the bullet window ran past its own bullet:\n{bullet}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The contract's ownership claims match the source — F7 of 0.62.0
+// ---------------------------------------------------------------------------
+//
+// `docs/CONTRACT.md` stated the defect 0.62.0 closes as a standing property of
+// the crate: "a run that is genuinely live is not detected either: `resume_*`
+// will refuse a request that has already been decided, but it will not refuse
+// one that is still being held by a process that is still running". That is now
+// false, and a page that under-promises goes uncorrected for exactly as long as
+// nobody is annoyed by it.
+//
+// **The needles below are copied from the real bytes of the page and of the
+// source, never from the sentence as a reader hears it.** 0.61.0's equivalent
+// gate was blind twice in a row: first because its identifier regex could not
+// match the `*` in `browser_*`, then because its needle read `"not yet hold"`
+// while the page writes `**not**` in the middle of the phrase. A checker that
+// searches for a sentence nobody typed passes for the wrong reason.
+
+/// The retired claim, exactly as `docs/CONTRACT.md` carried it before 0.62.0.
+/// Split at the line break the page had, so a re-wrap cannot smuggle it back in
+/// under a different shape — `flatten` collapses whitespace before the search.
+const RETIRED_LIVE_OWNER_CLAIM: &str =
+    "it will not refuse one that is still being held by a process that is still running";
+
+/// Whether a page still tells a reader that a live owner goes undetected.
+fn carries_no_undetected_live_owner_claim(page: &str) -> Result<(), String> {
+    let flat = flatten(page);
+    if flat.contains(RETIRED_LIVE_OWNER_CLAIM) {
+        return Err(format!(
+            "the page still says a live owner is not detected, which 0.62.0's lease made false: \
+             {RETIRED_LIVE_OWNER_CLAIM}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn the_contract_no_longer_says_a_live_owner_goes_undetected() {
+    if let Err(why) = carries_no_undetected_live_owner_claim(&read("docs/CONTRACT.md")) {
+        panic!("{why}");
+    }
+}
+
+#[test]
+fn the_undetected_live_owner_checker_rejects_the_retired_sentence() {
+    // The control. Without it the test above passes against a page that says
+    // nothing at all about ownership, which is how a prose gate goes quietly
+    // blind — and this is the arm the sabotage pass restores.
+    let fixture = "**The crate does not know whether the owner is alive.** A run that is\n\
+                   genuinely live is not detected either: `resume_*` will refuse a request that\n\
+                   has already been decided, but it will not refuse one that is still being held\n\
+                   by a process that is still running.\n";
+    let err = carries_no_undetected_live_owner_claim(fixture).unwrap_err();
+    assert!(err.contains("still running"), "{err}");
+}
+
+#[test]
+fn the_contracts_ownership_claims_match_the_source() {
+    let page = flatten(&read("docs/CONTRACT.md"));
+    let state = read("src/state.rs");
+    let run = read("src/run.rs");
+
+    // Claim: every `run_*` / `resume_*` takes a lease. The source is checked by
+    // counting acquire sites rather than by trusting the sentence: two run starts
+    // and four resume paths, which is every place the crate begins driving.
+    let acquires = run.matches("store.acquire_lease(").count();
+    assert_eq!(
+        acquires, 6,
+        "the contract claims every run and resume path takes a lease; src/run.rs has \
+         {acquires} acquire sites, not the two run starts and four resume paths it should"
+    );
+    assert!(
+        page.contains("takes a lease on the run it is about to drive"),
+        "the contract no longer states that a driver takes a lease"
+    );
+
+    // Claim: the generation is verified inside the transaction that writes the
+    // step. Asserted against the order of the real statements: the lease check
+    // must appear after the transaction is opened and before the step insert.
+    let commit = state
+        .split_once("pub fn checkpoint_step(")
+        .expect("checkpoint_step exists")
+        .1;
+    let tx = commit.find("unchecked_transaction()").expect("the transaction");
+    let check = commit
+        .find("SELECT generation FROM run_leases")
+        .expect("the generation check");
+    let insert = commit.find("INSERT INTO steps").expect("the step insert");
+    assert!(
+        tx < check && check < insert,
+        "the generation check must sit inside the transaction and before the step insert \
+         (tx {tx}, check {check}, insert {insert})"
+    );
+    assert!(
+        page.contains("verified inside the transaction that would have written them")
+            || page.contains("inside the transaction"),
+        "the contract no longer states where the generation is verified"
+    );
+
+    // Claim: the session head advances by compare-and-swap. Both in-crate callers
+    // go through it, and the unconditional writer is not one of them.
+    let session = read("src/session.rs");
+    assert_eq!(
+        session.matches("set_session_head_if(").count(),
+        2,
+        "both session-head advances must go through the compare-and-swap"
+    );
+    assert!(
+        !session.contains("store.set_session_head("),
+        "a session-head advance is still using the unconditional write"
+    );
+    assert!(
+        page.contains("compare-and-swap"),
+        "the contract no longer states that a session head advances by compare-and-swap"
+    );
+}

@@ -238,8 +238,12 @@ impl Session {
                 turn.session_id, self.id
             )));
         }
+        // Compare-and-swap against the head this handle believes it is moving
+        // (0.62.0). A branch is a deliberate move to an earlier turn, and it is
+        // still a lost update if another process moved the head while this one was
+        // deciding — the local head is only advanced once the store took the write.
+        store.set_session_head_if(self.id, self.head, Some(turn_id))?;
         self.head = Some(turn_id);
-        store.set_session_head(self.id, self.head)?;
         Ok(())
     }
 
@@ -826,8 +830,19 @@ impl Session {
             .map(|s| s.outcome)
             .unwrap_or_else(|| "running".into());
         store.finish_turn(turn_id, reply.as_deref(), &outcome)?;
+        // Compare-and-swap against the head this turn was taken on (0.62.0). Two
+        // processes taking a turn on one session used to both write their own turn
+        // id and the second won outright, leaving the first process's turn in
+        // `session_turns` with its parent intact but off the head path — answered,
+        // billed, and invisible to the next turn.
+        //
+        // The turn row is deliberately left exactly as it is when this refuses.
+        // This release makes a dropped turn *reported*, not landed: the answer was
+        // produced and paid for, and deleting it would destroy the one copy of what
+        // the model said. The local head is not advanced either, so this handle
+        // does not go on believing it owns a head the store gave to somebody else.
+        store.set_session_head_if(self.id, self.head, Some(turn_id))?;
         self.head = Some(turn_id);
-        store.set_session_head(self.id, self.head)?;
 
         // What the loop decided, read from the row it wrote rather than re-derived
         // here from a step count — the "built from what the run recorded, not from

@@ -221,6 +221,14 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     // than asserts on paper.
     "agent_messages",
     "agent_messages_to",
+    // 0.62.0 — who is driving a run right now. One table and NO index: `run_id` is
+    // its `INTEGER PRIMARY KEY` and therefore a rowid alias, so every lookup the
+    // crate makes on it is already a primary-key search, and an index no statement
+    // names is schema every later cross-version gate would carry for nothing.
+    // Added and nothing altered: a 0.29.0 binary opens a store carrying it and
+    // never names it, which `tests/cross_version_0_29_0.rs` executes rather than
+    // asserts on paper.
+    "run_leases",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].

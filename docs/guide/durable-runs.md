@@ -90,6 +90,60 @@ a fresh 24 hours.
 
 Run it live: `cargo run --example durable_run` (kills itself mid-run and resumes).
 
+## One driver per run (0.62.0)
+
+A run is driven under a **lease**. Every `run_*` and `resume_*` takes one on the
+run it is about to drive and gives it back on the way out, whichever way it
+leaves — an ordinary finish, an early return, an error. Nothing in your code
+changes: no entry point grew a parameter.
+
+What changes is what a *second* process gets. While the first driver holds the
+run, a second `resume` is refused before it drives anything:
+
+```rust,ignore
+match resume(&contract, &provider, &store, run_id).await {
+    Err(Error::Conflict { owner, expires_at, .. }) => {
+        // Somebody else is driving it. Back off, or wait until `expires_at`
+        // and take it over — the decision is yours, and you can make it
+        // without parsing a message.
+        eprintln!("held by {owner} until {expires_at}");
+    }
+    other => { other?; }
+}
+```
+
+Before this release both processes proceeded. Their steps interleaved into a
+single trace under one run id, each numbered from its own in-memory counter, and
+the result read as a coherent run that neither process had performed — no error,
+no event, and nothing in the store afterwards that told it from a real trace.
+
+**A crash is not a lock.** The lease carries a ttl and lapses, so a killed
+process does not take its run with it. Past the ttl another process acquires the
+run, the generation rises by one, and the dead owner — if it was somehow still
+alive — is refused at its next durable commit, writing neither a step row nor a
+checkpoint event.
+
+Set the ttl with `TaskContract::with_lease_ttl`. The default is
+`DEFAULT_LEASE_TTL`, twice `DEFAULT_EXEC_TIMEOUT`: the lease is renewed by every
+step commit, so what it has to outlast is one step — a completion plus at most one
+tool execution — and not a whole run. Shorten it if your steps are small and you
+want a crashed run recoverable sooner.
+
+Ask who holds a run with `Store::run_lease`. `runs.status = 'running'` has never
+distinguished a live process from a crashed one and still does not; the lease row
+is the answer to that question.
+
+**The bound: one machine.** The owner id is process-scoped and the lease is a row
+in a SQLite file. Two hosts sharing that file over a network filesystem is outside
+what SQLite itself promises, and this release does not claim it.
+
+**A session head is not leased.** A conversation is something many processes may
+legitimately read and branch, so locking one would forbid the `branch_from` this
+crate ships. Instead the head advances by compare-and-swap: a turn taken against a
+head that has since moved gets `Error::Conflict` back, and its turn row is left
+intact to be read or rebased. That reports a dropped turn rather than making both
+turns land — which it cannot, because a conversation has one head by definition.
+
 ## Putting a file back (0.28.0)
 
 A resume restores the run. `rewind` undoes it.

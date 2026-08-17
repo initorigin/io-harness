@@ -26,6 +26,91 @@ notes are produced from it.
 
 ### Security
 
+## [0.62.0] - 2026-08-17
+
+Two processes can no longer both drive one run. A driver holds a lease with a
+generation, every durable step commit carries it, a second live owner is refused
+with a typed conflict instead of racing, an expired lease can be taken over, and
+a session's head advances by compare-and-swap so a lost update is a returned
+conflict rather than a silently dropped turn.
+
+Before this release nothing in the crate detected a live owner: two processes
+calling `resume` on one run both passed every check and interleaved their steps
+into a single trace, under one run id, each numbered from its own in-memory
+counter. The result read as a coherent run that neither process had performed —
+no error, no event, and nothing in the store afterwards to tell it from a real
+one. For a runtime whose durable trace is the thing it is for, that was the
+sharpest correctness boundary left open.
+
+### Breaking changes
+
+- **BREAKING (compile)** — `Error` gains a `Conflict { run_id, owner,
+  expires_at }` variant. A program matching `Error` exhaustively outside the
+  crate stops compiling until it handles or ignores the new arm. *Migration:*
+  add the arm, or a `_ =>` catch-all. A caller that already has one is
+  unaffected.
+- **BREAKING (behaviour)** — a second process driving a run its owner still
+  holds now gets `Error::Conflict` where it previously got a trace. For every
+  caller that did this by accident — a supervisor restarting a worker before the
+  old one exited, a resume issued from a CLI while a service still holds the
+  run — the previous behaviour was a corrupted trace, so this is a silent
+  failure becoming a loud one. A caller that deliberately drove one run from two
+  processes and tolerated the interleaving must now wait for the lease to lapse
+  and take the run over. *Migration:* handle `Error::Conflict`; it names the
+  holder and when its lease expires.
+- **BREAKING (behaviour)** — a session-head write that lost a race used to
+  succeed silently and now returns `Error::Conflict`. The losing turn row is
+  left exactly as it was; only the head write is refused. *Migration:* where you
+  called `session.turn(...)` and ignored the possibility of a race, match
+  `Err(Error::Conflict { .. })` and either re-read the head with
+  `Store::session_head` and take the turn again, or keep the answer you have and
+  branch from it with `Session::branch_from`. A single-process program never sees
+  it. `Store::set_session_head` is unchanged and still writes unconditionally for
+  a caller that wants the old behaviour outright.
+
+### Added
+
+- `Store::acquire_lease`, `Store::renew_lease`, `Store::release_lease` and
+  `Store::run_lease`, with the `Lease` guard they hand back and the `LeaseRow`
+  they read. A lease is released when its guard drops, so no run-loop exit path
+  had to grow a release call. `Store::owner` is this handle's opaque owner id.
+- `Store::set_session_head_if`, the compare-and-swap behind every in-crate head
+  advance. `Store::set_session_head` is unchanged and still unconditional.
+- `TaskContract::lease_ttl` and `TaskContract::with_lease_ttl`, defaulting to
+  the new `DEFAULT_LEASE_TTL` — twice `DEFAULT_EXEC_TIMEOUT`, because the
+  renewal rides each step commit and so what the ttl must outlast is one step
+  rather than a whole run.
+- One additive table, `run_leases`. No index: `run_id` is its `INTEGER PRIMARY
+  KEY` and therefore a rowid alias, so every lookup the crate makes on it is
+  already a primary-key search. `CHECKPOINT_FORMAT` stays 7, and a 0.61.0 binary
+  opens a store this release wrote without ever naming the table.
+
+### Changed
+
+- `Store::checkpoint_step` verifies the caller's lease generation *inside* the
+  transaction it already opened, when the calling handle holds a lease on that
+  run. A driver whose run was taken over mid-completion therefore writes nothing
+  at all — no `steps` row and no `checkpoint_events` row — rather than writing a
+  step it was no longer entitled to. A handle holding no lease commits exactly as
+  it did before.
+- `Store::delete_session` and `Store::archive_session` now clear `run_leases`
+  along with every other run-keyed table.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **A session turn could be answered, billed, and then dropped without a word.**
+  `set_session_head` was a bare `UPDATE`, so two processes taking a turn on one
+  session both wrote their own turn id and the second won outright; the first
+  process's turn stayed in `session_turns` with its parent intact but off the
+  head path, invisible to every later turn. It is now a compare-and-swap and the
+  loser is told.
+
+### Security
+
 ## [0.61.0] - 2026-08-17
 
 Every name the harness answers is now reserved, and a test derived from the

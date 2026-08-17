@@ -658,8 +658,11 @@ A second process can [`Attach`](https://docs.rs/io-harness/latest/io_harness/str
 to a run that is still going: read the events the owning process is receiving, see
 what it is parked on, and answer it. The transport is the SQLite store both
 processes already open — `Store::open` has set `journal_mode = WAL` and a
-five-second `BUSY_TIMEOUT` since 0.12.0 — so there is no socket, no lock, no lease
-and no on-disk migration.
+five-second `BUSY_TIMEOUT` since 0.12.0 — so there is no socket and no on-disk
+migration. **Attaching itself still takes no lease**: reading a run's events and
+answering what it is parked on requires no ownership, and 0.62.0's run lease is
+about *driving* a run, which `Attach` cannot do. The two are separate questions and
+the answers did not merge.
 
 **Nothing is durable unless you broadcast.** `Observer` is still an in-process
 callback. The events reach the store only through
@@ -682,13 +685,39 @@ decision back from the row rather than from whoever raced.
 suits. The run picks up an attached answer at `ATTACH_POLL` — 200 ms — rather than
 instantly. Neither end pushes.
 
-**The crate does not know whether the owner is alive.** `runs.status = 'running'`
-has never told a live process from a crashed one and this does not change it. A run
-whose owning process died still reports what it was holding, and answering it
-writes a row nothing will read until somebody resumes. Conversely, a run that is
-genuinely live is not detected either: `resume_*` will refuse a request that has
-already been decided, but it will not refuse one that is still being held by a
-process that is still running.
+**`runs.status` still does not tell you whether the owner is alive — the lease
+does (0.62.0).** `runs.status = 'running'` has never distinguished a live process
+from a crashed one and this release does not change that column. What it adds is a
+different one to ask: `Store::run_lease` returns who holds a run, since when, and
+whether that hold has lapsed. A run whose owning process died still reports what it
+was holding, and answering it still writes a row nothing will read until somebody
+resumes.
+
+**A second process cannot drive a run its owner still holds (0.62.0).** Every
+`run_*` and `resume_*` takes a lease on the run it is about to drive and releases
+it on the way out, whichever way it leaves. A second driver arriving while that
+lease is live is refused with `Error::Conflict` naming the holder and the moment
+the lease lapses — it is refused before it drives anything, so it commits no step.
+Before this release both processes proceeded and interleaved their steps into one
+trace that described a run neither of them had performed, with no error and nothing
+in the store afterwards to distinguish it from a real one.
+
+**A lease lapses, so a crash is not a lock.** The ttl is
+`TaskContract::lease_ttl`, defaulting to `DEFAULT_LEASE_TTL` — twice
+`DEFAULT_EXEC_TIMEOUT`, because the renewal rides each step commit and so what it
+must outlast is one step rather than a whole run. Past it, another process takes
+the run over: the generation rises by one and the previous owner's next durable
+commit is refused, writing neither a `steps` row nor a checkpoint event, because
+the generation is verified inside the transaction that would have written them.
+
+**A session head advances by compare-and-swap, and a lost turn is reported
+(0.62.0).** Two processes taking a turn on one session used to both write their own
+turn id; the second won outright and the first process's turn stayed in
+`session_turns` with its parent intact but off the head path — answered, billed and
+invisible to the next turn. The losing write now returns `Error::Conflict` and the
+losing turn row is left exactly as it was. This reports a dropped turn; it does not
+make both turns land, and the answer that lost is still in the store to be read or
+rebased.
 
 **`run_events` never prunes itself.** A long run's stream grows without bound
 while the run lives, and nothing expires on a clock. Deleting it is still the
