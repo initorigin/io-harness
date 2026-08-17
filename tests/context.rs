@@ -59,6 +59,18 @@ impl MockScript {
     fn turns(&self) -> usize {
         self.seen.lock().unwrap().len()
     }
+
+    /// The role-tagged conversation of the `n`th request (0-based), 0.64.0.
+    ///
+    /// The other half of what a turn sends. `observations` above reads the flat
+    /// `user` string, which is the half a resumed run has always got right.
+    fn messages(&self, n: usize) -> Vec<io_harness::Message> {
+        let seen = self.seen.lock().unwrap();
+        seen.get(n)
+            .unwrap_or_else(|| panic!("the loop ran only {} turn(s), wanted turn {n}", seen.len()))
+            .messages
+            .clone()
+    }
 }
 
 impl Provider for MockScript {
@@ -1181,6 +1193,99 @@ async fn a_resumed_run_asks_the_model_what_an_uninterrupted_run_would_have() {
         rows,
         whole_store.observations(whole.0.run_id).unwrap(),
         "the interruption leaves the same durable ledger, with nothing duplicated"
+    );
+}
+
+/// F1 (0.64.0) — and the same is now true of the conversation, not only of the
+/// prose.
+///
+/// The twin of the test above, and deliberately its twin: same fixture, same
+/// interruption, same "turn 3 of the whole run is turn 2 of the resumed
+/// provider" alignment. That one compares the observation section, which a
+/// resumed run has assembled correctly since 0.13.0. This one compares
+/// `messages`, which until this release a resumed run did not send at all —
+/// every pre-crash step collapsed into user prose because the assistant turns
+/// that pair with those results were held in memory and died with the process.
+///
+/// **Nothing is normalised.** Not a field, not an id, not an ordering. Tool-call
+/// ids are minted from position inside each request and never stored, timestamps
+/// do not appear in `messages`, and row ids do not either — so there is nothing
+/// here that legitimately differs between the two runs, and a comparison that
+/// needed a `retain` would be evidence about the fix rather than about the run.
+#[tokio::test]
+async fn a_resumed_run_sends_the_conversation_an_uninterrupted_run_would_have() {
+    let script = || {
+        MockScript::new(vec![
+            vec![call("read_file", json!({ "path": "a.txt" }))],
+            vec![call(
+                "write_file",
+                json!({ "path": "b.txt", "content": "b" }),
+            )],
+            vec![call("read_file", json!({ "path": "b.txt" }))],
+        ])
+    };
+
+    let whole_dir = ws();
+    std::fs::write(whole_dir.path().join("a.txt"), "hello").unwrap();
+    let whole_store = Store::memory().unwrap();
+    let whole_provider = script();
+    run_with(
+        &never_passes(whole_dir.path(), 3),
+        &whole_provider,
+        &whole_store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let cut_dir = ws();
+    std::fs::write(cut_dir.path().join("a.txt"), "hello").unwrap();
+    let cut_store = Store::memory().unwrap();
+    let provider = script();
+    let first = run_with(
+        &never_passes(cut_dir.path(), 1),
+        &provider,
+        &cut_store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    io_harness::resume_with(
+        &never_passes(cut_dir.path(), 3),
+        &provider,
+        &cut_store,
+        first.run_id,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let uninterrupted = whole_provider.messages(2);
+    let resumed = provider.messages(2);
+
+    // The fixture has to be one this can fail on. A turn with no assistant
+    // message in it would compare two empty transcripts and pass forever.
+    assert!(
+        uninterrupted
+            .iter()
+            .any(|m| matches!(m, io_harness::Message::Assistant { .. })),
+        "the uninterrupted run must send assistant turns, or this proves nothing: \
+         {uninterrupted:?}"
+    );
+    assert!(
+        uninterrupted
+            .iter()
+            .any(|m| matches!(m, io_harness::Message::Results(_))),
+        "and result batches: {uninterrupted:?}"
+    );
+
+    assert_eq!(
+        resumed, uninterrupted,
+        "a resumed run sends the same roles, the same assistant turns and the same \
+         result batches the uninterrupted run sent"
     );
 }
 

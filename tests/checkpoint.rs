@@ -1447,3 +1447,74 @@ async fn a_committed_step_leaves_the_turn_it_took() {
         );
     }
 }
+
+/// F5 — a store written before 0.64.0 resumes exactly as it did then.
+///
+/// Rewinds the store to 0.63.0 the way the 0.12.0 test above rewinds to 0.12.0:
+/// the table simply is not there. The run must resume, produce prose for the
+/// history it cannot role-tag, and neither error nor invent an empty assistant
+/// turn to stand in for the one it does not have.
+#[tokio::test]
+async fn a_store_written_before_the_turn_table_resumes_as_it_did_then() {
+    let dir = ws();
+    let db = dir.path().join("runs.db");
+    let store = Store::open(&db).unwrap();
+    let crashed = run(
+        &out_contract(dir.path(), "DONE", 1),
+        &WriteOnce {
+            path: "out.txt",
+            content: "WORKING\n",
+        },
+        &store,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(crashed.outcome, RunOutcome::StepCapReached { .. }),
+        "an interrupted run to resume: {:?}",
+        crashed.outcome
+    );
+    let id = crashed.run_id;
+    assert!(
+        !store.step_turns(id).unwrap().is_empty(),
+        "the run left turns, so dropping them is a rewind rather than a no-op"
+    );
+    drop(store);
+
+    // Rewind to 0.63.0: the table is not there at all.
+    let c = sqlite(&db);
+    c.execute_batch("DROP TABLE step_turns;").unwrap();
+    assert!(
+        c.query_row("SELECT 1 FROM step_turns", [], |_| Ok(())).is_err(),
+        "the rewind removed the table"
+    );
+    drop(c);
+
+    // Reopening recreates it, empty — the state a 0.63.0 store is in the first
+    // time this binary opens it.
+    let store = Store::open(&db).unwrap();
+    assert!(
+        store.step_turns(id).unwrap().is_empty(),
+        "no turns to restore, which is what a pre-0.64.0 run has"
+    );
+    let done = resume(
+        &out_contract(dir.path(), "DONE", 3),
+        &WriteOnce {
+            path: "out.txt",
+            content: "DONE\n",
+        },
+        &store,
+        id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(done.outcome, RunOutcome::Success { .. }),
+        "it resumes rather than refusing: {:?}",
+        done.outcome
+    );
+    assert!(
+        store.last_step(id).unwrap() > 1,
+        "and it made progress past where it stopped"
+    );
+}
