@@ -42,7 +42,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.61"
+io-harness = "0.62"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -394,7 +394,8 @@ answer it — without killing it and without resuming it. The first answer wins 
 the loser is told, because the write is a compare-and-swap on the row the run
 already reads. An attaching process reads and decides: there is no method on it
 that starts, resumes or steps a run, so killing the watcher changes nothing and
-killing the owner leaves exactly the resumable run it always did.
+killing the owner leaves a resumable run — its lease is takeable as soon as that
+process is gone, so a resume is refused only while a live owner still holds one.
 
 ### Providers
 

@@ -5898,11 +5898,12 @@ pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(30);
 /// Twice that leaves the same margin again for the completion that asked for the
 /// command and for a retry behind it.
 ///
-/// The trade the number makes, stated rather than hidden: a process killed
-/// mid-step leaves its run un-resumable for up to this long. That is the price of
-/// not stopping a healthy run that is doing slow work, and it is why this is a
-/// lease with a ttl instead of a lock — a lock a dead process holds is an outage
-/// with no recovery at all.
+/// **A killed process does not cost this wait where liveness can be checked.** A
+/// lease whose owner no longer exists is takeable immediately, so `kill -9` and
+/// resume stays immediate; this bounds the cases that cannot be checked — a
+/// recycled pid, an owner id with no readable pid, and every case on Windows. It
+/// is a lease with a ttl rather than a lock for that residue: a lock a dead
+/// process holds is an outage with no recovery at all.
 ///
 /// ```
 /// use io_harness::{TaskContract, DEFAULT_EXEC_TIMEOUT, DEFAULT_LEASE_TTL};
@@ -5915,8 +5916,7 @@ pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(30);
 ///     DEFAULT_LEASE_TTL,
 /// );
 ///
-/// // An operator whose steps are small, and who wants a crashed run recoverable
-/// // sooner, says so.
+/// // An operator who wants the un-checkable cases to resolve sooner says so.
 /// let brisk = TaskContract::new("tidy the notes", "NOTES.md")
 ///     .with_lease_ttl(std::time::Duration::from_secs(60));
 /// assert!(brisk.lease_ttl < DEFAULT_LEASE_TTL);

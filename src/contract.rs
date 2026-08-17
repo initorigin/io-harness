@@ -381,12 +381,12 @@ pub struct TaskContract {
     /// Defaults to [`DEFAULT_LEASE_TTL`](crate::DEFAULT_LEASE_TTL). Set it with
     /// [`TaskContract::with_lease_ttl`].
     ///
-    /// The trade is direct and there is no setting that avoids it: too long, and a
-    /// run whose process was killed is unresumable until the lease lapses; too
-    /// short, and a healthy run doing slow work loses its lease to nobody. The
-    /// renewal rides each step commit, so the staleness this has to cover is *one
-    /// step* — one completion plus at most one tool execution — rather than a whole
-    /// run.
+    /// **This is the fallback, not the primary rule.** A lease whose owning process
+    /// is gone is takeable at once — that is what keeps `kill -9` and resume
+    /// immediate — so the ttl governs only the cases liveness cannot answer: a
+    /// recycled pid, an owner id with no readable pid, and every case on Windows.
+    /// The renewal rides each step commit, so what it has to outlast is *one step*,
+    /// a completion plus at most one tool execution, rather than a whole run.
     pub lease_ttl: Duration,
     /// A wall clock for any child spawned without one of its own (0.50.0).
     ///
@@ -1236,10 +1236,10 @@ impl TaskContract {
     /// rather than chosen: the renewal rides each step commit, so what the ttl has
     /// to outlast is one step.
     ///
-    /// Shorten it when a crashed run must be recoverable quickly and the work per
-    /// step is small; lengthen it when a step legitimately takes longer than the
-    /// exec timeout — a provider that is slow to first token behind a long tool
-    /// call. A ttl shorter than a step is not an error and will not corrupt
+    /// Shorten it where liveness cannot be checked — Windows, or a recycled pid —
+    /// and a stuck run must be recoverable quickly; lengthen it when a step
+    /// legitimately takes longer than the exec timeout, a provider slow to first
+    /// token behind a long tool call. A ttl shorter than a step is not an error and will not corrupt
     /// anything: the run simply becomes takeover-able while it is still healthy,
     /// and its next commit is then refused rather than landing wrongly.
     pub fn with_lease_ttl(mut self, lease_ttl: Duration) -> Self {

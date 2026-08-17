@@ -29,7 +29,11 @@ user input and pick up exactly where it stopped.
   `Error::Resume`, not a panic or a half-resume. `check_resumable` refuses a
   store written by a newer checkpoint format rather than misreading a layout it
   does not understand, and refuses a run id that is not in the store. An
-  already-completed run is *not* refused: it resumes as a no-op.
+  already-completed run is *not* refused: it resumes as a no-op. A run another
+  live process is already driving is refused as `Error::Conflict` (0.62.0), a
+  separate type because it answers a separate question — the checkpoint *can* be
+  continued, by somebody else, right now — and it names the holder and when its
+  lease lapses. See [one driver per run](#one-driver-per-run-0620).
 
 The 24h horizon is proven by a real `kill -9`-then-resume test plus a time-scaled
 long unattended run; a literal 24h wall-clock run is noted, not gated on.
@@ -117,17 +121,22 @@ single trace under one run id, each numbered from its own in-memory counter, and
 the result read as a coherent run that neither process had performed — no error,
 no event, and nothing in the store afterwards that told it from a real trace.
 
-**A crash is not a lock.** The lease carries a ttl and lapses, so a killed
-process does not take its run with it. Past the ttl another process acquires the
-run, the generation rises by one, and the dead owner — if it was somehow still
-alive — is refused at its next durable commit, writing neither a step row nor a
-checkpoint event.
+**A crash is not a lock.** An acquire is refused only while the lease is held by
+another owner, has *not* lapsed, and that owner's process is still running. So
+`kill -9` a driver and its run is takeable at once, not half an hour later. The
+liveness check errs towards "alive": an owner id with no readable pid, an answer
+the platform will not give, and every case on Windows all report the owner as
+running, and there the ttl alone governs. That is the safe direction — a dead
+owner believed alive costs a wait, while a live owner believed dead would hand
+its run to a second driver. Either way the takeover raises the generation by one,
+and the previous owner is refused at its next durable commit, writing neither a
+step row nor a checkpoint event.
 
 Set the ttl with `TaskContract::with_lease_ttl`. The default is
 `DEFAULT_LEASE_TTL`, twice `DEFAULT_EXEC_TIMEOUT`: the lease is renewed by every
 step commit, so what it has to outlast is one step — a completion plus at most one
 tool execution — and not a whole run. Shorten it if your steps are small and you
-want a crashed run recoverable sooner.
+want a run recoverable sooner in the cases liveness cannot answer.
 
 Ask who holds a run with `Store::run_lease`. `runs.status = 'running'` has never
 distinguished a live process from a crashed one and still does not; the lease row

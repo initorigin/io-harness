@@ -164,9 +164,16 @@ fn an_expired_lease_is_taken_over_and_a_live_one_is_not() {
     }
 }
 
-/// **F5** — a run whose owner died is resumable once its lease lapses. A lease
-/// that turns a crash into a permanent lock has traded a silent corruption for an
-/// outage, which is not an improvement.
+/// **F5** — a run whose owner died is resumable. A lease that turns a crash into a
+/// permanent lock has traded a silent corruption for an outage, which is not an
+/// improvement.
+///
+/// This is the ttl half: the owner here is *this* process, which is alive, so the
+/// liveness check cannot be what allows the takeover and expiry has to be. The
+/// liveness half — an owner that no longer exists, taken over with a ttl that
+/// cannot lapse — is `a_lease_whose_owner_no_longer_exists_is_taken_over_without_waiting`
+/// in `src/state/leases.rs`, where writing a row for a foreign pid needs the
+/// private connection.
 ///
 /// The crash is `std::mem::forget` on the guard: a killed process runs no
 /// destructor, so neither does this test. Nothing else in the file may do that —

@@ -10,7 +10,7 @@ you opened, and the program that opened it owns the policy.
 
 What 0.58.0 adds is the instrument that carries the policy out. Before it, a
 program that wanted to keep ninety days of history had to write its own SQL
-against thirty-three tables this crate owns and versions. The schema carries
+against thirty-four tables this crate owns and versions. The schema carries
 exactly one declared foreign key and never enables `PRAGMA foreign_keys`, so
 there is no cascade to lean on and no error when a table is missed — the result
 is a silent orphan, discovered months later as a file that will not shrink. And

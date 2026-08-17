@@ -44,7 +44,7 @@ cargo test --release --lib retention_cost -- --ignored --nocapture
 | 1,000 | 2,003 | 132,153 | 5.832 ms |
 
 A hundredfold more rows costs about five times as much, which is the two terms
-adding up rather than a sublinear removal: thirty-two statements are issued
+adding up rather than a sublinear removal: thirty-four statements are issued
 whatever the size, and at ten steps they are nearly all of the cost.
 
 ### A sweep against the loop it is not

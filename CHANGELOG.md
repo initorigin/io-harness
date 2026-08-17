@@ -55,9 +55,11 @@ sharpest correctness boundary left open.
   old one exited, a resume issued from a CLI while a service still holds the
   run — the previous behaviour was a corrupted trace, so this is a silent
   failure becoming a loud one. A caller that deliberately drove one run from two
-  processes and tolerated the interleaving must now wait for the lease to lapse
-  and take the run over. *Migration:* handle `Error::Conflict`; it names the
-  holder and when its lease expires.
+  processes and tolerated the interleaving must now wait for the holder to finish
+  or its lease to lapse and take the run over. Only a *live* owner refuses a
+  resume: a run whose driver was killed is taken over at once on unix, so
+  `kill -9` and resume is unchanged. *Migration:* handle `Error::Conflict`; it
+  names the holder and when its lease expires.
 - **BREAKING (behaviour)** — a session-head write that lost a race used to
   succeed silently and now returns `Error::Conflict`. The losing turn row is
   left exactly as it was; only the head write is refused. *Migration:* where you
@@ -72,8 +74,15 @@ sharpest correctness boundary left open.
 
 - `Store::acquire_lease`, `Store::renew_lease`, `Store::release_lease` and
   `Store::run_lease`, with the `Lease` guard they hand back and the `LeaseRow`
-  they read. A lease is released when its guard drops, so no run-loop exit path
-  had to grow a release call. `Store::owner` is this handle's opaque owner id.
+  they read. An acquire is refused only when the lease belongs to another owner,
+  has not lapsed, *and* that owner's process is still alive — checked with
+  `kill(pid, 0)` on unix against the pid in the owner id — so a `kill -9`'d
+  owner's run is taken over at once rather than at the ttl. The check errs
+  towards "alive", which is the direction that costs a wait rather than a second
+  driver: an owner id with no readable pid, an unknown answer and every case on
+  Windows all report the owner as running, and there the ttl alone governs. A
+  lease is released when its guard drops, so no run-loop exit path had to grow a
+  release call. `Store::owner` is this handle's opaque owner id.
 - `Store::set_session_head_if`, the compare-and-swap behind every in-crate head
   advance. `Store::set_session_head` is unchanged and still unconditional.
 - `TaskContract::lease_ttl` and `TaskContract::with_lease_ttl`, defaulting to

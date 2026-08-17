@@ -22,8 +22,11 @@
 //! What a session is not: an authorization channel. An operator's mid-turn
 //! message is text the model reads, exactly as a constraint is; every tool call it
 //! leads to is checked against the same [`Policy`] by the same code. And one
-//! session driven by two processes at once is not supported — the turns would
-//! interleave into one tree with no ordering anybody chose.
+//! session driven by two processes at once no longer interleaves silently: both
+//! head advances here — [`Session::branch_from`] and the one at the end of a turn
+//! — are a compare-and-swap on the head that was read, so the second writer is
+//! told with [`Error::Conflict`](crate::Error::Conflict) and its turn is left out
+//! of the tree. That reports a dropped turn; it does not make both of them land.
 
 use std::path::{Path, PathBuf};
 

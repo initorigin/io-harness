@@ -702,13 +702,22 @@ Before this release both processes proceeded and interleaved their steps into on
 trace that described a run neither of them had performed, with no error and nothing
 in the store afterwards to distinguish it from a real one.
 
-**A lease lapses, so a crash is not a lock.** The ttl is
-`TaskContract::lease_ttl`, defaulting to `DEFAULT_LEASE_TTL` — twice
-`DEFAULT_EXEC_TIMEOUT`, because the renewal rides each step commit and so what it
-must outlast is one step rather than a whole run. Past it, another process takes
-the run over: the generation rises by one and the previous owner's next durable
-commit is refused, writing neither a `steps` row nor a checkpoint event, because
-the generation is verified inside the transaction that would have written them.
+**A crash is not a lock.** An acquire is refused only when all three hold: the
+lease belongs to another owner, it has not lapsed, and that owner's process is
+still alive. Liveness is `kill(pid, 0)` on unix against the pid carried in the
+owner id, so a `kill -9`'d owner's run is takeable at once rather than at the ttl.
+The check errs towards "alive": an owner id with no readable pid, an unknown
+answer, and every case on Windows all report the owner as running — **on Windows
+the ttl alone governs.** That error direction is the bounded one: a dead owner
+believed alive costs a wait until the ttl, which is also what a recycled pid
+costs, whereas a live owner believed dead would hand its run to a second driver,
+and that cannot arise from an absent pid. The ttl is `TaskContract::lease_ttl`,
+defaulting to `DEFAULT_LEASE_TTL` — twice `DEFAULT_EXEC_TIMEOUT`, because the
+renewal rides each step commit and so what it must outlast is one step rather than
+a whole run. However the run is taken over, the generation rises by one and the
+previous owner's next durable commit is refused, writing neither a `steps` row nor
+a checkpoint event, because the generation is verified inside the transaction that
+would have written them.
 
 **A session head advances by compare-and-swap, and a lost turn is reported
 (0.62.0).** Two processes taking a turn on one session used to both write their own
@@ -2035,10 +2044,11 @@ refused anything — the same distinction 0.30.0 drew for a pinned memory entry.
 
 **A cancelled plan is final, and a pending one is not resumable twice (0.31.0).**
 `Store::decide_plan` refuses a second verdict with `Error::Resume`, so two
-processes racing to approve the same plan means one of them hears about it. What
-is *not* guarded is two processes each resuming the same run after a single
-approval; that is the same property every other resume in this crate has, and
-`Store::check_resumable` is the only lock there is.
+processes racing to approve the same plan means one of them hears about it. Two
+processes each resuming the same run after a single approval is guarded as well
+since 0.62.0, by the run's lease rather than by the plan: the second resume is
+refused with `Error::Conflict` before it drives a step. `Store::check_resumable`
+still answers only whether the checkpoint can be continued at all, never by whom.
 
 **Reasoning text is live-only (0.31.0).** `EventKind::Reasoning` is the only
 place the thinking appears. It is not written to the trace, so a run whose
@@ -2345,9 +2355,13 @@ the runs, not a second execution path:
 - **A steer and an interrupt land at the next step boundary**, never where they
   were sent — the same rule `Flow::Cancel` has always had, for the same reason: in
   between, a tool call is in flight and a file may be half-written.
-- **One session, one driver.** Two processes taking turns on the same session id
-  concurrently is unsupported and undefended beyond SQLite's own busy timeout;
-  their turns would interleave into one tree in an order nobody chose.
+- **One session, one driver, and the loser is told (0.62.0).** Two processes
+  taking turns on the same session id concurrently still do not both land on the
+  head path. What no longer happens is one of them being dropped silently: the
+  head advances by compare-and-swap, so the losing write returns
+  `Error::Conflict` with its turn row left intact, to be read or rebased. The run
+  behind each turn is leased besides, so two processes driving one run is refused
+  outright.
 - **A session has no aggregate budget.** Every turn is a fresh run with its own
   ceilings, so `max_steps` on one turn does not bound the next. A conversation-wide
   limit is the caller's to enforce, per turn, from `Store::run_summary`.
@@ -2433,7 +2447,9 @@ a projection onto the typed API and never a second path into the run loop:
 - **The `[toolchain]` override does not reach this crate's own run loop.** The
   harness detects for itself; `Config::toolchain(detected)` gives the embedding
   application the merged value. Wiring it into the loop needs a new
-  `TaskContract` field, which is a break, and no release so far carries one.
+  `TaskContract` field, which is an addition rather than a break — the type is
+  `#[non_exhaustive]`, and 0.62.0 added `lease_ttl` that way. The wiring is a
+  later release's work, not a break this one is avoiding.
 - **Scope discovery is fixed**: four scopes, no `include`, no `extends`, no
   parent-directory search, no JSON or YAML form, and no reload. `IO_CONFIG` (0.27.0)
   names the user-scope *file* outright, ahead of `IO_CONFIG_HOME` and every platform
