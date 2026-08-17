@@ -1131,7 +1131,6 @@ impl Store {
     }
 }
 
-
 /// The one place an assistant turn becomes rows (0.64.0).
 ///
 /// Two writers reach it — [`Store::record_step_turn`] for a direct caller, and
@@ -1142,13 +1141,10 @@ impl Store {
 /// drift, and the day they do it is the day a resumed run reads back something a
 /// live run never wrote.
 ///
-/// Takes anything that can execute, so the transaction and the bare connection
-/// are the same call.
-fn write_step_turn(
-    conn: &rusqlite::Connection,
-    run_id: i64,
-    turn: &AssistantTurn,
-) -> Result<()> {
+/// Takes a `&Connection`, which a `Transaction` dereferences to, so the
+/// in-transaction writer and the direct one are the same call rather than two
+/// spellings of it.
+fn write_step_turn(conn: &rusqlite::Connection, run_id: i64, turn: &AssistantTurn) -> Result<()> {
     let calls = serde_json::to_string(&turn.calls).map_err(|e| Error::Resume {
         reason: format!(
             "run {run_id} step {} has tool calls that cannot be stored: {e}",
