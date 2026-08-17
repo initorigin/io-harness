@@ -1757,24 +1757,24 @@ versions:
       patch.
 
       **Corrected 2026-08-17, when the contract was written, by reading the source first.** Three
-      things above are imprecise and one of them decides the fix. (1) The count is exact — 53 built-in
-      tool names exist and the reserved slice names 35 — but this entry says 18 names are "matched by
-      an arm that precedes `name if custom.owns(name)`", which is true of sixteen. `send_message` and
-      `read_messages` are intercepted by the **tree loop** at `src/run.rs:7702`, before `dispatch` is
-      called at all, and a flat run is not offered them — so a registered tool of that name *works*
-      today in a flat run and is shadowed in a tree. Reserving them removes a working configuration,
-      not merely a quiet one, which is the `SPAWN_TOOL` precedent 0.17.0 already settled.
-      (2) The six `browser_*` names are absent for a mechanical reason, not neglect: the consts are
-      `#[cfg(feature = "browser")]` (`src/tools/mod.rs:117-132`), so an unconditional slice literal
-      cannot name them in a default build. The fix therefore ungates the six names while leaving the
-      tools gated — 0.17.0's own answer for `view_image` and the nine document names
-      (`src/tools/mod.rs:244-259`). (3) "One constant that every dispatch arm reads" is not
-      implementable as written: a `match` arm cannot pattern-match against a slice const's elements
-      and each arm's body is different work. The enforceable invariant is a shared name slice where an
-      arm already reads a list (`is_browser_tool` is that idiom today) plus one test that derives the
-      built-in set from `src/` and fails when the reserved set does not hold it.
+      things above are imprecise and one of them decides the fix. (1) The count is exact — 53
+      built-in tool names exist and the reserved slice names 35 — but this entry says 18 names are
+      "matched by an arm that precedes `name if custom.owns(name)`", which is true of sixteen.
+      `send_message` and `read_messages` are intercepted by the **tree loop** at `src/run.rs:7702`,
+      before `dispatch` is called at all, and a flat run is not offered them — so a registered tool
+      of that name *works* today in a flat run and is shadowed in a tree. Reserving them removes a
+      working configuration, not merely a quiet one, which is the `SPAWN_TOOL` precedent 0.17.0
+      already settled. (2) The six `browser_*` names are absent for a mechanical reason, not
+      neglect: the consts are `#[cfg(feature = "browser")]` (`src/tools/mod.rs:117-132`), so an
+      unconditional slice literal cannot name them in a default build. The fix therefore ungates the
+      six names while leaving the tools gated — 0.17.0's own answer for `view_image` and the nine
+      document names (`src/tools/mod.rs:244-259`). (3) "One constant that every dispatch arm reads"
+      is not implementable as written: a `match` arm cannot pattern-match against a slice const's
+      elements and each arm's body is different work. The enforceable invariant is a shared name
+      slice where an arm already reads a list (`is_browser_tool` is that idiom today) plus one test
+      that derives the built-in set from `src/` and fails when the reserved set does not hold it.
     detail: specified
-    status: planned
+    status: released
   - version: 0.62.0
     outcome: >
       Two processes cannot both drive one run. Today `docs/CONTRACT.md` states the gap plainly — "a

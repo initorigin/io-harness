@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.61.0
-status: planned
+status: released
 release_type: minor
 outcome:
   user_can: >
@@ -389,3 +389,154 @@ open_questions:
   reserved, so `validate` refuses it either way and no caller can reach the case — but the asymmetry
   is worth confirming in implementation, because it is the same "an arm that is sometimes absent"
   shape the eighteen came from.
+released_at: 2026-08-17 01:52:58+00:00
+mode: published
+delivered: >
+  Every name the harness answers is reserved, and what keeps the set complete is a test rather than
+  diligence. `RESERVED_TOOL_NAMES` went from 35 entries to 53: `forget`, `check`, `patch_file`,
+  `git_branch`, `git_worktree`, the five `lsp_*`, the six `browser_*`, `send_message` and
+  `read_messages`. A program registering a `Tool` under any of them now fails at run start with
+  `Error::Config` naming it, before the provider is called once, instead of validating cleanly and
+  then never running.
+
+
+  **The six `browser_*` name constants lost their `#[cfg(feature = "browser")]`, and that was the
+  fix rather than a tidy-up.** An unconditional slice literal cannot name a constant a default build
+  does not compile, so the list was not merely un-updated — in that shape it was un-updatable. 0.17.0
+  met the same wall with the image and document names and answered it the same way. The tools stay
+  gated: the dispatch arm, the CDP client and every catalogue are untouched, and no build's offered
+  tool list moves by a byte.
+
+
+  **The invariant is `every_name_the_harness_answers_is_reserved`** in `tests/custom_tools.rs`. It
+  resolves every `const <IDENT>_TOOL: &str = "<name>"` under `src/`, resolves what the reserved slice
+  holds through those same constants, and asserts set equality in both directions — a built-in that
+  is not reserved fails, and a reserved name whose constant is gone fails too. Adding a built-in
+  without reserving its name is now a red test rather than a defect for the next audit. Its guards
+  are as important as the assertion: floors of fifty on both parses, a named panic when the slice
+  literal stops being one, a CRLF fixture, and a control that the one-entry exclusion list still
+  names something that exists and is not a tool.
+
+
+  `docs/CONTRACT.md`, `docs/guide/tools-and-skills.md` and the set's own rustdoc stopped describing
+  the defect as open, and the CHANGELOG carries it as `**BREAKING (behaviour)**` with a migration
+  note.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — **88 binaries, 1,880 passed, 0 failed, 6 ignored**, including
+    457 doctests, in 199 s, exit 0. 0.60.3 recorded 1,874 passed; the difference is exactly the six
+    tests this release adds. Full per-binary output stored at
+    `.ultraship/products/io-harness/evidence/0.61.0/default-suite.txt`.
+  - >
+    **The failing-first evidence.** Before `RESERVED_TOOL_NAMES` grew: `cargo test --test
+    custom_tools` → `test result: FAILED. 16 passed; 1 failed`, panicking on the first of the
+    eighteen — "a tool named after a built-in must be rejected: RunResult { outcome: StepCapReached
+    { steps: 1 }, run_id: 1, remembered: [] }". A registered `forget` did not merely validate; the
+    whole run completed around it while the caller's tool never ran.
+  - >
+    After the fix: `cargo test --test custom_tools` → 20 passed, 0 failed, and the same under
+    `--all-features` (20 passed) — which is F4, since the six `browser_*` rows are ungated and assert
+    in a build that compiles the browser and one that does not.
+  - >
+    **Sabotage: six arms, every one killed its named test and no other; none survived.** S1 a new
+    `pub const FAKE_TOOL` not reserved → only `every_name_the_harness_answers_is_reserved` fails,
+    which is the class no run-time test can reach. S2 `LSP_RENAME_TOOL` deleted from the slice → that
+    test and the refusal test fail together, as the contract predicted. S3 the stale guide paragraph
+    restored → the docs gate (see the finding below). S4 `|| name.starts_with("browser_")` added to
+    `Toolbox::validate` → **only F5's control fails**, which is what proves the set is names and not
+    a prefix rule. S5 the slice-literal panic replaced by `unwrap_or_default()` → only F3's control
+    fails. S6 the mailbox pair deleted → both tests fail naming `read_messages` and `send_message`.
+    Every arm was invoked against a named test binary, never a bare filter passed to every binary.
+  - >
+    Doc and surface gates, **re-run after the version bump**: `readme` 9, `docs_drift` 46,
+    `changelog` 5, `guide_pages` 10, `public_api` 8, `cross_version` 7, `custom_tools` 20 — all
+    green. The two that have cost a red CI round before are the ones the bump invalidates:
+    `readme_dependency_version_matches_cargo_toml` (README pin `0.60` → `0.61`) and
+    `the_capabilities_release_table_covers_every_released_version` (the `docs/CAPABILITIES.md` row).
+  builds:
+  - >
+    `cargo package --locked` — `Packaged 260 files, 7.5MiB (1.9MiB compressed)`, exit 0. The crate is
+    **2,025,491 bytes** locally (0.60.3: 2,019,152).
+  - >
+    `cargo check --features browser --lib` — clean. This is the check that the ungated constants do
+    not collide with the gated module that reads them.
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — clean,
+    and the rendered pages still carry feature labels (3 pages match "Available on crate feature"),
+    which is the half of that CI job exit 0 does not prove. Worth recording as a near miss: the first
+    draft of the browser rustdoc linked `RESERVED_TOOL_NAMES`, which is `pub(crate)` — precisely the
+    `rustdoc::private_intra_doc_links` class this gate has caught in eight of the last eleven
+    releases — and it was rewritten to plain backticks before the gate ran.
+  - >
+    `cargo tree | wc -l` — **402**, unchanged. No new dependency.
+  reviews:
+  - >
+    **The roadmap entry was wrong in two of its three claims, and reading the source before writing
+    the contract is what caught it — fifth release running.** (1) The entry said all eighteen names
+    are matched by a dispatch arm preceding `name if custom.owns(name)`. True of sixteen;
+    `send_message` and `read_messages` are intercepted by the tree loop at `src/run.rs:7702`, before
+    `dispatch` is reached, and a flat run is never offered them — so a registered tool of that name
+    **worked** in a flat run and was shadowed only inside a tree. (2) The six `browser_*` names were
+    absent for a mechanical reason the entry did not state: their constants were feature-gated. (3)
+    "One constant that every dispatch arm reads" is not implementable — a `match` arm cannot
+    pattern-match against a slice const's elements and each arm's body is different work. All three
+    corrections are written into the roadmap entry itself.
+  - >
+    The arithmetic was settled by machine rather than by reading: 53 built-in tool names against 35
+    reserved, and the name-shaped constant scan resolves **54** — the fifty-fourth being
+    `AT_BEFORE_TOOL` (`src/hooks.rs:61`, value `"before_tool"`), a hook stage caught only because its
+    identifier ends in `_TOOL`. That is the invariant's entire exclusion list.
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **Ungating the six constants is a public-surface addition no gate in this repository can see, and
+  `docs/public-api.txt` being unmoved is not evidence that it is safe.** That snapshot enumerates
+  items re-exported from `src/lib.rs`; the browser names are reached as `tools::BROWSER_*` and are
+  re-exported nowhere, so the file is byte-identical (`git diff develop -- docs/public-api.txt` is 0
+  lines) while `tools::BROWSER_NAVIGATE_TOOL` and its five siblings genuinely become nameable in a
+  default build. This is the same gap 0.60.3 recorded as A6 — the snapshot tracks re-exported names,
+  not a public module's own surface — hit a second time. The evidence for this change is the diff of
+  `src/tools/mod.rs`, not the snapshot.
+- >
+  **A working configuration is removed for two names.** A program that registered a tool called
+  `send_message` or `read_messages` and only ever started flat runs had a tool that worked; after
+  this release it fails at run start. That is deliberate and it is `spawn_agent`'s precedent — which
+  run shape a program happens to start must not decide which names are safe to register — but it is
+  the one place this release breaks something that was not already broken. The CHANGELOG marks it and
+  the migration is a rename.
+- >
+  **The full `--all-features` suite was not run locally; only `custom_tools` and `docs_drift` were.**
+  Disk on this machine stood at 28 GiB free against a 22 GiB `target/`, and the whole-matrix run is
+  what the PR's 19 checks and the release PR's 35 exist for. What was proved locally is that the six
+  browser names are refused in both builds.
+- >
+  **The record is sealed before the crates.io upload**, which follows the develop→main merge and the
+  GitHub Release. `mode: published` states the authorised target; the flow makes it true. The
+  published byte size and the release-run id are reported in the final report rather than sealed
+  here.
+- >
+  **F7's sabotage found a real gap in a gate, and the first fix for it was blind too.** Restoring the
+  stale guide paragraph left `docs_drift` at 45 passed, 0 failed: `guide_defers_to_the_reserved_set`
+  catches only 0.17.0's literal sentence and backticked names absent from the set, and the stale
+  claim cited `browser_*` and `lsp_*`, which end in a `*` the identifier regex never matches. It is
+  closed here — the checker now refuses a bullet claiming incompleteness by shape, with a fixture
+  sibling — but the first version of that check used the needle `"not yet hold"` while the page
+  writes the word as `**not**`, so the sabotage passed a second time. A prose checker has to be
+  tested against the real bytes of the page, not the sentence as a reader hears it.
+- >
+  **The LSP names did not get a shared slice.** The open question asked whether the five `lsp_*`
+  names should be grouped the way `is_browser_tool` groups the browser names. They are spread across
+  three dispatch arms with different bodies, so a shared slice would have added a layer rather than
+  removed a restatement. Not done, on the rule the contract set: if the diff does not delete a
+  restatement, do not make it.
+- >
+  **`READ_SKILL_TOOL`'s guarded arm was reasoned about, not tested.** `read_skill` is dispatched only
+  `if !skills.is_empty()`, so a run with no skills falls past that arm — but the name is reserved, so
+  `Toolbox::validate` refuses it before any run and no caller can reach the asymmetry. Left as it is;
+  it is the same "an arm that is sometimes absent" shape the eighteen came from, and if a name is
+  ever dispatched conditionally *and* left unreserved, the invariant catches it.
+supersedes: 0.60.3
+next_recommended_version: 0.62.0
+immutable: true
