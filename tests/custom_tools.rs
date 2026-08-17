@@ -497,6 +497,211 @@ async fn a_name_the_harness_does_not_answer_is_still_the_callers_to_take() {
     }
 }
 
+// ------------------------------------------------- F2/F3: the invariant itself
+//
+// 0.17.0 closed the shadowing gap by hand-patching the names it was missing, and
+// every built-in added afterwards reopened it by one. A list is not what keeps
+// this closed; the check below is. It derives the built-in set from the crate's
+// own constants and fails when `RESERVED_TOOL_NAMES` does not hold it, so adding
+// a built-in without reserving its name is a red test rather than a defect for
+// the next audit to find.
+
+/// A constant whose identifier ends in `_TOOL` and which is not a tool name.
+///
+/// Exactly one exists: `AT_BEFORE_TOOL` (`src/hooks.rs`) is a hook stage whose
+/// value is `"before_tool"`, caught here only by the shape of its identifier.
+/// `MCP_TOOL_PREFIX` and `NO_TOOL_CALL` do not match the pattern and need no
+/// entry.
+///
+/// **An entry added here to silence a failure is this defect reopening in a new
+/// place.** Every one carries the reason it is not a tool.
+const NOT_A_TOOL_NAME: &[&str] = &["AT_BEFORE_TOOL"];
+
+/// Every `const <IDENT>_TOOL: &str = "<name>";` in the source it is given, ident
+/// to tool name, minus the constants that are not tool names.
+///
+/// Takes the source rather than reading it, so the resolver itself can be run
+/// over a fixture — see `the_derivation_cannot_pass_by_finding_nothing`.
+fn tool_name_constants(sources: &str) -> std::collections::BTreeMap<String, String> {
+    let re = regex::Regex::new(r#"const ([A-Z0-9_]+_TOOL): &str = "([a-z0-9_]+)""#).unwrap();
+    re.captures_iter(sources)
+        .filter(|c| !NOT_A_TOOL_NAME.contains(&&c[1]))
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .collect()
+}
+
+/// The tool names `RESERVED_TOOL_NAMES` holds, resolved through the constants
+/// rather than read off a list written in prose.
+///
+/// Panics rather than returning an empty set when the slice literal is no longer
+/// there to parse: a checker that finds nothing and reports success is worse than
+/// no checker, and this repository has shipped that failure before.
+fn reserved_names(custom_rs: &str, sources: &str) -> std::collections::BTreeSet<String> {
+    let block =
+        regex::Regex::new(r"(?s)const RESERVED_TOOL_NAMES: &\[&str\] = &\[(.*?)\];").unwrap();
+    let body = block
+        .captures(custom_rs)
+        .map(|c| c[1].to_string())
+        .unwrap_or_else(|| {
+            panic!(
+                "RESERVED_TOOL_NAMES is no longer a slice literal in src/tools/custom.rs, so this \
+                 check and `tests/docs_drift.rs` are both reading nothing"
+            )
+        });
+    let consts = tool_name_constants(sources);
+    regex::Regex::new(r"([A-Z0-9_]+_TOOL)")
+        .unwrap()
+        .captures_iter(&body)
+        .filter_map(|c| consts.get(&c[1]).cloned())
+        .collect()
+}
+
+/// Every `.rs` file under `src/`, concatenated. The constants are spread across
+/// the tool modules, `src/run.rs` and `src/hooks.rs`, so one file is not enough.
+fn rust_sources() -> String {
+    fn walk(dir: &std::path::Path, out: &mut String) {
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            .map(|e| e.expect("dir entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push_str(&std::fs::read_to_string(&path).expect("read source"));
+                out.push('\n');
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut out,
+    );
+    out
+}
+
+/// F2 — a built-in name that is not reserved fails the build's tests.
+///
+/// Set equality, in both directions. A name dispatch or the tree loop answers and
+/// that this slice does not hold is the 0.17.0 defect; a name this slice holds
+/// whose constant no longer exists is a list describing a crate that has moved on.
+#[test]
+fn every_name_the_harness_answers_is_reserved() {
+    let sources = rust_sources();
+    let built_in: std::collections::BTreeSet<String> =
+        tool_name_constants(&sources).into_values().collect();
+    let reserved = reserved_names(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools/custom.rs"),
+        )
+        .expect("read src/tools/custom.rs"),
+        &sources,
+    );
+
+    // F3's floor. Both regexes matching nothing would make the assertion below
+    // trivially true, and a green vacuous check is how a gate stops being one.
+    assert!(
+        built_in.len() >= 50,
+        "the constant scan resolved only {} tool names, so it has stopped reading what it was \
+         written to read",
+        built_in.len()
+    );
+    assert!(
+        reserved.len() >= 50,
+        "the reserved-set parse resolved only {} names, so it has stopped reading the slice",
+        reserved.len()
+    );
+
+    let unreserved: Vec<&String> = built_in.difference(&reserved).collect();
+    assert!(
+        unreserved.is_empty(),
+        "{unreserved:?} are built-in tool names and RESERVED_TOOL_NAMES does not hold them. A \
+         registered tool taking one of those validates and is then unreachable, which is the \
+         defect 0.17.0 closed and every built-in added since reopened. Add the constant to the \
+         slice in src/tools/custom.rs — do not add the name to this test."
+    );
+    let stale: Vec<&String> = reserved.difference(&built_in).collect();
+    assert!(
+        stale.is_empty(),
+        "RESERVED_TOOL_NAMES holds {stale:?}, which no `*_TOOL` constant in src/ defines. The set \
+         is meant to be the built-ins, not a list that outlived them."
+    );
+}
+
+/// F3 — the derivation cannot pass by finding nothing, and it does not depend on
+/// the checkout's line endings.
+///
+/// 0.60.2 shipped a checker that windowed a page, found nothing, silently widened
+/// to the whole file and passed for the wrong reason on Windows only. Both
+/// resolvers here are run over a fixture whose lines end `\r\n`, and over one
+/// that holds no slice at all.
+#[test]
+fn the_derivation_cannot_pass_by_finding_nothing() {
+    let sources = "/// doc\r\npub const GREP_TOOL: &str = \"grep\";\r\n\
+                   const AT_BEFORE_TOOL: &str = \"before_tool\";\r\n\
+                   pub const SPAWN_TOOL: &str = \"spawn_agent\";\r\n";
+    let consts = tool_name_constants(sources);
+    assert_eq!(
+        consts.get("GREP_TOOL").map(String::as_str),
+        Some("grep"),
+        "CRLF source resolved no constants: {consts:?}"
+    );
+    assert!(
+        !consts.contains_key("AT_BEFORE_TOOL"),
+        "a hook stage is not a tool name, however its identifier ends"
+    );
+
+    let custom_rs = "const RESERVED_TOOL_NAMES: &[&str] = &[\r\n    super::GREP_TOOL,\r\n\
+                     crate::run::SPAWN_TOOL,\r\n];\r\n";
+    let reserved = reserved_names(custom_rs, sources);
+    assert_eq!(
+        reserved,
+        ["grep".to_string(), "spawn_agent".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the slice parse did not survive CRLF"
+    );
+
+    let missing = std::panic::catch_unwind(|| reserved_names("fn main() {}", sources));
+    assert!(
+        missing.is_err(),
+        "a source with no reserved slice must panic, not resolve an empty set that every later \
+         assertion then passes against"
+    );
+}
+
+/// F3's control on the exclusion list: it holds only names that really are in the
+/// source and really are not tools.
+///
+/// Without this, an entry added to `NOT_A_TOOL_NAME` to quiet a failure would
+/// simply delete a built-in from the invariant's view of the crate.
+#[test]
+fn the_exclusion_list_names_only_non_tools_that_exist() {
+    let sources = rust_sources();
+    for excluded in NOT_A_TOOL_NAME {
+        assert!(
+            sources.contains(&format!("const {excluded}: &str")),
+            "{excluded} is excluded from the built-in scan and no longer exists; remove it rather \
+             than leaving a hole in the invariant"
+        );
+        let re = regex::Regex::new(&format!(r#"const {excluded}: &str = "([a-z0-9_]+)""#)).unwrap();
+        let value = re
+            .captures(&sources)
+            .map(|c| c[1].to_string())
+            .unwrap_or_else(|| panic!("{excluded} is no longer a plain string constant"));
+        assert!(
+            !RESERVED_AND_DISPATCHED.contains(&value.as_str()),
+            "{excluded} carries the value {value:?}, which the harness does answer as a tool name"
+        );
+    }
+}
+
+/// The two names an excluded constant must not shadow: a spot check that the
+/// exclusion list cannot be used to hide a real tool behind a value.
+const RESERVED_AND_DISPATCHED: &[&str] = &["read_file", "write_file", "exec", "grep"];
+
 /// F3 — the `mcp__` prefix belongs to MCP servers and an in-process tool may not
 /// take it, or a server tool could be impersonated by a local one.
 #[tokio::test]

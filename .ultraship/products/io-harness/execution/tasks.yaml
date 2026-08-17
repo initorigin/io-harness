@@ -95,7 +95,7 @@ tasks:
     Without it this release is 0.17.0 again: a list patched by hand that the next built-in reopens. The
     floor and the CRLF control are what stop the derivation passing vacuously, which is the failure mode
     0.60.2 paid for.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.61.0-T02
   acceptance_criteria:
@@ -117,7 +117,31 @@ tasks:
     that silently falls back is the defect 0.60.2 paid for.
   files:
   - tests/custom_tools.rs
-  evidence: []
+  evidence:
+  - >-
+    `every_name_the_harness_answers_is_reserved` in `tests/custom_tools.rs` derives the built-in set from
+    every `const <IDENT>_TOOL: &str = "<name>"` under `src/` and asserts set equality with the names `RESERVED_TOOL_NAMES`
+    resolves to, in both directions. The resolvers take the source as an argument rather than reading
+    it, which is what lets the control run them over a fixture.
+  - >-
+    Sabotage A — `pub const FAKE_TOOL: &str = "fake_tool";` appended to `src/tools/mod.rs` and nothing
+    else changed: `every_name_the_harness_answers_is_reserved ... FAILED`, message `["fake_tool"] are
+    built-in tool names and RESERVED_TOOL_NAMES does not hold them`. **Only that test failed** — 19 filtered
+    out, and no run-time test can see a name no dispatch arm answers yet, which is exactly the class the
+    invariant exists for and the class a refusal test cannot cover.
+  - >-
+    Sabotage B — `super::LSP_RENAME_TOOL` deleted from the slice: `test result: FAILED. 18 passed; 2 failed`
+    — `every_name_the_harness_answers_is_reserved` and `no_name_the_harness_answers_can_be_taken_by_a_registered_tool`,
+    together, as the contract predicted. Both arms reverted with `git checkout`.
+  - >-
+    F3's guards, asserted rather than assumed: floors of fifty on both parses; `the_derivation_cannot_pass_by_finding_nothing`
+    runs both resolvers over a CRLF fixture and asserts a source with no slice literal **panics** rather
+    than resolving an empty set; `the_exclusion_list_names_only_non_tools_that_exist` fails if an entry
+    in `NOT_A_TOOL_NAME` stops existing or starts carrying a real tool's value.
+  - >-
+    The exclusion list has exactly one entry — `AT_BEFORE_TOOL` (`src/hooks.rs:61`, value `"before_tool"`),
+    a hook stage caught only because its identifier ends in `_TOOL`. 53 tool names resolved against 53
+    reserved.
 - id: US-IO-HARNESS-0.61.0-T04
   summary: Retire the open-defect prose in the reserved set's rustdoc, the tools guide, docs/CONTRACT.md
     and the CHANGELOG.
