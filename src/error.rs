@@ -231,15 +231,58 @@ fn is_context_overflow(message: &str) -> bool {
 /// }
 /// # }
 /// ```
+// `#[non_exhaustive]` since 0.63.0, and it is late. Every variant added since
+// 0.23.0 — `Lsp`, `Browser`, `Resume`, `Conflict` — was a compile break for a
+// caller matching this enum exhaustively, and 0.62.0's contract said so about
+// `Conflict` while believing the attribute was already here. It was on
+// `ProviderErrorKind`, not on `Error`. Paid once now, for the reason
+// `Verification` (0.34.0), `TaskContract` (0.35.0), `AgentDef` (0.36.0),
+// `TurnResult` (0.37.0) and `ProviderErrorKind` (0.43.0) each paid it: a caller
+// adds a wildcard arm once, and the next kind of failure the crate has to name
+// costs nobody anything.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// A filesystem tool operation failed.
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The state store failed.
+    ///
+    /// Owned since 0.63.0: `kind` is what a caller branches on and `message` is
+    /// what the storage layer reported, so neither requires depending on this
+    /// crate's storage library to read.
+    ///
+    /// ```
+    /// use io_harness::{Error, StorageErrorKind};
+    ///
+    /// # fn handle(failure: Error) -> &'static str {
+    /// match failure {
+    ///     // Somebody else is writing. This one is worth another attempt.
+    ///     Error::Storage { kind: StorageErrorKind::Busy, .. } => "retry",
+    ///     Error::Storage { .. } => "the store failed; do not retry blindly",
+    ///     _ => "not a storage failure",
+    /// }
+    /// # }
+    /// ```
+    #[error("state store error ({kind}): {message}")]
+    Storage {
+        /// What kind of storage failure it was, so a caller can branch on it
+        /// without reading the message.
+        kind: StorageErrorKind,
+        /// What the storage layer reported, kept whole.
+        message: String,
+    },
+
     /// The state store (rusqlite) failed.
+    #[deprecated(
+        since = "0.63.0",
+        note = "match Error::Storage { kind, message } instead — it carries the same failure \
+                without putting rusqlite in this crate's public contract. Nothing constructs \
+                this variant as of 0.63.0. Removed in 0.65.0."
+    )]
     #[error("state store error: {0}")]
-    State(#[from] rusqlite::Error),
+    State(rusqlite::Error),
 
     /// The provider request or its streamed response failed.
     ///
@@ -429,6 +472,97 @@ impl Error {
     }
 }
 
+/// What kind of storage failure [`Error::Storage`] is reporting.
+///
+/// Classified once, here, from what the storage layer said — so a caller asks
+/// the question a caller actually has ("is another writer holding it?") without
+/// depending on this crate's storage library at a matching version to ask it.
+/// That dependency is what [`Error::State`] required and why it is deprecated.
+///
+/// `#[non_exhaustive]` from birth: the arms below are the distinctions this
+/// crate can draw today, and a storage layer has more.
+///
+/// ```
+/// use io_harness::StorageErrorKind;
+///
+/// // Only `Busy` says another attempt could succeed on its own.
+/// assert!(StorageErrorKind::Busy.is_retryable());
+/// assert!(!StorageErrorKind::Constraint.is_retryable());
+/// assert_eq!(StorageErrorKind::Busy.to_string(), "busy");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StorageErrorKind {
+    /// Another connection holds the write lock. The only kind another attempt
+    /// can resolve on its own.
+    Busy,
+    /// A constraint was violated — a uniqueness rule, a check, a null. The
+    /// request itself is wrong and repeating it reaches the same failure.
+    Constraint,
+    /// The database file is unreadable, malformed, or not a database. Nothing a
+    /// caller does with the same file will fix it.
+    Corrupt,
+    /// A statement was rejected, a type did not convert, or the failure is one
+    /// this crate does not yet tell apart. The message carries what was said.
+    Other,
+}
+
+impl StorageErrorKind {
+    /// Whether re-issuing the same statement could plausibly succeed.
+    ///
+    /// Only [`Busy`](Self::Busy). A constraint violation and a corrupt file are
+    /// both permanent for the request that met them, and [`Other`](Self::Other)
+    /// is the arm this crate could not classify — retrying on "I do not know"
+    /// spends the budget to reach the same failure.
+    ///
+    /// ```
+    /// use io_harness::StorageErrorKind;
+    ///
+    /// assert!(StorageErrorKind::Busy.is_retryable());
+    /// assert!(!StorageErrorKind::Corrupt.is_retryable());
+    /// assert!(!StorageErrorKind::Other.is_retryable());
+    /// ```
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Busy)
+    }
+}
+
+impl std::fmt::Display for StorageErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Busy => "busy",
+            Self::Constraint => "constraint",
+            Self::Corrupt => "corrupt",
+            Self::Other => "other",
+        })
+    }
+}
+
+/// Every storage failure the crate sees is classified here once, rather than at
+/// each of the roughly 360 `?` sites in `src/state.rs` and `src/state/*.rs`.
+///
+/// This is the shape [`From<reqwest::Error>`](Error) below already uses, and the
+/// reason the conversion could move without touching a single one of those
+/// sites: they convert through `?`, and `?` reads whichever `From` is in scope.
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        use rusqlite::ffi::ErrorCode;
+        let kind = match &e {
+            rusqlite::Error::SqliteFailure(inner, _) => match inner.code {
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => StorageErrorKind::Busy,
+                ErrorCode::ConstraintViolation => StorageErrorKind::Constraint,
+                ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => StorageErrorKind::Corrupt,
+                _ => StorageErrorKind::Other,
+            },
+            _ => StorageErrorKind::Other,
+        };
+        Self::Storage {
+            kind,
+            message: e.to_string(),
+        }
+    }
+}
+
 /// Every `reqwest` failure the crate sees is a provider call that did not
 /// complete, so the timeout/transport split is decided here once instead of at
 /// each of the four call sites (three providers plus the shared SSE reader).
@@ -456,7 +590,7 @@ impl From<reqwest::Error> for Error {
 ///
 /// // `Result<RunOutcome>` is `std::result::Result<RunOutcome, io_harness::Error>`.
 /// # async fn build_notes(repo: &str) -> Result<io_harness::RunOutcome> {
-/// let store = Store::open("runs.db")?;          // rusqlite failure -> Error::State
+/// let store = Store::open("runs.db")?;          // storage failure -> Error::Storage
 /// let provider = OpenRouter::from_env()?;       // missing key   -> Error::Config
 /// let contract = TaskContract::workspace("summarise the README into NOTES.md", repo)
 ///     .with_verification(Verification::WorkspaceFileContains {

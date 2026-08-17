@@ -342,8 +342,7 @@ async fn a_note_written_mid_run_withdraws_the_marker_for_one_step() {
 /// still passed.
 #[test]
 fn the_boundary_is_one_helper_that_both_loops_call() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/run.rs")).unwrap();
-    let src = src.replace("\r\n", "\n");
+    let src = run_subsystem_source();
 
     for helper in ["cache_boundary_for", "frozen_prefix"] {
         let defs = src.matches(&format!("fn {helper}")).count();
@@ -749,3 +748,38 @@ const NOTE_KEYS: [&str; 20] = [
     "k00", "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10", "k11", "k12",
     "k13", "k14", "k15", "k16", "k17", "k18", "k19",
 ];
+
+/// `src/run.rs` and every `src/run/<subject>.rs`, concatenated.
+///
+/// 0.63.0 moved the run subsystem's private machinery into submodules, so a
+/// source-reading checker pointed at the parent alone now sees a fraction of it —
+/// and a count that comes back zero reads exactly like a rule that was deleted.
+/// The floor below is what turns "the walk went blind" into a failure instead of
+/// a silent pass.
+fn run_subsystem_source() -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all = std::fs::read_to_string(root.join("src/run.rs"))
+        .expect("src/run.rs")
+        .replace("\r\n", "\n");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("src/run"))
+        .expect("src/run/")
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    paths.sort();
+    assert!(
+        paths.len() >= 5,
+        "src/run/ holds only {} modules — the split has been undone or this walk is blind, \
+         and either way every count taken from it is meaningless",
+        paths.len()
+    );
+    for path in paths {
+        all.push('\n');
+        all.push_str(
+            &std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\r\n", "\n"),
+        );
+    }
+    all
+}

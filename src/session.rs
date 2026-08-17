@@ -789,7 +789,17 @@ impl Session {
         //
         // One place, not five: every entry point reaches the loop through here, so
         // the rule cannot hold at four of them and lapse at the fifth.
-        extras.classify = matches!(contract.verify, Verification::None);
+        //
+        // 0.63.0 — and the caller may now say outright. The inference above is
+        // right for the callers it was written for and wrong for one real shape:
+        // a chat surface that attaches a criterion to every turn loses greeting
+        // handling entirely, because a judged turn is work and "hello" starts a
+        // run. `TaskContract::conversational` is that way back, and `None` — every
+        // contract built before this release, and every one built without asking —
+        // leaves the inference exactly as it was.
+        extras.classify = contract
+            .conversational
+            .unwrap_or(matches!(contract.verify, Verification::None));
 
         // The run row and the turn row before the first completion is billed, so a
         // turn whose process dies mid-answer is in the tree with a run id a resume

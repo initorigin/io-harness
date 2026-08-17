@@ -788,9 +788,7 @@ fn a_manifest_may_not_run_a_command_in_any_scope() {
 /// that cannot fail is a comment.
 #[test]
 fn the_step_loop_never_touches_a_plugin() {
-    let source = std::fs::read_to_string("src/run.rs")
-        .unwrap()
-        .replace("\r\n", "\n");
+    let source = run_subsystem_source();
     let uses: Vec<&str> = source
         .lines()
         .filter(|l| l.contains("crate::plugin") || l.contains("plugin::"))
@@ -815,4 +813,38 @@ fn the_step_loop_never_touches_a_plugin() {
         1,
         "the control finds the call this test exists to catch"
     );
+}
+
+/// `src/run.rs` and every `src/run/<subject>.rs`, concatenated.
+///
+/// 0.63.0 moved the run subsystem's private machinery into submodules, so a
+/// source-reading checker pointed at the parent alone now sees a fraction of it —
+/// and a count that comes back zero reads exactly like a rule that was deleted.
+/// The floor below turns "the walk went blind" into a failure instead of a pass.
+fn run_subsystem_source() -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all = std::fs::read_to_string(root.join("src/run.rs"))
+        .expect("src/run.rs")
+        .replace("\r\n", "\n");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("src/run"))
+        .expect("src/run/")
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    paths.sort();
+    assert!(
+        paths.len() >= 5,
+        "src/run/ holds only {} modules — the split has been undone or this walk is blind, \
+         and either way every count taken from it is meaningless",
+        paths.len()
+    );
+    for path in paths {
+        all.push('\n');
+        all.push_str(
+            &std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\r\n", "\n"),
+        );
+    }
+    all
 }

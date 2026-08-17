@@ -62,6 +62,48 @@ would be answering about a different project.
 on a turn, or a headless one-shot for unattended work. It stopped being the only
 way in.
 
+## Binding the host once (0.63.0)
+
+Every signature above takes the provider, the store, the policy and the approver,
+and most programs pass the same four every time. `Harness` binds them, along with
+the settings on `TaskContract` that describe the *host* rather than a task — the
+toolbox, MCP and LSP servers, the browser, the skills directory, the plugin
+bundles, the agent roster, the responder and web access:
+
+```rust,no_run
+use io_harness::{ApproveAll, Harness, OpenRouter, Policy, Store, TaskContract};
+
+# async fn demo(policy: Policy) -> io_harness::Result<()> {
+let store = Store::open("runs.db")?;
+let provider = OpenRouter::from_env()?;
+
+let harness = Harness::new(&provider, &store)
+    .with_policy(policy)
+    .with_approver(&ApproveAll)
+    .with_defaults(TaskContract::workspace("", "/repo").with_skills("/repo/.io/skills"));
+
+let mut session = harness.session("/repo")?;
+harness.turn(&mut session, "what does the retry policy actually retry?").await?;
+harness.turn(&mut session, "now make it retry a 503 as well").await?;
+# Ok(()) }
+```
+
+Three things worth knowing about it:
+
+- **It borrows.** `rusqlite::Connection` is `Send` and not `Sync`, so a `Harness`
+  that owned the store would push that constraint onto anything holding one. Every
+  entry point above already takes these by reference, so borrowing composes with
+  what you already have.
+- **The template is not merged.** `harness.workspace(...)` and `harness.task(...)`
+  start from what `with_defaults` bound; a contract *you* built and handed to
+  `harness.run(...)` is used exactly as you built it. Nothing is filled in behind
+  your back, because a rule you cannot evaluate at the call site is worse than
+  typing a setting twice.
+- **It adds no path.** Every method calls the same free function or `Session` method
+  you would have called yourself, which is asserted as trace equality rather than
+  left as an intention. The functions above keep working exactly as they are; the
+  `Harness` is a convenience over them and never a replacement.
+
 ## Not every turn is work (0.37.0)
 
 Someone types `hi`. Through 0.36.1 that opened a run: a `runs` row, a plan gate
@@ -115,9 +157,37 @@ sentence has strictly more to go on.
 - **Only the first completion of a turn can be a reply.** A run whose fifth step
   stops on text is a run that finished, as it always was.
 - **Prose *and* a tool call is work.** The call decides.
-- **A contract carrying a `Verification` is never a reply.** You said how the turn
-  is judged, so you said it is work. A bounded contract with no verification
-  classifies like an unbounded turn.
+- **A contract carrying a `Verification` is never a reply — unless you say
+  otherwise (0.63.0).** By default, you said how the turn is judged, so you said
+  it is work; a bounded contract with no verification classifies like an unbounded
+  turn. That inference is right for most callers and wrong for one real shape: a
+  chat surface that attaches a criterion to *every* turn loses greeting handling
+  entirely, and before 0.63.0 there was no way to ask for it back.
+
+  `TaskContract::with_conversational_turns` is that way back, and its opposite:
+
+  ```rust,no_run
+  use io_harness::{TaskContract, Verification};
+
+  # fn demo(repo: &str) {
+  // Judged, and still allowed to answer "hello".
+  let chat = TaskContract::workspace("hello", repo)
+      .with_verification(Verification::Command {
+          argv: vec!["cargo".into(), "test".into()],
+          expect_exit: 0,
+      })
+      .with_conversational_turns(true);
+
+  // Unjudged, and required to do the work anyway.
+  let strict = TaskContract::workspace("summarise the README", repo)
+      .with_conversational_turns(false);
+  # let _ = (chat, strict); }
+  ```
+
+  Leaving it unset is a third state and not a spelling of `false`: it means
+  "infer", which is what every contract written before 0.63.0 does and what any
+  contract that never calls the builder keeps doing. It governs session turns
+  only — a one-shot `run_*` never classifies at all.
 - **`run_with` never classifies.** A one-shot contract is work by declaration.
 - **A reply is billed.** `Store::run_summary` reports its tokens and the per-call
   accounting row carries its model and latency. A turn that cannot afford its own

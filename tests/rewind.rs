@@ -758,9 +758,7 @@ async fn a_rewind_leaves_a_commit_alone_and_does_not_touch_what_it_did_not_keep(
 /// stated as what it proves, not as "the loop does no rewind work".
 #[test]
 fn no_tool_dispatches_to_a_rewind_and_the_loop_never_calls_one() {
-    let source = std::fs::read_to_string("src/run.rs")
-        .unwrap()
-        .replace("\r\n", "\n");
+    let source = run_subsystem_source();
 
     // Nothing the model can call is a rewind: the tool-name constants are the
     // whole surface a `ToolSpec` is built from.
@@ -831,4 +829,38 @@ async fn a_run_that_rewinds_nothing_writes_no_rewind_rows_and_makes_no_worktree(
         !dir.path().join(".worktrees").exists(),
         "nothing asked for a worktree, so none was made"
     );
+}
+
+/// `src/run.rs` and every `src/run/<subject>.rs`, concatenated.
+///
+/// 0.63.0 moved the run subsystem's private machinery into submodules, so a
+/// source-reading checker pointed at the parent alone now sees a fraction of it —
+/// and a count that comes back zero reads exactly like a rule that was deleted.
+/// The floor below turns "the walk went blind" into a failure instead of a pass.
+fn run_subsystem_source() -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all = std::fs::read_to_string(root.join("src/run.rs"))
+        .expect("src/run.rs")
+        .replace("\r\n", "\n");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("src/run"))
+        .expect("src/run/")
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    paths.sort();
+    assert!(
+        paths.len() >= 5,
+        "src/run/ holds only {} modules — the split has been undone or this walk is blind, \
+         and either way every count taken from it is meaningless",
+        paths.len()
+    );
+    for path in paths {
+        all.push('\n');
+        all.push_str(
+            &std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\r\n", "\n"),
+        );
+    }
+    all
 }

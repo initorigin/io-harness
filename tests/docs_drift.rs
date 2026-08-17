@@ -773,6 +773,106 @@ fn appcontainer_checker_reports_the_sentence_that_was_there() {
 }
 
 // ---------------------------------------------------------------------------
+// The storage library is out of the contract, and the page says so
+// ---------------------------------------------------------------------------
+
+/// The two claims `docs/CONTRACT.md` carried from 0.23.0 until 0.63.0 wrapped
+/// the error, taken from the **real bytes of the page** rather than from the
+/// sentences as a reader hears them.
+///
+/// 0.61.0's F7 was blind twice in a row for exactly this reason: its first needle
+/// contained a `*` its regex could never match, and its second read `"not yet
+/// hold"` while the page writes `**not**`. Both of these appear literally in the
+/// pre-0.63.0 file, and the control below pastes them from it.
+const RETIRED_STORAGE_CLAIMS: &[&str] = &[
+    "**`rusqlite` is a public dependency of this crate.**",
+    "the intent is to take it out",
+];
+
+/// Does `doc_text` describe the storage error as owned, and has it stopped
+/// describing the wrap as an intention?
+///
+/// A contract that promises a wrap the crate has already shipped is drift in the
+/// direction nobody complains about — a reader is under-informed rather than
+/// misinformed — which is precisely why nothing forces it into the open. 0.60.2's
+/// sweep found nineteen claims of that shape in this file.
+fn states_the_storage_error_is_owned(doc_text: &str) -> Result<(), String> {
+    let mut wrong = Vec::new();
+    for claim in RETIRED_STORAGE_CLAIMS {
+        if let Some(line) = doc_text.lines().position(|l| l.contains(claim)) {
+            wrong.push(format!(
+                "line {}: still says \"{claim}\", which 0.63.0's wrap made false",
+                line + 1
+            ));
+        }
+    }
+    for needed in ["Error::Storage", "StorageErrorKind"] {
+        if !doc_text.contains(needed) {
+            wrong.push(format!(
+                "names no `{needed}` — that is what a caller matches now, and a contract that \
+                 does not name it leaves them reaching for the deprecated variant"
+            ));
+        }
+    }
+    // The wrap bought a type-level guarantee and not a graph-level one, and
+    // saying only the first would be an overclaim in this crate's own favour.
+    if !doc_text.contains("links = \"sqlite3\"") {
+        wrong.push(
+            "does not state the `links = \"sqlite3\"` constraint that survives the wrap — a \
+             consumer still cannot hold a different rusqlite than this crate does"
+                .to_string(),
+        );
+    }
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(wrong.join("; "))
+    }
+}
+
+#[test]
+fn contract_states_the_storage_error_is_owned() {
+    if let Err(e) = states_the_storage_error_is_owned(&read("docs/CONTRACT.md")) {
+        panic!(
+            "docs/CONTRACT.md {e}\n\n\
+             This file is what a caller may depend on. It described wrapping the storage error \
+             as an intention for forty releases; shipping the wrap and leaving the page saying \
+             so would be the same drift in the opposite direction.\n"
+        );
+    }
+}
+
+#[test]
+fn storage_checker_reports_the_sentences_that_were_there() {
+    // Both sentences, pasted verbatim from the pre-0.63.0 page — including the
+    // `**` bold markers, which is the character class that made 0.61.0's
+    // equivalent checker blind.
+    let fixture = "There is a third half the snapshot cannot show, because it enumerates \
+                   re-exported\n*names* and this is a *type*: **`rusqlite` is a public \
+                   dependency of this crate.**\n`Error::State(#[from] rusqlite::Error)` carries \
+                   that crate's own error type.\n\n\
+                   **`rusqlite::Error` is in the public API, and the intent is to take it out\n\
+                   (0.23.0).**\n";
+    let err = states_the_storage_error_is_owned(fixture).expect_err("must be reported");
+    for claim in RETIRED_STORAGE_CLAIMS {
+        assert!(err.contains(claim), "the checker missed {claim:?}: {err}");
+    }
+    assert!(err.contains("Error::Storage"), "{err}");
+
+    // And the replacement passes.
+    let fixed = "`Error::Storage { kind, message }` carries an owned `StorageErrorKind`.\n\
+                 `libsqlite3-sys` declares `links = \"sqlite3\"`, so only one version can exist.\n";
+    assert_eq!(states_the_storage_error_is_owned(fixed), Ok(()));
+
+    // A CRLF checkout finds the same two claims — the shape that made a 0.60.2
+    // checker pass while checking nothing.
+    let crlf = fixture.replace('\n', "\r\n");
+    let err = states_the_storage_error_is_owned(&crlf.replace("\r\n", "\n"))
+        .expect_err("a normalised CRLF page must report the same claims");
+    assert!(err.contains(RETIRED_STORAGE_CLAIMS[0]), "{err}");
+}
+
+// ---------------------------------------------------------------------------
 // The release table is a list, and stays one
 // ---------------------------------------------------------------------------
 
@@ -1481,7 +1581,7 @@ fn the_contracts_ownership_claims_match_the_source() {
     // explicitly rather than searched for: a checker that hunts for its subject
     // across files is a checker that will one day find nothing and say nothing.
     let commit_home = read("src/state/trace.rs");
-    let run = read("src/run.rs");
+    let run = run_subsystem();
 
     // Claim: every `run_*` / `resume_*` takes a lease. **Derived, not counted.** A
     // count of acquire sites is satisfied by six acquires in one function, and this
@@ -1572,4 +1672,31 @@ fn the_contracts_ownership_claims_match_the_source() {
         page.contains("compare-and-swap"),
         "the contract no longer states that a session head advances by compare-and-swap"
     );
+}
+
+/// `src/run.rs` and every `src/run/<subject>.rs`, concatenated.
+///
+/// The lease invariant below is about every function that begins driving a run,
+/// and 0.63.0 moved `run_from`, `run_workspace_from` and `agent_loop` into
+/// `src/run/step.rs` and `src/run/tree.rs`. A checker reading the parent alone
+/// would find none of them and report nothing missing.
+fn run_subsystem() -> String {
+    let dir = repo_root().join("src/run");
+    let mut all = read("src/run.rs");
+    let mut paths: Vec<std::path::PathBuf> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    paths.sort();
+    assert!(
+        paths.len() >= 5,
+        "src/run/ holds only {} modules — the walk is blind and the invariant below is vacuous",
+        paths.len()
+    );
+    for path in paths {
+        all.push('\n');
+        all.push_str(&fs::read_to_string(&path).unwrap().replace("\r\n", "\n"));
+    }
+    all
 }

@@ -22,14 +22,27 @@ do compile, but they are not individually snapshotted. Treat them as public and
 stable in the same way, and expect the snapshot to grow to cover them rather than
 the items to be withdrawn.
 
-There is a third half the snapshot cannot show, because it enumerates re-exported
-*names* and this is a *type*: **`rusqlite` is a public dependency of this crate.**
-`Error::State(#[from] rusqlite::Error)` carries that crate's own error type, so a
-`rusqlite` major bump changes this crate's public API whether or not anything here
-behaves differently — which is exactly what 0.23.0 was. It is written down here
-because `public-api.txt` lists `enum Error src/error.rs` and stops there: the
-variant's payload is not a line in that file and never will be. The intent to
-wrap it is under [Limits that hold today](#limits-that-hold-today).
+There was a third half the snapshot could not show, because it enumerates
+re-exported *names* and this was a *type*: `rusqlite` used to be a public
+dependency of this crate. **As of 0.63.0 it is not.** `Error::Storage { kind,
+message }` carries an owned [`StorageErrorKind`] and the message the storage
+layer produced, so a `rusqlite` major bump no longer changes this crate's public
+API — which is exactly what 0.23.0 was, and what will not happen again.
+`Error::State(rusqlite::Error)` still exists, deprecated since 0.63.0 and
+**removed in 0.65.0**; nothing constructs it, and every storage failure converts
+to `Error::Storage`. The claim is enforced rather than promised: a derived check
+in `tests/state_error.rs` fails if any `pub` item's surface names `rusqlite`
+again, with the deprecated variant as its one declared exception, because
+`public-api.txt` lists `enum Error src/error.rs` and stops there — the variant's
+payload is not a line in that file and never will be.
+
+What this did **not** buy is graph-level independence, and the difference
+matters. `libsqlite3-sys` declares `links = "sqlite3"`, so only one version of it
+can exist in a consumer's dependency graph whatever this crate's error type looks
+like; `tests/fixtures/links-consumer/` is the standing proof of that wall.
+Wrapping the error means a `rusqlite` upgrade here stops being a *type-level*
+break for consumers. It does not mean they can hold a different `rusqlite`
+than this crate does.
 
 Not public, and free to change without any notice:
 
@@ -2258,31 +2271,42 @@ would answer the wrong call. Neither is a regression — both are exactly what
 0.48.0 sent — and neither is silent: `messages` is empty or short, and a reader
 can see it.
 
-**`rusqlite::Error` is in the public API, and the intent is to take it out
-(0.23.0).** `Error::State(#[from] rusqlite::Error)` carries the storage
-dependency's own error type, which makes `rusqlite` a *public* dependency of
-this crate: every `rusqlite` major bump is a breaking change here, whether or
-not anything about this crate's behaviour changes. That is exactly what
-happened in 0.23.0, whose entire content is a dependency move and which still
-had to be published as a break.
+**`rusqlite::Error` was in the public API. It was taken out in 0.63.0.** From
+0.23.0 until then, `Error::State(#[from] rusqlite::Error)` carried the storage
+dependency's own error type, which made `rusqlite` a *public* dependency of this
+crate: every `rusqlite` major bump was a breaking change here, whether or not
+anything about this crate's behaviour changed. That is exactly what happened in
+0.23.0, whose entire content is a dependency move and which still had to be
+published as a break.
 
-The intent is to wrap it, so that the variant carries a type this crate owns
-and a future `rusqlite` bump stops being a consumer break. It is stated here
-rather than done in 0.23.0 on purpose: a migration release has to be reviewable
-for exactly one property — that nothing behaves differently — and an
-error-type redesign in the same diff destroys that. It is not yet slotted to a
-version.
+It is wrapped now. `Error::Storage { kind, message }` carries a
+[`StorageErrorKind`] this crate owns — `Busy`, `Constraint`, `Corrupt`, `Other`,
+with only `Busy` retryable — and the message the storage layer produced, kept
+whole. The classification happens once, in the `From<rusqlite::Error>`
+conversion every `?` in the storage layer already went through, which is why the
+change cost no call site.
 
-**What this means if you are writing code today.** Matching the variant and
-ignoring its payload is safe and will stay safe:
+The wrap was deliberately not done in 0.23.0: a migration release has to be
+reviewable for exactly one property — that nothing behaves differently — and an
+error-type redesign in the same diff destroys that.
+
+**What this means if you are writing code today.** Match `Error::Storage` and
+branch on the kind:
 
 ```rust,ignore
-Err(Error::State(_)) => { /* the store failed; the payload will change */ }
+Err(Error::Storage { kind, message }) if kind.is_retryable() => retry(),
+Err(Error::Storage { message, .. }) => report(message),
 ```
 
-Reaching *through* the variant to use the payload as your own
-`rusqlite::Error` is the thing that will break when the wrap lands, and it
-already breaks on every `rusqlite` bump.
+`Error::State` still exists, **deprecated since 0.63.0 and removed in 0.65.0**.
+Nothing constructs it, so no failure this crate produces arrives as that variant
+any more; code matching it compiles with a warning naming the replacement, for
+the length of the cycle.
+
+What the wrap did **not** buy: `libsqlite3-sys` declares `links = "sqlite3"`, so
+a consumer's graph can still hold only one version of it. A `rusqlite` upgrade
+here is no longer a *type-level* break; it is still a graph-level constraint, and
+`tests/fixtures/links-consumer/` is what proves that wall is real.
 
 **What a provider-executed search or fetch is, and is not (0.22.0).** A
 `WebAccess` on the contract asks the *provider* to look something up inside the

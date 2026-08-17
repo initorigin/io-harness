@@ -9,6 +9,50 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What binding the host once costs (0.63.0)
+
+**What is being measured.** 0.63.0 adds a `Harness` that binds the provider, the
+store, the boundary, the approver, the observer and a template `TaskContract`,
+and then calls the same free function a caller would have called themselves. The
+question a reader will have is whether the convenience is paid for per step.
+
+**The shape to expect, stated before it was measured.** Constant, and paid once
+at construction. The `Harness` assembles nothing the entry points do not already
+assemble; it holds five references and a contract, and `Harness::run` is a call to
+`run_with_observed` with them. There is no work inside the loop for it to add, so
+the difference between the two paths should be indistinguishable from the noise of
+running the same scripted run twice.
+
+**Method.** `what_the_facade_costs_per_step` in `tests/harness.rs`, `#[ignore]`d
+because it prints rather than asserts. Twenty-one rounds of a four-step scripted
+run against an in-memory store, one fresh store and one fresh workspace per round,
+medians reported. Run it with
+`cargo test --test harness -- --ignored --nocapture`.
+
+**Numbers.** M1, `cargo test` (dev profile, unoptimized), medians of 21 rounds:
+
+| Path | Median, 4-step run |
+| --- | --- |
+| `run_with(&contract, &provider, &store, &policy, &ApproveAll)` | 4.845 ms |
+| `harness.run(&contract)` | 4.834 ms |
+
+The difference is smaller than the run-to-run spread of either arm, which is the
+answer the shape predicted: the second call *is* the first call, with the
+arguments read from a struct instead of from the stack.
+
+**A number that did not match the shape was a defect in the measurement, and the
+first version of this one reported the harness at 10.18 ms against 4.78 ms.** The
+harness arm bound a template contract carrying the crate's default cap of 12
+steps and was compared against a 4-step contract — it was timing three times the
+work, not three times the overhead. The two arms now assert they carry the same
+cap before either is timed. A measurement whose arms are not the same run
+measures nothing, and a 2× that appears where the design says "constant" is a bug
+report about one of the two.
+
+**What it does not measure.** Provider latency, which dominates a real run by
+orders of magnitude and is identical on both paths by construction — the same
+`Provider` value is called by the same function.
+
 ## What removing history costs (0.58.0)
 
 **What is being measured.** 0.58.0 gives an operator four instruments — a size,

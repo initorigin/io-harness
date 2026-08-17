@@ -100,6 +100,7 @@ enum RunOutcome src/run.rs
 enum RunStatus src/state.rs
 enum Selected src/sandbox.rs
 enum SpawnRefusal src/containment.rs
+enum StorageErrorKind src/error.rs
 enum SystemPrompt src/contract.rs
 enum TodoState src/state.rs
 enum ToolEffect src/tools/custom.rs
@@ -145,6 +146,7 @@ struct FirstTry src/state.rs
 struct FixedResponder src/approve.rs
 struct FleetTally src/containment.rs
 struct GateAttempt src/state.rs
+struct Harness src/harness.rs
 struct Hooks src/hooks.rs
 struct Identity src/tools/git.rs
 struct Ignore src/observe.rs
