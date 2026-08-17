@@ -1581,7 +1581,7 @@ fn the_contracts_ownership_claims_match_the_source() {
     // explicitly rather than searched for: a checker that hunts for its subject
     // across files is a checker that will one day find nothing and say nothing.
     let commit_home = read("src/state/trace.rs");
-    let run = read("src/run.rs");
+    let run = run_subsystem();
 
     // Claim: every `run_*` / `resume_*` takes a lease. **Derived, not counted.** A
     // count of acquire sites is satisfied by six acquires in one function, and this
@@ -1672,4 +1672,31 @@ fn the_contracts_ownership_claims_match_the_source() {
         page.contains("compare-and-swap"),
         "the contract no longer states that a session head advances by compare-and-swap"
     );
+}
+
+/// `src/run.rs` and every `src/run/<subject>.rs`, concatenated.
+///
+/// The lease invariant below is about every function that begins driving a run,
+/// and 0.63.0 moved `run_from`, `run_workspace_from` and `agent_loop` into
+/// `src/run/step.rs` and `src/run/tree.rs`. A checker reading the parent alone
+/// would find none of them and report nothing missing.
+fn run_subsystem() -> String {
+    let dir = repo_root().join("src/run");
+    let mut all = read("src/run.rs");
+    let mut paths: Vec<std::path::PathBuf> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    paths.sort();
+    assert!(
+        paths.len() >= 5,
+        "src/run/ holds only {} modules — the walk is blind and the invariant below is vacuous",
+        paths.len()
+    );
+    for path in paths {
+        all.push('\n');
+        all.push_str(&fs::read_to_string(&path).unwrap().replace("\r\n", "\n"));
+    }
+    all
 }

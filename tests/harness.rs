@@ -232,6 +232,54 @@ async fn the_facade_and_the_free_function_produce_the_same_trace() {
     );
 }
 
+/// What the facade costs per step, measured rather than asserted.
+///
+/// `#[ignore]` because it is a measurement and not a gate, which is the shape
+/// `memory_recall_cost` set. **No criterion in this release names a duration as a
+/// threshold**: the shape of the cost is what matters and it is constant — the
+/// `Harness` assembles the same binding the entry points assemble today, once at
+/// construction instead of per call, and then calls the same function. There is
+/// no work inside the loop for it to add.
+///
+/// Run it with `cargo test --test harness -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "a measurement, not a gate"]
+async fn what_the_facade_costs_per_step() {
+    const ROUNDS: usize = 21;
+
+    let mut direct = Vec::with_capacity(ROUNDS);
+    let mut faced = Vec::with_capacity(ROUNDS);
+
+    for _ in 0..ROUNDS {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let provider = Script::default();
+        let contract = TaskContract::workspace("write a few files", dir.path()).with_max_steps(4);
+        let at = std::time::Instant::now();
+        run_with(&contract, &provider, &store, &open_policy(), &ApproveAll)
+            .await
+            .unwrap();
+        direct.push(at.elapsed());
+
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let provider = Script::default();
+        let harness = Harness::new(&provider, &store).with_policy(open_policy());
+        let contract = harness.workspace("write a few files", dir.path());
+        let at = std::time::Instant::now();
+        harness.run(&contract).await.unwrap();
+        faced.push(at.elapsed());
+    }
+
+    direct.sort();
+    faced.sort();
+    println!(
+        "4-step run, {ROUNDS} rounds, medians: free function {:?}, harness {:?}",
+        direct[ROUNDS / 2],
+        faced[ROUNDS / 2]
+    );
+}
+
 /// The harness's defaults are the free function's defaults.
 ///
 /// `Harness::new` binds `Policy::permissive`, `ApproveAll` and `Ignore` — which is
