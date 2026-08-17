@@ -567,6 +567,35 @@ pub(super) fn restore_ledger(store: &Store, run_id: i64) -> Result<(ContextLedge
     Ok((ledger, written))
 }
 
+/// A run's assistant turns as the store has it, keyed by step (0.64.0).
+///
+/// The other half of what [`restore_ledger`] restores. The ledger holds every
+/// tool *result* and, because [`Piece::of`](crate::context::Piece) classifies by
+/// kind and ordinals are counted positionally per step, a restored ledger
+/// correlates every result with the call it answers — as soon as there is a call
+/// to correlate it with. This is those calls.
+///
+/// Empty for a run written before 0.64.0 and for a run that took no step. Those
+/// are the same to a reader and both mean "there is nothing to restore", which is
+/// 0.63.0's behaviour: the transcript builder falls back to prose for a step it
+/// has no turn for, which is exactly what every resumed run did before this
+/// release. **Absent is not empty**: a step with no row falls back, and a step
+/// whose row carries no calls and no text is a real turn that did nothing, and is
+/// emitted as one.
+pub(super) fn restore_turns(store: &Store, run_id: i64) -> Result<BTreeMap<u32, StepTurn>> {
+    let mut turns = BTreeMap::new();
+    for turn in store.step_turns(run_id)? {
+        turns.insert(
+            turn.step,
+            StepTurn {
+                text: turn.text,
+                calls: turn.calls,
+            },
+        );
+    }
+    Ok(turns)
+}
+
 /// Append everything observed since the last committed step, and return the new
 /// watermark.
 ///

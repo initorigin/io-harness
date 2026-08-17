@@ -753,10 +753,16 @@ pub(super) async fn run_workspace_from<P: Provider>(
     // prefix zero times from where it now stands, so it earns the marker again.
     let mut marked_prefix = PrefixGuard::default();
     // 0.49.0 — what each step of THIS run asked for, so the next step can send it
-    // back as an assistant turn. In memory and never stored: a vendor correlates a
-    // call with its result inside one request, and this loop rebuilds the whole
-    // request every step, so nothing here needs to outlive the run.
-    let mut turns: BTreeMap<u32, StepTurn> = BTreeMap::new();
+    // back as an assistant turn.
+    //
+    // 0.64.0 — restored from the store, for the same reason the ledger above is:
+    // a resumed run that could not read these sent the model a third-person
+    // account of its own past actions, and everything before the crash arrived as
+    // one block of user prose. The two halves are restored together because they
+    // are two halves of one request — the ledger carries the results, this carries
+    // the calls they answer. Empty for a run written before 0.64.0, which falls
+    // back exactly as every resumed run did then.
+    let mut turns: BTreeMap<u32, StepTurn> = restore_turns(store, run_id)?;
     // The run's live process handles, created before the first turn and killed
     // when the run ends however it ends. `Arc` because the reaping task for each
     // handle outlives the dispatch that started it and has to be able to record
@@ -1124,12 +1130,21 @@ pub(super) async fn run_workspace_from<P: Provider>(
         // 0.49.0 — record what this step asked for before anything is dispatched,
         // so the next step sends the model its own turn back instead of a
         // third-person account of it.
+        //
+        // 0.64.0 — and stage it durably, so a resumed run sends it back too. The
+        // write itself rides the transaction that commits this step, which is why
+        // this is a stage and not a record: a step that never commits must leave
+        // no turn, and a driver whose lease was taken from it must write none.
         turns.insert(
             step,
             StepTurn {
                 text: response.text.clone(),
                 calls: response.tool_calls.clone(),
             },
+        );
+        store.stage_step_turn(
+            run_id,
+            AssistantTurn::new(step, response.text.clone(), response.tool_calls.clone()),
         );
 
         // Dispatch every tool call the model made this step, in order, folding

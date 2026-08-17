@@ -587,9 +587,16 @@ pub(super) fn with_skill_catalog(base: String, skills: &Skills) -> String {
 /// What one step of this run asked for, kept so the next step can send it back as
 /// an assistant turn (0.49.0).
 ///
-/// In memory and for this run only. A resumed run has none of these for the steps
-/// it did not itself drive, and that is the whole of why its earlier history stays
-/// prose — see [`transcript`].
+/// **Durable since 0.64.0.** It was in memory and for this run only, so a resumed
+/// run had none of these for the steps it did not itself drive, and that was the
+/// whole of why its earlier history stayed prose. Each one is now staged as it is
+/// built and written by the transaction that commits its step, and restored into
+/// this map on a resume — so a resumed run's earlier history is role-tagged like
+/// any other. See [`transcript`], and [`AssistantTurn`](crate::AssistantTurn) for
+/// the stored form.
+///
+/// A run recorded before 0.64.0 has no rows to restore, and falls back exactly as
+/// it did then.
 #[derive(Debug, Clone)]
 pub(super) struct StepTurn {
     /// What the model wrote, when it wrote anything beside its calls.
@@ -607,16 +614,21 @@ pub(super) struct StepTurn {
 /// and interleave the steps' assistant turns into the middle.
 ///
 /// A step whose results do not line up with the calls it made is emitted as prose
-/// instead — the shape every release through 0.48.0 sent. Two ways to reach that:
+/// instead — the shape every release through 0.48.0 sent. There was one way left
+/// to reach that as of 0.64.0:
 ///
-/// - **a resumed run.** Its earlier steps were driven by a process that is gone,
-///   the ledger it restored holds text and not tool-call structure, and nothing is
-///   stored that would rebuild them. Everything from the resume point on is
-///   role-tagged.
 /// - **a count that disagrees.** If a step ever produced more results than it made
 ///   calls, correlating them positionally would answer the wrong call. Falling
 ///   back costs that step its block shape and loses nothing, where guessing would
 ///   send a transcript that reads as confident and is wrong.
+///
+/// **A resumed run was the other way, and 0.64.0 closed it.** Its earlier steps
+/// were driven by a process that is gone and the ledger it restored holds the
+/// results but not the calls they answer — so nothing paired, and everything
+/// before the resume point arrived as one block of user prose. The calls are now
+/// durable in `step_turns` and restored into `turns` beside the ledger, so a
+/// resumed run role-tags its whole history. A run recorded before 0.64.0 has no
+/// rows to restore and still falls back, which is the same behaviour it had.
 pub(super) fn transcript(
     user: &str,
     assembled: &Assembled,

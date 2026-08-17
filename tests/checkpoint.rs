@@ -1282,3 +1282,371 @@ async fn a_detached_child_is_readopted_after_a_restart() {
         "the re-adopted child's report reaches its parent"
     );
 }
+
+// ---------- 0.64.0: the assistant turn is durable ----------
+
+/// F2 — the turn round-trips through the store without loss, including the two
+/// shapes that break a string join.
+///
+/// `steps.tool_call` writes `name:args` joined with ` | `, so a tool name
+/// carrying a `:` and an argument carrying a ` | ` cannot be split back apart
+/// from it. That is why this table exists rather than the existing column being
+/// reused, and asserting it on those exact shapes is what makes the claim
+/// checkable instead of stated.
+#[test]
+fn an_assistant_turn_round_trips_through_the_store_whole() {
+    use io_harness::AssistantTurn;
+
+    let store = Store::memory().unwrap();
+    let run_id = store.start_run("goal", "model").unwrap();
+
+    let calls = vec![
+        ToolCall {
+            name: "ns:read_file".into(),
+            arguments: json!({ "path": "a.txt" }),
+        },
+        ToolCall {
+            name: "write_file".into(),
+            arguments: json!({ "path": "b.txt", "content": "left | right" }),
+        },
+        ToolCall {
+            name: "run_command".into(),
+            arguments: json!({ "argv": ["sh", "-c", "echo a | wc -l"], "n": 3, "deep": { "k": [1, 2] } }),
+        },
+    ];
+    store
+        .record_step_turn(
+            run_id,
+            &AssistantTurn::new(1, Some("I will read, then write."), calls.clone()),
+        )
+        .unwrap();
+
+    let back = store.step_turns(run_id).unwrap();
+    assert_eq!(back.len(), 1, "one step, one turn");
+    assert_eq!(back[0].step, 1);
+    assert_eq!(back[0].text.as_deref(), Some("I will read, then write."));
+    assert_eq!(
+        back[0].calls.len(),
+        3,
+        "every call survives, including the two a string join would fuse"
+    );
+    for (i, (want, got)) in calls.iter().zip(back[0].calls.iter()).enumerate() {
+        assert_eq!(
+            &got.name, &want.name,
+            "call {i} keeps its name and its order"
+        );
+        // Compared as JSON, not as a string: two renderings of one object are
+        // equal here and unequal as text, and the stored fact is the object.
+        assert_eq!(
+            &got.arguments, &want.arguments,
+            "call {i} keeps its arguments whole"
+        );
+    }
+}
+
+/// F2 — an absent text is not an empty one.
+///
+/// A model that wrote nothing beside its calls and a model that wrote `""` are
+/// different facts. A resumed run that cannot tell them apart emits an assistant
+/// turn the live run did not.
+#[test]
+fn an_absent_assistant_text_is_not_an_empty_one() {
+    use io_harness::AssistantTurn;
+
+    let store = Store::memory().unwrap();
+    let run_id = store.start_run("goal", "model").unwrap();
+
+    store
+        .record_step_turn(run_id, &AssistantTurn::new(1, None::<String>, Vec::new()))
+        .unwrap();
+    store
+        .record_step_turn(run_id, &AssistantTurn::new(2, Some(""), Vec::new()))
+        .unwrap();
+
+    let back = store.step_turns(run_id).unwrap();
+    assert_eq!(back.len(), 2, "oldest step first");
+    assert_eq!(back[0].step, 1);
+    assert_eq!(back[1].step, 2);
+    assert_eq!(back[0].text, None, "wrote nothing");
+    assert_eq!(back[1].text.as_deref(), Some(""), "wrote an empty string");
+    assert_ne!(
+        back[0].text, back[1].text,
+        "and the two are not the same row"
+    );
+}
+
+/// A step committed twice keeps one turn — the last one it actually took.
+///
+/// A retry after a tool error writes another `steps` row for the same step. The
+/// primary key is `(run_id, step)`, so this table replaces rather than growing a
+/// second trace of one step.
+#[test]
+fn a_step_recorded_twice_keeps_the_turn_it_last_took() {
+    use io_harness::AssistantTurn;
+
+    let store = Store::memory().unwrap();
+    let run_id = store.start_run("goal", "model").unwrap();
+
+    store
+        .record_step_turn(run_id, &AssistantTurn::new(1, Some("first"), Vec::new()))
+        .unwrap();
+    store
+        .record_step_turn(
+            run_id,
+            &AssistantTurn::new(
+                1,
+                Some("second"),
+                vec![ToolCall {
+                    name: "read_file".into(),
+                    arguments: json!({ "path": "a.txt" }),
+                }],
+            ),
+        )
+        .unwrap();
+
+    let back = store.step_turns(run_id).unwrap();
+    assert_eq!(back.len(), 1, "one row per step, not two");
+    assert_eq!(back[0].text.as_deref(), Some("second"));
+    assert_eq!(back[0].calls.len(), 1);
+}
+
+/// F2 — a committed step leaves the turn it took, and the turn is the model's
+/// own words and arguments rather than a rendering of them.
+///
+/// The write rides the transaction that commits the step, so this is also the
+/// assertion that the two agree about which steps happened — the turns are a
+/// subset of the committed steps, never a step ahead of them.
+#[tokio::test]
+async fn a_committed_step_leaves_the_turn_it_took() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let out = run_with(
+        &out_contract(dir.path(), "ALPHA", 3),
+        &WriteOnce {
+            path: "out.txt",
+            content: "ALPHA",
+        },
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let turns = store.step_turns(out.run_id).unwrap();
+    assert!(
+        !turns.is_empty(),
+        "the run committed steps, so it left turns"
+    );
+    let steps = store.steps(out.run_id).unwrap();
+    assert!(
+        turns.len() <= steps.len(),
+        "a turn per committed step at most, never one ahead: {} turns, {} step rows",
+        turns.len(),
+        steps.len()
+    );
+    for turn in &turns {
+        assert_eq!(
+            turn.calls.len(),
+            1,
+            "this provider makes exactly one call per step"
+        );
+        assert_eq!(turn.calls[0].name, "write_file");
+        assert_eq!(
+            turn.calls[0]
+                .arguments
+                .get("content")
+                .and_then(|v| v.as_str()),
+            Some("ALPHA"),
+            "the arguments are the model's own object, not a rendering of it"
+        );
+    }
+}
+
+/// F5 — a store written before 0.64.0 resumes exactly as it did then.
+///
+/// Rewinds the store to 0.63.0 the way the 0.12.0 test above rewinds to 0.12.0:
+/// the table simply is not there. The run must resume, produce prose for the
+/// history it cannot role-tag, and neither error nor invent an empty assistant
+/// turn to stand in for the one it does not have.
+#[tokio::test]
+async fn a_store_written_before_the_turn_table_resumes_as_it_did_then() {
+    let dir = ws();
+    let db = dir.path().join("runs.db");
+    let store = Store::open(&db).unwrap();
+    let crashed = run(
+        &out_contract(dir.path(), "DONE", 1),
+        &WriteOnce {
+            path: "out.txt",
+            content: "WORKING\n",
+        },
+        &store,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(crashed.outcome, RunOutcome::StepCapReached { .. }),
+        "an interrupted run to resume: {:?}",
+        crashed.outcome
+    );
+    let id = crashed.run_id;
+    assert!(
+        !store.step_turns(id).unwrap().is_empty(),
+        "the run left turns, so dropping them is a rewind rather than a no-op"
+    );
+    drop(store);
+
+    // Rewind to 0.63.0: the table is not there at all.
+    let c = sqlite(&db);
+    c.execute_batch("DROP TABLE step_turns;").unwrap();
+    assert!(
+        c.query_row("SELECT 1 FROM step_turns", [], |_| Ok(()))
+            .is_err(),
+        "the rewind removed the table"
+    );
+    drop(c);
+
+    // Reopening recreates it, empty — the state a 0.63.0 store is in the first
+    // time this binary opens it.
+    let store = Store::open(&db).unwrap();
+    assert!(
+        store.step_turns(id).unwrap().is_empty(),
+        "no turns to restore, which is what a pre-0.64.0 run has"
+    );
+    let done = resume(
+        &out_contract(dir.path(), "DONE", 3),
+        &WriteOnce {
+            path: "out.txt",
+            content: "DONE\n",
+        },
+        &store,
+        id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(done.outcome, RunOutcome::Success { .. }),
+        "it resumes rather than refusing: {:?}",
+        done.outcome
+    );
+    assert!(
+        store.last_step(id).unwrap() > 1,
+        "and it made progress past where it stopped"
+    );
+}
+
+/// A tree provider that keeps every request the ROOT agent was sent, so a
+/// resumed tree's conversation can be asserted the way the flat one's is.
+struct SeenTree {
+    inner: TreeProvider,
+    root_seen: std::sync::Mutex<Vec<CompletionRequest>>,
+}
+impl SeenTree {
+    fn new() -> Self {
+        Self {
+            inner: TreeProvider {
+                child_delay: Duration::ZERO,
+            },
+            root_seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+impl Provider for SeenTree {
+    async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        if req.user.contains("COORDINATOR") {
+            self.root_seen.lock().unwrap().push(req.clone());
+        }
+        self.inner.complete(req).await
+    }
+}
+
+/// F4 — an agent in a tree gets its own turns back on a resume too.
+///
+/// The tree loop keeps its own turns map, in its own file, and until this
+/// release its own comment recorded that the map — unlike the agent events
+/// beside it — did not survive the process. A resumed coordinator would read a
+/// third-person account of the fan-out it itself ordered.
+///
+/// Stopped at a step cap rather than cut off mid-fan-out: the root's step
+/// commits only once its children have returned, so a tree killed while they
+/// sleep has no committed root step and therefore nothing to restore. The
+/// criterion is about what a resumed agent is *sent*, so the run has to get far
+/// enough to have a history at all.
+#[tokio::test]
+async fn a_resumed_agent_in_a_tree_is_sent_its_own_turns() {
+    let dir = ws();
+    let db = dir.path().join("runs.db");
+    let store = Store::open(&db).unwrap();
+    // A criterion the children never satisfy, so the root runs its whole budget
+    // and every step is reached.
+    let contract = |steps: u32| {
+        TaskContract::workspace(
+            "COORDINATOR: delegate to sub-agents; do not write files yourself.",
+            dir.path(),
+        )
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "c.txt".into(),
+            needle: "GAMMA".into(),
+        })
+        .with_max_steps(steps)
+    };
+
+    let stopped = run_tree(
+        &contract(1),
+        &TreeProvider {
+            child_delay: Duration::ZERO,
+        },
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(stopped.outcome, RunOutcome::StepCapReached { .. }),
+        "an interrupted tree to resume: {:?}",
+        stopped.outcome
+    );
+    let turns_before = store.step_turns(stopped.run_id).unwrap();
+    assert!(
+        turns_before
+            .iter()
+            .any(|t| t.calls.iter().any(|c| c.name == "spawn_agent")),
+        "the root committed a step, so its spawn calls are durable: {turns_before:?}"
+    );
+    drop(store);
+
+    let store = Store::open(&db).unwrap();
+    let seen = SeenTree::new();
+    resume_tree(
+        &contract(2),
+        &seen,
+        &store,
+        stopped.run_id,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+
+    let root = seen.root_seen.lock().unwrap();
+    let with_history = root
+        .iter()
+        .find(|req| !req.messages.is_empty())
+        .unwrap_or_else(|| {
+            panic!(
+                "the resumed coordinator was sent {} request(s) and none carried a conversation",
+                root.len()
+            )
+        });
+    assert!(
+        with_history.messages.iter().any(|m| matches!(
+            m,
+            io_harness::Message::Assistant { calls, .. } if calls.iter().any(|c| c.name == "spawn_agent")
+        )),
+        "the coordinator is sent back its own spawn calls as its own turn, not as prose: {:?}",
+        with_history.messages
+    );
+}

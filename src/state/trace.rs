@@ -406,6 +406,82 @@ impl Store {
         Ok(())
     }
 
+    /// Record what one step asked for, so a resume can send it back (0.64.0).
+    ///
+    /// `INSERT OR REPLACE`: a step number can be committed more than once — a
+    /// retry after a tool error writes another `steps` row for the same step — and
+    /// the turn that matters is the last one the model actually took. The primary
+    /// key is `(run_id, step)`, so replacing is what keeps this table one row per
+    /// step rather than a second, differently-shaped trace.
+    ///
+    /// Called from inside the transaction that commits the step, so a step that
+    /// did not commit leaves no turn behind — the same ordering rule the ledger
+    /// is persisted under.
+    pub fn record_step_turn(&self, run_id: i64, turn: &AssistantTurn) -> Result<()> {
+        write_step_turn(&self.conn, run_id, turn)
+    }
+
+    /// Stage the turn this step took, to be written by the commit that ends it
+    /// (0.64.0).
+    ///
+    /// The run loop calls this immediately after the provider answers and before
+    /// anything is dispatched — the point where the turn is known and the step is
+    /// not yet finished. [`Self::checkpoint_step`] writes it inside the same
+    /// transaction as the `steps` row, after the lease check, so a step that never
+    /// commits and a driver that lost its lease both leave nothing behind.
+    ///
+    /// Staged per run, so two runs driven by one handle do not overwrite each
+    /// other, and replaced per step, so a retried step stages the turn it last
+    /// took.
+    pub(crate) fn stage_step_turn(&self, run_id: i64, turn: AssistantTurn) {
+        self.turn.borrow_mut().insert(run_id, turn);
+    }
+
+    /// Drop the turn staged for a run this handle no longer drives (0.64.0).
+    pub(crate) fn forget_staged_turn(&self, run_id: i64) {
+        self.turn.borrow_mut().remove(&run_id);
+    }
+
+    /// The one statement [`Self::step_turns`] runs, named so the query-plan
+    /// assertion can `EXPLAIN` the text the crate executes rather than a copy of
+    /// it that can drift.
+    pub(crate) const STEP_TURNS_SQL: &'static str =
+        "SELECT step, text, calls FROM step_turns WHERE run_id = ?1 ORDER BY step ASC";
+
+    /// Every assistant turn recorded for a run, oldest step first (0.64.0).
+    ///
+    /// Empty for a run written before 0.64.0 and for a run that took no step —
+    /// the two are the same to a reader, and both mean "there is nothing to
+    /// restore", which is what a resume of an older store must keep doing rather
+    /// than being told it lost something.
+    ///
+    /// The read is `WHERE run_id = ?1 ORDER BY step ASC`, which searches the
+    /// primary key on its leftmost column and returns in key order — there is no
+    /// second index and no sort step, asserted with `EXPLAIN QUERY PLAN` in
+    /// `tests/checkpoint.rs` rather than assumed here.
+    pub fn step_turns(&self, run_id: i64) -> Result<Vec<AssistantTurn>> {
+        let mut stmt = self.conn.prepare(Self::STEP_TURNS_SQL)?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u32,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (step, text, calls) = row?;
+            let calls: Vec<ToolCall> = serde_json::from_str(&calls).map_err(|e| Error::Resume {
+                reason: format!(
+                    "run {run_id} step {step} has an assistant turn this binary cannot \
+                         read: {e}"
+                ),
+            })?;
+            out.push(AssistantTurn { step, text, calls });
+        }
+        Ok(out)
+    }
+
     /// A run's durable ledger, in the order it was observed.
     ///
     /// Empty for a run that recorded nothing and for a run written before 0.13.0
@@ -526,6 +602,24 @@ impl Store {
              VALUES (?1, ?2, 'checkpoint', NULL)",
             (run_id, step.step),
         )?;
+        // 0.64.0 — and what this step asked for, in the same transaction, so the
+        // step and the turn it took cannot disagree about which of the two
+        // happened. Taken out of the staging cell rather than passed in, for the
+        // reasons `Store::turn` gives. A direct caller of this method stages
+        // nothing and writes nothing, exactly as before.
+        //
+        // Matched on the step number: a staged turn belongs to the step that
+        // staged it, and a checkpoint of some *other* step — a caller writing its
+        // own trace, or a loop committing a gate attempt — must not adopt it.
+        let staged = self
+            .turn
+            .borrow_mut()
+            .get(&run_id)
+            .filter(|t| t.step == step.step)
+            .cloned();
+        if let Some(turn) = staged {
+            write_step_turn(&tx, run_id, &turn)?;
+        }
         // The renewal rides the commit the run is already making. That is why
         // there is no heartbeat thread: a background renewer would need a second
         // thread holding a `Connection`, which is `Send` and not `Sync`, to keep
@@ -1037,6 +1131,34 @@ impl Store {
     }
 }
 
+/// The one place an assistant turn becomes rows (0.64.0).
+///
+/// Two writers reach it — [`Store::record_step_turn`] for a direct caller, and
+/// [`Store::checkpoint_step`] for the run loop, which writes inside the
+/// transaction that commits the step. **A sabotage found this as two encoders**:
+/// changing one to a lossy `name:args` join left the round-trip test green,
+/// because the test exercised the other. Two encoders of one durable format
+/// drift, and the day they do it is the day a resumed run reads back something a
+/// live run never wrote.
+///
+/// Takes a `&Connection`, which a `Transaction` dereferences to, so the
+/// in-transaction writer and the direct one are the same call rather than two
+/// spellings of it.
+fn write_step_turn(conn: &rusqlite::Connection, run_id: i64, turn: &AssistantTurn) -> Result<()> {
+    let calls = serde_json::to_string(&turn.calls).map_err(|e| Error::Resume {
+        reason: format!(
+            "run {run_id} step {} has tool calls that cannot be stored: {e}",
+            turn.step
+        ),
+    })?;
+    conn.execute(
+        "INSERT OR REPLACE INTO step_turns (run_id, step, text, calls)
+         VALUES (?1, ?2, ?3, ?4)",
+        (run_id, turn.step as i64, &turn.text, &calls),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1191,5 +1313,195 @@ mod tests {
             "the torn step must not survive"
         );
         assert_eq!(store.steps(run).unwrap().len(), 1);
+    }
+
+    /// N3 (0.64.0) — the turn read searches the primary key and sorts nothing.
+    ///
+    /// `PRIMARY KEY (run_id, step)` is the only index `step_turns` gets, and the
+    /// argument for that is the plan SQLite produces for the statement the crate
+    /// runs — `EXPLAIN`ed as the `const` itself, not as a copy that can drift.
+    /// The control filters on `text`, a column in **no** index at all: a trailing
+    /// column of the composite key is not a control, because SQLite skip-scans one
+    /// and produces a full read wearing an index's name.
+    ///
+    /// Measured on this fixture (40 runs x 30 steps): the read seeks and the
+    /// control scans. The numbers are recorded, not asserted — a wall-clock
+    /// assertion is flaky on a loaded runner and green on a fast one running a
+    /// full scan.
+    #[test]
+    fn the_turn_read_searches_the_primary_key_and_never_sorts() {
+        let store = Store::memory().unwrap();
+        let mut first = 0;
+        for r in 0..40 {
+            let run = store.start_run(&format!("run {r}"), "/repo").unwrap();
+            if r == 0 {
+                first = run;
+            }
+            for step in 0..30u32 {
+                store
+                    .record_step_turn(
+                        run,
+                        &AssistantTurn::new(step, Some(format!("step {step}")), Vec::new()),
+                    )
+                    .unwrap();
+            }
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let plan = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let n = stmt.parameter_count();
+            let args: Vec<i64> = vec![first][..n].to_vec();
+            stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ")
+        };
+
+        let read = plan(Store::STEP_TURNS_SQL);
+        assert!(
+            read.contains("SEARCH"),
+            "the turn read must seek on the primary key, got {read}"
+        );
+        assert!(
+            !read.contains("SCAN step_turns"),
+            "a resume must not read every run's turns, got {read}"
+        );
+        assert!(
+            !read.contains("TEMP B-TREE"),
+            "the primary key already returns step order, so nothing sorts, got {read}"
+        );
+
+        // The control: `text` is in no index, so this one has to scan. Without it
+        // the assertions above are about a planner that never scans anything
+        // rather than about this table's key.
+        let control = plan("SELECT step FROM step_turns WHERE text = 'step 3'");
+        assert!(
+            control.contains("SCAN step_turns"),
+            "the control must scan, or the assertions above prove nothing, got {control}"
+        );
+    }
+
+    /// F2 (0.64.0) — a driver whose run was taken over writes no turn either.
+    ///
+    /// The whole reason the turn rides `checkpoint_step`'s transaction rather
+    /// than being recorded beside it. Written outside, a stale driver would
+    /// replace the winner's turn for the same step, and a resume would compose an
+    /// assistant turn the run never took — the one-driver-per-run guarantee
+    /// 0.62.0 bought, given back at the one table that quotes the model.
+    ///
+    /// Two handles over one store are two drivers as far as a lease is concerned,
+    /// which is how this is written in one process.
+    ///
+    /// The one-second ttl and the sleep past it are a wait, not a deadline: the
+    /// owner id carries this process's pid and this process is alive, so a
+    /// takeover needs the lease to lapse. A slow machine sleeps longer and the
+    /// lease is more lapsed, never less — the direction of error a test is allowed
+    /// to have around a clock.
+    #[test]
+    fn a_driver_that_lost_its_lease_writes_no_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.sqlite3");
+        let first = Store::open(&db).unwrap();
+        let run_id = first.start_run("goal", "/repo").unwrap();
+        let lease = first.acquire_lease(run_id, 1).unwrap();
+
+        // The first driver stages a turn, as the loop does before it dispatches.
+        first.stage_step_turn(
+            run_id,
+            AssistantTurn::new(
+                1,
+                Some("mine"),
+                vec![ToolCall {
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({ "path": "a.txt" }),
+                }],
+            ),
+        );
+
+        // A second handle takes the run over while the first is mid-step.
+        let second = Store::open(&db).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let _taken = second.acquire_lease(run_id, 60).unwrap();
+
+        let refused = first.checkpoint_step(run_id, &StepRecord::new(1, "wrote file", "ok"));
+        assert!(
+            matches!(refused, Err(Error::Conflict { .. })),
+            "the stale driver is refused, got {refused:?}"
+        );
+        assert!(
+            first.step_turns(run_id).unwrap().is_empty(),
+            "and it wrote no turn — not the steps row, not the checkpoint, not this"
+        );
+        drop(lease);
+    }
+
+    /// N4 (0.64.0) — what the durable turn costs per step.
+    ///
+    /// Printed, never asserted: a duration asserted on a CI runner is a flake
+    /// waiting to be written. `cargo test --lib what_the_durable_turn_costs --
+    /// --ignored --nocapture`, and the numbers live in `docs/MEASUREMENTS.md`.
+    ///
+    /// **Both arms are made to do the same work before either is timed.** 0.63.0's
+    /// first facade measurement reported 2x and was itself the defect — one arm was
+    /// doing three times the steps — so this one asserts the two arms wrote the
+    /// same number of `steps` rows before it reports anything.
+    #[test]
+    #[ignore = "prints a measurement; run with --ignored --nocapture"]
+    fn what_the_durable_turn_costs_per_step() {
+        const ROUNDS: usize = 21;
+        const STEPS: u32 = 40;
+
+        let median = |mut v: Vec<std::time::Duration>| {
+            v.sort();
+            v[v.len() / 2]
+        };
+        let run = |stage: bool| {
+            let mut times = Vec::new();
+            for _ in 0..ROUNDS {
+                let store = Store::memory().unwrap();
+                let run_id = store.start_run("goal", "/repo").unwrap();
+                let started = std::time::Instant::now();
+                for step in 1..=STEPS {
+                    if stage {
+                        store.stage_step_turn(
+                            run_id,
+                            AssistantTurn::new(
+                                step,
+                                Some("working"),
+                                vec![ToolCall {
+                                    name: "read_file".into(),
+                                    arguments: serde_json::json!({ "path": "a.txt" }),
+                                }],
+                            ),
+                        );
+                    }
+                    store
+                        .checkpoint_step(run_id, &StepRecord::new(step, "read a.txt", "A"))
+                        .unwrap();
+                }
+                times.push(started.elapsed());
+                // The control on the arms doing the same work: same steps, and the
+                // turns present exactly when they were staged.
+                assert_eq!(store.steps(run_id).unwrap().len(), STEPS as usize);
+                assert_eq!(
+                    store.step_turns(run_id).unwrap().len(),
+                    if stage { STEPS as usize } else { 0 }
+                );
+            }
+            median(times)
+        };
+
+        let without = run(false);
+        let with = run(true);
+        println!(
+            "{STEPS} committed steps, median of {ROUNDS} rounds:\n  \
+             steps row only          {without:?}\n  \
+             steps row + turn        {with:?}"
+        );
     }
 }

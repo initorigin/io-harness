@@ -26,6 +26,71 @@ notes are produced from it.
 
 ### Security
 
+## [0.64.0] - 2026-08-17
+
+A resumed run sends the model its own past turns rather than a third-person
+account of them.
+
+Until this release, everything a run did before it was interrupted arrived in the
+next request as one flat block of user prose, and only the steps driven after the
+resume point were role-tagged. The cause was narrow and had been recorded in the
+source since 0.49.0: tool *results* are durable and their per-step positions are
+recomputed on restore, but the assistant turn they answer — what the model wrote
+and the calls it made — was held in memory by the run loop and died with the
+process. With nothing to pair the results against, they were flattened into the
+user message.
+
+That half is now durable. Given the same committed state and the same responses,
+a resumed run assembles the same `messages` an uninterrupted run assembles: same
+roles, same assistant turns, same result batches.
+
+### Added
+
+- **`AssistantTurn`, `Store::record_step_turn` and `Store::step_turns`** — what
+  one step asked for, kept. `text` is `Option<String>` so that *wrote nothing* and
+  *wrote the empty string* stay different facts; `calls` is the ordered
+  `Vec<ToolCall>` the model made, stored as this crate's own JSON rather than any
+  vendor's wire form.
+
+  ```rust,ignore
+  for turn in store.step_turns(run_id)? {
+      println!("step {} called {:?}", turn.step,
+               turn.calls.iter().map(|c| &c.name).collect::<Vec<_>>());
+  }
+  ```
+
+  This is the first durable, structured record of what a step asked for.
+  `StepRecord::tool_call` is unchanged and stays what it is — one human-readable
+  string, `name:args` joined with ` | `, which a trace dump prints and the stall
+  signature compares, and which cannot be split back apart when a tool name
+  contains `:` or an argument contains ` | `.
+
+- **One additive table, `step_turns`**, keyed `(run_id, step)` with no index of
+  its own — the primary key is the index every read searches. `CHECKPOINT_FORMAT`
+  is unchanged at 7 and no existing table, column or statement is altered. A store
+  written by an earlier release gains the table empty on first open; a store
+  written by this one is read by an earlier binary, which never names it.
+
+### Changed
+
+- **A resumed run's requests carry a conversation where they used to carry
+  prose.** This is a change to what goes on the wire, not to any signature: a
+  caller diffing raw requests across versions will see it, and it is the release.
+  The transcript a resumed run now sends is the one the uninterrupted run would
+  have sent.
+
+  Two things deliberately do not change. Tool-call ids are still minted from
+  position and still never stored, so the same transcript still assembles to the
+  same bytes and a cache prefix still holds. And a step whose results do not line
+  up with the calls it made still falls back to prose — correlating them
+  positionally would answer the wrong call, and that case is correct as it stands.
+
+- **A run resumed out of a store written before this release behaves exactly as it
+  did before it.** There are no turns to restore, so its earlier history is prose,
+  as it was. Absent is not empty: a step with no stored turn falls back, while a
+  step whose stored turn made no call and wrote no text is a real turn that did
+  nothing and is sent as one.
+
 ## [0.63.0] - 2026-08-17
 
 Build the harness once and run against it. A `Harness` binds the provider, the

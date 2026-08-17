@@ -2262,14 +2262,43 @@ string is those pieces concatenated, and the conversation is those same pieces
 interleaved with the assistant turns — which is why they cannot drift into two
 accounts of one run.
 
-**Two cases are sent as prose, and both are prose today.** A resumed run rebuilds
-its ledger from stored observation text, which holds no tool-call structure, so
-its **pre-resume** history stays in the first user message and everything from
-the resume point on is role-tagged. And a step whose results do not line up with
-the calls it made falls back the same way, because correlating them positionally
-would answer the wrong call. Neither is a regression — both are exactly what
-0.48.0 sent — and neither is silent: `messages` is empty or short, and a reader
-can see it.
+**Two cases were sent as prose. One is left, and it is deliberate.** A step whose
+results do not line up with the calls it made falls back to prose, because
+correlating them positionally would answer the wrong call and a `tool_result`
+naming a call that turn did not make is a 400 on at least one vendor. That is not
+a regression — it is exactly what 0.48.0 sent — and it is not silent: `messages`
+is empty or short, and a reader can see it.
+
+**The other was a resumed run, and 0.64.0 closed it.** Until then a resumed run
+rebuilt its ledger from stored observation text, which holds every tool *result*
+but no record of the calls they answer, so its pre-resume history stayed in the
+first user message and only the steps after the resume point were role-tagged.
+The missing half was never the results and never the ordinals — ordinals are
+recomputed positionally from the restored ledger, elided entries included. It was
+the assistant turn: what the model wrote and the calls it made, which the run loop
+held in memory and lost with the process.
+
+That turn is now durable. `step_turns(run_id, step, text, calls)` holds it — one
+row per committed step, written by the same transaction that writes the step, with
+the calls stored as this crate's own `ToolCall` JSON and `text` nullable so that
+*wrote nothing* and *wrote the empty string* stay different facts. Both loops, flat
+and tree, restore it beside the ledger. **Given the same committed state and the
+same responses, a resumed run assembles the same `messages` an uninterrupted run
+assembles** — same roles, same assistant turns, same result batches, nothing
+normalised away.
+
+**What this does not change.** Ids are still minted from position and still never
+stored, so the same transcript still assembles to the same bytes and a cache prefix
+still holds. Nothing is stored that a stored `Vec<Message>` would have been: the
+flat `user` string and the conversation stay two views of one emission, and what a
+turn carries stays a per-turn decision against that turn's context budget rather
+than a snapshot frozen at the step that wrote it.
+
+**A store written before 0.64.0 has no turns to restore, and a run resumed out of
+one behaves exactly as it did then** — prose for what it cannot pair, role-tagged
+from the resume point on. Absent is not empty: a step with no row falls back, and
+a step whose row carries no calls and no text is a real turn that did nothing and
+is sent as one.
 
 **`rusqlite::Error` was in the public API. It was taken out in 0.63.0.** From
 0.23.0 until then, `Error::State(#[from] rusqlite::Error)` carried the storage

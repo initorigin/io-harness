@@ -122,6 +122,7 @@ struct Anthropic src/provider/anthropic.rs
 struct ApprovalContext src/approve.rs
 struct ApproveAll src/approve.rs
 struct Archived src/state.rs
+struct AssistantTurn src/state.rs
 struct Attach src/attach.rs
 struct Broadcast src/observe.rs
 struct ChangeReview src/verify.rs
