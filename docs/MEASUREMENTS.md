@@ -29,7 +29,25 @@ run against an in-memory store, one fresh store and one fresh workspace per roun
 medians reported. Run it with
 `cargo test --test harness -- --ignored --nocapture`.
 
-**Numbers.** MEASURED_PLACEHOLDER
+**Numbers.** M1, `cargo test` (dev profile, unoptimized), medians of 21 rounds:
+
+| Path | Median, 4-step run |
+| --- | --- |
+| `run_with(&contract, &provider, &store, &policy, &ApproveAll)` | 4.845 ms |
+| `harness.run(&contract)` | 4.834 ms |
+
+The difference is smaller than the run-to-run spread of either arm, which is the
+answer the shape predicted: the second call *is* the first call, with the
+arguments read from a struct instead of from the stack.
+
+**A number that did not match the shape was a defect in the measurement, and the
+first version of this one reported the harness at 10.18 ms against 4.78 ms.** The
+harness arm bound a template contract carrying the crate's default cap of 12
+steps and was compared against a 4-step contract — it was timing three times the
+work, not three times the overhead. The two arms now assert they carry the same
+cap before either is timed. A measurement whose arms are not the same run
+measures nothing, and a 2× that appears where the design says "constant" is a bug
+report about one of the two.
 
 **What it does not measure.** Provider latency, which dominates a real run by
 orders of magnitude and is identical on both paths by construction — the same

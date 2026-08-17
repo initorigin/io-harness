@@ -219,9 +219,15 @@ async fn the_facade_and_the_free_function_produce_the_same_trace() {
         let dir = workspace();
         let store = Store::memory().unwrap();
         let provider = Script::default();
-        let direct = run_with(&contract(dir.path()), &provider, &store, &policy, &ApproveAll)
-            .await
-            .unwrap();
+        let direct = run_with(
+            &contract(dir.path()),
+            &provider,
+            &store,
+            &policy,
+            &ApproveAll,
+        )
+        .await
+        .unwrap();
         let direct_trace = store.canonical_trace(direct.run_id).unwrap();
 
         // Through the harness, with the same boundary bound instead of passed.
@@ -292,8 +298,19 @@ async fn what_the_facade_costs_per_step() {
         let dir = workspace();
         let store = Store::memory().unwrap();
         let provider = Script::default();
-        let harness = Harness::new(&provider, &store).with_policy(open_policy());
+        // The SAME cap the direct contract carries. The first version of this
+        // measurement bound a template with the crate default of 12 and compared
+        // it against a 4-step contract, and reported the harness as twice as slow
+        // — it was timing three times the work. A measurement whose two arms are
+        // not the same run measures nothing.
+        let harness = Harness::new(&provider, &store)
+            .with_policy(open_policy())
+            .with_defaults(TaskContract::workspace("", "").with_max_steps(4));
         let contract = harness.workspace("write a few files", dir.path());
+        assert_eq!(
+            contract.max_steps, 4,
+            "both arms must run the same contract"
+        );
         let at = std::time::Instant::now();
         harness.run(&contract).await.unwrap();
         faced.push(at.elapsed());
