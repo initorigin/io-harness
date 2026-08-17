@@ -533,7 +533,7 @@ pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
 pub use context::{Compaction, ContextBudget};
 pub use contract::{Preset, Routing, SystemPrompt, TaskContract};
-pub use error::{Error, ProviderErrorKind, Result};
+pub use error::{Error, ProviderErrorKind, Result, StorageErrorKind};
 pub use harness::Harness;
 pub use hooks::Hooks;
 pub use lsp::LspServer;

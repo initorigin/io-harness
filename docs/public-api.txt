@@ -100,6 +100,7 @@ enum RunOutcome src/run.rs
 enum RunStatus src/state.rs
 enum Selected src/sandbox.rs
 enum SpawnRefusal src/containment.rs
+enum StorageErrorKind src/error.rs
 enum SystemPrompt src/contract.rs
 enum TodoState src/state.rs
 enum ToolEffect src/tools/custom.rs
