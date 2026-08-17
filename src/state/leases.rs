@@ -23,8 +23,8 @@ impl Store {
     ///
     /// Refused with [`Error::Conflict`] only while a different owner's lease is
     /// unlapsed **and** that owner's process is still running (see `owner_is_alive`,
-    /// which errs towards "alive" and answers "alive" for everything it cannot
-    /// check, including all of Windows). The error names the holder and when its
+    /// which asks the operating system on both unix and Windows and errs towards
+    /// "alive" for anything it cannot check). The error names the holder and when its
     /// lease lapses, so a caller can choose between backing off and waiting without
     /// parsing a message.
     ///

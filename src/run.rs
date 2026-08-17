@@ -5901,9 +5901,9 @@ pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(30);
 /// **A killed process does not cost this wait where liveness can be checked.** A
 /// lease whose owner no longer exists is takeable immediately, so `kill -9` and
 /// resume stays immediate; this bounds the cases that cannot be checked — a
-/// recycled pid, an owner id with no readable pid, and every case on Windows. It
-/// is a lease with a ttl rather than a lock for that residue: a lock a dead
-/// process holds is an outage with no recovery at all.
+/// recycled pid and an owner id with no readable pid. It is a lease with a ttl
+/// rather than a lock for that residue: a lock a dead process holds is an outage
+/// with no recovery at all.
 ///
 /// ```
 /// use io_harness::{TaskContract, Verification, DEFAULT_EXEC_TIMEOUT, DEFAULT_LEASE_TTL};

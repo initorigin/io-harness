@@ -477,8 +477,11 @@ fn conflict_from(run_id: i64, held: Option<LeaseRow>) -> Error {
 /// that is bounded, because the first driver's next commit is then refused inside
 /// the transaction rather than interleaving. Unknown answers therefore return
 /// `true`: an owner id from an older release with no pid to read, a pid this
-/// platform cannot ask about, and every case on Windows, where the question needs
-/// a process handle this crate does not open.
+/// platform cannot ask about, and a Windows process that exited with code 259,
+/// which is indistinguishable from one still running because 259 is
+/// `STILL_ACTIVE`. Answered on unix with `kill(pid, 0)` and on Windows with
+/// `OpenProcess` + `GetExitCodeProcess`, neither of which costs a dependency this
+/// crate did not already have.
 ///
 /// **The pid may have been recycled**, which reads as "alive" and costs the wait.
 /// The dangerous direction — a live owner reported dead — requires the pid to be
@@ -500,7 +503,36 @@ fn owner_is_alive(owner: &str) -> bool {
         }
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // `OpenProcess` + `GetExitCodeProcess`, on the features this crate already
+        // enables — 0.24.0's Job Object backend brought `Win32_System_Threading`,
+        // so this costs no new dependency here either.
+        //
+        // The error direction is preserved deliberately. A handle that cannot be
+        // opened for lack of rights means the process is **there** and somebody
+        // else's, which is alive; only `ERROR_INVALID_PARAMETER` means no such
+        // process. And a process that exits with code 259 is indistinguishable from
+        // one still running, because 259 *is* `STILL_ACTIVE` — which errs alive, as
+        // everything unknown here does.
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+            if handle.is_null() {
+                return GetLastError() != ERROR_INVALID_PARAMETER;
+            }
+            let mut code: u32 = 0;
+            let read = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            read == 0 || code == STILL_ACTIVE as u32
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true

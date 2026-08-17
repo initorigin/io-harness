@@ -123,10 +123,16 @@ no event, and nothing in the store afterwards that told it from a real trace.
 
 **A crash is not a lock.** An acquire is refused only while the lease is held by
 another owner, has *not* lapsed, and that owner's process is still running. So
-`kill -9` a driver and its run is takeable at once, not half an hour later. The
-liveness check errs towards "alive": an owner id with no readable pid, an answer
-the platform will not give, and every case on Windows all report the owner as
-running, and there the ttl alone governs. That is the safe direction — a dead
+`kill -9` a driver and its run is takeable at once, not half an hour later — on
+Windows as well as on unix. The platform is asked directly about the pid in the
+owner id: `kill(pid, 0)` on unix, `OpenProcess` plus `GetExitCodeProcess` on
+Windows, neither of them a dependency this crate did not already have. A process
+that is there but somebody else's — `EPERM` on unix, a handle refused for lack of
+rights on Windows — counts as alive. The liveness check errs towards "alive": an
+owner id with no readable pid, a platform that is neither unix nor Windows, and a
+Windows process that exited with code 259, which cannot be told from a running one
+because 259 is `STILL_ACTIVE`, all report the owner as running, and there the ttl
+governs. That is the safe direction — a dead
 owner believed alive costs a wait, while a live owner believed dead would hand
 its run to a second driver. Either way the takeover raises the generation by one,
 and the previous owner is refused at its next durable commit, writing neither a

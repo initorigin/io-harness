@@ -57,8 +57,8 @@ sharpest correctness boundary left open.
   failure becoming a loud one. A caller that deliberately drove one run from two
   processes and tolerated the interleaving must now wait for the holder to finish
   or its lease to lapse and take the run over. Only a *live* owner refuses a
-  resume: a run whose driver was killed is taken over at once on unix, so
-  `kill -9` and resume is unchanged. *Migration:* handle `Error::Conflict`; it
+  resume: a run whose driver was killed is taken over at once, on unix and on
+  Windows, so `kill -9` and resume is unchanged. *Migration:* handle `Error::Conflict`; it
   names the holder and when its lease expires.
 - **BREAKING (behaviour)** — a session-head write that lost a race used to
   succeed silently and now returns `Error::Conflict`. The losing turn row is
@@ -75,12 +75,19 @@ sharpest correctness boundary left open.
 - `Store::acquire_lease`, `Store::renew_lease`, `Store::release_lease` and
   `Store::run_lease`, with the `Lease` guard they hand back and the `LeaseRow`
   they read. An acquire is refused only when the lease belongs to another owner,
-  has not lapsed, *and* that owner's process is still alive — checked with
-  `kill(pid, 0)` on unix against the pid in the owner id — so a `kill -9`'d
-  owner's run is taken over at once rather than at the ttl. The check errs
+  has not lapsed, *and* that owner's process is still alive — checked against the
+  pid in the owner id with `kill(pid, 0)` on unix and with
+  `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` plus `GetExitCodeProcess` on
+  Windows, neither of them a dependency this crate did not already have — so a
+  `kill -9`'d owner's run is taken over at once rather than at the ttl on both. A
+  process that is there but somebody else's counts as alive: `EPERM` on unix, a
+  handle refused for lack of rights on Windows, where only
+  `ERROR_INVALID_PARAMETER` means no such process. The check errs
   towards "alive", which is the direction that costs a wait rather than a second
-  driver: an owner id with no readable pid, an unknown answer and every case on
-  Windows all report the owner as running, and there the ttl alone governs. A
+  driver: an owner id with no readable pid, a platform that is neither unix nor
+  Windows, and a Windows process that exited with code 259 — which is
+  `STILL_ACTIVE` and so cannot be told from a running one — all report the owner
+  as running, and the ttl governs exactly those cases and a recycled pid. A
   lease is released when its guard drops, so no run-loop exit path had to grow a
   release call. `Store::owner` is this handle's opaque owner id.
 - `Store::set_session_head_if`, the compare-and-swap behind every in-crate head

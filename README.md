@@ -397,9 +397,12 @@ them performed, with no error and nothing in the store afterwards to tell it fro
 a real one.
 
 A crash is not a lock. A dead owner's lease is takeable at once, so `kill -9` and
-resume stays immediate; the ttl — `TaskContract::lease_ttl`, `DEFAULT_LEASE_TTL`
-by default — governs only what liveness cannot answer, a recycled pid and every
-case on Windows. A takeover raises the generation, and the previous owner's next
+resume stays immediate on unix and on Windows alike — `kill(pid, 0)` there,
+`OpenProcess` plus `GetExitCodeProcess` here, neither a dependency the crate did
+not already have. The ttl — `TaskContract::lease_ttl`, `DEFAULT_LEASE_TTL`
+by default — governs only what liveness cannot answer: a recycled pid, an owner id
+with no readable pid, a third kind of platform, and a Windows process that exited
+with code 259, which is `STILL_ACTIVE` and so reads as running. A takeover raises the generation, and the previous owner's next
 durable commit is refused inside the transaction that would have written it, so
 it writes neither a step row nor a checkpoint event. A session head is not leased,
 because a conversation is meant to be branched: it advances by compare-and-swap

@@ -704,14 +704,22 @@ in the store afterwards to distinguish it from a real one.
 
 **A crash is not a lock.** An acquire is refused only when all three hold: the
 lease belongs to another owner, it has not lapsed, and that owner's process is
-still alive. Liveness is `kill(pid, 0)` on unix against the pid carried in the
-owner id, so a `kill -9`'d owner's run is takeable at once rather than at the ttl.
-The check errs towards "alive": an owner id with no readable pid, an unknown
-answer, and every case on Windows all report the owner as running — **on Windows
-the ttl alone governs.** That error direction is the bounded one: a dead owner
+still alive. Liveness is asked of the platform against the pid carried in the
+owner id — `kill(pid, 0)` on unix, where `EPERM` counts as alive because the
+process is there and is somebody else's, and
+`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` plus `GetExitCodeProcess` on
+Windows, where a handle refused for lack of rights likewise means the process
+exists and only `ERROR_INVALID_PARAMETER` means it does not. Neither costs a
+dependency this crate did not already have. So a `kill -9`'d owner's run is
+takeable at once rather than at the ttl, on both. The check errs towards "alive":
+an owner id with no readable pid, a platform that is neither unix nor Windows,
+and a Windows process that exited with code 259 — indistinguishable from a
+running one, because 259 *is* `STILL_ACTIVE` — all report the owner as running.
+That error direction is the bounded one: a dead owner
 believed alive costs a wait until the ttl, which is also what a recycled pid
 costs, whereas a live owner believed dead would hand its run to a second driver,
-and that cannot arise from an absent pid. The ttl is `TaskContract::lease_ttl`,
+and that cannot arise from an absent pid. **The ttl governs exactly those cases
+and nothing else.** It is `TaskContract::lease_ttl`,
 defaulting to `DEFAULT_LEASE_TTL` — twice `DEFAULT_EXEC_TIMEOUT`, because the
 renewal rides each step commit and so what it must outlast is one step rather than
 a whole run. However the run is taken over, the generation rises by one and the
