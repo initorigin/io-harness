@@ -1275,6 +1275,25 @@ fn guide_defers_to_the_reserved_set(
                 .to_string(),
         );
     }
+    // 0.61.0. The page carried "It does **not** yet hold every name dispatch
+    // answers" for two releases, and every check below let it through: the
+    // sentence is not 0.17.0's, and the names it cited — `browser_*`, `lsp_*` —
+    // end in a `*` the identifier regex never matches. A claim that the set is
+    // incomplete is the same class of stale as a hand-typed list of it, so it is
+    // refused by shape rather than by the names it happens to cite.
+    // The needles skip the word `not` on purpose: the page wrote it as `**not**`,
+    // so a needle spanning it matches nothing — which is how the first version of
+    // this check passed against the very paragraph it was written to catch.
+    for claim in ["yet hold", "and not reserved", "dispatched and not"] {
+        if bullet.contains(claim) {
+            return Err(format!(
+                "the guide still says the reserved set is incomplete ({claim:?}). 0.61.0 closed \
+                 that gap and derives the set from the crate's own tool constants; a page that \
+                 tells a reader to avoid naming a tool after a built-in *because the check does \
+                 not catch it* is describing a release that has shipped."
+            ));
+        }
+    }
     if !bullet.contains("RESERVED_TOOL_NAMES") {
         return Err(
             "the guide no longer defers to RESERVED_TOOL_NAMES. Naming the set is what keeps this \
@@ -1321,10 +1340,14 @@ fn reserved_set_parse_resolves_names_and_not_idents() {
     let reserved = reserved_tool_names(&read("src/tools/custom.rs"), &rust_sources());
     assert!(reserved.contains("write_file"), "{reserved:?}");
     assert!(reserved.contains("view_image"), "{reserved:?}");
+    // 0.61.0 reserved `browser_click`, so this control can no longer be "the set
+    // does not hold it". What it still has to prove is that the parse resolves
+    // each entry through its constant rather than reporting the identifier it
+    // read, which is what a `contains` on the slice's raw text would do.
+    assert!(reserved.contains("browser_click"), "{reserved:?}");
     assert!(
-        !reserved.contains("browser_click"),
-        "browser_click is dispatched and not reserved; a parse that finds it there is reading \
-         the wrong list: {reserved:?}"
+        !reserved.contains("BROWSER_CLICK_TOOL"),
+        "the parse is reporting identifiers rather than resolving them to tool names: {reserved:?}"
     );
 }
 
@@ -1335,6 +1358,21 @@ fn guide_checker_rejects_the_claim_0_17_0_made_false() {
     let reserved = BTreeSet::from(["write_file".to_string()]);
     let err = guide_defers_to_the_reserved_set(&shadowing_bullet(fixture), &reserved).unwrap_err();
     assert!(err.contains("not in the reserved set"), "{err}");
+}
+
+/// The 0.61.0 sibling: the page may not tell a reader the set is incomplete.
+///
+/// This fixture is the paragraph the guide actually carried through 0.60.2, and
+/// every other check in this file passes on it — which is why the check exists.
+#[test]
+fn guide_checker_rejects_a_claim_that_the_set_is_incomplete() {
+    let fixture = "- **Nothing may shadow anything** — the reserved set is `RESERVED_TOOL_NAMES` \
+                   in `src/tools/custom.rs`. It does **not** yet hold every name dispatch \
+                   answers: the `browser_*` and `lsp_*` tools are among eighteen that are \
+                   dispatched and not reserved.\n- **Next bullet**";
+    let reserved = BTreeSet::from(["write_file".to_string()]);
+    let err = guide_defers_to_the_reserved_set(&shadowing_bullet(fixture), &reserved).unwrap_err();
+    assert!(err.contains("incomplete"), "{err}");
 }
 
 #[test]
