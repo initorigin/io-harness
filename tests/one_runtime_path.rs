@@ -498,3 +498,79 @@ fn the_parameter_counter_counts_what_a_caller_supplies() {
          reported `resume_tree` undefined"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F4 (0.64.0) — both loops restore their turns, and neither invents its own way
+// ---------------------------------------------------------------------------
+
+/// Every function that keeps a `turns` map initialises it from the one restore,
+/// and every function that fills one stages what it filled it with.
+///
+/// The two loops are separate functions in separate files and always have been:
+/// `run_workspace_from` in `src/run/step.rs` and `agent_loop` in
+/// `src/run/tree.rs`. 0.49.0 gave both an in-memory `turns` map, and the tree
+/// loop's own comment recorded that the map, unlike its agent events, was not
+/// durable. A release that restores one and not the other leaves the asymmetry
+/// undocumented and a resumed agent in a tree reading a third-person account of
+/// itself — so this asserts the pairing structurally rather than leaving it to
+/// two behavioural tests that would both pass if a third loop were added
+/// tomorrow.
+///
+/// Guards, in the shape 0.61.0 set: a floor on the parse so it cannot go blind,
+/// and a named panic when the declaration this reads stops being written the way
+/// the crate writes it.
+#[test]
+fn every_loop_that_keeps_a_turns_map_restores_it_from_the_one_function() {
+    let source = run_subsystem();
+    let items = functions(&source);
+    assert!(
+        items.len() >= ITEM_FLOOR,
+        "the parse of the run subsystem found only {} top-level functions, below the floor of \
+         {ITEM_FLOOR} — this checker is blind, which is a finding about the checker",
+        items.len()
+    );
+
+    // The declaration as the crate writes it. `cargo fmt` keeps it on one line;
+    // the named panic below fires if that stops being true rather than this
+    // quietly finding nothing.
+    const DECL: &str = "let mut turns: BTreeMap<u32, StepTurn>";
+    let keepers: Vec<&Fun> = items.iter().filter(|f| f.body.contains(DECL)).collect();
+    assert!(
+        !keepers.is_empty(),
+        "no function in the run subsystem declares `{DECL}` — the turns map has been renamed, \
+         retyped or reshaped, and this invariant must be rewritten against whatever replaced it \
+         rather than passing over its absence"
+    );
+    assert_eq!(
+        keepers.len(),
+        2,
+        "expected exactly the two loops to keep a turns map, found {}: {:?}. A third loop is \
+         either a defect or a reason to rewrite this test on purpose",
+        keepers.len(),
+        keepers.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+
+    for f in &keepers {
+        assert!(
+            f.body.contains("restore_turns("),
+            "`{}` starts its turns map from somewhere other than `restore_turns` — a loop that \
+             initialises it empty sends a resumed run a third-person account of its own actions",
+            f.name
+        );
+        assert!(
+            f.body.contains("stage_step_turn("),
+            "`{}` fills a turns map it never stages, so what it restores next time is whatever \
+             the other loop happened to write",
+            f.name
+        );
+    }
+
+    // The control: the restore is one function, not one per loop. Two copies
+    // would satisfy every assertion above and drift apart on the first fix.
+    let defined = items.iter().filter(|f| f.name == "restore_turns").count();
+    assert_eq!(
+        defined, 1,
+        "`restore_turns` is defined {defined} times — the point of the assertions above is that \
+         both loops read the same one"
+    );
+}

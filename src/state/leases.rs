@@ -172,6 +172,10 @@ impl Store {
         // generation it no longer claims would refuse its own later commits.
         if self.leases.borrow().get(&run_id) == Some(&generation) {
             self.leases.borrow_mut().remove(&run_id);
+            // 0.64.0 — and the turn staged for a run this handle has given up.
+            // A handle that drives many runs would otherwise hold one turn per
+            // run it ever drove, and a turn it can no longer legally commit.
+            self.forget_staged_turn(run_id);
         }
         self.conn.execute(
             "DELETE FROM run_leases WHERE run_id = ?1 AND owner = ?2 AND generation = ?3",

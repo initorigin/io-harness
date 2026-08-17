@@ -12,7 +12,7 @@ use crate::context::{ObsKind, Observation};
 use crate::error::{Error, Result};
 use crate::policy::Policy;
 use crate::pricing::{PriceTable, Spend};
-use crate::provider::Usage;
+use crate::provider::{ToolCall, Usage};
 use crate::web::{Citation, ServerToolCall};
 
 /// The group a call with no recorded model falls into. Named rather than
@@ -411,6 +411,27 @@ pub struct Store {
     /// which is what keeps every existing test and every direct caller of
     /// `checkpoint_step` unchanged.
     leases: std::cell::RefCell<std::collections::HashMap<i64, i64>>,
+    /// The assistant turn this handle is about to commit, per run (0.64.0).
+    ///
+    /// Set by the run loop immediately before the step commits and consumed
+    /// *inside* [`Self::checkpoint_step`]'s transaction, for the same two reasons
+    /// the lease generation above is checked there and not threaded:
+    ///
+    /// - **`checkpoint_step` takes a [`StepRecord`], and the turn is deliberately
+    ///   not part of that type.** `StepRecord` has six public fields and no
+    ///   `#[non_exhaustive]`, so a seventh is a compile break for anyone building
+    ///   one with a struct literal; and adding a parameter breaks every direct
+    ///   caller of a public method.
+    /// - **A turn written outside that transaction is a turn a driver that lost
+    ///   its lease can still write.** It would then replace the winner's turn for
+    ///   the same step, and a resume would compose an assistant turn the run never
+    ///   took — the one-driver-per-run guarantee 0.62.0 bought, given back at the
+    ///   only table that quotes the model.
+    ///
+    /// A step that does not commit leaves no turn behind, because the staged value
+    /// is written by the same transaction that writes the `steps` row or by
+    /// nothing at all.
+    turn: std::cell::RefCell<std::collections::HashMap<i64, AssistantTurn>>,
 }
 
 /// Whether the lease row in hand has lapsed, as SQL (0.62.0).
@@ -858,6 +879,74 @@ impl StepRecord {
         self.tool_call = tool_call.into();
         self.tokens = tokens;
         self
+    }
+}
+
+/// What one step asked for, kept so a resumed run can send it back (0.64.0).
+///
+/// The assistant half of a transcript: the text the model wrote this step, if
+/// any, and the tool calls it made, in the order it made them. The *results* half
+/// has been durable since 0.13.0 in the ledger, so this is the one piece a
+/// process death used to take with it — and the reason every step a resumed run
+/// did not itself drive arrived at the model as third-person prose rather than as
+/// its own turn.
+///
+/// **`text` distinguishes `None` from `Some("")`.** A model that wrote nothing
+/// beside its calls is not a model that wrote an empty string, and a resumed run
+/// that cannot tell them apart sends a turn the live run did not.
+///
+/// **This is not [`StepRecord::tool_call`].** That field is one human-readable
+/// string — `name:args` joined with ` | ` — which is what a trace dump prints and
+/// what the stall signature compares, and which cannot be split back apart when a
+/// tool name contains `:` or an argument contains ` | `. This type is the
+/// structured record, and the two are kept separate rather than one being made to
+/// serve both.
+///
+/// ```
+/// use io_harness::{AssistantTurn, Store, ToolCall};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run_id = store.start_run("write the file", "gpt-5")?;
+///
+/// store.record_step_turn(
+///     run_id,
+///     &AssistantTurn::new(
+///         1,
+///         Some("I will write it now."),
+///         vec![ToolCall {
+///             name: "write_file".into(),
+///             arguments: serde_json::json!({ "path": "NOTES.md" }),
+///         }],
+///     ),
+/// )?;
+///
+/// let turns = store.step_turns(run_id)?;
+/// assert_eq!(turns.len(), 1);
+/// assert_eq!(turns[0].calls[0].name, "write_file");
+/// assert_eq!(turns[0].text.as_deref(), Some("I will write it now."));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct AssistantTurn {
+    /// The step this turn was taken on.
+    pub step: u32,
+    /// What the model wrote this step, or `None` if it wrote nothing.
+    pub text: Option<String>,
+    /// The calls it made, in the order it made them.
+    pub calls: Vec<ToolCall>,
+}
+
+impl AssistantTurn {
+    /// A turn at `step`, with the text the model wrote and the calls it made.
+    pub fn new(step: u32, text: Option<impl Into<String>>, calls: Vec<ToolCall>) -> Self {
+        Self {
+            step,
+            text: text.map(Into::into),
+            calls,
+        }
     }
 }
 
@@ -3465,6 +3554,11 @@ pub(crate) const RUN_TABLES: &[(&str, &str)] = &[
     // eventually hand to a different run — which would then start life refused by a
     // driver that died before it existed.
     ("run_leases", "run_id"),
+    // 0.64.0 — the assistant turn is run-keyed like everything above it. It holds
+    // what a step asked for, which is the model's own words and arguments, so a
+    // session deleted for retention that left these behind would be leaving the
+    // most quotable rows of the run it claimed to remove.
+    ("step_turns", "run_id"),
 ];
 
 /// What one session is holding, in the bytes of its own rows.

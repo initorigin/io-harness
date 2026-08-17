@@ -229,6 +229,15 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     // never names it, which `tests/cross_version_0_29_0.rs` executes rather than
     // asserts on paper.
     "run_leases",
+    // 0.64.0 — what each step asked for, so a resumed run sends the model its own
+    // turns rather than a third-person account of them. One table and NO index of
+    // its own: `PRIMARY KEY (run_id, step)` is the index, every read searches it
+    // on its leftmost column and returns in key order, and an index no statement
+    // names is schema every later cross-version gate would carry for nothing.
+    // Added and nothing altered: a 0.29.0 binary opens a store carrying it and
+    // never names it, which `tests/cross_version_0_29_0.rs` executes rather than
+    // asserts on paper.
+    "step_turns",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].

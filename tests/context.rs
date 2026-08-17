@@ -59,6 +59,18 @@ impl MockScript {
     fn turns(&self) -> usize {
         self.seen.lock().unwrap().len()
     }
+
+    /// The role-tagged conversation of the `n`th request (0-based), 0.64.0.
+    ///
+    /// The other half of what a turn sends. `observations` above reads the flat
+    /// `user` string, which is the half a resumed run has always got right.
+    fn messages(&self, n: usize) -> Vec<io_harness::Message> {
+        let seen = self.seen.lock().unwrap();
+        seen.get(n)
+            .unwrap_or_else(|| panic!("the loop ran only {} turn(s), wanted turn {n}", seen.len()))
+            .messages
+            .clone()
+    }
 }
 
 impl Provider for MockScript {
@@ -1181,6 +1193,361 @@ async fn a_resumed_run_asks_the_model_what_an_uninterrupted_run_would_have() {
         rows,
         whole_store.observations(whole.0.run_id).unwrap(),
         "the interruption leaves the same durable ledger, with nothing duplicated"
+    );
+}
+
+/// F1 (0.64.0) — and the same is now true of the conversation, not only of the
+/// prose.
+///
+/// The twin of the test above, and deliberately its twin: same fixture, same
+/// interruption, same "turn 3 of the whole run is turn 2 of the resumed
+/// provider" alignment. That one compares the observation section, which a
+/// resumed run has assembled correctly since 0.13.0. This one compares
+/// `messages`, which until this release a resumed run did not send at all —
+/// every pre-crash step collapsed into user prose because the assistant turns
+/// that pair with those results were held in memory and died with the process.
+///
+/// **Nothing is normalised.** Not a field, not an id, not an ordering. Tool-call
+/// ids are minted from position inside each request and never stored, timestamps
+/// do not appear in `messages`, and row ids do not either — so there is nothing
+/// here that legitimately differs between the two runs, and a comparison that
+/// needed a `retain` would be evidence about the fix rather than about the run.
+#[tokio::test]
+async fn a_resumed_run_sends_the_conversation_an_uninterrupted_run_would_have() {
+    let script = || {
+        MockScript::new(vec![
+            vec![call("read_file", json!({ "path": "a.txt" }))],
+            vec![call(
+                "write_file",
+                json!({ "path": "b.txt", "content": "b" }),
+            )],
+            vec![call("read_file", json!({ "path": "b.txt" }))],
+        ])
+    };
+
+    let whole_dir = ws();
+    std::fs::write(whole_dir.path().join("a.txt"), "hello").unwrap();
+    let whole_store = Store::memory().unwrap();
+    let whole_provider = script();
+    run_with(
+        &never_passes(whole_dir.path(), 3),
+        &whole_provider,
+        &whole_store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let cut_dir = ws();
+    std::fs::write(cut_dir.path().join("a.txt"), "hello").unwrap();
+    let cut_store = Store::memory().unwrap();
+    let provider = script();
+    let first = run_with(
+        &never_passes(cut_dir.path(), 1),
+        &provider,
+        &cut_store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    io_harness::resume_with(
+        &never_passes(cut_dir.path(), 3),
+        &provider,
+        &cut_store,
+        first.run_id,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let uninterrupted = whole_provider.messages(2);
+    let resumed = provider.messages(2);
+
+    // The fixture has to be one this can fail on. A turn with no assistant
+    // message in it would compare two empty transcripts and pass forever.
+    assert!(
+        uninterrupted
+            .iter()
+            .any(|m| matches!(m, io_harness::Message::Assistant { .. })),
+        "the uninterrupted run must send assistant turns, or this proves nothing: \
+         {uninterrupted:?}"
+    );
+    assert!(
+        uninterrupted
+            .iter()
+            .any(|m| matches!(m, io_harness::Message::Results(_))),
+        "and result batches: {uninterrupted:?}"
+    );
+
+    assert_eq!(
+        resumed, uninterrupted,
+        "a resumed run sends the same roles, the same assistant turns and the same \
+         result batches the uninterrupted run sent"
+    );
+}
+
+/// F3 (0.64.0) — a result that survives an elision keeps the position of the
+/// call it answers, even when its own step's other result did not survive.
+///
+/// **This is the assertion the end-to-end test could not make, and a sabotage is
+/// what showed that.** Counting ordinals only over the results a turn *carries*
+/// leaves every run-level test green: a step's results are elided together, so
+/// within a carried step the positions come out the same either way. The defect
+/// needs one step whose results straddle the boundary — and the way to get one is
+/// to supersede a single read rather than to squeeze a budget.
+///
+/// Step 1 reads `a.txt` and then `b.txt`; step 2 writes `a.txt`, which
+/// invalidates the first read and stubs it. The surviving result is still the
+/// **second** call of step 1, and saying it is the first would answer the wrong
+/// call at the vendor.
+#[tokio::test]
+async fn a_surviving_result_keeps_the_position_of_the_call_it_answers() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "NEW-CONTENT").unwrap();
+
+    let mut ledger = Ledger::new();
+    ledger.push(Observation::new(
+        1,
+        ObsKind::Read,
+        Some("a.txt".into()),
+        "\n[read a.txt]\nOLD-A\n",
+    ));
+    ledger.push(Observation::new(
+        1,
+        ObsKind::Read,
+        Some("b.txt".into()),
+        "\n[read b.txt]\nB-CONTENT\n",
+    ));
+    ledger.push(Observation::new(
+        2,
+        ObsKind::Write,
+        Some("a.txt".into()),
+        "\n[wrote a.txt] (11 chars)\n",
+    ));
+
+    let policy = open_policy().deny_read("a.txt");
+    let workspace = Workspace::with_policy(dir.path(), policy.clone());
+    let out = assemble(
+        &ledger,
+        24_000,
+        &[],
+        &[],
+        Assembly {
+            ws: Some(&workspace),
+            policy: &policy,
+            store: &store,
+            run_id: 1,
+            step: 3,
+        },
+    )
+    .await
+    .unwrap();
+
+    // The fixture must actually straddle: one of step 1's two results carried,
+    // the other not. Without that this asserts nothing about ordinals.
+    assert!(
+        !out.text.contains("OLD-A"),
+        "the superseded read must be stubbed, got:\n{}",
+        out.text
+    );
+    assert!(
+        out.text.contains("B-CONTENT"),
+        "and the other read of the same step must be carried, got:\n{}",
+        out.text
+    );
+
+    let step_one: Vec<&Piece> = out
+        .emitted
+        .iter()
+        .filter(|e| e.step == 1)
+        .map(|e| &e.piece)
+        .collect();
+    assert_eq!(
+        step_one.len(),
+        2,
+        "both of step 1's entries are emitted, the stub included: {:?}",
+        out.emitted
+    );
+
+    let surviving = out
+        .emitted
+        .iter()
+        .find(|e| e.text.contains("B-CONTENT"))
+        .expect("the carried read is emitted");
+    assert_eq!(
+        surviving.ordinal, 1,
+        "the surviving result answers the SECOND call of step 1; calling it the first \
+         would answer the wrong call: {:?}",
+        out.emitted
+    );
+}
+
+/// F3 (0.64.0) — and it still holds once the older observations are elided.
+///
+/// This is the case a fix that only handles the happy path gets wrong. What a
+/// turn carries is decided per turn against the context budget: older entries
+/// are replaced by one-line stubs, and past a ceiling they collapse into a
+/// single line. Ordinals are counted over **every** result of a step whether or
+/// not the turn carries it (`src/context.rs`), so a result that survives the
+/// elision still names the position of the call it answers — but only if the
+/// calls are there to be named. A resumed run under a tight budget is where both
+/// halves have to be true at once.
+///
+/// The fixture asserts that elision actually happened before comparing anything.
+/// Under a budget nothing exceeds, this would be the flat test again wearing a
+/// different name.
+///
+/// **Two fixture properties this test cannot do without, and a sabotage found
+/// both.** The first version scripted one call per step, so every ordinal was 0
+/// and no ordinal defect could show; steps here issue two calls each. And the
+/// equality comparison alone is blind to a *systematic* ordinal error, because
+/// both arms run the same code and would be wrong together — so the correlation
+/// is also asserted absolutely, by reading each result's content back against the
+/// path named by the call it says it answers.
+#[tokio::test]
+async fn a_resumed_run_under_a_tight_budget_still_pairs_every_result_with_its_call() {
+    // Sized like the ceiling test at the top of this file: each file is under the
+    // per-read cap so the read succeeds, and four of them together are well over
+    // the assembly budget so the older ones stub.
+    let filler = format!("{}TAIL\n", "filler line\n".repeat(150));
+    // Two calls per step, so ordinals 0 and 1 both exist. With one call per step
+    // every ordinal is 0 and an ordinal that is counted wrongly still reads right.
+    let script = || {
+        MockScript::new(vec![
+            vec![
+                call("read_file", json!({ "path": "f0.txt" })),
+                call("read_file", json!({ "path": "f1.txt" })),
+            ],
+            vec![
+                call("read_file", json!({ "path": "f2.txt" })),
+                call("read_file", json!({ "path": "f3.txt" })),
+            ],
+            vec![
+                call("read_file", json!({ "path": "f4.txt" })),
+                call("read_file", json!({ "path": "f5.txt" })),
+            ],
+            vec![
+                call("read_file", json!({ "path": "f6.txt" })),
+                call("read_file", json!({ "path": "f7.txt" })),
+            ],
+        ])
+    };
+    let seed = |dir: &std::path::Path| {
+        for i in 0..8 {
+            // Each file names itself, so a result can be checked against the call
+            // it claims to answer rather than only against the other run.
+            std::fs::write(
+                dir.join(format!("f{i}.txt")),
+                format!("MARKER-f{i}\n{filler}"),
+            )
+            .unwrap();
+        }
+    };
+    let tight_contract = |dir: &std::path::Path, steps: u32| {
+        never_passes(dir, steps).with_context_budget(tight(1_000))
+    };
+
+    let whole_dir = ws();
+    seed(whole_dir.path());
+    let whole_store = Store::memory().unwrap();
+    let whole_provider = script();
+    run_with(
+        &tight_contract(whole_dir.path(), 4),
+        &whole_provider,
+        &whole_store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    // The fixture must actually elide, or this asserts nothing about elision.
+    let last = whole_provider.observations(3);
+    assert!(
+        last.contains("(elided:") || last.contains("earlier observation(s) elided"),
+        "the budget must be tight enough to stub or collapse, got {last}"
+    );
+
+    let cut_dir = ws();
+    seed(cut_dir.path());
+    let cut_store = Store::memory().unwrap();
+    let provider = script();
+    let first = run_with(
+        &tight_contract(cut_dir.path(), 1),
+        &provider,
+        &cut_store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    io_harness::resume_with(
+        &tight_contract(cut_dir.path(), 4),
+        &provider,
+        &cut_store,
+        first.run_id,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let uninterrupted = whole_provider.messages(3);
+    let resumed = provider.messages(3);
+    assert_eq!(
+        resumed, uninterrupted,
+        "an elided history role-tags the same way whether or not the process died"
+    );
+
+    // And the pairing itself, absolutely rather than by comparison: every result
+    // names a call the turn before it actually made, AND carries that call's own
+    // answer. Equality alone cannot see an ordinal counted wrongly in both arms.
+    let mut pairs = 0;
+    let mut checked = 0;
+    for window in resumed.windows(2) {
+        if let [Message::Assistant { calls, .. }, Message::Results(results)] = window {
+            pairs += 1;
+            for r in results {
+                assert!(
+                    r.call < calls.len(),
+                    "a result names call {} of a turn that made {}: {resumed:?}",
+                    r.call,
+                    calls.len()
+                );
+                let path = calls[r.call]
+                    .arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .expect("every scripted call names a path");
+                let marker = format!("MARKER-{}", path.trim_end_matches(".txt"));
+                // A carried result holds the file it read; an elided one is a stub
+                // naming the read it stands in for. Either way it must be about
+                // the call it says it answers.
+                if r.content.contains("MARKER-") || r.content.contains(".txt") {
+                    checked += 1;
+                    assert!(
+                        r.content.contains(&marker) || r.content.contains(path),
+                        "the result naming call {} of {:?} carries {:?}",
+                        r.call,
+                        calls[r.call].arguments,
+                        r.content
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        pairs > 0,
+        "the resumed transcript must contain at least one paired turn: {resumed:?}"
+    );
+    assert!(
+        checked >= 2,
+        "at least two results must have been checked against the call they name, or the \
+         correlation assertion is decorative: {resumed:?}"
     );
 }
 

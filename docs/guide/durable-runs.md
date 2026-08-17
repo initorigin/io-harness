@@ -78,9 +78,17 @@ Every one of these has an `_observed` twin taking an `Observer` last; see
 
 ## What is restored, and what is not
 
-Restored: the run id, the step it reached, its token and wall-clock budgets, and
-the observation ledger it had assembled — so the resumed run asks the model what
-the interrupted one would have. A resumed tree also restores the shared spend
+Restored: the run id, the step it reached, its token and wall-clock budgets, the
+observation ledger it had assembled, and — since 0.64.0 — the assistant turns
+that go with it: what the model wrote each step and the calls it made. Those two
+are the two halves of one request, so the resumed run does not merely ask the
+model what the interrupted one would have asked, it asks it the same way: the
+same roles, the same assistant turns, the same result batches. Before 0.64.0 the
+results were restored and the calls they answered were not, so everything before
+the crash arrived as one block of user prose — the model read a third-person
+account of its own actions, on exactly the runs that had already cost the
+operator a crash. A run recorded before 0.64.0 has no turns stored and still
+resumes that way. A resumed tree also restores the shared spend
 ledger from the tree's durable totals, so it draws against one continuous
 ceiling rather than a reset one, and an adopted child is not counted against the
 agent cap a second time.
