@@ -14,15 +14,43 @@ notes are produced from it.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **BREAKING (behaviour)** — eighteen names the harness answers are now reserved,
+  so a program registering a `Tool` called `forget`, `check`, `patch_file`,
+  `git_branch`, `git_worktree`, `lsp_definition`, `lsp_references`,
+  `lsp_symbols`, `lsp_hover`, `lsp_rename`, `browser_navigate`, `browser_read`,
+  `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`,
+  `send_message` or `read_messages` fails at run start with `Error::Config`
+  instead of validating. Sixteen of those were already broken and broken
+  silently — the built-in answered every call and the registered tool never ran
+  for the life of the process. `send_message` and `read_messages` are the two
+  that did work, in a flat run, while being shadowed inside an agent tree.
+  *Migration:* rename the registered tool. A name the harness does not answer is
+  unaffected, prefixes are not reserved, and `browser_history` or `checker`
+  remain yours to take.
+
 ### Added
 
 ### Changed
+
+- The six `browser_*` tool-name constants exist in every build, not only one with
+  the `browser` feature enabled. The tools behind them are still feature-gated
+  and no catalogue changes; the names are now the harness's in all builds, for
+  the reason the image and document names have been since 0.17.0 — enabling a
+  feature can never take away a tool that was working.
 
 ### Deprecated
 
 ### Removed
 
 ### Fixed
+
+- **A built-in added after 0.17.0 reopened the tool-name shadowing defect by one
+  name, every time, and nothing said so.** The reserved set is now derived from
+  the crate's own tool constants by a test that fails when a built-in name is
+  missing from it, in either direction, rather than being a list kept current by
+  hand.
 
 ### Security
 

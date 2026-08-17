@@ -80,12 +80,10 @@ let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?
   and that list is the statement of it rather than this page — a set retyped into
   prose is a set that goes stale. It holds the feature-gated built-ins it names
   in every build, including builds that do not compile them, so enabling a
-  feature can never take away a tool that was working. It does **not** yet hold
-  every name dispatch answers: the `browser_*` and `lsp_*` tools are among
-  eighteen that are dispatched and not reserved, and because dispatch matches
-  every built-in before it reaches the toolbox, a registered tool taking one of
-  those validates and is then never reached. 0.61.0 closes that gap. Until it
-  does, do not name a tool after anything the harness already answers.
+  feature can never take away a tool that was working. Since 0.61.0 it holds
+  every name the harness answers, and a test derived from the crate's own tool
+  constants is what keeps it complete — a built-in added without being reserved
+  fails the suite rather than waiting for an audit.
 - **A failing tool is an observation** — returning `Err` puts the message in the
   observations and the run continues, the same treatment `grep` gives a bad
   regex. Only the model can tell "try another id" from "give up on this

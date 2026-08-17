@@ -149,7 +149,7 @@ tasks:
     Three checked-in surfaces currently describe the gap as open, and the tools guide states the eighteen-name
     count. A release that closes a defect and leaves the documentation saying it is open ships a second
     defect of the class 0.60.2 existed to fix.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.61.0-T03
   acceptance_criteria:
@@ -164,7 +164,46 @@ tasks:
   - docs/guide/tools-and-skills.md
   - docs/CONTRACT.md
   - CHANGELOG.md
-  evidence: []
+  evidence:
+  - >-
+    `src/tools/custom.rs`: the doc block on `RESERVED_TOOL_NAMES` no longer declares the defect open.
+    It states the rule, names the test that enforces it, records that ungating the browser constants is
+    what made the set nameable, and carves out all three intercepted names (`spawn_agent`, `send_message`,
+    `read_messages`) instead of only `spawn_agent`.
+  - >-
+    `docs/guide/tools-and-skills.md`: the paragraph claiming the set omits eighteen names is gone; the
+    bullet still defers to `RESERVED_TOOL_NAMES` rather than restating it.
+  - >-
+    `docs/CONTRACT.md`: the "And it has reopened" section rewritten to the closed form, with the two consequences
+    a caller can see — the ungated browser names, and `send_message`/`read_messages` being reserved in
+    a flat run that is never offered them.
+  - >-
+    `CHANGELOG.md`: a `**BREAKING (behaviour)**` entry naming all eighteen with a `*Migration:*` note,
+    a Changed entry for the ungated constants, and a Fixed entry for the invariant. `tests/changelog.rs`
+    green (5 passed).
+  - >-
+    **F7's sabotage found a real gap in the gate, exactly as the criterion anticipated.** Restoring the
+    stale paragraph verbatim left `cargo test --test docs_drift` at `45 passed; 0 failed`. `guide_defers_to_the_reserved_set`
+    catches only 0.17.0's literal sentence and backticked names absent from the set, and the stale claim
+    cited `browser_*` and `lsp_*` — which end in a `*` the identifier regex never matches. A page can
+    therefore say the set is incomplete and pass every check.
+  - >-
+    Closed in the gate rather than recorded and left: `guide_defers_to_the_reserved_set` now refuses a
+    bullet claiming incompleteness by shape, with `guide_checker_rejects_a_claim_that_the_set_is_incomplete`
+    as its fixture sibling. Re-sabotage now fails with `the guide still says the reserved set is incomplete
+    ("yet hold")`.
+  - >-
+    **The first version of that check was itself blind, and this is the lesson worth carrying.** Its needle
+    was `"not yet hold"`; the page writes the word as `**not**`, so the phrase never appears as typed
+    and the sabotage passed a second time. The needles now skip the emphasised word. A prose checker must
+    be tested against the real bytes of the page, not against the sentence as a reader hears it.
+  - >-
+    `tests/docs_drift.rs:reserved_set_parse_resolves_names_and_not_idents` updated: its 0.60.2 form asserted
+    `browser_click` is **not** reserved — a control that pinned the defect in place. It now asserts the
+    name resolves and the identifier does not, which is the property it was written to check.
+  - >-
+    `cargo test --test docs_drift --test changelog --test guide_pages --test readme --test public_api`:
+    46 / 5 / 10 / 9 / 8, all green.
 - id: US-IO-HARNESS-0.61.0-T05
   summary: Verify the surface, the dependency count, the schema and the offered catalogue did not move.
   why_required: >-
