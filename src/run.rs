@@ -4232,6 +4232,79 @@ pub(crate) type PendingMedia = ();
 mod tests {
     use super::*;
 
+    /// F6 (0.64.0) — the OTHER prose case is untouched and still falls back.
+    ///
+    /// Two cases were sent as prose. This release closes the first — a resumed
+    /// run's pre-crash history — by restoring the turns it used to lose. The
+    /// second is a step whose results do not line up with the calls it made, and
+    /// it is correct as it stands: correlating them positionally would answer the
+    /// wrong call, and a `tool_result` naming a call that turn did not make is a
+    /// 400 on at least one vendor.
+    ///
+    /// Both cases run through the same lookup, so a change that quietly closed
+    /// this one too would be shipping an unreviewed behaviour under this
+    /// release's name. Asserted here rather than end to end because a run that
+    /// produces more results than calls is not something a fixture can ask a
+    /// provider for — it is a disagreement between two counts, and this is where
+    /// the two counts meet.
+    #[test]
+    fn a_step_whose_results_outnumber_its_calls_is_still_sent_as_prose() {
+        use crate::context::{Emitted, Piece};
+
+        let section = "\n[read a.txt]\nA\n\n[read b.txt]\nB\n";
+        let user = format!("HEAD{section}TAIL");
+        let assembled = Assembled {
+            text: section.to_string(),
+            emitted: vec![
+                Emitted {
+                    step: 1,
+                    ordinal: 0,
+                    piece: Piece::Result,
+                    text: "\n[read a.txt]\nA\n".into(),
+                },
+                Emitted {
+                    step: 1,
+                    ordinal: 1,
+                    piece: Piece::Result,
+                    text: "\n[read b.txt]\nB\n".into(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        // One call, two results: the pairing is not knowable, so the step is prose.
+        let mut turns = BTreeMap::new();
+        turns.insert(
+            1u32,
+            StepTurn {
+                text: None,
+                calls: vec![ToolCall {
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({ "path": "a.txt" }),
+                }],
+            },
+        );
+        let out = transcript(&user, &assembled, &turns);
+        assert!(
+            !out.iter()
+                .any(|m| matches!(m, Message::Assistant { .. }) || matches!(m, Message::Results(_))),
+            "a step whose counts disagree carries no assistant turn and no result batch: {out:?}"
+        );
+
+        // The control, and it is what makes the assertion above about the counts
+        // rather than about a transcript that never pairs anything: give the turn
+        // the second call and the same emission pairs.
+        turns.get_mut(&1).unwrap().calls.push(ToolCall {
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "b.txt" }),
+        });
+        let paired = transcript(&user, &assembled, &turns);
+        assert!(
+            paired.iter().any(|m| matches!(m, Message::Results(rs) if rs.len() == 2)),
+            "with both calls present the same results are one batch: {paired:?}"
+        );
+    }
+
     /// 0.57.0 — a cohort with nothing to separate it keeps the order the store
     /// returned, at a size where an unstable sort would not.
     ///

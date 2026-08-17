@@ -1289,6 +1289,117 @@ async fn a_resumed_run_sends_the_conversation_an_uninterrupted_run_would_have() 
     );
 }
 
+/// F3 (0.64.0) — and it still holds once the older observations are elided.
+///
+/// This is the case a fix that only handles the happy path gets wrong. What a
+/// turn carries is decided per turn against the context budget: older entries
+/// are replaced by one-line stubs, and past a ceiling they collapse into a
+/// single line. Ordinals are counted over **every** result of a step whether or
+/// not the turn carries it (`src/context.rs`), so a result that survives the
+/// elision still names the position of the call it answers — but only if the
+/// calls are there to be named. A resumed run under a tight budget is where both
+/// halves have to be true at once.
+///
+/// The fixture asserts that elision actually happened before comparing anything.
+/// Under a budget nothing exceeds, this would be the flat test again wearing a
+/// different name.
+#[tokio::test]
+async fn a_resumed_run_under_a_tight_budget_still_pairs_every_result_with_its_call() {
+    // Sized like the ceiling test at the top of this file: each file is under the
+    // per-read cap so the read succeeds, and four of them together are well over
+    // the assembly budget so the older ones stub.
+    let filler = format!("{}TAIL\n", "filler line\n".repeat(150));
+    let script = || {
+        MockScript::new(vec![
+            vec![call("read_file", json!({ "path": "f0.txt" }))],
+            vec![call("read_file", json!({ "path": "f1.txt" }))],
+            vec![call("read_file", json!({ "path": "f2.txt" }))],
+            vec![call("read_file", json!({ "path": "f3.txt" }))],
+        ])
+    };
+    let seed = |dir: &std::path::Path| {
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("f{i}.txt")), &filler).unwrap();
+        }
+    };
+    let tight_contract =
+        |dir: &std::path::Path, steps: u32| never_passes(dir, steps).with_context_budget(tight(1_000));
+
+    let whole_dir = ws();
+    seed(whole_dir.path());
+    let whole_store = Store::memory().unwrap();
+    let whole_provider = script();
+    run_with(
+        &tight_contract(whole_dir.path(), 4),
+        &whole_provider,
+        &whole_store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    // The fixture must actually elide, or this asserts nothing about elision.
+    let last = whole_provider.observations(3);
+    assert!(
+        last.contains("(elided:") || last.contains("earlier observation(s) elided"),
+        "the budget must be tight enough to stub or collapse, got {last}"
+    );
+
+    let cut_dir = ws();
+    seed(cut_dir.path());
+    let cut_store = Store::memory().unwrap();
+    let provider = script();
+    let first = run_with(
+        &tight_contract(cut_dir.path(), 1),
+        &provider,
+        &cut_store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    io_harness::resume_with(
+        &tight_contract(cut_dir.path(), 4),
+        &provider,
+        &cut_store,
+        first.run_id,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let uninterrupted = whole_provider.messages(3);
+    let resumed = provider.messages(3);
+    assert_eq!(
+        resumed, uninterrupted,
+        "an elided history role-tags the same way whether or not the process died"
+    );
+
+    // And the pairing itself, read off the messages rather than inferred from
+    // their equality: every result names a call the assistant turn before it
+    // actually made.
+    let mut pairs = 0;
+    for window in resumed.windows(2) {
+        if let [Message::Assistant { calls, .. }, Message::Results(results)] = window {
+            pairs += 1;
+            for r in results {
+                assert!(
+                    r.call < calls.len(),
+                    "a result names call {} of a turn that made {}: {resumed:?}",
+                    r.call,
+                    calls.len()
+                );
+            }
+        }
+    }
+    assert!(
+        pairs > 0,
+        "the resumed transcript must contain at least one paired turn: {resumed:?}"
+    );
+}
+
 /// The restore is a restore, not a re-derivation: what step one observed is in
 /// the prompt step two is sent, across the process boundary. Asserted on the
 /// provider's own received requests, which is the only place it is observable.
