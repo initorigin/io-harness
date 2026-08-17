@@ -1435,4 +1435,70 @@ mod tests {
         drop(lease);
     }
 
+
+    /// N4 (0.64.0) — what the durable turn costs per step.
+    ///
+    /// Printed, never asserted: a duration asserted on a CI runner is a flake
+    /// waiting to be written. `cargo test --lib what_the_durable_turn_costs --
+    /// --ignored --nocapture`, and the numbers live in `docs/MEASUREMENTS.md`.
+    ///
+    /// **Both arms are made to do the same work before either is timed.** 0.63.0's
+    /// first facade measurement reported 2x and was itself the defect — one arm was
+    /// doing three times the steps — so this one asserts the two arms wrote the
+    /// same number of `steps` rows before it reports anything.
+    #[test]
+    #[ignore = "prints a measurement; run with --ignored --nocapture"]
+    fn what_the_durable_turn_costs_per_step() {
+        const ROUNDS: usize = 21;
+        const STEPS: u32 = 40;
+
+        let median = |mut v: Vec<std::time::Duration>| {
+            v.sort();
+            v[v.len() / 2]
+        };
+        let run = |stage: bool| {
+            let mut times = Vec::new();
+            for _ in 0..ROUNDS {
+                let store = Store::memory().unwrap();
+                let run_id = store.start_run("goal", "/repo").unwrap();
+                let started = std::time::Instant::now();
+                for step in 1..=STEPS {
+                    if stage {
+                        store.stage_step_turn(
+                            run_id,
+                            AssistantTurn::new(
+                                step,
+                                Some("working"),
+                                vec![ToolCall {
+                                    name: "read_file".into(),
+                                    arguments: serde_json::json!({ "path": "a.txt" }),
+                                }],
+                            ),
+                        );
+                    }
+                    store
+                        .checkpoint_step(run_id, &StepRecord::new(step, "read a.txt", "A"))
+                        .unwrap();
+                }
+                times.push(started.elapsed());
+                // The control on the arms doing the same work: same steps, and the
+                // turns present exactly when they were staged.
+                assert_eq!(store.steps(run_id).unwrap().len(), STEPS as usize);
+                assert_eq!(
+                    store.step_turns(run_id).unwrap().len(),
+                    if stage { STEPS as usize } else { 0 }
+                );
+            }
+            median(times)
+        };
+
+        let without = run(false);
+        let with = run(true);
+        println!(
+            "{STEPS} committed steps, median of {ROUNDS} rounds:\n  \
+             steps row only          {without:?}\n  \
+             steps row + turn        {with:?}"
+        );
+    }
+
 }

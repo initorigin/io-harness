@@ -9,6 +9,39 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What the durable assistant turn costs (0.64.0)
+
+**What is being measured.** 0.64.0 writes one extra row per committed step — the
+assistant turn, so a resumed run can send it back — inside the transaction that
+already writes the step. The question a reader will have is what a run pays per
+step for it.
+
+**The shape to expect, stated before it was measured.** One `INSERT OR REPLACE`
+per committed step, in a transaction that is already open, against a table whose
+only index is its primary key. Constant per step, not growing with the run: the
+read side is one keyed `SELECT` per *resume*, not per step. So the expected shape
+is a small fixed addition to what a checkpoint already costs, and nothing that
+changes as a run gets longer.
+
+**Method.** `what_the_durable_turn_costs_per_step` in `src/state/trace.rs`,
+`#[ignore]`d because it prints rather than asserts. Forty committed steps against
+a fresh in-memory store per round, twenty-one rounds, medians reported. Both arms
+assert they wrote the same number of `steps` rows before anything is reported —
+0.63.0's first facade measurement was itself the defect because its two arms were
+not doing the same work. Run it with
+`cargo test --lib what_the_durable_turn_costs -- --ignored --nocapture`.
+
+**Numbers.** M1, `cargo test` (dev profile, unoptimized), medians of 21 rounds:
+
+| Per committed step | 40 steps |
+| --- | --- |
+| `steps` row and checkpoint event only | 787.459 µs |
+| the same, plus the assistant turn | 1.190167 ms |
+
+About 10 µs per step, on an in-memory store in an unoptimized build, for a step
+that in a real run is dominated by a provider call measured in hundreds of
+milliseconds. The number is recorded, not asserted: no test gates on it.
+
 ## What binding the host once costs (0.63.0)
 
 **What is being measured.** 0.63.0 adds a `Harness` that binds the provider, the
