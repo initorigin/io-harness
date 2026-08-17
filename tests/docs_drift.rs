@@ -1700,3 +1700,97 @@ fn run_subsystem() -> String {
     }
     all
 }
+
+// ---------------------------------------------------------------------------
+// 0.64.0 — the resume half of the prose claim is retired
+// ---------------------------------------------------------------------------
+
+/// The claim `docs/CONTRACT.md` and the run subsystem carried from 0.49.0 until
+/// 0.64.0: that a resumed run's earlier history is prose and stays that way.
+///
+/// **Taken from the real bytes of the page**, not from the sentence as a reader
+/// hears it. 0.61.0's prose gate was blind twice in a row — first because its
+/// regex could not match a `*`, then because it searched for a phrase the page
+/// writes with markup in the middle — so this needle is a fragment that survives
+/// `flatten`, contains no markup, and was copied out of the page it retired.
+///
+/// **It cost a round here too, and the control is what caught it.** The first
+/// needle was `its pre-resume history stays in the first user message`, and the
+/// page writes `its **pre-resume** history …` — the asterisks sit inside the
+/// phrase a reader hears as continuous, so the checker matched nothing and the
+/// test above passed while checking nothing. Third instance of that exact trap.
+/// The needle now starts after the markup.
+const RETIRED_RESUME_PROSE_CLAIM: &str = "history stays in the first user message";
+
+/// Whether a page still tells a reader that a resumed run cannot be role-tagged.
+fn carries_no_permanent_resume_prose_claim(page: &str) -> Result<(), String> {
+    let flat = flatten(page);
+    if flat.contains(RETIRED_RESUME_PROSE_CLAIM) {
+        return Err(format!(
+            "the page still says a resumed run's earlier history stays prose, which 0.64.0's \
+             durable assistant turn made false: {RETIRED_RESUME_PROSE_CLAIM}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn no_page_still_says_a_resumed_runs_history_stays_prose() {
+    for (name, page) in [
+        ("docs/CONTRACT.md", read("docs/CONTRACT.md")),
+        ("docs/guide/durable-runs.md", read("docs/guide/durable-runs.md")),
+    ] {
+        if let Err(why) = carries_no_permanent_resume_prose_claim(&page) {
+            panic!("{name}: {why}");
+        }
+    }
+}
+
+#[test]
+fn the_resume_prose_checker_rejects_the_retired_sentence() {
+    // The control, and the arm the sabotage pass restores. Without it this passes
+    // against a page that says nothing about resume at all, which is how a prose
+    // gate goes quietly blind.
+    let fixture = "**Two cases are sent as prose, and both are prose today.** A resumed run\n\
+                   rebuilds its ledger from stored observation text, which holds no tool-call\n\
+                   structure, so its **pre-resume** history stays in the first user message and\n\
+                   everything from the resume point on is role-tagged.\n";
+    let err = carries_no_permanent_resume_prose_claim(fixture).unwrap_err();
+    assert!(err.contains("first user message"), "{err}");
+}
+
+/// And the replacement claim is true of the source, not merely written down.
+///
+/// A page can be corrected into a different wrong statement. This reads the two
+/// facts the rewritten paragraph rests on out of the code: the turn is written by
+/// the transaction that commits the step, and both loops restore it.
+#[test]
+fn the_contracts_resume_claim_matches_the_source() {
+    let page = flatten(&read("docs/CONTRACT.md"));
+    assert!(
+        page.contains("step_turns"),
+        "the CONTRACT names the table a reader would go looking for"
+    );
+
+    let commit_home = read("src/state/trace.rs");
+    let checkpoint = commit_home
+        .split("pub fn checkpoint_step(")
+        .nth(1)
+        .expect("src/state/trace.rs still defines checkpoint_step")
+        .split("\n    pub ")
+        .next()
+        .expect("the commit's body");
+    assert!(
+        checkpoint.contains("INSERT OR REPLACE INTO step_turns"),
+        "the CONTRACT says the turn rides the transaction that commits the step; \
+         `checkpoint_step` does not write it"
+    );
+
+    let run = run_subsystem();
+    let restores = run.matches("restore_turns(").count();
+    assert!(
+        restores >= 3,
+        "expected the one definition and both loops to name `restore_turns`, found {restores} \
+         mention(s) — the CONTRACT claims both loops restore the turn"
+    );
+}

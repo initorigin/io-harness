@@ -72,6 +72,7 @@ into it.
 
 | Version | What it introduced | Entry |
 | --- | --- | --- |
+| 0.64.0 | A resumed run sends the model its own past turns rather than a third-person account of them — the assistant half of a transcript becomes durable and is restored beside the ledger, in both loops | [2026-08-17](../CHANGELOG.md#0640---2026-08-17) |
 | 0.63.0 | The host is bound once in a `Harness` — provider, store, boundary and the configuration that is not a property of any task — the storage library leaves the public contract, and a turn's framing becomes settable | [2026-08-17](../CHANGELOG.md#0630---2026-08-17) |
 | 0.62.0 | One driver per run: a lease with a generation, a typed conflict for a second live owner, takeover of a lapsed lease, and a session head that advances by compare-and-swap | [2026-08-17](../CHANGELOG.md#0620---2026-08-17) |
 | 0.61.0 | Every name the harness answers is reserved, and a test derived from the crate's own tool constants keeps the set complete | [2026-08-17](../CHANGELOG.md#0610---2026-08-17) |
