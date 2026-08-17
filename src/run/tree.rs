@@ -414,7 +414,13 @@ where
         let mut marked_prefix = PrefixGuard::default();
         // 0.49.0 — per agent in the tree, for the reason the flat loop keeps one per
         // run: a child's turns are its own and must never reach its parent's request.
-        let mut turns: BTreeMap<u32, StepTurn> = BTreeMap::new();
+        //
+        // 0.64.0 — and restored through the same function the flat loop uses, keyed
+        // on this agent's own run id. A resumed agent is the same agent, at whatever
+        // depth it sits, and an agent whose earlier turns were driven by a process
+        // that is gone would otherwise be the only one in the tree reading a
+        // third-person account of its own actions.
+        let mut turns: BTreeMap<u32, StepTurn> = restore_turns(tree.store, run_id)?;
         // Same ledger and same per-turn assembly as the workspace loop: a tree of
         // 100 children each re-sending its own unbounded log is the multiplied
         // version of the problem 0.10.0 exists to fix — and, since 0.13.0, the
@@ -720,6 +726,10 @@ where
             }
 
             // 0.49.0 — recorded before dispatch, as the flat loop does.
+            //
+            // 0.64.0 — and staged durably, as the flat loop does. The write rides
+            // the transaction that commits this step, so a step that never commits
+            // and an agent whose lease was taken from it both leave no turn.
             turns.insert(
                 step,
                 StepTurn {
@@ -727,11 +737,19 @@ where
                     calls: response.tool_calls.clone(),
                 },
             );
+            tree.store.stage_step_turn(
+                run_id,
+                AssistantTurn::new(step, response.text.clone(), response.tool_calls.clone()),
+            );
 
-            // 0.50.0 — and made durable, which `turns` is not. The last of these
-            // rows is what this agent's parent composes as its conclusion, so it
-            // has to survive the process: a parent that adopts a child a previous
-            // process left behind reads the same words a parent that waited does.
+            // 0.50.0 — and recorded as an agent event, which is a different fact
+            // from the turn staged above: the last of THESE rows is what this
+            // agent's parent composes as its conclusion, so a parent that adopts a
+            // child a previous process left behind reads the same words a parent
+            // that waited does. The turn is what the agent itself is sent back on
+            // a resume; this is what its parent quotes. Same text, two readers,
+            // and folding them into one row would make either the parent's
+            // conclusion or the agent's own transcript the other's leftovers.
             // Here rather than in `finish` because every ending is a different
             // return and `turns` is in scope at exactly one place.
             if let Some(said) = response

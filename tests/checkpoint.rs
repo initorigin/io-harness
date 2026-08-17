@@ -1518,3 +1518,119 @@ async fn a_store_written_before_the_turn_table_resumes_as_it_did_then() {
         "and it made progress past where it stopped"
     );
 }
+
+/// A tree provider that keeps every request the ROOT agent was sent, so a
+/// resumed tree's conversation can be asserted the way the flat one's is.
+struct SeenTree {
+    inner: TreeProvider,
+    root_seen: std::sync::Mutex<Vec<CompletionRequest>>,
+}
+impl SeenTree {
+    fn new() -> Self {
+        Self {
+            inner: TreeProvider {
+                child_delay: Duration::ZERO,
+            },
+            root_seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+impl Provider for SeenTree {
+    async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        if req.user.contains("COORDINATOR") {
+            self.root_seen.lock().unwrap().push(req.clone());
+        }
+        self.inner.complete(req).await
+    }
+}
+
+/// F4 — an agent in a tree gets its own turns back on a resume too.
+///
+/// The tree loop keeps its own turns map, in its own file, and until this
+/// release its own comment recorded that the map — unlike the agent events
+/// beside it — did not survive the process. A resumed coordinator would read a
+/// third-person account of the fan-out it itself ordered.
+///
+/// Stopped at a step cap rather than cut off mid-fan-out: the root's step
+/// commits only once its children have returned, so a tree killed while they
+/// sleep has no committed root step and therefore nothing to restore. The
+/// criterion is about what a resumed agent is *sent*, so the run has to get far
+/// enough to have a history at all.
+#[tokio::test]
+async fn a_resumed_agent_in_a_tree_is_sent_its_own_turns() {
+    let dir = ws();
+    let db = dir.path().join("runs.db");
+    let store = Store::open(&db).unwrap();
+    // A criterion the children never satisfy, so the root runs its whole budget
+    // and every step is reached.
+    let contract = |steps: u32| {
+        TaskContract::workspace(
+            "COORDINATOR: delegate to sub-agents; do not write files yourself.",
+            dir.path(),
+        )
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "c.txt".into(),
+            needle: "GAMMA".into(),
+        })
+        .with_max_steps(steps)
+    };
+
+    let stopped = run_tree(
+        &contract(1),
+        &TreeProvider {
+            child_delay: Duration::ZERO,
+        },
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(stopped.outcome, RunOutcome::StepCapReached { .. }),
+        "an interrupted tree to resume: {:?}",
+        stopped.outcome
+    );
+    let turns_before = store.step_turns(stopped.run_id).unwrap();
+    assert!(
+        turns_before
+            .iter()
+            .any(|t| t.calls.iter().any(|c| c.name == "spawn_agent")),
+        "the root committed a step, so its spawn calls are durable: {turns_before:?}"
+    );
+    drop(store);
+
+    let store = Store::open(&db).unwrap();
+    let seen = SeenTree::new();
+    resume_tree(
+        &contract(2),
+        &seen,
+        &store,
+        stopped.run_id,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+
+    let root = seen.root_seen.lock().unwrap();
+    let with_history = root
+        .iter()
+        .find(|req| !req.messages.is_empty())
+        .unwrap_or_else(|| {
+            panic!(
+                "the resumed coordinator was sent {} request(s) and none carried a conversation",
+                root.len()
+            )
+        });
+    assert!(
+        with_history.messages.iter().any(|m| matches!(
+            m,
+            io_harness::Message::Assistant { calls, .. } if calls.iter().any(|c| c.name == "spawn_agent")
+        )),
+        "the coordinator is sent back its own spawn calls as its own turn, not as prose: {:?}",
+        with_history.messages
+    );
+}
