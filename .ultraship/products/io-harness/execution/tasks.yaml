@@ -210,7 +210,7 @@ tasks:
     The ungate is a public-surface addition no gate in this repository can see, so N1 has to be established
     by reading the diff rather than by a green snapshot. N2/N3/N4 are the release's claim that nothing
     else moved.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.61.0-T04
   acceptance_criteria:
@@ -234,14 +234,33 @@ tasks:
     baselines in `tests/prompt.rs` stay green untouched, which is the evidence.
   files:
   - docs/public-api.txt
-  evidence: []
+  evidence:
+  - >-
+    N1 — `git diff develop -- docs/public-api.txt` is **0 lines**, and `tests/public_api.rs` is green
+    (8 passed). The snapshot does not move because it enumerates items re-exported from `src/lib.rs` and
+    the browser name constants are reached as `tools::BROWSER_*`; `src/lib.rs` mentions them once, in
+    prose, and re-exports none of them.
+  - >-
+    N1's limitation, stated rather than hidden behind that green: ungating the six constants **is** a
+    public-surface addition — `tools::BROWSER_NAVIGATE_TOOL` and its five siblings become nameable in
+    a default build — and no gate in this repository can see it. Same shape as 0.60.3's A6. Evidence is
+    the diff of `src/tools/mod.rs`, not the snapshot.
+  - N2 — `cargo tree | wc -l` is **402**, unchanged since 0.50.0.
+  - >-
+    N3 — `CHECKPOINT_FORMAT` unmoved at **7** (`src/state.rs:107`); `git diff develop -- src/` contains
+    **zero** added `CREATE TABLE` / `ALTER TABLE` / `CREATE INDEX` lines; `tests/cross_version.rs` green
+    (25 passed) with no `ADDED_SINCE_0_22_0` entry needed.
+  - >-
+    N4 — the offered catalogue does not move: `tests/prompt.rs` (10 passed) and `tests/cache_boundary.rs`
+    (7 passed) green with no edits, which is what says 0.38.0's cacheable prefix is byte-identical for
+    every configuration. No tool was added to or removed from any build.
 - id: US-IO-HARNESS-0.61.0-T06
   summary: Run the suite, the nightly rustdoc gate and the sabotage pass, one arm per functional criterion.
   why_required: >-
     A sabotage arm that fails nothing is a finding about the test, and this release is almost entirely
     tests. The rustdoc gate has caught something in eight of the last eleven releases and this release
     edits seven doc blocks, one of which links a pub(crate) item.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.61.0-T05
   acceptance_criteria:
@@ -267,4 +286,35 @@ tasks:
     and `target/debug/deps`, `build` and `incremental` cleared before a full run, and `CARGO_PROFILE_DEV_DEBUG=0`
     is set.
   files: []
-  evidence: []
+  evidence:
+  - >-
+    O1 — default suite green: **88 binaries, 1,880 passed, 0 failed, 6 ignored**, plus 457 doctests inside
+    that total, in 199 s. 0.60.3 recorded 1,874 passed; the difference is exactly the six tests this release
+    adds (two in T01, three in T03, one docs_drift fixture sibling in T04). No behaviour path changed,
+    and the binary count is unmoved.
+  - >-
+    F4's second half — `cargo test --all-features --test custom_tools --test docs_drift`: 20 and 46, both
+    green. The six `browser_*` rows in the refusal test are ungated, so they assert in a default build
+    **and** in a build that compiles the browser.
+  - >-
+    O2 — the nightly rustdoc gate is clean: `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc
+    --all-features --no-deps` finished with no diagnostics, and the rendered pages still carry feature
+    labels (3 pages match "Available on crate feature"), which is the half of the CI job that exit 0 does
+    not prove. Notable because this release edits seven doc blocks and the set it documents is `pub(crate)`
+    — `rustdoc::private_intra_doc_links` is exactly what that combination trips, and the first draft of
+    the browser rustdoc did link it before being rewritten to plain backticks.
+  - >-
+    O3 — **six sabotage arms, every one killed its named test and no other; none survived.** S1 `pub const
+    FAKE_TOOL` added and not reserved → only `every_name_the_harness_answers_is_reserved` fails (the class
+    no run-time test can see). S2 `LSP_RENAME_TOOL` deleted from the slice → that test and F1 fail together.
+    S3 the stale guide paragraph restored → the docs gate. S4 `|| name.starts_with("browser_")` added
+    to `validate` → **only F5's control fails**, which is what proves the set is names and not a prefix
+    rule. S5 the slice-literal panic replaced by `unwrap_or_default()` → only F3's control fails. S6 the
+    mailbox pair deleted → F1 and F2 fail naming `read_messages` and `send_message`.
+  - >-
+    Each arm was run with the test binary named explicitly (`cargo test --test custom_tools <filter>`),
+    never a bare filter passed to every binary — 0.60.3 recorded a survival for a test that had run zero
+    times that way.
+  - >-
+    O5 — disk checked before every full run: 33 GiB free against a 22 GiB `target/` at the start, 29 GiB
+    free after the all-features build. `CARGO_PROFILE_DEV_DEBUG=0` set throughout.
