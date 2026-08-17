@@ -31,11 +31,17 @@ const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 /// The two crate-internal engines every driving entry point must reach.
 const ENGINES: &[&str] = &["run_with_extras", "run_tree_with_extras"];
 
-/// The floor on how many top-level functions the parse must find in `src/run.rs`.
+/// The floor on how many top-level functions the parse must find across the run
+/// subsystem — `src/run.rs` and every `src/run/<subject>.rs`.
 ///
-/// It stood at 251 when this test was written. The floor is deliberately far
-/// below that: its job is to catch a parse that has gone blind, not to be a
-/// second inventory that needs updating whenever a private helper is added.
+/// It stood at 251 when this test was written and at 250 after 0.63.0 split the
+/// file. The floor is deliberately far below that: its job is to catch a parse
+/// that has gone blind, not to be a second inventory that needs updating whenever
+/// a private helper is added.
+///
+/// It has already done that job once. The 0.63.0 split moved 12,000 lines into
+/// submodules and this checker, still reading one file, found 41 functions and
+/// said so — instead of passing over a graph with most of its edges missing.
 const ITEM_FLOOR: usize = 150;
 
 /// The floor on how many *driving* public entry points the parse must find.
@@ -86,6 +92,18 @@ fn functions(source: &str) -> Vec<Fun> {
             })
             .or_else(|| {
                 line.strip_prefix("pub(crate) fn ")
+                    .map(|r| (r, false, false))
+            })
+            // `pub(super)` is what the 0.63.0 split promoted every moved item to.
+            // Without these two arms the parse sees `src/run.rs` and nothing in
+            // `src/run/`, which is how it went from 251 functions to 41 — caught
+            // by ITEM_FLOOR rather than by a wrong answer.
+            .or_else(|| {
+                line.strip_prefix("pub(super) async fn ")
+                    .map(|r| (r, false, true))
+            })
+            .or_else(|| {
+                line.strip_prefix("pub(super) fn ")
                     .map(|r| (r, false, false))
             })
             .or_else(|| line.strip_prefix("async fn ").map(|r| (r, false, true)))
@@ -167,17 +185,46 @@ fn reaches(graph: &BTreeMap<&str, &str>, start: &str) -> BTreeSet<String> {
 // F3 — one runtime path
 // ---------------------------------------------------------------------------
 
-/// Every driving public entry point in `src/run.rs` reaches one of the two
+/// Every `.rs` file of the run subsystem: `src/run.rs` and its submodules.
+///
+/// One graph, because the call graph is one graph. The 0.63.0 split moved the
+/// private machinery into `src/run/<subject>.rs` and glob-imported it back, so an
+/// entry point in `src/run.rs` still calls straight into `step.rs` and `tree.rs`
+/// — a checker reading only the parent would be looking at a graph with most of
+/// its edges cut, and would pass for that reason rather than for a true one.
+fn run_subsystem() -> String {
+    let mut all = read("src/run.rs");
+    let dir = PathBuf::from(ROOT).join("src/run");
+    let mut names: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+        .collect();
+    names.sort();
+    assert!(
+        names.len() >= 5,
+        "only {} submodules found under src/run/ — the split has been undone or this walk is \
+         blind, and either way the graph below is not the subsystem's",
+        names.len()
+    );
+    for path in names {
+        all.push('\n');
+        all.push_str(&fs::read_to_string(&path).unwrap().replace("\r\n", "\n"));
+    }
+    all
+}
+
+/// Every driving public entry point in the run subsystem reaches one of the two
 /// engines, and no entry point assembles a run of its own.
 #[test]
 fn every_driving_entry_point_reaches_the_shared_engine() {
-    let source = read("src/run.rs");
+    let source = run_subsystem();
     let items = functions(&source);
     assert!(
         items.len() >= ITEM_FLOOR,
-        "the parse of src/run.rs found only {} top-level functions, which is below the \
-         floor of {ITEM_FLOOR} — the file's layout has changed and this checker is blind, \
-         which is a finding about the checker and not a passing test",
+        "the parse of the run subsystem found only {} top-level functions, which is below \
+         the floor of {ITEM_FLOOR} — its layout has changed and this checker is blind, which \
+         is a finding about the checker and not a passing test",
         items.len()
     );
 
@@ -188,9 +235,9 @@ fn every_driving_entry_point_reaches_the_shared_engine() {
     for engine in ENGINES {
         assert!(
             graph.contains_key(engine),
-            "src/run.rs no longer defines `{engine}` — the engine this invariant is written \
-             about has been renamed or removed, and the invariant must be rewritten rather \
-             than left to pass vacuously"
+            "the run subsystem no longer defines `{engine}` — the engine this invariant is \
+             written about has been renamed or removed, and the invariant must be rewritten \
+             rather than left to pass vacuously"
         );
     }
 
@@ -200,7 +247,7 @@ fn every_driving_entry_point_reaches_the_shared_engine() {
         .collect();
     assert!(
         drivers.len() >= DRIVER_FLOOR,
-        "only {} public async entry points found in src/run.rs, below the floor of \
+        "only {} public async entry points found in the run subsystem, below the floor of \
          {DRIVER_FLOOR}",
         drivers.len()
     );
