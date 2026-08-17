@@ -42,7 +42,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.60"
+io-harness = "0.61"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

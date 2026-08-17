@@ -14,6 +14,27 @@ notes are produced from it.
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.61.0] - 2026-08-17
+
+Every name the harness answers is now reserved, and a test derived from the
+crate's own tool constants is what keeps the set complete. Eighteen built-in
+names were dispatched and unreserved, so a registered tool taking one of them
+validated cleanly and was then unreachable for the life of the process — with no
+error, no event and no log line. 0.17.0 closed this once as a hand-patched list,
+and every built-in added afterwards reopened it by one name.
+
 ### Breaking changes
 
 - **BREAKING (behaviour)** — eighteen names the harness answers are now reserved,
