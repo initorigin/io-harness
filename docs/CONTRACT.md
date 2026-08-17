@@ -2659,15 +2659,28 @@ and a registered tool taking one of those names fails the run before the first
 completion. The names it holds are reserved even where the tool itself is not
 compiled in, so enabling a feature can never take away a tool that was working.
 
-**And it has reopened, because the fix was a list rather than an invariant.**
-Eighteen names dispatch answers today are absent from the set — `forget`,
-`check`, `patch_file`, `git_branch`, `git_worktree`, the five `lsp_*` tools, the
-six `browser_*` tools, `send_message` and `read_messages` — so every built-in
-added after 0.17.0 reopened the defect by one name. A registered tool taking one
-of those validates and is then unreachable, exactly as before. It is stated here
-rather than fixed here because adding a name to the set changes what
-`Toolbox::validate` accepts, which is a break and not a patch: **0.61.0** closes
-it as one const every dispatch arm reads.
+**It reopened once, because the fix was a list rather than an invariant, and
+0.61.0 closed it as a rule.** Every built-in added after 0.17.0 reopened the
+defect by one name — the worktree tool, `patch_file`, `check`, the five `lsp_*`
+tools, the six `browser_*` tools, `forget`, and the mailbox pair — eighteen in
+all, each validating cleanly and then never reached. The set now holds all 53
+names the harness answers, and what keeps it holding them is a test rather than
+diligence: `every_name_the_harness_answers_is_reserved` derives the built-in set
+from the crate's own `*_TOOL` constants and fails when `RESERVED_TOOL_NAMES` does
+not hold it, in either direction. Adding a built-in without reserving its name is
+a red test.
+
+Two consequences of that release a caller can see. The six `browser_*` name
+constants are no longer `#[cfg(feature = "browser")]` — a name the harness owns
+is owned in every build, which is the same reason 0.17.0 ungated the image and
+document names, and it is what lets one unconditional list hold them. And
+`send_message` / `read_messages` are reserved in **every** run shape, including a
+flat run that is never offered them: before 0.61.0 a registered tool could take
+one of those names and work in a flat run while being shadowed inside a tree,
+which made the safe set of names depend on which run shape a program happened to
+start. That is `spawn_agent`'s own precedent, and it is the one place where this
+release takes away a configuration that worked rather than one that was quietly
+broken.
 
 **Windows resource caps.** See the platform table above.
 

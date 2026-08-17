@@ -113,22 +113,24 @@ pub const LSP_RENAME_TOOL: &str = "lsp_rename";
 /// these in its catalogue, which is what keeps its composed prompt — and the
 /// cacheable prefix that prompt is billed against — byte-identical to a build
 /// made before this release.
-#[cfg(feature = "browser")]
+///
+/// These six names exist in **every** build, though the tools behind them do not
+/// — the `browser` feature is what compiles the dispatch arm and the CDP client,
+/// not what makes the name the harness's. Until 0.61.0 the constants themselves
+/// were `#[cfg(feature = "browser")]`, which is why the reserved-name set
+/// `Toolbox::validate` enforces could not name them: an unconditional list cannot
+/// hold a constant that does not exist in a default build. That is the same wall 0.17.0 met with the image and document names and
+/// answered the same way — see [`VIEW_IMAGE_TOOL`].
 pub const BROWSER_NAVIGATE_TOOL: &str = "browser_navigate";
 /// The rendered text of the page, after its scripts have run.
-#[cfg(feature = "browser")]
 pub const BROWSER_READ_TOOL: &str = "browser_read";
 /// A picture of the page, which the model is shown.
-#[cfg(feature = "browser")]
 pub const BROWSER_SCREENSHOT_TOOL: &str = "browser_screenshot";
 /// A trusted click at a resolved element.
-#[cfg(feature = "browser")]
 pub const BROWSER_CLICK_TOOL: &str = "browser_click";
 /// Typing into a focused element.
-#[cfg(feature = "browser")]
 pub const BROWSER_TYPE_TOOL: &str = "browser_type";
 /// Scrolling the page.
-#[cfg(feature = "browser")]
 pub const BROWSER_SCROLL_TOOL: &str = "browser_scroll";
 /// The name the model uses to run a command (0.17.0).
 ///
