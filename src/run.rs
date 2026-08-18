@@ -242,12 +242,34 @@ const OBS_LIST_DIR_CAP: usize = 200;
 /// `StepCapReached { steps: 12 }` and a `Success { steps: 12 }` cost the same
 /// and only one of them produced anything. For what the run actually spent, use
 /// [`RunResult::summary`].
+/// `#[non_exhaustive]` from 0.65.0, which is a break taken deliberately and
+/// once. Adding `AwaitingRecovery` already broke every exhaustive `match` on this
+/// enum, so the attribute that stops the next addition breaking anybody is paid
+/// for by the same edit rather than by a second one later. The fix in a caller is
+/// one wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RunOutcome {
     /// Verification passed. `steps` is the step it passed on.
     Success { steps: u32 },
     /// The step budget was reached before verification passed.
     StepCapReached { steps: u32 },
+    /// (0.65.0) The run died in the middle of a call the harness cannot inspect —
+    /// a charge, a deployment, a posted message, an MCP call, any registered
+    /// [`Tool`](crate::tools::Tool) whose
+    /// [`recovery`](crate::tools::Tool::recovery) is
+    /// [`ToolRecovery::Indeterminate`](crate::ToolRecovery::Indeterminate) — and
+    /// whether that call landed cannot be established from here. The run is
+    /// paused, not finished: the attempt is persisted under `attempt_id` and
+    /// survives this process, so [`resume_with_recovery`] continues it once a
+    /// human decides. `steps` is how many steps completed.
+    ///
+    /// Distinct from every other pause in this enum because nothing is being
+    /// asked *of* the agent: the question is not whether an action is permitted
+    /// or what was wanted, it is whether an action that may already have happened
+    /// should happen again. Only the operator can answer it, and until they do
+    /// the safe move is to do nothing — which is what this outcome is.
+    AwaitingRecovery { attempt_id: i64, steps: u32 },
     /// The time budget was exceeded. `steps` is how many steps completed.
     TimeBudgetExceeded { steps: u32 },
     /// The cost (token) budget was exceeded. `steps` is how many steps completed.
@@ -1461,6 +1483,13 @@ pub async fn resume_observed<P: Provider>(
     // typed error, rather than misreading it or panicking. Before the policy
     // gate below, so an unknown run still reports as an unknown run.
     store.check_resumable(run_id)?;
+    // 0.65.0 — refuse to re-drive a run whose journal still holds a call the
+    // harness cannot inspect. Before anything drives, because the first thing a
+    // resumed run does is replay the step that died, and by then the decision to
+    // repeat the call has already been taken.
+    if let Some(paused) = recovery_pause(store, run_id)? {
+        return Ok(RunResult::new(paused, run_id));
+    }
     // The lease (0.62.0). Taken after the resumability checks so an unknown run
     // still reports as an unknown run, and before any step is driven so a second
     // live driver is refused rather than interleaving its steps with the first
@@ -2252,6 +2281,13 @@ pub async fn resume_with_observed<P: Provider>(
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
     store.check_resumable(run_id)?;
+    // 0.65.0 — refuse to re-drive a run whose journal still holds a call the
+    // harness cannot inspect. Before anything drives, because the first thing a
+    // resumed run does is replay the step that died, and by then the decision to
+    // repeat the call has already been taken.
+    if let Some(paused) = recovery_pause(store, run_id)? {
+        return Ok(RunResult::new(paused, run_id));
+    }
     // The lease (0.62.0). Taken after the resumability checks so an unknown run
     // still reports as an unknown run, and before any step is driven so a second
     // live driver is refused rather than interleaving its steps with the first
@@ -2805,6 +2841,13 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
     observer: &dyn Observer,
 ) -> Result<RunResult> {
     store.check_resumable(run_id)?;
+    // 0.65.0 — refuse to re-drive a run whose journal still holds a call the
+    // harness cannot inspect. Before anything drives, because the first thing a
+    // resumed run does is replay the step that died, and by then the decision to
+    // repeat the call has already been taken.
+    if let Some(paused) = recovery_pause(store, run_id)? {
+        return Ok(RunResult::new(paused, run_id));
+    }
     // The lease (0.62.0). Taken after the resumability checks so an unknown run
     // still reports as an unknown run, and before any step is driven so a second
     // live driver is refused rather than interleaving its steps with the first
@@ -3829,6 +3872,13 @@ pub async fn resume_tree_observed<P: Provider>(
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
     store.check_resumable(run_id)?;
+    // 0.65.0 — refuse to re-drive a run whose journal still holds a call the
+    // harness cannot inspect. Before anything drives, because the first thing a
+    // resumed run does is replay the step that died, and by then the decision to
+    // repeat the call has already been taken.
+    if let Some(paused) = recovery_pause(store, run_id)? {
+        return Ok(RunResult::new(paused, run_id));
+    }
     // The lease (0.62.0). Taken after the resumability checks so an unknown run
     // still reports as an unknown run, and before any step is driven so a second
     // live driver is refused rather than interleaving its steps with the first

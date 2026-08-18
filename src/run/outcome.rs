@@ -661,6 +661,33 @@ pub(super) fn emit_plugins(watch: &Watch<'_>, run_id: i64, contract: &TaskContra
 /// returned as-is, so resuming twice does not re-drive the loop or re-charge the
 /// budget. A run still `Running` — its process died mid-loop — reads as `None`
 /// here and is resumed from its last committed step.
+/// 0.65.0 — refuse to drive a run that has a call the harness cannot inspect
+/// still open in its journal.
+///
+/// Returns the pause, or `None` when there is nothing indeterminate to decide
+/// about — which is every run of built-in tools, since a replayable call is never
+/// journalled at all.
+///
+/// **Why this is a gate at each resume root rather than a check inside the
+/// loop.** What must not happen is the loop being *entered*: the first thing a
+/// resumed run does is re-drive the step that died, and the model re-issues the
+/// call it was making. By the time the loop can look at anything, the decision to
+/// repeat the call has already been taken.
+///
+/// The oldest open attempt is the one reported. A run interrupted twice is
+/// decided one attempt at a time, in the order the calls were made, because a
+/// decision about the second says nothing about the first.
+pub(super) fn recovery_pause(store: &Store, run_id: i64) -> Result<Option<RunOutcome>> {
+    let open = store.open_attempts(run_id)?;
+    let Some(first) = open.first() else {
+        return Ok(None);
+    };
+    Ok(Some(RunOutcome::AwaitingRecovery {
+        attempt_id: first.id,
+        steps: store.last_step(run_id)?,
+    }))
+}
+
 pub(super) fn finished_outcome(store: &Store, run_id: i64) -> Result<Option<RunOutcome>> {
     if store.run_status(run_id)? != Some(RunStatus::Completed) {
         return Ok(None);

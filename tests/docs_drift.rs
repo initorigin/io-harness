@@ -1680,6 +1680,76 @@ fn the_contracts_ownership_claims_match_the_source() {
 /// and 0.63.0 moved `run_from`, `run_workspace_from` and `agent_loop` into
 /// `src/run/step.rs` and `src/run/tree.rs`. A checker reading the parent alone
 /// would find none of them and report nothing missing.
+/// F5 — 0.65.0: every function that resumes a run refuses to drive one whose
+/// journal still holds an open indeterminate attempt.
+///
+/// **Derived per function, never counted.** A count of `recovery_pause` call
+/// sites is satisfied by four of them inside one function while three other
+/// resume roots drive straight past an open attempt — which is the exact shape
+/// 0.62.0's lease gate was rewritten to catch, after a release shipped with an
+/// acquire missing from a path no test covered and the suite stayed green.
+///
+/// The subject is `check_resumable` rather than "a function whose name starts
+/// with `resume`": what has to be gated is every place the crate begins driving
+/// an existing run, and that is exactly the set of bodies asking whether a run is
+/// resumable at all.
+#[test]
+fn every_resume_root_refuses_an_open_indeterminate_attempt() {
+    let run = run_subsystem();
+
+    let roots = || {
+        run.split("\npub async fn ")
+            .skip(1)
+            .chain(run.split("\npub(crate) async fn ").skip(1))
+            .map(|body| {
+                let name = body
+                    .split(['<', '('])
+                    .next()
+                    .unwrap_or("?")
+                    .trim()
+                    .to_string();
+                (name, body.split("\npub").next().unwrap_or(body).to_string())
+            })
+            .filter(|(_, body)| body.contains("store.check_resumable("))
+    };
+
+    let missing: Vec<String> = roots()
+        .filter(|(_, body)| !body.contains("recovery_pause(store, run_id)"))
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every function that resumes a run must refuse one with an open indeterminate \
+         attempt, and these do not: {missing:?}"
+    );
+
+    // The floor. If the parse stops finding resume roots the assertion above
+    // passes by finding nothing, which is how a derived test goes blind — and
+    // 0.63.0's split disarmed seven gates of this shape in one commit.
+    let found = roots().count();
+    assert!(
+        found >= 4,
+        "the parse found only {found} resume roots in the run subsystem, so it is checking \
+         almost nothing"
+    );
+
+    // The gate is worth nothing if it runs after the loop has been entered. The
+    // pause must be decided before the lease is taken and before any step is
+    // driven, so its position is asserted rather than its presence.
+    for (name, body) in roots() {
+        let gate = body
+            .find("recovery_pause(store, run_id)")
+            .unwrap_or_else(|| panic!("{name} has no recovery gate"));
+        let lease = body
+            .find("store.acquire_lease(")
+            .unwrap_or_else(|| panic!("{name} takes no lease"));
+        assert!(
+            gate < lease,
+            "{name} decides the recovery pause after it has started driving"
+        );
+    }
+}
+
 fn run_subsystem() -> String {
     let dir = repo_root().join("src/run");
     let mut all = read("src/run.rs");
