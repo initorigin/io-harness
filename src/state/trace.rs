@@ -409,7 +409,8 @@ impl Store {
     /// Open the journal on a call the harness cannot inspect (0.65.0).
     ///
     /// Returns the attempt's id, or `None` when `recovery` is
-    /// [`ToolRecovery::Replayable`] — the decision not to journal lives here, in
+    /// [`ToolRecovery::Replayable`](crate::ToolRecovery::Replayable) — the decision
+    /// not to journal lives here, in
     /// one place, rather than at each call site, so a site added later cannot
     /// forget it. A run of built-in tools therefore writes nothing at all.
     ///
