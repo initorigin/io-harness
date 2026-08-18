@@ -3605,6 +3605,13 @@ pub(crate) const RUN_TABLES: &[(&str, &str)] = &[
     // session deleted for retention that left these behind would be leaving the
     // most quotable rows of the run it claimed to remove.
     ("step_turns", "run_id"),
+    // 0.65.0 — the journal of calls the harness could not inspect, run-keyed like
+    // everything above it. 0.58.0's schema-driven seeder found this one too, in
+    // the same round it was written: an attempt row names a run, a tool and a
+    // time, and a session deleted for retention that left them behind would be
+    // keeping a record of what the operator was charged for by a run it claims to
+    // have removed.
+    ("tool_attempts", "run_id"),
 ];
 
 /// What one session is holding, in the bytes of its own rows.

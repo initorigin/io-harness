@@ -234,6 +234,15 @@ const OBS_LIST_DIR_CAP: usize = 200;
 ///     // agent stopped, not because a ceiling did. Nothing checked the work —
 ///     // read it, rather than shipping it the way a `Success` may be shipped.
 ///     RunOutcome::Finished { .. } => "the agent is done; nothing verified it",
+///
+///     // (0.65.0) The run died mid-call to something this crate cannot inspect,
+///     // and whether that call landed is not knowable from here. Nothing has been
+///     // repeated: `resume_with_recovery` carries an operator's decision.
+///     RunOutcome::AwaitingRecovery { attempt_id: _, .. } => "decide about the call, then resume",
+///
+///     // `RunOutcome` is `#[non_exhaustive]` from 0.65.0, so a later variant is a
+///     // line here rather than a compile break. This arm is what pays for that.
+///     _ => "a later release added an outcome this program does not know",
 /// }
 /// # }
 /// ```
