@@ -396,14 +396,15 @@ pub(super) fn speculable(ws: &Workspace, call: &ToolCall, custom: &Toolbox) -> O
             // moved either would otherwise start an indeterminate call with no
             // record that it had begun, which is the exact defect 0.65.0 exists
             // to prevent.
-            let journal_free = tool.recovery() == crate::ToolRecovery::Replayable;
-            (journal_free && allowed(Act::Exec, name)).then(|| ReadWork::Custom {
-                name: name.to_string(),
-                tool: std::sync::Arc::clone(tool),
-                arguments: call.arguments.clone(),
-                remember: Vec::new(),
-                attempt: None,
-            })
+            (tool.recovery() == crate::ToolRecovery::Replayable && allowed(Act::Exec, name)).then(
+                || ReadWork::Custom {
+                    name: name.to_string(),
+                    tool: std::sync::Arc::clone(tool),
+                    arguments: call.arguments.clone(),
+                    remember: Vec::new(),
+                    attempt: None,
+                },
+            )
         }
     }
 }

@@ -1801,10 +1801,15 @@ fn nothing_is_speculated_that_would_need_a_journal_row() {
         .expect("speculable is defined in the run subsystem")
         .1;
     let body = body.split("\npub").next().unwrap_or(body);
+    // The needle is the CONDITION as applied, not a mention of the constant. The
+    // first version of this test looked for `ToolRecovery::Replayable` anywhere in
+    // the body, and the sabotage that deletes the guard left the comparison
+    // sitting one line above it as a dead binding — so the arm survived, and a
+    // gate that a deleted guard passes is not a gate.
     assert!(
-        body.contains("ToolRecovery::Replayable"),
-        "speculable may only build work for a call that needs no journal row, and it no \
-         longer says so"
+        body.contains("tool.recovery() == crate::ToolRecovery::Replayable && allowed("),
+        "speculable may only build work for a call that needs no journal row, and the guard \
+         that says so is no longer part of the condition"
     );
     // The floor: if the parse stops at the signature the assertion above is about
     // an empty string.
