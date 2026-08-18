@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
-use io_harness::tools::{Tool, ToolFuture, Toolbox};
+use io_harness::tools::{Tool, ToolEffect, ToolFuture, ToolRecovery, Toolbox};
 use io_harness::{
     resume_tree, run_tree, run_with, Act, ApproveAll, Containment, Effect, Policy, Provider, Store,
     TaskContract, ToolSpec, Verification,
@@ -1322,5 +1322,107 @@ async fn a_contract_with_no_registered_tools_behaves_as_before() {
         matches!(result.outcome, io_harness::RunOutcome::Success { .. }),
         "an unregistered contract must behave exactly as 0.8.1, got {:?}",
         result.outcome
+    );
+}
+
+// ---------------------------------------------------------------- 0.65.0 recovery
+
+/// A tool that declares `ReadOnly` — it says, in the crate's own vocabulary, that
+/// it observes and changes nothing.
+struct Weather;
+
+impl Tool for Weather {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "weather".into(),
+            description: "Look the forecast up.".into(),
+            parameters: json!({ "type": "object" }),
+        }
+    }
+
+    fn invoke<'a>(&'a self, _arguments: &'a serde_json::Value) -> ToolFuture<'a> {
+        Box::pin(async { Ok("fine".to_string()) })
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+}
+
+/// A tool that declares nothing, and is therefore `Mutating` — the default every
+/// tool written before 0.41.0 has.
+struct Charge;
+
+impl Tool for Charge {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "charge".into(),
+            description: "Charge the customer.".into(),
+            parameters: json!({ "type": "object" }),
+        }
+    }
+
+    fn invoke<'a>(&'a self, _arguments: &'a serde_json::Value) -> ToolFuture<'a> {
+        Box::pin(async { Ok("charged".to_string()) })
+    }
+}
+
+/// A tool that must run on its own AND is safe to repeat: it writes, but writing
+/// the same row twice is the same row. Both axes are declared, and they disagree,
+/// which is the case that proves they are two axes.
+struct Upsert;
+
+impl Tool for Upsert {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "upsert".into(),
+            description: "Write the row, whatever was there.".into(),
+            parameters: json!({ "type": "object" }),
+        }
+    }
+
+    fn invoke<'a>(&'a self, _arguments: &'a serde_json::Value) -> ToolFuture<'a> {
+        Box::pin(async { Ok("written".to_string()) })
+    }
+
+    fn recovery(&self) -> ToolRecovery {
+        ToolRecovery::Replayable
+    }
+}
+
+/// F3 — the recovery answer is derived from `effect()`, and only in the safe
+/// direction.
+///
+/// A `ReadOnly` declaration is a claim about the world ("observes and changes
+/// nothing"), so it carries replay safety with it. `Mutating` — which is what a
+/// tool that declares nothing gets — carries no such claim, so it is
+/// `Indeterminate` and the run pauses rather than repeating it. There is no path
+/// by which a `Mutating` declaration *alone* produces `Replayable`: the only way
+/// to get there is to say so.
+#[test]
+fn the_recovery_answer_is_derived_from_the_effect_and_only_in_the_safe_direction() {
+    assert_eq!(Weather.effect(), ToolEffect::ReadOnly);
+    assert_eq!(Weather.recovery(), ToolRecovery::Replayable);
+
+    // Declares nothing at all: `Mutating`, and therefore indeterminate.
+    assert_eq!(Charge.effect(), ToolEffect::Mutating);
+    assert_eq!(Charge.recovery(), ToolRecovery::Indeterminate);
+
+    // The two axes disagreeing is legal and is the whole reason they are two.
+    assert_eq!(Upsert.effect(), ToolEffect::Mutating);
+    assert_eq!(Upsert.recovery(), ToolRecovery::Replayable);
+}
+
+/// The control for the derivation: a `Mutating` tool that overrides nothing is
+/// the ONLY shape the default has to get right, and it must not be replayable.
+/// Asserted separately from F3 so that widening the default fails a test whose
+/// name says what was widened.
+#[test]
+fn a_tool_that_declares_nothing_is_never_assumed_safe_to_repeat() {
+    assert_eq!(Echo.recovery(), ToolRecovery::Indeterminate);
+    assert_eq!(
+        Broken.recovery(),
+        ToolRecovery::Indeterminate,
+        "a tool that fails is still a tool whose call may have landed"
     );
 }
