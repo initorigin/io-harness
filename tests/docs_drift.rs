@@ -1779,6 +1779,41 @@ fn every_resume_root_refuses_an_open_indeterminate_attempt() {
     );
 }
 
+/// 0.65.0 — nothing is speculated that would need a journal row, and the
+/// requirement is asserted where the work is built.
+///
+/// `speculable` starts a call before the completion asking for it has settled and
+/// holds no `Store`, so it cannot open an attempt. That is sound only while
+/// nothing needing one can be started there. Two separate rules make it true —
+/// `Speculation::offer` refuses anything that is not `ToolEffect::ReadOnly`, and
+/// a `ReadOnly` tool derives `ToolRecovery::Replayable` — and a rule that holds
+/// by agreement between two files is one a later release moves half of.
+///
+/// Asserted on the source because it is a claim about what the code is allowed to
+/// construct, not about what one fixture reaches: `speculable` is private, and a
+/// call that is refused speculation is invisible from outside — it runs serially
+/// and produces the identical observation, which is 0.54.0's whole design.
+#[test]
+fn nothing_is_speculated_that_would_need_a_journal_row() {
+    let run = run_subsystem();
+    let body = run
+        .split_once("pub(super) fn speculable(")
+        .expect("speculable is defined in the run subsystem")
+        .1;
+    let body = body.split("\npub").next().unwrap_or(body);
+    assert!(
+        body.contains("ToolRecovery::Replayable"),
+        "speculable may only build work for a call that needs no journal row, and it no \
+         longer says so"
+    );
+    // The floor: if the parse stops at the signature the assertion above is about
+    // an empty string.
+    assert!(
+        body.contains("ReadWork::Custom {"),
+        "the parse did not reach speculable's registered-tool arm, so it is checking nothing"
+    );
+}
+
 fn run_subsystem() -> String {
     let dir = repo_root().join("src/run");
     let mut all = read("src/run.rs");
