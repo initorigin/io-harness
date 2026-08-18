@@ -950,6 +950,30 @@ impl AssistantTurn {
     }
 }
 
+/// One attempt at a call the harness cannot inspect (0.65.0).
+///
+/// Written before the call and closed after it, on its own rather than at the
+/// step boundary — so a process that died between the two leaves this row behind
+/// and a resumed run can find out that something was started and never finished.
+///
+/// `#[non_exhaustive]`: a later release may need to carry the arguments, an
+/// idempotency key or the owner that wrote it, and adding a field to a struct
+/// callers construct is the break 0.64.0 could not pay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ToolAttempt {
+    /// The row's own id, and what a decision names.
+    pub id: i64,
+    /// The run the call belongs to.
+    pub run_id: i64,
+    /// The step the call was made on.
+    pub step: u32,
+    /// The tool that was called.
+    pub tool: String,
+    /// When it was started, as `%Y-%m-%dT%H:%M:%fZ`.
+    pub started_at: String,
+}
+
 /// One policy event in the trace: an action refused, or a human decision.
 ///
 /// Records the path, command, rule, layer, and decision — never file contents
