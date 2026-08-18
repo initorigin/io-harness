@@ -1603,7 +1603,14 @@ fn the_contracts_ownership_claims_match_the_source() {
             .to_string();
         let body = body.split("\npub").next().unwrap_or(body);
         let drives = body.contains("store.check_resumable(") || body.contains("store.start_run(");
-        if drives && !body.contains("store.acquire_lease(") {
+        // 0.65.0 — a body that hands the whole drive to `resume_with_observed`
+        // takes the lease there. Stated as delegation to a named function that is
+        // ITSELF in this set rather than as an exemption for a name: the
+        // delegate has to satisfy the same assertion, so nothing escapes by
+        // being called from somewhere else.
+        let delegates =
+            body.contains("resume_with_observed(") && !body.contains("store.acquire_lease(");
+        if drives && !delegates && !body.contains("store.acquire_lease(") {
             missing.push(name);
         }
     }
@@ -1680,6 +1687,138 @@ fn the_contracts_ownership_claims_match_the_source() {
 /// and 0.63.0 moved `run_from`, `run_workspace_from` and `agent_loop` into
 /// `src/run/step.rs` and `src/run/tree.rs`. A checker reading the parent alone
 /// would find none of them and report nothing missing.
+/// F5 — 0.65.0: every function that resumes a run refuses to drive one whose
+/// journal still holds an open indeterminate attempt.
+///
+/// **Derived per function, never counted.** A count of `recovery_pause` call
+/// sites is satisfied by four of them inside one function while three other
+/// resume roots drive straight past an open attempt — which is the exact shape
+/// 0.62.0's lease gate was rewritten to catch, after a release shipped with an
+/// acquire missing from a path no test covered and the suite stayed green.
+///
+/// The subject is `check_resumable` rather than "a function whose name starts
+/// with `resume`": what has to be gated is every place the crate begins driving
+/// an existing run, and that is exactly the set of bodies asking whether a run is
+/// resumable at all.
+#[test]
+fn every_resume_root_refuses_an_open_indeterminate_attempt() {
+    let run = run_subsystem();
+
+    let roots = || {
+        run.split("\npub async fn ")
+            .skip(1)
+            .chain(run.split("\npub(crate) async fn ").skip(1))
+            .map(|body| {
+                let name = body
+                    .split(['<', '('])
+                    .next()
+                    .unwrap_or("?")
+                    .trim()
+                    .to_string();
+                (name, body.split("\npub").next().unwrap_or(body).to_string())
+            })
+            .filter(|(_, body)| body.contains("store.check_resumable("))
+    };
+
+    // A root either decides the pause itself or hands the whole drive to one that
+    // does. `resume_with_recovery_observed` is the second shape by construction:
+    // it exists to resolve the attempt the pause named, so pausing on it again
+    // would make the decision unusable — and `resume_with_observed`, which it
+    // delegates to, is in this same set and is asserted below.
+    // A root either decides the pause itself or hands the WHOLE drive to one that
+    // does — and "the whole drive" is what `store.acquire_lease(` distinguishes: a
+    // body that takes its own lease is driving and owes its own gate, whatever
+    // else it calls. Written the loose way first, this clause silently excused
+    // three roots that had a stale needle, which is exactly how an exemption
+    // turns into a hole.
+    let missing: Vec<String> = roots()
+        .filter(|(_, body)| {
+            let delegates =
+                body.contains("resume_with_observed(") && !body.contains("store.acquire_lease(");
+            !delegates && !body.contains("recovery_pause(store, run_id, observer)")
+        })
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every function that resumes a run must refuse one with an open indeterminate \
+         attempt, and these do not: {missing:?}"
+    );
+
+    // The floor. If the parse stops finding resume roots the assertion above
+    // passes by finding nothing, which is how a derived test goes blind — and
+    // 0.63.0's split disarmed seven gates of this shape in one commit.
+    let found = roots().count();
+    assert!(
+        found >= 4,
+        "the parse found only {found} resume roots in the run subsystem, so it is checking \
+         almost nothing"
+    );
+
+    // The gate is worth nothing if it runs after the loop has been entered. The
+    // pause must be decided before the lease is taken and before any step is
+    // driven, so its position is asserted rather than its presence.
+    let mut gating = 0;
+    for (name, body) in roots() {
+        let (Some(gate), Some(lease)) = (
+            body.find("recovery_pause(store, run_id, observer)"),
+            body.find("store.acquire_lease("),
+        ) else {
+            continue; // a delegating root, covered by the assertion above
+        };
+        gating += 1;
+        assert!(
+            gate < lease,
+            "{name} decides the recovery pause after it has started driving"
+        );
+    }
+    assert!(
+        gating >= 4,
+        "only {gating} roots were checked for ordering, so the loop is skipping the \
+         functions it exists to check"
+    );
+}
+
+/// 0.65.0 — nothing is speculated that would need a journal row, and the
+/// requirement is asserted where the work is built.
+///
+/// `speculable` starts a call before the completion asking for it has settled and
+/// holds no `Store`, so it cannot open an attempt. That is sound only while
+/// nothing needing one can be started there. Two separate rules make it true —
+/// `Speculation::offer` refuses anything that is not `ToolEffect::ReadOnly`, and
+/// a `ReadOnly` tool derives `ToolRecovery::Replayable` — and a rule that holds
+/// by agreement between two files is one a later release moves half of.
+///
+/// Asserted on the source because it is a claim about what the code is allowed to
+/// construct, not about what one fixture reaches: `speculable` is private, and a
+/// call that is refused speculation is invisible from outside — it runs serially
+/// and produces the identical observation, which is 0.54.0's whole design.
+#[test]
+fn nothing_is_speculated_that_would_need_a_journal_row() {
+    let run = run_subsystem();
+    let body = run
+        .split_once("pub(super) fn speculable(")
+        .expect("speculable is defined in the run subsystem")
+        .1;
+    let body = body.split("\npub").next().unwrap_or(body);
+    // The needle is the CONDITION as applied, not a mention of the constant. The
+    // first version of this test looked for `ToolRecovery::Replayable` anywhere in
+    // the body, and the sabotage that deletes the guard left the comparison
+    // sitting one line above it as a dead binding — so the arm survived, and a
+    // gate that a deleted guard passes is not a gate.
+    assert!(
+        body.contains("tool.recovery() == crate::ToolRecovery::Replayable && allowed("),
+        "speculable may only build work for a call that needs no journal row, and the guard \
+         that says so is no longer part of the condition"
+    );
+    // The floor: if the parse stops at the signature the assertion above is about
+    // an empty string.
+    assert!(
+        body.contains("ReadWork::Custom {"),
+        "the parse did not reach speculable's registered-tool arm, so it is checking nothing"
+    );
+}
+
 fn run_subsystem() -> String {
     let dir = repo_root().join("src/run");
     let mut all = read("src/run.rs");

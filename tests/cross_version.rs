@@ -238,6 +238,16 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     // never names it, which `tests/cross_version_0_29_0.rs` executes rather than
     // asserts on paper.
     "step_turns",
+    // 0.65.0 — the journal of calls the harness cannot inspect, and the partial
+    // index the resume gate reads. The index is NOT surplus schema the way
+    // 0.64.0's would have been: the gate's read is `WHERE run_id = ?1 AND
+    // completed_at IS NULL`, and a partial index over only the open rows is what
+    // keeps that lookup independent of how many calls a store has completed over
+    // its life. Added and nothing altered: a 0.29.0 binary opens a store carrying
+    // both and never names either, which `tests/cross_version_0_29_0.rs` executes
+    // rather than asserts on paper.
+    "tool_attempts",
+    "tool_attempts_open",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].

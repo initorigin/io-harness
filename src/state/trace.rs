@@ -406,6 +406,106 @@ impl Store {
         Ok(())
     }
 
+    /// Open the journal on a call the harness cannot inspect (0.65.0).
+    ///
+    /// Returns the attempt's id, or `None` when `recovery` is
+    /// [`ToolRecovery::Replayable`](crate::ToolRecovery::Replayable) — the decision
+    /// not to journal lives here, in
+    /// one place, rather than at each call site, so a site added later cannot
+    /// forget it. A run of built-in tools therefore writes nothing at all.
+    ///
+    /// **Committed on its own, outside every step transaction, and that is the
+    /// whole point.** Everything else a run records is written inside the
+    /// transaction that commits the step, so a step that never committed leaves
+    /// nothing behind ([`Self::record_observations`] says so). This row exists to
+    /// be read *after* the process died mid-step; written under the step's
+    /// transaction it would die with the step, and the run would resume with no
+    /// evidence that a call had ever been started.
+    ///
+    /// The window this does not close is the one between deciding to call and
+    /// this insert returning. It is one committed `INSERT` wide and it cannot be
+    /// removed — the write and the call are not one atomic act.
+    pub fn open_attempt(
+        &self,
+        run_id: i64,
+        step: u32,
+        tool: &str,
+        recovery: crate::ToolRecovery,
+    ) -> Result<Option<i64>> {
+        if recovery == crate::ToolRecovery::Replayable {
+            return Ok(None);
+        }
+        self.conn.execute(
+            "INSERT INTO tool_attempts (run_id, step, tool) VALUES (?1, ?2, ?3)",
+            (run_id, step as i64, tool),
+        )?;
+        Ok(Some(self.conn.last_insert_rowid()))
+    }
+
+    /// Close an attempt whose call returned (0.65.0).
+    ///
+    /// A closed attempt is one nothing needs to decide about: the call finished
+    /// and its result is on its way into the ledger by the ordinary path. Writing
+    /// the id is a primary-key search, because `id` is a rowid alias.
+    pub fn close_attempt(&self, attempt_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tool_attempts
+                SET completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+              WHERE id = ?1 AND completed_at IS NULL",
+            [attempt_id],
+        )?;
+        Ok(())
+    }
+
+    /// Close an attempt by a decision an operator made (0.65.0).
+    ///
+    /// The same close as [`Self::close_attempt`], carrying what was decided so a
+    /// later reader of the store can tell an attempt that finished from one a
+    /// human ruled on. Nothing in the run loop reads `resolution`; it is there
+    /// because a journal that forgets who closed a row is not a journal.
+    pub fn resolve_attempt(&self, attempt_id: i64, resolution: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tool_attempts
+                SET completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    resolution   = ?2
+              WHERE id = ?1 AND completed_at IS NULL",
+            (attempt_id, resolution),
+        )?;
+        Ok(())
+    }
+
+    /// The one statement [`Self::open_attempts`] runs, named so the query-plan
+    /// assertion can `EXPLAIN` the text the crate executes rather than a copy of
+    /// it that can drift.
+    pub(crate) const OPEN_ATTEMPTS_SQL: &'static str =
+        "SELECT id, run_id, step, tool, started_at FROM tool_attempts \
+         WHERE run_id = ?1 AND completed_at IS NULL ORDER BY id ASC";
+
+    /// Every attempt of this run that was started and never finished (0.65.0).
+    ///
+    /// What the resume gate reads. Oldest first, so a run interrupted twice is
+    /// decided in the order the calls were made.
+    ///
+    /// `WHERE run_id = ?1 AND completed_at IS NULL` is served by the partial
+    /// index `tool_attempts_open`, which holds only the rows that are still open —
+    /// so the lookup a resume pays for does not grow with the attempts a store has
+    /// completed over its life.
+    pub fn open_attempts(&self, run_id: i64) -> Result<Vec<ToolAttempt>> {
+        let mut stmt = self.conn.prepare(Self::OPEN_ATTEMPTS_SQL)?;
+        let rows = stmt
+            .query_map([run_id], |r| {
+                Ok(ToolAttempt {
+                    id: r.get(0)?,
+                    run_id: r.get(1)?,
+                    step: r.get::<_, i64>(2)? as u32,
+                    tool: r.get(3)?,
+                    started_at: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Record what one step asked for, so a resume can send it back (0.64.0).
     ///
     /// `INSERT OR REPLACE`: a step number can be committed more than once — a
@@ -1383,6 +1483,71 @@ mod tests {
         assert!(
             control.contains("SCAN step_turns"),
             "the control must scan, or the assertions above prove nothing, got {control}"
+        );
+    }
+
+    /// N3 — the resume gate's lookup is a search over the partial index of open
+    /// attempts, not a scan of every attempt the store has ever recorded.
+    ///
+    /// The point of the partial index is that a store which has completed a
+    /// million calls carries none of them into the lookup a resume pays for, so
+    /// the assertion is about which index is used and not merely about "an
+    /// index": `tool_attempts_open` holds only the rows where `completed_at IS
+    /// NULL`.
+    #[test]
+    fn the_open_attempt_lookup_searches_the_partial_index() {
+        let store = Store::memory().unwrap();
+        let mut first = 0;
+        for r in 0..20 {
+            let run = store.start_run("goal", "root").unwrap();
+            if r == 0 {
+                first = run;
+            }
+            for step in 0..30u32 {
+                let id = store
+                    .open_attempt(run, step, "charge", crate::ToolRecovery::Indeterminate)
+                    .unwrap()
+                    .unwrap();
+                // All but the last of each run's attempts completed, which is the
+                // ordinary shape: the table is mostly closed rows.
+                if step < 29 {
+                    store.close_attempt(id).unwrap();
+                }
+            }
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let plan = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let n = stmt.parameter_count();
+            let args: Vec<i64> = vec![first][..n].to_vec();
+            stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ")
+        };
+
+        let read = plan(Store::OPEN_ATTEMPTS_SQL);
+        assert!(
+            read.contains("SEARCH") && read.contains("tool_attempts_open"),
+            "the resume gate must search the partial index of open attempts, got {read}"
+        );
+        assert!(
+            !read.contains("SCAN tool_attempts"),
+            "a resume must not read every attempt in the store, got {read}"
+        );
+
+        // The control: `tool` is in no index, so this one has to scan. Without it
+        // the assertion above is about a planner that never scans anything rather
+        // than about this table's index.
+        let control = plan("SELECT id FROM tool_attempts WHERE tool = 'deploy'");
+        assert!(
+            control.contains("SCAN tool_attempts"),
+            "the control must scan, or the assertion above proves nothing, got {control}"
         );
     }
 

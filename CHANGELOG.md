@@ -26,6 +26,74 @@ notes are produced from it.
 
 ### Security
 
+## [0.65.0] - 2026-08-18
+
+A run killed in the middle of a call the harness cannot inspect pauses for a
+decision instead of silently making the call twice.
+
+Everything a run records is written at the step boundary that commits, so that an
+observation belonging to a step that never committed does not outlive it. That is
+the right rule for a ledger, and it is exactly what makes an interrupted external
+call invisible: the call ran, the process died before the step committed, and the
+store holds no evidence that anything was attempted. Resume then replays the step
+— correct for a workspace edit, which can be read back, and wrong for a charge, a
+deployment, a posted message or any registered tool reaching a service the crate
+cannot see. This release gives those calls a durable journal of their own, written
+before the call and closed after it, outside every step transaction, and a resume
+that refuses to drive a run holding an open one.
+
+### Breaking changes
+
+- **BREAKING** `RunOutcome` gained the variant `AwaitingRecovery { attempt_id,
+  steps }` and is now `#[non_exhaustive]`. The variant alone already breaks an
+  exhaustive `match`; the attribute lands in the same release so that no later
+  addition breaks one again. *Migration:* add a wildcard arm.
+
+  ```rust
+  match result.outcome {
+      RunOutcome::Success { steps } => println!("done in {steps}"),
+      // Handle the pause if you register tools with effects the crate cannot
+      // see; otherwise this arm is unreachable and the wildcard is enough.
+      RunOutcome::AwaitingRecovery { attempt_id, .. } => decide(attempt_id),
+      _ => {}
+  }
+  ```
+
+- **BREAKING (behaviour)** A resumed run whose journal holds a call that was
+  started and never finished returns `AwaitingRecovery` instead of driving. This
+  can only happen for a registered `Tool` reporting
+  `ToolRecovery::Indeterminate` — which is every tool declaring, or defaulting
+  to, `ToolEffect::Mutating` — or for an MCP call. A run of built-in tools, and a
+  tool declaring `ToolEffect::ReadOnly`, are unaffected and journal nothing.
+  *Migration:* to keep the old behaviour for a tool you know is safe to repeat,
+  say so — `fn recovery(&self) -> ToolRecovery { ToolRecovery::Replayable }` —
+  which is also what makes the claim reviewable. To act on the pause, call
+  `resume_with_recovery` with `RecoveryDecision::Retry`, `Completed { observation }`
+  or `Abort`.
+
+### Added
+
+- `ToolRecovery`, and `Tool::recovery`, a defaulted trait method: whether a call
+  that was in flight when the process died is safe to make again. Defaulted from
+  `Tool::effect`, so every existing implementation compiles unchanged.
+- `RecoveryDecision` and `resume_with_recovery` / `resume_with_recovery_observed`:
+  retry the call, record it as already completed with the account the model is
+  given, or abort the run.
+- `ToolAttempt`, `Store::open_attempt`, `Store::close_attempt`,
+  `Store::open_attempts` and `Store::resolve_attempt` — the journal, readable by
+  an operator directly.
+- `EventKind::RecoveryPaused`, emitted by the resume that finds an open attempt,
+  so a caller driving many runs learns which attempt is holding which run without
+  opening the store.
+
+### Changed
+
+- A read-only call is never speculated ahead of its completion unless it is also
+  replayable. The two were already the same set — speculation requires
+  `ToolEffect::ReadOnly` and that derives `ToolRecovery::Replayable` — and the
+  requirement is now stated where the work is built rather than left to hold by
+  agreement between two files.
+
 ## [0.64.0] - 2026-08-17
 
 A resumed run sends the model its own past turns rather than a third-person

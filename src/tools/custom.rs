@@ -146,6 +146,61 @@ pub enum ToolEffect {
     Mutating,
 }
 
+/// Whether a call that was in flight when the process died is safe to make again
+/// (0.65.0).
+///
+/// A separate axis from [`ToolEffect`], and deliberately so. `ToolEffect` answers
+/// whether two calls may run at the same time; this answers whether one call may
+/// happen twice. A tool that must be serialised is not thereby unsafe to repeat —
+/// an upsert is both — and reading one question's answer as the other's would
+/// either serialise what need not be or repeat what must not be.
+///
+/// `#[non_exhaustive]` from birth: a later release may want to name an answer
+/// between these two, and doing that must not break a caller who matched on them.
+///
+/// ```
+/// use io_harness::tools::{Tool, ToolEffect, ToolFuture, ToolRecovery};
+/// use io_harness::ToolSpec;
+/// # use serde_json::{json, Value};
+///
+/// struct Forecast;
+///
+/// impl Tool for Forecast {
+///     # fn spec(&self) -> ToolSpec {
+///     #     ToolSpec { name: "forecast".into(), description: "Look the weather up.".into(),
+///     #                parameters: json!({"type": "object"}) }
+///     # }
+///     # fn invoke<'a>(&'a self, _a: &'a Value) -> ToolFuture<'a> {
+///     #     Box::pin(async { Ok("fine".to_string()) })
+///     # }
+///     fn effect(&self) -> ToolEffect {
+///         ToolEffect::ReadOnly
+///     }
+/// }
+///
+/// // Nothing was declared about recovery, and nothing had to be: a tool that
+/// // observes and changes nothing is safe to call again after a crash.
+/// assert_eq!(Forecast.recovery(), ToolRecovery::Replayable);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ToolRecovery {
+    /// Making this call a second time reaches the same end state as making it
+    /// once, so a resumed run may simply replay it. Every built-in tool is this:
+    /// a file the run wrote can be read back and written again.
+    Replayable,
+    /// Whether the call landed cannot be established from here, so a resumed run
+    /// must not decide on its own. The run pauses at
+    /// [`RunOutcome::AwaitingRecovery`](crate::RunOutcome::AwaitingRecovery) and
+    /// an operator says what to do.
+    ///
+    /// This is where a charge, a deployment, a posted message and every MCP call
+    /// sit — not because they are known to be unsafe, but because nothing here
+    /// knows they are safe, and the two defaults are not equally recoverable: a
+    /// pause costs a decision, a duplicate charge costs money.
+    Indeterminate,
+}
+
 /// An action the embedding program lets the agent take.
 ///
 /// Implement it for anything the model should be able to do that the built-in
@@ -244,6 +299,56 @@ pub trait Tool: Send + Sync {
     /// be.
     fn effect(&self) -> ToolEffect {
         ToolEffect::Mutating
+    }
+
+    /// Whether an interrupted call is safe to make again (0.65.0).
+    ///
+    /// Defaulted from [`Tool::effect`], so a tool written against any earlier
+    /// release compiles unchanged and gets the answer its own declaration already
+    /// implies: [`ToolEffect::ReadOnly`] says the call "observes and changes
+    /// nothing", which is a statement about the world and carries replay safety
+    /// with it, so it is [`ToolRecovery::Replayable`]. [`ToolEffect::Mutating`] —
+    /// what a tool that declares nothing gets — says only that the call must run
+    /// on its own, which is no claim about repeating it, so it is
+    /// [`ToolRecovery::Indeterminate`] and a resumed run pauses instead of
+    /// calling it again.
+    ///
+    /// The derivation runs in one direction only. Nothing reads `Mutating` as
+    /// replayable; the only way for a mutating tool to be replayed is to say so:
+    ///
+    /// ```
+    /// use io_harness::tools::{Tool, ToolFuture, ToolRecovery};
+    /// use io_harness::ToolSpec;
+    /// # use serde_json::{json, Value};
+    ///
+    /// struct Upsert;
+    ///
+    /// impl Tool for Upsert {
+    ///     # fn spec(&self) -> ToolSpec {
+    ///     #     ToolSpec { name: "upsert".into(), description: "Write the row.".into(),
+    ///     #                parameters: json!({"type": "object"}) }
+    ///     # }
+    ///     # fn invoke<'a>(&'a self, _a: &'a Value) -> ToolFuture<'a> {
+    ///     #     Box::pin(async { Ok("written".to_string()) })
+    ///     # }
+    ///     // It writes, so it runs on its own — but writing the same row twice
+    ///     // is the same row, so a resumed run may simply repeat it.
+    ///     fn recovery(&self) -> ToolRecovery {
+    ///         ToolRecovery::Replayable
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(Upsert.recovery(), ToolRecovery::Replayable);
+    /// ```
+    ///
+    /// Read before the call is made and again while a resumed run decides what to
+    /// do about it, so — as with [`Tool::effect`] — it must answer the same way
+    /// every time.
+    fn recovery(&self) -> ToolRecovery {
+        match self.effect() {
+            ToolEffect::ReadOnly => ToolRecovery::Replayable,
+            ToolEffect::Mutating => ToolRecovery::Indeterminate,
+        }
     }
 
     /// The containment mode this tool needs (0.48.0).

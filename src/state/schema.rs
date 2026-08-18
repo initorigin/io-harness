@@ -1075,6 +1075,44 @@ impl Store {
              );",
         )?;
 
+        // 0.65.0 — the journal of calls the harness cannot inspect. One row per
+        // attempt at a tool whose [`ToolRecovery`](crate::ToolRecovery) is
+        // `Indeterminate`, written **before** the call and closed after it.
+        //
+        // This is the one table in the crate whose rows must OUTLIVE the step they
+        // belong to. Everything else a run records is written inside the
+        // transaction that commits the step, precisely so a step that never
+        // committed leaves nothing behind — and that rule is what makes an
+        // interrupted external call invisible today. An attempt row exists to be
+        // read after the process that wrote it died mid-step, so it commits on its
+        // own and is deliberately outside every step transaction.
+        //
+        // `id INTEGER PRIMARY KEY` is a rowid alias, so resolving one attempt is
+        // already a primary-key search. The partial index is what the resume gate
+        // reads: every open attempt for a run, over an index holding only the rows
+        // that are still open — so a store with a million completed attempts
+        // carries none of them into the lookup. Asserted with EXPLAIN QUERY PLAN
+        // against the statement the crate runs, not believed.
+        //
+        // Additive, and deliberately NOT a `CHECKPOINT_FORMAT` bump, for the
+        // reason 0.62.0's lease and 0.64.0's turns were not: no checkpoint layout
+        // changed, a 0.64.0 binary never names this table, and bumping the format
+        // would make [`Self::check_resumable`] refuse every 0.64.0 store over a
+        // table it does not read.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tool_attempts (
+                 id           INTEGER PRIMARY KEY,
+                 run_id       INTEGER NOT NULL,
+                 step         INTEGER NOT NULL,
+                 tool         TEXT NOT NULL,
+                 started_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                 completed_at TEXT,
+                 resolution   TEXT
+             );
+             CREATE INDEX IF NOT EXISTS tool_attempts_open
+                 ON tool_attempts (run_id) WHERE completed_at IS NULL;",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses

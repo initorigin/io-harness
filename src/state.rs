@@ -950,6 +950,52 @@ impl AssistantTurn {
     }
 }
 
+/// One attempt at a call the harness cannot inspect (0.65.0).
+///
+/// Written before the call and closed after it, on its own rather than at the
+/// step boundary — so a process that died between the two leaves this row behind
+/// and a resumed run can find out that something was started and never finished.
+///
+/// `#[non_exhaustive]`: a later release may need to carry the arguments, an
+/// idempotency key or the owner that wrote it, and adding a field to a struct
+/// callers construct is the break 0.64.0 could not pay.
+///
+/// ```
+/// use io_harness::{Store, ToolRecovery};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("charge the customer", "root")?;
+///
+/// // The run loop writes this before it makes the call. Shown here directly,
+/// // because what an operator needs is the read below.
+/// let id = store.open_attempt(run, 3, "charge", ToolRecovery::Indeterminate)?;
+///
+/// let open = store.open_attempts(run)?;
+/// assert_eq!(open.len(), 1);
+/// assert_eq!(open[0].tool, "charge");
+/// assert_eq!(Some(open[0].id), id);
+///
+/// // Closed once the call returned, and then there is nothing to decide.
+/// store.close_attempt(open[0].id)?;
+/// assert!(store.open_attempts(run)?.is_empty());
+/// # Ok(()) }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ToolAttempt {
+    /// The row's own id, and what a decision names.
+    pub id: i64,
+    /// The run the call belongs to.
+    pub run_id: i64,
+    /// The step the call was made on.
+    pub step: u32,
+    /// The tool that was called.
+    pub tool: String,
+    /// When it was started, as `%Y-%m-%dT%H:%M:%fZ`.
+    pub started_at: String,
+}
+
 /// One policy event in the trace: an action refused, or a human decision.
 ///
 /// Records the path, command, rule, layer, and decision — never file contents
@@ -3559,6 +3605,13 @@ pub(crate) const RUN_TABLES: &[(&str, &str)] = &[
     // session deleted for retention that left these behind would be leaving the
     // most quotable rows of the run it claimed to remove.
     ("step_turns", "run_id"),
+    // 0.65.0 — the journal of calls the harness could not inspect, run-keyed like
+    // everything above it. 0.58.0's schema-driven seeder found this one too, in
+    // the same round it was written: an attempt row names a run, a tool and a
+    // time, and a session deleted for retention that left them behind would be
+    // keeping a record of what the operator was charged for by a run it claims to
+    // have removed.
+    ("tool_attempts", "run_id"),
 ];
 
 /// What one session is holding, in the bytes of its own rows.
