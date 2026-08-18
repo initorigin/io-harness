@@ -677,11 +677,26 @@ pub(super) fn emit_plugins(watch: &Watch<'_>, run_id: i64, contract: &TaskContra
 /// The oldest open attempt is the one reported. A run interrupted twice is
 /// decided one attempt at a time, in the order the calls were made, because a
 /// decision about the second says nothing about the first.
-pub(super) fn recovery_pause(store: &Store, run_id: i64) -> Result<Option<RunOutcome>> {
+pub(super) fn recovery_pause(
+    store: &Store,
+    run_id: i64,
+    observer: &dyn crate::Observer,
+) -> Result<Option<RunOutcome>> {
     let open = store.open_attempts(run_id)?;
     let Some(first) = open.first() else {
         return Ok(None);
     };
+    // Announced as well as returned. A caller driving many runs learns which
+    // attempt is holding this one without opening the store, and an operator
+    // watching a fleet is the party the pause exists for.
+    crate::run::Watch::new(observer).emit(crate::RunEvent::new(
+        run_id,
+        first.step,
+        crate::EventKind::RecoveryPaused {
+            attempt_id: first.id,
+            tool: first.tool.clone(),
+        },
+    ));
     Ok(Some(RunOutcome::AwaitingRecovery {
         attempt_id: first.id,
         steps: store.last_step(run_id)?,
