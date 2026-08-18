@@ -2732,7 +2732,17 @@ pub(super) async fn dispatch(
             )
             .await?
             {
-                Prepared::Work(work) => work.run(ws, cap, max_read, run_id, step).await,
+                Prepared::Work(work) => {
+                    // 0.65.0 — `prepare_read` opened the journal row; this is the
+                    // one place that knows the call returned. Read before the
+                    // work is consumed.
+                    let attempt = work.attempt();
+                    let done = work.run(ws, cap, max_read, run_id, step).await;
+                    if let Some(id) = attempt {
+                        store.close_attempt(id)?;
+                    }
+                    done
+                }
                 Prepared::Done(done) | Prepared::Stop(done) => done,
             }
         }
@@ -2756,6 +2766,12 @@ pub(super) async fn dispatch(
                     format!("\n[{name} refused]{why} — the policy forbids calling this tool\n"),
                 ));
             }
+            // 0.65.0 — an MCP server declares nothing about whether its tools may
+            // be called twice, and this crate cannot see what one does, so every
+            // call is `Indeterminate`. Opened before the call and closed after it,
+            // both here, because this arm is the only route to a server.
+            let attempt =
+                store.open_attempt(run_id, step, name, crate::ToolRecovery::Indeterminate)?;
             let out = mcp
                 .call_media(
                     name,
@@ -2769,6 +2785,9 @@ pub(super) async fn dispatch(
                     pending_media,
                 )
                 .await?;
+            if let Some(id) = attempt {
+                store.close_attempt(id)?;
+            }
             Dispatched::seen(
                 format!("called {name}"),
                 format!("\n[{name}]\n{out}\n"),
