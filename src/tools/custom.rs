@@ -157,6 +157,31 @@ pub enum ToolEffect {
 ///
 /// `#[non_exhaustive]` from birth: a later release may want to name an answer
 /// between these two, and doing that must not break a caller who matched on them.
+///
+/// ```
+/// use io_harness::tools::{Tool, ToolEffect, ToolFuture, ToolRecovery};
+/// use io_harness::ToolSpec;
+/// # use serde_json::{json, Value};
+///
+/// struct Forecast;
+///
+/// impl Tool for Forecast {
+///     # fn spec(&self) -> ToolSpec {
+///     #     ToolSpec { name: "forecast".into(), description: "Look the weather up.".into(),
+///     #                parameters: json!({"type": "object"}) }
+///     # }
+///     # fn invoke<'a>(&'a self, _a: &'a Value) -> ToolFuture<'a> {
+///     #     Box::pin(async { Ok("fine".to_string()) })
+///     # }
+///     fn effect(&self) -> ToolEffect {
+///         ToolEffect::ReadOnly
+///     }
+/// }
+///
+/// // Nothing was declared about recovery, and nothing had to be: a tool that
+/// // observes and changes nothing is safe to call again after a crash.
+/// assert_eq!(Forecast.recovery(), ToolRecovery::Replayable);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ToolRecovery {

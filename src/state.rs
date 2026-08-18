@@ -959,6 +959,28 @@ impl AssistantTurn {
 /// `#[non_exhaustive]`: a later release may need to carry the arguments, an
 /// idempotency key or the owner that wrote it, and adding a field to a struct
 /// callers construct is the break 0.64.0 could not pay.
+///
+/// ```
+/// use io_harness::{Store, ToolRecovery};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("charge the customer", "root")?;
+///
+/// // The run loop writes this before it makes the call. Shown here directly,
+/// // because what an operator needs is the read below.
+/// let id = store.open_attempt(run, 3, "charge", ToolRecovery::Indeterminate)?;
+///
+/// let open = store.open_attempts(run)?;
+/// assert_eq!(open.len(), 1);
+/// assert_eq!(open[0].tool, "charge");
+/// assert_eq!(Some(open[0].id), id);
+///
+/// // Closed once the call returned, and then there is nothing to decide.
+/// store.close_attempt(open[0].id)?;
+/// assert!(store.open_attempts(run)?.is_empty());
+/// # Ok(()) }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ToolAttempt {

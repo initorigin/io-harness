@@ -2379,65 +2379,6 @@ pub async fn resume_with_observed<P: Provider>(
     }
 }
 
-/// Continue a run that stopped at [`RunOutcome::AwaitingApproval`], once a
-/// human has decided about the pending action.
-///
-/// An approval performs exactly the action that was persisted — the same target
-/// and the same content the human was shown — and then continues the run under
-/// its original `run_id`. The decision is re-checked against the policy first,
-/// so a deny that landed after the pause still holds. A denial closes the run
-/// without performing the action.
-///
-/// Preserves the policy — it is an argument — and, since 0.13.0, the run's
-/// observation ledger. It is for a run that *paused*, though: a run that crashed
-/// has no `request_id` and no pending decision to supply, and wants
-/// [`resume_with`].
-///
-/// This is the other half of [`Decision::Defer`], and it is what makes an
-/// approval able to outlive the process that asked for it — a web app can show
-/// the pending action, close the request, and continue the run when someone
-/// clicks approve tomorrow:
-///
-/// ```no_run
-/// use io_harness::{resume_with_decision, ApproveAll, Act, Decision, OpenRouter, Policy,
-///                  Request, RunOutcome, Store, TaskContract};
-///
-/// # async fn on_click(contract: &TaskContract, policy: &Policy, request_id: i64, approved: bool)
-/// #     -> io_harness::Result<()> {
-/// let store = Store::open("runs.db")?;
-/// let pending = store.pending(request_id)?.expect("a pending request");
-///
-/// let decision = if approved {
-///     // Approving performs exactly what was persisted — the same target, the
-///     // same bytes the human was shown. Hand back a `modified` request to
-///     // perform something else instead; it is re-checked against the policy
-///     // first, so an approver cannot rewrite an action across a deny.
-///     Decision::Approve {
-///         modified: Some(Request::new(Act::Write, "docs/NOTES.md")
-///             .with_content(pending.content.clone().unwrap_or_default())),
-///         remember: Vec::new(),
-///     }
-/// } else {
-///     // The action never happens and the run closes as `RunOutcome::Denied`.
-///     Decision::deny("rejected in review")
-/// };
-///
-/// let result = resume_with_decision(
-///     contract, &OpenRouter::from_env()?, &store, pending.run_id, request_id, decision,
-///     policy, &ApproveAll,
-/// )
-/// .await?;
-///
-/// // Deferring again is legal and leaves it pending — the run stays paused.
-/// if let RunOutcome::AwaitingApproval { .. } = result.outcome {
-///     println!("still waiting");
-/// }
-/// # Ok(()) }
-/// ```
-///
-/// For a paused *tree*, use [`resume_tree_with_decision`]: the pending action
-/// often belongs to a child rather than the root, and only that function
-/// validates the request against the whole tree.
 /// What to do about a call that was in flight when the process died (0.65.0).
 ///
 /// The three answers an operator has, and no more: the runtime deliberately has
@@ -2447,6 +2388,17 @@ pub async fn resume_with_observed<P: Provider>(
 /// `#[non_exhaustive]` from birth, for the reason
 /// [`SystemPrompt`](crate::SystemPrompt) is: a later release naming a fourth
 /// answer must not break a caller who matched on these.
+///
+/// ```
+/// use io_harness::RecoveryDecision;
+///
+/// // What an operator who checked the payment provider and found the charge
+/// // captured sends back. The text is what the model is told the call returned.
+/// let decided = RecoveryDecision::Completed {
+///     observation: "charge ch_9f21 captured".into(),
+/// };
+/// assert_ne!(decided, RecoveryDecision::Retry);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RecoveryDecision {
@@ -2523,6 +2475,31 @@ pub async fn resume_with_recovery<P: Provider>(
 
 /// [`resume_with_recovery`], reporting to `observer` as it happens. See
 /// [`run_observed`].
+///
+/// ```no_run
+/// use io_harness::{resume_with_recovery_observed, ApproveAll, Flow, Observer, OpenRouter,
+///                  Policy, RecoveryDecision, RunEvent, Store, TaskContract};
+///
+/// struct Trail;
+///
+/// impl Observer for Trail {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         println!("run {} step {}: {:?}", event.run_id, event.step, event.kind);
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, policy: &Policy, run_id: i64, attempt_id: i64)
+/// #     -> io_harness::Result<()> {
+/// // The operator established the deployment never started, so making the call
+/// // again is the safe answer rather than the optimistic one.
+/// resume_with_recovery_observed(
+///     contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, run_id, attempt_id,
+///     RecoveryDecision::Retry, policy, &ApproveAll, &Trail,
+/// )
+/// .await?;
+/// # Ok(()) }
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_with_recovery_observed<P: Provider>(
     contract: &TaskContract,
@@ -2590,6 +2567,65 @@ pub async fn resume_with_recovery_observed<P: Provider>(
     .await
 }
 
+/// Continue a run that stopped at [`RunOutcome::AwaitingApproval`], once a
+/// human has decided about the pending action.
+///
+/// An approval performs exactly the action that was persisted — the same target
+/// and the same content the human was shown — and then continues the run under
+/// its original `run_id`. The decision is re-checked against the policy first,
+/// so a deny that landed after the pause still holds. A denial closes the run
+/// without performing the action.
+///
+/// Preserves the policy — it is an argument — and, since 0.13.0, the run's
+/// observation ledger. It is for a run that *paused*, though: a run that crashed
+/// has no `request_id` and no pending decision to supply, and wants
+/// [`resume_with`].
+///
+/// This is the other half of [`Decision::Defer`], and it is what makes an
+/// approval able to outlive the process that asked for it — a web app can show
+/// the pending action, close the request, and continue the run when someone
+/// clicks approve tomorrow:
+///
+/// ```no_run
+/// use io_harness::{resume_with_decision, ApproveAll, Act, Decision, OpenRouter, Policy,
+///                  Request, RunOutcome, Store, TaskContract};
+///
+/// # async fn on_click(contract: &TaskContract, policy: &Policy, request_id: i64, approved: bool)
+/// #     -> io_harness::Result<()> {
+/// let store = Store::open("runs.db")?;
+/// let pending = store.pending(request_id)?.expect("a pending request");
+///
+/// let decision = if approved {
+///     // Approving performs exactly what was persisted — the same target, the
+///     // same bytes the human was shown. Hand back a `modified` request to
+///     // perform something else instead; it is re-checked against the policy
+///     // first, so an approver cannot rewrite an action across a deny.
+///     Decision::Approve {
+///         modified: Some(Request::new(Act::Write, "docs/NOTES.md")
+///             .with_content(pending.content.clone().unwrap_or_default())),
+///         remember: Vec::new(),
+///     }
+/// } else {
+///     // The action never happens and the run closes as `RunOutcome::Denied`.
+///     Decision::deny("rejected in review")
+/// };
+///
+/// let result = resume_with_decision(
+///     contract, &OpenRouter::from_env()?, &store, pending.run_id, request_id, decision,
+///     policy, &ApproveAll,
+/// )
+/// .await?;
+///
+/// // Deferring again is legal and leaves it pending — the run stays paused.
+/// if let RunOutcome::AwaitingApproval { .. } = result.outcome {
+///     println!("still waiting");
+/// }
+/// # Ok(()) }
+/// ```
+///
+/// For a paused *tree*, use [`resume_tree_with_decision`]: the pending action
+/// often belongs to a child rather than the root, and only that function
+/// validates the request against the whole tree.
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_with_decision<P: Provider>(
     contract: &TaskContract,

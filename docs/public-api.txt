@@ -34,6 +34,8 @@ async_fn resume_with_decision_observed src/run.rs
 async_fn resume_with_observed src/run.rs
 async_fn resume_with_plan_decision src/run.rs
 async_fn resume_with_plan_decision_observed src/run.rs
+async_fn resume_with_recovery src/run.rs
+async_fn resume_with_recovery_observed src/run.rs
 async_fn retry_gate src/run.rs
 async_fn retry_gate_observed src/run.rs
 async_fn run src/run.rs
@@ -94,6 +96,7 @@ enum Preset src/contract.rs
 enum PromptFamily src/provider/mod.rs
 enum ProviderErrorKind src/error.rs
 enum ProviderSpec src/config.rs
+enum RecoveryDecision src/run.rs
 enum Reverted src/run.rs
 enum Rewind src/run.rs
 enum RunOutcome src/run.rs
@@ -104,6 +107,7 @@ enum StorageErrorKind src/error.rs
 enum SystemPrompt src/contract.rs
 enum TodoState src/state.rs
 enum ToolEffect src/tools/custom.rs
+enum ToolRecovery src/tools/custom.rs
 enum TurnKind src/session.rs
 enum Verification src/verify.rs
 enum Waiting src/attach.rs
@@ -222,6 +226,7 @@ struct TaskContract src/contract.rs
 struct Template src/template.rs
 struct Templates src/template.rs
 struct TodoItem src/state.rs
+struct ToolAttempt src/state.rs
 struct Transcript src/session.rs
 struct TranscriptTurn src/session.rs
 struct ToolCall src/provider/mod.rs
