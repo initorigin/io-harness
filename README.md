@@ -42,7 +42,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.64"
+io-harness = "0.65"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -140,6 +140,7 @@ layer.
 | **Verification** | Any language's own test command, a second model against a rubric, or no gate at all | [verification](docs/guide/verification.md) |
 | **Budgets** | Steps, wall-clock and token spend, from one ledger a whole tree of agents shares and no child can raise | [composition](docs/guide/composition.md) |
 | **Durable runs** | Trace, budget draw and checkpoint commit together after every completed step; a crash resumes the whole tree | [durable runs](docs/guide/durable-runs.md) |
+| **Indeterminate effects pause** | A run killed mid-call to something the harness cannot inspect — a charge, a deployment, an MCP server — resumes to an operator's decision instead of making the call again | [durable runs](docs/guide/durable-runs.md) |
 | **One driver per run** | Every run and resume takes a lease on the run it drives; a second driver is refused by name before it can interleave its steps into the trace | [durable runs](docs/guide/durable-runs.md) |
 | **Undo** | Per-file restore points and a whole-run rewind that leaves the ledger and the trace intact | [durable runs](docs/guide/durable-runs.md) |
 | **Agent composition** | Nested sub-agents over a shared workspace, inherit-and-narrow, with refusing and queueing caps | [composition](docs/guide/composition.md) |

@@ -102,6 +102,78 @@ a fresh 24 hours.
 
 Run it live: `cargo run --example durable_run` (kills itself mid-run and resumes).
 
+## A call the harness cannot inspect pauses instead of repeating (0.65.0)
+
+Replay is the right answer for a workspace edit — the file can be read back and
+written again — and the wrong one for a charge, a deployment, a posted message,
+or any registered `Tool` reaching a service the crate cannot see. Whether that
+call landed is not knowable from here, and the two possible defaults are not
+equally recoverable: a pause costs a decision, a repeat costs the effect twice.
+
+Every call is classified on a **recovery** axis, separate from `ToolEffect`:
+
+```rust
+use io_harness::tools::{Tool, ToolFuture, ToolRecovery};
+# use io_harness::ToolSpec;
+# use serde_json::{json, Value};
+
+struct Upsert;
+
+impl Tool for Upsert {
+    # fn spec(&self) -> ToolSpec {
+    #     ToolSpec { name: "upsert".into(), description: "Write the row.".into(),
+    #                parameters: json!({"type": "object"}) }
+    # }
+    # fn invoke<'a>(&'a self, _a: &'a Value) -> ToolFuture<'a> {
+    #     Box::pin(async { Ok("written".to_string()) })
+    # }
+    // It writes, so it runs alone — and writing the same row twice is the same
+    // row, so a resumed run may simply repeat it.
+    fn recovery(&self) -> ToolRecovery { ToolRecovery::Replayable }
+}
+```
+
+You rarely write that. `Tool::recovery` defaults from `Tool::effect`: a tool
+declaring `ToolEffect::ReadOnly` says it observes and changes nothing, so it is
+replayable; `ToolEffect::Mutating` — the default a tool declaring nothing gets —
+says only that it must run alone, so it is **indeterminate** and pauses. MCP calls
+are indeterminate too, because a server declares nothing about being called
+twice.
+
+An indeterminate call is written to `tool_attempts` before it is made and closed
+after it returns. That row is the one thing in the crate deliberately written
+outside the step's transaction: it exists to be read after the process that wrote
+it died mid-step. A resume that finds one open drives nothing and returns
+`RunOutcome::AwaitingRecovery { attempt_id, .. }`, and you continue it with a
+decision:
+
+```rust,no_run
+use io_harness::{resume_with_recovery, ApproveAll, Policy, RecoveryDecision, Store,
+                 TaskContract};
+
+# async fn demo(contract: &TaskContract, provider: &io_harness::OpenRouter, store: &Store,
+#               policy: &Policy, run_id: i64, attempt_id: i64) -> io_harness::Result<()> {
+resume_with_recovery(
+    contract, provider, store, run_id, attempt_id,
+    // The operator checked the payment provider: the charge did land, and this
+    // is what the model is told the call returned.
+    RecoveryDecision::Completed { observation: "charge ch_9f21 captured".into() },
+    policy, &ApproveAll,
+)
+.await?;
+# Ok(()) }
+```
+
+`RecoveryDecision::Retry` makes the call again, and `Abort` ends the run as
+`RunOutcome::Denied` without making it. Whichever you choose, the attempt is
+closed and what was decided is recorded against it.
+
+**What this does not close.** Between deciding to make a call and the journal row
+committing there is nothing on disk, so a process dying in that window still
+replays the call. No journal closes that gap — the write and the call are not one
+act — and the crate narrows it to one committed `INSERT` rather than claiming to
+remove it. Nothing here undoes an effect or compensates for one.
+
 ## One driver per run (0.62.0)
 
 A run is driven under a **lease**. Every `run_*` and `resume_*` takes one on the

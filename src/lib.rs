@@ -567,10 +567,11 @@ pub use run::{
     resume_tree_with_plan_decision_observed, resume_with, resume_with_answer,
     resume_with_answer_observed, resume_with_decision, resume_with_decision_observed,
     resume_with_observed, resume_with_plan_decision, resume_with_plan_decision_observed,
-    retry_gate, retry_gate_observed, rewind, rewind_run, rewind_run_observed, rewind_step,
-    rewind_step_observed, run, run_observed, run_tree, run_tree_observed, run_with,
-    run_with_observed, Reverted, Rewind, Rewound, RunOutcome, RunResult, DEFAULT_LEASE_TTL,
-    DEFAULT_MAX_WAIT, READ_MESSAGES_TOOL, SEND_MESSAGE_TOOL, SPAWN_TOOL,
+    resume_with_recovery, resume_with_recovery_observed, retry_gate, retry_gate_observed, rewind,
+    rewind_run, rewind_run_observed, rewind_step, rewind_step_observed, run, run_observed,
+    run_tree, run_tree_observed, run_with, run_with_observed, RecoveryDecision, Reverted, Rewind,
+    Rewound, RunOutcome, RunResult, DEFAULT_LEASE_TTL, DEFAULT_MAX_WAIT, READ_MESSAGES_TOOL,
+    SEND_MESSAGE_TOOL, SPAWN_TOOL,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, ExecMode, Sandbox, SandboxConfig, SandboxLimits,
@@ -591,14 +592,14 @@ pub use state::{
     MemoryKind, MemoryLimits, MemoryRecall, MemoryWrite, Pending, PendingPlan, PendingQuestion,
     PolicyEvent, ProcessHandle, ProviderCall, Pruned, Recovery, RewindRecord, RunStatus,
     RunSummary, SandboxEvent, SessionSize, SpawnRow, StepRecord, Store, StoreSize, Summary, Tally,
-    TodoItem, TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT, GLOBAL_MEMORY_WORKSPACE,
-    MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS, ROOT_ADDRESS, SUCCESS_OUTCOME,
-    TODO_MAX_ITEMS, TODO_TEXT_CAP, UNKNOWN_MODEL,
+    TodoItem, TodoState, ToolAttempt, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT,
+    GLOBAL_MEMORY_WORKSPACE, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
+    ROOT_ADDRESS, SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP, UNKNOWN_MODEL,
 };
 pub use template::{Template, Templates};
 pub use tools::git::Identity;
 pub use tools::{
-    Tool, ToolEffect, ToolFuture, Toolbox, ASK_QUESTION_TOOL, DEFAULT_EXEC_TIMEOUT,
+    Tool, ToolEffect, ToolFuture, ToolRecovery, Toolbox, ASK_QUESTION_TOOL, DEFAULT_EXEC_TIMEOUT,
     PROPOSE_PLAN_TOOL, TODO_WRITE_TOOL,
 };
 pub use verify::{

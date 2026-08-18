@@ -83,6 +83,10 @@ pub(super) enum ReadWork {
         tool: std::sync::Arc<dyn crate::tools::Tool>,
         arguments: serde_json::Value,
         remember: Vec<Rule>,
+        /// 0.65.0 — the open journal row for this call, when the tool's
+        /// [`ToolRecovery`](crate::ToolRecovery) is `Indeterminate`. `None` for a
+        /// replayable tool, which is journalled nowhere and costs nothing.
+        attempt: Option<i64>,
     },
 }
 
@@ -174,6 +178,20 @@ pub(super) fn over_ceiling(
 }
 
 impl ReadWork {
+    /// The journal row this work must close when it returns (0.65.0).
+    ///
+    /// Read before the work is moved — into a `JoinSet` task by
+    /// [`read_batch`], or into `run` by the serial arm — because closing is the
+    /// caller's job: `run` holds no [`Store`](crate::Store) and must not, since
+    /// the batch runs it on a spawned task and a `Store` owns a rusqlite
+    /// `Connection`.
+    pub(super) fn attempt(&self) -> Option<i64> {
+        match self {
+            ReadWork::Custom { attempt, .. } => *attempt,
+            _ => None,
+        }
+    }
+
     /// Perform it. The same code the serial path runs, so the two cannot drift:
     /// a batched read and a lone read are the same function called from two
     /// places.
@@ -288,6 +306,7 @@ impl ReadWork {
                 tool,
                 arguments,
                 remember,
+                attempt: _,
             } => match tool.invoke(&arguments).await {
                 Ok(out) => {
                     let (out, truncated) = crate::tools::cap_result(out, cap);
@@ -366,12 +385,26 @@ pub(super) fn speculable(ws: &Workspace, call: &ToolCall, custom: &Toolbox) -> O
         }
         name => {
             let tool = custom.get(name)?;
-            allowed(Act::Exec, name).then(|| ReadWork::Custom {
-                name: name.to_string(),
-                tool: std::sync::Arc::clone(tool),
-                arguments: call.arguments.clone(),
-                remember: Vec::new(),
-            })
+            // 0.65.0 — a speculated call starts before the completion that asked
+            // for it has settled, and this function holds no
+            // [`Store`](crate::Store), so it cannot open a journal row. That is
+            // only sound if nothing needing one can be started here, so the
+            // requirement is stated as a condition rather than left to the
+            // caller: `Speculation::offer` already refuses anything that is not
+            // `ToolEffect::ReadOnly`, and a `ReadOnly` tool derives
+            // `ToolRecovery::Replayable`, so the two agree — but a release that
+            // moved either would otherwise start an indeterminate call with no
+            // record that it had begun, which is the exact defect 0.65.0 exists
+            // to prevent.
+            (tool.recovery() == crate::ToolRecovery::Replayable && allowed(Act::Exec, name)).then(
+                || ReadWork::Custom {
+                    name: name.to_string(),
+                    tool: std::sync::Arc::clone(tool),
+                    arguments: call.arguments.clone(),
+                    remember: Vec::new(),
+                    attempt: None,
+                },
+            )
         }
     }
 }
@@ -523,11 +556,18 @@ pub(super) async fn prepare_read(
                 Gated::Go { remember, .. } => {
                     // `validate` ran at run start, so the lookup cannot miss.
                     let tool = custom.get(name).expect("owns() and get() agree");
+                    // 0.65.0 — the journal opens HERE, before the work exists,
+                    // because this is the last point at which the crate can still
+                    // say "nothing has been started". `open_attempt` writes
+                    // nothing for a replayable tool, so the decision lives in one
+                    // place and a built-in run pays no write.
+                    let attempt = store.open_attempt(run_id, step, name, tool.recovery())?;
                     Prepared::Work(ReadWork::Custom {
                         name: name.to_string(),
                         tool: std::sync::Arc::clone(tool),
                         arguments: call.arguments.clone(),
                         remember,
+                        attempt,
                     })
                 }
             }
@@ -564,7 +604,7 @@ pub(super) async fn read_batch(
     hooks: Option<&crate::hooks::Hooks>,
 ) -> Result<std::collections::VecDeque<Dispatched>> {
     let mut out: Vec<Option<Dispatched>> = Vec::with_capacity(calls.len());
-    let mut queued: std::collections::VecDeque<(usize, ReadWork)> =
+    let mut queued: std::collections::VecDeque<(usize, Option<i64>, ReadWork)> =
         std::collections::VecDeque::new();
     for call in calls {
         // Announced here rather than in the concurrent half, so a watcher sees
@@ -580,7 +620,7 @@ pub(super) async fn read_batch(
         .await?
         {
             Prepared::Work(work) => {
-                queued.push_back((out.len(), work));
+                queued.push_back((out.len(), work.attempt(), work));
                 out.push(None);
             }
             Prepared::Done(done) => out.push(Some(done)),
@@ -592,21 +632,29 @@ pub(super) async fn read_batch(
     }
 
     let owned = ws.clone();
-    let mut set: tokio::task::JoinSet<(usize, Dispatched)> = tokio::task::JoinSet::new();
-    let fill = |set: &mut tokio::task::JoinSet<(usize, Dispatched)>,
-                queued: &mut std::collections::VecDeque<(usize, ReadWork)>| {
-        while set.len() < max_parallel {
-            let Some((at, work)) = queued.pop_front() else {
-                break;
-            };
-            let ws = owned.clone();
-            set.spawn(async move { (at, work.run(&ws, cap, max_read, run_id, step).await) });
-        }
-    };
+    let mut set: tokio::task::JoinSet<(usize, Option<i64>, Dispatched)> =
+        tokio::task::JoinSet::new();
+    let fill =
+        |set: &mut tokio::task::JoinSet<(usize, Option<i64>, Dispatched)>,
+         queued: &mut std::collections::VecDeque<(usize, Option<i64>, ReadWork)>| {
+            while set.len() < max_parallel {
+                let Some((at, attempt, work)) = queued.pop_front() else {
+                    break;
+                };
+                let ws = owned.clone();
+                set.spawn(async move {
+                    (
+                        at,
+                        attempt,
+                        work.run(&ws, cap, max_read, run_id, step).await,
+                    )
+                });
+            }
+        };
     fill(&mut set, &mut queued);
     while let Some(joined) = set.join_next().await {
-        let (at, done) = match joined {
-            Ok(pair) => pair,
+        let (at, attempt, done) = match joined {
+            Ok(triple) => triple,
             // A tool that panics panicked before this release too, and the run
             // died with it. Carrying the unwind on rather than turning it into an
             // observation keeps that true.
@@ -617,6 +665,12 @@ pub(super) async fn read_batch(
                 )))
             }
         };
+        // 0.65.0 — the call returned, so the attempt is no longer indeterminate.
+        // Closed here rather than inside the task: `run` holds no store, and a
+        // `Store` cannot cross into a spawned task.
+        if let Some(id) = attempt {
+            store.close_attempt(id)?;
+        }
         out[at] = Some(done);
         fill(&mut set, &mut queued);
     }

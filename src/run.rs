@@ -234,6 +234,15 @@ const OBS_LIST_DIR_CAP: usize = 200;
 ///     // agent stopped, not because a ceiling did. Nothing checked the work —
 ///     // read it, rather than shipping it the way a `Success` may be shipped.
 ///     RunOutcome::Finished { .. } => "the agent is done; nothing verified it",
+///
+///     // (0.65.0) The run died mid-call to something this crate cannot inspect,
+///     // and whether that call landed is not knowable from here. Nothing has been
+///     // repeated: `resume_with_recovery` carries an operator's decision.
+///     RunOutcome::AwaitingRecovery { attempt_id: _, .. } => "decide about the call, then resume",
+///
+///     // `RunOutcome` is `#[non_exhaustive]` from 0.65.0, so a later variant is a
+///     // line here rather than a compile break. This arm is what pays for that.
+///     _ => "a later release added an outcome this program does not know",
 /// }
 /// # }
 /// ```
@@ -242,12 +251,34 @@ const OBS_LIST_DIR_CAP: usize = 200;
 /// `StepCapReached { steps: 12 }` and a `Success { steps: 12 }` cost the same
 /// and only one of them produced anything. For what the run actually spent, use
 /// [`RunResult::summary`].
+/// `#[non_exhaustive]` from 0.65.0, which is a break taken deliberately and
+/// once. Adding `AwaitingRecovery` already broke every exhaustive `match` on this
+/// enum, so the attribute that stops the next addition breaking anybody is paid
+/// for by the same edit rather than by a second one later. The fix in a caller is
+/// one wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RunOutcome {
     /// Verification passed. `steps` is the step it passed on.
     Success { steps: u32 },
     /// The step budget was reached before verification passed.
     StepCapReached { steps: u32 },
+    /// (0.65.0) The run died in the middle of a call the harness cannot inspect —
+    /// a charge, a deployment, a posted message, an MCP call, any registered
+    /// [`Tool`](crate::tools::Tool) whose
+    /// [`recovery`](crate::tools::Tool::recovery) is
+    /// [`ToolRecovery::Indeterminate`](crate::ToolRecovery::Indeterminate) — and
+    /// whether that call landed cannot be established from here. The run is
+    /// paused, not finished: the attempt is persisted under `attempt_id` and
+    /// survives this process, so [`resume_with_recovery`] continues it once a
+    /// human decides. `steps` is how many steps completed.
+    ///
+    /// Distinct from every other pause in this enum because nothing is being
+    /// asked *of* the agent: the question is not whether an action is permitted
+    /// or what was wanted, it is whether an action that may already have happened
+    /// should happen again. Only the operator can answer it, and until they do
+    /// the safe move is to do nothing — which is what this outcome is.
+    AwaitingRecovery { attempt_id: i64, steps: u32 },
     /// The time budget was exceeded. `steps` is how many steps completed.
     TimeBudgetExceeded { steps: u32 },
     /// The cost (token) budget was exceeded. `steps` is how many steps completed.
@@ -1461,6 +1492,13 @@ pub async fn resume_observed<P: Provider>(
     // typed error, rather than misreading it or panicking. Before the policy
     // gate below, so an unknown run still reports as an unknown run.
     store.check_resumable(run_id)?;
+    // 0.65.0 — refuse to re-drive a run whose journal still holds a call the
+    // harness cannot inspect. Before anything drives, because the first thing a
+    // resumed run does is replay the step that died, and by then the decision to
+    // repeat the call has already been taken.
+    if let Some(paused) = recovery_pause(store, run_id, observer)? {
+        return Ok(RunResult::new(paused, run_id));
+    }
     // The lease (0.62.0). Taken after the resumability checks so an unknown run
     // still reports as an unknown run, and before any step is driven so a second
     // live driver is refused rather than interleaving its steps with the first
@@ -2252,6 +2290,13 @@ pub async fn resume_with_observed<P: Provider>(
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
     store.check_resumable(run_id)?;
+    // 0.65.0 — refuse to re-drive a run whose journal still holds a call the
+    // harness cannot inspect. Before anything drives, because the first thing a
+    // resumed run does is replay the step that died, and by then the decision to
+    // repeat the call has already been taken.
+    if let Some(paused) = recovery_pause(store, run_id, observer)? {
+        return Ok(RunResult::new(paused, run_id));
+    }
     // The lease (0.62.0). Taken after the resumability checks so an unknown run
     // still reports as an unknown run, and before any step is driven so a second
     // live driver is refused rather than interleaving its steps with the first
@@ -2341,6 +2386,194 @@ pub async fn resume_with_observed<P: Provider>(
         )),
         None => run_from(contract, provider, store, run_id, start_step, watch).await,
     }
+}
+
+/// What to do about a call that was in flight when the process died (0.65.0).
+///
+/// The three answers an operator has, and no more: the runtime deliberately has
+/// no fourth, because anything else is a variation on one of these that only the
+/// caller's own system can perform.
+///
+/// `#[non_exhaustive]` from birth, for the reason
+/// [`SystemPrompt`](crate::SystemPrompt) is: a later release naming a fourth
+/// answer must not break a caller who matched on these.
+///
+/// ```
+/// use io_harness::RecoveryDecision;
+///
+/// // What an operator who checked the payment provider and found the charge
+/// // captured sends back. The text is what the model is told the call returned.
+/// let decided = RecoveryDecision::Completed {
+///     observation: "charge ch_9f21 captured".into(),
+/// };
+/// assert_ne!(decided, RecoveryDecision::Retry);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecoveryDecision {
+    /// Make the call again. The run resumes exactly as it would have without the
+    /// journal — the step replays and the model re-issues the call — which is
+    /// what a caller should choose when they have established the effect did not
+    /// land, or when repeating it is harmless.
+    Retry,
+    /// The call landed; do not make it again. `observation` is what the model is
+    /// told the call returned, and it reaches the model as an ordinary tool
+    /// observation on the step the call was made — so the run continues from a
+    /// transcript in which the tool answered, which is the truth.
+    ///
+    /// Nothing validates the text. The operator is asserting a fact about the
+    /// outside world that the crate has no way to check, and a crate that
+    /// pretended otherwise would be back where this release started.
+    Completed {
+        /// What the call returned, or the operator's account of it.
+        observation: String,
+    },
+    /// Do not make the call, and do not continue. The run ends as
+    /// [`RunOutcome::Denied`], which is what it already means for a human to
+    /// refuse an action on resume and stop the run rather than perform it.
+    Abort,
+}
+
+/// Continue a run paused at
+/// [`RunOutcome::AwaitingRecovery`](crate::RunOutcome::AwaitingRecovery), with an
+/// operator's decision about the call that was in flight (0.65.0).
+///
+/// ```no_run
+/// use io_harness::{resume_with_recovery, ApproveAll, OpenRouter, Policy, RecoveryDecision,
+///                  RunOutcome, Store, TaskContract};
+///
+/// # async fn demo(contract: &TaskContract, policy: &Policy, run_id: i64) -> io_harness::Result<()> {
+/// let store = Store::open("runs.db")?;
+/// let provider = OpenRouter::from_env()?;
+///
+/// // The operator checked the payment provider: the charge did land, and the
+/// // reference is what the tool would have returned.
+/// if let RunOutcome::AwaitingRecovery { attempt_id, .. } =
+///     io_harness::resume(contract, &provider, &store, run_id).await?.outcome
+/// {
+///     resume_with_recovery(
+///         contract, &provider, &store, run_id, attempt_id,
+///         RecoveryDecision::Completed { observation: "charge ch_9f21 captured".into() },
+///         policy, &ApproveAll,
+///     )
+///     .await?;
+/// }
+/// # Ok(()) }
+/// ```
+///
+/// The attempt is closed by this call whichever decision is made, and what was
+/// decided is recorded against it — so a store read later says not only that a
+/// call was interrupted but how it was resolved. A second decision on the same
+/// attempt is an error rather than a second resolution.
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_with_recovery<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    attempt_id: i64,
+    decision: RecoveryDecision,
+    policy: &Policy,
+    approver: &dyn Approver,
+) -> Result<RunResult> {
+    resume_with_recovery_observed(
+        contract, provider, store, run_id, attempt_id, decision, policy, approver, &Ignore,
+    )
+    .await
+}
+
+/// [`resume_with_recovery`], reporting to `observer` as it happens. See
+/// [`run_observed`].
+///
+/// ```no_run
+/// use io_harness::{resume_with_recovery_observed, ApproveAll, Flow, Observer, OpenRouter,
+///                  Policy, RecoveryDecision, RunEvent, Store, TaskContract};
+///
+/// struct Trail;
+///
+/// impl Observer for Trail {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         println!("run {} step {}: {:?}", event.run_id, event.step, event.kind);
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, policy: &Policy, run_id: i64, attempt_id: i64)
+/// #     -> io_harness::Result<()> {
+/// // The operator established the deployment never started, so making the call
+/// // again is the safe answer rather than the optimistic one.
+/// resume_with_recovery_observed(
+///     contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, run_id, attempt_id,
+///     RecoveryDecision::Retry, policy, &ApproveAll, &Trail,
+/// )
+/// .await?;
+/// # Ok(()) }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_with_recovery_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    attempt_id: i64,
+    decision: RecoveryDecision,
+    policy: &Policy,
+    approver: &dyn Approver,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
+    store.check_resumable(run_id)?;
+    // The attempt must be this run's and must still be open. A decision about an
+    // attempt that is already resolved is refused rather than applied twice: the
+    // second caller believes they authorised something, and under
+    // `Completed` they would be writing a second observation of one call.
+    let attempt = store
+        .open_attempts(run_id)?
+        .into_iter()
+        .find(|a| a.id == attempt_id)
+        .ok_or_else(|| {
+            crate::error::Error::Config(format!(
+                "run {run_id} has no open attempt {attempt_id} — it was never opened, belongs to \
+                 another run, or has already been decided"
+            ))
+        })?;
+
+    match decision {
+        RecoveryDecision::Retry => {
+            store.resolve_attempt(attempt_id, "retry")?;
+        }
+        RecoveryDecision::Completed { observation } => {
+            // Written in the ledger's own shape, on the step the call was made,
+            // so the resumed run assembles it exactly as it would have assembled
+            // the answer the tool never got to give. Recorded BEFORE the attempt
+            // is resolved: an interrupted decision then leaves the attempt open
+            // and the run still paused, which is the recoverable direction.
+            store.record_observations(
+                run_id,
+                &[crate::context::Observation::new(
+                    attempt.step,
+                    crate::context::ObsKind::Tool,
+                    Some(attempt.tool.clone()),
+                    format!("\n[{}]\n{}\n", attempt.tool, observation),
+                )],
+            )?;
+            store.resolve_attempt(attempt_id, "completed")?;
+        }
+        RecoveryDecision::Abort => {
+            store.resolve_attempt(attempt_id, "abort")?;
+            store.finish_run(run_id, "denied")?;
+            return Ok(RunResult::new(
+                RunOutcome::Denied {
+                    steps: store.last_step(run_id)?,
+                },
+                run_id,
+            ));
+        }
+    }
+
+    resume_with_observed(
+        contract, provider, store, run_id, policy, approver, observer,
+    )
+    .await
 }
 
 /// Continue a run that stopped at [`RunOutcome::AwaitingApproval`], once a
@@ -2805,6 +3038,13 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
     observer: &dyn Observer,
 ) -> Result<RunResult> {
     store.check_resumable(run_id)?;
+    // 0.65.0 — refuse to re-drive a run whose journal still holds a call the
+    // harness cannot inspect. Before anything drives, because the first thing a
+    // resumed run does is replay the step that died, and by then the decision to
+    // repeat the call has already been taken.
+    if let Some(paused) = recovery_pause(store, run_id, observer)? {
+        return Ok(RunResult::new(paused, run_id));
+    }
     // The lease (0.62.0). Taken after the resumability checks so an unknown run
     // still reports as an unknown run, and before any step is driven so a second
     // live driver is refused rather than interleaving its steps with the first
@@ -3829,6 +4069,13 @@ pub async fn resume_tree_observed<P: Provider>(
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
     store.check_resumable(run_id)?;
+    // 0.65.0 — refuse to re-drive a run whose journal still holds a call the
+    // harness cannot inspect. Before anything drives, because the first thing a
+    // resumed run does is replay the step that died, and by then the decision to
+    // repeat the call has already been taken.
+    if let Some(paused) = recovery_pause(store, run_id, observer)? {
+        return Ok(RunResult::new(paused, run_id));
+    }
     // The lease (0.62.0). Taken after the resumability checks so an unknown run
     // still reports as an unknown run, and before any step is driven so a second
     // live driver is refused rather than interleaving its steps with the first
