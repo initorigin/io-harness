@@ -1603,7 +1603,14 @@ fn the_contracts_ownership_claims_match_the_source() {
             .to_string();
         let body = body.split("\npub").next().unwrap_or(body);
         let drives = body.contains("store.check_resumable(") || body.contains("store.start_run(");
-        if drives && !body.contains("store.acquire_lease(") {
+        // 0.65.0 — a body that hands the whole drive to `resume_with_observed`
+        // takes the lease there. Stated as delegation to a named function that is
+        // ITSELF in this set rather than as an exemption for a name: the
+        // delegate has to satisfy the same assertion, so nothing escapes by
+        // being called from somewhere else.
+        let delegates =
+            body.contains("resume_with_observed(") && !body.contains("store.acquire_lease(");
+        if drives && !delegates && !body.contains("store.acquire_lease(") {
             missing.push(name);
         }
     }
@@ -1713,8 +1720,23 @@ fn every_resume_root_refuses_an_open_indeterminate_attempt() {
             .filter(|(_, body)| body.contains("store.check_resumable("))
     };
 
+    // A root either decides the pause itself or hands the whole drive to one that
+    // does. `resume_with_recovery_observed` is the second shape by construction:
+    // it exists to resolve the attempt the pause named, so pausing on it again
+    // would make the decision unusable — and `resume_with_observed`, which it
+    // delegates to, is in this same set and is asserted below.
+    // A root either decides the pause itself or hands the WHOLE drive to one that
+    // does — and "the whole drive" is what `store.acquire_lease(` distinguishes: a
+    // body that takes its own lease is driving and owes its own gate, whatever
+    // else it calls. Written the loose way first, this clause silently excused
+    // three roots that had a stale needle, which is exactly how an exemption
+    // turns into a hole.
     let missing: Vec<String> = roots()
-        .filter(|(_, body)| !body.contains("recovery_pause(store, run_id)"))
+        .filter(|(_, body)| {
+            let delegates =
+                body.contains("resume_with_observed(") && !body.contains("store.acquire_lease(");
+            !delegates && !body.contains("recovery_pause(store, run_id, observer)")
+        })
         .map(|(name, _)| name)
         .collect();
     assert!(
@@ -1736,18 +1758,25 @@ fn every_resume_root_refuses_an_open_indeterminate_attempt() {
     // The gate is worth nothing if it runs after the loop has been entered. The
     // pause must be decided before the lease is taken and before any step is
     // driven, so its position is asserted rather than its presence.
+    let mut gating = 0;
     for (name, body) in roots() {
-        let gate = body
-            .find("recovery_pause(store, run_id)")
-            .unwrap_or_else(|| panic!("{name} has no recovery gate"));
-        let lease = body
-            .find("store.acquire_lease(")
-            .unwrap_or_else(|| panic!("{name} takes no lease"));
+        let (Some(gate), Some(lease)) = (
+            body.find("recovery_pause(store, run_id, observer)"),
+            body.find("store.acquire_lease("),
+        ) else {
+            continue; // a delegating root, covered by the assertion above
+        };
+        gating += 1;
         assert!(
             gate < lease,
             "{name} decides the recovery pause after it has started driving"
         );
     }
+    assert!(
+        gating >= 4,
+        "only {gating} roots were checked for ordering, so the loop is skipping the \
+         functions it exists to check"
+    );
 }
 
 fn run_subsystem() -> String {

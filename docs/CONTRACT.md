@@ -2942,6 +2942,29 @@ starts its window at zero exactly as it did before.
 containing a newline renders ambiguously to the model. A display concern, not a
 boundary one — the path policy still sees the real path.
 
+**A call the harness cannot inspect is not replayed on a resume (0.65.0).** Every
+registered `Tool` and every MCP call is classified on a recovery axis —
+`ToolRecovery::Replayable` or `ToolRecovery::Indeterminate` — separately from
+`ToolEffect`, which answers concurrency and not repeatability. `Tool::recovery`
+defaults from `Tool::effect`: a tool declaring `ToolEffect::ReadOnly` states that
+it observes and changes nothing, so it is replayable; `ToolEffect::Mutating`,
+which is what a tool declaring nothing gets, states only that it must run alone,
+so it is indeterminate. An indeterminate call is journalled in `tool_attempts`
+before it is made and closed after it returns, on its own rather than at the step
+boundary — the one thing in this crate written to outlive a step that never
+committed. A resume that finds an open attempt returns
+`RunOutcome::AwaitingRecovery` and drives nothing; `resume_with_recovery` carries
+the operator's decision, which is to retry the call, to record it as completed
+with the account the model is then given, or to abort the run.
+
+**What it does not close.** Between the decision to make a call and the journal
+row committing there is nothing on disk, and no journal closes that gap, because
+the write and the call are not one act. A process dying in that window replays the
+call exactly as it did before 0.65.0. What the release narrows the window to is
+the width of one committed `INSERT`, and the crate does not claim more than that.
+Nothing here undoes an effect, compensates for one, or sends anything to the
+service on the tool's behalf; the crate records what was started and asks.
+
 **Git commit idempotency across a resume.** A replayed run does not commit
 twice, but that rests on git's own semantics — a replayed `add` stages nothing,
 so the replayed commit finds nothing staged — rather than on a durable marker
