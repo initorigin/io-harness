@@ -9,9 +9,10 @@ or more — each running the same observe/reason/act/verify/stop loop over the
 **same workspace and the same trace**. A child's result composes back so the
 parent continues from what it produced, and children may nest.
 
-Sub-agents are **opt-in**: `run_tree` and — since 0.39.0 —
-`Session::turn_contained` are the entry points that offer the `spawn_agent` tool.
-Pass a `Containment` and the tree runs under it.
+Sub-agents are **opt-in**: `run_tree`, and — since 0.39.0 —
+`Session::turn_contained`, are the entry points that offer the `spawn_agent` tool.
+Since 0.66.0 a contained turn can also carry a contract, through
+`Session::turn_contained_bounded`. Pass a `Containment` and the tree runs under it.
 
 ```rust
 use io_harness::{run_tree, ApproveAll, Containment, Policy, Store, TaskContract, Verification};
@@ -213,6 +214,14 @@ ledger is built per turn, so it is not a ceiling across the conversation; and a
 child is given its goal rather than the conversation, so what the operator said
 three turns ago reaches the root and stops there. [Sessions](sessions.md) has the
 rest.
+
+**And since 0.66.0 that turn takes your contract.**
+`Session::turn_contained_bounded` takes a `TaskContract` beside the `Containment`,
+so a fan-out inside a conversation can carry a plan gate, registered tools, a
+budget or a verification gate — the things a `turn_bounded` has always accepted and
+a contained turn could not be given. The contract bounds the agent answering the
+turn; the containment still bounds the tree, including its one shared spend
+ceiling.
 
 ## See also
 

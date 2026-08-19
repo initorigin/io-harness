@@ -296,6 +296,9 @@ fn the_facade_delegates_to_the_public_entry_points() {
         "run_tree_observed",
         "turn_observed",
         "turn_bounded_observed",
+        // 0.66.0 — the facade's contained turns, delegating outward like the rest.
+        "turn_contained_observed",
+        "turn_contained_bounded_observed",
     ];
     for name in expected {
         assert!(
@@ -391,6 +394,11 @@ fn no_entry_point_signature_moved() {
         ("turn_bounded_observed", 7),
         ("turn_contained", 7),
         ("turn_contained_observed", 8),
+        // 0.66.0 — the contained pair that takes a contract. Added to the table in
+        // the release that adds them, so the next release inherits the same promise
+        // about them that every entry point above already carries.
+        ("turn_contained_bounded", 7),
+        ("turn_contained_bounded_observed", 8),
     ];
 
     let mut wrong = Vec::new();

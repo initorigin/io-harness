@@ -1074,6 +1074,29 @@ decompose the work into contained children. The five turn entry points that
 predate this are untouched and still never offer the tool: a session that does not
 pass a `Containment` behaves exactly as it did in 0.38.0.
 
+**And it may carry a contract (0.66.0).** `Session::turn_contained_bounded` and
+`Session::turn_contained_bounded_observed` take a `TaskContract` beside the
+`Containment`, so a turn that may fan out can carry a plan gate, a preset or a
+replaced system prompt, repository instructions, registered tools, MCP servers,
+skills, a step or token budget and a verification gate — every one of which
+`turn_bounded` has accepted since 0.36.0 and no contained turn could be given at
+all. The contract's `root` is replaced by the session's, exactly as `turn_bounded`
+replaces it. `Harness::turn_contained` and `Harness::turn_contained_with` are the
+same two shapes with the host bound once.
+
+Four things the tree loop reads differently from the flat one, and none is new in
+0.66.0 — each has been true of `run_tree` since 0.39.0, and 0.66.0 only makes them
+reachable from a session. The tree's one shared spend ceiling is built from the
+`Containment`, not from the contract; `contract.max_tokens` bounds the single agent
+and is capped by the tree's remaining budget. `Routing::escalate_after` and
+`downshift_under` do not move the model per step, because `apply_routing` is called
+from the flat workspace loop only. The preflight checks made before a flat run's
+first request — a `Verification::Review` contract with no reviewer, a reviewer that
+is the model under review, and `Routing::require_primary` against
+`Provider::reachable` — are not made for a tree, though a model approving its own
+call is still refused at the root. And `max_parallel_reads` bounds a batch that only
+the flat loop builds; a contained agent dispatches its reads one at a time.
+
 What the fan-out inherits is what `run_tree` has always given a tree — the
 caller's policy narrowed per child through `Policy::contain`, one shared `Ledger`
 no child contract can raise, per-tier concurrency slots with a durable queue, and
@@ -1475,9 +1498,11 @@ took 0.41.0's batch path either. Both are unchanged by this release.
 **Speculation follows streaming, and streaming follows the turn entry point.**
 Only the `_observed` and `_steered` session turns stream —
 `Session::turn_observed`, `Session::turn_steered`,
-`Session::turn_bounded_observed` and `Session::turn_contained_observed`. A turn
-taken through `Session::turn`, `Session::turn_bounded` or
-`Session::turn_contained` does not stream and therefore starts nothing early. That
+`Session::turn_bounded_observed`, `Session::turn_contained_observed` and
+`Session::turn_contained_bounded_observed`. A turn taken through `Session::turn`,
+`Session::turn_bounded`, `Session::turn_contained` or
+`Session::turn_contained_bounded` does not stream and therefore starts nothing
+early. That
 is 0.20.0's rule about where `EventKind::Token` comes from, unchanged; it is
 restated here because it now decides a second thing.
 
