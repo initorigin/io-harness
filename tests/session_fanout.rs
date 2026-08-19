@@ -863,3 +863,100 @@ fn run_subsystem_source() -> String {
     }
     all
 }
+
+// ------------------------------------------------- 0.66.0: a contained turn
+// the caller shaped
+//
+// Until this release a contained turn built its own contract from the operator's
+// text, so the file above had to reach for `turn_bounded` — the flat loop — every
+// time it wanted to say something about a contract. These drive the contained
+// loop with the caller's own contract, which is the thing that could not be done.
+
+/// **F5** — the contract's root is replaced by the session's.
+///
+/// `turn_bounded` has made this promise since 0.36.0 and states it in its rustdoc:
+/// a turn is about the conversation's workspace. If the contained pair did not
+/// make the same one, a fan-out would be the one way to point a session's turn at
+/// somebody else's directory — and every child inherits that root.
+#[tokio::test]
+async fn a_contained_bounded_turn_runs_in_the_sessions_workspace() {
+    let session_dir = ws();
+    let elsewhere = ws();
+    let store = Store::memory().unwrap();
+    let mut session = Session::open(&store, session_dir.path()).unwrap();
+
+    // The contract names the other directory, and nothing else about it is wrong.
+    let contract = TaskContract::workspace("write a.txt", elsewhere.path()).with_max_steps(2);
+    let mock = Mock::new(vec![Say::Calls(vec![write("a.txt", "hi")])]);
+
+    session
+        .turn_contained_bounded(
+            &contract,
+            &mock,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &roomy(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        session_dir.path().join("a.txt").exists(),
+        "the turn wrote outside the session's workspace"
+    );
+    assert!(
+        !elsewhere.path().join("a.txt").exists(),
+        "the contract's own root was used, so a turn escaped its conversation"
+    );
+}
+
+/// **F5**, the observed twin — it reaches the observer, and it is one turn.
+///
+/// A fan-out is the shape that most needs an observer: children run at once and
+/// their output interleaves, so `depth` and `run_id` are what make the stream
+/// readable. A twin that delegated to the unobserved method would still fan out,
+/// still pass every assertion about the workspace, and quietly report nothing.
+#[tokio::test]
+async fn the_observed_contained_bounded_turn_reports_its_children() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let mut session = Session::open(&store, dir.path()).unwrap();
+    let contract = TaskContract::workspace("decompose it", dir.path()).with_max_steps(3);
+    let log = Log::default();
+    let mock = Mock::new(vec![
+        Say::Calls(vec![spawn("write a.txt saying A", "a.txt", "A")]),
+        Say::Calls(vec![write("a.txt", "A")]),
+        Say::Text("done"),
+    ]);
+
+    let turn = session
+        .turn_contained_bounded_observed(
+            &contract,
+            &mock,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &roomy(),
+            &log,
+        )
+        .await
+        .unwrap();
+
+    let spawned = log.kinds("spawned");
+    assert_eq!(
+        spawned.len(),
+        1,
+        "the bound observer heard nothing about the fan-out: {spawned:?}"
+    );
+    assert_eq!(
+        store.children(turn.run_id).unwrap().len(),
+        1,
+        "one child, under this turn's run"
+    );
+    assert_eq!(
+        session.history(&store).unwrap().len(),
+        1,
+        "a fan-out is still one turn in the conversation"
+    );
+}
