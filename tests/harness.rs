@@ -15,9 +15,13 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use std::sync::Mutex;
+
+use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    run_with, ApproveAll, Harness, Policy, Provider, RunOutcome, Store, TaskContract, Verification,
+    run_with, ApproveAll, Containment, Harness, Policy, Provider, RunOutcome, Store, TaskContract,
+    Verification,
 };
 use serde_json::json;
 
@@ -346,4 +350,183 @@ async fn an_unconfigured_harness_is_the_unpoliced_entry_point() {
     // permissive: this returns a result rather than `Error::Config`.
     let contract = harness.workspace("write a file", dir.path());
     assert!(harness.run(&contract).await.is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// F7 — the bound facade takes a contained turn (0.66.0)
+// ---------------------------------------------------------------------------
+//
+// Until this release `Harness` offered `turn`, `turn_with` and `run_tree` and no
+// contained turn at all, so an embedder who bound their host once had to unbind
+// the moment a conversation needed to decompose.
+
+/// Spawns once, then answers.
+#[derive(Default)]
+struct Fanout {
+    at: AtomicUsize,
+    tools: Mutex<Vec<Vec<String>>>,
+}
+
+impl Provider for Fanout {
+    fn name(&self) -> &str {
+        "fanout"
+    }
+
+    async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        self.tools
+            .lock()
+            .unwrap()
+            .push(req.tools.iter().map(|t| t.name.clone()).collect());
+        let i = self.at.fetch_add(1, Ordering::SeqCst);
+        Ok(match i {
+            0 => CompletionResponse {
+                tool_calls: vec![ToolCall {
+                    name: "spawn_agent".into(),
+                    arguments: json!({
+                        "goal": "write a.txt saying A",
+                        "verify_file": "a.txt",
+                        "verify_contains": "A",
+                    }),
+                }],
+                ..Default::default()
+            },
+            1 => CompletionResponse {
+                tool_calls: vec![ToolCall {
+                    name: "write_file".into(),
+                    arguments: json!({ "path": "a.txt", "content": "A" }),
+                }],
+                ..Default::default()
+            },
+            _ => CompletionResponse {
+                text: Some("done".into()),
+                ..Default::default()
+            },
+        })
+    }
+}
+
+/// Counts what the bound observer was told.
+#[derive(Default)]
+struct Heard {
+    spawned: Mutex<Vec<(i64, u32)>>,
+}
+
+impl Observer for Heard {
+    fn event(&self, event: &RunEvent) -> Flow {
+        if let EventKind::Spawned { .. } = &event.kind {
+            self.spawned.lock().unwrap().push((event.run_id, event.depth));
+        }
+        Flow::Continue
+    }
+}
+
+fn roomy() -> Containment {
+    Containment::new(10, 4, 3, 1_000_000)
+}
+
+/// A contained turn through the facade fans out, and the **bound** observer hears
+/// it.
+///
+/// The observer is the load-bearing half. A delegation that reached the unobserved
+/// session method would still fan out, still write the file, still report the same
+/// outcome — and silently tell the operator's observer nothing, which is the one
+/// thing a tree most needs it for.
+#[tokio::test]
+async fn a_bound_harness_takes_a_contained_turn() {
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Fanout::default();
+    let heard = Heard::default();
+    let harness = Harness::new(&provider, &store)
+        .with_policy(open_policy())
+        .with_approver(&ApproveAll)
+        .with_observer(&heard);
+    let mut session = harness.session(dir.path()).unwrap();
+
+    let turn = harness
+        .turn_contained(&mut session, "decompose it", &roomy())
+        .await
+        .unwrap();
+
+    assert!(
+        provider.tools.lock().unwrap()[0].contains(&"spawn_agent".to_string()),
+        "the facade's contained turn was not offered the spawn tool"
+    );
+    let spawned = heard.spawned.lock().unwrap().clone();
+    assert_eq!(
+        spawned.len(),
+        1,
+        "the harness's own observer heard nothing about the fan-out: {spawned:?}"
+    );
+    assert_eq!(
+        store.children(turn.run_id).unwrap().len(),
+        1,
+        "one child, under this turn's run"
+    );
+}
+
+/// The contract reaches the facade's contained turn, and so does the bound policy.
+///
+/// Two arms for the reason `the_facade_and_the_free_function_produce_the_same_trace`
+/// records: under a permitting boundary a facade that threw its bound policy away
+/// would pass every assertion here. The closed arm is the one that can fail.
+#[tokio::test]
+async fn a_bound_harness_takes_a_contained_turn_under_a_contract() {
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Fanout::default();
+    let harness = Harness::new(&provider, &store)
+        .with_policy(open_policy())
+        .with_approver(&ApproveAll);
+    let mut session = harness.session(dir.path()).unwrap();
+
+    let contract = harness.task(
+        "write a.txt",
+        dir.path(),
+        Verification::WorkspaceFileContains {
+            file: "a.txt".into(),
+            needle: "A".into(),
+        },
+    );
+    let turn = harness
+        .turn_contained_with(&mut session, &contract, &roomy())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(turn.outcome, RunOutcome::Success { .. }),
+        "the contract's gate did not decide the facade's contained turn: {:?}",
+        turn.outcome
+    );
+
+    // The same contract under a boundary that refuses the write: the gate cannot
+    // pass, which it only cannot do if the harness's bound policy reached the loop.
+    let closed_store = Store::memory().unwrap();
+    let closed_provider = Fanout::default();
+    let closed = Harness::new(&closed_provider, &closed_store)
+        .with_policy(closed_policy())
+        .with_approver(&ApproveAll);
+    let mut session = closed.session(dir.path()).unwrap();
+    let contract = closed.task(
+        "write b.txt",
+        dir.path(),
+        Verification::WorkspaceFileContains {
+            file: "b.txt".into(),
+            needle: "B".into(),
+        },
+    );
+    let refused = closed
+        .turn_contained_with(&mut session, &contract, &roomy())
+        .await
+        .unwrap();
+
+    assert!(
+        !matches!(refused.outcome, RunOutcome::Success { .. }),
+        "the harness's bound policy did not reach the contained turn: {:?}",
+        refused.outcome
+    );
+    assert!(
+        !dir.path().join("b.txt").exists(),
+        "a write the bound policy denies was made anyway"
+    );
 }
