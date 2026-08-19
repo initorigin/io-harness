@@ -22,9 +22,10 @@ use std::sync::Mutex;
 use io_harness::approve::{Decision, DecisionFuture, Request};
 use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
+use io_harness::provider::ToolSpec;
 use io_harness::{
     resume_tree_with_decision, ApproveAll, Approver, Containment, Policy, Provider, RunOutcome,
-    Session, Store, TaskContract, TurnKind, Verification,
+    Session, Store, TaskContract, Tool, ToolFuture, Toolbox, TurnKind, Verification,
 };
 use serde_json::json;
 
@@ -499,6 +500,29 @@ async fn a_contained_turn_with_a_criterion_does_not_classify() {
         !mock.system(0).contains("may not be work at all"),
         "no conversational opening on a judged turn"
     );
+
+    // 0.66.0 — and now on the path this file is actually about. Until this release
+    // the arm above was the only one available: a contained turn built its own
+    // contract, so a *judged* contained turn could not be expressed, and the test
+    // for the tree loop's half of the 0.37.0 rule was driving the flat loop.
+    let contained = Mock::new(vec![Say::Text("I would rather not")]);
+    let turn = session
+        .turn_contained_bounded(
+            &contract,
+            &contained,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &roomy(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(turn.kind, TurnKind::Run, "a judged contained turn is work");
+    assert!(
+        !contained.system(0).contains("may not be work at all"),
+        "no conversational opening on a judged contained turn"
+    );
 }
 
 // ------------------------------------------------------------------------- F7
@@ -958,5 +982,165 @@ async fn the_observed_contained_bounded_turn_reports_its_children() {
         session.history(&store).unwrap().len(),
         1,
         "a fan-out is still one turn in the conversation"
+    );
+}
+
+/// A tool that counts the times it was actually invoked.
+///
+/// The counter is the assertion: "the fan-out could call the caller's own tool" is
+/// a measurement here, not an argument about what the model was offered.
+struct Counted(std::sync::Arc<AtomicUsize>);
+
+impl Tool for Counted {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "count_me".into(),
+            description: "Record that this was called.".into(),
+            parameters: json!({ "type": "object" }),
+        }
+    }
+
+    fn invoke<'a>(&'a self, _arguments: &'a serde_json::Value) -> ToolFuture<'a> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok("counted".to_string()) })
+    }
+}
+
+/// **F4a** — a verification gate on a contained turn decides the outcome.
+///
+/// Both directions, because a gate that never passes and a gate that never runs are
+/// indistinguishable from one arm. The failing arm ends at the step cap; the passing
+/// arm ends at `Success`, which on this loop is reached only through `evaluate_gate`.
+#[tokio::test]
+async fn a_contained_turns_verification_gate_decides_its_outcome() {
+    for (content, expect_success) in [("wrong", false), ("A", true)] {
+        let dir = ws();
+        let store = Store::memory().unwrap();
+        let mut session = Session::open(&store, dir.path()).unwrap();
+        let contract = TaskContract::workspace("write a.txt", dir.path())
+            .with_verification(Verification::WorkspaceFileContains {
+                file: "a.txt".into(),
+                needle: "A".into(),
+            })
+            .with_max_steps(2);
+        let mock = Mock::new(vec![Say::Calls(vec![write("a.txt", content)])]);
+
+        let turn = session
+            .turn_contained_bounded(
+                &contract,
+                &mock,
+                &store,
+                &Policy::permissive(),
+                &ApproveAll,
+                &roomy(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            matches!(turn.outcome, RunOutcome::Success { .. }),
+            expect_success,
+            "a gate the contained turn carried did not decide it: {:?} for {content:?}",
+            turn.outcome
+        );
+        // The other half of the 0.37.0 rule, on this loop: a judged turn is work.
+        assert_eq!(turn.kind, TurnKind::Run, "a judged contained turn is work");
+    }
+}
+
+/// **F4b** — a tool the caller registered is reachable inside the fan-out.
+///
+/// Asserted on the tool's own counter and on `Store::observations`, never on the
+/// model's reply: a scripted provider will happily say it called something it did
+/// not, and the reply is the one piece of evidence that proves nothing.
+#[tokio::test]
+async fn a_contained_turn_can_call_the_contracts_own_tool() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let mut session = Session::open(&store, dir.path()).unwrap();
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let contract = TaskContract::workspace("use the tool", dir.path())
+        .with_tools(Toolbox::new().with(Counted(calls.clone())))
+        .with_max_steps(3);
+    let mock = Mock::new(vec![
+        Say::Calls(vec![call("count_me", json!({}))]),
+        Say::Text("done"),
+    ]);
+
+    let turn = session
+        .turn_contained_bounded(
+            &contract,
+            &mock,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &roomy(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        mock.tools(0).contains(&"count_me".to_string()),
+        "the caller's tool was not offered to the root of the fan-out: {:?}",
+        mock.tools(0)
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the caller's tool was offered and then not actually invoked"
+    );
+    assert!(
+        store
+            .observations(turn.run_id)
+            .unwrap()
+            .iter()
+            .any(|o| o.text.contains("counted")),
+        "the tool's result never reached the run's observations"
+    );
+}
+
+/// **F4c** — the contract's step cap stops the contained turn.
+///
+/// The provider never stops calling tools, so the only thing that can end this run
+/// is the cap the caller set.
+#[tokio::test]
+async fn a_contained_turns_step_cap_is_the_contracts() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let mut session = Session::open(&store, dir.path()).unwrap();
+    let contract = TaskContract::workspace("keep writing", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "never.txt".into(),
+            needle: "never".into(),
+        })
+        .with_max_steps(2);
+    let mock = Mock::new(vec![
+        Say::Calls(vec![write("a.txt", "1")]),
+        Say::Calls(vec![write("a.txt", "2")]),
+        Say::Calls(vec![write("a.txt", "3")]),
+        Say::Calls(vec![write("a.txt", "4")]),
+    ]);
+
+    let turn = session
+        .turn_contained_bounded(
+            &contract,
+            &mock,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &roomy(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(turn.outcome, RunOutcome::StepCapReached { steps: 2 }),
+        "the contract's cap did not bound the turn: {:?}",
+        turn.outcome
+    );
+    assert_eq!(
+        mock.calls(),
+        2,
+        "the model was asked for more completions than the cap allows"
     );
 }
