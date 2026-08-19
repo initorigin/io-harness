@@ -1680,3 +1680,48 @@ async fn a_preset_keeps_the_world_a_contained_agent_is_in() {
         }
     }
 }
+
+/// **F6** — the text-taking contained turn composes exactly what it always did.
+///
+/// The release adds a way in; it must move nothing that was there. Asserted as
+/// byte equality against the contract-taking twin handed the contract
+/// `turn_contained` builds for itself — which is the strongest available form of
+/// "unchanged", because it pins the two paths to each other as well as to the
+/// framing pinned above.
+#[tokio::test]
+async fn a_text_contained_turn_composes_what_a_default_contract_composes() {
+    let dir = workspace();
+
+    let text = {
+        let provider = Rec::new(vec![vec![]]);
+        let store = Store::memory().unwrap();
+        let mut session = Session::open(&store, dir.path()).unwrap();
+        let _ = session
+            .turn_contained(
+                "hello",
+                &provider,
+                &store,
+                &Policy::permissive(),
+                &ApproveAll,
+                &Containment::new(4, 2, 2, 100_000),
+            )
+            .await;
+        provider.system()
+    };
+
+    let bounded = contained_conversational_system(
+        &TaskContract::workspace("hello", dir.path()),
+        dir.path(),
+    )
+    .await;
+
+    assert_eq!(
+        text, bounded,
+        "the two contained entry points compose different prompts for one turn"
+    );
+    assert!(
+        text.starts_with(V0660_CONVERSATIONAL_TREE),
+        "the text contained turn's framing moved:\n{text}"
+    );
+    assert!(text.ends_with(CONVERSATIONAL_ENDING));
+}

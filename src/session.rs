@@ -703,8 +703,28 @@ impl Session {
     /// shared spend ceiling is built from [`Containment`], not from the contract:
     /// `max_tokens` bounds *this* agent, the containment's budget bounds every
     /// agent in the turn together, and a child's own contract can raise neither.
-    /// Everything else the contract carries reaches the root agent exactly as it
-    /// does on the flat loop.
+    ///
+    /// **What this loop reads differently, stated rather than discovered.** All of
+    /// it is equally true of [`run_tree`](crate::run_tree), which has taken a
+    /// contract since 0.39.0; none of it is new here, and none of it is a promise
+    /// that quietly does nothing:
+    ///
+    /// - [`TaskContract::routing`]'s `escalate_after` and `downshift_under` move
+    ///   the model per step in the flat loop only. A contained turn keeps the
+    ///   model it started on.
+    /// - The preflight checks a flat run makes before its first request — a
+    ///   [`Verification::Review`] contract with no
+    ///   reviewer, a reviewer that is the model under review, and
+    ///   `Routing::require_primary` against [`Provider::reachable`] — are not made
+    ///   here. Refusing a model that approves its own call is, at the root.
+    /// - `max_parallel_reads` bounds a batch the flat loop builds; a contained
+    ///   agent dispatches its reads one at a time.
+    /// - `file` is the single-file contract's target and has no meaning for a
+    ///   tree, which is refused without a workspace root.
+    ///
+    /// Everything else the contract carries — the gate, the toolbox, MCP servers,
+    /// skills, the plan gate, the prompt, the budgets, the sandbox, the hooks —
+    /// reaches the root agent exactly as it does on the flat loop.
     ///
     /// ```no_run
     /// use io_harness::{ApproveAll, Containment, OpenRouter, Policy, Session, Store,
