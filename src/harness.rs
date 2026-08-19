@@ -493,6 +493,101 @@ impl<'a, P: Provider> Harness<'a, P> {
             .await
     }
 
+    /// Take one turn in `session` that may fan out, against the bound provider,
+    /// boundary and observer (0.66.0).
+    ///
+    /// [`Session::turn_contained_observed`] with the harness's bindings. The
+    /// facade had no contained turn at all until this release, so an embedder who
+    /// bound their host once had to unbind and reach for [`Session`] the moment a
+    /// conversation needed to decompose — which is the "pick one" 0.66.0 removes
+    /// on both types.
+    ///
+    /// ```no_run
+    /// use io_harness::{Containment, Harness, OpenRouter, Store};
+    ///
+    /// # async fn demo() -> io_harness::Result<()> {
+    /// let provider = OpenRouter::from_env()?;
+    /// let store = Store::open("runs.db")?;
+    /// let harness = Harness::new(&provider, &store);
+    /// let mut session = harness.session("/repo")?;
+    /// let turn = harness
+    ///     .turn_contained(
+    ///         &mut session,
+    ///         "document every public module under docs/, one file per module",
+    ///         &Containment::new(12, 4, 2, 500_000),
+    ///     )
+    ///     .await?;
+    /// println!("{:?} {}", turn.outcome, store.children(turn.run_id)?.len());
+    /// # Ok(()) }
+    /// ```
+    pub async fn turn_contained(
+        &self,
+        session: &mut Session,
+        text: impl Into<String>,
+        containment: &Containment,
+    ) -> Result<TurnResult> {
+        session
+            .turn_contained_observed(
+                text,
+                self.provider,
+                self.store,
+                &self.policy,
+                self.approver,
+                containment,
+                self.observer,
+            )
+            .await
+    }
+
+    /// Take one turn in `session` that may fan out, under a contract the caller
+    /// shaped (0.66.0).
+    ///
+    /// [`Session::turn_contained_bounded_observed`] with the harness's bindings.
+    /// The contract is used **verbatim**, as [`turn_with`](Self::turn_with) uses
+    /// it — build it with [`workspace`](Self::workspace) or [`task`](Self::task)
+    /// to get the bound host configuration into it.
+    ///
+    /// The contract bounds the agent answering the turn; the [`Containment`]
+    /// bounds the tree it may grow, and the tree's one shared spend ceiling comes
+    /// from the containment rather than from the contract.
+    ///
+    /// ```no_run
+    /// use io_harness::{Containment, Harness, OpenRouter, Store, Verification};
+    ///
+    /// # async fn demo() -> io_harness::Result<()> {
+    /// let provider = OpenRouter::from_env()?;
+    /// let store = Store::open("runs.db")?;
+    /// let harness = Harness::new(&provider, &store);
+    /// let mut session = harness.session("/repo")?;
+    /// let contract = harness.task("document every public module", "/repo",
+    ///     Verification::Command {
+    ///         argv: vec!["cargo".into(), "doc".into()],
+    ///         expect_exit: 0,
+    ///     });
+    /// harness
+    ///     .turn_contained_with(&mut session, &contract, &Containment::new(12, 4, 2, 500_000))
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn turn_contained_with(
+        &self,
+        session: &mut Session,
+        contract: &TaskContract,
+        containment: &Containment,
+    ) -> Result<TurnResult> {
+        session
+            .turn_contained_bounded_observed(
+                contract,
+                self.provider,
+                self.store,
+                &self.policy,
+                self.approver,
+                containment,
+                self.observer,
+            )
+            .await
+    }
+
     /// The store this harness is bound to.
     ///
     /// So a caller can reach the trace — [`Store::run_summary`], the transcript,

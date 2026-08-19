@@ -72,6 +72,7 @@ into it.
 
 | Version | What it introduced | Entry |
 | --- | --- | --- |
+| 0.66.0 | A session turn that may fan out takes the caller's `TaskContract` — a plan gate, registered tools, a budget or a verification gate on a turn that can decompose — and the bound `Harness` gains a contained turn at all | [2026-08-19](../CHANGELOG.md#0660---2026-08-19) |
 | 0.65.0 | A run killed in the middle of a call the harness cannot inspect pauses for an operator's decision instead of repeating it — a durable journal of what was started, a recovery classification on the `Tool` trait, and a resume that refuses to drive past an open attempt | [2026-08-18](../CHANGELOG.md#0650---2026-08-18) |
 | 0.64.0 | A resumed run sends the model its own past turns rather than a third-person account of them — the assistant half of a transcript becomes durable and is restored beside the ledger, in both loops | [2026-08-17](../CHANGELOG.md#0640---2026-08-17) |
 | 0.63.0 | The host is bound once in a `Harness` — provider, store, boundary and the configuration that is not a property of any task — the storage library leaves the public contract, and a turn's framing becomes settable | [2026-08-17](../CHANGELOG.md#0630---2026-08-17) |

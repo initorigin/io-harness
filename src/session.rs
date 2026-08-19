@@ -683,6 +683,139 @@ impl Session {
         .await
     }
 
+    /// A turn that may fan out, under a contract the caller shaped (0.66.0).
+    ///
+    /// [`turn_contained`](Session::turn_contained) takes a string and builds the
+    /// session's default contract from it, so a turn that could decompose was the
+    /// one turn shape with no way to carry a plan gate, a preset, registered
+    /// tools, MCP servers, skills, a budget or a verification. The flat loop has
+    /// had [`turn_bounded`](Session::turn_bounded) for that since 0.36.0; this is
+    /// its contained counterpart, and the two arguments are the whole difference —
+    /// the contract says what bounds this agent, the [`Containment`] says what
+    /// bounds the tree it may grow.
+    ///
+    /// The contract is used as [`turn_bounded`](Session::turn_bounded) uses it: its
+    /// `root` is replaced by the session's, because a turn is about the
+    /// conversation's workspace and a contract naming another one would answer
+    /// about a different project. Bounds apply to this turn only.
+    ///
+    /// **What the containment decides and the contract does not.** The tree's one
+    /// shared spend ceiling is built from [`Containment`], not from the contract:
+    /// `max_tokens` bounds *this* agent, the containment's budget bounds every
+    /// agent in the turn together, and a child's own contract can raise neither.
+    ///
+    /// **What this loop reads differently, stated rather than discovered.** All of
+    /// it is equally true of [`run_tree`](crate::run_tree), which has taken a
+    /// contract since 0.39.0; none of it is new here, and none of it is a promise
+    /// that quietly does nothing:
+    ///
+    /// - [`TaskContract::routing`]'s `escalate_after` and `downshift_under` move
+    ///   the model per step in the flat loop only. A contained turn keeps the
+    ///   model it started on.
+    /// - The preflight checks a flat run makes before its first request — a
+    ///   [`Verification::Review`] contract with no
+    ///   reviewer, a reviewer that is the model under review, and
+    ///   `Routing::require_primary` against [`Provider::reachable`] — are not made
+    ///   here. Refusing a model that approves its own call is, at the root.
+    /// - `max_parallel_reads` bounds a batch the flat loop builds; a contained
+    ///   agent dispatches its reads one at a time.
+    /// - `file` is the single-file contract's target and has no meaning for a
+    ///   tree, which is refused without a workspace root.
+    ///
+    /// Everything else the contract carries — the gate, the toolbox, MCP servers,
+    /// skills, the plan gate, the prompt, the budgets, the sandbox, the hooks —
+    /// reaches the root agent exactly as it does on the flat loop.
+    ///
+    /// ```no_run
+    /// use io_harness::{ApproveAll, Containment, OpenRouter, Policy, Session, Store,
+    ///                  TaskContract, Verification};
+    ///
+    /// # async fn demo(store: &Store, policy: &Policy) -> io_harness::Result<()> {
+    /// let mut session = Session::open(store, "/repo")?;
+    ///
+    /// // A fan-out with a checkable definition of done: the children write the
+    /// // pages, and the turn reports `Success` only if the project's own command
+    /// // agrees at the end.
+    /// let contract = TaskContract::workspace("document every public module", "/repo")
+    ///     .with_verification(Verification::Command {
+    ///         argv: vec!["cargo".into(), "doc".into()],
+    ///         expect_exit: 0,
+    ///     })
+    ///     .with_max_steps(30);
+    ///
+    /// let turn = session
+    ///     .turn_contained_bounded(
+    ///         &contract,
+    ///         &OpenRouter::from_env()?,
+    ///         store,
+    ///         policy,
+    ///         &ApproveAll,
+    ///         &Containment::new(12, 4, 2, 500_000),
+    ///     )
+    ///     .await?;
+    /// println!("{:?}", turn.outcome);
+    /// # Ok(()) }
+    /// ```
+    pub async fn turn_contained_bounded<P: Provider>(
+        &mut self,
+        contract: &TaskContract,
+        provider: &P,
+        store: &Store,
+        policy: &Policy,
+        approver: &dyn Approver,
+        containment: &Containment,
+    ) -> Result<TurnResult> {
+        let contract = self.rooted(contract);
+        self.drive(
+            &contract,
+            provider,
+            store,
+            policy,
+            approver,
+            &Ignore,
+            Some(containment),
+            TurnExtras::default(),
+        )
+        .await
+    }
+
+    /// [`turn_contained_bounded`](Session::turn_contained_bounded), reporting to
+    /// `observer` as the fan-out happens and streaming the model's text as it
+    /// arrives.
+    ///
+    /// The observer is what makes a tree readable — children run at once and their
+    /// output interleaves, so `depth` and `run_id` are what turn the stream back
+    /// into something a person can follow. See
+    /// [`turn_contained_observed`](Session::turn_contained_observed) for the events
+    /// a fan-out adds.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn turn_contained_bounded_observed<P: Provider>(
+        &mut self,
+        contract: &TaskContract,
+        provider: &P,
+        store: &Store,
+        policy: &Policy,
+        approver: &dyn Approver,
+        containment: &Containment,
+        observer: &dyn Observer,
+    ) -> Result<TurnResult> {
+        let contract = self.rooted(contract);
+        self.drive(
+            &contract,
+            provider,
+            store,
+            policy,
+            approver,
+            observer,
+            Some(containment),
+            TurnExtras {
+                stream: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
     /// The whole conversation as one readable artifact (0.43.0).
     ///
     /// A pure read: no provider is called, no row is written, and a session whose
