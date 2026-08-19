@@ -486,7 +486,10 @@ budgeted, policy-bounded, checkpointed and resumable.
 turn decompose the work into contained sub-agents — under the session's own policy,
 one shared ledger for the turn, and the observer the operator is already reading. It
 stays one turn in the conversation whatever it spawned, and the turn entry points
-that predate it never offer the spawn tool.
+that predate it never offer the spawn tool. `Session::turn_contained_bounded` takes
+a `TaskContract` beside the `Containment`, so a turn that may fan out also carries a
+plan gate, registered tools, a budget or a verification gate — and
+`Harness::turn_contained_with` is the same with the host bound once.
 
 And not every turn is work. A turn's own first completion decides what the turn
 was: stopped on text, it closes as `TurnKind::Reply` with no step, no gate, no

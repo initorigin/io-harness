@@ -34,7 +34,7 @@ let id = session.id();
 # Ok(()) }
 ```
 
-## The seven entry points
+## The nine entry points
 
 | Method | Bound | Observer | Streams | Steerable | May spawn |
 | --- | --- | --- | --- | --- | --- |
@@ -45,6 +45,8 @@ let id = session.id();
 | `turn_bounded_observed` | your `TaskContract` | yes | yes | no | no |
 | `turn_contained` | no criterion | — | no | no | **yes** |
 | `turn_contained_observed` | no criterion | yes | yes | no | **yes** |
+| `turn_contained_bounded` | your `TaskContract` | — | no | no | **yes** |
+| `turn_contained_bounded_observed` | your `TaskContract` | yes | yes | no | **yes** |
 
 An unbounded turn runs with `Verification::None`: it ends when the agent stops
 calling tools, reported as `RunOutcome::Finished`. That is the conversational
@@ -387,6 +389,47 @@ What the fan-out inherits is what [composition.md](composition.md) already
 describes — inherit-and-narrow policy, one shared ledger, per-tier concurrency
 slots with a durable queue, the whole tree reconstructable from
 `Store::agent_events`. What is new is only the caller.
+
+**A contained turn can carry a contract too (0.66.0).** `turn_contained` builds
+the session's default contract from your text, which is the right shape for
+*decompose this* and the wrong one the moment the turn needs a plan gate, a
+preset, registered tools, a budget or a verification gate. `turn_contained_bounded`
+and `turn_contained_bounded_observed` take a `TaskContract` beside the
+`Containment` — the contract bounds the agent answering the turn, the containment
+bounds the tree it may grow:
+
+```no_run
+use io_harness::{ApproveAll, Containment, OpenRouter, Policy, Session, Store,
+                 TaskContract, Verification};
+
+# async fn demo(store: &Store, policy: &Policy) -> io_harness::Result<()> {
+let mut session = Session::open(store, "/repo")?;
+let contract = TaskContract::workspace("document every public module", "/repo")
+    .with_verification(Verification::Command {
+        argv: vec!["cargo".into(), "doc".into()],
+        expect_exit: 0,
+    })
+    .with_max_steps(30);
+
+let turn = session
+    .turn_contained_bounded(
+        &contract, &OpenRouter::from_env()?, store, policy, &ApproveAll,
+        &Containment::new(12, 4, 2, 500_000),
+    )
+    .await?;
+println!("{:?}", turn.outcome);
+# Ok(()) }
+```
+
+Four things the tree loop reads differently from the flat one, none of them new in
+0.66.0 — all of them are equally true of `run_tree`, which has taken a contract
+since 0.39.0. The tree's spend ceiling comes from the `Containment` and not from
+the contract's `max_tokens`, which bounds one agent. `Routing`'s `escalate_after`
+and `downshift_under` do not move the model per step. The preflight checks a flat
+run makes before its first request — a `Verification::Review` with no reviewer, a
+reviewer that is the model under review, `Routing::require_primary` — are not made,
+though a model approving its own call is still refused at the root. And
+`max_parallel_reads` bounds a batch only the flat loop builds.
 
 Four things are worth knowing before you reach for it:
 

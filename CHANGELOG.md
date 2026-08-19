@@ -26,6 +26,50 @@ notes are produced from it.
 
 ### Security
 
+## [0.66.0] - 2026-08-19
+
+A turn that may fan out takes the caller's contract, on the session and on the
+bound harness alike.
+
+`Session::turn_contained` built its own contract from the operator's text, so a
+turn that could decompose was the one turn shape with no way to carry a plan gate,
+a preset or a replaced system prompt, repository instructions, registered tools,
+MCP servers, skills, a step or token budget, or a verification gate — every one of
+which `Session::turn_bounded` has accepted since 0.36.0. A caller who wanted a
+fan-out *and* a contract was told to pick one. Nothing in the tree loop was
+missing: `run_tree` has taken a full contract since 0.39.0 and the loop reads all
+of it. What was missing was a way to reach it as a turn.
+
+`Harness` had no contained turn at all, so an embedder who bound their host once
+had to unbind the moment a conversation needed to decompose.
+
+### Added
+
+- `Session::turn_contained_bounded` and `Session::turn_contained_bounded_observed`
+  — a contained turn under a `TaskContract` the caller shaped, taken beside the
+  `Containment`. The contract bounds the agent answering the turn; the containment
+  bounds the tree it may grow. As with `turn_bounded`, the contract's `root` is
+  replaced by the session's, because a turn is about the conversation's workspace.
+- `Harness::turn_contained` and `Harness::turn_contained_with` — the same two
+  shapes with the provider, store, policy, approver and observer bound once.
+
+- What the tree loop reads differently from the flat one is now stated in the new
+  methods' rustdoc, in `docs/CONTRACT.md` and in `docs/guide/sessions.md`: the
+  tree's one shared spend ceiling comes from the `Containment` rather than from the
+  contract, `Routing`'s `escalate_after` and `downshift_under` do not move the model
+  per step, the preflight checks a flat run makes before its first request (a
+  `Verification::Review` with no reviewer, a reviewer that is the model under
+  review, `Routing::require_primary` against `Provider::reachable`) are not made
+  though a model approving its own call is still refused at the root, and
+  `max_parallel_reads` bounds a batch only the flat loop builds. None of this is new
+  in 0.66.0 — all of it has been true of `run_tree` since 0.39.0 — but a contract
+  reaching that loop from a session turn puts it in front of callers who have never
+  read it.
+
+Nothing else moves: every existing signature is unchanged, no schema moved,
+`CHECKPOINT_FORMAT` stays at 7, and a caller who never calls the new methods gets
+exactly the crate they had.
+
 ## [0.65.0] - 2026-08-18
 
 A run killed in the middle of a call the harness cannot inspect pauses for a
