@@ -1621,8 +1621,8 @@ async fn a_plan_gated_classifying_contained_turn_reads_the_boundary_in_force() {
 
     let seen = boundary_of(&opening, CONVERSATIONAL_ENDING)
         .expect("a gated contained classifying turn is told what will refuse it");
-    let enforced =
-        boundary_of(&work, CALL_TOOLS_ENDING).expect("the tree work prompt names the gate's boundary");
+    let enforced = boundary_of(&work, CALL_TOOLS_ENDING)
+        .expect("the tree work prompt names the gate's boundary");
 
     assert_eq!(
         seen, enforced,
@@ -1709,11 +1709,9 @@ async fn a_text_contained_turn_composes_what_a_default_contract_composes() {
         provider.system()
     };
 
-    let bounded = contained_conversational_system(
-        &TaskContract::workspace("hello", dir.path()),
-        dir.path(),
-    )
-    .await;
+    let bounded =
+        contained_conversational_system(&TaskContract::workspace("hello", dir.path()), dir.path())
+            .await;
 
     assert_eq!(
         text, bounded,

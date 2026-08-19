@@ -21,8 +21,8 @@ use std::sync::Mutex;
 
 use io_harness::approve::{Decision, DecisionFuture, Request};
 use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
-use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::provider::ToolSpec;
+use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{
     resume_tree_with_decision, ApproveAll, Approver, Containment, Policy, Provider, RunOutcome,
     Session, Store, TaskContract, Tool, ToolFuture, Toolbox, TurnKind, Verification,

@@ -414,7 +414,10 @@ struct Heard {
 impl Observer for Heard {
     fn event(&self, event: &RunEvent) -> Flow {
         if let EventKind::Spawned { .. } = &event.kind {
-            self.spawned.lock().unwrap().push((event.run_id, event.depth));
+            self.spawned
+                .lock()
+                .unwrap()
+                .push((event.run_id, event.depth));
         }
         Flow::Continue
     }
