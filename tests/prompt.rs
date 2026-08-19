@@ -1338,9 +1338,10 @@ async fn a_preset_is_opt_in_and_the_builtin_does_not_move() {
 // the conversational framing away and handed back the two claims 0.49.0 removed.
 //
 // All three live in `conversational_opening` and `compose`, which both loops share.
-// Only the flat loop is reachable from a caller's contract — `Session::turn_contained`
-// builds its own — so the tree loop's half is asserted in `src/run.rs`'s own tests
-// (`US-IO-HARNESS-0.60.3-I01`).
+// The flat loop's half is here; the tree loop's half was asserted inside `src/run.rs`
+// until 0.66.0, because no caller could produce a classifying contained turn
+// (`US-IO-HARNESS-0.60.3-I01`). `Session::turn_contained_bounded` is that caller, so
+// the tree half now lives at the bottom of this file, driven end to end like this one.
 
 /// The sentence a turn that may still answer must not be given.
 const UNCONDITIONAL_PLAN: &str = "Before you do anything else you must call `propose_plan`";
@@ -1515,3 +1516,167 @@ const CONCISE_MANNER: &str = "Act before you explain: make the change, then repo
 
 /// The working style `Preset::Careful` adds, and the whole of what it adds.
 const CAREFUL_MANNER: &str = "Before you report a change as done, check it: read back what you wrote, or run the project's own check where one exists. Say what you verified and how. If you could not verify something, say that instead of implying you did.";
+
+// ------------------------------------------- 0.66.0: the contained turn's own
+// framings, end to end
+//
+// 0.60.3 fixed three composition defects on the tree loop and could assert none
+// of them from out here: `Session::turn_contained` built its own contract, and
+// `run_tree` — which does take one — never sets `TurnExtras::classify`, so no
+// caller of any kind could produce a *classifying* contained turn. The three
+// claims lived in `src/run.rs`'s own `mod tests` for that reason
+// (`US-IO-HARNESS-0.60.3-I01`). `turn_contained_bounded` is the way in, and these
+// are those claims re-asserted against a prompt a real turn was made with.
+
+/// The tree loop's conversational framing, pinned here for the first release in
+/// which anything outside the crate can receive it.
+///
+/// Captured from `src/run/prompts.rs`'s literal rather than from a helper, for the
+/// reason the 0.44.0 baselines above give: a control built out of the thing it
+/// controls is not one.
+const V0660_CONVERSATIONAL_TREE: &str = "You are an agent working in a repository, in conversation with an operator. Use `grep`, `find`, `read_file`, and `write_file` as in a normal run. You may also decompose the work: call `spawn_agent` to launch a sub-agent that pursues a smaller goal over the same workspace, and its result is reported back to you. A sub-agent inherits your permissions and can only be more restricted, never less. Prefer spawning when parts of the task are independent. Work in small steps.";
+
+/// The prompt a *contained* classifying session turn's first completion is made
+/// with — the tree loop's counterpart of [`conversational_system_under`].
+async fn contained_conversational_system_under(
+    contract: &TaskContract,
+    root: &std::path::Path,
+    policy: &Policy,
+) -> String {
+    let provider = Rec::new(vec![vec![]]);
+    let store = Store::memory().unwrap();
+    let mut session = Session::open(&store, root).unwrap();
+    let _ = session
+        .turn_contained_bounded(
+            contract,
+            &provider,
+            &store,
+            policy,
+            &ApproveAll,
+            &Containment::new(4, 2, 2, 100_000),
+        )
+        .await;
+    provider.system()
+}
+
+/// Under the permissive default, as [`conversational_system`] is.
+async fn contained_conversational_system(
+    contract: &TaskContract,
+    root: &std::path::Path,
+) -> String {
+    contained_conversational_system_under(contract, root, &Policy::permissive()).await
+}
+
+/// **F1**, contained — a plan-gated classifying turn is not ordered to plan first.
+///
+/// Promoted from `the_tree_loops_gated_classifying_turn_may_still_answer`, which
+/// could only hand `conversational_opening` its arguments directly. What is read
+/// here is the `system` string the provider was actually given.
+#[tokio::test]
+async fn a_plan_gated_classifying_contained_turn_may_still_answer() {
+    let dir = workspace();
+    let c = gated(dir.path());
+
+    let opening = contained_conversational_system(&c, dir.path()).await;
+
+    assert!(
+        opening.starts_with(V0660_CONVERSATIONAL_TREE),
+        "a contained classifying turn was not framed as one:\n{opening}"
+    );
+    assert!(
+        !opening.contains(UNCONDITIONAL_PLAN),
+        "a turn allowed to answer was ordered to propose a plan first:\n{opening}"
+    );
+    assert!(
+        opening.contains("propose_plan"),
+        "the gate is still in force and the turn is still told about it:\n{opening}"
+    );
+    assert!(
+        opening.ends_with(CONVERSATIONAL_ENDING),
+        "the crate's own ending is not last:\n{opening}"
+    );
+
+    // The control, on the same loop: a contained turn already decided to be work
+    // reads one thing, not two.
+    let work = tree_system(&c).await;
+    assert!(
+        work.contains(UNCONDITIONAL_PLAN),
+        "the gate was weakened for work as well, which is not what this fixes:\n{work}"
+    );
+}
+
+/// **F2**, contained — a plan-gated classifying turn reads the boundary in force.
+///
+/// The two blocks of one turn must describe one boundary. Up to 0.60.2 both tree
+/// call sites handed `after_planning`, so a gated turn was told about the layer
+/// that was *not* refusing it — and the ungated arm is what says the narrowed
+/// boundary is a phase and not a permanent decoration.
+#[tokio::test]
+async fn a_plan_gated_classifying_contained_turn_reads_the_boundary_in_force() {
+    let dir = workspace();
+    let c = gated(dir.path());
+
+    let opening = contained_conversational_system(&c, dir.path()).await;
+    let work = tree_system(&c).await;
+
+    let seen = boundary_of(&opening, CONVERSATIONAL_ENDING)
+        .expect("a gated contained classifying turn is told what will refuse it");
+    let enforced =
+        boundary_of(&work, CALL_TOOLS_ENDING).expect("the tree work prompt names the gate's boundary");
+
+    assert_eq!(
+        seen, enforced,
+        "the two blocks of one contained turn describe two different boundaries"
+    );
+    assert!(
+        seen.contains("(plan-gate)"),
+        "the layer that will refuse is not the layer named:\n{seen}"
+    );
+    for act in ["Writing files", "Running a command"] {
+        assert!(seen.contains(act), "{act} is not accounted for:\n{seen}");
+    }
+
+    // And the other way round: with no gate there is no narrowed layer, so a turn
+    // is never told about one that has stopped refusing it.
+    let ungated = contained_conversational_system(&contract(dir.path()), dir.path()).await;
+    assert!(
+        !ungated.contains("(plan-gate)"),
+        "an ungated turn was told a gate refuses it:\n{ungated}"
+    );
+}
+
+/// **F3** — a preset shapes a contained turn's framing instead of replacing it.
+///
+/// `Preset::describe` returned a whole replacement description, so a preset on a
+/// contained turn discarded the paragraph that says the agent may fan out — the
+/// exact claim `Preset`'s own rustdoc makes about itself. Both tree framings are
+/// covered: the classifying one through a real session turn, the work one through
+/// `run_tree`.
+#[tokio::test]
+async fn a_preset_keeps_the_world_a_contained_agent_is_in() {
+    let dir = workspace();
+    let tree_work = without_ending(V0440_TREE, CALL_TOOLS_ENDING);
+
+    for preset in [Preset::Concise, Preset::Careful] {
+        let c = contract(dir.path()).with_system_prompt(SystemPrompt::Preset(preset));
+
+        let opening = contained_conversational_system(&c, dir.path()).await;
+        let work = tree_system(&c).await;
+
+        for (framing, composed, what) in [
+            (V0660_CONVERSATIONAL_TREE, &opening, "classifying"),
+            (tree_work.as_str(), &work, "work"),
+        ] {
+            assert!(
+                composed.starts_with(framing),
+                "{preset:?} replaced the {what} framing instead of shaping it:\n{composed}"
+            );
+            for kept in ["spawn_agent", "inherits your permissions"] {
+                assert!(
+                    composed.contains(kept),
+                    "{preset:?} dropped {kept} from a contained agent's {what} world:\n{composed}"
+                );
+            }
+        }
+    }
+}
