@@ -615,7 +615,7 @@ mod requested {
     use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
     use io_harness::{
         ApproveAll, Compaction, ContextBudget, EventKind, Flow, Observer, Policy, Provider,
-        RunEvent, Session, Store, TaskContract, Verification,
+        RunEvent, Session, Store, TaskContract, TranscriptTurn, TurnResult, Verification,
     };
     use serde_json::json;
 
@@ -1184,6 +1184,374 @@ mod requested {
         assert!(
             sizes[1] < sizes[0],
             "the retry must be smaller than what was refused: {sizes:?}"
+        );
+    }
+
+    // ------------------------------------- 0.69.0: a fold outlives its own turn
+
+    /// The paragraph a *second* fold of the same run writes, in F11. Distinct from
+    /// [`SUMMARY_SENTENCE`] so "the newest paragraph" and "the older one" are
+    /// telling apart rather than counting.
+    const SECOND_SUMMARY: &str = "VV-SECOND-FOLD-VV and then the tokeniser was rewritten.";
+
+    /// The seed entries one turn contributes, exactly as `Session::seed` writes
+    /// them: the operator's line, then the agent's.
+    ///
+    /// Built from the store rather than spelled out in each test, so an assertion
+    /// about what a fold left whole is byte-exact without restating the
+    /// conversation — and so it fails if the seed's own framing changes under it.
+    fn seeded(turn: &TranscriptTurn) -> String {
+        format!(
+            "\n[operator] {}\n\n[agent] {}\n",
+            turn.prompt,
+            turn.reply.clone().unwrap_or_default()
+        )
+    }
+
+    /// Six conversational turns, then one turn that is asked to fold them.
+    ///
+    /// Twelve seeded entries and `keep_recent: 2`: the fold stands in for ten of
+    /// them and leaves the last two whole. Two steps rather than one so the folding
+    /// turn ends by saying something — a turn with no reply seeds no `[agent]`
+    /// entry, and the folding turn's own reply is half of what F8 measures.
+    async fn a_folded_conversation(
+        dir: &std::path::Path,
+        store: &Store,
+        policy: &Policy,
+    ) -> (Session, TurnResult) {
+        let mut session = Session::open(store, dir).unwrap();
+        converse(&mut session, store, policy).await;
+
+        let talker = Talker::new(vec![vec![read("notes.txt")]]);
+        let folds = Folds::default();
+        let seen = Arc::clone(&folds.0);
+        let folding = session
+            .turn_bounded_observed(
+                &measured(dir, true, keeping_two()).with_max_steps(2),
+                &talker,
+                store,
+                policy,
+                &ApproveAll,
+                &folds,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the fixture turn did not fold, so nothing built on it discriminates"
+        );
+        (session, folding)
+    }
+
+    // ------------------------------------------------------------------ F8
+
+    /// F8 — the turn after a fold is seeded with the summary *and* with exactly
+    /// what the fold left whole.
+    ///
+    /// Through 0.68.0 a fold bought one turn of relief and no more: `summaries` is
+    /// keyed on `run_id`, every turn is its own run, and the next turn's seed was
+    /// rebuilt from `session_turns` however much of the conversation had just been
+    /// replaced. This is the assertion that says the paragraph survives the turn
+    /// that wrote it.
+    ///
+    /// Both halves discriminate and neither alone would. "Carries the summary" is
+    /// satisfied by a seed that replaces the whole conversation with a paragraph,
+    /// which would silently throw away the tail the fold deliberately kept;
+    /// "dropped the folded pairs" is satisfied by a seed that drops everything.
+    /// The pair that decides it is the paragraph followed, contiguously and in
+    /// order, by the two entries the fold left live and then by the folding turn
+    /// itself.
+    #[tokio::test]
+    async fn the_turn_after_a_fold_is_seeded_with_the_summary_and_what_the_fold_left() {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let (mut session, folding) = a_folded_conversation(dir.path(), &store, &policy).await;
+
+        let rows = store.summaries(folding.run_id).unwrap();
+        assert_eq!(rows.len(), 1, "one requested fold, one row: {rows:?}");
+        assert_eq!(
+            rows[0].folded, 10,
+            "the fixture is twelve seeded entries keeping two; a different number \
+             means the arithmetic below is measuring something else"
+        );
+
+        let turns = session.transcript(&store).unwrap().turns;
+
+        // The turn after it. Nothing here asks for a fold and the default budget
+        // leaves the threshold 19,200 tokens away, so whatever this request
+        // carries came from the seed and from nowhere else.
+        let later = Talker::new(Vec::new());
+        session
+            .turn(
+                "and what did we decide?",
+                &later,
+                &store,
+                &policy,
+                &ApproveAll,
+            )
+            .await
+            .unwrap();
+        let working = later.working();
+        let first = working.first().expect("the later turn made no request");
+
+        assert!(
+            first.contains(SUMMARY_SENTENCE),
+            "the turn after the fold lost the paragraph the fold paid for: {first}"
+        );
+        // What the fold consumed is gone — the oldest turn by its own marker, and
+        // then every prompt behind the kept tail, so a seed that dropped only the
+        // first pair cannot pass.
+        assert!(
+            !first.contains(MARKER),
+            "the folded conversation came back whole in the next turn"
+        );
+        for turn in &turns[..5] {
+            assert!(
+                !first.contains(&turn.prompt),
+                "a folded prompt is still being seeded: {}",
+                turn.prompt
+            );
+        }
+
+        // And the remainder, byte for byte: the paragraph, then the `keep_recent`
+        // tail in order, then the folding turn's own prompt and reply.
+        let remainder = format!(
+            "{}{}{}",
+            io_harness::context::summarised_entry(SUMMARY_SENTENCE),
+            seeded(&turns[5]),
+            seeded(&turns[6])
+        );
+        assert!(
+            first.contains(&remainder),
+            "the seed after the fold is not the paragraph followed by what it left:\n{first}"
+        );
+    }
+
+    // ------------------------------------------------------------------ F9
+
+    /// F9 — a session that never folded is seeded exactly as it was before.
+    ///
+    /// The control for the whole half, and it is only a control because the
+    /// fixture is the one F8 folds: the same six turns, the same twelve entries,
+    /// the same `keep_recent: 2`. Had the fold path fired here it would have
+    /// replaced ten of those entries with a paragraph, so "unchanged" is a claim
+    /// this fixture can actually break. A two-turn conversation could not — four
+    /// entries is under the fold's own floor, and it would read as passing whether
+    /// or not the new path ran.
+    #[tokio::test]
+    async fn a_session_that_never_folded_is_seeded_exactly_as_it_was_before() {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let mut session = Session::open(&store, dir.path()).unwrap();
+        converse(&mut session, &store, &policy).await;
+
+        let talker = Talker::new(vec![vec![read("notes.txt")]]);
+        session
+            .turn_bounded(
+                &measured(dir.path(), false, keeping_two()),
+                &talker,
+                &store,
+                &policy,
+                &ApproveAll,
+            )
+            .await
+            .unwrap();
+
+        let turns = session.transcript(&store).unwrap().turns;
+        assert!(
+            turns.iter().all(|t| t.summaries.is_empty()),
+            "this fixture was meant never to fold"
+        );
+
+        let working = talker.working();
+        let first = working.first().expect("the measured turn made no request");
+        // Every turn, in order, contiguous, with nothing between them: the shape
+        // `Session::seed` produced before this release, asserted as bytes rather
+        // than as a count so an inserted or reordered entry fails it.
+        let whole: String = turns[..6].iter().map(seeded).collect();
+        assert!(
+            first.contains(&whole),
+            "a session that never folded was seeded differently:\n{first}"
+        );
+        // The framing `context::summarised_entry` writes. A seed that folded
+        // carries it; this one must not.
+        assert!(
+            !first.contains("[earlier work, summarised]"),
+            "a summary was seeded into a session that never folded"
+        );
+    }
+
+    // ----------------------------------------------------------------- F10
+
+    /// F10 — the transcript still holds everything, and a reopened session is
+    /// seeded the same way.
+    ///
+    /// The fold is only acceptable because what it replaced stays on disk, so the
+    /// half of the claim that matters most is the one the model cannot see: after
+    /// F8's fold every turn is still in `Session::transcript` with its prompt and
+    /// reply whole, including the turn whose text the seed no longer carries.
+    ///
+    /// The second half is that the new seed is a property of the store rather than
+    /// of the live handle. A fresh `Session::reopen` holds no memory of the fold
+    /// and rebuilds the seed from the same rows, so it must produce the same
+    /// paragraph and the same remainder — which is what a resumed process gets.
+    #[tokio::test]
+    async fn the_transcript_still_holds_it_all_and_a_reopened_session_seeds_the_same() {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let (session, _) = a_folded_conversation(dir.path(), &store, &policy).await;
+
+        let transcript = session.transcript(&store).unwrap();
+        let turns = transcript.turns;
+        assert_eq!(
+            turns.len(),
+            7,
+            "six conversational turns and the folding one"
+        );
+        assert!(
+            turns[0].prompt.contains(MARKER),
+            "the folded turn's prompt is gone from the store, not merely from the model"
+        );
+        for turn in &turns {
+            assert!(
+                !turn.prompt.is_empty(),
+                "turn {} lost its prompt",
+                turn.turn_id
+            );
+            assert!(
+                turn.reply.as_deref().is_some_and(|r| !r.is_empty()),
+                "turn {} lost its reply",
+                turn.turn_id
+            );
+        }
+        assert!(
+            turns.iter().any(|t| !t.summaries.is_empty()),
+            "the fold is invisible in the transcript, so a reader cannot see what \
+             the paragraph stands in for"
+        );
+
+        // A handle that knows nothing but the session id.
+        let mut reopened = Session::reopen(&store, session.id()).unwrap();
+        assert_eq!(
+            reopened.head(),
+            session.head(),
+            "the reopened session is on a different head, so the seeds below are \
+             not comparable"
+        );
+
+        let later = Talker::new(Vec::new());
+        reopened
+            .turn(
+                "and what did we decide?",
+                &later,
+                &store,
+                &policy,
+                &ApproveAll,
+            )
+            .await
+            .unwrap();
+        let working = later.working();
+        let first = working.first().expect("the reopened turn made no request");
+
+        let remainder = format!(
+            "{}{}{}",
+            io_harness::context::summarised_entry(SUMMARY_SENTENCE),
+            seeded(&turns[5]),
+            seeded(&turns[6])
+        );
+        assert!(
+            first.contains(&remainder),
+            "a reopened session seeded a different conversation from the live one:\n{first}"
+        );
+    }
+
+    // ----------------------------------------------------------------- F11
+
+    /// F11 — a turn that folded twice seeds one paragraph and the right remainder.
+    ///
+    /// A later fold's prefix begins with the paragraph the earlier one wrote, so it
+    /// reaches one *fewer* seeded entry than its own `folded` count says. A
+    /// one-fold fixture cannot see that: with a single row the count and the reach
+    /// are the same number.
+    ///
+    /// The second fold is written as a `summaries` row rather than driven for real.
+    /// Reaching a second threshold crossing inside one turn needs a budget small
+    /// enough that the fold competes with the entry cap, and a fixture tuned that
+    /// finely asserts the tuning rather than the arithmetic. The row written here
+    /// is exactly the one a real second fold leaves: after the first fold the
+    /// ledger is the paragraph, the two kept entries and the turn's own step, so
+    /// the next fold at `keep_recent: 2` takes the first two — the paragraph, which
+    /// stood for ten entries, and one entry more.
+    ///
+    /// Eleven, therefore, not twelve. Twelve is what dropping the `- 1` produces,
+    /// and it eats the agent's half of the kept pair — which is why the assertion
+    /// below is on the entry immediately behind the new paragraph.
+    #[tokio::test]
+    async fn a_turn_that_folded_twice_seeds_the_newest_paragraph_and_the_second_folds_remainder() {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let (mut session, folding) = a_folded_conversation(dir.path(), &store, &policy).await;
+
+        let rows = store.summaries(folding.run_id).unwrap();
+        assert_eq!(rows.len(), 1, "the fixture folded more than once already");
+        store
+            .put_summary(
+                folding.run_id,
+                rows[0].through_step + 1,
+                2,
+                SECOND_SUMMARY,
+                io_harness::context::estimate_tokens(SECOND_SUMMARY),
+            )
+            .unwrap();
+
+        let turns = session.transcript(&store).unwrap().turns;
+
+        let later = Talker::new(Vec::new());
+        session
+            .turn(
+                "and what did we decide?",
+                &later,
+                &store,
+                &policy,
+                &ApproveAll,
+            )
+            .await
+            .unwrap();
+        let working = later.working();
+        let first = working.first().expect("the later turn made no request");
+
+        assert!(
+            first.contains(SECOND_SUMMARY),
+            "the newest paragraph was not seeded: {first}"
+        );
+        assert!(
+            !first.contains(SUMMARY_SENTENCE),
+            "both paragraphs were seeded; the newer one already stands in for the older"
+        );
+        assert!(
+            !first.contains(&turns[5].prompt),
+            "the second fold consumed this prompt and it came back anyway: {}",
+            turns[5].prompt
+        );
+
+        // The newest paragraph, then the one entry the second fold stopped short
+        // of, then the folding turn itself. Reaching one entry too far loses the
+        // agent's line; one too few leaves the operator's line in front of it.
+        let remainder = format!(
+            "{}\n[agent] {}\n{}",
+            io_harness::context::summarised_entry(SECOND_SUMMARY),
+            turns[5].reply.clone().unwrap_or_default(),
+            seeded(&turns[6])
+        );
+        assert!(
+            first.contains(&remainder),
+            "the second fold's remainder is not what was seeded:\n{first}"
         );
     }
 }

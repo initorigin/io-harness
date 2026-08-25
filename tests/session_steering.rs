@@ -16,8 +16,8 @@ use std::sync::Mutex;
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{
-    ApproveAll, Containment, EventKind, Flow, Ignore, Observer, Policy, Provider, RunEvent,
-    RunOutcome, RunStatus, Session, Steer, Store, SystemPrompt, TaskContract,
+    ApproveAll, Compaction, Containment, EventKind, Flow, Ignore, Observer, Policy, Provider,
+    RunEvent, RunOutcome, RunStatus, Session, Steer, Store, SystemPrompt, TaskContract,
 };
 use serde_json::json;
 
@@ -242,6 +242,173 @@ impl Provider for Recording {
     }
 }
 
+/// The sentence the summarising model writes (0.69.0). Distinctive, so a request
+/// can be asked whether it carries *this* summary rather than something
+/// summary-shaped.
+const FOLD_SUMMARY: &str = "ZZ-FOLDED-ZZ the earlier steps looked at notes.md.";
+
+/// How a summarising request is told apart from a working one, without the test
+/// re-implementing the prompt: the system block the crate sends for a fold says
+/// this and no working request does.
+const SUMMARISER: &str = "compacting an agent's own working notes";
+
+/// A string that appears in the first step's observation and nowhere else, so
+/// "the fold replaced it" is distinguishable from "the request happens not to
+/// mention it".
+///
+/// Carried by a *read* rather than by a write: a write's observation names the
+/// path and the size, so content sent through one never reaches the ledger and an
+/// assertion about the ledger losing it would pass whatever the fold did.
+const FIRST_STEP: &str = "QQ-ONLY-IN-THE-FIRST-STEP-QQ";
+
+/// Writes a file every step and answers the summariser, keeping every request.
+///
+/// The working half never stops asking, so a turn ends on its contract's bound
+/// rather than on the model's say-so and the operator has boundaries to send at.
+#[derive(Default)]
+struct Folding {
+    seen: Mutex<Vec<(String, String)>>,
+    working: AtomicUsize,
+    summarised: AtomicUsize,
+}
+
+impl Folding {
+    /// The requests that were not the summariser's, in order.
+    fn working(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(system, _)| !system.contains(SUMMARISER))
+            .map(|(_, user)| user.clone())
+            .collect()
+    }
+
+    fn summarised(&self) -> usize {
+        self.summarised.load(Ordering::SeqCst)
+    }
+}
+
+impl Provider for Folding {
+    async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        let summarising = req.system.contains(SUMMARISER);
+        self.seen
+            .lock()
+            .unwrap()
+            .push((req.system.clone(), req.user.clone()));
+        if summarising {
+            self.summarised.fetch_add(1, Ordering::SeqCst);
+            return Ok(CompletionResponse {
+                text: Some(FOLD_SUMMARY.into()),
+                usage: Some(usage()),
+                ..Default::default()
+            });
+        }
+        let n = self.working.fetch_add(1, Ordering::SeqCst);
+        // The first step reads the marked file, so the marker is an observation
+        // the fold can be asked to have replaced; every step after it writes, so
+        // the ledger keeps growing by one entry a step.
+        let call = if n == 0 {
+            ToolCall {
+                name: "read_file".into(),
+                arguments: json!({ "path": "marker.md" }),
+            }
+        } else {
+            ToolCall {
+                name: "write_file".into(),
+                arguments: json!({ "path": "notes.md", "content": format!("pass {n}\n") }),
+            }
+        };
+        Ok(CompletionResponse {
+            tool_calls: vec![call],
+            usage: Some(usage()),
+            ..Default::default()
+        })
+    }
+
+    fn name(&self) -> &str {
+        "folding"
+    }
+}
+
+/// The operator at the keyboard (0.69.0): sends `fold()` at the step boundaries
+/// named, optionally an interrupt beside one of them, and counts the folds that
+/// resulted.
+///
+/// Sending and counting are one object because a turn takes one observer, and
+/// counting `Compacted` off the event stream keeps the "did it fold" half
+/// independent of the store.
+struct Operator {
+    steer: Steer,
+    /// Step-event indices after which a fold is asked for.
+    fold_after: Vec<usize>,
+    /// The step-event index after which the turn is also interrupted, if any.
+    interrupt_after: Option<usize>,
+    steps: AtomicUsize,
+    folded: Mutex<Vec<u32>>,
+}
+
+impl Operator {
+    fn folding_after(steer: Steer, fold_after: Vec<usize>) -> Self {
+        Self {
+            steer,
+            fold_after,
+            interrupt_after: None,
+            steps: AtomicUsize::new(0),
+            folded: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn also_interrupting_after(mut self, step: usize) -> Self {
+        self.interrupt_after = Some(step);
+        self
+    }
+
+    /// The `through_step` of every fold this turn emitted, in order.
+    fn folds(&self) -> Vec<u32> {
+        self.folded.lock().unwrap().clone()
+    }
+}
+
+impl Observer for Operator {
+    fn event(&self, event: &RunEvent) -> Flow {
+        match &event.kind {
+            EventKind::Step { .. } => {
+                let n = self.steps.fetch_add(1, Ordering::SeqCst);
+                // Ignored on a closed channel, for the reason every other observer
+                // here ignores it: an observer must not panic.
+                if self.fold_after.contains(&n) {
+                    let _ = self.steer.fold();
+                }
+                // Sent after the fold and read in the same drain, which is the
+                // arrangement F5 is about.
+                if self.interrupt_after == Some(n) {
+                    let _ = self.steer.interrupt();
+                }
+            }
+            EventKind::Compacted { through_step, .. } => {
+                self.folded.lock().unwrap().push(*through_step);
+            }
+            _ => {}
+        }
+        Flow::Continue
+    }
+}
+
+/// A turn long enough to fold, under a threshold that never fires on its own.
+///
+/// `keep_recent: 1` so a fold is possible after one durable observation, and
+/// `at_share: 0.99` so nothing this small crosses the threshold — any fold in
+/// these tests is one somebody asked for.
+fn foldable(goal: &str, root: &std::path::Path, max_steps: u32) -> TaskContract {
+    TaskContract::workspace(goal, root)
+        .with_max_steps(max_steps)
+        .with_compaction(Compaction {
+            at_share: 0.99,
+            keep_recent: 1,
+        })
+}
+
 fn usage() -> Usage {
     Usage {
         total_tokens: 3,
@@ -252,6 +419,9 @@ fn usage() -> Usage {
 fn workspace() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("notes.md"), "# notes\n").unwrap();
+    // Read by the first step of a foldable turn (0.69.0), so the oldest
+    // observation carries a string nothing else does.
+    std::fs::write(dir.path().join("marker.md"), format!("{FIRST_STEP}\n")).unwrap();
     std::fs::create_dir_all(dir.path().join("docs")).unwrap();
     std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
     std::fs::write(dir.path().join("secrets/key.txt"), "the real key\n").unwrap();
@@ -500,14 +670,66 @@ async fn a_steer_sent_after_the_turn_is_an_error_rather_than_silence() {
 
     // Everything sent, in order, with the interrupt reported alongside — an
     // operator who typed a correction and then hit interrupt sent both.
-    let (messages, interrupted) = inbox.pending();
-    assert_eq!(messages, vec!["first".to_string(), "second".to_string()]);
-    assert!(interrupted);
-    // Drained is drained.
-    assert_eq!(inbox.pending(), (Vec::new(), false));
+    let steering = inbox.pending();
+    assert_eq!(
+        steering.messages,
+        vec!["first".to_string(), "second".to_string()]
+    );
+    assert!(steering.interrupted);
+    // Drained is drained. Per field rather than against a literal: `Steering` is
+    // `#[non_exhaustive]`, so a struct expression here would not compile outside
+    // the crate — which is the property the type exists to have.
+    let drained = inbox.pending();
+    assert!(drained.messages.is_empty());
+    assert!(!drained.interrupted);
+    assert!(!drained.fold);
 
     drop(inbox);
     assert!(steer.say("nobody home").is_err());
+}
+
+// --------------------------------------------------------------- F7 (0.69.0)
+
+/// **F7 (0.69.0)** — the drained state is complete, and a fold nobody read is
+/// visible.
+///
+/// The surface criterion for this release's one break. `pending()` returned
+/// `(Vec<String>, bool)` through 0.68.0, and a third thing an operator can send
+/// either grows that tuple — the same break again at the fourth — or is dropped
+/// from it silently, which loses a request the operator was told had been sent.
+/// This is the test that fails if it is dropped.
+#[tokio::test]
+async fn a_fold_nobody_read_is_still_in_the_inbox_and_a_late_one_is_an_error() {
+    let (steer, inbox) = Steer::channel();
+    steer.say("prefer the smaller diff").unwrap();
+    steer.fold().unwrap();
+
+    // All three, from one drain: the message the operator typed and the fold they
+    // asked for, with no interrupt invented alongside them.
+    let steering = inbox.pending();
+    assert_eq!(
+        steering.messages,
+        vec!["prefer the smaller diff".to_string()]
+    );
+    assert!(steering.fold, "the fold request was dropped on the way out");
+    assert!(!steering.interrupted);
+
+    // Two folds in one drain are one fold: the second would summarise a ledger the
+    // first has just replaced with a paragraph.
+    steer.fold().unwrap();
+    steer.fold().unwrap();
+    let twice = inbox.pending();
+    assert!(twice.fold);
+    assert!(twice.messages.is_empty());
+
+    let drained = inbox.pending();
+    assert!(!drained.fold, "a drained fold was reported a second time");
+
+    drop(inbox);
+    assert!(
+        steer.fold().is_err(),
+        "a fold asked for after the turn ended was swallowed rather than refused"
+    );
 }
 
 // ------------------------------------------------- a steered turn with a contract
@@ -753,4 +975,268 @@ async fn both_steered_entry_points_run_in_the_sessions_workspace() {
         "# notes\n",
         "the contract's own root was used, so a steered fan-out escaped its conversation"
     );
+}
+
+// ------------------------------------------------- the operator's fold (0.69.0)
+
+/// **F1 (0.69.0)** — a fold sent mid-turn lands at the next step boundary, before
+/// that step's request.
+///
+/// Both halves are asserted because either alone is something the crate could
+/// already do: that it folded at all, and that the fold reached the request built
+/// *after* the boundary that read it rather than the one after that. The
+/// threshold is set where nothing this small crosses it, so the fold is
+/// attributable to the operator and to nothing else.
+#[tokio::test]
+async fn a_fold_asked_for_mid_turn_lands_at_the_next_boundary() {
+    let ws = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Folding::default();
+    let (steer, inbox) = Steer::channel();
+    // Sent after the second step commits: with `keep_recent: 1` a fold needs more
+    // than one entry to reach, and a request the loop cannot honour is consumed
+    // rather than held.
+    let operator = Operator::folding_after(steer, vec![1]);
+
+    let contract = foldable("keep the notes moving", ws.path(), 4);
+    let mut session = Session::open(&store, ws.path()).unwrap();
+    let turn = session
+        .turn_bounded_steered(
+            &contract,
+            &provider,
+            &store,
+            &guarded(),
+            &ApproveAll,
+            &operator,
+            &inbox,
+        )
+        .await
+        .unwrap();
+
+    // 1. It folded, once, and at the boundary that read the request rather than at
+    //    the turn's first step — which is what tells this apart from `fold_now`.
+    assert_eq!(
+        operator.folds().len(),
+        1,
+        "expected exactly one fold, got {:?}",
+        operator.folds()
+    );
+    assert!(
+        operator.folds()[0] >= 3,
+        "the fold landed at step {}, which is earlier than the boundary the operator sent at",
+        operator.folds()[0]
+    );
+    assert_eq!(
+        provider.summarised(),
+        1,
+        "the summariser ran the wrong number of times"
+    );
+    assert_eq!(
+        store.summaries(turn.run_id).unwrap().len(),
+        1,
+        "the fold left no durable summary"
+    );
+
+    // 2. The request built after that boundary carries the summary, and no longer
+    //    carries the observation the fold replaced. The marker is the
+    //    discriminating half: a request that merely stopped mentioning the first
+    //    step would pass the first assertion on its own.
+    let working = provider.working();
+    // The second request is the first one built after the read committed, so it is
+    // where the marker is if the ledger ever held it. Without this the assertion
+    // below would pass against a marker that never arrived.
+    assert!(
+        working[1].contains(FIRST_STEP),
+        "the first step's own observation never reached the ledger, so its absence later proves \
+         nothing"
+    );
+    let after = working
+        .iter()
+        .find(|user| user.contains(FOLD_SUMMARY))
+        .expect("no request after the fold carried the summary");
+    assert!(
+        !after.contains(FIRST_STEP),
+        "the request carrying the summary still carried what the summary replaced"
+    );
+}
+
+/// **F2 (0.69.0)** — the same turn with nothing sent does not fold.
+///
+/// The control F1 is meaningless without: it says the fold came from the operator
+/// rather than from a fixture that folds on its own, and it is the criterion that
+/// proves a caller who never asks sees exactly 0.68.0's behaviour.
+#[tokio::test]
+async fn without_a_send_the_same_turn_does_not_fold() {
+    let ws = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Folding::default();
+    let (steer, inbox) = Steer::channel();
+    // The same operator, sending at no boundary at all.
+    let operator = Operator::folding_after(steer, vec![]);
+
+    let contract = foldable("keep the notes moving", ws.path(), 4);
+    let mut session = Session::open(&store, ws.path()).unwrap();
+    let turn = session
+        .turn_bounded_steered(
+            &contract,
+            &provider,
+            &store,
+            &guarded(),
+            &ApproveAll,
+            &operator,
+            &inbox,
+        )
+        .await
+        .unwrap();
+
+    assert!(operator.folds().is_empty(), "an unasked-for fold happened");
+    assert_eq!(provider.summarised(), 0, "the summariser was called anyway");
+    assert!(store.summaries(turn.run_id).unwrap().is_empty());
+    assert!(
+        provider.working().last().unwrap().contains(FIRST_STEP),
+        "the conversation was shortened without anybody asking"
+    );
+}
+
+/// **F3 (0.69.0)** — an off setting stays off.
+///
+/// `Compaction { at_share: 1.0, .. }` never folds, and this trigger is not an
+/// exception. The alternative reading — an explicit request beats an explicit off
+/// — is the one somebody implements by accident, and it would make "off" mean two
+/// things: the crate already promises this answer for the overflow recovery.
+#[tokio::test]
+async fn a_fold_asked_for_does_not_override_an_off_setting() {
+    let ws = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Folding::default();
+    let (steer, inbox) = Steer::channel();
+    let operator = Operator::folding_after(steer, vec![1]);
+
+    let contract = TaskContract::workspace("keep the notes moving", ws.path())
+        .with_max_steps(4)
+        .with_compaction(Compaction {
+            at_share: 1.0,
+            keep_recent: 1,
+        });
+    let mut session = Session::open(&store, ws.path()).unwrap();
+    let turn = session
+        .turn_bounded_steered(
+            &contract,
+            &provider,
+            &store,
+            &guarded(),
+            &ApproveAll,
+            &operator,
+            &inbox,
+        )
+        .await
+        .unwrap();
+
+    assert!(operator.folds().is_empty(), "an off setting folded anyway");
+    assert_eq!(provider.summarised(), 0, "an off setting bought a summary");
+    assert!(store.summaries(turn.run_id).unwrap().is_empty());
+    // And the turn is unharmed: a request that cannot be honoured is not an error.
+    assert!(
+        matches!(turn.outcome, RunOutcome::StepCapReached { steps: 4 }),
+        "the turn did not run to its bound, got {:?}",
+        turn.outcome
+    );
+}
+
+/// **F4 (0.69.0)** — one send, one fold; a second send folds again.
+///
+/// The bug this catches is the flag being read rather than taken, which turns one
+/// request into a mode where every step folds. Asserted over a turn long enough
+/// for a second fold to be visible, with the threshold set high enough that any
+/// fold at all is attributable to a send.
+#[tokio::test]
+async fn each_send_folds_once_and_not_every_step_after_it() {
+    let ws = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Folding::default();
+    let (steer, inbox) = Steer::channel();
+    // Two sends, two boundaries apart, over a turn of six steps — both at
+    // boundaries where the ledger is long enough for a fold to reach.
+    let operator = Operator::folding_after(steer, vec![1, 3]);
+
+    let contract = foldable("keep the notes moving", ws.path(), 6);
+    let mut session = Session::open(&store, ws.path()).unwrap();
+    let turn = session
+        .turn_bounded_steered(
+            &contract,
+            &provider,
+            &store,
+            &guarded(),
+            &ApproveAll,
+            &operator,
+            &inbox,
+        )
+        .await
+        .unwrap();
+
+    let folds = operator.folds();
+    assert_eq!(
+        folds.len(),
+        2,
+        "two sends produced {} folds: {:?}",
+        folds.len(),
+        folds
+    );
+    assert!(
+        folds[0] < folds[1],
+        "both folds landed on the same step: {folds:?}"
+    );
+    assert_eq!(
+        store.summaries(turn.run_id).unwrap().len(),
+        2,
+        "the second fold wrote no summary of its own"
+    );
+}
+
+/// **F5 (0.69.0)** — an interrupt beside a fold ends the turn and does not fold.
+///
+/// Both are sent before the same boundary, so the drain holds both and the order
+/// it answers them in is the behaviour. Stopping wins: a summariser call spent on
+/// a turn nobody is going to read is money the run does not get back.
+#[tokio::test]
+async fn an_interrupt_beside_a_fold_stops_the_turn_and_buys_no_summary() {
+    let ws = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Folding::default();
+    let (steer, inbox) = Steer::channel();
+    // Sent at a boundary where a fold is genuinely reachable — F1 folds at this
+    // one — so the absence below is of something that could have happened.
+    let operator = Operator::folding_after(steer, vec![1]).also_interrupting_after(1);
+
+    let contract = foldable("keep the notes moving", ws.path(), 6);
+    let mut session = Session::open(&store, ws.path()).unwrap();
+    let turn = session
+        .turn_bounded_steered(
+            &contract,
+            &provider,
+            &store,
+            &guarded(),
+            &ApproveAll,
+            &operator,
+            &inbox,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(turn.outcome, RunOutcome::Cancelled { .. }),
+        "the interrupt did not end the turn, got {:?}",
+        turn.outcome
+    );
+    assert!(
+        operator.folds().is_empty(),
+        "the turn folded on its way out: {:?}",
+        operator.folds()
+    );
+    assert_eq!(
+        provider.summarised(),
+        0,
+        "a summary was bought for a turn that was being stopped"
+    );
+    assert!(store.summaries(turn.run_id).unwrap().is_empty());
 }
