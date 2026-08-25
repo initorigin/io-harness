@@ -42,7 +42,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.66"
+io-harness = "0.67"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -490,6 +490,11 @@ that predate it never offer the spawn tool. `Session::turn_contained_bounded` ta
 a `TaskContract` beside the `Containment`, so a turn that may fan out also carries a
 plan gate, registered tools, a budget or a verification gate — and
 `Harness::turn_contained_with` is the same with the host bound once.
+`Session::turn_bounded_steered` and `Session::turn_contained_bounded_steered` add
+the operator's `SteerInbox` to that same call, so a turn carrying a contract can be
+corrected while it runs instead of only before it starts. The correction reaches
+the root of a fan-out and never a child, which is never steerable by an operator it
+has not spoken to.
 
 And not every turn is work. A turn's own first completion decides what the turn
 was: stopped on text, it closes as `TurnKind::Reply` with no step, no gate, no

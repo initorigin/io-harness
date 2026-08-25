@@ -1144,3 +1144,172 @@ async fn a_contained_turns_step_cap_is_the_contracts() {
         "the model was asked for more completions than the cap allows"
     );
 }
+
+// ---------------------------------------------------- a steered fan-out (0.67.0)
+
+/// What the operator says mid-turn. Distinctive, so its presence or absence in a
+/// prompt is not a coincidence.
+const OPERATOR: &str = "only the public modules";
+
+/// The fan-out both 0.67.0 criteria are asserted against: the root spawns one
+/// child, the child does its work, the root then stops on text.
+///
+/// The script order is what tells the root's completions from the child's — the
+/// tree awaits a child inside the step that spawned it, so completion 0 is the
+/// root's first step, completion 1 is the child's, and completion 2 is the root's
+/// second. Every other test in this file relies on the same ordering.
+fn one_child() -> Mock {
+    Mock::new(vec![
+        Say::Calls(vec![spawn("write a.txt saying A", "a.txt", "A")]),
+        Say::Calls(vec![write("a.txt", "A")]),
+        Say::Text("done"),
+    ])
+}
+
+/// Says the operator's correction the moment a child is spawned — which is
+/// emitted before the child's own events start arriving, so the message is
+/// **pending in the inbox while the child runs**.
+///
+/// That timing is the whole point. A message queued before the turn would be
+/// drained by the root's first boundary and gone before any child existed, and a
+/// child that then failed to see it would prove nothing about whether children can
+/// be steered.
+struct SayOnSpawn(io_harness::Steer, AtomicUsize);
+
+impl Observer for SayOnSpawn {
+    fn event(&self, event: &RunEvent) -> Flow {
+        if matches!(event.kind, EventKind::Spawned { .. })
+            && self.1.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            // Ignored on a closed channel: an observer must not panic.
+            let _ = self.0.say(OPERATOR);
+        }
+        Flow::Continue
+    }
+}
+
+/// **F2 (0.67.0)** — a contained turn is steerable at its root, and the tree loop's
+/// drain executes.
+///
+/// `src/run/tree.rs` has called `drain_steer` at its own step boundary since the
+/// loop was written, and until this release no contained entry point could pass an
+/// inbox — so the call had never executed from a real caller. This is its first
+/// end-to-end execution, and the fan-out still has to happen underneath it: a
+/// steerable turn that stopped decomposing would be a different feature.
+#[tokio::test]
+async fn a_contained_bounded_turn_is_steerable_at_its_root() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let mut session = Session::open(&store, dir.path()).unwrap();
+    let contract = TaskContract::workspace("decompose it", dir.path()).with_max_steps(3);
+    let mock = one_child();
+    let (steer, inbox) = io_harness::Steer::channel();
+
+    let turn = session
+        .turn_contained_bounded_steered(
+            &contract,
+            &mock,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &roomy(),
+            &SayOnSpawn(steer, AtomicUsize::new(0)),
+            &inbox,
+        )
+        .await
+        .unwrap();
+
+    // Completion 2 is the root's second step — its first boundary after the
+    // message was sent. Completion 0 is the root's first step, before it existed.
+    assert!(
+        !mock.user(0).contains(OPERATOR),
+        "the message was in the root's context before it was sent, so this says \
+         nothing about a boundary"
+    );
+    assert!(
+        mock.user(2).contains(OPERATOR),
+        "the tree loop's drain never put the operator's message in the root's context: {}",
+        mock.user(2)
+    );
+    // The same claim from the store rather than from the provider's recollection.
+    let root_steps = store.steps(turn.run_id).unwrap();
+    assert!(
+        root_steps.iter().any(|s| s.prompt.contains(OPERATOR)),
+        "the message is not in the root run's own trace"
+    );
+
+    // ...and the fan-out still happened underneath it.
+    let children = store.children(turn.run_id).unwrap();
+    assert_eq!(children.len(), 1, "one child, under this turn's run");
+    assert!(
+        !store.steps(children[0]).unwrap().is_empty(),
+        "the child took no step of its own"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "A",
+        "the child's work never reached the workspace"
+    );
+}
+
+/// **F3 (0.67.0)** — a child is not steerable, and the root of the same turn is.
+///
+/// `Tree::extras` hands a child the empty set, so a sub-agent is never steerable by
+/// an operator it has not spoken to. That is a deliberate boundary rather than an
+/// oversight, so it is asserted rather than assumed — and asserted with the
+/// positive control in the same test, because an absence that would also hold if
+/// the fixture never ran is not evidence of anything.
+#[tokio::test]
+async fn the_operators_message_reaches_the_root_and_not_the_child() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let mut session = Session::open(&store, dir.path()).unwrap();
+    let contract = TaskContract::workspace("decompose it", dir.path()).with_max_steps(3);
+    let mock = one_child();
+    let (steer, inbox) = io_harness::Steer::channel();
+
+    let turn = session
+        .turn_contained_bounded_steered(
+            &contract,
+            &mock,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &roomy(),
+            &SayOnSpawn(steer, AtomicUsize::new(0)),
+            &inbox,
+        )
+        .await
+        .unwrap();
+
+    // The control: the root did read it, at its next boundary. Without this line
+    // the assertion below would pass on a fixture that never delivered the message
+    // to anyone.
+    assert!(
+        mock.user(2).contains(OPERATOR),
+        "the root never read the message, so nothing here is evidence about the child"
+    );
+    // The child's own completion, which is the second in script order — and it ran
+    // while the message was sitting unread in the inbox.
+    assert!(
+        !mock.user(1).contains(OPERATOR),
+        "the operator's message reached a sub-agent they never spoke to: {}",
+        mock.user(1)
+    );
+
+    // And from the store: nothing in the child's trace carries it, and the child
+    // completed its work regardless.
+    let children = store.children(turn.run_id).unwrap();
+    assert_eq!(children.len(), 1);
+    let child_steps = store.steps(children[0]).unwrap();
+    assert!(!child_steps.is_empty(), "the child took no step of its own");
+    assert!(
+        !child_steps.iter().any(|s| s.prompt.contains(OPERATOR)),
+        "the child's trace carries the operator's message"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "A",
+        "the child did not complete its work"
+    );
+}
