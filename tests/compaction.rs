@@ -595,3 +595,602 @@ mod the_fold {
         );
     }
 }
+
+// ------------------------------------------------------- the fold that was asked for
+
+/// Caller-triggered compaction (0.68.0): `TaskContract::fold_now`.
+///
+/// Every test here drives a **session turn** rather than a bare run, because the
+/// thing an operator asks to fold is the conversation, and a conversation only
+/// reaches a ledger through `seed_conversation`. A run-level fixture would fold
+/// this run's own reads and prove nothing about the case the release exists for.
+///
+/// The threshold is deliberately left far out of reach in every test but the
+/// overflow one. If the ledger crossed it, a fold would happen whether or not
+/// anybody asked, and none of these assertions would discriminate.
+mod requested {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
+    use io_harness::{
+        ApproveAll, Compaction, ContextBudget, EventKind, Flow, Observer, Policy, Provider,
+        RunEvent, Session, Store, TaskContract, Verification,
+    };
+    use serde_json::json;
+
+    const SUMMARISER: &str = "compacting an agent's own working notes";
+    const SUMMARY_SENTENCE: &str = "YY-ASKED-FOR-IT-YY the thread so far was about the parser.";
+    /// Appears in the oldest turn of the conversation and nowhere else, so "the
+    /// seed was folded" is distinguishable from "the seed was dropped".
+    const MARKER: &str = "WW-OLDEST-TURN-ONLY-WW";
+
+    /// Answers a summarising request with [`SUMMARY_SENTENCE`], a conversational
+    /// one with a sentence, and a working one from a script. Records every
+    /// request so a test can ask what the *first* working one carried.
+    struct Talker {
+        steps: Vec<Vec<ToolCall>>,
+        at: AtomicUsize,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+        summarised: Arc<AtomicUsize>,
+    }
+
+    impl Talker {
+        fn new(steps: Vec<Vec<ToolCall>>) -> Self {
+            Self {
+                steps,
+                at: AtomicUsize::new(0),
+                seen: Arc::new(Mutex::new(Vec::new())),
+                summarised: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// The user blocks of the requests that were not the summariser's, in
+        /// order. `working()[0]` is the turn's first request, which is the one
+        /// this release is about.
+        fn working(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(system, _)| !system.contains(SUMMARISER))
+                .map(|(_, user)| user.clone())
+                .collect()
+        }
+
+        fn summarising_calls(&self) -> usize {
+            self.summarised.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Provider for Talker {
+        async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+            let summarising = req.system.contains(SUMMARISER);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((req.system.clone(), req.user.clone()));
+            let usage = Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+                ..Default::default()
+            });
+            if summarising {
+                self.summarised.fetch_add(1, Ordering::SeqCst);
+                return Ok(CompletionResponse {
+                    text: Some(SUMMARY_SENTENCE.into()),
+                    usage,
+                    ..Default::default()
+                });
+            }
+            let i = self.at.fetch_add(1, Ordering::SeqCst);
+            match self.steps.get(i) {
+                Some(calls) => Ok(CompletionResponse {
+                    tool_calls: calls.clone(),
+                    usage,
+                    ..Default::default()
+                }),
+                None => Ok(CompletionResponse {
+                    text: Some("nothing further".into()),
+                    usage,
+                    ..Default::default()
+                }),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Folds(Arc<Mutex<Vec<(u32, u64, u64)>>>);
+
+    impl Observer for Folds {
+        fn event(&self, event: &RunEvent) -> Flow {
+            if let EventKind::Compacted {
+                through_step,
+                before_tokens,
+                after_tokens,
+            } = &event.kind
+            {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*through_step, *before_tokens, *after_tokens));
+            }
+            Flow::Continue
+        }
+    }
+
+    fn read(path: &str) -> ToolCall {
+        ToolCall {
+            name: "read_file".into(),
+            arguments: json!({ "path": path }),
+        }
+    }
+
+    fn open_policy() -> Policy {
+        Policy::default()
+            .layer("test")
+            .allow_read("*")
+            .allow_write("*")
+    }
+
+    /// A workspace with one small file, so a working step has something to do
+    /// that does not itself grow the ledger enough to cross a threshold.
+    fn workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "one short line\n").unwrap();
+        dir
+    }
+
+    /// Six conversational turns, the oldest carrying [`MARKER`], so the next
+    /// turn's seed is twelve observations deep.
+    ///
+    /// Conversational rather than working turns on purpose: what is being folded
+    /// has to be the conversation, and this is how a conversation gets into a
+    /// session.
+    async fn converse(session: &mut Session, store: &Store, policy: &Policy) {
+        for i in 0..6 {
+            let prompt = if i == 0 {
+                format!("{MARKER} where did we get to on the parser?")
+            } else {
+                format!("and then what happened at stage {i}?")
+            };
+            let talker = Talker::new(Vec::new());
+            session
+                .turn(&prompt, &talker, store, policy, &ApproveAll)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The measured turn's contract. Verification is set and never satisfied, so
+    /// the turn is work rather than a reply — a classifying turn answers before
+    /// the loop and never reaches a fold at all.
+    ///
+    /// The context budget is the default, so the threshold is 19,200 tokens and a
+    /// twelve-entry conversation is nowhere near it. Any fold in these tests is
+    /// therefore one that was asked for.
+    fn measured(root: &std::path::Path, fold_now: bool, folding: Compaction) -> TaskContract {
+        TaskContract::workspace("summarise and continue", root)
+            .with_verification(Verification::WorkspaceFileContains {
+                file: "unreachable.txt".into(),
+                needle: "never".into(),
+            })
+            .with_max_steps(1)
+            .with_context_budget(ContextBudget::default())
+            .with_compaction(folding)
+            .with_fold_now(fold_now)
+    }
+
+    fn keeping_two() -> Compaction {
+        Compaction {
+            at_share: 0.8,
+            keep_recent: 2,
+        }
+    }
+
+    // ------------------------------------------------------------------ F1
+
+    /// F1 — a requested fold lands before the turn's first request.
+    ///
+    /// Both halves matter and neither alone would do. "Folded" is satisfied by a
+    /// threshold nobody asked about; "before the first request" is satisfied by a
+    /// turn that never folded at all. The discriminating assertion is that
+    /// `working()[0]` — the turn's very first request — already carries the
+    /// summary and no longer carries the oldest turn's text, with the threshold
+    /// set where it cannot have been the cause.
+    #[tokio::test]
+    async fn a_requested_fold_lands_before_the_turns_first_request() {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let mut session = Session::open(&store, dir.path()).unwrap();
+        converse(&mut session, &store, &policy).await;
+
+        let talker = Talker::new(vec![vec![read("notes.txt")]]);
+        let folds = Folds::default();
+        let seen = Arc::clone(&folds.0);
+        session
+            .turn_bounded_observed(
+                &measured(dir.path(), true, keeping_two()),
+                &talker,
+                &store,
+                &policy,
+                &ApproveAll,
+                &folds,
+            )
+            .await
+            .unwrap();
+
+        let folded = seen.lock().unwrap().clone();
+        assert_eq!(
+            folded.len(),
+            1,
+            "the request should have folded exactly once: {folded:?}"
+        );
+        assert!(
+            folded[0].2 < folded[0].1,
+            "a fold must shrink the section: {folded:?}"
+        );
+
+        let working = talker.working();
+        let first = working
+            .first()
+            .expect("the turn made no working request at all");
+        assert!(
+            first.contains(SUMMARY_SENTENCE),
+            "the turn's FIRST request did not carry the summary: {first}"
+        );
+        assert!(
+            !first.contains(MARKER),
+            "the folded conversation is still being sent whole in the first request"
+        );
+    }
+
+    // ------------------------------------------------------------------ F2
+
+    /// F2 — the same turn without the flag does not fold.
+    ///
+    /// The control F1 is meaningless without: same conversation, same contract,
+    /// same threshold, `fold_now` off. If this folded, F1 would be measuring the
+    /// threshold rather than the request.
+    #[tokio::test]
+    async fn without_the_flag_the_same_turn_does_not_fold() {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let mut session = Session::open(&store, dir.path()).unwrap();
+        converse(&mut session, &store, &policy).await;
+
+        let talker = Talker::new(vec![vec![read("notes.txt")]]);
+        let folds = Folds::default();
+        let seen = Arc::clone(&folds.0);
+        session
+            .turn_bounded_observed(
+                &measured(dir.path(), false, keeping_two()),
+                &talker,
+                &store,
+                &policy,
+                &ApproveAll,
+                &folds,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a turn nobody asked to fold folded anyway"
+        );
+        assert_eq!(
+            talker.summarising_calls(),
+            0,
+            "the summariser was called for a fold nobody asked for"
+        );
+        let first = talker.working().first().cloned().unwrap_or_default();
+        assert!(
+            first.contains(MARKER),
+            "the conversation should have reached the first request whole: {first}"
+        );
+    }
+
+    // ------------------------------------------------------------------ F3
+
+    /// F3 — an off setting stays off.
+    ///
+    /// `Compaction { at_share: 1.0, .. }` is 0.42.0's behaviour, and
+    /// `docs/CONTRACT.md` promises that includes the overflow recovery. A
+    /// caller-triggered fold is a third trigger for the same machinery, and the
+    /// machinery is what was turned off — so the request is a no-op, and the turn
+    /// proceeds rather than erroring.
+    #[tokio::test]
+    async fn a_requested_fold_does_not_override_an_off_setting() {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let mut session = Session::open(&store, dir.path()).unwrap();
+        converse(&mut session, &store, &policy).await;
+
+        let talker = Talker::new(vec![vec![read("notes.txt")]]);
+        let folds = Folds::default();
+        let seen = Arc::clone(&folds.0);
+        let off = Compaction {
+            at_share: 1.0,
+            ..Compaction::default()
+        };
+        session
+            .turn_bounded_observed(
+                &measured(dir.path(), true, off),
+                &talker,
+                &store,
+                &policy,
+                &ApproveAll,
+                &folds,
+            )
+            .await
+            .expect("an off setting must be a no-op, not an error");
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "folding was off and a fold happened anyway"
+        );
+        assert_eq!(
+            talker.summarising_calls(),
+            0,
+            "an off setting still paid for a summariser"
+        );
+    }
+
+    // ------------------------------------------------------------------ F4
+
+    /// F4 — the request is honoured once, not every step.
+    ///
+    /// A flag on a contract is read once per step unless something consumes it,
+    /// and a fold at every step of a run is the bug that shape invites. Three
+    /// steps, one fold, with the threshold far enough away that a second fold
+    /// could only have come from the flag being read again.
+    #[tokio::test]
+    async fn the_request_is_consumed_and_does_not_fold_every_step() {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let mut session = Session::open(&store, dir.path()).unwrap();
+        converse(&mut session, &store, &policy).await;
+
+        let talker = Talker::new(vec![
+            vec![read("notes.txt")],
+            vec![read("notes.txt")],
+            vec![read("notes.txt")],
+        ]);
+        let folds = Folds::default();
+        let seen = Arc::clone(&folds.0);
+        let contract = measured(dir.path(), true, keeping_two()).with_max_steps(3);
+        session
+            .turn_bounded_observed(
+                &contract,
+                &talker,
+                &store,
+                &policy,
+                &ApproveAll,
+                &folds,
+            )
+            .await
+            .unwrap();
+
+        let folded = seen.lock().unwrap().clone();
+        assert_eq!(
+            folded.len(),
+            1,
+            "one request, one fold — found {}: {folded:?}",
+            folded.len()
+        );
+        assert_eq!(
+            talker.summarising_calls(),
+            1,
+            "one fold should have cost exactly one summarising call"
+        );
+    }
+
+    // ------------------------------------------------------------------ F7
+
+    /// F7 — the seed becomes durable before the first step, and the watermark
+    /// says so.
+    ///
+    /// Asserted directly rather than left to be inferred from F1, because F1 and
+    /// F6 both rest on it and neither would say which of the two changes carried
+    /// them. The observer opens its **own** connection — a `&Store` cannot cross
+    /// into one, and two connections to one WAL file is the shape this crate
+    /// already uses — and reads the run's observations at the moment the fold is
+    /// announced, which is the moment `compact_ledger` ran.
+    #[tokio::test]
+    async fn the_seed_is_durable_before_the_first_step() {
+        struct AtTheFold {
+            path: std::path::PathBuf,
+            /// The observations the store held when the fold was announced.
+            texts: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl Observer for AtTheFold {
+            fn event(&self, event: &RunEvent) -> Flow {
+                if matches!(event.kind, EventKind::Compacted { .. }) {
+                    let store = Store::open(&self.path).expect("a second connection");
+                    let seen = store.observations(event.run_id).expect("observations");
+                    *self.texts.lock().unwrap() =
+                        seen.into_iter().map(|o| o.text).collect::<Vec<_>>();
+                }
+                Flow::Continue
+            }
+        }
+
+        let dir = workspace();
+        // File-backed, because the assertion is that a SECOND reader can see the
+        // rows — an in-memory store is private to its own connection and would
+        // make this test pass by never being asked.
+        let db = dir.path().join("runs.db");
+        let store = Store::open(&db).unwrap();
+        let policy = open_policy();
+        let mut session = Session::open(&store, dir.path()).unwrap();
+        converse(&mut session, &store, &policy).await;
+
+        let talker = Talker::new(vec![vec![read("notes.txt")]]);
+        let watcher = AtTheFold {
+            path: db.clone(),
+            texts: Arc::new(Mutex::new(Vec::new())),
+        };
+        let texts = Arc::clone(&watcher.texts);
+        session
+            .turn_bounded_observed(
+                &measured(dir.path(), true, keeping_two()),
+                &talker,
+                &store,
+                &policy,
+                &ApproveAll,
+                &watcher,
+            )
+            .await
+            .unwrap();
+
+        let at_the_fold = texts.lock().unwrap().clone();
+        assert!(
+            !at_the_fold.is_empty(),
+            "the fold never happened, so this asserts nothing"
+        );
+        assert!(
+            at_the_fold.iter().any(|t| t.contains(MARKER)),
+            "the seeded conversation was not durable when the fold ran: {at_the_fold:?}"
+        );
+        assert!(
+            at_the_fold.len() >= 12,
+            "twelve seeded observations were expected to be durable, found {}",
+            at_the_fold.len()
+        );
+    }
+
+    // ------------------------------------------------------------------ F6
+
+    /// F6 — a seeded turn that overflows the window now recovers, and before this
+    /// release it could not.
+    ///
+    /// This is the defect the release fixes, and it is nothing to do with the new
+    /// flag. A fold may only replace entries the store already holds, and until
+    /// 0.68.0 the seeded conversation sat **above** the watermark for the whole of
+    /// step one — `written` was `0` until the first `persist_ledger`, which runs
+    /// at the *end* of that step. So `compact_ledger` returned at its `count == 0`
+    /// guard before `forced` was ever read, and the overflow recovery — whose
+    /// entire job is to fold a request the vendor has just refused — folded
+    /// nothing and re-sent the same bytes. A session turn whose conversation
+    /// exceeded the window was unrecoverable, which is precisely the turn the
+    /// recovery exists for.
+    ///
+    /// The assertion is the recovery working end to end: a refusal, a fold, and a
+    /// second request that is smaller than the first and is served.
+    #[tokio::test]
+    async fn a_seeded_turn_that_overflows_folds_and_recovers() {
+        /// Refuses a working request over `ceiling` chars with a vendor's own
+        /// wording, and always serves the summariser — a provider that refused
+        /// the summariser would be refusing the way out.
+        struct Fussy {
+            ceiling: usize,
+            sizes: Arc<Mutex<Vec<usize>>>,
+            refusals: Arc<AtomicUsize>,
+        }
+
+        impl Provider for Fussy {
+            async fn complete(
+                &self,
+                req: CompletionRequest,
+            ) -> io_harness::Result<CompletionResponse> {
+                let usage = Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 2,
+                    total_tokens: 12,
+                    ..Default::default()
+                });
+                if req.system.contains(SUMMARISER) {
+                    return Ok(CompletionResponse {
+                        text: Some(SUMMARY_SENTENCE.into()),
+                        usage,
+                        ..Default::default()
+                    });
+                }
+                self.sizes.lock().unwrap().push(req.user.len());
+                if req.user.len() > self.ceiling {
+                    self.refusals.fetch_add(1, Ordering::SeqCst);
+                    return Err(io_harness::Error::provider_status(
+                        400,
+                        None,
+                        "This model's maximum context length is 8192 tokens, however you requested more",
+                    ));
+                }
+                Ok(CompletionResponse {
+                    text: Some("nothing further".into()),
+                    usage,
+                    ..Default::default()
+                })
+            }
+        }
+
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let mut session = Session::open(&store, dir.path()).unwrap();
+
+        // A conversation long enough that the seed alone is what overflows. Each
+        // turn is padded, so the folded paragraph is dramatically smaller than
+        // what it stands in for and the recovery has somewhere to get to.
+        for i in 0..6 {
+            let padding = "and we discussed the tokeniser at some length. ".repeat(30);
+            let prompt = if i == 0 {
+                format!("{MARKER} {padding}")
+            } else {
+                format!("stage {i}: {padding}")
+            };
+            let talker = Talker::new(Vec::new());
+            session
+                .turn(&prompt, &talker, &store, &policy, &ApproveAll)
+                .await
+                .unwrap();
+        }
+
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let refusals = Arc::new(AtomicUsize::new(0));
+        let fussy = Fussy {
+            // Under the seeded conversation whole, over it once folded.
+            ceiling: 2_000,
+            sizes: Arc::clone(&sizes),
+            refusals: Arc::clone(&refusals),
+        };
+        let folds = Folds::default();
+        let seen = Arc::clone(&folds.0);
+
+        // `fold_now` is off. The recovery is what asks for this fold, and the
+        // release's claim is that it can now be answered.
+        session
+            .turn_bounded_observed(
+                &measured(dir.path(), false, keeping_two()),
+                &fussy,
+                &store,
+                &policy,
+                &ApproveAll,
+                &folds,
+            )
+            .await
+            .expect("the turn should have recovered rather than escalated");
+
+        assert_eq!(
+            refusals.load(Ordering::SeqCst),
+            1,
+            "expected exactly one refusal, then a recovery"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the refusal should have forced exactly one fold"
+        );
+        let sizes = sizes.lock().unwrap().clone();
+        assert_eq!(sizes.len(), 2, "a refusal and one retry: {sizes:?}");
+        assert!(
+            sizes[1] < sizes[0],
+            "the retry must be smaller than what was refused: {sizes:?}"
+        );
+    }
+}

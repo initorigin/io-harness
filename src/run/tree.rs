@@ -430,6 +430,14 @@ where
         // The conversation this turn continues, at the root and nowhere else: a
         // child is given its goal, not the transcript.
         seed_conversation(&mut ledger, extras);
+        // 0.68.0 — durable immediately, for the reason argued at the flat loop's
+        // own call: a fold may only replace what the store already holds, so a
+        // conversation above the watermark is one no fold can reach. `extras` is
+        // root-only here, so at every other depth this appends nothing.
+        written = persist_ledger(tree.store, run_id, &ledger, written)?;
+        // 0.68.0 — the caller's standing request for a fold, consumed once, and by
+        // the root only. `fold_forced` is what enforces both.
+        let mut fold_asked = contract.fold_now;
         // And the turn is typed before its first completion is billed, the same
         // order the flat loop writes it in.
         open_turn_kind(tree.store, run_id, extras)?;
@@ -565,7 +573,7 @@ where
                     &mut ledger,
                     &mut written,
                     budget_tokens,
-                    recovered,
+                    fold_forced(recovered, depth, &mut fold_asked),
                 )
                 .await?;
                 let assembled = assemble(

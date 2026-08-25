@@ -602,6 +602,13 @@ pub(super) fn restore_turns(store: &Store, run_id: i64) -> Result<BTreeMap<u32, 
 /// Called at the step boundary that commits, so an observation belonging to a
 /// step that never committed does not outlive it — the ledger stays consistent
 /// with the trace rather than running ahead of it.
+///
+/// And once before the loop, on the seeded conversation (0.68.0). That is not an
+/// exception to the rule above: the seed belongs to no step of this run, so there
+/// is no step it could outlive. It is written early because a fold may only
+/// replace entries the store already holds, and a conversation sitting above the
+/// watermark is one that neither the threshold nor the overflow recovery could
+/// fold.
 pub(super) fn persist_ledger(
     store: &Store,
     run_id: i64,
