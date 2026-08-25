@@ -1255,28 +1255,9 @@ impl Session {
                 ));
             }
         }
-        let Some((at, summaries)) = self.newest_fold(store, &history)? else {
+        let Some((consumed, text)) = self.carried_fold(store, &history, &starts)? else {
             return Ok(out);
         };
-        // What that turn's folds consumed of the conversation seeded into it. The
-        // first fold's prefix is conversation; every later one's begins with the
-        // paragraph the previous fold wrote, so it reaches one fewer — the same
-        // arithmetic `restore_ledger` replays, and the reason a two-fold turn is
-        // its own criterion. Capped at what was seeded, because a fold long enough
-        // to reach past it was folding the turn's own work.
-        let seeded_before = starts[at];
-        let mut consumed = 0usize;
-        for (nth, summary) in summaries.iter().enumerate() {
-            let reach = if nth == 0 {
-                summary.folded as usize
-            } else {
-                (summary.folded as usize).saturating_sub(1)
-            };
-            consumed = consumed.saturating_add(reach).min(seeded_before);
-        }
-        // The newest paragraph alone: a later fold's prefix contained the earlier
-        // one, so it already stands in for everything the earlier folds did.
-        let text = summaries.last().map(|s| s.text.clone()).unwrap_or_default();
         let mut folded = Vec::with_capacity(out.len() - consumed + 1);
         folded.push((
             crate::context::SEED_SUMMARY,
@@ -1290,7 +1271,8 @@ impl Session {
         Ok(folded)
     }
 
-    /// The newest turn on this path whose run folded, and the folds it wrote.
+    /// How many seed entries the folds on this path stand in for, and the
+    /// paragraph that stands in for them.
     ///
     /// (0.69.0) A fold used to buy one turn of relief: `summaries` is keyed on
     /// `run_id`, every turn is its own run, and the seed above rebuilt the whole
@@ -1299,22 +1281,65 @@ impl Session {
     /// [`Session::transcript`](Session::transcript) already makes — a turn row
     /// carries its `run_id` — so nothing is stored that was not stored before.
     ///
-    /// Newest wins and the walk stops there: an earlier fold's paragraph was part
-    /// of what a later fold summarised, so the later one already stands in for it.
+    /// **It is a forward walk and not a jump to the newest fold, because
+    /// `summaries.folded` counts entries in the ledger of the turn that wrote it —
+    /// and since this release that ledger may begin with the paragraph an *earlier*
+    /// turn's fold left behind.** Counting the two in one space is what a first
+    /// version of this did, and it is wrong in both directions: too few entries
+    /// dropped and everything the first fold replaced returns beside a paragraph
+    /// claiming to stand in for it, too many and a reply nobody summarised is
+    /// thrown away. So each fold is converted into conversation entries in the
+    /// space it was measured in, oldest first:
+    ///
+    /// - Within one turn, the first row reaches `folded` entries and every later
+    ///   row `folded - 1`, because a later fold's prefix begins with the paragraph
+    ///   the previous one wrote. This is the arithmetic `restore_ledger` replays.
+    /// - Across turns, one of the entries that prefix reached is the paragraph the
+    ///   turn inherited, which already stands in for everything before it. So the
+    ///   inherited entry is subtracted and the rest are added to the running total.
+    ///
+    /// A fold that stands in for nothing seeded — the first turn of a session
+    /// folding its own work — carries no paragraph forward. Its summary describes
+    /// observations the conversation never held, and seeding it would make the next
+    /// turn's seed *longer*, which is the opposite of what a fold is for.
+    ///
     /// A session that never folded pays one indexed lookup per turn on its path
     /// and gets today's seed unchanged.
-    fn newest_fold(
+    fn carried_fold(
         &self,
         store: &Store,
         history: &[Turn],
-    ) -> Result<Option<(usize, Vec<crate::state::Summary>)>> {
-        for (at, turn) in history.iter().enumerate().rev() {
-            let summaries = store.summaries(turn.run_id)?;
-            if !summaries.is_empty() {
-                return Ok(Some((at, summaries)));
+        starts: &[usize],
+    ) -> Result<Option<(usize, String)>> {
+        let mut consumed = 0usize;
+        let mut carried: Option<String> = None;
+        for (at, turn) in history.iter().enumerate() {
+            let rows = store.summaries(turn.run_id)?;
+            if rows.is_empty() {
+                continue;
             }
+            // The ledger prefix this turn's newest paragraph stands in for.
+            let prefix = rows.iter().enumerate().fold(0usize, |acc, (nth, row)| {
+                let reach = if nth == 0 {
+                    row.folded as usize
+                } else {
+                    (row.folded as usize).saturating_sub(1)
+                };
+                acc.saturating_add(reach)
+            });
+            // In conversation entries: one of them was the inherited paragraph,
+            // which is already counted in `consumed`. Capped at what was seeded
+            // before this turn, because a fold reaching past that was folding the
+            // turn's own work rather than the conversation.
+            let raw = prefix.saturating_sub(usize::from(carried.is_some()));
+            let reached = consumed.saturating_add(raw).min(starts[at]);
+            if reached == 0 {
+                continue;
+            }
+            consumed = reached;
+            carried = rows.last().map(|row| row.text.clone());
         }
-        Ok(None)
+        Ok(carried.map(|text| (consumed, text)))
     }
 }
 
@@ -1566,9 +1591,19 @@ impl Steer {
     /// - It loses to an interrupt sent before the same boundary. An operator who
     ///   asked for a fold and then stopped the turn stopped the turn, and no
     ///   summariser call is spent on a turn nobody is going to read.
+    /// - It does nothing when there is nothing to fold. A fold keeps
+    ///   [`Compaction::keep_recent`](crate::Compaction::keep_recent) observations
+    ///   whole and may only replace ones the store already holds, so a request made
+    ///   over a conversation shorter than that is spent and no fold happens. The
+    ///   request is in the trace either way, but an interface must not report a
+    ///   fold on the strength of having sent one — read the
+    ///   [`Compacted`](crate::EventKind::Compacted) event instead.
     ///
-    /// One request, one fold: asking twice in the same turn folds twice, and
-    /// asking once does not put the turn into a mode where every step folds.
+    /// One request, one fold, and the unit is the boundary rather than the call:
+    /// two asks that reach the same boundary are one fold, because the second would
+    /// summarise a ledger the first has just replaced with a paragraph. Two asks
+    /// separated by a boundary are two folds. Asking once never puts the turn into
+    /// a mode where every step folds.
     pub fn fold(&self) -> Result<()> {
         self.send(Steered::Fold)
     }

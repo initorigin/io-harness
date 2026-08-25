@@ -1554,4 +1554,110 @@ mod requested {
             "the second fold's remainder is not what was seeded:\n{first}"
         );
     }
+
+    // ----------------------------------------------------------------- F12
+
+    /// F12 — a second fold, in a *later turn*, stands in for what the first one
+    /// already replaced.
+    ///
+    /// The case F8 through F11 cannot see: they all fold inside one turn, and a
+    /// turn's `summaries.folded` counts entries in **that turn's ledger**, whose
+    /// first entry — since this release — may be the paragraph a previous turn's
+    /// fold left behind. Counting those two in the same space drops the wrong
+    /// number of conversation entries: too few, and everything the first fold
+    /// replaced comes back beside a paragraph that claims to stand in for it; too
+    /// many, and a reply nobody summarised is thrown away.
+    ///
+    /// This is the shape a real session takes the moment an operator folds twice,
+    /// which is the whole outcome of the release rather than an edge of it.
+    #[tokio::test]
+    async fn a_fold_in_a_later_turn_stands_in_for_what_the_first_one_replaced() {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let (mut session, first_fold) = a_folded_conversation(dir.path(), &store, &policy).await;
+
+        // The second fold, in a turn of its own. Its seed is the paragraph, the
+        // two entries the first fold left whole, and the folding turn's own pair —
+        // five entries, of which `keep_recent: 2` leaves two, so it folds three:
+        // the paragraph and the two entries beside it.
+        let talker = Talker::new(vec![vec![read("notes.txt")]]);
+        let folds = Folds::default();
+        let seen = Arc::clone(&folds.0);
+        let second = session
+            .turn_bounded_observed(
+                &measured(dir.path(), true, keeping_two()).with_max_steps(2),
+                &talker,
+                &store,
+                &policy,
+                &ApproveAll,
+                &folds,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the second turn did not fold, so nothing below discriminates"
+        );
+        let rows = store.summaries(second.run_id).unwrap();
+        assert_eq!(rows.len(), 1, "one requested fold, one row: {rows:?}");
+        assert_eq!(
+            rows[0].folded, 3,
+            "the second fold was expected to reach the paragraph and the two entries \
+             beside it; a different number means this test measures something else"
+        );
+        assert!(
+            !store.summaries(first_fold.run_id).unwrap().is_empty(),
+            "the first fold's row went missing, so the two-fold shape is not under test"
+        );
+
+        let turns = session.transcript(&store).unwrap().turns;
+
+        let later = Talker::new(Vec::new());
+        session
+            .turn(
+                "and what did we decide?",
+                &later,
+                &store,
+                &policy,
+                &ApproveAll,
+            )
+            .await
+            .unwrap();
+        let first = later
+            .working()
+            .first()
+            .cloned()
+            .expect("the later turn made no request");
+
+        // The second fold replaced the first paragraph, and the first paragraph
+        // stood in for the whole of the conversation before it. So none of that
+        // conversation may come back — not the oldest turn, and not the middle of
+        // it either, which is the half a wrong index space leaves behind.
+        assert!(
+            !first.contains(MARKER),
+            "the oldest turn came back after two folds: {first}"
+        );
+        for turn in turns.iter().take(6) {
+            assert!(
+                !first.contains(&turn.prompt),
+                "a conversational turn the folds replaced was seeded again: {}",
+                turn.prompt
+            );
+        }
+
+        // What is left is the newest paragraph and the two turns that did the
+        // folding, contiguously and in order.
+        let remainder = format!(
+            "{}{}{}",
+            io_harness::context::summarised_entry(SUMMARY_SENTENCE),
+            seeded(&turns[6]),
+            seeded(&turns[7])
+        );
+        assert!(
+            first.contains(&remainder),
+            "the seed after two folds is not the paragraph followed by the two folding turns:\n{first}"
+        );
+    }
 }

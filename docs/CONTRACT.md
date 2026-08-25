@@ -1794,9 +1794,21 @@ at_share: 1.0, .. }` never folds, this trigger included. It does **not** reach a
 spawned child, which is the boundary `fold_now` and steering both already draw. And
 it **loses to an interrupt drained at the same boundary**: the interrupt is
 answered first, the turn ends as `RunOutcome::Cancelled`, and no summariser call is
-spent on a turn nobody is going to read. One request is one fold — asking twice in a
-turn folds twice, and asking once does not put the turn into a mode where every step
-folds.
+spent on a turn nobody is going to read.
+
+**A fifth boundary, and it is the one an operator meets first.** A request made
+when there is nothing to fold is spent and nothing happens: a fold keeps
+`keep_recent` observations whole and may only replace ones the store already holds,
+so a conversation shorter than that has no prefix to stand in for. The request is
+recorded either way, which is what makes it visible after the fact — but an
+interface that reports "compacted" because it sent one is reporting something this
+contract does not promise. The `Compacted` event is the fact; the request is not.
+
+One request is one fold, and the unit is the boundary rather than the call: two
+asks that reach the same boundary are one fold, because the second would summarise
+a ledger the first has just replaced with a paragraph. Two asks separated by a
+boundary are two folds. Asking once does not put the turn into a mode where every
+step folds.
 
 **A fold outlives the turn that made it (0.69.0).** `summaries` is keyed on
 `run_id` and every session turn is its own run, so a fold used to buy one turn of

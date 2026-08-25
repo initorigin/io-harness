@@ -180,8 +180,19 @@ arm "F10 the summary replaces every earlier turn" \
 # to any fixture that folds once.
 arm "F11 a later fold reaches one entry too far" \
     src/session.rs \
-    's/                \(summary\.folded as usize\)\.saturating_sub\(1\)/                summary.folded as usize/' \
+    's/                    \(row\.folded as usize\)\.saturating_sub\(1\)/                    row.folded as usize/' \
     compaction a_turn_that_folded_twice_seeds_the_newest_paragraph_and_the_second_folds_remainder
+
+# ---- F12: a fold in a later turn stands in for what the first one replaced.
+# The two index spaces are counted as one — `folded` measures the folding turn's
+# own ledger, whose first entry may be the paragraph an earlier turn left behind.
+# Forgetting to carry the earlier fold's reach is the defect a review found in
+# this release's first implementation: everything the first fold replaced comes
+# back beside a paragraph claiming to stand in for it.
+arm "F12 an inherited fold's reach is not carried forward" \
+    src/session.rs \
+    's/            let reached = consumed\.saturating_add\(raw\)\.min\(starts\[at\]\);/            let reached = raw.min(starts[at]);/' \
+    compaction a_fold_in_a_later_turn_stands_in_for_what_the_first_one_replaced
 
 echo
 echo "arms killed: $pass   survived: $survived   broken: $broken"

@@ -50,16 +50,22 @@ step of the next turn, on every trigger.
   request itself is in the trace as a `ContextEvent::steered` line at the step that
   read it.
 
-  Four boundaries, each of them a reading somebody would otherwise implement. It is
+  Five boundaries, each of them a reading somebody would otherwise implement. It is
   **not immediate**: like a message and an interrupt it lands at the next step
   boundary, because a tool call in flight is not a safe place to change the
   conversation out from under. It does **not** override an off setting —
   `Compaction { at_share: 1.0, .. }` never folds, this trigger included. It does
   **not** reach a spawned child, whose ledger is its own work with no conversation
-  seeded into it. And it **loses to an interrupt** sent before the same boundary:
-  the turn is cancelled and no summariser call is spent on a turn nobody is going
-  to read. One request, one fold — asking twice folds twice, and asking once does
-  not put the turn into a mode where every step folds.
+  seeded into it. It **loses to an interrupt** sent before the same boundary: the
+  turn is cancelled and no summariser call is spent on a turn nobody is going to
+  read. And it does **nothing when there is nothing to fold** — a conversation
+  shorter than `keep_recent` has no prefix a paragraph could stand in for, so the
+  request is spent and the turn goes on. `EventKind::Compacted` is what says a fold
+  happened; having sent the request is not.
+
+  One request, one fold, and the unit is the boundary rather than the call: two asks
+  that reach the same boundary are one fold, two asks separated by a boundary are
+  two, and asking once does not put the turn into a mode where every step folds.
 
 ### Changed
 

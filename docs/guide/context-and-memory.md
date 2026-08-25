@@ -394,12 +394,17 @@ summary is in the next thing the model is sent rather than the one after that, a
 the request itself is a `ContextEvent::steered` line in the trace at the step that
 read it — what the operator asked for is recorded beside what the fold then did.
 
-The three boundaries above hold here too, with a fourth. It is not immediate: it
+The three boundaries above hold here too, with two more. It is not immediate: it
 lands at the next step boundary, because a tool call in flight is not a safe place
 to change the conversation out from under. It does not override an off setting. It
-does not reach a spawned child. And it loses to an interrupt sent before the same
-boundary — the turn is cancelled and no summariser call is spent on it. Asking
-twice folds twice.
+does not reach a spawned child. It loses to an interrupt sent before the same
+boundary — the turn is cancelled and no summariser call is spent on it. And it does
+nothing when there is nothing to fold: a conversation shorter than `keep_recent` has
+no prefix to stand in for, so the request is spent and the turn goes on. Read the
+`Compacted` event for whether a fold happened; the request alone does not say.
+
+Two asks that reach the same boundary are one fold; two asks separated by a boundary
+are two.
 
 What a turn read at a boundary is reported as a `Steering`, whose `messages`,
 `interrupted` and `fold` are what `SteerInbox::pending` returns.

@@ -371,14 +371,20 @@ and `TaskContract::fold_now` drive — the same summariser, the same durable
 `summaries` row, the same `EventKind::Compacted` — so an interface does not have to
 know which trigger fired.
 
-Four things it does not do. It does not fold where it was typed: like a message and
+Five things it does not do. It does not fold where it was typed: like a message and
 an interrupt it waits for the boundary. It does not override
 `Compaction { at_share: 1.0, .. }`, because off is a setting rather than an
 absence. It does not reach a spawned child, whose ledger is its own work with no
-conversation in it. And it loses to an interrupt sent before the same boundary — an
+conversation in it. It loses to an interrupt sent before the same boundary — an
 operator who asked for a summary and then stopped the turn stopped the turn, and no
-summariser call is spent on a turn nobody is going to read. Asking twice folds
-twice; asking once does not put the turn into a mode where every step folds.
+summariser call is spent on a turn nobody is going to read. And it does nothing when
+there is nothing to fold: a conversation shorter than `keep_recent` has no prefix a
+paragraph could stand in for, so the request is spent and no fold happens. The
+`Compacted` event is what says a fold happened; having sent the request is not.
+
+Two asks that reach the same boundary are one fold — the second would summarise a
+ledger the first has just replaced — and two asks separated by a boundary are two
+folds. Asking once does not put the turn into a mode where every step folds.
 
 All three land at a step boundary and nowhere else, for the reason cancellation
 always has: in between, a tool call is in flight and a file may be half-written.
