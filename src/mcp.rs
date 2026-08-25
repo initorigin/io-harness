@@ -386,18 +386,25 @@ impl McpSession {
                 })
                 .collect();
 
-            // `detail` carries the transport and nothing else — the tool
-            // count is already implied by the `discovered` events that
-            // follow, and overwriting it here would lose the one fact only
-            // this event records.
+            // `detail` still carries the transport and nothing else: overwriting
+            // it would lose the one fact only this event records. What changed in
+            // 0.68.0 is where the tool count goes. The note that stood here said
+            // the count needed no home because the `discovered` events that follow
+            // already imply it. That argument was always weaker than it read: the
+            // count is derivable, but only by an observer attached for the whole of
+            // connect, counting N events apart from the rest by which of their
+            // fields happen to be set. So the count rides the announced event as a
+            // stated number instead — including `Some(0)`, which is a server that
+            // offered nothing and is a different fact from an event that does not
+            // carry the count at all.
             let ev = McpEvent::connected(&server.id, transport_name(&server.transport))
                 .with_millis(started.elapsed().as_millis() as u64);
             store.record_mcp(run_id, &ev)?;
-            announce(watch, run_id, 0, &ev);
+            announce(watch, run_id, 0, &ev, Some(tools.len() as u32));
             for t in &tools {
                 let ev = McpEvent::discovered(&server.id, &t.name);
                 store.record_mcp(run_id, &ev)?;
-                announce(watch, run_id, 0, &ev);
+                announce(watch, run_id, 0, &ev, None);
             }
             info!(server = %server.id, tools = tools.len(), "mcp server connected");
 
@@ -498,7 +505,7 @@ impl McpSession {
             .with_millis(millis)
             .with_detail(if truncated { "truncated" } else { "" });
         store.record_mcp(run_id, &ev)?;
-        announce(watch, run_id, depth, &ev);
+        announce(watch, run_id, depth, &ev, None);
         Ok(text)
     }
 
@@ -508,17 +515,27 @@ impl McpSession {
         for s in self.servers {
             let ev = McpEvent::disconnected(&s.id);
             let _ = store.record_mcp(run_id, &ev);
-            announce(watch, run_id, 0, &ev);
+            announce(watch, run_id, 0, &ev, None);
             let _ = s.service.cancel().await;
         }
     }
 }
 
-/// Announce one MCP row to the observer, built from the row itself so the event
-/// cannot report a server, tool, outcome or duration the `mcp_events` row does
-/// not. The row's own `step` is used — `0` for connect, discover and disconnect,
-/// which happen outside any step.
-fn announce(watch: &Watch<'_>, run_id: i64, depth: u32, e: &McpEvent) {
+/// Announce one MCP row to the observer. Server, tool, outcome and duration are
+/// read off the row itself, so the event cannot report any of those four the
+/// `mcp_events` row does not — that much is still a pure projection. The row's
+/// own `step` is used — `0` for connect, discover and disconnect, which happen
+/// outside any step.
+///
+/// `tools` is the one field that is not a projection, and it is deliberately
+/// event-only: no row carries it, so the caller passes it in. The count's stated
+/// consumer is the live observer stream, and giving it a durable home costs more
+/// than the fact is worth — [`McpEvent`] is public, with public fields and no
+/// `#[non_exhaustive]`, so a fifth field on it breaks every consumer that
+/// constructs one, and the row behind it would need a new column and a migration
+/// besides. Only the connect event passes anything; every other form passes
+/// `None`, which is what keeps its serialized shape identical to 0.67.0.
+fn announce(watch: &Watch<'_>, run_id: i64, depth: u32, e: &McpEvent, tools: Option<u32>) {
     watch.emit(RunEvent::at_depth(
         run_id,
         e.step,
@@ -528,6 +545,7 @@ fn announce(watch: &Watch<'_>, run_id: i64, depth: u32, e: &McpEvent) {
             tool: e.tool.clone(),
             ok: e.ok,
             millis: e.millis,
+            tools,
         },
     ));
 }
