@@ -26,6 +26,82 @@ notes are produced from it.
 
 ### Security
 
+## [0.68.0] - 2026-08-25
+
+The conversation folds when the operator says so, as well as when the threshold
+notices.
+
+`Compaction { at_share, keep_recent }` has decided every fold since 0.43.0, and it
+decides them by watching the ledger cross a share of the window. An interface that
+wanted to fold *now* — the `/compact` an operator reaches for when they know a long
+thread is finished — had no call to make. It could only lower `at_share` for a turn
+and hope the ledger crossed it: a caller's own setting mutated to fake a request,
+landing at a point nothing could predict, and possibly not landing at all.
+
+### Added
+
+- `TaskContract::fold_now` and `TaskContract::with_fold_now` — fold this turn's
+  history at its first step, before that step assembles its first request.
+
+  Automatic compaction is untouched and stays the default. This is a second
+  trigger for the same machinery, the same summariser and the same durable
+  `summaries` row, so a caller who never sets the flag sees exactly the behaviour
+  they had.
+
+  Three boundaries are deliberate and each is asserted. The request is consumed
+  **once**, at the turn's first step, so a contract reused for every turn does not
+  fold every turn. It does **not** override an off setting — `Compaction { at_share:
+  1.0, .. }` never folds, and one trigger reversing that would make "off" mean two
+  things. And it does **not** reach a spawned child: a contract reaches the whole
+  tree, but a child's ledger is its own work with no conversation seeded into it,
+  so only the root turn honours the request.
+
+- `EventKind::Mcp` carries `tools` — how many tools a server offered, on the event
+  that announces it reaching the run, and `None` on every other form. A server that
+  came up offering nothing announces `Some(0)`, which is the fact this exists to
+  separate from "this event does not carry the count".
+
+### Changed
+
+- **BREAKING** — `EventKind::Mcp` gained a field, which an exhaustive match does
+  not survive. `EventKind` itself has been `#[non_exhaustive]` since 0.24.0, but
+  that covers the variant *list* rather than a variant's fields, so this one is
+  paid rather than free.
+
+  *Migration:* add `..` to the pattern.
+
+  ```rust
+  // Before
+  EventKind::Mcp { server, tool, ok, millis } => { /* ... */ }
+  // After
+  EventKind::Mcp { server, tool, ok, millis, .. } => { /* ... */ }
+  ```
+
+  The count was previously argued to be implied by the `discovered` events that
+  follow a connect. It is derivable — by counting N events and telling them apart
+  by which of their fields are set — but only by an observer attached for the whole
+  of connect, and never as a number the event itself states. That reasoning is
+  reversed here rather than left standing beside the change.
+
+### Fixed
+
+- **A session turn seeded with a long conversation could not fold at its first
+  step — on the threshold or on the overflow recovery.** A fold may only replace
+  entries the store already holds, and the seeded conversation sat above that
+  watermark for the whole of step one: it became durable at the *end* of that step,
+  while the fold is attempted at the start of it. So the check returned early
+  before it ever asked whether a fold was forced, and a turn whose conversation
+  exceeded the window re-sent the same refused request and escalated — the one turn
+  the overflow recovery exists for was the one it could not help.
+
+  The seed is now made durable before the first step. That is not a relaxation of
+  the rule that an observation must not outlive a step that never committed: the
+  seed belongs to no step of the run, and is a copy of conversation rows that are
+  already durable.
+
+Nothing else moves: no schema change, `CHECKPOINT_FORMAT` stays at 7, no dependency
+was added, and no other signature changed.
+
 ## [0.67.0] - 2026-08-25
 
 A turn can be steered whatever contract it carries.

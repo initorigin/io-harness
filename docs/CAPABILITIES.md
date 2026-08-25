@@ -72,6 +72,7 @@ into it.
 
 | Version | What it introduced | Entry |
 | --- | --- | --- |
+| 0.68.0 | The conversation folds when the operator says so as well as when the threshold notices — `TaskContract::fold_now` folds a turn's history before its first request, beside the automatic fold that is unchanged — and an MCP server says how many tools it offered | [2026-08-25](../CHANGELOG.md#0680---2026-08-25) |
 | 0.67.0 | A session turn can be steered whatever contract it carries — the caller's `TaskContract`, an `Observer` and a `SteerInbox` on one call, on the flat turn and on a fan-out whose root reads the operator's correction while its children never do | [2026-08-25](../CHANGELOG.md#0670---2026-08-25) |
 | 0.66.0 | A session turn that may fan out takes the caller's `TaskContract` — a plan gate, registered tools, a budget or a verification gate on a turn that can decompose — and the bound `Harness` gains a contained turn at all | [2026-08-19](../CHANGELOG.md#0660---2026-08-19) |
 | 0.65.0 | A run killed in the middle of a call the harness cannot inspect pauses for an operator's decision instead of repeating it — a durable journal of what was started, a recovery classification on the `Tool` trait, and a resume that refuses to drive past an open attempt | [2026-08-18](../CHANGELOG.md#0650---2026-08-18) |

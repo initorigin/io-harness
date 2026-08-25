@@ -98,7 +98,7 @@ new trait method every implementer inherits.
 | `Fleet { tier, working, queued, done }` | One tier of the tree changed shape: a child queued, was admitted, or finished |
 | `MemoryWrote { key }` | The agent wrote to durable cross-run memory |
 | `Sandbox { kind, backend }` | `create`, `exec`, `cap_hit`, `destroy` or `gate_phase_failed` |
-| `Mcp { server, tool, ok, millis }` | An MCP server was reached, or one of its tools called |
+| `Mcp { server, tool, ok, millis, tools }` | An MCP server was reached, or one of its tools called. `tools` is how many it offered, on the reaching event and `None` on the rest — `Some(0)` for a server that came up offering nothing |
 | `Finished { outcome, steps, tokens }` | Once, last |
 
 Every variant reports something the trace already records. The event stream added
