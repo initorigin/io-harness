@@ -566,12 +566,11 @@ pub const SEED_SUMMARY: &str = "summary";
 
 /// How a summary reads to the model, wherever it was written.
 ///
-/// One definition rather than two format strings: [`compact_ledger`] writes it
-/// when a turn folds and `Session::seed` writes it when a *previous* turn folded,
-/// and an operator reading a trace should not be able to tell the two apart by
-/// their framing.
-///
-/// [`compact_ledger`]: crate::run::memory::compact_ledger
+/// One definition rather than two format strings: `compact_ledger` writes it when
+/// a turn folds and `Session::seed` writes it when a *previous* turn folded, and
+/// an operator reading a trace should not be able to tell the two apart by their
+/// framing. Neither is nameable from here — both are private to their modules —
+/// so they are named in prose rather than linked.
 pub fn summarised_entry(text: &str) -> String {
     format!("\n[earlier work, summarised]\n{text}\n")
 }
