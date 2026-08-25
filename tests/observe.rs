@@ -1269,11 +1269,19 @@ async fn every_mcp_row_is_announced_with_the_same_server_tool_outcome_and_latenc
         .events()
         .iter()
         .filter_map(|e| match &e.kind {
+            // The `..` is 0.68.0's declared break, demonstrated in the repo:
+            // `EventKind::Mcp` gained a `tools` field, and a destructure that
+            // named all four fields stopped compiling. `#[non_exhaustive]` on
+            // the enum covers new variants, not new fields on an existing one,
+            // so this is the edit every consumer matching by name has to make.
+            // Nothing else here changes: this test compares the four
+            // row-derived fields, and those are still a pure projection.
             EventKind::Mcp {
                 server,
                 tool,
                 ok,
                 millis,
+                ..
             } => Some((server.clone(), tool.clone(), *ok, *millis)),
             _ => None,
         })
@@ -1362,4 +1370,108 @@ async fn a_denied_network_host_is_announced_with_what_the_row_records() {
         announced, rows,
         "a denied host must be announced with exactly what the trace row records"
     );
+}
+
+// ------------------------------------------------------------------------- F9
+
+/// F9 — a `run_events` row written before 0.68.0 still deserialises, and the
+/// three MCP shapes that do not carry a count still serialise exactly as they
+/// did.
+///
+/// This check did not exist before 0.68.0 and the field's back-compatibility was
+/// resting on an assumption. The round-trip tests inside `src/observe.rs` prove
+/// the current schema against itself, which cannot fail when a field is added to
+/// both sides at once; and `tests/cross_version.rs`'s fixtures are 0.22.0 stores,
+/// from before `run_events` existed at all. So nothing in the suite was reading a
+/// row written by an older binary.
+///
+/// Both halves are asserted because they fail differently. A missing `tools` key
+/// arriving as `None` is what makes an old row readable; `skip_serializing_if`
+/// keeping the key *out* of the three other shapes is what stops this release
+/// rewriting a stream every existing consumer already parses.
+mod stored_events {
+    use io_harness::{EventKind, RunEvent};
+
+    /// Exactly what 0.67.0 wrote for a server reaching a run: four fields, no
+    /// `tools` key anywhere.
+    const CONNECTED_0_67_0: &str = r#"{"run_id":7,"step":0,"depth":0,"event":"mcp","server":"docs","tool":null,"ok":null,"millis":12}"#;
+
+    /// And for one of its tools being called.
+    const CALLED_0_67_0: &str = r#"{"run_id":7,"step":3,"depth":0,"event":"mcp","server":"docs","tool":"search","ok":true,"millis":40}"#;
+
+    #[test]
+    fn a_row_written_before_the_field_existed_reads_back_with_no_count() {
+        for raw in [CONNECTED_0_67_0, CALLED_0_67_0] {
+            let back: RunEvent = serde_json::from_str(raw)
+                .unwrap_or_else(|err| panic!("a 0.67.0 row must still parse: {raw}: {err}"));
+            match back.kind {
+                EventKind::Mcp { tools, server, .. } => {
+                    assert_eq!(server, "docs");
+                    assert_eq!(
+                        tools, None,
+                        "a row from before the field must read as no count, not as zero: {raw}"
+                    );
+                }
+                other => panic!("expected an Mcp event, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_event_with_no_count_serialises_exactly_as_it_did_before() {
+        // The three shapes that do not carry a count: a discovered tool, a call,
+        // and a disconnect. None of them may gain a `"tools":null` — that would
+        // be a visible change to a stream consumers already read.
+        for kind in [
+            EventKind::Mcp {
+                server: "docs".into(),
+                tool: Some("search".into()),
+                ok: None,
+                millis: None,
+                tools: None,
+            },
+            EventKind::Mcp {
+                server: "docs".into(),
+                tool: Some("search".into()),
+                ok: Some(true),
+                millis: Some(40),
+                tools: None,
+            },
+            EventKind::Mcp {
+                server: "docs".into(),
+                tool: None,
+                ok: None,
+                millis: None,
+                tools: None,
+            },
+        ] {
+            let json = serde_json::to_string(&RunEvent::at_depth(7, 3, 0, kind)).unwrap();
+            assert!(
+                !json.contains("tools"),
+                "an event with no count must not write the key at all: {json}"
+            );
+        }
+
+        // And the positive control, without which the assertion above is
+        // satisfied by a field that never serialises: the connect event does
+        // write it, and writes `0` rather than nothing for a server that offered
+        // nothing.
+        let counted = serde_json::to_string(&RunEvent::at_depth(
+            7,
+            0,
+            0,
+            EventKind::Mcp {
+                server: "docs".into(),
+                tool: None,
+                ok: None,
+                millis: Some(12),
+                tools: Some(0),
+            },
+        ))
+        .unwrap();
+        assert!(
+            counted.contains("\"tools\":0"),
+            "a server that offered nothing must still say so: {counted}"
+        );
+    }
 }

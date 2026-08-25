@@ -386,6 +386,36 @@ pub(super) fn cache_through_for(boundary: Option<usize>, messages: &[Message]) -
 /// [`Store::spent_tokens`](crate::Store::spent_tokens) sums and therefore what the
 /// run's token budget is measured against: a fold billed only in `provider_calls`
 /// would be money the run's own ceiling never saw.
+/// Whether this attempt's fold is forced — asked for by the caller, or made
+/// necessary by a provider that has just refused the request as too large
+/// (0.68.0).
+///
+/// One definition called from both loops, because it is a rule and not a value:
+/// `run_workspace_from` and `run_agent` are near-parallel, and a rule spelled out
+/// twice is the drift `tests/session_fanout.rs` exists to catch. It decides three
+/// things the loops must not decide differently:
+///
+/// - **Once.** `asked` is taken, not read, so a caller's request folds the turn's
+///   first step and no later one. Without that a `fold_now` contract would fold
+///   at every step of the run.
+/// - **Consumed either way.** An overflow recovery at the first step has already
+///   folded, and a caller who asked for one fold should not be given a second at
+///   the next step because the recovery got there first.
+/// - **The root only.** A contract reaches the whole tree, but a child's ledger is
+///   its own work with no conversation seeded into it — folding it would fold
+///   something the operator never saw. This is the boundary
+///   [`Tree::extras`](crate::run::Tree::extras) already draws for steering.
+///
+/// It deliberately says nothing about whether folding is on. That question is
+/// [`Compaction::enabled`], asked first inside [`compact_ledger`], and a caller
+/// who set `at_share: 1.0` turned the machinery off — including for the recovery.
+/// Off is a setting rather than an absence, and one trigger reversing it would
+/// make "off" mean two things.
+pub(super) fn fold_forced(recovered: bool, depth: u32, asked: &mut bool) -> bool {
+    let asked_now = depth == 0 && std::mem::take(asked);
+    recovered || asked_now
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn compact_ledger<P: Provider>(
     provider: &P,

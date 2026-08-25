@@ -331,6 +331,38 @@ folds rather than paying for them again — so a fold is bought once per run, no
 once per process. `Session::transcript` is how a person reads back what a fold took
 out of the model's context.
 
+## Folding because the operator said so (0.68.0)
+
+The threshold decides the folds nobody asked for. `fold_now` is how somebody asks:
+
+```rust
+use io_harness::TaskContract;
+
+// The operator typed `/compact`. Fold the thread, then answer.
+let contract = TaskContract::workspace("summarise where we got to", "/repo")
+    .with_fold_now(true);
+```
+
+The turn's first step folds before it assembles its first request — so the summary
+is in the request the operator is waiting on, not in some later one. Everything
+else is the same machinery: the same summariser, the same `summaries` row, the same
+`EventKind::Compacted`, and nothing about automatic compaction changes. A caller
+who never sets it sees exactly the behaviour they had.
+
+Before 0.68.0 the only way to ask was to lower `at_share` for a turn and hope the
+ledger crossed it, which mutates your own setting to fake a request and can promise
+neither when it lands nor whether it does.
+
+Three things it does not do, each on purpose:
+
+- **It is not mid-turn.** The request is read once, at the turn's first step. It is
+  a property of the turn, so a contract you build once and reuse folds every turn.
+- **It does not override an off setting.** `Compaction { at_share: 1.0, .. }` never
+  folds, and that includes this. Off is a setting rather than an absence.
+- **It does not reach a spawned child.** A contract reaches the whole tree, but a
+  child's ledger is its own work with no conversation in it. Only the root turn
+  honours the request.
+
 ## The limits, stated plainly
 
 Assembly **bounds** what a request carries and applies exactly the two staleness

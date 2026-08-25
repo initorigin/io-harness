@@ -24,8 +24,9 @@ use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
 use io_harness::provider::ToolSpec;
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{
-    resume_tree_with_decision, ApproveAll, Approver, Containment, Policy, Provider, RunOutcome,
-    Session, Store, TaskContract, Tool, ToolFuture, Toolbox, TurnKind, Verification,
+    resume_tree_with_decision, ApproveAll, Approver, Compaction, Containment, ContextBudget,
+    Policy, Provider, RunOutcome, Session, Store, TaskContract, Tool, ToolFuture, Toolbox,
+    TurnKind, Verification,
 };
 use serde_json::json;
 
@@ -47,6 +48,14 @@ struct Seen {
     user: String,
     tools: Vec<String>,
 }
+
+/// A phrase out of `SUMMARY_SYSTEM`, which is the only prompt in the crate that
+/// carries it: how a fold's own completion is told apart from a step's.
+const SUMMARISER: &str = "compacting an agent's own working notes";
+
+/// What the summariser answers with. Distinctive, so a ledger that carries it is
+/// one that was folded rather than one that happens to read that way.
+const SUMMARY: &str = "ZZ-FOLDED-ZZ the agent read some notes and decided nothing.";
 
 /// Plays a script and keeps every request it was handed.
 struct Mock {
@@ -84,6 +93,24 @@ impl Mock {
 
 impl Provider for Mock {
     async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        // 0.68.0 — a fold's summarising request is answered off-script, and is not
+        // recorded. It is a completion the loop makes on its own behalf rather than
+        // a step anyone wrote, so letting it take a script slot would shift every
+        // later `Say` by one — and letting it take a `seen` slot would shift the
+        // positional claims (`mock.user(1)` is the child's) that this whole file
+        // rests on. No test that folds indexes by position; every test that indexes
+        // by position never folds, because its ledger is a handful of entries under
+        // a budget nobody shrank.
+        if req.system.contains(SUMMARISER) {
+            return Ok(CompletionResponse {
+                text: Some(SUMMARY.to_string()),
+                usage: Some(Usage {
+                    total_tokens: 100,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
         self.seen.lock().unwrap().push(Seen {
             system: req.system.clone(),
             user: req.user.clone(),
@@ -137,6 +164,9 @@ impl Observer for Log {
             EventKind::Fleet { .. } => "fleet",
             EventKind::Answered { .. } => "answered",
             EventKind::Step { .. } => "step",
+            // 0.68.0 — and `kinds` already returns the pair a fold has to be
+            // judged on: the run it happened in and the depth it happened at.
+            EventKind::Compacted { .. } => "compacted",
             _ => "other",
         };
         self.events
@@ -826,6 +856,12 @@ fn each_session_rule_is_one_helper_that_both_loops_call() {
         "classify_first_completion",
         "drain_steer",
         "conversational_opening",
+        // 0.68.0 — whether a step's fold is forced. A rule and not a value: it
+        // decides that a caller's request is consumed once, that an overflow
+        // recovery consumes it too, and that only the root honours it. Spelled
+        // out at each call site instead, those three would drift apart the first
+        // time one loop was edited without the other.
+        "fold_forced",
     ] {
         let defs = src.matches(&format!("fn {helper}(")).count();
         assert_eq!(defs, 1, "{helper} is defined exactly once");
@@ -844,6 +880,11 @@ fn each_session_rule_is_one_helper_that_both_loops_call() {
         "set_turn_kind(run_id, TURN_KIND_RUN)",
         "turn interrupted by its operator",
         "turn answered without opening a run",
+        // 0.68.0 — the take that makes a requested fold happen once. A second
+        // occurrence means one loop consumed the request beside the helper rather
+        // than through it, which is the copy that would let the two disagree
+        // about whether a fold has already been spent.
+        "std::mem::take(asked)",
     ] {
         assert_eq!(
             src.matches(once_only).count(),
@@ -1311,5 +1352,256 @@ async fn the_operators_message_reaches_the_root_and_not_the_child() {
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
         "A",
         "the child did not complete its work"
+    );
+}
+
+// ------------------------------------------- a requested fold, in a tree (0.68.0)
+//
+// `TaskContract::fold_now` is one contract laid over a whole tree, and a tree is
+// the one shape where "the caller asked for a fold" and "this agent's own history
+// needs one" are different sentences about different ledgers. `fold_forced` is
+// where they are kept apart, and this is where that separation is measured.
+
+/// A tree ceiling low enough that an agent's context budget lands on the
+/// 2,000-token floor, and therefore its fold threshold on 1,600.
+///
+/// This is the only lever that reaches a **child's** threshold. `spawn_child`
+/// builds every child a fresh `TaskContract::workspace(...)`, so a child inherits
+/// none of the turn contract's `context`, `compaction` or `fold_now` — what it
+/// does inherit is the tree's remaining tokens, through `effective_token_budget`.
+/// Roomy enough that the ~1,000 tokens both arms of the test below actually spend
+/// never reach the ceiling: this shrinks the prompt budget, it does not halt the
+/// fan-out the way `the_shared_ledger_halts_a_turns_fan_out_on_spend` does.
+fn tight() -> Containment {
+    Containment::new(10, 4, 3, 4_000)
+}
+
+fn read(path: &str) -> ToolCall {
+    call("read_file", json!({ "path": path }))
+}
+
+/// Nine files of 1,800 characters each, and the nine reads that pull them in.
+///
+/// Nine because a child keeps `Compaction::default().keep_recent` — eight —
+/// observations whole, so a ninth is the first entry a fold has anything to fold.
+///
+/// 1,800 characters because the child's per-read ceiling is 2,000 — the entry cap
+/// derived from what the tree's token ceiling leaves it — and **a file over that
+/// ceiling is refused outright, not truncated**. Two earlier versions of this
+/// fixture were written the other way round, at 3,000 and then 20,000 characters,
+/// on the assumption that an oversized read arrives clipped to the cap. Both
+/// measured thirteen durable observations totalling about 4,000 characters and no
+/// fold at all: every read had come back as a one-line refusal saying the file was
+/// over the ceiling, so the ledger the control needed to grow was made of error
+/// notes. Just under the ceiling, each entry arrives whole and nine of them are
+/// several times the 1,600-token threshold, which is a margin rather than a
+/// coincidence.
+///
+/// Distinct paths so the stall detector sees nine different signatures and never
+/// mistakes the fixture for an agent going in circles.
+fn readable(dir: &std::path::Path) -> Vec<ToolCall> {
+    (0..9)
+        .map(|i| {
+            let name = format!("note{i}.txt");
+            std::fs::write(dir.join(&name), i.to_string().repeat(1_800)).unwrap();
+            read(&name)
+        })
+        .collect()
+}
+
+/// Four conversational turns, so the next turn's seed is eight observations deep
+/// — more than the `keep_recent` below, which is what gives a root fold anything
+/// to fold. Conversational rather than working turns because the thing a root
+/// folds *is* the conversation, and this is how a conversation gets into a
+/// session.
+async fn converse(session: &mut Session, store: &Store, policy: &Policy) {
+    for i in 0..4 {
+        let talker = Mock::new(vec![Say::Text("noted")]);
+        session
+            .turn(
+                &format!("what happened at stage {i}?"),
+                &talker,
+                store,
+                policy,
+                &ApproveAll,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// The turn contract both arms are driven with, differing only in `fold_now`.
+///
+/// Verification is set and unreachable, so the turn is work rather than a reply:
+/// a classifying turn answers before the loop and never reaches a fold at all.
+/// `keep_recent: 2` against an eight-entry seed, so the root has six observations
+/// a fold can replace.
+fn folding_contract(root: &std::path::Path, fold_now: bool) -> TaskContract {
+    TaskContract::workspace("decompose it", root)
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "unreachable.txt".into(),
+            needle: "never".into(),
+        })
+        .with_max_steps(4)
+        .with_context_budget(ContextBudget::default())
+        .with_compaction(Compaction {
+            at_share: 0.8,
+            keep_recent: 2,
+        })
+        .with_fold_now(fold_now)
+}
+
+/// **F5 (0.68.0)** — a spawned child does not fold on the root's request.
+///
+/// Two arms in one test, and the second is what makes the first mean anything.
+/// Arm A asks a fan-out to fold and finds `Compacted` at depth 0 and nowhere
+/// below it. On its own that assertion is also satisfied by a tree in which a
+/// child could not have folded under any circumstances — which is 0.67.0's F3
+/// lesson stated again: an absence is evidence only when the thing absent was
+/// reachable at the moment it did not happen. Arm B is that reachability,
+/// measured rather than argued: the same fixture with the request off and a child
+/// given enough reads to cross its **own** threshold, which does emit `Compacted`
+/// at depth 1. Delete the `depth == 0` term from `fold_forced` and arm A fails;
+/// break child folding outright and arm B fails; write the test with arm A alone
+/// and neither failure is distinguishable from a fixture that never ran.
+///
+/// The lever arm B pulls is the *tree's* token ceiling and not the turn
+/// contract's `ContextBudget`, which is worth stating because it is not the
+/// obvious knob. `spawn_child` builds each child a fresh `TaskContract`, so a
+/// child inherits neither `compaction` nor `context` nor `fold_now` from the
+/// contract the caller wrote; what reaches it is `Containment`'s remaining
+/// tokens. Shrinking the tree ceiling is therefore the only way a caller can put
+/// a child's fold threshold within reach at all — see [`tight`].
+///
+/// The same fact is why arm A's absence is, today, over-determined: at depth 1
+/// `contract.fold_now` is already `false` before `fold_forced` is consulted, so
+/// the depth gate is the second of two locks on one door rather than the only
+/// one. It is still the lock that decides the question the day a child is handed
+/// its parent's contract — inheriting a step cap or a compaction setting is a
+/// plausible next release, and `fold_now` is the field that must not ride along —
+/// and this test is what would fail on that day.
+#[tokio::test]
+async fn a_spawned_child_does_not_fold_on_the_roots_request() {
+    // ---------------- arm A: the request is honoured, and stops at the root.
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let policy = Policy::permissive();
+    let mut session = Session::open(&store, dir.path()).unwrap();
+    converse(&mut session, &store, &policy).await;
+
+    let log = Log::default();
+    let mock = Mock::new(vec![
+        Say::Calls(vec![spawn("write a.txt saying A", "a.txt", "A")]),
+        Say::Calls(vec![write("a.txt", "A")]),
+    ]);
+    let turn = session
+        .turn_contained_bounded_observed(
+            &folding_contract(dir.path(), true),
+            &mock,
+            &store,
+            &policy,
+            &ApproveAll,
+            &tight(),
+            &log,
+        )
+        .await
+        .unwrap();
+
+    // First, that there was a child at all and that it worked. Without these three
+    // lines every assertion below is about a tree that never fanned out, and "no
+    // child folded" would be true of a turn with no children.
+    let children = store.children(turn.run_id).unwrap();
+    assert_eq!(
+        children.len(),
+        1,
+        "no child ran, so nothing here is about one"
+    );
+    assert!(
+        !store.steps(children[0]).unwrap().is_empty(),
+        "the child took no step of its own, so it had no ledger to fold"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "A",
+        "the child's work never reached the workspace"
+    );
+
+    let folds = log.kinds("compacted");
+    let root_folds: Vec<_> = folds.iter().filter(|(_, depth)| *depth == 0).collect();
+    assert!(
+        !root_folds.is_empty(),
+        "the root did not honour `fold_now`, so the request never reached the tree loop: {folds:?}"
+    );
+    assert!(
+        root_folds.iter().all(|(run, _)| *run == turn.run_id),
+        "a depth-0 fold that is not this turn's own run: {folds:?}"
+    );
+    // The claim.
+    let child_folds: Vec<_> = folds.iter().filter(|(_, depth)| *depth > 0).collect();
+    assert!(
+        child_folds.is_empty(),
+        "a spawned child folded a ledger on a request that was never made of it, \
+         and folded away work the operator never saw: {child_folds:?}"
+    );
+
+    // ---------------- arm B: the positive control — a child that folds its own.
+    //
+    // Same contract, same containment, same conversation. `fold_now` is off and
+    // the child is given nine reads instead of one write, so the only thing that
+    // can fold anything here is a ledger crossing its own threshold — and the
+    // ledger that crosses it is the child's.
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let mut session = Session::open(&store, dir.path()).unwrap();
+    converse(&mut session, &store, &policy).await;
+
+    let reads = readable(dir.path());
+    let log = Log::default();
+    let mock = Mock::new(vec![
+        Say::Calls(vec![spawn("read every note", "unreachable.txt", "never")]),
+        Say::Calls(reads[0..3].to_vec()),
+        Say::Calls(reads[3..6].to_vec()),
+        Say::Calls(reads[6..9].to_vec()),
+    ]);
+    let turn = session
+        .turn_contained_bounded_observed(
+            &folding_contract(dir.path(), false),
+            &mock,
+            &store,
+            &policy,
+            &ApproveAll,
+            &tight(),
+            &log,
+        )
+        .await
+        .unwrap();
+
+    let children = store.children(turn.run_id).unwrap();
+    assert_eq!(children.len(), 1, "no child ran, so this controls nothing");
+    let folds = log.kinds("compacted");
+    let child_folds: Vec<_> = folds.iter().filter(|(_, depth)| *depth > 0).collect();
+    // The child's own numbers, in the message rather than in a comment: when this
+    // control fails, the question is always which of the three preconditions was
+    // missed — enough durable entries to exceed `keep_recent`, enough estimated
+    // tokens to cross the threshold, or enough steps for a fold to be attempted
+    // after the entries existed. A count answers the first two immediately.
+    let obs = store.observations(children[0]).unwrap();
+    let child_obs = obs.len();
+    let chars: usize = obs.iter().map(|o| o.text.chars().count()).sum();
+    let child_steps = store.steps(children[0]).unwrap().len();
+    assert!(
+        !child_folds.is_empty(),
+        "a child never folded: {child_obs} durable observations over {child_steps} steps \
+         totalling {chars} characters (~{} estimated tokens), against `keep_recent` 8 — \
+         so arm A's absence is an artefact of a fixture in which no child could ever fold, \
+         and proves nothing about the depth gate: {folds:?}\nfirst entry: {:?}",
+        chars / 4,
+        obs.first()
+            .map(|o| o.text.chars().take(160).collect::<String>())
+            .unwrap_or_default()
+    );
+    assert!(
+        child_folds.iter().all(|(run, _)| children.contains(run)),
+        "a fold below depth 0 that belongs to no child of this turn: {folds:?}"
     );
 }

@@ -611,6 +611,27 @@ pub enum EventKind {
         ok: Option<bool>,
         /// How long it took.
         millis: Option<u64>,
+        /// How many tools the server offered, on the event that announces it
+        /// reaching the run. `None` on every other form.
+        ///
+        /// `Some(0)` is a server that offered nothing, and `None` is an event
+        /// that does not carry the fact at all. Separating those two is the
+        /// whole of what this field adds (0.68.0): before it, an observer that
+        /// wanted the count had to be attached for the entirety of connect and
+        /// then count the `discovered` events that followed, telling them apart
+        /// from the rest by which fields happened to be set. That is derivable
+        /// and it is not a stated number.
+        ///
+        /// Both serde attributes are load-bearing, and together they depart on
+        /// purpose from this enum's convention of emitting nulls — `tool`, `ok`
+        /// and `millis` above carry no such attribute and serialize as `null`
+        /// when absent. `default` is what lets a `run_events` row written before
+        /// 0.68.0 deserialize, since those rows have no `tools` key at all.
+        /// `skip_serializing_if` is what keeps the other three MCP shapes
+        /// byte-identical to 0.67.0, so anything diffing stored JSON sees a new
+        /// key only on the one event that has something to say with it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tools: Option<u32>,
     },
     /// A long-running process was started and registered as a handle (0.25.0).
     ///
@@ -1767,6 +1788,7 @@ mod tests {
                 tool: Some("t".into()),
                 ok: Some(true),
                 millis: Some(5),
+                tools: Some(2),
             },
             EventKind::Finished {
                 outcome: "success".into(),

@@ -735,6 +735,32 @@ pub(super) async fn run_workspace_from<P: Provider>(
     // has them from the store — the seed was persisted with the first step — and
     // seeding again would say everything twice.
     seed_conversation(&mut ledger, extras);
+    // 0.68.0 — and made durable immediately, before the first step, which is what
+    // lets the conversation be folded at all.
+    //
+    // A fold may only replace entries the store already holds
+    // (`count = (len - keep).min(written)`), and `written` is 0 until the first
+    // `persist_ledger` at the END of step one. So a turn seeded with a long
+    // conversation could not fold at its first step — not on the threshold, and
+    // not on the overflow recovery either, which sets `forced` and then dies at
+    // the same `count == 0` guard before `forced` is ever read. The turn most
+    // likely to overflow the window was the one immune to both remedies.
+    //
+    // This is not the rule at the commit boundary below being relaxed. That rule
+    // is about an observation belonging to a step: it must not outlive a step
+    // that never committed, so the ledger never runs ahead of the trace. The seed
+    // belongs to no step of this run — it is step 0, a copy of `session_turns`
+    // rows that are already durable — so there is no step it could outlive, and
+    // nothing here can be orphaned by a step that fails to commit.
+    //
+    // A no-op on a resumed run: `restore_ledger` already returned
+    // `written == ledger.len()`, so the slice appended is empty.
+    written = persist_ledger(store, run_id, &ledger, written)?;
+    // 0.68.0 — the caller's standing request for a fold, held here so it can be
+    // consumed once. `fold_forced` takes it rather than reading it, which is what
+    // makes "fold this turn" a request about the turn and not a setting that folds
+    // every step of it.
+    let mut fold_asked = contract.fold_now;
     // Is the agent getting anywhere? Restored from nothing on resume by design: a
     // resumed run has just been given a fresh chance, and condemning it for the
     // window it stalled in before the crash would be a poor welcome.
@@ -976,7 +1002,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 &mut ledger,
                 &mut written,
                 budget_tokens,
-                recovered,
+                fold_forced(recovered, 0, &mut fold_asked),
             )
             .await?;
             let assembled = assemble(
