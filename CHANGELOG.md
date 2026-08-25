@@ -26,6 +26,91 @@ notes are produced from it.
 
 ### Security
 
+## [0.69.0] - 2026-08-25
+
+An operator can fold a running turn, and a fold outlives the turn that made it.
+
+`Compaction` decides the folds nobody asked for and `TaskContract::fold_now` asks
+for one before a turn's first request. Neither is reachable by an operator watching
+a turn that is already long and already running: a contract is fixed when the turn
+starts, and the threshold lands where it lands. The other half is that a fold in a
+session bought exactly one turn of relief. `summaries` is keyed on `run_id`, every
+session turn is its own run, and the next turn's seed rebuilt the conversation from
+the turn rows — so whatever a fold had just replaced came back whole at the first
+step of the next turn, on every trigger.
+
+### Added
+
+- `Steer::fold()` — fold the conversation at the next step boundary, beside
+  `Steer::say` and `Steer::interrupt`. It is a third trigger for the one machinery:
+  the same summariser, the same durable `summaries` row, the same
+  `EventKind::Compacted`, and the same "what it never loses". The step that reads
+  the request folds before it assembles its own request, so the summary reaches the
+  model on the next thing it is sent rather than the one after that, and the
+  request itself is in the trace as a `ContextEvent::steered` line at the step that
+  read it.
+
+  Four boundaries, each of them a reading somebody would otherwise implement. It is
+  **not immediate**: like a message and an interrupt it lands at the next step
+  boundary, because a tool call in flight is not a safe place to change the
+  conversation out from under. It does **not** override an off setting —
+  `Compaction { at_share: 1.0, .. }` never folds, this trigger included. It does
+  **not** reach a spawned child, whose ledger is its own work with no conversation
+  seeded into it. And it **loses to an interrupt** sent before the same boundary:
+  the turn is cancelled and no summariser call is spent on a turn nobody is going
+  to read. One request, one fold — asking twice folds twice, and asking once does
+  not put the turn into a mode where every step folds.
+
+### Changed
+
+- **BREAKING** — `SteerInbox::pending` returns `Steering` instead of
+  `(Vec<String>, bool)`. The third thing an operator can send had to either grow
+  the tuple — the same break again at the fourth — or be dropped from it silently,
+  which loses a request the operator was told had been sent. `Steering` is
+  `#[non_exhaustive]` for exactly that reason, so the next field costs a caller
+  nothing.
+
+  *Migration:* bind the struct and read its fields.
+
+  ```rust
+  // Before
+  let (messages, interrupted) = inbox.pending();
+  // After
+  let steering = inbox.pending();
+  let (messages, interrupted) = (steering.messages, steering.interrupted);
+  // and steering.fold, which is what the tuple had no room for
+  ```
+
+- **A fold now survives the turn that made it.** `Session::seed` asks for the
+  newest turn on the path whose run folded, and seeds that turn's newest summary
+  paragraph in place of the conversation entries the fold actually consumed —
+  rather than rebuilding every prompt and reply and undoing the fold. The paragraph
+  carries the same `[earlier work, summarised]` framing an in-turn fold writes, so
+  a folded span reads identically whether it was folded three steps ago or three
+  turns ago, and it reaches the model as narration rather than as either party's
+  words.
+
+  It does not replace every earlier turn. A fold keeps the newest `keep_recent`
+  entries whole, so the seed keeps them too, and the turns after the folding one
+  are seeded as they always were.
+
+  Nothing is stored that was not stored before: it is a join over
+  `session_turns.run_id` and `summaries.run_id`, the same join `Session::transcript`
+  already makes. The transcript is untouched — every prompt and reply is still
+  there whole and the folded observations are still in the trace. Only what the
+  model is seeded with gets shorter.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+Nothing else moves: no schema change, `CHECKPOINT_FORMAT` stays at 7, no
+dependency was added, and no signature other than the one marked above changed.
+
 ## [0.68.0] - 2026-08-25
 
 The conversation folds when the operator says so, as well as when the threshold

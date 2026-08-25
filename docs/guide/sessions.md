@@ -320,7 +320,7 @@ against the event renders something rather than nothing, while being honest that
 nothing was incremental. The three built-in providers override it and emit each
 delta as its SSE event arrives.
 
-## Steering and interruption
+## Steering, folding and interruption
 
 ```rust,no_run
 use io_harness::{ApproveAll, Ignore, OpenRouter, Policy, Session, Steer, Store};
@@ -350,8 +350,41 @@ whole, the run records `cancelled`, the outcome is `RunOutcome::Cancelled`, and
 the turn stays resumable. The session goes on — the interrupted turn is in the
 tree with its outcome, and the next turn reads it like any other.
 
-Both land at a step boundary and nowhere else, for the reason cancellation always
-has: in between, a tool call is in flight and a file may be half-written.
+`fold` (0.69.0) is the third thing an operator can send. It summarises what has
+happened so far and the turn carries on from the paragraph — the `/compact` a
+person reaches for when the thread they are watching has got long and the answer
+they want is still coming:
+
+```rust,no_run
+use io_harness::Steer;
+
+# fn demo(steer: &Steer) -> io_harness::Result<()> {
+// The operator hit `/compact` twenty steps into a long turn.
+steer.fold()?;
+# Ok(()) }
+```
+
+The step that reads the request folds before it assembles its own request, so the
+summary is in the next thing the model is sent rather than the one after that. It
+is the same machinery [`Compaction`](context-and-memory.md#when-the-history-is-folded-instead-of-truncated-0430)
+and `TaskContract::fold_now` drive — the same summariser, the same durable
+`summaries` row, the same `EventKind::Compacted` — so an interface does not have to
+know which trigger fired.
+
+Four things it does not do. It does not fold where it was typed: like a message and
+an interrupt it waits for the boundary. It does not override
+`Compaction { at_share: 1.0, .. }`, because off is a setting rather than an
+absence. It does not reach a spawned child, whose ledger is its own work with no
+conversation in it. And it loses to an interrupt sent before the same boundary — an
+operator who asked for a summary and then stopped the turn stopped the turn, and no
+summariser call is spent on a turn nobody is going to read. Asking twice folds
+twice; asking once does not put the turn into a mode where every step folds.
+
+All three land at a step boundary and nowhere else, for the reason cancellation
+always has: in between, a tool call is in flight and a file may be half-written.
+What a turn read at one boundary is what `SteerInbox::pending` reports, as a
+`Steering` — `messages`, `interrupted` and `fold` — so a caller draining an inbox
+they are no longer going to hand to a turn can see what was in it.
 
 A message sent after its turn has ended is an error rather than a shrug. An
 operator whose correction went nowhere needs to know it went nowhere.

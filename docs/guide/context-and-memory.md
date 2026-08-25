@@ -363,6 +363,73 @@ Three things it does not do, each on purpose:
   child's ledger is its own work with no conversation in it. Only the root turn
   honours the request.
 
+## Folding a turn that is already running (0.69.0)
+
+`fold_now` is fixed when the turn starts, which is no use to an operator watching a
+turn that has been going for twenty steps. `Steer::fold` is that third trigger, and
+it sits beside `say` and `interrupt` on the channel a session turn already accepts:
+
+```rust,no_run
+use io_harness::{ApproveAll, Ignore, OpenRouter, Policy, Session, Steer, Store};
+
+# async fn demo(store: &Store, policy: &Policy) -> io_harness::Result<()> {
+let (steer, inbox) = Steer::channel();
+let mut session = Session::open(store, "/repo")?;
+
+let handle = steer.clone();
+tokio::spawn(async move {
+    // The operator hit `/compact` while the turn was still working.
+    let _ = handle.fold();
+});
+
+let result = session
+    .turn_steered("port the parser", &OpenRouter::from_env()?, store, policy,
+                  &ApproveAll, &Ignore, &inbox)
+    .await?;
+# Ok(()) }
+```
+
+The step that drains the inbox folds before it assembles its own request, so the
+summary is in the next thing the model is sent rather than the one after that, and
+the request itself is a `ContextEvent::steered` line in the trace at the step that
+read it — what the operator asked for is recorded beside what the fold then did.
+
+The three boundaries above hold here too, with a fourth. It is not immediate: it
+lands at the next step boundary, because a tool call in flight is not a safe place
+to change the conversation out from under. It does not override an off setting. It
+does not reach a spawned child. And it loses to an interrupt sent before the same
+boundary — the turn is cancelled and no summariser call is spent on it. Asking
+twice folds twice.
+
+What a turn read at a boundary is reported as a `Steering`, whose `messages`,
+`interrupted` and `fold` are what `SteerInbox::pending` returns.
+
+## A fold outlives the turn that made it (0.69.0)
+
+Compaction is bought per run, and in a session every turn is its own run. So a fold
+used to last exactly as long as the turn that paid for it: the next turn's seed
+rebuilt the conversation from the turn rows, and the paragraph the operator had just
+asked for was replaced by the prompts and replies it stood in for. Over a long
+conversation that meant folding again on every turn, and paying again on every turn.
+
+The seed now looks for the newest turn on the path whose run folded, and seeds that
+turn's newest summary paragraph in place of the conversation entries the fold
+consumed. So a `/compact` at turn nine is still in force at turn ten, and at turn
+twenty, until something folds again.
+
+It does not flatten the whole conversation. A fold keeps the newest `keep_recent`
+entries whole, so the seed keeps that tail whole too, and every turn after the
+folding one is seeded as it always was — what an operator sees over a long session
+is an older span that has become one paragraph and a recent span that is still
+verbatim.
+
+The paragraph reads the same as an in-turn fold's, `[earlier work, summarised]` and
+all, and reaches the model as narration rather than as something either party said.
+`Session::transcript` is unchanged and still renders every prompt and every reply,
+and the folded observations are still in the store: what got shorter is the seed,
+not the record. Nothing new is stored for it — it is a join between the turn rows
+and the `summaries` rows, both of which were already there.
+
 ## The limits, stated plainly
 
 Assembly **bounds** what a request carries and applies exactly the two staleness
