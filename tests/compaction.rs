@@ -965,14 +965,7 @@ mod requested {
         let seen = Arc::clone(&folds.0);
         let contract = measured(dir.path(), true, keeping_two()).with_max_steps(3);
         session
-            .turn_bounded_observed(
-                &contract,
-                &talker,
-                &store,
-                &policy,
-                &ApproveAll,
-                &folds,
-            )
+            .turn_bounded_observed(&contract, &talker, &store, &policy, &ApproveAll, &folds)
             .await
             .unwrap();
 

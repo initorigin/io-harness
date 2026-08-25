@@ -24,9 +24,9 @@ use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
 use io_harness::provider::ToolSpec;
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{
-    resume_tree_with_decision, ApproveAll, Approver, Compaction, Containment, ContextBudget, Policy,
-    Provider, RunOutcome, Session, Store, TaskContract, Tool, ToolFuture, Toolbox, TurnKind,
-    Verification,
+    resume_tree_with_decision, ApproveAll, Approver, Compaction, Containment, ContextBudget,
+    Policy, Provider, RunOutcome, Session, Store, TaskContract, Tool, ToolFuture, Toolbox,
+    TurnKind, Verification,
 };
 use serde_json::json;
 
@@ -1511,7 +1511,11 @@ async fn a_spawned_child_does_not_fold_on_the_roots_request() {
     // lines every assertion below is about a tree that never fanned out, and "no
     // child folded" would be true of a turn with no children.
     let children = store.children(turn.run_id).unwrap();
-    assert_eq!(children.len(), 1, "no child ran, so nothing here is about one");
+    assert_eq!(
+        children.len(),
+        1,
+        "no child ran, so nothing here is about one"
+    );
     assert!(
         !store.steps(children[0]).unwrap().is_empty(),
         "the child took no step of its own, so it had no ledger to fold"
