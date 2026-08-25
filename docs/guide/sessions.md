@@ -34,7 +34,7 @@ let id = session.id();
 # Ok(()) }
 ```
 
-## The nine entry points
+## The eleven entry points
 
 | Method | Bound | Observer | Streams | Steerable | May spawn |
 | --- | --- | --- | --- | --- | --- |
@@ -43,10 +43,18 @@ let id = session.id();
 | `turn_steered` | no criterion | yes | yes | yes | no |
 | `turn_bounded` | your `TaskContract` | — | no | no | no |
 | `turn_bounded_observed` | your `TaskContract` | yes | yes | no | no |
+| `turn_bounded_steered` | your `TaskContract` | yes | yes | **yes** | no |
 | `turn_contained` | no criterion | — | no | no | **yes** |
 | `turn_contained_observed` | no criterion | yes | yes | no | **yes** |
 | `turn_contained_bounded` | your `TaskContract` | — | no | no | **yes** |
 | `turn_contained_bounded_observed` | your `TaskContract` | yes | yes | no | **yes** |
+| `turn_contained_bounded_steered` | your `TaskContract` | yes | yes | **yes** | **yes** |
+
+The two steered rows that take a contract are 0.67.0. Before them, an operator who
+wanted to correct an agent mid-run and an operator who wanted that run to carry
+skills, a step budget or a verification gate were told to pick one. On the
+contained row the inbox reaches the root agent only — a spawned child is never
+steerable by an operator it has not spoken to.
 
 An unbounded turn runs with `Verification::None`: it ends when the agent stops
 calling tools, reported as `RunOutcome::Finished`. That is the conversational

@@ -26,6 +26,48 @@ notes are produced from it.
 
 ### Security
 
+## [0.67.0] - 2026-08-25
+
+A turn can be steered whatever contract it carries.
+
+An operator who wanted to correct an agent mid-run and an operator who wanted that
+run to carry skills, MCP servers, registered tools, a plan gate, a step or token
+budget or a verification gate were told to pick one. `Session::turn_steered` takes
+a `SteerInbox` and builds its contract internally from the operator's text;
+`turn_bounded_observed` and `turn_contained_bounded_observed` take the caller's
+contract and take no inbox at all. There was no third option, so an interface that
+wanted both dropped steering.
+
+Nothing in the loop was missing. `Session::drive` has taken the contract, an
+optional `Containment` and the steer inbox as three orthogonal parameters since
+they existed, and the tree loop has drained the inbox at its own step boundary all
+along — that call had simply never executed from a real entry point, because no
+contained turn could be given an inbox to drain.
+
+### Added
+
+- `Session::turn_bounded_steered` — the caller's `TaskContract`, an `Observer` and
+  a `SteerInbox` on one call. The contract's `root` is replaced by the session's,
+  as `turn_bounded` replaces it.
+- `Session::turn_contained_bounded_steered` — the same for a turn that may fan out,
+  with the `Containment` in `turn_contained_bounded_observed`'s position and the
+  inbox appended last. The operator's correction reaches the root of the fan-out;
+  a spawned child is handed no inbox at all, because a sub-agent is never steerable
+  by an operator it has not spoken to.
+
+Steering itself is unchanged. A message is drained at the step boundary and nowhere
+else, so the step in flight completes whole and the agent reads the correction
+before choosing its next action; an interrupt ends the turn as
+`RunOutcome::Cancelled` on a whole step. On the contained path that boundary is the
+root's own step, which is the one point at which no child of the root is in flight —
+so a correction typed while children are running lands after that step's children
+have finished rather than interrupting one of them. That is now stated in both
+methods' rustdoc, in `docs/CONTRACT.md` and in `docs/guide/sessions.md`.
+
+Nothing else moves: every existing signature is unchanged, no schema moved,
+`CHECKPOINT_FORMAT` stays at 7, no dependency was added, and a caller who never
+calls the new methods gets exactly the crate they had.
+
 ## [0.66.0] - 2026-08-19
 
 A turn that may fan out takes the caller's contract, on the session and on the

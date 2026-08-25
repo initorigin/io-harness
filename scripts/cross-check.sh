@@ -131,7 +131,10 @@ pub mod linux { pub const LANDLOCK_NET_ABI: u32 = 4; }
 #[allow(dead_code)]
 fn consumer(fd: std::os::fd::RawFd, w: &std::path::Path) -> std::io::Result<()> {
     let abi = landlock::abi().unwrap_or(1);
-    let p = landlock::plan(abi, ExecMode::WorkspaceWrite, true, w, &[], w);
+    // `Some(port)` here would exercise the proxy arm as well; `None` is the shape
+    // a run with no proxy of its own passes, and it is the arm every caller that
+    // predates the parameter still takes.
+    let p = landlock::plan(abi, ExecMode::WorkspaceWrite, true, w, &[], w, None);
     let r = landlock::Ruleset::build(&p)?;
     let _ = r.raw();
     unsafe { landlock::restrict_self(fd)?; }

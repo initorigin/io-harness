@@ -1084,6 +1084,24 @@ all. The contract's `root` is replaced by the session's, exactly as `turn_bounde
 replaces it. `Harness::turn_contained` and `Harness::turn_contained_with` are the
 same two shapes with the host bound once.
 
+**And it may be steered while it carries one (0.67.0).**
+`Session::turn_bounded_steered` and `Session::turn_contained_bounded_steered` take
+the caller's `TaskContract`, an `Observer` and a `SteerInbox` on one call, so a turn
+that carries any of the above can also be corrected while it runs — and a fan-out
+can be corrected at its root. Before this release the choice was exclusive:
+`Session::turn_steered` takes the inbox and builds its contract internally, and the
+`_bounded_observed` pair takes the contract and no inbox.
+
+Nothing about steering changes. A message is drained at the step boundary and
+nowhere else, so the step in flight completes whole and the agent reads the
+correction before choosing its next action; an interrupt ends the turn as
+`RunOutcome::Cancelled` on a whole step. **On the contained path that boundary is
+the root's own step**, which is the one point at which no child of the root is in
+flight — children are awaited inside the step that spawned them. So a correction
+typed while children are running lands after that step's children have finished,
+not while they run. **A spawned child is handed no inbox at all**, deliberately: a
+sub-agent is never steerable by an operator it has not spoken to.
+
 Four things the tree loop reads differently from the flat one, and none is new in
 0.66.0 — each has been true of `run_tree` since 0.39.0, and 0.66.0 only makes them
 reachable from a session. The tree's one shared spend ceiling is built from the
@@ -1498,8 +1516,10 @@ took 0.41.0's batch path either. Both are unchanged by this release.
 **Speculation follows streaming, and streaming follows the turn entry point.**
 Only the `_observed` and `_steered` session turns stream —
 `Session::turn_observed`, `Session::turn_steered`,
-`Session::turn_bounded_observed`, `Session::turn_contained_observed` and
-`Session::turn_contained_bounded_observed`. A turn taken through `Session::turn`,
+`Session::turn_bounded_observed`, `Session::turn_contained_observed`,
+`Session::turn_contained_bounded_observed`, and (0.67.0)
+`Session::turn_bounded_steered` and `Session::turn_contained_bounded_steered`. A
+turn taken through `Session::turn`,
 `Session::turn_bounded`, `Session::turn_contained` or
 `Session::turn_contained_bounded` does not stream and therefore starts nothing
 early. That

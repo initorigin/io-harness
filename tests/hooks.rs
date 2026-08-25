@@ -334,10 +334,16 @@ async fn f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin() {
     empty_user_scope();
     let ws = tempfile::tempdir().unwrap();
 
+    // A generous bound, because nothing here is asserting one. This test asks what
+    // reached the child, not how fast it got there, and the deadline exists only so
+    // a wedged child cannot hang the suite. 20_000 was not generous enough: a
+    // Windows runner under load took a PowerShell that normally starts in ~2s past
+    // it, the hook was killed before it wrote, and the assertion below read that as
+    // a split argv.
     run_under(
         ws.path(),
         &format!(
-            "[[hook]]\non = [\"started\"]\nrun = {}\ntimeout_ms = 20000\n",
+            "[[hook]]\non = [\"started\"]\nrun = {}\ntimeout_ms = 120000\n",
             argv(CAPTURE)
         ),
     )
