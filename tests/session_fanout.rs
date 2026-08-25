@@ -24,8 +24,8 @@ use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
 use io_harness::provider::ToolSpec;
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{
-    resume_tree_with_decision, ApproveAll, Approver, Containment, Ignore, Policy, Provider,
-    RunOutcome, Session, Store, TaskContract, Tool, ToolFuture, Toolbox, TurnKind, Verification,
+    resume_tree_with_decision, ApproveAll, Approver, Containment, Policy, Provider, RunOutcome,
+    Session, Store, TaskContract, Tool, ToolFuture, Toolbox, TurnKind, Verification,
 };
 use serde_json::json;
 
@@ -1166,6 +1166,27 @@ fn one_child() -> Mock {
     ])
 }
 
+/// Says the operator's correction the moment a child is spawned — which is
+/// emitted before the child's own events start arriving, so the message is
+/// **pending in the inbox while the child runs**.
+///
+/// That timing is the whole point. A message queued before the turn would be
+/// drained by the root's first boundary and gone before any child existed, and a
+/// child that then failed to see it would prove nothing about whether children can
+/// be steered.
+struct SayOnSpawn(io_harness::Steer, AtomicUsize);
+
+impl Observer for SayOnSpawn {
+    fn event(&self, event: &RunEvent) -> Flow {
+        if matches!(event.kind, EventKind::Spawned { .. }) && self.1.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            // Ignored on a closed channel: an observer must not panic.
+            let _ = self.0.say(OPERATOR);
+        }
+        Flow::Continue
+    }
+}
+
 /// **F2 (0.67.0)** — a contained turn is steerable at its root, and the tree loop's
 /// drain executes.
 ///
@@ -1183,12 +1204,6 @@ async fn a_contained_bounded_turn_is_steerable_at_its_root() {
     let mock = one_child();
     let (steer, inbox) = io_harness::Steer::channel();
 
-    // Sent before the turn starts, which is the same code path as sending it during
-    // a step: the tree loop reads the inbox at every boundary, and the first
-    // boundary is one. It is also what leaves the message live while the child runs,
-    // which is what makes the sibling test about the child mean something.
-    steer.say(OPERATOR).unwrap();
-
     let turn = session
         .turn_contained_bounded_steered(
             &contract,
@@ -1197,16 +1212,23 @@ async fn a_contained_bounded_turn_is_steerable_at_its_root() {
             &Policy::permissive(),
             &ApproveAll,
             &roomy(),
-            &Ignore,
+            &SayOnSpawn(steer, AtomicUsize::new(0)),
             &inbox,
         )
         .await
         .unwrap();
 
+    // Completion 2 is the root's second step — its first boundary after the
+    // message was sent. Completion 0 is the root's first step, before it existed.
     assert!(
-        mock.user(0).contains(OPERATOR),
+        !mock.user(0).contains(OPERATOR),
+        "the message was in the root's context before it was sent, so this says \
+         nothing about a boundary"
+    );
+    assert!(
+        mock.user(2).contains(OPERATOR),
         "the tree loop's drain never put the operator's message in the root's context: {}",
-        mock.user(0)
+        mock.user(2)
     );
     // The same claim from the store rather than from the provider's recollection.
     let root_steps = store.steps(turn.run_id).unwrap();
@@ -1244,7 +1266,6 @@ async fn the_operators_message_reaches_the_root_and_not_the_child() {
     let contract = TaskContract::workspace("decompose it", dir.path()).with_max_steps(3);
     let mock = one_child();
     let (steer, inbox) = io_harness::Steer::channel();
-    steer.say(OPERATOR).unwrap();
 
     let turn = session
         .turn_contained_bounded_steered(
@@ -1254,19 +1275,21 @@ async fn the_operators_message_reaches_the_root_and_not_the_child() {
             &Policy::permissive(),
             &ApproveAll,
             &roomy(),
-            &Ignore,
+            &SayOnSpawn(steer, AtomicUsize::new(0)),
             &inbox,
         )
         .await
         .unwrap();
 
-    // The control: the root did read it. Without this line the assertion below
-    // would pass on a fixture that never delivered the message to anyone.
+    // The control: the root did read it, at its next boundary. Without this line
+    // the assertion below would pass on a fixture that never delivered the message
+    // to anyone.
     assert!(
-        mock.user(0).contains(OPERATOR),
+        mock.user(2).contains(OPERATOR),
         "the root never read the message, so nothing here is evidence about the child"
     );
-    // The child's own completion, which is the second in script order.
+    // The child's own completion, which is the second in script order — and it ran
+    // while the message was sitting unread in the inbox.
     assert!(
         !mock.user(1).contains(OPERATOR),
         "the operator's message reached a sub-agent they never spoke to: {}",
