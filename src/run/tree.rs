@@ -512,8 +512,15 @@ where
             // The same boundary carries an operator's steering, and it is the one
             // point at which no child of this agent is in flight: children are
             // awaited inside the step that spawned them.
-            if let Some(o) = drain_steer(tree.store, tree.watch, run_id, step, &mut ledger, extras)?
-            {
+            if let Some(o) = drain_steer(
+                tree.store,
+                tree.watch,
+                run_id,
+                step,
+                &mut ledger,
+                extras,
+                &mut fold_asked,
+            )? {
                 return Ok(o);
             }
             if let Some(max) = contract.max_duration {

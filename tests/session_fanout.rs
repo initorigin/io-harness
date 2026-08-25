@@ -1229,6 +1229,116 @@ impl Observer for SayOnSpawn {
     }
 }
 
+/// A [`Log`] that also asks the root to fold, once, at its first step boundary
+/// (0.69.0).
+///
+/// One object because a turn takes one observer, and the two jobs have to be the
+/// same one: the request has to be sent from inside the run for it to be a
+/// *mid-turn* fold at all, and the folds it produces are read off the same event
+/// stream.
+struct FoldOnFirstStep {
+    log: Log,
+    steer: io_harness::Steer,
+    steps: AtomicUsize,
+}
+
+impl FoldOnFirstStep {
+    fn new(steer: io_harness::Steer) -> Self {
+        Self {
+            log: Log::default(),
+            steer,
+            steps: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Observer for FoldOnFirstStep {
+    fn event(&self, event: &RunEvent) -> Flow {
+        if matches!(event.kind, EventKind::Step { .. })
+            && event.depth == 0
+            && self.steps.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            // Ignored on a closed channel: an observer must not panic.
+            let _ = self.steer.fold();
+        }
+        self.log.event(event)
+    }
+}
+
+/// **F6 (0.69.0)** — the operator's fold reaches the root while children are
+/// running, and reaches no child.
+///
+/// The reachability half of F6, whose rule is asserted as a unit in `src/run.rs`
+/// for the reason 0.68.0's F5 arm recorded: at depth 1 the absence is
+/// over-determined — a child's contract is fresh *and* its extras are
+/// `NO_EXTRAS` — so this test would go on passing with either lock removed. What
+/// it does prove, and nothing else does, is that the tree loop's `drain_steer`
+/// call site sets the flag its own `compact_ledger` then reads: a fold asked for
+/// mid-turn on a fan-out lands, on the run that has children in flight.
+#[tokio::test]
+async fn the_operators_fold_reaches_the_root_and_not_the_children() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let policy = Policy::permissive();
+    let mut session = Session::open(&store, dir.path()).unwrap();
+    // Four turns of conversation, so the root has a ledger worth folding.
+    converse(&mut session, &store, &policy).await;
+
+    let (steer, inbox) = io_harness::Steer::channel();
+    let log = FoldOnFirstStep::new(steer);
+    let mock = Mock::new(vec![
+        Say::Calls(vec![spawn("write a.txt saying A", "a.txt", "A")]),
+        Say::Calls(vec![write("a.txt", "A")]),
+    ]);
+
+    // `fold_now: false`, so the only thing that can fold this turn is the operator.
+    let turn = session
+        .turn_contained_bounded_steered(
+            &folding_contract(dir.path(), false),
+            &mock,
+            &store,
+            &policy,
+            &ApproveAll,
+            &tight(),
+            &log,
+            &inbox,
+        )
+        .await
+        .unwrap();
+
+    // The fan-out happened, so "no child folded" is a statement about a child.
+    let children = store.children(turn.run_id).unwrap();
+    assert_eq!(
+        children.len(),
+        1,
+        "no child ran, so nothing here is about one"
+    );
+    assert!(
+        !store.steps(children[0]).unwrap().is_empty(),
+        "the child took no step of its own, so it had no ledger to fold"
+    );
+
+    let folds = log.log.kinds("compacted");
+    let root_folds: Vec<_> = folds.iter().filter(|(_, depth)| *depth == 0).collect();
+    assert!(
+        !root_folds.is_empty(),
+        "the operator's fold never reached the tree loop: {folds:?}"
+    );
+    assert!(
+        root_folds.iter().all(|(run, _)| *run == turn.run_id),
+        "a depth-0 fold that is not this turn's own run: {folds:?}"
+    );
+    assert!(
+        !store.summaries(turn.run_id).unwrap().is_empty(),
+        "the fold emitted an event and wrote nothing durable"
+    );
+    let child_folds: Vec<_> = folds.iter().filter(|(_, depth)| *depth > 0).collect();
+    assert!(
+        child_folds.is_empty(),
+        "a child folded on a request made through a channel it was never given: {child_folds:?}"
+    );
+}
+
 /// **F2 (0.67.0)** — a contained turn is steerable at its root, and the tree loop's
 /// drain executes.
 ///
