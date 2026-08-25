@@ -1233,8 +1233,13 @@ impl Session {
     /// which is where the model was trained to read it.
     fn seed(&self, store: &Store, contract: &TaskContract) -> Result<Vec<(&'static str, String)>> {
         let cap = entry_cap_chars(contract.context.effective_tokens(contract.max_tokens));
+        let history = self.history(store)?;
         let mut out = Vec::new();
-        for turn in self.history(store)? {
+        // Where each turn's entries begin, so the fold below can say how much of
+        // the conversation it stood in for without re-deriving the count.
+        let mut starts = Vec::with_capacity(history.len());
+        for turn in &history {
+            starts.push(out.len());
             out.push((
                 crate::context::SEED_OPERATOR,
                 bound(
@@ -1250,7 +1255,66 @@ impl Session {
                 ));
             }
         }
-        Ok(out)
+        let Some((at, summaries)) = self.newest_fold(store, &history)? else {
+            return Ok(out);
+        };
+        // What that turn's folds consumed of the conversation seeded into it. The
+        // first fold's prefix is conversation; every later one's begins with the
+        // paragraph the previous fold wrote, so it reaches one fewer — the same
+        // arithmetic `restore_ledger` replays, and the reason a two-fold turn is
+        // its own criterion. Capped at what was seeded, because a fold long enough
+        // to reach past it was folding the turn's own work.
+        let seeded_before = starts[at];
+        let mut consumed = 0usize;
+        for (nth, summary) in summaries.iter().enumerate() {
+            let reach = if nth == 0 {
+                summary.folded as usize
+            } else {
+                (summary.folded as usize).saturating_sub(1)
+            };
+            consumed = consumed.saturating_add(reach).min(seeded_before);
+        }
+        // The newest paragraph alone: a later fold's prefix contained the earlier
+        // one, so it already stands in for everything the earlier folds did.
+        let text = summaries.last().map(|s| s.text.clone()).unwrap_or_default();
+        let mut folded = Vec::with_capacity(out.len() - consumed + 1);
+        folded.push((
+            crate::context::SEED_SUMMARY,
+            bound(
+                &crate::context::summarised_entry(&text),
+                cap,
+                ObsKind::Message,
+            ),
+        ));
+        folded.extend(out.drain(..).skip(consumed));
+        Ok(folded)
+    }
+
+    /// The newest turn on this path whose run folded, and the folds it wrote.
+    ///
+    /// (0.69.0) A fold used to buy one turn of relief: `summaries` is keyed on
+    /// `run_id`, every turn is its own run, and the seed above rebuilt the whole
+    /// conversation from `session_turns` however much of it a fold had just
+    /// replaced. The join that fixes it is the one
+    /// [`Session::transcript`](Session::transcript) already makes — a turn row
+    /// carries its `run_id` — so nothing is stored that was not stored before.
+    ///
+    /// Newest wins and the walk stops there: an earlier fold's paragraph was part
+    /// of what a later fold summarised, so the later one already stands in for it.
+    /// A session that never folded pays one indexed lookup per turn on its path
+    /// and gets today's seed unchanged.
+    fn newest_fold(
+        &self,
+        store: &Store,
+        history: &[Turn],
+    ) -> Result<Option<(usize, Vec<crate::state::Summary>)>> {
+        for (at, turn) in history.iter().enumerate().rev() {
+            let summaries = store.summaries(turn.run_id)?;
+            if !summaries.is_empty() {
+                return Ok(Some((at, summaries)));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -1365,14 +1429,16 @@ pub(crate) struct SessionTurn<'a> {
     pub prompt: &'a str,
 }
 
-/// An operator's channel into a running turn: say something else, or stop.
+/// An operator's channel into a running turn: say something else, fold what has
+/// happened so far, or stop.
 ///
 /// `Send + Sync` and cheap to clone, so a UI thread, a signal handler or another
 /// task can hold one while the turn runs on the task that started it.
 ///
-/// Both a message and an interrupt land at the **next step boundary** — the same
-/// point [`Flow::Cancel`](crate::Flow::Cancel) is honoured at, and for the same
-/// reason: in between, a tool call is in flight and a file may be half-written.
+/// A message, a fold and an interrupt all land at the **next step boundary** —
+/// the same point [`Flow::Cancel`](crate::Flow::Cancel) is honoured at, and for
+/// the same reason: in between, a tool call is in flight and a file may be
+/// half-written.
 ///
 /// A message is text, not permission. It reaches the model exactly as a
 /// constraint does, and every tool call it leads to is checked against the same
@@ -1389,9 +1455,9 @@ pub(crate) struct SessionTurn<'a> {
 ///
 /// // Nothing is delivered until the turn reads its inbox at a step boundary, so
 /// // an operator who says three things in one second has said three things.
-/// let (messages, interrupted) = inbox.pending();
-/// assert_eq!(messages, vec!["prefer the smaller diff".to_string()]);
-/// assert!(interrupted);
+/// let steering = inbox.pending();
+/// assert_eq!(steering.messages, vec!["prefer the smaller diff".to_string()]);
+/// assert!(steering.interrupted);
 /// # Ok(())
 /// # }
 /// ```
@@ -1417,9 +1483,9 @@ pub struct Steer {
 ///
 /// // Nothing is lost by being early: a message sent before the turn's first step
 /// // is read at that step, like any other.
-/// let (messages, interrupted) = inbox.pending();
-/// assert_eq!(messages, vec!["use the smaller diff".to_string()]);
-/// assert!(!interrupted);
+/// let steering = inbox.pending();
+/// assert_eq!(steering.messages, vec!["use the smaller diff".to_string()]);
+/// assert!(!steering.interrupted);
 /// # Ok(())
 /// # }
 /// ```
@@ -1429,10 +1495,16 @@ pub struct SteerInbox {
 }
 
 /// One thing an operator sent.
+///
+/// Private, and deliberately: an operator gains ways to speak — two in 0.67.0,
+/// three now — and a public enum would make each of them a variant addition on a
+/// type callers match. What they read is [`Steering`], which is
+/// `#[non_exhaustive]` for that reason.
 #[derive(Debug, Clone)]
 enum Steered {
     Say(String),
     Interrupt,
+    Fold,
 }
 
 impl Steer {
@@ -1467,6 +1539,40 @@ impl Steer {
         self.send(Steered::Interrupt)
     }
 
+    /// Fold the conversation at the next step boundary: summarise what has
+    /// happened so far and carry on.
+    ///
+    /// The third trigger for the one machinery. [`Compaction`](crate::Compaction)
+    /// decides the folds nobody asked for and
+    /// [`TaskContract::fold_now`](crate::TaskContract::fold_now) asks for one
+    /// before a turn's first request; this asks for one *during* the turn. The
+    /// step that reads it folds before it assembles its own request, so the
+    /// summary reaches the model on the next thing it is sent rather than the one
+    /// after that.
+    ///
+    /// Four things it does not do, each of them a reading somebody would
+    /// otherwise implement:
+    ///
+    /// - It is not immediate. Like a message and an interrupt it lands at the
+    ///   next step boundary, because a tool call in flight is not a safe place to
+    ///   change the conversation out from under.
+    /// - It does not override an off setting. `Compaction { at_share: 1.0, .. }`
+    ///   never folds, this trigger included — off is a setting rather than an
+    ///   absence, and one trigger reversing it would make the word mean two
+    ///   things.
+    /// - It does not reach a spawned child. A child's ledger is its own work with
+    ///   no conversation seeded into it, so folding it would fold something the
+    ///   operator never saw.
+    /// - It loses to an interrupt sent before the same boundary. An operator who
+    ///   asked for a fold and then stopped the turn stopped the turn, and no
+    ///   summariser call is spent on a turn nobody is going to read.
+    ///
+    /// One request, one fold: asking twice in the same turn folds twice, and
+    /// asking once does not put the turn into a mode where every step folds.
+    pub fn fold(&self) -> Result<()> {
+        self.send(Steered::Fold)
+    }
+
     fn send(&self, message: Steered) -> Result<()> {
         self.tx.send(message).map_err(|_| {
             Error::Config(
@@ -1477,20 +1583,18 @@ impl Steer {
 }
 
 impl SteerInbox {
-    /// Everything sent since the last read: the messages in order, and whether an
-    /// interrupt was among them.
+    /// Everything sent since the last read.
     ///
     /// Public so a caller can drain an inbox they are no longer going to hand to a
     /// turn and see what was in it, rather than discovering that an operator's last
     /// message vanished with the channel.
-    pub fn pending(&self) -> (Vec<String>, bool) {
-        let drained = self.drain();
-        (drained.messages, drained.interrupted)
+    pub fn pending(&self) -> Steering {
+        self.drain()
     }
 
     /// What the run loop reads at a step boundary.
-    pub(crate) fn drain(&self) -> Drained {
-        let mut out = Drained::default();
+    pub(crate) fn drain(&self) -> Steering {
+        let mut out = Steering::default();
         let mut rx = self.rx.borrow_mut();
         while let Ok(message) = rx.try_recv() {
             match message {
@@ -1498,17 +1602,58 @@ impl SteerInbox {
                 // Not a `break`: an operator who typed a correction and then hit
                 // interrupt sent both, and the trace should hold both.
                 Steered::Interrupt => out.interrupted = true,
+                // A latch rather than a count, for the reason the interrupt is
+                // one: two folds arriving in the same drain are one fold at that
+                // boundary, because the second would summarise a ledger the first
+                // has just replaced with a paragraph.
+                Steered::Fold => out.fold = true,
             }
         }
         out
     }
 }
 
-/// One step boundary's worth of steering.
+/// One step boundary's worth of steering: what an operator sent since the turn
+/// last read its inbox.
+///
+/// `#[non_exhaustive]`, and that is the point of the type. Until 0.69.0
+/// [`SteerInbox::pending`] returned `(Vec<String>, bool)`, so the third thing an
+/// operator can send had to either grow the tuple — the same break again at the
+/// fourth — or be dropped from it silently, which loses a request the operator
+/// was told had been sent. A struct that may gain a field costs a caller nothing
+/// the next time.
+///
+/// ```
+/// use io_harness::Steer;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let (steer, inbox) = Steer::channel();
+/// steer.say("prefer the smaller diff")?;
+/// steer.fold()?;
+///
+/// let steering = inbox.pending();
+/// assert_eq!(steering.messages, vec!["prefer the smaller diff".to_string()]);
+/// assert!(steering.fold);
+/// assert!(!steering.interrupted);
+///
+/// // Drained is drained: what a turn has read, a later read does not see again.
+/// let nothing = inbox.pending();
+/// assert!(nothing.messages.is_empty() && !nothing.fold);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Default)]
-pub(crate) struct Drained {
+#[non_exhaustive]
+pub struct Steering {
+    /// What the operator said, in the order they said it.
     pub messages: Vec<String>,
+    /// Whether an interrupt was among what they sent. It ends the turn at this
+    /// boundary and it wins over everything else in the same drain.
     pub interrupted: bool,
+    /// Whether a fold was asked for. Honoured before this step assembles its
+    /// request, unless the interrupt above ends the turn first or compaction is
+    /// off.
+    pub fold: bool,
 }
 
 /// The last thing the agent said, if its last word was a message rather than a

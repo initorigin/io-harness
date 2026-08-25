@@ -3560,18 +3560,32 @@ const NO_EXTRAS: TurnExtras<'static> = TurnExtras {
     classify: false,
 };
 
+/// The session extras an agent at `depth` runs under — the turn's at the root,
+/// and nothing below it.
+///
+/// A free function rather than a method (0.69.0) so the rule can be asserted
+/// without a live tree, which needs a provider, a store and a boundary. The
+/// assertion matters more since the operator's fold arrives through the inbox
+/// this decides a child does not get: "a child is work, not conversation" is what
+/// stops a fold asked for at the root from folding a child's own ledger, and a
+/// test that restated the match instead of calling it would go on passing while
+/// the match said something else.
+fn extras_for<'a>(turn: Option<&'a TurnExtras<'a>>, depth: u32) -> &'a TurnExtras<'a> {
+    match depth {
+        0 => turn.unwrap_or(&NO_EXTRAS),
+        _ => &NO_EXTRAS,
+    }
+}
+
 impl<P: Provider> Tree<'_, P> {
     /// The session extras this agent runs under — the turn's at the root, and
     /// nothing at any other depth.
     ///
-    /// The depth test lives here rather than at each of the four use sites, so
-    /// "a child is work, not conversation" is one rule that cannot hold at three
-    /// of them and lapse at the fourth.
+    /// The depth test lives in [`extras_for`] rather than at each of the four use
+    /// sites, so "a child is work, not conversation" is one rule that cannot hold
+    /// at three of them and lapse at the fourth.
     fn extras(&self, depth: u32) -> &TurnExtras<'_> {
-        match depth {
-            0 => self.turn.unwrap_or(&NO_EXTRAS),
-            _ => &NO_EXTRAS,
-        }
+        extras_for(self.turn, depth)
     }
 }
 
@@ -4525,6 +4539,45 @@ mod tests {
             !asked,
             "a recovery that folded left the caller's request outstanding"
         );
+    }
+
+    /// F6 (0.69.0) — the operator's fold reaches the root and no child, and the
+    /// reason is that a child has no inbox to read it from.
+    ///
+    /// Asserted here for the reason the criterion above is: end to end the rule is
+    /// over-determined twice over — a child's contract is fresh, *and* the extras
+    /// it runs under are `NO_EXTRAS` — so a fan-out fixture would go on passing
+    /// with either lock removed. What the fan-out test proves is that the root
+    /// still folds while children are in flight, which is reachability rather than
+    /// the rule.
+    ///
+    /// The two locks are not redundant with each other. `fold_forced`'s depth gate
+    /// answers "may this agent fold on a request", and this one answers "can this
+    /// agent hear a request at all" — the day a child inherits its parent's
+    /// contract, only the first still holds, and the day a child is handed a
+    /// stream to write to, only the second does.
+    #[test]
+    fn a_child_has_no_inbox_to_hear_the_operators_fold_in() {
+        let (_steer, inbox) = crate::session::Steer::channel();
+        let turn = TurnExtras {
+            steer: Some(&inbox),
+            ..Default::default()
+        };
+
+        assert!(
+            extras_for(Some(&turn), 0).steer.is_some(),
+            "the root cannot hear its own operator"
+        );
+        for depth in 1..4 {
+            assert!(
+                extras_for(Some(&turn), depth).steer.is_none(),
+                "a child at depth {depth} was handed the operator's inbox"
+            );
+        }
+        // And what a missing inbox means at the drain: `drain_steer` returns
+        // before it reads anything, so a child cannot fold, cannot be corrected
+        // and cannot be interrupted through a channel it was never given.
+        assert!(NO_EXTRAS.steer.is_none());
     }
 
     /// F6 (0.64.0) — the OTHER prose case is untouched and still falls back.

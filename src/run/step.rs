@@ -331,6 +331,14 @@ pub(super) fn classify_first_completion(
 /// `Ok(Some(_))` is the interrupt: the turn is finished rather than abandoned,
 /// so `runs.status` stops being `running` and a resume reports the cancellation
 /// instead of re-driving the loop.
+///
+/// `fold_asked` is the loop's own standing request for a fold — the one
+/// [`fold_forced`](super::memory::fold_forced) consumes — and a drained
+/// [`Steering::fold`](crate::Steering::fold) is ORed into it rather than
+/// returned, so the fold is decided by the same expression whichever trigger
+/// asked. It is set here and read by the compaction attempt of *this* step, a
+/// few lines further down each loop, which is what makes a fold typed mid-step
+/// land on the request built after it rather than the one after that.
 pub(super) fn drain_steer(
     store: &Store,
     watch: &Watch<'_>,
@@ -338,16 +346,31 @@ pub(super) fn drain_steer(
     step: u32,
     ledger: &mut ContextLedger,
     extras: &TurnExtras<'_>,
+    fold_asked: &mut bool,
 ) -> Result<Option<RunOutcome>> {
     let Some(inbox) = extras.steer else {
         return Ok(None);
     };
     let steered = inbox.drain();
     if steered.interrupted {
-        // The cancel path, not a second one.
+        // The cancel path, not a second one. Answered before the fold for a
+        // reason a caller can predict: an operator who asked for a summary and
+        // then stopped the turn stopped the turn, and a summariser call spent on
+        // a turn nobody will read is money the run does not get back.
         finish(store, watch, run_id, 0, step - 1, "cancelled")?;
         info!(run_id, steps = step - 1, "turn interrupted by its operator");
         return Ok(Some(RunOutcome::Cancelled { steps: step - 1 }));
+    }
+    if steered.fold {
+        // ORed, never assigned: a contract that already asked for a fold this
+        // turn has not been served yet, and an operator asking again must not
+        // clear it.
+        *fold_asked = true;
+        info!(run_id, step, "operator asked the turn to fold");
+        store.record_context_event(
+            run_id,
+            &ContextEvent::steered(step, "operator asked for a fold".to_string()),
+        )?;
     }
     for message in steered.messages {
         // An observation like any other: bounded by the same budget, recorded in
@@ -921,7 +944,15 @@ pub(super) async fn run_workspace_from<P: Provider>(
         // The same boundary is where an operator's steering lands, for the same
         // reason: the points in between are not safe to stop at or to change course
         // from — a tool call is in flight and a file may be half-written.
-        if let Some(o) = drain_steer(store, watch, run_id, step, &mut ledger, extras)? {
+        if let Some(o) = drain_steer(
+            store,
+            watch,
+            run_id,
+            step,
+            &mut ledger,
+            extras,
+            &mut fold_asked,
+        )? {
             return Ok(RunResult::new(o, run_id).with_remembered(remembered));
         }
         if let Some(max) = contract.max_duration {
