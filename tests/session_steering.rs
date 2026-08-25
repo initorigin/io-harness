@@ -182,7 +182,8 @@ struct SayOnFirstStep(Steer, AtomicUsize);
 
 impl Observer for SayOnFirstStep {
     fn event(&self, event: &RunEvent) -> Flow {
-        if matches!(event.kind, EventKind::Step { .. }) && self.1.fetch_add(1, Ordering::SeqCst) == 0
+        if matches!(event.kind, EventKind::Step { .. })
+            && self.1.fetch_add(1, Ordering::SeqCst) == 0
         {
             // Ignored on a closed channel, for the reason `InterruptOnFirstStep`
             // ignores it: an observer must not panic.
@@ -576,7 +577,11 @@ async fn a_steered_bounded_turn_honours_its_contract_and_reads_the_steer() {
         "the turn did not stop at the contract's step bound, got {:?}",
         turn.outcome
     );
-    assert_eq!(provider.calls(), 3, "the step bound was not the three asked for");
+    assert_eq!(
+        provider.calls(),
+        3,
+        "the step bound was not the three asked for"
+    );
 }
 
 /// **F4 (0.67.0)** — an interrupt ends a bounded steered turn as `Cancelled`, on a
@@ -600,8 +605,7 @@ async fn an_interrupt_ends_a_steered_bounded_turn_and_the_session_carries_on() {
     let provider = Insistent::default();
     let (steer, inbox) = Steer::channel();
 
-    let contract =
-        TaskContract::workspace("keep editing the notes", ws.path()).with_max_steps(5);
+    let contract = TaskContract::workspace("keep editing the notes", ws.path()).with_max_steps(5);
     let mut session = Session::open(&store, ws.path()).unwrap();
     let interrupted = session
         .turn_bounded_steered(
@@ -691,8 +695,7 @@ async fn both_steered_entry_points_run_in_the_sessions_workspace() {
     let elsewhere = workspace();
     let store = Store::memory().unwrap();
     let mut session = Session::open(&store, session_dir.path()).unwrap();
-    let contract =
-        TaskContract::workspace("edit the notes", elsewhere.path()).with_max_steps(1);
+    let contract = TaskContract::workspace("edit the notes", elsewhere.path()).with_max_steps(1);
     let (_steer, inbox) = Steer::channel();
 
     session
@@ -723,8 +726,7 @@ async fn both_steered_entry_points_run_in_the_sessions_workspace() {
     let session_dir2 = workspace();
     let elsewhere2 = workspace();
     let mut session2 = Session::open(&store, session_dir2.path()).unwrap();
-    let contract2 =
-        TaskContract::workspace("edit the notes", elsewhere2.path()).with_max_steps(1);
+    let contract2 = TaskContract::workspace("edit the notes", elsewhere2.path()).with_max_steps(1);
     let (_steer2, inbox2) = Steer::channel();
 
     session2

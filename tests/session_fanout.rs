@@ -1178,7 +1178,8 @@ struct SayOnSpawn(io_harness::Steer, AtomicUsize);
 
 impl Observer for SayOnSpawn {
     fn event(&self, event: &RunEvent) -> Flow {
-        if matches!(event.kind, EventKind::Spawned { .. }) && self.1.fetch_add(1, Ordering::SeqCst) == 0
+        if matches!(event.kind, EventKind::Spawned { .. })
+            && self.1.fetch_add(1, Ordering::SeqCst) == 0
         {
             // Ignored on a closed channel: an observer must not panic.
             let _ = self.0.say(OPERATOR);
