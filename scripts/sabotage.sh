@@ -151,19 +151,19 @@ arm "F7 the drain forgets the fold" \
     session_steering a_fold_nobody_read_is_still_in_the_inbox_and_a_late_one_is_an_error
 
 # ---- F8: the turn after a fold is seeded with the summary.
-# The seed stops looking for a fold at all, which is 0.68.0's behaviour: every
-# fold is undone at the next turn's first step.
+# The walk stops finding folds at all, which is 0.68.0's behaviour: every fold is
+# undone at the next turn's first step.
 arm "F8 the seed never looks for a fold" \
     src/session.rs \
-    's/            if !summaries\.is_empty\(\) \{/            if false {/' \
+    's/            if rows\.is_empty\(\) \{/            if true {/' \
     compaction the_turn_after_a_fold_is_seeded_with_the_summary_and_what_the_fold_left
 
 # ---- F9: a session that never folded is seeded exactly as it was.
-# Every turn now counts as folded, so a session that never folded is seeded with
-# an empty paragraph in place of its first entries. Only the control can see it.
-arm "F9 a turn with no summary counts as folded" \
+# A session with no folds is seeded with an empty paragraph in front of a
+# conversation nothing replaced. Only the control can see it.
+arm "F9 a paragraph is seeded whether or not one exists" \
     src/session.rs \
-    's/            if !summaries\.is_empty\(\) \{/            if true {/' \
+    's/        let Some\(\(consumed, text\)\) = self\.carried_fold\(store, &history, &starts\)\? else \{\n            return Ok\(out\);\n        \};/        let (consumed, text) = self.carried_fold(store, \&history, \&starts)?.unwrap_or((0, String::new()));/' \
     compaction a_session_that_never_folded_is_seeded_exactly_as_it_was_before
 
 # ---- F10: the transcript holds it all and a reopened session seeds the same.
@@ -171,7 +171,7 @@ arm "F9 a turn with no summary counts as folded" \
 # the fold consumed, which throws away the tail `keep_recent` kept whole.
 arm "F10 the summary replaces every earlier turn" \
     src/session.rs \
-    's/            consumed = consumed\.saturating_add\(reach\)\.min\(seeded_before\);/            consumed = seeded_before;/' \
+    's/            let reached = consumed\.saturating_add\(raw\)\.min\(starts\[at\]\);/            let reached = starts[at];/' \
     compaction the_transcript_still_holds_it_all_and_a_reopened_session_seeds_the_same
 
 # ---- F11: a turn that folded twice seeds the right remainder.
