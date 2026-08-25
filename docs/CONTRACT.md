@@ -1746,6 +1746,43 @@ folds, and that includes the overflow recovery: a caller who turned folding off
 asked for 0.42.0's behaviour, and an over-window request being terminal is part of
 what they asked for.
 
+## A fold the caller asked for (0.68.0)
+
+**There are two triggers and one machinery.** `Compaction` decides the folds
+nobody asked for. `TaskContract::fold_now` is how somebody asks: set it on a turn
+and that turn's first step folds before it assembles its first request, whatever
+the threshold says. Everything else is identical — the same summariser, the same
+cached `summaries` row, the same `EventKind::Compacted`, the same "what it never
+loses". An interface should not have to care which trigger fired, which is why
+there is no second event.
+
+**It lands before the turn's first request, and that is the whole promise.** The
+alternative available before 0.68.0 was to lower `at_share` for one turn and wait
+for the ledger to cross it, which mutates the caller's own setting to fake a
+request and can say neither when it will land nor whether it will. A request that
+is honoured at a stated point is a promise an interface can pass on to an
+operator.
+
+**Three boundaries, each deliberate.** The request is consumed **once**, at the
+turn's first step — a contract reused for every turn would otherwise fold every
+turn, and a flag on a contract is a property of the turn rather than of the
+moment. It does **not** override an off setting, for the reason stated directly
+above: one trigger reversing "off" would make the word mean two things. And it
+does **not** reach a spawned child — a contract reaches the whole tree, but a
+child's ledger is its own work with no conversation seeded into it, so folding it
+would fold something the operator never saw. That is the same boundary steering
+draws.
+
+**The conversation is made durable before the first step, and it has to be.** A
+fold may only replace entries the store already holds. Until 0.68.0 the seeded
+conversation sat above that watermark for the whole of step one — it became
+durable at the *end* of the step, while a fold is attempted at the start of it —
+so a session turn seeded with a long conversation could not fold at its first step
+on any trigger, the overflow recovery included. The turn most likely to exceed the
+window was the one the recovery could not help. The seed is now written before the
+loop, which is not a relaxation of the rule that an observation must not outlive a
+step that never committed: the seed belongs to no step of the run.
+
 ## What a context overflow does now (0.43.0)
 
 **It is classified from the vendor's own words.** `ProviderErrorKind::from_response`

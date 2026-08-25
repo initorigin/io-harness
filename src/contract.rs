@@ -385,6 +385,33 @@ pub struct TaskContract {
     /// into fixing. `Compaction { at_share: 1.0, .. }` is 0.42.0's behaviour
     /// exactly, and is a setting rather than an absence.
     pub compaction: Compaction,
+    /// Fold this turn's history at its first step, whatever the threshold says
+    /// (0.68.0).
+    ///
+    /// [`Compaction`] decides when a fold happens that nobody asked for. This is
+    /// the other trigger: the `/compact` an operator reaches for when they know a
+    /// long thread is finished, rather than waiting for the ledger to cross a
+    /// share of the window. Defaults to `false`, so a caller who never sets it
+    /// sees exactly the behaviour they had before this release.
+    ///
+    /// Three things it deliberately does not do, each of which is a bug somebody
+    /// would otherwise write:
+    ///
+    /// - **It is not mid-turn.** The request is read once, at the turn's first
+    ///   step, before that step assembles its first request. A flag on a contract
+    ///   is a property of the turn, not of the moment — so a caller who builds one
+    ///   contract and reuses it for every turn folds every turn.
+    /// - **It does not override an off setting.** `Compaction { at_share: 1.0, .. }`
+    ///   never folds, and that includes this. Off is a setting rather than an
+    ///   absence, and one trigger reversing it would make "off" mean two things.
+    /// - **It does not reach a spawned child.** A contract reaches the whole tree,
+    ///   but a child's ledger is its own work with no conversation seeded into it;
+    ///   folding it would be folding something the operator never saw. Only the
+    ///   root turn honours the request, which is the boundary steering already
+    ///   draws.
+    ///
+    /// Set it with [`TaskContract::with_fold_now`].
+    pub fold_now: bool,
     /// How long a command the agent runs with the `exec` tool may take before it
     /// is killed and reported as a timeout.
     ///
@@ -637,6 +664,7 @@ impl TaskContract {
             max_wait_secs: None,
             memory: MemoryLimits::default(),
             compaction: Compaction::default(),
+            fold_now: false,
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -714,6 +742,7 @@ impl TaskContract {
             max_wait_secs: None,
             memory: MemoryLimits::default(),
             compaction: Compaction::default(),
+            fold_now: false,
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -1618,6 +1647,40 @@ impl TaskContract {
     #[must_use]
     pub fn with_compaction(mut self, compaction: Compaction) -> Self {
         self.compaction = compaction;
+        self
+    }
+
+    /// Ask for this turn's history to be folded at its first step (0.68.0).
+    ///
+    /// The companion to [`TaskContract::with_compaction`]: that decides when a
+    /// fold nobody asked for happens, this is how somebody asks. The fold lands
+    /// before the turn's first request rather than at some point during it, which
+    /// is the difference between a promise an interface can make to an operator
+    /// and one it has to apologise for.
+    ///
+    /// Before 0.68.0 the only way to ask was to lower
+    /// [`Compaction::at_share`](crate::Compaction::at_share) for a turn and hope
+    /// the ledger crossed it — which mutates the caller's own setting to make it
+    /// happen and cannot say when, or whether, it will.
+    ///
+    /// ```
+    /// use io_harness::{Compaction, TaskContract};
+    ///
+    /// // The operator said the thread is finished. Fold it, then answer.
+    /// let now = TaskContract::workspace("summarise where we got to", "/repo")
+    ///     .with_fold_now(true);
+    /// assert!(now.fold_now);
+    ///
+    /// // An explicit off is still off — the request is honoured through the same
+    /// // machinery, and that machinery is what the caller turned off.
+    /// let never = TaskContract::workspace("summarise where we got to", "/repo")
+    ///     .with_compaction(Compaction { at_share: 1.0, ..Compaction::default() })
+    ///     .with_fold_now(true);
+    /// assert!(never.fold_now && !never.compaction.enabled());
+    /// ```
+    #[must_use]
+    pub fn with_fold_now(mut self, fold_now: bool) -> Self {
+        self.fold_now = fold_now;
         self
     }
 

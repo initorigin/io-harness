@@ -10,10 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    run_with, ApproveAll, Error, McpServer, Policy, Provider, RunOutcome, Store, TaskContract,
-    Verification, MCP_TOOL_PREFIX,
+    run_with, run_with_observed, ApproveAll, Error, McpServer, Policy, Provider, RunOutcome, Store,
+    TaskContract, Verification, MCP_TOOL_PREFIX,
 };
 use serde_json::json;
 
@@ -26,13 +27,24 @@ use serde_json::json;
 mod fixture_server;
 
 /// Serve the fixture over streamable HTTP on an ephemeral port, returning its
-/// URL. The task lives for the rest of the test process.
+/// URL.
 async fn serve_http() -> String {
+    serve(fixture_server::Fixture).await
+}
+
+/// Serve one handler over streamable HTTP on an ephemeral port, returning its
+/// URL. The task lives for the rest of the test process.
+///
+/// Generic over the handler since 0.68.0, so the tool-count test can mount a
+/// server that offers nothing beside the fixture that offers five. HTTP is the
+/// only transport an in-test handler can reach: the stdio fixture has to be a
+/// real child process, and its tool set is fixed when the example is compiled.
+async fn serve<S: rmcp::handler::server::ServerHandler + Clone>(handler: S) -> String {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::StreamableHttpService;
 
     let service = StreamableHttpService::new(
-        || Ok(fixture_server::Fixture),
+        move || Ok(handler.clone()),
         std::sync::Arc::new(LocalSessionManager::default()),
         Default::default(),
     );
@@ -620,5 +632,206 @@ async fn an_mcp_result_is_folded_into_the_next_prompt() {
         prompts[1].contains("echo: sentinel-value"),
         "the second prompt must carry the server's reply, got:\n{}",
         prompts[1]
+    );
+}
+
+// ------------------------------------------------------ the tool count (0.68.0)
+
+/// A server that speaks the protocol correctly and offers no tools at all.
+///
+/// In-test rather than a second example binary, because there is almost nothing
+/// to it: `ServerHandler`'s default `list_tools` already answers with an empty
+/// list, so declaring the tools capability is the whole handler. Declaring it is
+/// the part that matters — this has to be a server that *could* offer tools and
+/// offers none, not one that never claimed the capability, or the test would be
+/// proving something about capability negotiation instead of about the count.
+#[derive(Clone)]
+struct Barren;
+
+impl rmcp::handler::server::ServerHandler for Barren {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        // `ServerInfo` is `#[non_exhaustive]`, so it is built by mutation rather
+        // than by a struct literal — the same as the stdio fixture does it.
+        let mut info = rmcp::model::ServerInfo::default();
+        info.capabilities = rmcp::model::ServerCapabilities::builder()
+            .enable_tools()
+            .build();
+        info
+    }
+}
+
+/// Records the live event stream, which is the only place the tool count exists:
+/// it is announced and never written to a row, so `Store::mcp_events` cannot see
+/// it and the durable-trace assertions above cannot reach it.
+#[derive(Default)]
+struct Announcements(Mutex<Vec<RunEvent>>);
+
+impl Observer for Announcements {
+    fn event(&self, event: &RunEvent) -> Flow {
+        self.0.lock().unwrap().push(event.clone());
+        Flow::Continue
+    }
+}
+
+/// One announced MCP event, reduced to the three fields that tell the four MCP
+/// shapes apart: a connect names no tool but carries a count, a `discovered`
+/// names a tool with no outcome, a `called` names a tool with an outcome, and a
+/// `disconnected` names neither.
+type Shape = (Option<String>, Option<bool>, Option<u32>);
+
+impl Announcements {
+    /// Every announced `EventKind::Mcp`, in order. `..` skips `server` and
+    /// `millis`, which nothing here asserts on.
+    fn mcp(&self) -> Vec<Shape> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Mcp {
+                    tool, ok, tools, ..
+                } => Some((tool.clone(), *ok, *tools)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// F8 — a connected MCP server announces its tool count, and the count is the
+/// catalogue's.
+///
+/// The fixture's five tools are deliberately not written down here. The claim is
+/// that the announced number equals the catalogue the same connect went on to
+/// discover, so a sixth tool added to the fixture keeps this test honest instead
+/// of breaking it — and a count that drifted from the catalogue fails it however
+/// many tools the fixture happens to carry.
+#[tokio::test]
+async fn a_connected_server_announces_the_number_of_tools_it_offered() {
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Script::new(vec![
+        vec![call("mcp__fix__echo", json!({"text": "hello"}))],
+        vec![call(
+            "write_file",
+            json!({"path": "src/a.rs", "content": "fn hello() {}"}),
+        )],
+    ]);
+    let contract = contract(dir.path(), 4).with_mcp([fixture("fix")]);
+    let watcher = Announcements::default();
+
+    let result = run_with_observed(
+        &contract,
+        &provider,
+        &store,
+        &permitted(),
+        &ApproveAll,
+        &watcher,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
+
+    let mcp = watcher.mcp();
+    // Exactly one event carries a count, and it is the first: connect is the
+    // only shape that has the catalogue in hand, and a `discovered`, a `called`
+    // or a `disconnected` that carried one would be reporting a fact it does not
+    // have. The run above discovers, calls and disconnects, so all three of the
+    // other shapes are on this stream to be checked.
+    let carrying: Vec<usize> = mcp
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, tools))| tools.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        carrying,
+        vec![0],
+        "only the connect carries a tool count: {mcp:?}"
+    );
+    let n = mcp[0].2.expect("the connect announced a count");
+    assert!(n > 0, "the fixture offers tools: {mcp:?}");
+
+    // And the count is the catalogue's — the number of `discovered` events that
+    // follow it, which is exactly what an observer had to derive for itself
+    // before 0.68.0.
+    let discovered = mcp[1..]
+        .iter()
+        .filter(|(tool, ok, _)| tool.is_some() && ok.is_none())
+        .count();
+    assert_eq!(
+        n as usize, discovered,
+        "the announced count is the catalogue's: {mcp:?}"
+    );
+    // Cross-checked against the durable rows, which name their kind outright
+    // instead of being told apart by which of their fields are set. If the
+    // field-presence reading above is wrong, these two disagree.
+    let rows = store
+        .mcp_events(result.run_id)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "discovered")
+        .count();
+    assert_eq!(
+        n as usize, rows,
+        "the announced count matches the discovered rows"
+    );
+}
+
+/// F8, the other arm — a server that offers nothing announces `Some(0)`, never
+/// `None`.
+///
+/// "Offered nothing" and "this event does not carry the fact" are the two things
+/// this release exists to separate, and an empty catalogue announced as `None`
+/// would collapse them back together on the one event that is supposed to keep
+/// them apart.
+#[tokio::test]
+async fn a_server_offering_no_tools_announces_zero_rather_than_nothing() {
+    let url = serve(Barren).await;
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Script::new(vec![vec![call(
+        "write_file",
+        json!({"path": "src/a.rs", "content": "fn hello() {}"}),
+    )]]);
+    // The host is not the provider's, so only an explicit allow_net reaches it.
+    let policy = permitted().layer("egress").allow_net("127.0.0.1");
+    let contract = contract(dir.path(), 4).with_mcp([McpServer::http("bare", &url)]);
+    let watcher = Announcements::default();
+
+    let result = run_with_observed(&contract, &provider, &store, &policy, &ApproveAll, &watcher)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
+
+    // Nothing was offered, so nothing was discovered and nothing was called: the
+    // whole MCP stream is the connect and the disconnect, and the count has no
+    // `discovered` events behind it to be derived from.
+    assert!(
+        !provider
+            .tools_offered()
+            .iter()
+            .any(|t| t.starts_with(MCP_TOOL_PREFIX)),
+        "an empty server contributes no tools: {:?}",
+        provider.tools_offered()
+    );
+    let mcp = watcher.mcp();
+    assert!(
+        mcp.iter().all(|(tool, _, _)| tool.is_none()),
+        "a server with no tools discovers and calls nothing: {mcp:?}"
+    );
+    assert_eq!(
+        mcp.first().map(|e| e.2),
+        Some(Some(0)),
+        "an empty catalogue is announced as Some(0), not None: {mcp:?}"
+    );
+    assert!(
+        mcp[1..].iter().all(|(_, _, tools)| tools.is_none()),
+        "only the connect carries the count: {mcp:?}"
     );
 }
