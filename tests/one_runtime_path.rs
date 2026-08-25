@@ -399,6 +399,12 @@ fn no_entry_point_signature_moved() {
         // about them that every entry point above already carries.
         ("turn_contained_bounded", 7),
         ("turn_contained_bounded_observed", 8),
+        // 0.67.0 — the steered pair that takes a contract. Same rule as the rows
+        // above: written in the release that adds them, because a table that only
+        // covers the entry points somebody remembered to add is a gate for those
+        // and a blind spot for the rest.
+        ("turn_bounded_steered", 8),
+        ("turn_contained_bounded_steered", 9),
     ];
 
     let mut wrong = Vec::new();

@@ -388,6 +388,13 @@ impl Session {
     /// [`turn_observed`](Session::turn_observed), reading `steer` at every step
     /// boundary so an operator can change course or interrupt mid-turn.
     ///
+    /// It builds its own contract from `text`, so this turn carries no gate, no
+    /// budget and no tools of the caller's. A steered turn that carries a
+    /// [`TaskContract`] is [`turn_bounded_steered`](Session::turn_bounded_steered),
+    /// and one that may also fan out is
+    /// [`turn_contained_bounded_steered`](Session::turn_contained_bounded_steered)
+    /// (0.67.0).
+    ///
     /// The turn's future is driven on the caller's task — [`Store`] is `!Sync` — so
     /// steer it from a `select!` beside the turn, or from another thread or task
     /// through the [`Steer`], which is `Send + Sync`.
@@ -498,6 +505,10 @@ impl Session {
 
     /// [`turn_bounded`](Session::turn_bounded), reporting to `observer` and
     /// streaming the model's text as it arrives.
+    ///
+    /// It takes no steer inbox. A turn that needs both the caller's contract and an
+    /// operator's mid-turn corrections is
+    /// [`turn_bounded_steered`](Session::turn_bounded_steered) (0.67.0).
     pub async fn turn_bounded_observed<P: Provider>(
         &mut self,
         contract: &TaskContract,
@@ -518,6 +529,93 @@ impl Session {
             None,
             TurnExtras {
                 stream: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// [`turn_bounded_observed`](Session::turn_bounded_observed), reading `steer` at
+    /// every step boundary so an operator can change course or interrupt a turn that
+    /// carries their own contract (0.67.0).
+    ///
+    /// [`turn_steered`](Session::turn_steered) builds its contract from the
+    /// operator's text, and [`turn_bounded_observed`](Session::turn_bounded_observed)
+    /// takes a contract and no inbox, so a turn carrying skills, MCP servers,
+    /// registered tools, a plan gate, a budget or a verification gate could not also
+    /// be corrected while it ran. This is that turn.
+    ///
+    /// Nothing about steering changes here. A message is drained at the step
+    /// boundary and nowhere else, so the step in flight completes whole and the
+    /// agent reads the correction before choosing its next action; an interrupt ends
+    /// the turn as [`RunOutcome::Cancelled`](crate::RunOutcome::Cancelled) on a whole
+    /// step, still resumable. The contract's `root` is replaced by the session's,
+    /// exactly as [`turn_bounded`](Session::turn_bounded) replaces it.
+    ///
+    /// The turn's future is driven on the caller's task — [`Store`] is `!Sync` — so
+    /// steer it from a `select!` beside the turn, or from another thread or task
+    /// through the [`Steer`], which is `Send + Sync`.
+    ///
+    /// ```no_run
+    /// use io_harness::{ApproveAll, Ignore, OpenRouter, Policy, Session, Steer, Store,
+    ///                  TaskContract, Verification};
+    ///
+    /// # async fn demo(store: &Store, policy: &Policy) -> io_harness::Result<()> {
+    /// let (steer, inbox) = Steer::channel();
+    /// let mut session = Session::open(store, "/repo")?;
+    ///
+    /// // The bound this turn runs under: the project's own command decides, and the
+    /// // turn stops after twenty steps whatever the model thinks.
+    /// let contract = TaskContract::workspace("bring the docs up to date", "/repo")
+    ///     .with_verification(Verification::Command {
+    ///         argv: vec!["cargo".into(), "doc".into()],
+    ///         expect_exit: 0,
+    ///     })
+    ///     .with_max_steps(20);
+    ///
+    /// let handle = steer.clone();
+    /// tokio::spawn(async move {
+    ///     // Read at the next step boundary, without discarding the contract above.
+    ///     let _ = handle.say("actually, only touch the public modules");
+    /// });
+    ///
+    /// let result = session
+    ///     .turn_bounded_steered(
+    ///         &contract,
+    ///         &OpenRouter::from_env()?,
+    ///         store,
+    ///         policy,
+    ///         &ApproveAll,
+    ///         &Ignore,
+    ///         &inbox,
+    ///     )
+    ///     .await?;
+    /// println!("{:?}", result.outcome);
+    /// # Ok(()) }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub async fn turn_bounded_steered<P: Provider>(
+        &mut self,
+        contract: &TaskContract,
+        provider: &P,
+        store: &Store,
+        policy: &Policy,
+        approver: &dyn Approver,
+        observer: &dyn Observer,
+        steer: &SteerInbox,
+    ) -> Result<TurnResult> {
+        let contract = self.rooted(contract);
+        self.drive(
+            &contract,
+            provider,
+            store,
+            policy,
+            approver,
+            observer,
+            None,
+            TurnExtras {
+                stream: true,
+                steer: Some(steer),
                 ..Default::default()
             },
         )
@@ -788,6 +886,11 @@ impl Session {
     /// into something a person can follow. See
     /// [`turn_contained_observed`](Session::turn_contained_observed) for the events
     /// a fan-out adds.
+    ///
+    /// It takes no steer inbox. A fan-out that needs both the caller's contract and
+    /// an operator's mid-turn corrections is
+    /// [`turn_contained_bounded_steered`](Session::turn_contained_bounded_steered)
+    /// (0.67.0).
     #[allow(clippy::too_many_arguments)]
     pub async fn turn_contained_bounded_observed<P: Provider>(
         &mut self,
@@ -810,6 +913,95 @@ impl Session {
             Some(containment),
             TurnExtras {
                 stream: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// [`turn_contained_bounded_observed`](Session::turn_contained_bounded_observed),
+    /// reading `steer` at every step boundary so an operator can change course or
+    /// interrupt a fan-out that carries their own contract (0.67.0).
+    ///
+    /// **The inbox reaches the root agent and no child.** The tree loop drains it at
+    /// its own step boundary, which is the one point at which no child of this agent
+    /// is in flight — children are awaited inside the step that spawned them. A
+    /// spawned sub-agent is handed no inbox at all, deliberately: it is never
+    /// steerable by an operator it has not spoken to. So a correction typed while
+    /// children are running lands at the root's next boundary, which is after the
+    /// children of the step in flight have finished, not while they run.
+    ///
+    /// Nothing else about steering changes: the step in flight completes whole, an
+    /// interrupt ends the turn as
+    /// [`RunOutcome::Cancelled`](crate::RunOutcome::Cancelled) and it stays
+    /// resumable, and the contract's `root` is replaced by the session's exactly as
+    /// [`turn_contained_bounded`](Session::turn_contained_bounded) replaces it.
+    ///
+    /// The turn's future is driven on the caller's task — [`Store`] is `!Sync` — so
+    /// steer it from a `select!` beside the turn, or from another thread or task
+    /// through the [`Steer`], which is `Send + Sync`.
+    ///
+    /// ```no_run
+    /// use io_harness::{ApproveAll, Containment, Ignore, OpenRouter, Policy, Session,
+    ///                  Steer, Store, TaskContract, Verification};
+    ///
+    /// # async fn demo(store: &Store, policy: &Policy) -> io_harness::Result<()> {
+    /// let (steer, inbox) = Steer::channel();
+    /// let mut session = Session::open(store, "/repo")?;
+    ///
+    /// let contract = TaskContract::workspace("document every public module", "/repo")
+    ///     .with_verification(Verification::Command {
+    ///         argv: vec!["cargo".into(), "doc".into()],
+    ///         expect_exit: 0,
+    ///     })
+    ///     .with_max_steps(30);
+    /// let containment = Containment::new(12, 4, 2, 500_000);
+    ///
+    /// let handle = steer.clone();
+    /// tokio::spawn(async move {
+    ///     let _ = handle.say("skip the private modules");
+    /// });
+    ///
+    /// // Every argument named at its binding, because there are nine of them.
+    /// let turn = session
+    ///     .turn_contained_bounded_steered(
+    ///         &contract,
+    ///         &OpenRouter::from_env()?,
+    ///         store,
+    ///         policy,
+    ///         &ApproveAll,
+    ///         &containment,
+    ///         &Ignore,
+    ///         &inbox,
+    ///     )
+    ///     .await?;
+    /// println!("{:?}", turn.outcome);
+    /// # Ok(()) }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub async fn turn_contained_bounded_steered<P: Provider>(
+        &mut self,
+        contract: &TaskContract,
+        provider: &P,
+        store: &Store,
+        policy: &Policy,
+        approver: &dyn Approver,
+        containment: &Containment,
+        observer: &dyn Observer,
+        steer: &SteerInbox,
+    ) -> Result<TurnResult> {
+        let contract = self.rooted(contract);
+        self.drive(
+            &contract,
+            provider,
+            store,
+            policy,
+            approver,
+            observer,
+            Some(containment),
+            TurnExtras {
+                stream: true,
+                steer: Some(steer),
                 ..Default::default()
             },
         )

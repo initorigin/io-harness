@@ -16,8 +16,8 @@ use std::sync::Mutex;
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{
-    ApproveAll, EventKind, Flow, Ignore, Observer, Policy, Provider, RunEvent, RunOutcome,
-    RunStatus, Session, Steer, Store,
+    ApproveAll, Containment, EventKind, Flow, Ignore, Observer, Policy, Provider, RunEvent,
+    RunOutcome, RunStatus, Session, Steer, Store, SystemPrompt, TaskContract,
 };
 use serde_json::json;
 
@@ -171,6 +171,73 @@ impl Observer for InterruptOnFirstStep {
             let _ = self.0.interrupt();
         }
         Flow::Continue
+    }
+}
+
+/// Says the operator's correction the moment the first step commits — the
+/// correction typed while the agent is already working, rather than one queued
+/// before it started. Once, so the assertion about *which* step read it means
+/// something.
+struct SayOnFirstStep(Steer, AtomicUsize);
+
+impl Observer for SayOnFirstStep {
+    fn event(&self, event: &RunEvent) -> Flow {
+        if matches!(event.kind, EventKind::Step { .. }) && self.1.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            // Ignored on a closed channel, for the reason `InterruptOnFirstStep`
+            // ignores it: an observer must not panic.
+            let _ = self.0.say(STEER);
+        }
+        Flow::Continue
+    }
+}
+
+/// Records every request whole, and never stops asking for a write — so the turn
+/// ends on the contract's bound rather than on the model's say-so.
+///
+/// A claim about what the contract composed and a claim about what the operator's
+/// message reached are both claims about the requests this kept.
+#[derive(Default)]
+struct Recording {
+    seen: Mutex<Vec<(String, String)>>,
+    calls: AtomicUsize,
+}
+
+impl Recording {
+    /// The system prompt composed for the nth completion.
+    fn system(&self, n: usize) -> String {
+        self.seen.lock().unwrap()[n].0.clone()
+    }
+
+    /// The assembled context sent on the nth completion.
+    fn user(&self, n: usize) -> String {
+        self.seen.lock().unwrap()[n].1.clone()
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Provider for Recording {
+    async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((req.system.clone(), req.user.clone()));
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(CompletionResponse {
+            tool_calls: vec![ToolCall {
+                name: "write_file".into(),
+                arguments: json!({ "path": "notes.md", "content": format!("pass {n}\n") }),
+            }],
+            usage: Some(usage()),
+            ..Default::default()
+        })
+    }
+
+    fn name(&self) -> &str {
+        "recording"
     }
 }
 
@@ -440,4 +507,248 @@ async fn a_steer_sent_after_the_turn_is_an_error_rather_than_silence() {
 
     drop(inbox);
     assert!(steer.say("nobody home").is_err());
+}
+
+// ------------------------------------------------- a steered turn with a contract
+
+/// The replacement this release's contract carries, distinctive enough that its
+/// presence in the composed prompt cannot be a coincidence.
+const REPLACEMENT: &str = "you are the release scribe and you write nothing else";
+
+/// **F1 (0.67.0)** — a steered bounded turn honours the contract *and* reads the
+/// steer.
+///
+/// Either half alone is what the crate could already do: `turn_bounded_observed`
+/// honours a contract and hears no operator, `turn_steered` hears the operator and
+/// builds its own contract. So both halves are asserted on one turn, because the
+/// release is the conjunction and nothing else.
+#[tokio::test]
+async fn a_steered_bounded_turn_honours_its_contract_and_reads_the_steer() {
+    let ws = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Recording::default();
+    let (steer, inbox) = Steer::channel();
+
+    // A contract `turn_steered` could not have built: a replaced description and a
+    // step bound of the caller's own.
+    let contract = TaskContract::workspace("bring the docs up to date", ws.path())
+        .with_system_prompt(SystemPrompt::Replace(REPLACEMENT.into()))
+        .with_max_steps(3);
+
+    let mut session = Session::open(&store, ws.path()).unwrap();
+    let turn = session
+        .turn_bounded_steered(
+            &contract,
+            &provider,
+            &store,
+            &guarded(),
+            &ApproveAll,
+            &SayOnFirstStep(steer, AtomicUsize::new(0)),
+            &inbox,
+        )
+        .await
+        .unwrap();
+
+    // 1. The caller's contract composed the prompt, so it was not discarded for a
+    //    `default_contract`.
+    assert!(
+        provider.system(0).contains(REPLACEMENT),
+        "the contract's replaced description never reached the composer: {}",
+        provider.system(0)
+    );
+
+    // 2. The operator's message reached the agent at a step boundary — not before
+    //    the turn started, which is the case `turn_steered` already covers.
+    assert!(
+        !provider.user(0).contains(STEER),
+        "the message was in the first step's context, so this says nothing about a boundary"
+    );
+    assert!(
+        provider.user(1).contains(STEER),
+        "the operator's message never reached the ledger: {}",
+        provider.user(1)
+    );
+
+    // 3. And the contract's bound is what ended the turn, rather than the model
+    //    running on until something else stopped it.
+    assert!(
+        matches!(turn.outcome, RunOutcome::StepCapReached { steps: 3 }),
+        "the turn did not stop at the contract's step bound, got {:?}",
+        turn.outcome
+    );
+    assert_eq!(provider.calls(), 3, "the step bound was not the three asked for");
+}
+
+/// **F4 (0.67.0)** — an interrupt ends a bounded steered turn as `Cancelled`, on a
+/// whole step, and what it leaves behind is readable and carried on from.
+///
+/// This is `turn_steered`'s promise since 0.20.0, re-asserted through the new entry
+/// point: a caller migrating to a contract must not silently lose the ability to
+/// stop the turn.
+///
+/// **What "resumable" means here, stated rather than assumed.** `resume` *reports*
+/// a cancelled run and drives nothing — the rule in `terminal_outcome` since
+/// 0.12.0, for the reason a `denied` run is final: the caller asked for it, and
+/// restarting the loop under them would be answering a question nobody asked. So
+/// the promise the interrupt keeps is that the run is left whole and readable
+/// rather than half-written, and that the conversation goes on from it. Both are
+/// asserted below.
+#[tokio::test]
+async fn an_interrupt_ends_a_steered_bounded_turn_and_the_session_carries_on() {
+    let ws = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Insistent::default();
+    let (steer, inbox) = Steer::channel();
+
+    let contract =
+        TaskContract::workspace("keep editing the notes", ws.path()).with_max_steps(5);
+    let mut session = Session::open(&store, ws.path()).unwrap();
+    let interrupted = session
+        .turn_bounded_steered(
+            &contract,
+            &provider,
+            &store,
+            &guarded(),
+            &ApproveAll,
+            &InterruptOnFirstStep(steer),
+            &inbox,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(interrupted.outcome, RunOutcome::Cancelled { .. }),
+        "an interrupt should report Cancelled, got {:?}",
+        interrupted.outcome
+    );
+    // One whole step, and the workspace holds all of it — an interrupt stops the
+    // turn at the boundary, not in the middle of the step it is on.
+    assert_eq!(store.last_step(interrupted.run_id).unwrap(), 1);
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("notes.md")).unwrap(),
+        "pass 0\n",
+        "the interrupted turn's one step is not whole in the workspace"
+    );
+    // Finished rather than left `running`, which is what makes it distinguishable
+    // from a crashed process — and what makes it resumable.
+    assert_eq!(
+        store.run_status(interrupted.run_id).unwrap(),
+        Some(RunStatus::Completed)
+    );
+
+    // Readable rather than corrupt: `resume` reads the run back and reports what
+    // the operator asked for, without driving the loop or asking the provider.
+    let more = Insistent::default();
+    let read_back = io_harness::resume(&contract, &more, &store, interrupted.run_id)
+        .await
+        .unwrap();
+    assert!(
+        matches!(read_back.outcome, RunOutcome::Cancelled { steps: 1 }),
+        "resume did not report the cancellation it was handed, got {:?}",
+        read_back.outcome
+    );
+    assert_eq!(
+        more.calls.load(Ordering::SeqCst),
+        0,
+        "resume re-drove a run its operator cancelled"
+    );
+
+    // And the conversation goes on from it: the interrupted turn is in the tree
+    // with its outcome, and the next turn reads it like any other.
+    let recorded = store.session_turn(interrupted.turn_id).unwrap().unwrap();
+    assert_eq!(recorded.outcome.as_deref(), Some("cancelled"));
+
+    let next = Recording::default();
+    let (_steer2, inbox2) = Steer::channel();
+    let after = session
+        .turn_bounded_steered(
+            &TaskContract::workspace("stop there", ws.path()).with_max_steps(1),
+            &next,
+            &store,
+            &guarded(),
+            &ApproveAll,
+            &Ignore,
+            &inbox2,
+        )
+        .await
+        .unwrap();
+    assert_ne!(after.run_id, interrupted.run_id);
+    assert_eq!(store.session_turns(session.id()).unwrap().len(), 2);
+    assert_eq!(session.history(&store).unwrap().len(), 2);
+}
+
+/// **F5 (0.67.0)** — the session's root wins over the contract's own, on both new
+/// entry points.
+///
+/// `turn_bounded` has made this promise since 0.36.0: a turn is about the
+/// conversation's workspace, and a contract naming another directory would be
+/// answering about a different project. A steered twin that dropped `rooted` would
+/// make the operator's own correction channel the way out of it.
+#[tokio::test]
+async fn both_steered_entry_points_run_in_the_sessions_workspace() {
+    // The flat arm.
+    let session_dir = workspace();
+    let elsewhere = workspace();
+    let store = Store::memory().unwrap();
+    let mut session = Session::open(&store, session_dir.path()).unwrap();
+    let contract =
+        TaskContract::workspace("edit the notes", elsewhere.path()).with_max_steps(1);
+    let (_steer, inbox) = Steer::channel();
+
+    session
+        .turn_bounded_steered(
+            &contract,
+            &Recording::default(),
+            &store,
+            &guarded(),
+            &ApproveAll,
+            &Ignore,
+            &inbox,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(session_dir.path().join("notes.md")).unwrap(),
+        "pass 0\n",
+        "the steered bounded turn wrote outside the session's workspace"
+    );
+    assert_eq!(
+        std::fs::read_to_string(elsewhere.path().join("notes.md")).unwrap(),
+        "# notes\n",
+        "the contract's own root was used, so a steered turn escaped its conversation"
+    );
+
+    // The contained arm, same contract, same claim.
+    let session_dir2 = workspace();
+    let elsewhere2 = workspace();
+    let mut session2 = Session::open(&store, session_dir2.path()).unwrap();
+    let contract2 =
+        TaskContract::workspace("edit the notes", elsewhere2.path()).with_max_steps(1);
+    let (_steer2, inbox2) = Steer::channel();
+
+    session2
+        .turn_contained_bounded_steered(
+            &contract2,
+            &Recording::default(),
+            &store,
+            &guarded(),
+            &ApproveAll,
+            &Containment::new(10, 4, 3, 1_000_000),
+            &Ignore,
+            &inbox2,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(session_dir2.path().join("notes.md")).unwrap(),
+        "pass 0\n",
+        "the steered contained turn wrote outside the session's workspace"
+    );
+    assert_eq!(
+        std::fs::read_to_string(elsewhere2.path().join("notes.md")).unwrap(),
+        "# notes\n",
+        "the contract's own root was used, so a steered fan-out escaped its conversation"
+    );
 }
