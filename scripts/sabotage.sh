@@ -56,7 +56,14 @@ arm() {
         return
     fi
 
-    cargo test --no-fail-fast --test "$target" "$test_name" >"$log" 2>&1
+    # `--lib` is a target selector rather than a test binary's name, so it cannot
+    # be spelled `--test --lib`. Some rules are only assertable in the crate's own
+    # `#[cfg(test)] mod tests` — see the F5 arm — so the runner has to reach it.
+    if [ "$target" = "--lib" ]; then
+        cargo test --no-fail-fast --lib "$test_name" >"$log" 2>&1
+    else
+        cargo test --no-fail-fast --test "$target" "$test_name" >"$log" 2>&1
+    fi
     local status=$?
     # `running N tests` — summed, because a filter may match in more than one
     # binary and a zero total is a filter that matched nothing.
@@ -112,15 +119,17 @@ arm "F4 the request is read, not consumed" \
     compaction the_request_is_consumed_and_does_not_fold_every_step
 
 # ---- F5: a spawned child does not fold on the root's request.
-# The depth gate is removed. NOTE: this arm is expected to survive today, because
-# `spawn_child` builds each child a fresh contract, so `fold_now` is already
-# false at depth 1 before the gate is consulted. It is run anyway, and its
-# survival is reported rather than hidden — the gate is the lock that decides the
-# question the day a child inherits its parent's contract.
+#
+# Aimed at the unit assertion, not the fan-out test, and that is the finding this
+# arm produced rather than a convenience. `spawn_child` builds each child a fresh
+# contract, so `fold_now` is already false at depth 1 before the gate is
+# consulted: pointed at `session_fanout` this arm SURVIVED — the end-to-end
+# criterion is over-determined and would go on passing with the gate deleted.
+# The rule is asserted where it lives instead, and the arm now kills something.
 arm "F5 the depth gate is removed" \
     src/run/memory.rs \
     's/let asked_now = depth == 0 && std::mem::take\(asked\);/let asked_now = { let _ = depth; std::mem::take(asked) };/' \
-    session_fanout a_spawned_child_does_not_fold_on_the_roots_request
+    --lib a_requested_fold_is_consumed_once_and_never_by_a_child
 
 # ---- F6 and F7: the seed is durable before the first step.
 # The seed goes back above the watermark, which is 0.67.0's behaviour: no fold

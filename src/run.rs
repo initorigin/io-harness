@@ -4478,6 +4478,55 @@ pub(crate) type PendingMedia = ();
 mod tests {
     use super::*;
 
+    /// F5 (0.68.0) — `fold_forced` decides three things, and the depth one is
+    /// asserted here because no fixture can reach it.
+    ///
+    /// A spawned child gets a **fresh** `TaskContract::workspace(goal, root)`
+    /// carrying only `web` and `max_steps`, so `fold_now` is already `false` at
+    /// depth 1 before the gate is consulted. The end-to-end criterion is
+    /// therefore over-determined: `tests/session_fanout.rs` proves a child does
+    /// not fold on the root's request, and would go on proving it with the gate
+    /// deleted. That is a branch nothing would fail on, which is the same thing
+    /// as a rule nobody wrote.
+    ///
+    /// So it is asserted where the rule lives. The gate is kept rather than
+    /// dropped as redundant because it is the lock that decides the question the
+    /// day a child inherits its parent's contract — inheriting a compaction
+    /// setting or a step cap is a plausible next release, and `fold_now` is the
+    /// field that must not ride along.
+    #[test]
+    fn a_requested_fold_is_consumed_once_and_never_by_a_child() {
+        // The root: honoured once, and gone afterwards. Read instead of taken
+        // and every step of the run would fold.
+        let mut asked = true;
+        assert!(fold_forced(false, 0, &mut asked));
+        assert!(!asked, "the request must be consumed, not merely read");
+        assert!(!fold_forced(false, 0, &mut asked));
+
+        // A child: never, whatever it was asked. This is the assertion the
+        // fan-out test cannot make today.
+        let mut asked = true;
+        assert!(
+            !fold_forced(false, 1, &mut asked),
+            "a child folded on a request that was never made of it"
+        );
+
+        // An overflow recovery forces a fold at any depth — it is the vendor
+        // refusing the request, not the operator asking.
+        let mut none = false;
+        assert!(fold_forced(true, 3, &mut none));
+
+        // And a recovery at the root consumes the caller's request too: it has
+        // already folded, and the caller who asked for one fold is not owed a
+        // second at the next step.
+        let mut asked = true;
+        assert!(fold_forced(true, 0, &mut asked));
+        assert!(
+            !asked,
+            "a recovery that folded left the caller's request outstanding"
+        );
+    }
+
     /// F6 (0.64.0) — the OTHER prose case is untouched and still falls back.
     ///
     /// Two cases were sent as prose. This release closes the first — a resumed
