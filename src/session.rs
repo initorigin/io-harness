@@ -548,7 +548,7 @@ impl Session {
     /// Nothing about steering changes here. A message is drained at the step
     /// boundary and nowhere else, so the step in flight completes whole and the
     /// agent reads the correction before choosing its next action; an interrupt ends
-    /// the turn as [`RunOutcome::Cancelled`](crate::RunOutcome::Cancelled) on a whole
+    /// the turn as [`RunOutcome::Cancelled`] on a whole
     /// step, still resumable. The contract's `root` is replaced by the session's,
     /// exactly as [`turn_bounded`](Session::turn_bounded) replaces it.
     ///
@@ -933,7 +933,7 @@ impl Session {
     ///
     /// Nothing else about steering changes: the step in flight completes whole, an
     /// interrupt ends the turn as
-    /// [`RunOutcome::Cancelled`](crate::RunOutcome::Cancelled) and it stays
+    /// [`RunOutcome::Cancelled`] and it stays
     /// resumable, and the contract's `root` is replaced by the session's exactly as
     /// [`turn_contained_bounded`](Session::turn_contained_bounded) replaces it.
     ///
