@@ -555,6 +555,25 @@ pub struct Assembled {
 pub const SEED_OPERATOR: &str = "operator";
 /// See [`SEED_OPERATOR`].
 pub const SEED_AGENT: &str = "agent";
+/// (0.69.0) The `target` on a seeded paragraph that stands in for the part of the
+/// conversation an earlier turn folded away.
+///
+/// The same word a fold inside a turn tags its own summary with, so a folded span
+/// reads identically whether it was folded three steps ago or three turns ago —
+/// and, like that one, it maps to [`Piece::Prose`]: it is narration about the
+/// conversation rather than a thing either party said.
+pub const SEED_SUMMARY: &str = "summary";
+
+/// How a summary reads to the model, wherever it was written.
+///
+/// One definition rather than two format strings: `compact_ledger` writes it when
+/// a turn folds and `Session::seed` writes it when a *previous* turn folded, and
+/// an operator reading a trace should not be able to tell the two apart by their
+/// framing. Neither is nameable from here — both are private to their modules —
+/// so they are named in prose rather than linked.
+pub fn summarised_entry(text: &str) -> String {
+    format!("\n[earlier work, summarised]\n{text}\n")
+}
 
 /// (0.49.0) What one [`Emitted`] piece is, for a loop building a transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

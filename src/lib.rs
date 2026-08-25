@@ -577,7 +577,9 @@ pub use sandbox::{
     copy_back, select, Backend, Cap, ExecMode, Sandbox, SandboxConfig, SandboxLimits,
     SandboxOutcome, Selected,
 };
-pub use session::{Session, Steer, SteerInbox, Transcript, TranscriptTurn, TurnKind, TurnResult};
+pub use session::{
+    Session, Steer, SteerInbox, Steering, Transcript, TranscriptTurn, TurnKind, TurnResult,
+};
 pub use skills::{Skill, Skills};
 // `AgentEvent` and `SpawnRow` were `pub` inside this private module but were not
 // re-exported, so `Store::agent_events` and `Store::find_spawn` returned values an

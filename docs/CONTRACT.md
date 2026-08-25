@@ -1095,7 +1095,9 @@ can be corrected at its root. Before this release the choice was exclusive:
 Nothing about steering changes. A message is drained at the step boundary and
 nowhere else, so the step in flight completes whole and the agent reads the
 correction before choosing its next action; an interrupt ends the turn as
-`RunOutcome::Cancelled` on a whole step. **On the contained path that boundary is
+`RunOutcome::Cancelled` on a whole step; and a fold (0.69.0) summarises the
+conversation so far at that same boundary, before the step assembles its own
+request. **On the contained path that boundary is
 the root's own step**, which is the one point at which no child of the root is in
 flight — children are awaited inside the step that spawned them. So a correction
 typed while children are running lands after that step's children have finished,
@@ -1748,13 +1750,14 @@ what they asked for.
 
 ## A fold the caller asked for (0.68.0)
 
-**There are two triggers and one machinery.** `Compaction` decides the folds
-nobody asked for. `TaskContract::fold_now` is how somebody asks: set it on a turn
-and that turn's first step folds before it assembles its first request, whatever
-the threshold says. Everything else is identical — the same summariser, the same
-cached `summaries` row, the same `EventKind::Compacted`, the same "what it never
-loses". An interface should not have to care which trigger fired, which is why
-there is no second event.
+**There are three triggers and one machinery.** `Compaction` decides the folds
+nobody asked for. `TaskContract::fold_now` is how somebody asks before the turn
+starts: set it on a turn and that turn's first step folds before it assembles its
+first request, whatever the threshold says. `Steer::fold` (0.69.0) is how somebody
+asks while the turn is already running. Everything else is identical — the same
+summariser, the same cached `summaries` row, the same `EventKind::Compacted`, the
+same "what it never loses". An interface should not have to care which trigger
+fired, which is why there is no second event.
 
 **It lands before the turn's first request, and that is the whole promise.** The
 alternative available before 0.68.0 was to lower `at_share` for one turn and wait
@@ -1763,7 +1766,7 @@ request and can say neither when it will land nor whether it will. A request tha
 is honoured at a stated point is a promise an interface can pass on to an
 operator.
 
-**Three boundaries, each deliberate.** The request is consumed **once**, at the
+**Three boundaries on the contract flag, each deliberate.** The request is consumed **once**, at the
 turn's first step — a contract reused for every turn would otherwise fold every
 turn, and a flag on a contract is a property of the turn rather than of the
 moment. It does **not** override an off setting, for the reason stated directly
@@ -1772,6 +1775,66 @@ does **not** reach a spawned child — a contract reaches the whole tree, but a
 child's ledger is its own work with no conversation seeded into it, so folding it
 would fold something the operator never saw. That is the same boundary steering
 draws.
+
+**A steered fold lands at the next step boundary, and folds before that step's own
+request (0.69.0).** `Steer::fold` is the third way in, beside `say` and
+`interrupt`, and it promises a point rather than a moment: the step that drains the
+inbox raises the loop's standing fold request, and that request is read by the
+compaction attempt of the *same* step iteration, a few lines further down. So a
+fold asked for mid-step lands on the request built after that boundary, not the one
+after that. The request is recorded as a `ContextEvent::steered` line at the step
+that read it, so a trace says when the operator asked as well as when the fold
+happened.
+
+**Four boundaries on the steered fold, each deliberate.** It is **not immediate** —
+like a message and an interrupt it lands at the next step boundary, because a tool
+call in flight is not a safe place to change the conversation out from under. It
+does **not** override an off setting, for the reason stated above: `Compaction {
+at_share: 1.0, .. }` never folds, this trigger included. It does **not** reach a
+spawned child, which is the boundary `fold_now` and steering both already draw. And
+it **loses to an interrupt drained at the same boundary**: the interrupt is
+answered first, the turn ends as `RunOutcome::Cancelled`, and no summariser call is
+spent on a turn nobody is going to read.
+
+**A fifth boundary, and it is the one an operator meets first.** A request made
+when there is nothing to fold is spent and nothing happens: a fold keeps
+`keep_recent` observations whole and may only replace ones the store already holds,
+so a conversation shorter than that has no prefix to stand in for. The request is
+recorded either way, which is what makes it visible after the fact — but an
+interface that reports "compacted" because it sent one is reporting something this
+contract does not promise. The `Compacted` event is the fact; the request is not.
+
+One request is one fold, and the unit is the boundary rather than the call: two
+asks that reach the same boundary are one fold, because the second would summarise
+a ledger the first has just replaced with a paragraph. Two asks separated by a
+boundary are two folds. Asking once does not put the turn into a mode where every
+step folds.
+
+**A fold outlives the turn that made it (0.69.0).** `summaries` is keyed on
+`run_id` and every session turn is its own run, so a fold used to buy one turn of
+relief: the next turn's seed rebuilt the conversation from the turn rows and put
+back whatever the fold had just replaced, on every trigger. `Session::seed` now
+finds the newest turn on the path whose run folded and seeds that turn's newest
+summary paragraph in place of the conversation entries the fold consumed — the
+first summary row stands in for `folded` entries and each later one for `folded - 1`,
+because a later fold's prefix begins with the paragraph the earlier one wrote, and
+the total is capped at what was seeded before that turn. Newest wins and the walk
+stops there, since an earlier paragraph was part of what a later fold summarised.
+
+**It does not replace every earlier turn**, and the transcript does not move at
+all. A fold keeps the newest `keep_recent` entries whole, so the seed keeps that
+tail whole too, and every turn after the folding one is seeded as it always was.
+`Session::transcript` still renders every prompt and reply, and the folded
+observations are still in `ledger_observations` — what gets shorter is the seed the
+model reads, and nothing else. The paragraph is seeded under the public
+`SEED_SUMMARY` target with the same `[earlier work, summarised]` framing an in-turn
+fold writes, so a folded span reads identically whether it was folded three steps
+ago or three turns ago, and it reaches the model as `Piece::Prose` rather than as
+either party's words. Nothing is stored that was not stored before: it is a join
+over `session_turns.run_id` and `summaries.run_id`, the join `Session::transcript`
+already makes, with no schema change and `CHECKPOINT_FORMAT` still at 7. A session
+that never folded pays one indexed lookup per turn on its path and gets the seed it
+had.
 
 **The conversation is made durable before the first step, and it has to be.** A
 fold may only replace entries the store already holds. Until 0.68.0 the seeded
@@ -2495,9 +2558,13 @@ the runs, not a second execution path:
   the model exactly as a `TaskContract` constraint does, and every tool call it
   leads to is checked against the same policy by the same code. A `Steer` cannot
   change the policy, the budgets, the sandbox or the contract of a turn in flight.
-- **A steer and an interrupt land at the next step boundary**, never where they
-  were sent — the same rule `Flow::Cancel` has always had, for the same reason: in
-  between, a tool call is in flight and a file may be half-written.
+  `Steer::fold` (0.69.0) is the same rule from the other side: it changes what the
+  next request carries and nothing else — not the trace, which keeps every folded
+  observation, and not a boundary.
+- **A steer, a fold and an interrupt land at the next step boundary**, never where
+  they were sent — the same rule `Flow::Cancel` has always had, for the same reason:
+  in between, a tool call is in flight and a file may be half-written. An interrupt
+  drained at the same boundary as a fold wins, and the fold is not bought.
 - **One session, one driver, and the loser is told (0.62.0).** Two processes
   taking turns on the same session id concurrently still do not both land on the
   head path. What no longer happens is one of them being dropped silently: the

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 #
-# 0.68.0's sabotage pass: break one thing, run the test that claims to catch it,
+# 0.69.0's sabotage pass: break one thing, run the test that claims to catch it,
 # and require that it fails.
 #
-# A test nobody has tried to break is a test that may assert nothing. Two
+# A test nobody has tried to break is a test that may assert nothing. Three
 # releases running have had an arm expose a criterion whose fixture proved
-# nothing — 0.67.0's F3 asserted an absence the fixture made unreachable, and this
-# release's F5 control failed twice before it measured anything — so the arms
-# below are the release's evidence that its own tests discriminate, not a
-# formality run at the end.
+# nothing — 0.67.0's F3 asserted an absence the fixture made unreachable, 0.68.0's
+# F5 arm survived against the fan-out test because the rule it aimed at was
+# over-determined end to end, and this release moved F6 into a function of its own
+# so the arm below hits the rule rather than a restatement of it. The arms are the
+# release's evidence that its own tests discriminate, not a formality run at the
+# end.
 #
 # Three rules this runner enforces because each has cost a release something:
 #
@@ -86,21 +88,22 @@ arm() {
     rm -f "$log"
 }
 
-# ---- F1: a requested fold lands before the turn's first request.
-# The request stops being read at all. Everything else about folding is intact,
-# so only a test that asserts the REQUEST caused a fold can notice.
-arm "F1 the request is never read" \
-    src/run/memory.rs \
-    's/let asked_now = depth == 0 && std::mem::take\(asked\);/let asked_now = { let _ = asked; false };/' \
-    compaction a_requested_fold_lands_before_the_turns_first_request
+# ---- F1: a fold sent mid-turn lands at the next step boundary.
+# The drained request is thrown away at the one site that reads it. Every other
+# part of folding is intact — the threshold, `fold_now`, the summariser — so only
+# a test that asserts the OPERATOR caused a fold can notice.
+arm "F1 the drained fold is dropped" \
+    src/run/step.rs \
+    's/\*fold_asked = true;/let _ = \&steered.fold;/' \
+    session_steering a_fold_asked_for_mid_turn_lands_at_the_next_boundary
 
-# ---- F2: a turn without the flag does not fold.
-# Every turn is forced. F2 is the control that says this release changed nothing
-# for a caller who never asks, and it is the only test that can see this.
-arm "F2 every turn is forced" \
-    src/run/memory.rs \
-    's/let asked_now = depth == 0 && std::mem::take\(asked\);/let asked_now = { let _ = asked; true };/' \
-    compaction without_the_flag_the_same_turn_does_not_fold
+# ---- F2: the same turn with nothing sent does not fold.
+# Every drain asks for a fold. F2 is the control that says the fold in F1 came
+# from the operator rather than from a fixture that folds on its own.
+arm "F2 every boundary asks for a fold" \
+    src/run/step.rs \
+    's/if steered\.fold \{/if true {/' \
+    session_steering without_a_send_the_same_turn_does_not_fold
 
 # ---- F3: an off setting stays off.
 # The `enabled()` gate is skipped whenever a fold is forced, which is the exact
@@ -108,52 +111,88 @@ arm "F2 every turn is forced" \
 arm "F3 forced folds bypass an off setting" \
     src/run/memory.rs \
     's/    if !folding\.enabled\(\) \{\n        return Ok\(0\);\n    \}/    if !folding.enabled() \&\& !forced {\n        return Ok(0);\n    }/' \
-    compaction a_requested_fold_does_not_override_an_off_setting
+    session_steering a_fold_asked_for_does_not_override_an_off_setting
 
-# ---- F4: the request is honoured once, not every step.
-# Read instead of taken, so the flag stays true and every step folds. This is the
-# bug a bool-on-a-contract invites, and only a multi-step test sees it.
+# ---- F4: one send, one fold.
+# Read instead of taken, so the flag stays true and every step after the first
+# send folds. Only a turn long enough for a second fold can see it.
 arm "F4 the request is read, not consumed" \
     src/run/memory.rs \
     's/let asked_now = depth == 0 && std::mem::take\(asked\);/let asked_now = depth == 0 \&\& *asked;/' \
-    compaction the_request_is_consumed_and_does_not_fold_every_step
+    session_steering each_send_folds_once_and_not_every_step_after_it
 
-# ---- F5: a spawned child does not fold on the root's request.
-#
-# Aimed at the unit assertion, not the fan-out test, and that is the finding this
-# arm produced rather than a convenience. `spawn_child` builds each child a fresh
-# contract, so `fold_now` is already false at depth 1 before the gate is
-# consulted: pointed at `session_fanout` this arm SURVIVED — the end-to-end
-# criterion is over-determined and would go on passing with the gate deleted.
-# The rule is asserted where it lives instead, and the arm now kills something.
-arm "F5 the depth gate is removed" \
-    src/run/memory.rs \
-    's/let asked_now = depth == 0 && std::mem::take\(asked\);/let asked_now = { let _ = depth; std::mem::take(asked) };/' \
-    --lib a_requested_fold_is_consumed_once_and_never_by_a_child
-
-# ---- F6 and F7: the seed is durable before the first step.
-# The seed goes back above the watermark, which is 0.67.0's behaviour: no fold
-# can reach the conversation at the first step, on any trigger.
-arm "F6/F7 the seed is not persisted before the loop" \
+# ---- F5: an interrupt beside a fold ends the turn and buys no summary.
+# The interrupt stops winning when a fold is in the same drain — the plausible
+# bug, not an absurd one: an operator who asked for a summary could be read as
+# wanting the turn to go on. The turn then runs to its bound and folds.
+arm "F5 a fold overrides the interrupt" \
     src/run/step.rs \
-    's/    written = persist_ledger\(store, run_id, &ledger, written\)\?;\n    \/\/ 0\.68\.0 — the caller.s standing request/    \/\/ 0.68.0 — the caller'"'"'s standing request/' \
-    compaction a_seeded_turn_that_overflows_folds_and_recovers
+    's/if steered\.interrupted \{/if steered.interrupted \&\& !steered.fold {/' \
+    session_steering an_interrupt_beside_a_fold_stops_the_turn_and_buys_no_summary
 
-# ---- F8: a connected MCP server announces its tool count.
-# The count is dropped at the one site that has it, which is indistinguishable
-# from 0.67.0 unless a test reads the connect event's `tools`.
-arm "F8 the connect event drops the count" \
-    src/mcp.rs \
-    's/Some\(tools\.len\(\) as u32\)/None/' \
-    mcp a_connected_server_announces_the_number_of_tools_it_offered
+# ---- F6: a child has no inbox to hear the operator's fold in.
+#
+# Aimed at the unit assertion over `extras_for`, which is why that function exists
+# (0.69.0). 0.68.0's equivalent arm SURVIVED against the fan-out test because a
+# child's contract is fresh *and* its extras are empty — two locks on one door, so
+# removing either leaves the end-to-end test green. The rule is asserted where it
+# lives, and this arm hands a child the root's inbox.
+arm "F6 a child is handed the root's extras" \
+    src/run.rs \
+    's/        _ => &NO_EXTRAS,/        _ => turn.unwrap_or(\&NO_EXTRAS),/' \
+    --lib a_child_has_no_inbox_to_hear_the_operators_fold_in
 
-# ---- F9: an event with no count serialises as it did before.
-# `skip_serializing_if` goes, so every MCP event gains `"tools":null` — a visible
-# change to a stream existing consumers already parse.
-arm "F9 the null is written back onto every MCP event" \
-    src/observe.rs \
-    's/#\[serde\(default, skip_serializing_if = "Option::is_none"\)\]\n        tools:/#[serde(default)]\n        tools:/' \
-    observe an_event_with_no_count_serialises_exactly_as_it_did_before
+# ---- F7: the drained state is complete.
+# The fold is dropped on its way out of the inbox, which is precisely what a
+# `pending()` that kept returning a 2-tuple would have done silently.
+arm "F7 the drain forgets the fold" \
+    src/session.rs \
+    's/Steered::Fold => out\.fold = true,/Steered::Fold => {}/' \
+    session_steering a_fold_nobody_read_is_still_in_the_inbox_and_a_late_one_is_an_error
+
+# ---- F8: the turn after a fold is seeded with the summary.
+# The walk stops finding folds at all, which is 0.68.0's behaviour: every fold is
+# undone at the next turn's first step.
+arm "F8 the seed never looks for a fold" \
+    src/session.rs \
+    's/            if rows\.is_empty\(\) \{/            if true {/' \
+    compaction the_turn_after_a_fold_is_seeded_with_the_summary_and_what_the_fold_left
+
+# ---- F9: a session that never folded is seeded exactly as it was.
+# A session with no folds is seeded with an empty paragraph in front of a
+# conversation nothing replaced. Only the control can see it.
+arm "F9 a paragraph is seeded whether or not one exists" \
+    src/session.rs \
+    's/        let Some\(\(consumed, text\)\) = self\.carried_fold\(store, &history, &starts\)\? else \{\n            return Ok\(out\);\n        \};/        let (consumed, text) = self.carried_fold(store, \&history, \&starts)?.unwrap_or((0, String::new()));/' \
+    compaction a_session_that_never_folded_is_seeded_exactly_as_it_was_before
+
+# ---- F10: the transcript holds it all and a reopened session seeds the same.
+# The summary replaces every entry before the folding turn rather than the ones
+# the fold consumed, which throws away the tail `keep_recent` kept whole.
+arm "F10 the summary replaces every earlier turn" \
+    src/session.rs \
+    's/            let reached = consumed\.saturating_add\(raw\)\.min\(starts\[at\]\);/            let reached = starts[at];/' \
+    compaction the_transcript_still_holds_it_all_and_a_reopened_session_seeds_the_same
+
+# ---- F11: a turn that folded twice seeds the right remainder.
+# The off-by-one: a later fold's prefix begins with the paragraph the earlier one
+# wrote, and forgetting that consumes one conversation entry too many. Invisible
+# to any fixture that folds once.
+arm "F11 a later fold reaches one entry too far" \
+    src/session.rs \
+    's/                    \(row\.folded as usize\)\.saturating_sub\(1\)/                    row.folded as usize/' \
+    compaction a_turn_that_folded_twice_seeds_the_newest_paragraph_and_the_second_folds_remainder
+
+# ---- F12: a fold in a later turn stands in for what the first one replaced.
+# The two index spaces are counted as one — `folded` measures the folding turn's
+# own ledger, whose first entry may be the paragraph an earlier turn left behind.
+# Forgetting to carry the earlier fold's reach is the defect a review found in
+# this release's first implementation: everything the first fold replaced comes
+# back beside a paragraph claiming to stand in for it.
+arm "F12 an inherited fold's reach is not carried forward" \
+    src/session.rs \
+    's/            let reached = consumed\.saturating_add\(raw\)\.min\(starts\[at\]\);/            let reached = raw.min(starts[at]);/' \
+    compaction a_fold_in_a_later_turn_stands_in_for_what_the_first_one_replaced
 
 echo
 echo "arms killed: $pass   survived: $survived   broken: $broken"

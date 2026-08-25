@@ -520,8 +520,11 @@ pub(super) async fn compact_ledger<P: Provider>(
         Observation::new(
             step,
             ObsKind::Message,
-            Some("summary".into()),
-            format!("\n[earlier work, summarised]\n{text}\n"),
+            // 0.69.0 — one definition of the word, shared with the seed, because a
+            // folded span reads the same whether it was folded three steps ago or
+            // three turns ago.
+            Some(crate::context::SEED_SUMMARY.into()),
+            crate::context::summarised_entry(&text),
         ),
     );
     if folded == 0 {
