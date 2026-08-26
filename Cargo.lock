@@ -334,7 +334,7 @@ dependencies = [
  "encoding_rs",
  "fast-float2",
  "log",
- "quick-xml",
+ "quick-xml 0.41.0",
  "serde",
  "zip",
 ]
@@ -730,7 +730,7 @@ dependencies = [
  "base64 0.22.1",
  "crc32fast",
  "image",
- "quick-xml",
+ "quick-xml 0.41.0",
  "serde",
  "serde_json",
  "smallvec",
@@ -1495,7 +1495,7 @@ dependencies = [
  "libc",
  "lopdf 0.44.0",
  "pdf-extract",
- "quick-xml",
+ "quick-xml 0.42.0",
  "regex",
  "reqwest",
  "rmcp",
@@ -2303,6 +2303,15 @@ dependencies = [
  "encoding_rs",
  "memchr",
  "serde",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -3625,7 +3634,7 @@ dependencies = [
  "md-5 0.11.0",
  "num-traits",
  "phf 0.14.0",
- "quick-xml",
+ "quick-xml 0.41.0",
  "rand 0.10.2",
  "rgb",
  "sha2 0.11.0",
