@@ -1054,3 +1054,144 @@ async fn a_run_with_no_recorded_policy_is_refused_rather_than_resumed_permissive
     .expect_err("a run whose boundary cannot be recovered must not be resumed");
     assert!(matches!(&err, io_harness::Error::Resume { .. }), "{err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// `Effect::ALL` — 0.71.0, issue #218
+//
+// The crate used to write the three effects out by hand wherever it walked
+// them. The list is now declared once; what follows pins the two properties a
+// caller depends on — that the list is the wire format's own list, and that
+// replacing the hand-written iterations changed neither site's output.
+//
+// The *completeness* guard is not here: proving a fourth variant cannot be
+// forgotten needs an exhaustive `match`, which only the defining crate can
+// write, so it lives in `src/policy.rs`'s own test module.
+// ---------------------------------------------------------------------------
+
+/// Every effect's `as_str` is the word the crate's own deserializer accepts,
+/// and no effect is named twice.
+#[test]
+fn every_effect_in_all_round_trips_through_the_deserializer() {
+    let mut words: Vec<&str> = Vec::new();
+    for effect in Effect::ALL {
+        let word = effect.as_str();
+        assert!(
+            !words.contains(&word),
+            "{word:?} appears twice in Effect::ALL"
+        );
+        words.push(word);
+        assert_eq!(
+            serde_json::from_str::<Effect>(&format!("\"{word}\"")).unwrap(),
+            effect,
+            "{word:?} is not the word the deserializer reads back as {effect:?}"
+        );
+    }
+    assert_eq!(words, ["allow", "ask", "deny"]);
+}
+
+/// The reversed call site: [`Policy::explain`] still resolves deny, then ask,
+/// then allow.
+///
+/// One target matched by a rule of every effect in three separate layers, so
+/// the answer is decided by the iteration order alone and nothing else. Walking
+/// `Effect::ALL` forward instead of reversed returns `Allow` here — a policy's
+/// deny silently losing to its own allow.
+#[test]
+fn explain_still_resolves_strictest_first() {
+    let policy = Policy::default()
+        .layer("permissive-first")
+        .allow_write("src/*")
+        .layer("asks")
+        .ask_write("src/*")
+        .layer("denies")
+        .deny_write("src/*");
+
+    let verdict = policy.explain(Act::Write, "src/a.rs");
+    assert_eq!(verdict.effect, Effect::Deny);
+    assert_eq!(verdict.layer.as_deref(), Some("denies"));
+
+    // With the deny gone, ask still beats the allow that is written first.
+    let softer = Policy::default()
+        .layer("permissive-first")
+        .allow_write("src/*")
+        .layer("asks")
+        .ask_write("src/*");
+    let verdict = softer.explain(Act::Write, "src/a.rs");
+    assert_eq!(verdict.effect, Effect::Ask);
+    assert_eq!(verdict.layer.as_deref(), Some("asks"));
+}
+
+/// Records the composed system prompt, which is the only place the boundary
+/// section is observable from outside the crate.
+struct RecordingProvider {
+    systems: Mutex<Vec<String>>,
+}
+
+impl Provider for RecordingProvider {
+    async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        self.systems.lock().unwrap().push(req.system.clone());
+        Ok(CompletionResponse::default())
+    }
+}
+
+/// The forward call site: the boundary line still groups permissive-first,
+/// `Allowed` then `Needs approval` then `Refused`, on one line.
+///
+/// The order is what the agent reads as increasing restriction; reversed, the
+/// line opens with what it may not do. Asserted as positions on the one line
+/// that carries all three groups, so a reordering fails here rather than
+/// leaving three still-present substrings.
+#[tokio::test]
+async fn the_boundary_line_still_groups_permissive_first() {
+    let dir = fixture();
+    let policy = Policy::default()
+        .layer("base")
+        .allow_write("src/allowed.rs")
+        .ask_write("src/asked.rs")
+        .deny_write("src/refused.rs");
+    let provider = RecordingProvider {
+        systems: Mutex::new(Vec::new()),
+    };
+    let store = Store::memory().unwrap();
+
+    // The prompt is composed before the first completion, so it is recorded
+    // whatever the run itself goes on to do with an answer and no tool call.
+    let _ = run_with(
+        &TaskContract::workspace("look at the boundary", dir.path()).with_max_steps(1),
+        &provider,
+        &store,
+        &policy,
+        &Counting::new(Decision::approve()),
+    )
+    .await;
+
+    let system = provider
+        .systems
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("the provider was consulted at least once");
+    let line = system
+        .lines()
+        .find(|l| l.starts_with("- Writing files:"))
+        .unwrap_or_else(|| panic!("no writing-files boundary line in:\n{system}"));
+
+    let at = |needle: &str| {
+        line.find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} missing from {line:?}"))
+    };
+    let (allowed, asked, refused) = (at("Allowed: "), at("Needs approval: "), at("Refused: "));
+    assert!(
+        allowed < asked && asked < refused,
+        "the boundary line is no longer permissive-first: {line:?}"
+    );
+    // And each pattern still sits inside its own group, so the headings did not
+    // merely keep their order while the contents moved.
+    let mine = at("src/allowed.rs");
+    assert!(allowed < mine && mine < asked, "{line:?}");
+    let mine = at("src/asked.rs");
+    assert!(asked < mine && mine < refused, "{line:?}");
+    // The deny carries the layer that produced it, after the built-in secrets.
+    assert!(refused < at("src/refused.rs (base)"), "{line:?}");
+}

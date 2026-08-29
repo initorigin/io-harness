@@ -301,13 +301,8 @@ async fn full_access_narrows_nothing_and_wraps_nothing() {
 
 #[test]
 fn the_narrower_of_two_grants_is_the_one_that_permits_less() {
-    let all = [
-        ExecMode::ReadOnly,
-        ExecMode::WorkspaceWrite,
-        ExecMode::FullAccess,
-    ];
-    for a in all {
-        for b in all {
+    for a in ExecMode::ALL {
+        for b in ExecMode::ALL {
             // Commutative, idempotent, and never wider than either input.
             assert_eq!(a.narrower(b), b.narrower(a), "{a:?} {b:?}");
             assert!(a.narrower(b).satisfied_by(a) && a.narrower(b).satisfied_by(b));
@@ -318,4 +313,34 @@ fn the_narrower_of_two_grants_is_the_one_that_permits_less() {
     }
     assert!(!ExecMode::WorkspaceWrite.satisfied_by(ExecMode::ReadOnly));
     assert!(!ExecMode::FullAccess.satisfied_by(ExecMode::WorkspaceWrite));
+}
+
+/// `ExecMode::ALL` — 0.71.0, issue #218.
+///
+/// The mode algebra above used to open with the three modes written out by
+/// hand, which is what a `#[non_exhaustive]` enum leaves every caller doing:
+/// the list keeps compiling after a fourth mode arrives and quietly stops
+/// covering it. It now walks `ALL`, and this pins what `ALL` promises a caller
+/// — each mode once, spelled the way the crate's own deserializer reads it.
+///
+/// That a *new* mode cannot be left out of `ALL` is not provable from here: it
+/// needs an exhaustive `match`, which only the defining crate may write over a
+/// `#[non_exhaustive]` enum, so that guard lives in `src/sandbox.rs`.
+#[test]
+fn every_mode_in_all_round_trips_through_the_deserializer() {
+    let mut words: Vec<&str> = Vec::new();
+    for mode in ExecMode::ALL {
+        let word = mode.as_str();
+        assert!(
+            !words.contains(&word),
+            "{word:?} appears twice in ExecMode::ALL"
+        );
+        words.push(word);
+        assert_eq!(
+            serde_json::from_str::<ExecMode>(&format!("\"{word}\"")).unwrap(),
+            mode,
+            "{word:?} is not the word the deserializer reads back as {mode:?}"
+        );
+    }
+    assert_eq!(words, ["read-only", "workspace-write", "full-access"]);
 }

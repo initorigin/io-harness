@@ -282,7 +282,7 @@ pub(super) fn boundary_line(policy: &Policy, act: Act, label: &str, default: Eff
             named.push((rule.pattern.clone(), verdict.effect, verdict.layer));
         }
     }
-    for effect in [Effect::Allow, Effect::Ask, Effect::Deny] {
+    for effect in Effect::ALL {
         let group: Vec<String> = named
             .iter()
             .filter(|(_, e, _)| *e == effect)
