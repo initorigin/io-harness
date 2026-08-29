@@ -576,25 +576,36 @@ impl Plugins {
                 .map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into());
             match load_one(*scope, &dir) {
                 Ok(plugin) => {
-                    // A switched-off bundle is held to this check like any
-                    // other: two entries claiming one id is a mistake in the
-                    // configuration whichever of them is switched on, and the
-                    // check reserves nothing — a disabled bundle never reaches
-                    // `loaded`, so it holds no contribution name either way.
-                    if !seen.insert(plugin.id.clone()) {
-                        out.dropped.push(Dropped {
-                            id: plugin.id.clone(),
-                            path: dir,
-                            error: format!(
-                                "a plugin with id `{}` is already declared; two bundles cannot \
-                                 share an id, because the id is what every name they contribute \
-                                 is namespaced by",
-                                plugin.id
-                            ),
-                        });
-                        continue;
-                    }
+                    // A switched-off bundle claims no id, and the ordering here
+                    // is the whole of that rule (0.70.0).
+                    //
+                    // The id exists to namespace what a bundle contributes, and a
+                    // disabled one contributes nothing — so reserving it would be
+                    // holding a name against a bundle that uses none. It would
+                    // also break the swap this feature exists to make easy:
+                    // switching `tools-v1` off and declaring `tools-v2` beside it
+                    // is a one-line edit, and if the disabled entry held the id
+                    // the new bundle would be dropped as a duplicate and neither
+                    // would contribute — with the failure reported against the
+                    // entry the operator did not touch.
+                    //
+                    // Two ENABLED bundles sharing an id is still a mistake and is
+                    // still reported, because that is a real collision. Two
+                    // disabled ones are not: neither claims anything.
                     if decl.enabled {
+                        if !seen.insert(plugin.id.clone()) {
+                            out.dropped.push(Dropped {
+                                id: plugin.id.clone(),
+                                path: dir,
+                                error: format!(
+                                    "a plugin with id `{}` is already declared and switched on; \
+                                     two bundles cannot share an id, because the id is what \
+                                     every name they contribute is namespaced by",
+                                    plugin.id
+                                ),
+                            });
+                            continue;
+                        }
                         out.loaded.push(plugin);
                     } else {
                         out.disabled.push(plugin);

@@ -441,9 +441,13 @@ pub(super) async fn run_from<P: Provider>(
     // workspace loop: a fact about the run that only the loop can hold, because a
     // rule applied to a freshly built request cannot detect its own transition.
     //
-    // False, not "no gate yet": a run that never reaches its gate has not been
-    // judged, and that is the honest answer for it too.
-    let mut criterion_failed = false;
+    // Seeded from the store rather than from `false`, because `start_step..=max`
+    // is EMPTY on a resume that does not raise the cap — the body never runs, and
+    // a flag starting false would let the tail overwrite a durable
+    // `"verification_failed"` with `"step_cap_reached"`. A fresh run has no
+    // outcome and seeds false, which is the honest answer for a run that never
+    // reaches its gate.
+    let mut criterion_failed = criterion_already_failed(store, run_id);
 
     for step in start_step..=contract.max_steps {
         // A cancellation is acted on here, at the boundary between two steps, and
@@ -809,10 +813,21 @@ pub(super) async fn run_workspace_from<P: Provider>(
     // 0.70.0 — has the criterion ever judged this run and said no? Held here for
     // the same reason `marked_prefix` above is: it is a fact about the run rather
     // than about a step, and the loop's tail is where it is needed and where the
-    // step it came from is already gone. Not restored on resume, deliberately —
-    // the run is about to evaluate the gate again on its first step, and a
-    // resumed run that ends at its cap will have earned the answer itself.
-    let mut criterion_failed = false;
+    // step it came from is already gone.
+    //
+    // Restored from the store, and the first draft's reasoning for NOT restoring
+    // it — "the run is about to evaluate the gate again on its first step" — is
+    // false for the one case that matters. `start_step..=max_steps` is empty on a
+    // resume that does not raise the cap, so there is no first step to earn the
+    // answer on, and a flag starting false would let the tail overwrite a durable
+    // `"verification_failed"` with `"step_cap_reached"`.
+    let mut criterion_failed = criterion_already_failed(store, run_id);
+    // 0.70.0 — the gate-failure section most recently appended to the ledger, so
+    // a criterion failing the same way every step is reported once rather than
+    // once per step. Run-scoped for the same reason `criterion_failed` is: the
+    // comparison is against what an earlier step appended, and that step is gone
+    // by the time the next one asks.
+    let mut last_gate_feedback: Option<String> = None;
     // 0.49.0 — what each step of THIS run asked for, so the next step can send it
     // back as an assistant turn.
     //
@@ -1693,8 +1708,19 @@ pub(super) async fn run_workspace_from<P: Provider>(
         // Guarded on there being a next step: the last step of a run has no
         // request to inform, and a context event for a step that never ran would
         // say a blind attempt was told.
+        // And guarded on the section being NEW. The ledger accumulates for the
+        // whole run, so a gate failing the same way at every step would append a
+        // near-identical block per step and re-send all of them thereafter —
+        // the context leak with a plausible-looking cause this release's own
+        // contract names as a risk. Comparing against the last one appended
+        // costs one `String` and collapses the common case to a single block,
+        // while a failure that CHANGES is still reported. The ledger is never
+        // shortened to achieve this: it is tracked by a watermark index and
+        // anything that shortens it in place corrupts the store.
         if step < contract.max_steps {
-            if let Some(section) = gate_failure_feedback(store, run_id, step) {
+            if let Some((key, section)) = gate_failure_feedback(store, run_id, step)
+                .filter(|(key, _)| last_gate_feedback.as_deref() != Some(key.as_str()))
+            {
                 store.record_context_event(
                     run_id,
                     &ContextEvent::gate_feedback(
@@ -1711,6 +1737,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     None,
                     bound(&section, entry_cap, ObsKind::Error),
                 ));
+                last_gate_feedback = Some(key);
             }
         }
     }

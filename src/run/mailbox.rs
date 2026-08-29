@@ -378,10 +378,19 @@ pub(super) async fn mailbox_call(
 /// What this function still cannot do is *pause*. Its result is a `PathBuf` or a
 /// reason, and its caller turns a reason into a spawn that did not happen, so a
 /// [`Decision::Defer`](crate::Decision::Defer) — "a human will decide later" — has
-/// nowhere to go and is reported as the reason instead. The pending row it left
-/// behind stays answerable, and the next attempt at the same spawn derives the
-/// same path and asks again. Making the spawn itself pausable is a change to
-/// `SpawnOutcome` and its caller, not to this function.
+/// nowhere to go and is reported as the reason instead. Making the spawn itself
+/// pausable is a change to `SpawnOutcome` and its caller, not to this function.
+///
+/// **What a deferral leaves behind, stated accurately.** `gate` writes the
+/// pending row before it consults the approver, so a deferral leaves an
+/// unresolved row on a run that then carries on and finishes — nothing surfaces
+/// `AwaitingApproval` for it. And that row is *not* usefully answerable later:
+/// the derived slug embeds the spawning `step`, so a retry at a later step asks
+/// about a different path and writes its own row rather than meeting the
+/// standing one. Each deferred attempt leaves one. An approver that defers on a
+/// worktree spawn is therefore choosing "not this run", not "ask me again in a
+/// moment" — the honest reading, and the reason this is a limitation rather than
+/// a feature waiting to be finished.
 pub(super) async fn worktree_for<P: Provider>(
     tree: &Tree<'_, P>,
     parent_policy: &Policy,

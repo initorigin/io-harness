@@ -438,11 +438,18 @@ where
         // 0.68.0 — the caller's standing request for a fold, consumed once, and by
         // the root only. `fold_forced` is what enforces both.
         let mut fold_asked = contract.fold_now;
-        // 0.70.0 — see the workspace loop. Per agent, like everything else here:
-        // a child that failed its own criterion composes back into its parent
-        // carrying that, so a parent can tell a child that ran out of room from
-        // one whose work was checked and rejected.
-        let mut criterion_failed = false;
+        // 0.70.0 — see the workspace loop, including why this is seeded from the
+        // store rather than from `false`: a resume that does not raise the cap
+        // runs an empty loop and would otherwise un-conclude what a previous
+        // attempt judged. Per agent, like everything else here: a child that
+        // failed its own criterion composes back into its parent carrying that,
+        // so a parent can tell a child that ran out of room from one whose work
+        // was checked and rejected.
+        let mut criterion_failed = criterion_already_failed(tree.store, run_id);
+        // 0.70.0 — the gate-failure section most recently appended, so a
+        // criterion failing the same way every step is reported once rather than
+        // once per step. Per agent, like everything else in this loop.
+        let mut last_gate_feedback: Option<String> = None;
         // And the turn is typed before its first completion is billed, the same
         // order the flat loop writes it in.
         open_turn_kind(tree.store, run_id, extras)?;
@@ -1328,8 +1335,15 @@ where
             // the same helper. A contained agent that is told nothing about why its
             // gate failed is the one that can least afford to guess: it has a
             // narrower workspace and a smaller budget than its parent.
+            // And only when the section is NEW — see the workspace loop. A gate
+            // failing the same way every step would otherwise append a
+            // near-identical block per step and re-send all of them, which for a
+            // child is worse than for a root: it has the smaller context budget
+            // of the two.
             if step < contract.max_steps {
-                if let Some(section) = gate_failure_feedback(tree.store, run_id, step) {
+                if let Some((key, section)) = gate_failure_feedback(tree.store, run_id, step)
+                    .filter(|(key, _)| last_gate_feedback.as_deref() != Some(key.as_str()))
+                {
                     tree.store.record_context_event(
                         run_id,
                         &ContextEvent::gate_feedback(
@@ -1346,6 +1360,7 @@ where
                         None,
                         bound(&section, entry_cap, ObsKind::Error),
                     ));
+                    last_gate_feedback = Some(key);
                 }
             }
         }

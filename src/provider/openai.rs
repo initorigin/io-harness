@@ -106,7 +106,7 @@ impl std::fmt::Debug for OpenAi {
     /// all, not even its length.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAi")
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &super::redacted_endpoint(&self.endpoint))
             .field("model", &self.model)
             .finish_non_exhaustive()
     }

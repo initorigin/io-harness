@@ -890,7 +890,31 @@ const ENABLED_KEY: &str = "enabled";
 /// It is an [`Error::Config`] rather than a warning because there is no warning
 /// channel to use: configuration parsing returns `Result` and nothing else, and a
 /// warning nobody has a way to print is a decision not to say anything.
+/// It recurses into `[profile.*]` bodies for the same reason `refuse_widening`
+/// does, and its own comment there says it best: a key hidden in a profile
+/// "would otherwise reach the same place by a different path". A `[[mcp]]` array
+/// inside a profile is a fully supported declaration — `Config::with_profile`
+/// merges the body over the base and the servers it names are the ones that get
+/// started — so a check that only read the top level would leave the hazard open
+/// on the one path it did not cover. Profiles cannot nest
+/// (`refuse_nested_profiles`), so one level is the whole of it.
 pub(crate) fn check_enabled_spelling(table: &toml::value::Table, path: &Path) -> Result<()> {
+    check_mcp_entries(table, path, "")?;
+    if let Some(profiles) = table.get("profile").and_then(toml::Value::as_table) {
+        for (name, body) in profiles {
+            if let Some(body) = body.as_table() {
+                check_mcp_entries(body, path, &format!("profile.{name}."))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One array of `[[mcp]]` tables, named by `scope` so the diagnostic points at
+/// the section the operator actually wrote — `[[mcp]]` at the top level,
+/// `[[profile.prod.mcp]]` inside a profile. A bare entry index is useless to
+/// someone with servers declared in both places.
+fn check_mcp_entries(table: &toml::value::Table, path: &Path, scope: &str) -> Result<()> {
     let Some(entries) = table.get("mcp").and_then(|v| v.as_array()) else {
         return Ok(());
     };
@@ -908,10 +932,10 @@ pub(crate) fn check_enabled_spelling(table: &toml::value::Table, path: &Path) ->
             // and a diagnostic that quotes a name the file does not contain is
             // worse than one that counts.
             return Err(Error::Config(format!(
-                "{}: `[[mcp]]` entry {index}: key `{key}`: did you mean `{ENABLED_KEY}`? \
-                 An `[[mcp]]` table cannot reject unknown keys, so this one would be \
-                 silently dropped and the server would stay switched on — the opposite \
-                 of what writing it asks for.",
+                "{}: `[[{scope}mcp]]` entry {index}: key `{key}`: did you mean \
+                 `{ENABLED_KEY}`? An `[[mcp]]` table cannot reject unknown keys, so this \
+                 one would be silently dropped and the server would stay switched on — \
+                 the opposite of what writing it asks for.",
                 path.display()
             )));
         }

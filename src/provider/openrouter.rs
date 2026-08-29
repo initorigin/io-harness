@@ -105,7 +105,7 @@ impl std::fmt::Debug for OpenRouter {
     /// not even its length, because a length narrows which key it is.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenRouter")
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &super::redacted_endpoint(&self.endpoint))
             .field("model", &self.model)
             .finish_non_exhaustive()
     }

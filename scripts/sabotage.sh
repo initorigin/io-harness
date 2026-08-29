@@ -211,8 +211,58 @@ arm "F10 the cap always reports a verification failure" \
 # reaches the request, which is the only thing that makes a retry informed.
 arm "F11 the section is framing without the output" \
     src/run/outcome.rs \
-    's/    if let Some\(output\) = output \{\n        section\.push_str\("The end of what it printed:\\n"\);/    if let Some(output) = output.filter(|_| false) {\n        section.push_str("The end of what it printed:\\n");/' \
+    's/    let mut key = phase\.unwrap_or_default\(\);\n    if let Some\(output\) = output \{/    let mut key = phase.unwrap_or_default();\n    if let Some(output) = output.filter(|_| false) {/' \
     verification_outcome the_step_after_a_gate_failure_is_told_what_the_gate_said
+
+# ---- F11b: the same failure is carried once, not once per step.
+# The dedup key becomes the framed section, which NAMES THE STEP — so two
+# identical failures never compare equal and the guard is decorative. This is the
+# exact mistake the first implementation made and the arm that catches it: every
+# other assertion about the feedback still passes, because the content reaching
+# the model is unchanged; only the count moves.
+arm "F11b the dedup compares a key that includes the step" \
+    src/run/outcome.rs \
+    's/    let mut key = phase\.unwrap_or_default\(\);/    let mut key = format!("{step}");/' \
+    verification_outcome a_repeated_gate_failure_is_carried_once
+
+# ---- F10b: a resumed run does not un-conclude what a previous attempt judged.
+# The seed goes back to `false`, which is what the first implementation had. Every
+# other F10 assertion still passes — a run that reaches its cap in one go is
+# unaffected — and only a resume at the SAME cap, where the loop body never runs,
+# can see it. The durable row is what it corrupts, which is what makes it worth
+# an arm of its own.
+arm "F10b a resumed run starts having judged nothing" \
+    src/run/step.rs \
+    's/    let mut criterion_failed = criterion_already_failed\(store, run_id\);\n    \/\/ 0\.70\.0 — the gate-failure section/    let mut criterion_failed = false;\n    \/\/ 0.70.0 — the gate-failure section/' \
+    verification_outcome resuming_at_the_same_cap_does_not_rewrite_the_verification_failure
+
+# ---- HIGH 2: the near-miss check reaches into a profile.
+# The recursion is removed, which is exactly the state the release shipped to
+# review with. The top-level check still passes, so only a profile-declared
+# server can see it — and a profile's `[[mcp]]` is merged over the base and
+# started like any other.
+arm "F4b the near-miss check does not look inside a profile" \
+    src/mcp.rs \
+    's/    if let Some\(profiles\) = table\.get\("profile"\)\.and_then\(toml::Value::as_table\) \{/    if let Some(profiles) = None::<\&toml::value::Table> {/' \
+    config a_near_miss_inside_a_profile_is_refused_and_names_the_profile
+
+# ---- MEDIUM 3: a switched-off bundle claims no id.
+# `seen.insert` moves back above the `enabled` branch, so a disabled entry holds
+# the id and the enabled twin beside it is dropped. The duplicate-id test still
+# passes — two ENABLED bundles still collide — so only the swap can see it.
+arm "F2b a disabled bundle reserves its id" \
+    src/plugin.rs \
+    's/                    if decl\.enabled \{\n                        if !seen\.insert\(plugin\.id\.clone\(\)\) \{/                    if true {\n                        if !seen.insert(plugin.id.clone()) {/' \
+    plugin a_disabled_twin_claims_no_id_and_the_enabled_one_loads
+
+# ---- LOW 6: a credential carried in the URL is not printed either.
+# The redactor becomes the identity function. Every existing F9 assertion still
+# passes, because those providers' default endpoints carry no credential — only
+# a caller-supplied base with the key in it can see this.
+arm "F9b the endpoint is printed verbatim" \
+    src/provider/mod.rs \
+    's/pub\(crate\) fn redacted_endpoint\(endpoint: &str\) -> String \{/pub(crate) fn redacted_endpoint(endpoint: \&str) -> String {\n    return endpoint.to_string();/' \
+    verify a_credential_carried_in_the_base_url_is_not_printed_either
 
 echo
 echo "arms killed: $pass   survived: $survived   broken: $broken"

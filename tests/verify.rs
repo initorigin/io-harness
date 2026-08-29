@@ -25,7 +25,8 @@
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, Fallback, Provider, Record};
 use io_harness::{
-    Anthropic, Approver, Compatible, ModelApprover, ModelReviewer, OpenAi, OpenRouter, Reviewer,
+    Anthropic, Approver, Auth, Compatible, ModelApprover, ModelReviewer, OpenAi, OpenRouter,
+    Reviewer,
 };
 
 /// The key every provider below is built with. Distinctive enough that a
@@ -91,6 +92,27 @@ fn anthropic_debug_hides_the_key() {
 fn compatible_debug_hides_the_key() {
     let provider = Compatible::groq(SENTINEL, "llama-3.3-70b");
     hides_key_shows(&provider, &["llama-3.3-70b", "groq"]);
+}
+
+/// Withholding the `api_key` field is not enough on its own: the base URL is
+/// caller-supplied, and gateway and Azure-style deployments routinely carry the
+/// credential *in the URL*. Printing the endpoint verbatim would put the key in
+/// a log through the one door these impls exist to close.
+///
+/// `Compatible` is the provider whose base a caller sets directly, so it is the
+/// one that can be driven end to end; `redacted_endpoint`'s own unit tests cover
+/// the shapes the other three would hit.
+#[test]
+fn a_credential_carried_in_the_base_url_is_not_printed_either() {
+    for base in [
+        format!("https://user:{SENTINEL}@gateway.example.com/v1"),
+        format!("https://gateway.example.com/v1?api-key={SENTINEL}"),
+    ] {
+        let provider = Compatible::new(&base, Auth::Bearer, SENTINEL, "some-model");
+        // The host is the positive control: an impl that printed nothing at all
+        // would pass the absence assertion and tell an operator nothing.
+        hides_key_shows(&provider, &["some-model", "gateway.example.com"]);
+    }
 }
 
 // ---------------------------------------------------------------------------

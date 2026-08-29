@@ -268,12 +268,41 @@ pub(super) fn gate_judged(verify: &Verification) -> bool {
 pub(super) fn capped_outcome(judged_and_failed: bool, steps: u32) -> (&'static str, RunOutcome) {
     if judged_and_failed {
         (
-            "verification_failed",
+            VERIFICATION_FAILED,
             RunOutcome::VerificationFailed { steps },
         )
     } else {
         ("step_cap_reached", RunOutcome::StepCapReached { steps })
     }
+}
+
+/// The durable string for a run that reached its cap having failed its criterion.
+///
+/// Named once because it is now read as well as written: [`capped_outcome`]
+/// writes it and [`criterion_already_failed`] reads it back to seed a resumed
+/// run. Two spellings of one durable string is exactly the drift
+/// [`capped_outcome`] exists to prevent, and a reader is the second chance to
+/// introduce one.
+pub(super) const VERIFICATION_FAILED: &str = "verification_failed";
+
+/// Whether a previous attempt at this run already concluded that its criterion
+/// failed (0.70.0).
+///
+/// A step loop's `criterion_failed` flag is loop-local and starts false, but the
+/// loop is `start_step..=max_steps` and a resume that does **not** raise the cap
+/// leaves that range empty. The body never runs, nothing sets the flag, and the
+/// tail would answer `StepCapReached` — overwriting a durable
+/// `"verification_failed"` with the very reading it was added to correct, and
+/// telling the caller to raise `max_steps` when the criterion is the problem.
+/// `Store::finish_run`'s `UPDATE` is unconditional, so the record an audit reads
+/// is overwritten too.
+///
+/// Seeding from the store makes a resume idempotent: a fresh run has no outcome
+/// and seeds `false`, and a resumed run inherits what the previous attempt
+/// judged. A read failure seeds `false` rather than propagating, because the
+/// worst case is the pre-0.70.0 answer rather than a run that cannot resume.
+pub(super) fn criterion_already_failed(store: &Store, run_id: i64) -> bool {
+    matches!(store.outcome(run_id), Ok(Some(o)) if o == VERIFICATION_FAILED)
 }
 
 /// What the criterion said when it failed at `step`, framed for the next request
@@ -294,7 +323,19 @@ pub(super) fn capped_outcome(judged_and_failed: bool, steps: u32) -> (&'static s
 /// The *last* row of each kind for the step, because a step evaluates its gate
 /// once but `record_gate_failure` is called by the compile-only gates per phase,
 /// and the phase that failed last is the one that stopped it.
-pub(super) fn gate_failure_feedback(store: &Store, run_id: i64, step: u32) -> Option<String> {
+/// Returns the section to append **and a key identifying what the gate said**,
+/// so a caller can tell "the same failure again" from "a different one" (0.70.0).
+///
+/// The key exists because the section itself cannot serve as one: it opens by
+/// naming the step, so two identical failures at two steps produce two different
+/// strings and a comparison on the section would never match. The key is the
+/// phase and the bounded output and nothing else — the parts that describe the
+/// failure rather than when it happened.
+pub(super) fn gate_failure_feedback(
+    store: &Store,
+    run_id: i64,
+    step: u32,
+) -> Option<(String, String)> {
     let events = store.sandbox_events(run_id).unwrap_or_default();
     let detail = |kind: &str| {
         events
@@ -316,16 +357,16 @@ pub(super) fn gate_failure_feedback(store: &Store, run_id: i64, step: u32) -> Op
             None => String::new(),
         }
     );
+    let mut key = phase.unwrap_or_default();
     if let Some(output) = output {
+        let tail = last_lines(&output, GATE_FEEDBACK_LINES, GATE_FEEDBACK_CHARS);
         section.push_str("The end of what it printed:\n");
-        section.push_str(&last_lines(
-            &output,
-            GATE_FEEDBACK_LINES,
-            GATE_FEEDBACK_CHARS,
-        ));
+        section.push_str(&tail);
         section.push('\n');
+        key.push('\n');
+        key.push_str(&tail);
     }
-    Some(section)
+    Some((key, section))
 }
 
 /// A criterion's short name, as it is recorded in `gate_attempts.phase`.

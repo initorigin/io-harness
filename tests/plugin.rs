@@ -997,12 +997,14 @@ fn a_disabled_project_scoped_bundle_is_still_refused_its_hook() {
     }
 }
 
-/// Two entries claiming one id are a mistake in the configuration whichever of
-/// them is switched off, so the second is dropped either way. Both orders,
-/// because the id a switched-off bundle claims is claimed by the entry, not by
-/// anything it contributes.
+/// A switched-off bundle claims no id, so the enabled twin beside it loads.
+///
+/// This is the swap the flag exists to make easy — switch `v1` off, declare `v2`
+/// beside it — and it is asserted in both orders, because an id reserved by the
+/// entry rather than by what it contributes would break exactly one of them and
+/// report the failure against the entry the operator did not edit.
 #[test]
-fn a_disabled_twin_is_still_a_duplicate_id() {
+fn a_disabled_twin_claims_no_id_and_the_enabled_one_loads() {
     for first_enabled in [true, false] {
         let dir = tmp();
         let root = dir.path();
@@ -1020,19 +1022,43 @@ fn a_disabled_twin_is_still_a_duplicate_id() {
         );
 
         let plugins = Config::discover(root).unwrap().plugins();
-        assert_eq!(
-            plugins.dropped().len(),
-            1,
-            "the second entry is dropped, first_enabled = {first_enabled}"
-        );
         assert!(
-            plugins.dropped()[0].error.contains("already declared"),
-            "for the duplicate id and not something else: {}",
-            plugins.dropped()[0].error
+            plugins.dropped().is_empty(),
+            "neither entry collides, first_enabled = {first_enabled}: {:?}",
+            plugins.dropped()
         );
-        assert_eq!(plugins.len(), usize::from(first_enabled));
-        assert_eq!(plugins.disabled().len(), usize::from(!first_enabled));
+        assert_eq!(
+            plugins.len(),
+            1,
+            "the switched-on one loads, first_enabled = {first_enabled}"
+        );
+        assert_eq!(plugins.disabled().len(), 1);
+        assert_eq!(plugins.disabled()[0].id(), "good");
     }
+}
+
+/// But two bundles that are both switched ON still collide, because that is a
+/// real clash over the namespace every contributed name carries.
+#[test]
+fn two_enabled_bundles_sharing_an_id_still_collide() {
+    let dir = tmp();
+    let root = dir.path();
+    bundle(root, "good");
+    write(&root.join("bundles/twin/plugin.toml"), "name = \"good\"\n");
+    write(
+        &root.join("io.local.toml"),
+        "[[plugin]]\npath = \"bundles/good\"\n[[plugin]]\npath = \"bundles/twin\"\n",
+    );
+
+    let plugins = Config::discover(root).unwrap().plugins();
+    assert_eq!(plugins.dropped().len(), 1, "the second is dropped");
+    assert!(
+        plugins.dropped()[0].error.contains("already declared"),
+        "for the duplicate id and not something else: {}",
+        plugins.dropped()[0].error
+    );
+    assert_eq!(plugins.len(), 1);
+    assert!(plugins.disabled().is_empty());
 }
 
 // ------------------------------------------------------------------ N3

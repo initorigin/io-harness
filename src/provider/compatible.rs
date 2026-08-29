@@ -380,7 +380,7 @@ impl std::fmt::Debug for Compatible {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Compatible")
             .field("name", &self.name)
-            .field("base", &self.base)
+            .field("base", &super::redacted_endpoint(&self.base))
             .field("model", &self.model)
             .finish_non_exhaustive()
     }

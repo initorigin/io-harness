@@ -186,6 +186,89 @@ async fn a_verification_failure_is_not_a_terminal_outcome() {
     );
 }
 
+/// A resume that does NOT raise the cap must not un-conclude what the first
+/// attempt judged.
+///
+/// The dangerous shape, and the one the test above cannot reach because it
+/// raises the budget: `start_step..=max_steps` is **empty** when the run already
+/// reached its cap, so the loop body never executes. A `criterion_failed` flag
+/// starting at `false` would take the tail straight to `StepCapReached` and
+/// `finish_run`'s unconditional `UPDATE` would overwrite the durable
+/// `"verification_failed"` — handing back exactly the reading this release
+/// exists to correct, in the record an audit reads, on the *second* use.
+///
+/// A fleet driver that resumes uniformly, or an operator resuming before
+/// deciding how much more budget to give, both land here.
+#[tokio::test]
+async fn resuming_at_the_same_cap_does_not_rewrite_the_verification_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let contract = TaskContract::workspace("write done into out.txt", dir.path())
+        .with_verification(never_passes())
+        .with_max_steps(2);
+
+    let first = run_with(
+        &contract,
+        &looking(2),
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.outcome, RunOutcome::VerificationFailed { steps: 2 });
+    assert_eq!(
+        store.outcome(first.run_id).unwrap().as_deref(),
+        Some("verification_failed")
+    );
+
+    // Same contract, same cap, nothing repaired. The loop has no step to run.
+    let again = io_harness::resume(&contract, &looking(2), &store, first.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        again.outcome,
+        RunOutcome::VerificationFailed { steps: 2 },
+        "a no-op resume reports what the run already concluded, not a step cap"
+    );
+    assert_eq!(
+        store.outcome(first.run_id).unwrap().as_deref(),
+        Some("verification_failed"),
+        "and the durable record is not overwritten"
+    );
+}
+
+/// The negative control for the seed: a run with no criterion, capped and
+/// resumed at the same cap, still answers the plain step cap. A seed that
+/// answered "verification failed" for everything would pass the test above and
+/// fail this one.
+#[tokio::test]
+async fn resuming_a_no_criterion_run_at_the_same_cap_still_reports_the_step_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let contract = TaskContract::workspace("keep looking", dir.path()).with_max_steps(2);
+
+    let first = run_with(
+        &contract,
+        &looking(2),
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.outcome, RunOutcome::StepCapReached { steps: 2 });
+
+    let again = io_harness::resume(&contract, &looking(2), &store, first.run_id)
+        .await
+        .unwrap();
+    assert_eq!(again.outcome, RunOutcome::StepCapReached { steps: 2 });
+    assert_eq!(
+        store.outcome(first.run_id).unwrap().as_deref(),
+        Some("step_cap_reached")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // F11 — the failure's own words reach the next request
 // ---------------------------------------------------------------------------
@@ -262,6 +345,13 @@ async fn the_step_after_a_gate_failure_is_told_what_the_gate_said() {
 
     // And the trace says which attempt was informed, so a reader can tell an
     // informed retry from a blind one.
+    //
+    // Exactly one entry, not one per failing step. This gate fails identically
+    // every time, and the ledger accumulates for the whole run — appending a
+    // near-identical block per step would re-send all of them on every request
+    // thereafter, which is the context leak with a plausible-looking cause the
+    // contract names as a risk. Step 1 is blind because nothing had failed yet;
+    // step 2 is told; step 3 is told nothing new because there is nothing new.
     let told: Vec<u32> = store
         .context_events(result.run_id)
         .unwrap()
@@ -271,8 +361,45 @@ async fn the_step_after_a_gate_failure_is_told_what_the_gate_said() {
         .collect();
     assert_eq!(
         told,
-        vec![2, 3],
-        "steps 2 and 3 were informed; step 1 was blind, and there is no step 4 to tell"
+        vec![2],
+        "the same failure is reported once, not once per step"
+    );
+}
+
+/// The same failure repeated is carried once; a failure that CHANGES is carried
+/// again.
+///
+/// The dedup compares what the gate *said* — its phase and the tail of its
+/// output — and deliberately not the appended section, which opens by naming the
+/// step and so differs every time. A comparison on the section would match
+/// nothing and the guard would be decorative.
+#[tokio::test]
+async fn a_repeated_gate_failure_is_carried_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let contract = TaskContract::workspace("make the criterion pass", dir.path())
+        .with_verification(failing_command())
+        .with_max_steps(5);
+
+    let result = run_with(
+        &contract,
+        &looking(5),
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let appended = store
+        .observations(result.run_id)
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.text.contains("the success criterion ran at step"))
+        .count();
+    assert_eq!(
+        appended, 1,
+        "five identical failures leave one section on the ledger, not four"
     );
 }
 
