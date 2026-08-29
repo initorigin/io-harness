@@ -366,7 +366,7 @@ async fn falling_over_costs_the_primary_one_attempt_per_step_not_a_retry_budget(
         .await
         .unwrap();
 
-    assert_eq!(result.outcome, RunOutcome::StepCapReached { steps: 3 });
+    assert_eq!(result.outcome, RunOutcome::VerificationFailed { steps: 3 });
     // Three steps, three attempts at the primary — not three times six.
     assert_eq!(
         primary_calls.load(Ordering::SeqCst),

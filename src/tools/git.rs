@@ -50,7 +50,12 @@ use crate::policy::{Act, Effect, Policy};
 
 /// The binary. A constant rather than a parameter so a policy rule has a stable
 /// `Act::Exec` target to name.
-const GIT: &str = "git";
+///
+/// Crate-visible since 0.70.0: the run loop puts this exact string through its
+/// approval gate before it builds a [`Git`], so the target the approver is asked
+/// about and the target [`Git::run`] checks are one value rather than two
+/// spellings that can drift.
+pub(crate) const GIT: &str = "git";
 
 /// The platform's bit bucket, used both as the "global config" file and as the
 /// hooks directory.
@@ -475,6 +480,20 @@ pub(crate) struct Git<'a> {
     /// three readers declare `ReadOnly` — so it is handed in rather than derived
     /// here, which keeps one answer per call instead of two that can disagree.
     sandbox: Option<std::sync::Arc<crate::sandbox::ExecContainment>>,
+    /// Whether the caller already put `Act::Exec` on [`GIT`] through the run
+    /// loop's approval gate (0.70.0).
+    ///
+    /// It matters because an [`Effect::Ask`] this struct cannot see may already
+    /// have been *answered*. Re-asking the policy here would read `Ask` again,
+    /// find no approver, and refuse — undoing the approval a human just gave,
+    /// which is the exact shape of the defect this release fixes one layer up.
+    ///
+    /// A `Deny` is still refused either way: a deny is not a thing an approver
+    /// can move, so it is the one verdict that means the same to both layers.
+    /// And a caller that has *not* gated keeps the whole check, so this stays a
+    /// real boundary for anything that reaches `git` without a run loop around
+    /// it rather than a defence deleted because one caller stopped needing it.
+    gated: bool,
 }
 
 impl<'a> Git<'a> {
@@ -490,7 +509,16 @@ impl<'a> Git<'a> {
             program: GIT.into(),
             cap,
             sandbox: None,
+            gated: false,
         }
+    }
+
+    /// Declare that `Act::Exec` on [`GIT`] has already been through the run
+    /// loop's approval gate (0.70.0). See the `gated` field for why the check
+    /// below cannot simply be repeated here.
+    pub(crate) fn gated(mut self) -> Self {
+        self.gated = true;
+        self
     }
 
     /// Run this call's `git` inside the containment the run resolved (0.48.0).
@@ -551,7 +579,18 @@ impl<'a> Git<'a> {
         // consulted, so a permissive policy is not a way to smuggle one through.
         let argv = self.argv(cmd)?;
         let verdict = self.policy.check(Act::Exec, &self.program);
-        if verdict.effect != Effect::Allow {
+        // 0.70.0 — `Ask` is not `Deny`. Until this release every verdict that was
+        // not `Allow` was refused here, so the default policy's `exec: Ask` made
+        // every git built-in fail out of the box with a message naming `git`,
+        // which reads as a missing binary rather than as a question nobody was
+        // asked. A gated caller has already had that question answered; see the
+        // `gated` field.
+        let refuse = match verdict.effect {
+            Effect::Allow => false,
+            Effect::Deny => true,
+            Effect::Ask => !self.gated,
+        };
+        if refuse {
             return Err(Error::Refused {
                 act: "exec".into(),
                 target: self.program.clone(),
@@ -1049,6 +1088,53 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(out, GitOutcome::Unavailable { .. }), "{out:?}");
+    }
+
+    /// 0.70.0 — `gated()` answers `Ask` and nothing else.
+    ///
+    /// Both halves matter. An `Ask` a caller has already put through the run
+    /// loop's gate must not be re-refused here, or the approval a human just gave
+    /// is undone by the layer below it. A `Deny` must still refuse *even when
+    /// gated*, because a deny is not something an approver can move — and a
+    /// `gated()` that waved everything through would be a policy bypass reachable
+    /// from one builder call.
+    #[tokio::test]
+    async fn gated_answers_ask_and_still_refuses_a_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = GitCmd::Status { paths: vec![] };
+
+        // `Policy::default()` names no rule for this binary, so it falls to the
+        // `exec: Ask` default — the configuration the whole release is about.
+        let asking = Policy::default();
+        let ungated = git(&asking, dir.path())
+            .program("io-harness-fake-git")
+            .run(&cmd)
+            .await;
+        assert!(
+            matches!(&ungated, Err(Error::Refused { .. })),
+            "an ungated caller has no approval to rely on: {ungated:?}"
+        );
+        let gated = git(&asking, dir.path())
+            .program("io-harness-fake-git")
+            .gated()
+            .run(&cmd)
+            .await
+            .expect("a gated `Ask` proceeds to the spawn");
+        assert!(matches!(gated, GitOutcome::Unavailable { .. }), "{gated:?}");
+
+        let denied = Policy::default()
+            .layer("l")
+            .deny_exec("io-harness-fake-git");
+        let err = git(&denied, dir.path())
+            .program("io-harness-fake-git")
+            .gated()
+            .run(&cmd)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Refused { act, .. } if act == "exec"),
+            "gating must not weaken a deny: {err:?}"
+        );
     }
 
     /// End to end, when the machine has a git. Deliberately outside a repository:

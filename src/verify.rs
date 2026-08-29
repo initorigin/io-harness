@@ -661,17 +661,44 @@ pub trait Reviewer: Send + Sync + std::fmt::Debug {
 /// design: reusing the run's provider is the cheapest implementation available
 /// and it is exactly the mistake the criterion exists to prevent.
 ///
+/// The provider it holds needs no `Debug` of its own (0.70.0). It used to: the
+/// derived `Debug` this type carried put a `P: Debug` bound on the very impls
+/// that make it a [`Reviewer`], so a shipped provider — none of which derive
+/// `Debug`, because deriving one would print an API key — could not be reviewed
+/// with at all. The `Debug` below is written by hand instead, and the bound is
+/// gone.
+///
 /// ```
-/// # use io_harness::{ModelReviewer, Reviewer};
-/// # fn demo<P: io_harness::Provider + std::fmt::Debug + Send + Sync>(provider: P) {
-/// let reviewer = ModelReviewer::new(provider, "a-different-model");
+/// use io_harness::{ModelReviewer, OpenRouter, Reviewer};
+///
+/// // This is the construction that did not compile before 0.70.0.
+/// let reviewer = ModelReviewer::new(
+///     OpenRouter::new("sk-not-a-real-key", "a-model"),
+///     "a-different-model",
+/// );
 /// assert_eq!(reviewer.model(), Some("a-different-model"));
-/// # }
+/// // And nothing of the provider — key included — reaches the formatter.
+/// assert_eq!(
+///     format!("{reviewer:?}"),
+///     "ModelReviewer { model: \"a-different-model\", .. }"
+/// );
 /// ```
-#[derive(Debug)]
 pub struct ModelReviewer<P> {
     provider: P,
     model: String,
+}
+
+impl<P> std::fmt::Debug for ModelReviewer<P> {
+    /// The model, and deliberately nothing else — the shape
+    /// [`Toolbox`](crate::Toolbox) uses for the same reason. `P` is caller code
+    /// with no `Debug` bound on it here, and the point of removing that bound
+    /// was that a provider which holds a credential should not be printable by
+    /// accident; printing it here would put the bound straight back.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelReviewer")
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<P> ModelReviewer<P> {
@@ -705,7 +732,7 @@ object and nothing else:
 Give a reason for every refusal. Judge the work in front of you against the \
 rubric, not against what you would have written.";
 
-impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> ModelReviewer<P> {
+impl<P: crate::provider::Provider + Send + Sync> ModelReviewer<P> {
     /// Ask, and read the verdict out of the answer.
     async fn judge(&self, user: String) -> Result<Review> {
         let response = self
@@ -721,7 +748,7 @@ impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> ModelReviewer
     }
 }
 
-impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> Reviewer for ModelReviewer<P> {
+impl<P: crate::provider::Provider + Send + Sync> Reviewer for ModelReviewer<P> {
     fn review<'a>(&'a self, request: ReviewRequest) -> Reviewing<'a> {
         Box::pin(async move {
             let mut user = format!(
@@ -1012,10 +1039,26 @@ impl<'a> ExecGuard<'a> {
         if verdict.effect == Effect::Allow {
             Ok(())
         } else {
+            // 0.70.0 — `Ask` still refuses here, and now says so honestly. The
+            // tool gate routes `Ask` to an approver; a verification gate has
+            // none. There is no run turn to pause: `check` is reached through
+            // `Verification::passes_guarded`, a public method returning
+            // `Result<bool>` with nowhere to put a pause, and two of its four
+            // call sites are outside any run loop. `Policy::default()`
+            // allow-lists `rustc` and the test binary by name for exactly this
+            // reason. What was wrong was the *reason given* — an `Ask` reported
+            // as "the policy forbids this" sends an operator hunting for a deny
+            // rule that does not exist.
+            let rule = verdict.rule.or(match verdict.effect {
+                Effect::Ask => {
+                    Some("<the policy asks, and a verification gate has no approver>".into())
+                }
+                _ => None,
+            });
             Err(Error::Refused {
                 act: "exec".into(),
                 target: program.to_string(),
-                rule: verdict.rule,
+                rule,
                 layer: verdict.layer,
             })
         }

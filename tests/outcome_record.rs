@@ -69,6 +69,8 @@ fn a_finished_run_reports_success_steps_spend_and_a_duration() {
 fn every_other_outcome_is_recorded_and_is_not_success() {
     for outcome in [
         "step_cap_reached",
+        // 0.70.0 — a capped run that had a criterion and never met it.
+        "verification_failed",
         "time_budget_exceeded",
         "cost_budget_exceeded",
         "denied",

@@ -432,6 +432,22 @@ pub(super) async fn run_from<P: Provider>(
     // still sandboxed (0.6.0). A permissive guard carries the trace so the
     // sandbox lifecycle is recorded for single-file runs too.
     let permissive = Policy::permissive();
+    // 0.70.0 — has the criterion ever judged this run and said no? The loop
+    // cannot ask afterwards: the gate is evaluated inside the step and its answer
+    // is a `bool` that goes out of scope with the iteration, so a tail that wanted
+    // to know would have to re-run the criterion — on a workspace the agent has
+    // stopped editing, at whatever the gate costs, to learn something the loop
+    // already had. The same shape as `marked_prefix` and `routed_model` in the
+    // workspace loop: a fact about the run that only the loop can hold, because a
+    // rule applied to a freshly built request cannot detect its own transition.
+    //
+    // Seeded from the store rather than from `false`, because `start_step..=max`
+    // is EMPTY on a resume that does not raise the cap — the body never runs, and
+    // a flag starting false would let the tail overwrite a durable
+    // `"verification_failed"` with `"step_cap_reached"`. A fresh run has no
+    // outcome and seeds false, which is the honest answer for a run that never
+    // reaches its gate.
+    let mut criterion_failed = criterion_already_failed(store, run_id);
 
     for step in start_step..=contract.max_steps {
         // A cancellation is acted on here, at the boundary between two steps, and
@@ -578,22 +594,15 @@ pub(super) async fn run_from<P: Provider>(
             finish(store, watch, run_id, 0, step, "success")?;
             return Ok(RunResult::new(RunOutcome::Success { steps: step }, run_id));
         }
+        // `|=` rather than `=`: the question is whether the criterion has *ever*
+        // judged and refused, and a later gate that could not run must not erase
+        // one that already said no.
+        criterion_failed |= gate_judged(&contract.verify);
     }
 
-    finish(
-        store,
-        watch,
-        run_id,
-        0,
-        contract.max_steps,
-        "step_cap_reached",
-    )?;
-    Ok(RunResult::new(
-        RunOutcome::StepCapReached {
-            steps: contract.max_steps,
-        },
-        run_id,
-    ))
+    let (recorded, outcome) = capped_outcome(criterion_failed, contract.max_steps);
+    finish(store, watch, run_id, 0, contract.max_steps, recorded)?;
+    Ok(RunResult::new(outcome, run_id))
 }
 
 /// The workspace loop (0.3 multi-file mode): the agent greps, finds, reads, and
@@ -801,6 +810,24 @@ pub(super) async fn run_workspace_from<P: Provider>(
     // whose summary assembly stubbed, and on a resume — a resumed run has sent this
     // prefix zero times from where it now stands, so it earns the marker again.
     let mut marked_prefix = PrefixGuard::default();
+    // 0.70.0 — has the criterion ever judged this run and said no? Held here for
+    // the same reason `marked_prefix` above is: it is a fact about the run rather
+    // than about a step, and the loop's tail is where it is needed and where the
+    // step it came from is already gone.
+    //
+    // Restored from the store, and the first draft's reasoning for NOT restoring
+    // it — "the run is about to evaluate the gate again on its first step" — is
+    // false for the one case that matters. `start_step..=max_steps` is empty on a
+    // resume that does not raise the cap, so there is no first step to earn the
+    // answer on, and a flag starting false would let the tail overwrite a durable
+    // `"verification_failed"` with `"step_cap_reached"`.
+    let mut criterion_failed = criterion_already_failed(store, run_id);
+    // 0.70.0 — the gate-failure section most recently appended to the ledger, so
+    // a criterion failing the same way every step is reported once rather than
+    // once per step. Run-scoped for the same reason `criterion_failed` is: the
+    // comparison is against what an earlier step appended, and that step is gone
+    // by the time the next one asks.
+    let mut last_gate_feedback: Option<String> = None;
     // 0.49.0 — what each step of THIS run asked for, so the next step can send it
     // back as an assistant turn.
     //
@@ -1670,22 +1697,54 @@ pub(super) async fn run_workspace_from<P: Provider>(
             return Ok(RunResult::new(RunOutcome::Success { steps: step }, run_id)
                 .with_remembered(remembered));
         }
+        // See the single-file loop: `|=`, and `Verification::None` never counts.
+        criterion_failed |= gate_judged(&contract.verify);
+        // 0.70.0 — and the failure's own words go into the next step's request.
+        // An observation rather than a new prompt section, which is what keeps
+        // 0.44.0's `cache_boundary_for` looking at the same string shape it has
+        // always looked at: this arrives where every tool result arrives, bounded
+        // by the same `entry_cap`, foldable by the same compaction.
+        //
+        // Guarded on there being a next step: the last step of a run has no
+        // request to inform, and a context event for a step that never ran would
+        // say a blind attempt was told.
+        // And guarded on the section being NEW. The ledger accumulates for the
+        // whole run, so a gate failing the same way at every step would append a
+        // near-identical block per step and re-send all of them thereafter —
+        // the context leak with a plausible-looking cause this release's own
+        // contract names as a risk. Comparing against the last one appended
+        // costs one `String` and collapses the common case to a single block,
+        // while a failure that CHANGES is still reported. The ledger is never
+        // shortened to achieve this: it is tracked by a watermark index and
+        // anything that shortens it in place corrupts the store.
+        if step < contract.max_steps {
+            if let Some((key, section)) = gate_failure_feedback(store, run_id, step)
+                .filter(|(key, _)| last_gate_feedback.as_deref() != Some(key.as_str()))
+            {
+                store.record_context_event(
+                    run_id,
+                    &ContextEvent::gate_feedback(
+                        step + 1,
+                        format!(
+                            "step {step} gate failure, {} chars",
+                            section.chars().count()
+                        ),
+                    ),
+                )?;
+                ledger.push(Observation::new(
+                    step,
+                    ObsKind::Error,
+                    None,
+                    bound(&section, entry_cap, ObsKind::Error),
+                ));
+                last_gate_feedback = Some(key);
+            }
+        }
     }
 
-    finish(
-        store,
-        watch,
-        run_id,
-        0,
-        contract.max_steps,
-        "step_cap_reached",
-    )?;
-    Ok(RunResult::new(
-        RunOutcome::StepCapReached {
-            steps: contract.max_steps,
-        },
-        run_id,
-    ))
+    let (recorded, outcome) = capped_outcome(criterion_failed, contract.max_steps);
+    finish(store, watch, run_id, 0, contract.max_steps, recorded)?;
+    Ok(RunResult::new(outcome, run_id))
 }
 
 /// The server half of a diagnostics answer, attributed to the server that gave it.

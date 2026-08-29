@@ -1175,7 +1175,7 @@ async fn a_contained_turns_step_cap_is_the_contracts() {
         .unwrap();
 
     assert!(
-        matches!(turn.outcome, RunOutcome::StepCapReached { steps: 2 }),
+        matches!(turn.outcome, RunOutcome::VerificationFailed { steps: 2 }),
         "the contract's cap did not bound the turn: {:?}",
         turn.outcome
     );

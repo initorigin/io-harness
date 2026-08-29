@@ -234,7 +234,7 @@ async fn the_same_read_repeated_over_an_unchanged_workspace_is_caught_within_the
 
     // Four steps was the whole budget, so this run ends at the cap — the warning
     // was delivered, not acted on. Ending it is F9's business, below.
-    assert_eq!(result.outcome, RunOutcome::StepCapReached { steps: 4 });
+    assert_eq!(result.outcome, RunOutcome::VerificationFailed { steps: 4 });
 }
 
 // ------------------------------------------------- F8: healthy runs are left alone
@@ -265,7 +265,7 @@ async fn an_agent_that_changes_the_workspace_is_never_flagged() {
     let store = Store::memory().unwrap();
     let result = go(&contract, &provider, &store).await;
 
-    assert_eq!(result.outcome, RunOutcome::StepCapReached { steps: 8 });
+    assert_eq!(result.outcome, RunOutcome::VerificationFailed { steps: 8 });
     assert_eq!(provider.turns(), 8, "every scripted turn must have run");
     assert!(
         !provider.any_prompt_carries_the_directive(),
@@ -301,7 +301,7 @@ async fn varied_calls_that_write_nothing_are_exploration_and_are_never_flagged()
     let store = Store::memory().unwrap();
     let result = go(&contract, &provider, &store).await;
 
-    assert_eq!(result.outcome, RunOutcome::StepCapReached { steps: 7 });
+    assert_eq!(result.outcome, RunOutcome::VerificationFailed { steps: 7 });
     assert_eq!(provider.turns(), 7, "every scripted turn must have run");
     assert!(
         !provider.any_prompt_carries_the_directive(),
@@ -446,10 +446,18 @@ async fn a_window_of_zero_restores_the_old_step_cap_behaviour_exactly() {
     let dir = ws();
     std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
     const BUDGET: u32 = 20;
-    let contract = never_passes(dir.path(), BUDGET).with_stall_policy(StallPolicy {
-        window: 0,
-        max_replans: 0,
-    });
+    // Deliberately NOT `never_passes`: this test's whole claim is that the old
+    // step-cap ending comes back untouched, and 0.10.0 had no way to report a
+    // failed criterion. A contract carrying one would reach `VerificationFailed`
+    // since 0.70.0, which is a different ending from the one being restored. The
+    // run still spends its whole budget because the script answers with a tool
+    // call on every step, so `finished()` never fires.
+    let contract = TaskContract::workspace("exercise stall detection", dir.path())
+        .with_max_steps(BUDGET)
+        .with_stall_policy(StallPolicy {
+            window: 0,
+            max_replans: 0,
+        });
     let provider = MockScript::repeating(
         BUDGET as usize,
         call("read_file", json!({ "path": "a.rs" })),

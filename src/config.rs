@@ -655,14 +655,16 @@ pub struct Config {
     /// operator writing `append = "audit.jsonl"` means the project they are pointing
     /// the harness at rather than their own home directory.
     dir: PathBuf,
-    /// Every `[[plugin]]` entry with the scope of the file that declared it
-    /// (0.35.0).
+    /// Every `[[plugin]]` entry as it was written, with the scope of the file
+    /// that declared it (0.35.0).
     ///
     /// Recorded per scope as the scopes are read, like `origins` and for the same
     /// reason: the merge concatenates the arrays and nothing afterwards can say
     /// which file wrote which element. The trust rule needs exactly that answer,
-    /// so it is kept rather than derived.
-    plugin_decls: Vec<(Scope, PathBuf)>,
+    /// so it is kept rather than derived. The whole `Declaration` rather than its
+    /// path, because since 0.70.0 the entry also carries whether the bundle is
+    /// switched on.
+    plugin_decls: Vec<(Scope, crate::plugin::Declaration)>,
 }
 
 impl Config {
@@ -704,7 +706,7 @@ impl Config {
             // Captured here, from this scope's own table, for the reason
             // `record_origins` runs here: after the merge the arrays are one array.
             for decl in declared_plugins(&table, &path)? {
-                plugin_decls.push((scope, decl.path));
+                plugin_decls.push((scope, decl));
             }
             // Recorded from the scope's own table, before the merge folds it into
             // everything read so far — afterwards there is nothing left to say
@@ -773,12 +775,15 @@ impl Config {
         refuse_nested_profiles(&file, path)?;
         crate::hooks::Hooks::check(&file.hook, path)?;
         check_providers(&file.provider)?;
+        // The same check `read_scope` makes, because this function repeats that
+        // validator row rather than sharing it (0.70.0).
+        crate::mcp::check_enabled_spelling(&table, path)?;
         // Parsed text is the project scope, so every plugin it declares is
         // declared from the scope a `git clone` delivers.
         let plugin_decls = file
             .plugin
             .iter()
-            .map(|d| (Scope::Project, d.path.clone()))
+            .map(|d| (Scope::Project, d.clone()))
             .collect();
         Ok(Self {
             file,
@@ -1710,6 +1715,10 @@ fn read_scope(scope: Scope, path: &Path) -> Result<toml::value::Table> {
     refuse_nested_profiles(&file, path)?;
     crate::hooks::Hooks::check(&file.hook, path)?;
     check_providers(&file.provider)?;
+    // Against the raw table, not `file`: `[[mcp]]` is the one section exempt from
+    // `deny_unknown_fields`, so by the time it has deserialized the misspelling
+    // is already gone (0.70.0).
+    crate::mcp::check_enabled_spelling(&table, path)?;
     Ok(table)
 }
 

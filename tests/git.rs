@@ -352,12 +352,13 @@ async fn no_git_binary_is_an_observation_and_the_run_carries_on() {
     )
     .await;
 
-    // The run reached its step cap rather than failing: a git that cannot work
-    // here is something the model reads and adapts to.
+    // The run spent its whole budget rather than erroring out: a git that cannot
+    // work here is something the model reads and adapts to. The contract's
+    // criterion is never satisfiable, so the budget ends in the 0.70.0 variant.
     assert!(
         matches!(
             result.outcome,
-            io_harness::RunOutcome::StepCapReached { .. }
+            io_harness::RunOutcome::VerificationFailed { .. }
         ),
         "{:?}",
         result.outcome
@@ -381,7 +382,7 @@ async fn a_commit_with_nothing_staged_is_reported_not_fatal() {
     assert!(
         matches!(
             result.outcome,
-            io_harness::RunOutcome::StepCapReached { .. }
+            io_harness::RunOutcome::VerificationFailed { .. }
         ),
         "{:?}",
         result.outcome

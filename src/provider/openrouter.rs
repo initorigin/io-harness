@@ -94,6 +94,23 @@ impl OpenRouter {
     }
 }
 
+impl std::fmt::Debug for OpenRouter {
+    /// Hand-written for exactly one reason: a derived `Debug` would print
+    /// `api_key`. This type is held inside things that *do* derive `Debug` —
+    /// [`Record`](crate::provider::Record),
+    /// [`Fallback`](crate::provider::Fallback), a caller's own config struct —
+    /// so a single `{:?}` anywhere above it would put the operator's credential
+    /// in a log. The endpoint and the model are what someone debugging a
+    /// misconfiguration actually needs; nothing at all is said about the key,
+    /// not even its length, because a length narrows which key it is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenRouter")
+            .field("endpoint", &super::redacted_endpoint(&self.endpoint))
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Provider for OpenRouter {
     fn name(&self) -> &str {
         "openrouter"

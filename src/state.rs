@@ -3060,6 +3060,20 @@ impl ContextEvent {
         Self::of("served", step, provider)
     }
 
+    /// What the failing criterion printed was carried into this step's request
+    /// (0.70.0). The step is the one that was *told*, not the one that failed —
+    /// the failure is already in `sandbox_events` under the step it happened on,
+    /// and what this answers is the other question: which attempt was informed
+    /// and which was blind.
+    ///
+    /// The detail names the failed step and the size of what was carried, not the
+    /// output itself, which is already stored once as a `gate_output` sandbox row
+    /// and would otherwise be stored twice — the same rule
+    /// [`Self::todo_write`] and [`Self::plan_proposed`] follow.
+    pub fn gate_feedback(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("gate_feedback", step, detail)
+    }
+
     /// The agent made no progress and was told once to change approach. The run
     /// continues.
     ///

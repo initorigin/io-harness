@@ -338,6 +338,87 @@ async fn a_worktree_that_cannot_be_made_fails_the_spawn_instead_of_sharing_the_t
     );
 }
 
+// -------------------------------------------------------- 0.70.0 F7
+
+/// 0.70.0 F7 — the run row of a `worktree = true` child names the directory that
+/// child's files are actually in.
+///
+/// Checked **against the filesystem**, never against a recomputed path. The slug
+/// is derived from the agent name, the parent run, the step and a digest of the
+/// goal; deriving it again here would assert that this test can do the same
+/// arithmetic as `worktree_for`, which is a different claim and a much weaker
+/// one. So the `.worktrees/` entries are enumerated from disk, and what the store
+/// recorded has to be that set — and each recorded path has to hold that child's
+/// own write, read through the recorded path rather than through the enumerated
+/// one.
+///
+/// Without this reader an operator asking where a child's work went had the
+/// value in the row and no way to get it out, and the only alternative was to
+/// re-derive a path from three things they would have had to dig out of the
+/// trace first.
+#[tokio::test]
+async fn a_worktree_childs_run_row_names_the_directory_its_files_are_in() {
+    if !have_git() {
+        return;
+    }
+    let dir = repo();
+    let (store, root) = fan_out(&dir, true).await;
+
+    // What git actually made, off the filesystem.
+    let trees = worktrees(dir.path());
+    assert_eq!(trees.len(), 2, "one worktree per child: {trees:?}");
+
+    let children: Vec<i64> = store
+        .runs()
+        .expect("the runs")
+        .into_iter()
+        .filter(|r| store.parent(*r).expect("a parent") == Some(root))
+        .collect();
+    assert_eq!(children.len(), 2, "two children: {children:?}");
+
+    let mut recorded: Vec<std::path::PathBuf> = children
+        .iter()
+        .map(|c| {
+            std::path::PathBuf::from(
+                store
+                    .run_file(*c)
+                    .expect("the read")
+                    .expect("the child's run row"),
+            )
+        })
+        .collect();
+    recorded.sort();
+
+    assert_eq!(
+        recorded, trees,
+        "the run rows name the worktrees on disk, not the parent's tree"
+    );
+
+    // And the recorded path is where that child's write landed. Read through
+    // the value the store gave, so a row naming the wrong existing directory
+    // fails here rather than passing on the set comparison alone.
+    let mut contents: Vec<String> = recorded
+        .iter()
+        .map(|p| std::fs::read_to_string(p.join(SHARED)).expect("the child's own file"))
+        .collect();
+    contents.sort();
+    assert_eq!(contents, vec!["alpha".to_string(), "beta".to_string()]);
+
+    // The root records the tree's own root, which is the distinction the whole
+    // reader exists to make: a child's directory is not its parent's.
+    assert_eq!(
+        store
+            .run_file(root)
+            .expect("the read")
+            .expect("the root's run row"),
+        dir.path().display().to_string()
+    );
+    assert!(
+        !recorded.contains(&dir.path().to_path_buf()),
+        "no child recorded the directory it was spawned from: {recorded:?}"
+    );
+}
+
 // ------------------------------------------------------------------- F4
 
 /// A provider that plays one script per goal and can be told to park forever on

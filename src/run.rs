@@ -26,8 +26,8 @@ use crate::approve::{Plan, PlanGate, PlanStep, PlanVerdict};
 use crate::approve::{Question, Responder, ResponderNone};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::context::{
-    assemble, bound, entry_cap_chars, Assembled, Assembly, Ledger as ContextLedger, ObsKind,
-    Observation, Piece,
+    assemble, bound, entry_cap_chars, last_lines, Assembled, Assembly, Ledger as ContextLedger,
+    ObsKind, Observation, Piece, GATE_FEEDBACK_CHARS, GATE_FEEDBACK_LINES,
 };
 use crate::contract::{Preset, SystemPrompt, TaskContract};
 use crate::error::{Error, Result};
@@ -215,6 +215,11 @@ const OBS_LIST_DIR_CAP: usize = 200;
 ///     RunOutcome::StepCapReached { .. } | RunOutcome::TimeBudgetExceeded { .. } => "raise the bound and resume",
 ///     RunOutcome::CostBudgetExceeded { .. } | RunOutcome::BudgetCeilingReached { .. } => "split the task",
 ///
+///     // (0.70.0) Also the step cap, but the criterion had judged the work and
+///     // refused it every time. Raising the bound buys more of the same answer:
+///     // read `gate_output` in `sandbox_events` first.
+///     RunOutcome::VerificationFailed { .. } => "read why the gate failed before resuming",
+///
 ///     // The agent is going in circles and was already told once. Resuming
 ///     // spends the rest of the budget proving it again — change the goal.
 ///     RunOutcome::Stalled { .. } => "rewrite the contract",
@@ -261,8 +266,40 @@ const OBS_LIST_DIR_CAP: usize = 200;
 pub enum RunOutcome {
     /// Verification passed. `steps` is the step it passed on.
     Success { steps: u32 },
-    /// The step budget was reached before verification passed.
+    /// The step budget was reached and no criterion ever judged the work — the
+    /// contract carries none, or no step of this run got as far as evaluating
+    /// one. There is no verdict either way.
+    ///
+    /// Narrowed in 0.70.0: a run that *was* judged and failed now reports
+    /// [`VerificationFailed`](RunOutcome::VerificationFailed) instead. Before
+    /// that release this variant carried both, and a caller reading it could not
+    /// tell "unfinished" from "wrong".
     StepCapReached { steps: u32 },
+    /// (0.70.0) The step budget was reached *and* the criterion had been
+    /// evaluated and did not hold. The run got as far as being judged, every
+    /// time, and every time the answer was no.
+    ///
+    /// The distinction is from [`StepCapReached`](RunOutcome::StepCapReached),
+    /// which before this release absorbed both cases. That one means the budget
+    /// ran out with the work possibly fine and simply unfinished, so raising
+    /// `max_steps` is the reasonable next move. This one means the work was
+    /// checked and rejected, so raising `max_steps` buys more of the same
+    /// rejection: what the run needs is a look at *why* the criterion failed —
+    /// which is in `sandbox_events` under `gate_output` — before it is given
+    /// another budget. A fleet operator re-driving on the step count alone
+    /// cannot tell those two apart, and pays for the second as if it were the
+    /// first.
+    ///
+    /// Not a claim the criterion can never pass, which is why this is not a
+    /// terminal outcome: a `Verification::Command` gate that failed because the
+    /// test runner is not installed is a machine to fix, and the run resumes
+    /// unchanged once it is. See the note in `terminal_outcome`.
+    ///
+    /// [`Verification::None`](crate::Verification::None) can never reach this.
+    /// That criterion answers `false` for every entry point — it is the absence
+    /// of a gate, not a gate that says no — and a run under it that spends its
+    /// whole budget still reports `StepCapReached`.
+    VerificationFailed { steps: u32 },
     /// (0.65.0) The run died in the middle of a call the harness cannot inspect —
     /// a charge, a deployment, a posted message, an MCP call, any registered
     /// [`Tool`](crate::tools::Tool) whose
@@ -2769,22 +2806,37 @@ pub async fn resume_with_decision_observed<P: Provider>(
             finish(store, watch, run_id, 0, step, "denied")?;
             Ok(RunResult::new(RunOutcome::Denied { steps: step }, run_id))
         }
-        // A deferred *network* action has no filesystem effect to replay: the
-        // run paused before its first step, so approving it grants the host and
-        // starts the loop. Routing it through the write path below would check
-        // a host against the path policy and then try to create a file named
-        // after it.
-        Decision::Approve { ref remember, .. } if pending.act == "net" => {
+        // A deferred *network* or *exec* action has no filesystem effect to
+        // replay, and approving it grants the thing that was approved for the
+        // rest of the run. Routing either through the write path below would
+        // check a host or a program name against the path policy and then try to
+        // create a file named after it.
+        //
+        // `exec` joins `net` here in 0.70.0, when `Effect::Ask` on `Act::Exec`
+        // started reaching an approver instead of refusing. Without this arm,
+        // approving a paused git built-in would write an empty file called `git`
+        // into the workspace root and resume without ever running the command.
+        // The grant matters for the same reason it does for a host: without it
+        // the model re-issues the call and the approver is asked a second time
+        // for what they have just allowed.
+        Decision::Approve { ref remember, .. } if pending.act == "net" || pending.act == "exec" => {
+            let granted = if pending.act == "net" {
+                net::provider_layer(&pending.target)
+            } else {
+                Policy::permissive()
+                    .layer("approved-exec")
+                    .allow_exec(&pending.target)
+            };
             let effective = policy
                 .clone()
-                .merge(net::provider_layer(&pending.target))
+                .merge(granted)
                 .merge(remembered_layer(remember));
             store.resolve_pending(request_id, "approve")?;
             store.record_event(
                 run_id,
                 &PolicyEvent::decision(
                     step,
-                    "net",
+                    &pending.act,
                     &pending.target,
                     "approve",
                     format!("resumed:{request_id}"),
@@ -3116,17 +3168,28 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
         }
         // As in `resume_with_decision`: an approved network action grants the
         // host and starts the tree, with no filesystem effect to replay.
-        Decision::Approve { ref remember, .. } if pending.act == "net" => {
+        // The tree twin of the arm in `resume_with_decision` — see the comment
+        // there. `exec` joined `net` in 0.70.0 and for the same reason: a spawn
+        // or a git built-in paused for approval must not come back as an empty
+        // file named after the program.
+        Decision::Approve { ref remember, .. } if pending.act == "net" || pending.act == "exec" => {
+            let granted = if pending.act == "net" {
+                net::provider_layer(&pending.target)
+            } else {
+                Policy::permissive()
+                    .layer("approved-exec")
+                    .allow_exec(&pending.target)
+            };
             let effective = policy
                 .clone()
-                .merge(net::provider_layer(&pending.target))
+                .merge(granted)
                 .merge(remembered_layer(remember));
             store.resolve_pending(request_id, "approve")?;
             store.record_event(
                 pending.run_id,
                 &PolicyEvent::decision(
                     step,
-                    "net",
+                    &pending.act,
                     &pending.target,
                     "approve",
                     format!("resumed:{request_id}"),

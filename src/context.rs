@@ -478,6 +478,57 @@ pub fn bound(text: &str, cap: usize, kind: ObsKind) -> String {
     }
 }
 
+/// How many lines of a failing gate's output the next request carries.
+///
+/// Forty because a test runner puts the whole of what is wrong at the end and in
+/// very few lines: the failing assertion, its expected and actual, and the frames
+/// or the file/line above them. `cargo test`'s failure block is a dozen lines,
+/// pytest's is about the same, and a `Makefile` gate's is one. What lies further
+/// back is the runner's progress log — every test that passed — which the model
+/// pays for on every step until the gate goes green and which tells it nothing.
+pub const GATE_FEEDBACK_LINES: usize = 40;
+
+/// The ceiling on that same section, in **chars**.
+///
+/// A line count alone bounds nothing: one minified stack trace, one serialized
+/// JSON body, or one `-vvv` line can be a megabyte on its own, and forty of those
+/// is a request the provider refuses. So both bounds apply and the tighter one
+/// wins.
+///
+/// **Chars, not bytes, and that is a deliberate substitution.** The bound was
+/// asked for in bytes; every other cap in this crate — [`entry_cap_chars`],
+/// [`bound`], `head_and_tail` — is counted in chars, and this section is itself
+/// bounded a second time by [`entry_cap_chars`] on its way into the ledger. A cap
+/// measured in a unit no other cap here uses would be one number an operator
+/// cannot compare against the ones beside it, for a safety difference of at most
+/// the 4x between a char and its UTF-8 encoding. Chars also split where `bound`
+/// already splits — never through a char boundary.
+///
+/// 2,000 rather than the 4,000 of `GATE_OUTPUT_TRACE_CHARS`, which is what the
+/// `sandbox_events` row keeps: the trace row is written once and read by a human
+/// afterwards, this section is re-sent on every step until the criterion passes.
+/// It is also exactly the floor of [`entry_cap_chars`], so this section can never
+/// on its own exceed what one observation is guaranteed.
+pub const GATE_FEEDBACK_CHARS: usize = 2_000;
+
+/// The last `lines` lines of `text`, and never more than `cap` chars of them.
+///
+/// The tail is the useful end of a build or test log — a runner reports what
+/// failed after it reports what ran — so this keeps the end and drops the
+/// beginning, the same choice [`bound`] makes for an [`ObsKind::Read`] and for
+/// the same reason. Both bounds are needed rather than either alone: see
+/// [`GATE_FEEDBACK_CHARS`] for the single enormous line that defeats a line count.
+///
+/// Elision by the char cap is marked, by [`bound`]. Elision by the line count is
+/// not marked here — the caller frames the section as a tail, so the model is not
+/// being told this is the whole log.
+pub fn last_lines(text: &str, lines: usize, cap: usize) -> String {
+    let text = text.trim_end();
+    let kept: Vec<&str> = text.lines().rev().take(lines).collect();
+    let tail: Vec<&str> = kept.into_iter().rev().collect();
+    bound(&tail.join("\n"), cap, ObsKind::Read)
+}
+
 /// `41220` -> `41,220`. Sizes in a stub are for a human and a model to judge
 /// "is that worth re-reading", and unseparated digits read as noise.
 fn commas(n: usize) -> String {
