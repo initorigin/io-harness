@@ -73,26 +73,26 @@ fn slide_text(xml: &[u8]) -> std::result::Result<String, quick_xml::Error> {
     let mut in_text = false;
     loop {
         match reader.read_event()? {
-            Event::Start(e) if e.local_name().as_ref() == b"t" => in_text = true,
+            Event::Start(e) if e.local_name().as_ref() == "t" => in_text = true,
             Event::End(e) => match e.local_name().as_ref() {
-                b"t" => in_text = false,
-                b"p" => out.push('\n'),
+                "t" => in_text = false,
+                "p" => out.push('\n'),
                 _ => {}
             },
-            Event::Empty(e) if e.local_name().as_ref() == b"br" => out.push('\n'),
+            Event::Empty(e) if e.local_name().as_ref() == "br" => out.push('\n'),
             // quick-xml 0.41 split what `BytesText::unescape` used to do. A text
             // event no longer carries entities at all — the reader emits each one
-            // as its own `GeneralRef` — so the text arm only decodes and
-            // normalises end-of-lines, which is what `xml10_content` is for. A
-            // slide is XML 1.0.
-            Event::Text(t) if in_text => out.push_str(&t.xml10_content()?),
+            // as its own `GeneralRef` — so the text arm only normalises
+            // end-of-lines, which is what `xml10_content` is for. A slide is
+            // XML 1.0.
+            Event::Text(t) if in_text => out.push_str(&t.xml10_content()),
             // `&amp;` arrives here as the bare name `amp`. Rebuilding the
             // reference and handing it to `unescape` resolves the five predefined
             // entities and a numeric character reference alike, and an entity
             // this crate cannot resolve stays an error rather than silently
             // deleting a character from someone's slide.
             Event::GeneralRef(r) if in_text => {
-                let name = r.decode()?;
+                let name = r.into_inner();
                 out.push_str(&quick_xml::escape::unescape(&format!("&{name};"))?);
             }
             Event::Eof => break,
