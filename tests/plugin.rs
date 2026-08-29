@@ -667,7 +667,7 @@ fn a_bad_or_duplicate_id_drops_only_its_own_bundle() {
             &format!("name = \"{id}\"\n"),
         );
     }
-    // A second directory claiming an id that is already loaded.
+    // A second directory claiming an id that is already declared.
     write(&root.join("bundles/twin/plugin.toml"), "name = \"good\"\n");
 
     write(
@@ -685,7 +685,7 @@ fn a_bad_or_duplicate_id_drops_only_its_own_bundle() {
     assert!(plugins
         .dropped()
         .iter()
-        .any(|d| d.error.contains("already loaded")));
+        .any(|d| d.error.contains("already declared")));
 }
 
 // ------------------------------------------------------------------ F7
@@ -778,6 +778,287 @@ fn a_manifest_may_not_run_a_command_in_any_scope() {
             plugins.dropped()[0].error
         );
     }
+}
+
+// --------------------------------------------------- 0.70.0, `enabled`
+
+/// The `bundle()` above grown to all six contribution kinds — its four plus a
+/// hook and an MCP server, which only a locally declared bundle may contribute.
+/// Six is the number that matters here: a disabled bundle has to contribute
+/// none of them, and a bundle declaring four would leave two untested.
+fn six_kind_bundle(root: &Path, id: &str) -> PathBuf {
+    let dir = bundle(root, id);
+    let manifest = std::fs::read_to_string(dir.join("plugin.toml")).unwrap();
+    write(
+        &dir.join("plugin.toml"),
+        &format!(
+            "{manifest}\n\
+             [[hook]]\non = [\"finished\"]\nappend = \"audit.jsonl\"\n\
+             \n\
+             [[mcp]]\nid = \"fixture\"\ntransport = \"stdio\"\ncommand = {:?}\n",
+            fixture_server().display().to_string()
+        ),
+    );
+    dir
+}
+
+/// **F2** (0.70.0). A bundle declaring all six contribution kinds and switched
+/// off contributes none of them, and is still listed as declared-and-off. The
+/// positive control is the identical tree with the flag absent, which
+/// contributes all six — without it a loader that had stopped loading anything
+/// at all would pass every absence assertion below.
+#[tokio::test]
+async fn a_disabled_bundle_contributes_none_of_the_six_and_stays_visible() {
+    for enabled in [true, false] {
+        let dir = tmp();
+        let root = dir.path();
+        six_kind_bundle(root, "rust-review");
+        write(
+            &root.join("io.local.toml"),
+            &format!(
+                "[[plugin]]\npath = \"bundles/rust-review\"\n{}",
+                if enabled { "" } else { "enabled = false\n" }
+            ),
+        );
+
+        let config = Config::discover(root).unwrap();
+        let plugins = config.plugins();
+        assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
+        assert_eq!(plugins.len(), usize::from(enabled), "loaded, {enabled}");
+        assert_eq!(
+            plugins.disabled().len(),
+            usize::from(!enabled),
+            "disabled, {enabled}"
+        );
+        if !enabled {
+            // Readable as declared-and-off: the id it would namespace by, and
+            // the six kinds turning it back on would bring.
+            assert_eq!(plugins.disabled()[0].id(), "rust-review");
+            assert_eq!(
+                plugins.disabled()[0].contributions(),
+                vec!["skills", "templates", "agents", "mcp", "hooks", "policy"],
+                "a switched-off bundle still says what it holds"
+            );
+        }
+
+        let contract = plugins.apply_to(contract(root));
+        let policy = plugins.apply_to_policy(Policy::permissive());
+        let templates = plugins.templates().unwrap();
+        let hooks = plugins.apply_to_hooks(config.hooks(), root);
+
+        assert_eq!(
+            contract.agents.get("rust-review__reviewer").is_some(),
+            enabled,
+            "agent roster, enabled = {enabled}"
+        );
+        assert_eq!(
+            contract.mcp.iter().any(|s| s.id == "rust-review__fixture"),
+            enabled,
+            "mcp servers, enabled = {enabled}"
+        );
+        assert_eq!(
+            policy.layers.iter().any(|l| l.name == "rust-review__guard"),
+            enabled,
+            "policy stack, enabled = {enabled}"
+        );
+        assert_eq!(
+            templates.get("rust-review__bugfix").is_some(),
+            enabled,
+            "templates, enabled = {enabled}"
+        );
+        assert_eq!(!hooks.is_empty(), enabled, "hooks, enabled = {enabled}");
+
+        // And the skill catalogue, discovered at run start rather than here.
+        let provider = Script::of(vec![vec![]]);
+        run_with(&contract, &provider, &store(root), &policy, &ApproveAll)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.request(0).system.contains("rust-review__review"),
+            enabled,
+            "skill catalogue, enabled = {enabled}"
+        );
+    }
+}
+
+/// **F3** (0.70.0), the plugin half. An entry with no `enabled` key contributes
+/// exactly what the same entry written `enabled = true` contributes, in the same
+/// order — compared against the switched-on tree itself rather than against a
+/// list written out here, which would only assert that today agrees with a copy
+/// of today.
+#[test]
+fn an_absent_enabled_key_is_indistinguishable_from_switched_on() {
+    let summarise = |suffix: &str| {
+        let dir = tmp();
+        let root = dir.path();
+        bundle(root, "alpha");
+        bundle(root, "beta");
+        write(
+            &root.join("io.local.toml"),
+            &format!(
+                "[[plugin]]\npath = \"bundles/alpha\"\n{suffix}\
+                 [[plugin]]\npath = \"bundles/beta\"\n{suffix}"
+            ),
+        );
+
+        let plugins = Config::discover(root).unwrap().plugins();
+        let contract = plugins.apply_to(contract(root));
+        let policy = plugins.apply_to_policy(Policy::permissive());
+        let templates = plugins.templates().unwrap();
+        (
+            plugins.names().join(","),
+            plugins.disabled().len(),
+            plugins.dropped().len(),
+            contract.agents.names().join(","),
+            contract.mcp.len(),
+            policy
+                .layers
+                .iter()
+                .map(|l| l.name.clone())
+                .collect::<Vec<_>>()
+                .join(","),
+            templates.names().join(","),
+        )
+    };
+
+    let absent = summarise("");
+    assert_eq!(
+        absent,
+        summarise("enabled = true\n"),
+        "the key's absence is its default"
+    );
+    // The comparison is only worth anything if both sides loaded something.
+    assert_eq!(absent.0, "alpha,beta", "both bundles loaded, in order");
+}
+
+/// A bundle that is switched off *and* broken is dropped, not listed as
+/// disabled: `enabled = false` says what a bundle contributes, never whether it
+/// parses, and an operator who fixes the flag would otherwise meet the real
+/// failure for the first time on the day they switch it on.
+#[test]
+fn a_disabled_bundle_that_cannot_be_read_is_still_dropped() {
+    let dir = tmp();
+    let root = dir.path();
+    write(
+        &root.join("bundles/broken/plugin.toml"),
+        "name = \"broken\"\nskils = \"skills\"\n",
+    );
+    write(
+        &root.join("io.local.toml"),
+        "[[plugin]]\npath = \"bundles/broken\"\nenabled = false\n",
+    );
+
+    let plugins = Config::discover(root).unwrap().plugins();
+    assert!(plugins.disabled().is_empty(), "not switched off, broken");
+    assert_eq!(plugins.dropped().len(), 1);
+    assert!(
+        plugins.dropped()[0].error.contains("unknown field"),
+        "the reason is the one an operator has to fix: {}",
+        plugins.dropped()[0].error
+    );
+}
+
+/// The trust rule is extended by `enabled`, never weakened. A project-scoped
+/// bundle carrying a `[[hook]]` is refused whether or not it is switched on,
+/// because switching it on is a one-character edit to a file a `git clone`
+/// delivered — a manifest that arrived switched off would otherwise be a hook
+/// waiting for someone to flip a boolean.
+#[test]
+fn a_disabled_project_scoped_bundle_is_still_refused_its_hook() {
+    for enabled in [true, false] {
+        let dir = tmp();
+        let root = dir.path();
+        let plugin = bundle(root, "rust-review");
+        let manifest = std::fs::read_to_string(plugin.join("plugin.toml")).unwrap();
+        write(
+            &plugin.join("plugin.toml"),
+            &format!("{manifest}\n[[hook]]\non = [\"finished\"]\nappend = \"audit.jsonl\"\n"),
+        );
+        write(
+            &root.join("io.toml"),
+            &format!(
+                "[[plugin]]\npath = \"bundles/rust-review\"\n{}",
+                if enabled { "" } else { "enabled = false\n" }
+            ),
+        );
+
+        let plugins = Config::discover(root).unwrap().plugins();
+        assert_eq!(plugins.len(), 0, "nothing loaded, enabled = {enabled}");
+        assert!(
+            plugins.disabled().is_empty(),
+            "refused, not switched off, enabled = {enabled}"
+        );
+        assert_eq!(plugins.dropped().len(), 1, "enabled = {enabled}");
+        assert!(
+            plugins.dropped()[0].error.contains("hook"),
+            "the refusal names the key at fault: {}",
+            plugins.dropped()[0].error
+        );
+    }
+}
+
+/// A switched-off bundle claims no id, so the enabled twin beside it loads.
+///
+/// This is the swap the flag exists to make easy — switch `v1` off, declare `v2`
+/// beside it — and it is asserted in both orders, because an id reserved by the
+/// entry rather than by what it contributes would break exactly one of them and
+/// report the failure against the entry the operator did not edit.
+#[test]
+fn a_disabled_twin_claims_no_id_and_the_enabled_one_loads() {
+    for first_enabled in [true, false] {
+        let dir = tmp();
+        let root = dir.path();
+        bundle(root, "good");
+        write(&root.join("bundles/twin/plugin.toml"), "name = \"good\"\n");
+        let off = "enabled = false\n";
+        write(
+            &root.join("io.local.toml"),
+            &format!(
+                "[[plugin]]\npath = \"bundles/good\"\n{}\
+                 [[plugin]]\npath = \"bundles/twin\"\n{}",
+                if first_enabled { "" } else { off },
+                if first_enabled { off } else { "" }
+            ),
+        );
+
+        let plugins = Config::discover(root).unwrap().plugins();
+        assert!(
+            plugins.dropped().is_empty(),
+            "neither entry collides, first_enabled = {first_enabled}: {:?}",
+            plugins.dropped()
+        );
+        assert_eq!(
+            plugins.len(),
+            1,
+            "the switched-on one loads, first_enabled = {first_enabled}"
+        );
+        assert_eq!(plugins.disabled().len(), 1);
+        assert_eq!(plugins.disabled()[0].id(), "good");
+    }
+}
+
+/// But two bundles that are both switched ON still collide, because that is a
+/// real clash over the namespace every contributed name carries.
+#[test]
+fn two_enabled_bundles_sharing_an_id_still_collide() {
+    let dir = tmp();
+    let root = dir.path();
+    bundle(root, "good");
+    write(&root.join("bundles/twin/plugin.toml"), "name = \"good\"\n");
+    write(
+        &root.join("io.local.toml"),
+        "[[plugin]]\npath = \"bundles/good\"\n[[plugin]]\npath = \"bundles/twin\"\n",
+    );
+
+    let plugins = Config::discover(root).unwrap().plugins();
+    assert_eq!(plugins.dropped().len(), 1, "the second is dropped");
+    assert!(
+        plugins.dropped()[0].error.contains("already declared"),
+        "for the duplicate id and not something else: {}",
+        plugins.dropped()[0].error
+    );
+    assert_eq!(plugins.len(), 1);
+    assert!(plugins.disabled().is_empty());
 }
 
 // ------------------------------------------------------------------ N3

@@ -62,8 +62,43 @@ let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?
   with latency and outcome, and every network verdict with the layer that decided
   it. The MCP conversation is a new table rather than a changed one, so an
   existing store gains it in place and an older binary still reads it.
+- **Switched off is not absent** — `enabled = false` on a server, or
+  `McpServer { enabled: false, .. }`, means it is never started and contributes no
+  tools, while every listing still shows it as configured-and-off. A server that
+  vanished from the listing could not be told apart from one that was never
+  declared, and nothing could switch it back on. The field defaults to `true`, so
+  every file written before 0.70.0 means exactly what it always meant.
 
 Run it live: `cargo run --example mcp_run`.
+
+## Asking whether a server actually answers
+
+A policy preflight tells you whether a server is *permitted* to start. It cannot
+tell you whether it works: a wrong command and an unreachable host both pass it.
+`probe_mcp` starts one configured server, reports what happened, and shuts it down
+again.
+
+```rust
+use io_harness::{probe_mcp, McpProbe, McpServer, Policy};
+
+let server = McpServer::stdio("files", "my-mcp-file-server");
+match probe_mcp(&server, &policy).await {
+    McpProbe::Answered { tools } => println!("{} tools", tools.len()),
+    McpProbe::Refused { rule, layer, .. } => println!("policy said no: {rule:?} in {layer:?}"),
+    McpProbe::NotStarted { reason } => println!("the command is wrong: {reason}"),
+    McpProbe::Unreachable { reason } => println!("the host is not there: {reason}"),
+    McpProbe::TimedOut { secs } => println!("no answer within {secs}s"),
+    McpProbe::Disabled => println!("switched off; nothing was started"),
+    _ => {}
+}
+```
+
+Those are four different problems with four different fixes, which is the whole
+reason the probe reports them apart rather than as one failure. It is bounded by
+the server's own `timeout_secs` — **including the handshake**, which the run loop's
+own connect does not bound — so a server that accepts a connection and then says
+nothing is reported as timed out rather than hanging the caller. A disabled server
+answers `Disabled` without being started.
 
 ## What a refusal looks like
 
@@ -71,8 +106,14 @@ An out-of-policy **tool call** is an observation the model can adapt to, not a
 crashed run — the same treatment a refused path already gets:
 
 ```text
-[mcp__files__delete_everything refused] (rule mcp__files__delete_*) — the policy forbids calling this tool
+[exec refused] mcp__files__delete_everything (rule mcp__files__delete_*) — the policy forbids this; carry on without it
 ```
+
+Since 0.70.0 the call goes through the same approval gate a write does, so a
+policy whose `exec` effect is `Ask` — which `Policy::default()`'s is — asks the
+approver instead of refusing. An approver that denies produces the observation
+above; one that defers pauses the run with a pending row, and the run resumes
+through `resume_with_decision` exactly as a deferred write does.
 
 A denied **host**, or a configured server that will not start, stops the run
 before anything happens, with `Error::Refused { act: "net", .. }` or

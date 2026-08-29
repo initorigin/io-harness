@@ -664,6 +664,14 @@ that is the whole point of it — the crate stores it and never looks inside. Ev
 other section rejects what it does not know. Two exceptions listed together are a
 rule with edges; one listed and one hidden is a rule nobody can trust.
 
+**One key inside `[[mcp]]` is checked anyway, and 0.70.0 says why.** The exemption
+stays — it is what keeps a newer server key forward-compatible with an older
+binary — but `enabled` is the one key whose misspelling silently *inverts* what the
+operator asked for. `enabld = false` under the exemption is swallowed, and the
+server they meant to switch off runs. So a near-miss spelling of that one key is
+refused by name, while an unrelated unknown key in the same table is still
+accepted. The narrow check exists precisely so the broad exemption can survive.
+
 **`${cmd:...}` has no timeout.** A credential helper that hangs hangs your own
 `Config::discover`, before any run exists, with your own privileges. That is
 visible rather than silent, and it is the reason there is no timeout knob rather

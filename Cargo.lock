@@ -334,7 +334,7 @@ dependencies = [
  "encoding_rs",
  "fast-float2",
  "log",
- "quick-xml",
+ "quick-xml 0.41.0",
  "serde",
  "zip",
 ]
@@ -730,7 +730,7 @@ dependencies = [
  "base64 0.22.1",
  "crc32fast",
  "image",
- "quick-xml",
+ "quick-xml 0.41.0",
  "serde",
  "serde_json",
  "smallvec",
@@ -1448,6 +1448,8 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -1483,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "io-harness"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "base64 0.23.1",
  "calamine",
@@ -1495,7 +1497,7 @@ dependencies = [
  "libc",
  "lopdf 0.44.0",
  "pdf-extract",
- "quick-xml",
+ "quick-xml 0.42.0",
  "regex",
  "reqwest",
  "rmcp",
@@ -2306,6 +2308,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2654,9 +2665,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.1.2"
+version = "3.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8dddc5b1924b9a59fba420166160ca2c4663a4e01803e52eda33070f56d63c8"
+checksum = "1a15bc53261a9dc37e105df006e4656c598379a8f9581f8950debb130f27a7cf"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2666,6 +2677,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "indexmap",
  "pastey",
  "pin-project-lite",
  "process-wrap",
@@ -2711,9 +2723,9 @@ dependencies = [
 
 [[package]]
 name = "rust_xlsxwriter"
-version = "0.98.1"
+version = "0.98.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e291f3208e0ed430e5c49d240adbf2935a94bbbf5fed945bbf096cf024585355"
+checksum = "093d730a6f64f9620e047b2de2876e61a691fbcaca3aaf436edade9b897c7a27"
 dependencies = [
  "zip",
 ]
@@ -3606,9 +3618,9 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "umya-spreadsheet"
-version = "3.0.1"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2ecbb0bd4092e75183ae19674fc209a5ba016b0bd796378623d1980b6bec044"
+checksum = "560ef3816b56fce89975a58a7f271c57f7b3873aac8fba70572f93f3683be405"
 dependencies = [
  "aes 0.9.1",
  "base64 0.22.1",
@@ -3625,7 +3637,7 @@ dependencies = [
  "md-5 0.11.0",
  "num-traits",
  "phf 0.14.0",
- "quick-xml",
+ "quick-xml 0.41.0",
  "rand 0.10.2",
  "rgb",
  "sha2 0.11.0",

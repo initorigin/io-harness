@@ -443,7 +443,7 @@ async fn f5_a_failing_hook_stops_the_run_only_when_the_operator_asked_it_to() {
     )
     .await;
     assert!(
-        matches!(outcome, io_harness::RunOutcome::StepCapReached { .. }),
+        matches!(outcome, io_harness::RunOutcome::VerificationFailed { .. }),
         "the default is continue: {outcome:?}"
     );
 }

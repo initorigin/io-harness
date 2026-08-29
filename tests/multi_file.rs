@@ -145,7 +145,7 @@ async fn run_fails_when_one_of_the_edited_files_is_wrong() {
     let store = Store::memory().unwrap();
 
     let result = run(&contract, &script, &store).await.unwrap();
-    assert_eq!(result.outcome, RunOutcome::StepCapReached { steps: 4 });
+    assert_eq!(result.outcome, RunOutcome::VerificationFailed { steps: 4 });
 }
 
 #[tokio::test]
@@ -164,7 +164,7 @@ async fn write_outside_the_workspace_is_refused_not_crashing_the_run() {
     let store = Store::memory().unwrap();
 
     let result = run(&contract, &script, &store).await.unwrap();
-    assert_eq!(result.outcome, RunOutcome::StepCapReached { steps: 1 });
+    assert_eq!(result.outcome, RunOutcome::VerificationFailed { steps: 1 });
     // Nothing was written outside the root.
     assert!(!dir.path().parent().unwrap().join("escaped.rs").exists());
 }

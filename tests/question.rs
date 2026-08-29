@@ -203,7 +203,7 @@ async fn a_malformed_question_is_an_observation_rather_than_the_end_of_the_run()
     .unwrap();
 
     assert!(
-        matches!(result.outcome, RunOutcome::StepCapReached { .. }),
+        matches!(result.outcome, RunOutcome::VerificationFailed { .. }),
         "a malformed question must not end the run; got {:?}",
         result.outcome
     );
@@ -586,7 +586,9 @@ async fn a_childs_question_pauses_the_whole_tree_and_the_tree_resumes_on_the_ans
     assert!(
         matches!(
             resumed.outcome,
-            RunOutcome::Success { .. } | RunOutcome::StepCapReached { .. }
+            RunOutcome::Success { .. }
+                | RunOutcome::StepCapReached { .. }
+                | RunOutcome::VerificationFailed { .. }
         ),
         "the tree should have carried on, got {:?}",
         resumed.outcome

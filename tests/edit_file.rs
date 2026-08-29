@@ -159,7 +159,7 @@ async fn edits_file_and_verifies_success() {
 }
 
 #[tokio::test]
-async fn stops_at_step_cap_when_never_verified() {
+async fn reports_verification_failed_when_the_criterion_never_passes() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("out.txt");
 
@@ -176,7 +176,9 @@ async fn stops_at_step_cap_when_never_verified() {
 
     let result = run(&contract, &provider, &store).await.unwrap();
 
-    assert_eq!(result.outcome, RunOutcome::StepCapReached { steps: 3 });
+    // The criterion was judged at every step and never passed, so the capped run
+    // reports the 0.70.0 variant rather than a bare cap.
+    assert_eq!(result.outcome, RunOutcome::VerificationFailed { steps: 3 });
     assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
 }
 
@@ -193,7 +195,7 @@ async fn execution_verify_rejects_the_i01_stub_in_the_loop() {
     let store = Store::memory().unwrap();
 
     let result = run(&contract, &stub, &store).await.unwrap();
-    assert_eq!(result.outcome, RunOutcome::StepCapReached { steps: 2 });
+    assert_eq!(result.outcome, RunOutcome::VerificationFailed { steps: 2 });
 }
 
 #[tokio::test]
@@ -305,7 +307,7 @@ async fn resumes_an_interrupted_run_without_restarting() {
         .with_max_steps(2);
     let wrong = MockWriter::new("still working");
     let r1 = run(&first, &wrong, &store).await.unwrap();
-    assert_eq!(r1.outcome, RunOutcome::StepCapReached { steps: 2 });
+    assert_eq!(r1.outcome, RunOutcome::VerificationFailed { steps: 2 });
 
     // Resume the same run id with a provider that finishes the job.
     let second = TaskContract::new("finish", &file, Verification::FileContains("DONE".into()))

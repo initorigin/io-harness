@@ -386,8 +386,9 @@ async fn a_refused_action_consumes_a_step_so_retrying_it_hits_the_cap() {
     .await
     .unwrap();
 
-    // Bounded by the step cap rather than looping forever.
-    assert_eq!(result.outcome, RunOutcome::StepCapReached { steps: 3 });
+    // Bounded by the step cap rather than looping forever. The contract carries a
+    // criterion that never passed, so the capped run reports the 0.70.0 variant.
+    assert_eq!(result.outcome, RunOutcome::VerificationFailed { steps: 3 });
     let refusals = store
         .events(result.run_id)
         .unwrap()
@@ -798,7 +799,7 @@ async fn a_resumed_run_still_enforces_the_policy_it_was_started_under() {
     )
     .await
     .unwrap();
-    assert_eq!(first.outcome, RunOutcome::StepCapReached { steps: 1 });
+    assert_eq!(first.outcome, RunOutcome::VerificationFailed { steps: 1 });
 
     let resumed = io_harness::resume_with(
         &capped(dir.path(), 5),
@@ -928,7 +929,7 @@ async fn a_bare_resume_still_works_for_a_run_that_never_had_a_boundary() {
     )
     .await
     .unwrap();
-    assert_eq!(first.outcome, RunOutcome::StepCapReached { steps: 1 });
+    assert_eq!(first.outcome, RunOutcome::VerificationFailed { steps: 1 });
 
     let resumed = io_harness::resume(&capped(dir.path(), 5), &script, &store, first.run_id)
         .await

@@ -328,7 +328,10 @@ async fn no_double_charge_across_a_crash_resume() {
     )
     .await
     .unwrap();
-    assert!(matches!(crashed.outcome, RunOutcome::StepCapReached { .. }));
+    assert!(matches!(
+        crashed.outcome,
+        RunOutcome::VerificationFailed { .. }
+    ));
     assert_eq!(
         store.spent_tokens(crashed.run_id).unwrap(),
         20,
@@ -688,7 +691,7 @@ async fn a_store_written_without_the_0_13_0_tables_opens_and_resumes() {
     .await
     .unwrap();
     assert!(
-        matches!(crashed.outcome, RunOutcome::StepCapReached { .. }),
+        matches!(crashed.outcome, RunOutcome::VerificationFailed { .. }),
         "an interrupted run to resume: {:?}",
         crashed.outcome
     );
@@ -919,7 +922,10 @@ async fn a_sandboxed_verification_is_recreated_on_resume() {
     let broken = run(&capped, &Script::new(vec![("fn main( {\n", 5)]), &store)
         .await
         .unwrap();
-    assert!(matches!(broken.outcome, RunOutcome::StepCapReached { .. }));
+    assert!(matches!(
+        broken.outcome,
+        RunOutcome::VerificationFailed { .. }
+    ));
     let before = store.last_step(broken.run_id).unwrap();
 
     let contract =
@@ -1485,7 +1491,7 @@ async fn a_store_written_before_the_turn_table_resumes_as_it_did_then() {
     .await
     .unwrap();
     assert!(
-        matches!(crashed.outcome, RunOutcome::StepCapReached { .. }),
+        matches!(crashed.outcome, RunOutcome::VerificationFailed { .. }),
         "an interrupted run to resume: {:?}",
         crashed.outcome
     );
@@ -1604,7 +1610,7 @@ async fn a_resumed_agent_in_a_tree_is_sent_its_own_turns() {
     .await
     .unwrap();
     assert!(
-        matches!(stopped.outcome, RunOutcome::StepCapReached { .. }),
+        matches!(stopped.outcome, RunOutcome::VerificationFailed { .. }),
         "an interrupted tree to resume: {:?}",
         stopped.outcome
     );

@@ -21,6 +21,7 @@
 //! builds.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rmcp::model::CallToolRequestParams;
@@ -85,6 +86,15 @@ fn default_timeout_secs() -> u64 {
     DEFAULT_TIMEOUT_SECS
 }
 
+/// A server that was declared and not explicitly switched off is on.
+///
+/// The default has to be `true` rather than `false` for the reason every
+/// defaulted field in this crate has the value it has: the key is new, and every
+/// file written before it existed has to keep meaning what it already meant.
+fn default_enabled() -> bool {
+    true
+}
+
 /// How to reach one MCP server.
 ///
 /// The two variants are not interchangeable configuration: they are checked by
@@ -110,6 +120,7 @@ fn default_timeout_secs() -> u64 {
 ///         env: BTreeMap::from([("GITHUB_TOKEN".into(), std::env::var("GH_PAT").unwrap_or_default())]),
 ///     },
 ///     timeout_secs: 30,
+///     enabled: true,
 /// };
 ///
 /// // Dialled remotely. Static headers go on every request.
@@ -120,6 +131,7 @@ fn default_timeout_secs() -> u64 {
 ///         headers: BTreeMap::from([("Authorization".into(), "Bearer …".into())]),
 ///     },
 ///     timeout_secs: 30,
+///     enabled: true,
 /// };
 ///
 /// // One rule each, and of different kinds. Egress is deny-by-default, so
@@ -230,6 +242,23 @@ pub struct McpServer {
     /// Per-call timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// Whether the harness may start this server at all.
+    ///
+    /// An operator turns a server off without deleting its declaration. The
+    /// entry stays in the file and stays in every listing — [`Config::mcp_servers`],
+    /// [`TaskContract::mcp`], [`Plugin::mcp_servers`] all report the servers that
+    /// were *configured* — and the run simply does not connect to it. Switching
+    /// a server off and cutting it out of the file are different acts, and only
+    /// one of them is reversible by editing a single word back.
+    ///
+    /// Defaults to `true`, so a file written before this key existed means
+    /// exactly what it already meant.
+    ///
+    /// [`Config::mcp_servers`]: crate::Config::mcp_servers
+    /// [`TaskContract::mcp`]: crate::TaskContract::mcp
+    /// [`Plugin::mcp_servers`]: crate::Plugin::mcp_servers
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
 }
 
 impl McpServer {
@@ -243,6 +272,7 @@ impl McpServer {
                 env: BTreeMap::new(),
             },
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            enabled: true,
         }
     }
 
@@ -255,6 +285,7 @@ impl McpServer {
                 headers: BTreeMap::new(),
             },
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            enabled: true,
         }
     }
 
@@ -314,6 +345,18 @@ impl McpSession {
     ) -> Result<Self> {
         let mut connected = Vec::new();
         for server in servers {
+            // The one place `enabled` is honoured, and deliberately the earliest
+            // one. Skipping here means no process is spawned, no socket dialled
+            // and no `Connected` entry — so the roster carries none of this
+            // server's tools and `owns` answers false for every one of them,
+            // from a single decision rather than three that have to agree.
+            // Filtering in `tool_specs` instead would leave a switched-off server
+            // spawned and still callable by name, which is the defect wearing a
+            // fix's clothes.
+            if !server.enabled {
+                info!(server = %server.id, "mcp server disabled, not started");
+                continue;
+            }
             let started = Instant::now();
             let service = match &server.transport {
                 McpTransport::Stdio { command, args, env } => {
@@ -337,28 +380,10 @@ impl McpSession {
                         .tracing(store, run_id, 0)
                         .watching(watch, 0)
                         .check(url)?;
-                    let mut config = StreamableHttpClientTransportConfig::with_uri(url.clone());
-                    // Built as one map and set once: `custom_headers` replaces
-                    // the whole map, so setting it per header would keep only
-                    // the last one — and an auth header silently dropped is the
-                    // kind of bug that looks like the server rejecting you.
-                    let custom: std::collections::HashMap<_, _> = headers
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            match (
-                                k.parse::<reqwest::header::HeaderName>(),
-                                v.parse::<reqwest::header::HeaderValue>(),
-                            ) {
-                                (Ok(name), Ok(value)) => Some((name, value)),
-                                _ => None,
-                            }
-                        })
-                        .collect();
-                    if !custom.is_empty() {
-                        config = config.custom_headers(custom);
-                    }
-                    let transport =
-                        StreamableHttpClientTransport::with_client(net::http_client(), config);
+                    let transport = StreamableHttpClientTransport::with_client(
+                        net::http_client(),
+                        http_config(url, headers),
+                    );
                     ().serve(transport).await.map_err(|e| Error::Mcp {
                         server: server.id.clone(),
                         reason: format!("could not connect to {url}: {e}"),
@@ -589,6 +614,375 @@ pub(crate) fn authorize_spawn(
     }
 }
 
+/// What [`probe_mcp`] found when it tried one server on its own.
+///
+/// The whole value of the type is that these are *different* answers to the same
+/// question. "It did not work" is the report an operator cannot act on: a policy
+/// that would refuse the server needs a rule added, a command that does not exist
+/// needs the path fixed, and a host that will not answer needs neither — it needs
+/// somebody to look at the host. A run reports all three as [`Error::Mcp`] or
+/// [`Error::Refused`] at the moment the run is already failing; this reports them
+/// before a run is started, which is when they are still cheap to fix.
+///
+/// `#[non_exhaustive]`, because a state this release did not think of — a server
+/// that answers but speaks a protocol version the crate will not talk — costs a
+/// caller nothing but a `_` arm to be told about later.
+///
+/// ```no_run
+/// use io_harness::{probe_mcp, McpProbe, McpServer, Policy};
+///
+/// # async fn demo() {
+/// let server = McpServer::stdio("github", "github-mcp-server").with_args(["stdio"]);
+/// let policy = Policy::default().layer("app").allow_exec("github-mcp-server");
+///
+/// let line = match probe_mcp(&server, &policy).await {
+///     McpProbe::Answered { tools } => format!("ready, {} tools", tools.len()),
+///     McpProbe::Disabled => "switched off in the configuration".to_string(),
+///     // The fix is a policy rule, and this names the rule to write.
+///     McpProbe::Refused { act, target, .. } => format!("the policy refuses {act} on {target}"),
+///     // The fix is the command; the server was never reached.
+///     McpProbe::NotStarted { reason } => format!("did not start: {reason}"),
+///     // The command or the URL was fine; the far end was not.
+///     McpProbe::Unreachable { reason } => format!("no answer: {reason}"),
+///     McpProbe::TimedOut { secs } => format!("silent for {secs}s"),
+///     _ => "an outcome added after this code was written".to_string(),
+/// };
+/// println!("{}: {line}", server.id);
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum McpProbe {
+    /// `enabled = false`. Nothing was spawned, dialled, or even checked against
+    /// the policy — the same thing a run does with it, which is the point.
+    Disabled,
+    /// The policy would refuse this server before it existed. The fields are the
+    /// ones [`Error::Refused`] carries, because this is that refusal, found
+    /// early: `act` and `target` say what to allow, `rule` and `layer` say what
+    /// denied it, which is the difference between adding an allow and removing a
+    /// deny.
+    Refused {
+        /// `exec` for a stdio server's binary, `net` for an HTTP server's host.
+        act: String,
+        /// The binary or `host:port` that was checked.
+        target: String,
+        /// The glob that refused it, when a rule rather than a default did.
+        rule: Option<String>,
+        /// The layer that rule came from.
+        layer: Option<String>,
+    },
+    /// The policy allowed it and the process would not start — almost always a
+    /// command that is not on the path.
+    NotStarted {
+        /// The spawn failure, as the operating system reported it.
+        reason: String,
+    },
+    /// It started, or the URL was allowed, and the far end never completed a
+    /// handshake or a tool listing.
+    Unreachable {
+        /// What the transport said.
+        reason: String,
+    },
+    /// Nothing came back inside the server's own [`McpServer::timeout_secs`].
+    TimedOut {
+        /// The bound that was exceeded, in seconds.
+        secs: u64,
+    },
+    /// It answered, and offered these tools — under the namespaced
+    /// `mcp__<server>__<tool>` names the model would see and the policy would
+    /// decide on, not the bare ones the server sent.
+    Answered {
+        /// Every tool offered, in the order the server listed them.
+        tools: Vec<String>,
+    },
+}
+
+/// Try one MCP server on its own, and report what happened.
+///
+/// This is the preflight the run loop does not have. The session the loop opens
+/// needs a [`Store`], a run id and a live observer, because everything it does is
+/// recorded against a run. A probe is asked before there is a run — from a
+/// `doctor` command, from a settings screen, from a test that wants to know
+/// whether a configured server is real — so it re-walks the same transport
+/// without any of that, and returns instead of failing.
+///
+/// It performs the same two checks a run performs, in the same order: a stdio
+/// server's binary is an [`Act::Exec`] check, an HTTP server's host an
+/// [`Act::Net`] one. A server the policy would refuse is reported as refused
+/// **without being started**, which is the only honest thing to do — a probe
+/// that spawned a process the run would not have spawned would be answering a
+/// different question.
+///
+/// # What bounds it
+///
+/// The whole probe, handshake included, is bounded by the server's own
+/// [`McpServer::timeout_secs`]. That is deliberately *wider* than what a run
+/// bounds: inside a run the timeout covers the tool listing and each call, but
+/// not the handshake, so a server that accepts a connection and never finishes
+/// initialising holds the run open. A caller asking "is this server real?" must
+/// get an answer, so here the deadline starts before the handshake and covers
+/// everything after it.
+///
+/// The server is shut down on every path that started one — the timeout and the
+/// failures included.
+///
+/// ```no_run
+/// use io_harness::{probe_mcp, Config, McpProbe, Policy};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// // Everything the operator configured, checked before a run needs it.
+/// let config = Config::discover(".")?;
+/// let policy = Policy::default().layer("app").allow_exec("*");
+///
+/// for server in config.mcp_servers() {
+///     match probe_mcp(server, &policy).await {
+///         McpProbe::Answered { tools } => println!("{}: {} tools", server.id, tools.len()),
+///         other => println!("{}: {other:?}", server.id),
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub async fn probe_mcp(server: &McpServer, policy: &Policy) -> McpProbe {
+    if !server.enabled {
+        return McpProbe::Disabled;
+    }
+    // Started before the handshake rather than after it, which is the whole
+    // difference between this bound and the run's.
+    let deadline = tokio::time::Instant::now() + server.timeout();
+    match &server.transport {
+        McpTransport::Stdio { command, args, env } => {
+            // The same call `authorize_spawn` makes, minus the tracing it does
+            // against a run that does not exist here. `Ask` is not an allowance,
+            // for the reason stated there: connecting is configuration, not an
+            // action a human is standing by to approve.
+            let verdict = policy.check(Act::Exec, command);
+            if verdict.effect != Effect::Allow {
+                return McpProbe::Refused {
+                    act: "exec".into(),
+                    target: command.clone(),
+                    rule: verdict.rule,
+                    layer: verdict.layer,
+                };
+            }
+            let mut cmd = tokio::process::Command::new(command);
+            cmd.args(args);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let transport = match TokioChildProcess::new(cmd) {
+                Ok(t) => t,
+                Err(e) => {
+                    return McpProbe::NotStarted {
+                        reason: format!("could not spawn {command}: {e}"),
+                    }
+                }
+            };
+            finish_probe(().serve(transport), server, deadline).await
+        }
+        McpTransport::Http { url, headers } => {
+            match NetGuard::new(policy).check(url) {
+                // `Ask` comes back as a verdict rather than an error, and is let
+                // through here exactly as `connect` lets it through.
+                Ok(_) => {}
+                Err(Error::Refused {
+                    act,
+                    target,
+                    rule,
+                    layer,
+                }) => {
+                    return McpProbe::Refused {
+                        act,
+                        target,
+                        rule,
+                        layer,
+                    }
+                }
+                Err(e) => {
+                    return McpProbe::Unreachable {
+                        reason: e.to_string(),
+                    }
+                }
+            }
+            let transport = StreamableHttpClientTransport::with_client(
+                net::http_client(),
+                http_config(url, headers),
+            );
+            finish_probe(().serve(transport), server, deadline).await
+        }
+    }
+}
+
+/// What a handshake resolves to, whichever transport carried it: a running
+/// service, or an error the transport can describe.
+type Served<E> = std::result::Result<RunningService<RoleClient, ()>, E>;
+
+/// The half of [`probe_mcp`] that is the same for both transports: finish the
+/// handshake, list the tools, and shut the server down whatever happened.
+///
+/// Generic over the handshake future rather than over the transport, because the
+/// two transports produce different types and this only needs the one thing they
+/// agree on — a future of a running service, or an error worth printing.
+///
+/// The service handle is taken out of the timeout before the listing runs, so
+/// every exit from here has something to `cancel`. A timeout that fired while the
+/// handshake was still in flight is the one path with no handle: there the
+/// transport is dropped instead, and `rmcp`'s own child-process transport kills
+/// the process it owns on drop.
+async fn finish_probe<E: std::fmt::Display>(
+    handshake: impl std::future::Future<Output = Served<E>>,
+    server: &McpServer,
+    deadline: tokio::time::Instant,
+) -> McpProbe {
+    let secs = server.timeout().as_secs();
+    let service = match tokio::time::timeout_at(deadline, handshake).await {
+        Err(_) => return McpProbe::TimedOut { secs },
+        Ok(Err(e)) => {
+            return McpProbe::Unreachable {
+                reason: format!("handshake failed: {e}"),
+            }
+        }
+        Ok(Ok(service)) => service,
+    };
+
+    let listed = tokio::time::timeout_at(deadline, service.list_all_tools()).await;
+    // Before the match, not inside three arms of it: a probe that left a server
+    // running on the timeout path would be a resource leak wearing a diagnostic's
+    // clothes.
+    let _ = service.cancel().await;
+    match listed {
+        Err(_) => McpProbe::TimedOut { secs },
+        Ok(Err(e)) => McpProbe::Unreachable {
+            reason: format!("could not list tools: {e}"),
+        },
+        Ok(Ok(tools)) => McpProbe::Answered {
+            tools: tools
+                .iter()
+                .map(|t| tool_name(&server.id, &t.name))
+                .collect(),
+        },
+    }
+}
+
+/// The key an operator meant when they wrote something one letter away from it.
+const ENABLED_KEY: &str = "enabled";
+
+/// Refuse a near-miss spelling of `enabled` inside an `[[mcp]]` table.
+///
+/// `[[mcp]]` is the one table in the file format `deny_unknown_fields` cannot
+/// cover: [`McpServer`] is `#[serde(flatten)]`-based and serde refuses the two
+/// attributes together, so an unknown key inside one of these tables is
+/// swallowed. That exemption stays, and for most keys it costs little — a key
+/// that adds something, dropped, leaves the server behaving as it would have
+/// anyway.
+///
+/// `enabled` is the one key where silence inverts the intent rather than
+/// ignoring it. `enabld = false` is an operator switching a server **off**; being
+/// swallowed leaves it **on**, running, with its tools in the roster, and with
+/// the file saying otherwise. Every other misspelling fails safe; this one fails
+/// in exactly the direction the operator was trying to move away from.
+///
+/// So the raw table is read here, before serde has had its chance to drop the
+/// key, and only the near misses are refused — a different case, or one edit
+/// away. An unrelated unknown key is still accepted, because this narrows one
+/// hazard and does not claim to close the hole.
+///
+/// It is an [`Error::Config`] rather than a warning because there is no warning
+/// channel to use: configuration parsing returns `Result` and nothing else, and a
+/// warning nobody has a way to print is a decision not to say anything.
+/// It recurses into `[profile.*]` bodies for the same reason `refuse_widening`
+/// does, and its own comment there says it best: a key hidden in a profile
+/// "would otherwise reach the same place by a different path". A `[[mcp]]` array
+/// inside a profile is a fully supported declaration — `Config::with_profile`
+/// merges the body over the base and the servers it names are the ones that get
+/// started — so a check that only read the top level would leave the hazard open
+/// on the one path it did not cover. Profiles cannot nest
+/// (`refuse_nested_profiles`), so one level is the whole of it.
+pub(crate) fn check_enabled_spelling(table: &toml::value::Table, path: &Path) -> Result<()> {
+    check_mcp_entries(table, path, "")?;
+    if let Some(profiles) = table.get("profile").and_then(toml::Value::as_table) {
+        for (name, body) in profiles {
+            if let Some(body) = body.as_table() {
+                check_mcp_entries(body, path, &format!("profile.{name}."))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One array of `[[mcp]]` tables, named by `scope` so the diagnostic points at
+/// the section the operator actually wrote — `[[mcp]]` at the top level,
+/// `[[profile.prod.mcp]]` inside a profile. A bare entry index is useless to
+/// someone with servers declared in both places.
+fn check_mcp_entries(table: &toml::value::Table, path: &Path, scope: &str) -> Result<()> {
+    let Some(entries) = table.get("mcp").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(entry) = entry.as_table() else {
+            continue;
+        };
+        for key in entry.keys() {
+            // The correctly spelled key is the one thing this must never reject.
+            if key == ENABLED_KEY || !near_miss(key) {
+                continue;
+            }
+            // The index rather than the id, the shape `[[provider]]` already
+            // uses: an entry misspelling one key may have misspelled `id` too,
+            // and a diagnostic that quotes a name the file does not contain is
+            // worse than one that counts.
+            return Err(Error::Config(format!(
+                "{}: `[[{scope}mcp]]` entry {index}: key `{key}`: did you mean \
+                 `{ENABLED_KEY}`? An `[[mcp]]` table cannot reject unknown keys, so this \
+                 one would be silently dropped and the server would stay switched on — \
+                 the opposite of what writing it asks for.",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Is `key` the same word as `enabled` in a different case, or one edit —
+/// insert, delete or substitute — away from it?
+///
+/// Deliberately not a fuzzy-match crate and deliberately not a general edit
+/// distance: one target and one distance make the whole thing a length check and
+/// a single walk, with no matrix and no dependency. The real keys of an
+/// `[[mcp]]` table — `id`, `transport`, `command`, `args`, `env`, `url`,
+/// `headers`, `timeout_secs` — are all far outside a distance of one, which is
+/// what keeps an unrelated unknown key accepted.
+fn near_miss(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    if key == ENABLED_KEY {
+        return true;
+    }
+    let (a, b) = (key.as_bytes(), ENABLED_KEY.as_bytes());
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if long.len() - short.len() > 1 {
+        return false;
+    }
+    let (mut i, mut j, mut edits) = (0, 0, 0);
+    while i < short.len() && j < long.len() {
+        if short[i] == long[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        edits += 1;
+        if edits > 1 {
+            return false;
+        }
+        // A substitution consumes a character from both; an insertion consumes
+        // one only from the longer.
+        if short.len() == long.len() {
+            i += 1;
+        }
+        j += 1;
+    }
+    edits + (long.len() - j) <= 1
+}
+
 /// `mcp__<server>__<tool>`.
 fn tool_name(server: &str, tool: &str) -> String {
     format!("{MCP_TOOL_PREFIX}{server}__{tool}")
@@ -597,6 +991,39 @@ fn tool_name(server: &str, tool: &str) -> String {
 /// The server-side tool name inside a namespaced one.
 fn bare_name<'a>(server: &str, namespaced: &'a str) -> Option<&'a str> {
     namespaced.strip_prefix(&format!("{MCP_TOOL_PREFIX}{server}__"))
+}
+
+/// The streamable-HTTP transport configuration for one server.
+///
+/// One function rather than a block in each caller, because [`McpSession::connect`]
+/// and [`probe_mcp`] have to dial a server the *same* way — a probe that reported
+/// a working server the run then cannot reach would be worse than no probe.
+///
+/// The headers are built as one map and set once: `custom_headers` replaces the
+/// whole map, so setting it per header would keep only the last one — and an
+/// auth header silently dropped is the kind of bug that looks like the server
+/// rejecting you.
+fn http_config(
+    url: &str,
+    headers: &BTreeMap<String, String>,
+) -> StreamableHttpClientTransportConfig {
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url);
+    let custom: std::collections::HashMap<_, _> = headers
+        .iter()
+        .filter_map(|(k, v)| {
+            match (
+                k.parse::<reqwest::header::HeaderName>(),
+                v.parse::<reqwest::header::HeaderValue>(),
+            ) {
+                (Ok(name), Ok(value)) => Some((name, value)),
+                _ => None,
+            }
+        })
+        .collect();
+    if !custom.is_empty() {
+        config = config.custom_headers(custom);
+    }
+    config
 }
 
 fn transport_name(t: &McpTransport) -> &'static str {
@@ -742,6 +1169,13 @@ mod tests {
             McpServer::stdio("files", "mcp-files").with_args(["--root", "/tmp"]),
             McpServer::http("remote", "https://mcp.example.com/mcp")
                 .with_timeout(Duration::from_secs(5)),
+            // A switched-off server has to survive the round trip too: it is
+            // still a declaration, and a serializer that dropped the flag would
+            // turn it back on.
+            McpServer {
+                enabled: false,
+                ..McpServer::stdio("off", "mcp-files")
+            },
         ] {
             let json = serde_json::to_string(&server).unwrap();
             let back: McpServer = serde_json::from_str(&json).unwrap();
@@ -756,6 +1190,89 @@ mod tests {
                 .unwrap();
         assert_eq!(s.timeout_secs, DEFAULT_TIMEOUT_SECS);
         assert!(matches!(s.transport, McpTransport::Stdio { .. }));
+        // 0.70.0. A file written before `enabled` existed declares a server that
+        // runs, which is what it meant when it was written.
+        assert!(s.enabled, "an absent `enabled` means on");
+    }
+
+    // ------------------------------------------------- the near-miss check (0.70.0)
+
+    fn table(text: &str) -> toml::value::Table {
+        toml::from_str(text).expect("the fixture is valid TOML")
+    }
+
+    /// One `[[mcp]]` entry with one extra key on it.
+    fn with_key(line: &str) -> toml::value::Table {
+        table(&format!(
+            "[[mcp]]\nid = \"files\"\ntransport = \"stdio\"\ncommand = \"mcp-files\"\n{line}\n"
+        ))
+    }
+
+    /// F4 — each near miss is refused, and the diagnostic names the key that was
+    /// written, the key that was meant, and the table it is in.
+    ///
+    /// The three spellings are the three shapes the check has to catch: a
+    /// deletion in the middle, a truncation at the end, and a capital.
+    #[test]
+    fn a_near_miss_spelling_of_enabled_is_refused_and_named() {
+        for spelling in ["enabld", "enable", "Enabled"] {
+            let raw = with_key(&format!("{spelling} = false"));
+            let err = check_enabled_spelling(&raw, Path::new("io.toml"))
+                .expect_err("a misspelled `enabled` inverts the operator's intent")
+                .to_string();
+            assert!(
+                err.contains(&format!("`{spelling}`")),
+                "names what was written: {err}"
+            );
+            assert!(err.contains("`enabled`"), "names what was meant: {err}");
+            assert!(err.contains("[[mcp]]"), "names the table: {err}");
+            assert!(err.contains("io.toml"), "and the file it is in: {err}");
+        }
+
+        // And it is the offending table that is counted, not the first one.
+        let two = table(
+            "[[mcp]]\nid = \"a\"\ntransport = \"stdio\"\ncommand = \"a\"\n\
+             [[mcp]]\nid = \"b\"\ntransport = \"stdio\"\ncommand = \"b\"\nenabld = false\n",
+        );
+        let err = check_enabled_spelling(&two, Path::new("io.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("entry 1"),
+            "counts to the offending table: {err}"
+        );
+    }
+
+    /// F4's control — the exemption stays. An unknown key that is not a near miss
+    /// is accepted exactly as it was before, and the correct spelling is never
+    /// rejected.
+    ///
+    /// Without this the check could pass its own tests by refusing every unknown
+    /// key, which is a different change to the file format than the one made
+    /// here.
+    #[test]
+    fn an_unrelated_unknown_key_in_an_mcp_table_is_still_accepted() {
+        for line in [
+            "enabled = false",
+            "enabled = true",
+            // Every real key of the table, none of which may be mistaken for a
+            // near miss of `enabled`.
+            "timeout_secs = 30",
+            "args = [\"stdio\"]",
+            // And unknown keys the exemption still swallows.
+            "colour = \"blue\"",
+            "en = 1",
+            "disabled_maybe = false",
+        ] {
+            assert!(
+                check_enabled_spelling(&with_key(line), Path::new("io.toml")).is_ok(),
+                "`{line}` is not a near miss of `enabled`"
+            );
+        }
+
+        // A file with no `[[mcp]]` at all has nothing to check.
+        let none = table("[run]\nmax_steps = 3\n");
+        assert!(check_enabled_spelling(&none, Path::new("io.toml")).is_ok());
     }
 
     #[test]

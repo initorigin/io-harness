@@ -64,6 +64,38 @@ pub(crate) async fn ensure_success(resp: reqwest::Response) -> Result<reqwest::R
 ///
 /// A response with text and no tool call is *not* this: that is a model that
 /// answered without calling anything, and it keeps its meaning exactly.
+/// An endpoint with anything credential-shaped taken out of it, for the four
+/// providers' hand-written [`std::fmt::Debug`] impls (0.70.0).
+///
+/// Those impls exist so a `{:?}` on a provider never prints its `api_key`. That
+/// is not enough on its own: a base URL is caller-supplied, and gateway and
+/// Azure-style deployments routinely carry the key *in the URL* — as
+/// `https://user:sk-…@host/v1` or `https://host/v1?api-key=sk-…`. Printing the
+/// endpoint verbatim would put the credential in a log through the one door
+/// those impls were written to close.
+///
+/// So the authority's userinfo goes, and everything from the first `?` or `#`
+/// goes. Scheme, host, port and path stay, which is what someone debugging a
+/// misconfiguration is actually looking at. Deliberately `str` work rather than
+/// a URL parser: this runs on a value that may not parse as a URL at all, and
+/// the safe answer for a malformed endpoint is still to drop the risky parts.
+pub(crate) fn redacted_endpoint(endpoint: &str) -> String {
+    let (head, rest) = match endpoint.find("://") {
+        Some(i) => endpoint.split_at(i + 3),
+        None => ("", endpoint),
+    };
+    // The authority ends at the first `/`, `?` or `#`; userinfo is whatever
+    // precedes an `@` inside it. Searching past the authority would strip a `@`
+    // that is merely part of a path.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let rest = match rest[..authority_end].rfind('@') {
+        Some(at) => &rest[at + 1..],
+        None => rest,
+    };
+    let cut = rest.find(['?', '#']).unwrap_or(rest.len());
+    format!("{head}{}", &rest[..cut])
+}
+
 pub(crate) fn ensure_parsed(response: CompletionResponse) -> Result<CompletionResponse> {
     if response.text.is_none() && response.tool_calls.is_empty() && response.usage.is_none() {
         return Err(Error::provider_malformed(
@@ -2228,6 +2260,70 @@ pub(crate) mod failures {
 
 /// F3 — the catalogue method is defaulted, so the crate's one extension point
 /// stays open.
+#[cfg(test)]
+mod redaction {
+    use super::redacted_endpoint;
+
+    /// The two shapes that carry a credential in a URL, and the ordinary one
+    /// that must survive intact.
+    #[test]
+    fn userinfo_and_query_are_dropped_and_nothing_else_is() {
+        // Userinfo — `https://user:secret@host/path`.
+        assert_eq!(
+            redacted_endpoint("https://user:sk-SECRET@api.example.com/v1/messages"),
+            "https://api.example.com/v1/messages"
+        );
+        // Query — the Azure/gateway shape.
+        assert_eq!(
+            redacted_endpoint("https://api.example.com/v1/chat?api-key=sk-SECRET&x=1"),
+            "https://api.example.com/v1/chat"
+        );
+        // Fragment, for completeness.
+        assert_eq!(
+            redacted_endpoint("https://api.example.com/v1#sk-SECRET"),
+            "https://api.example.com/v1"
+        );
+        // Both at once.
+        assert_eq!(
+            redacted_endpoint("https://u:sk-SECRET@api.example.com/v1?api-key=sk-SECRET"),
+            "https://api.example.com/v1"
+        );
+        // The ordinary endpoint is untouched — the positive control, without
+        // which a redactor returning the empty string would pass every
+        // assertion above.
+        assert_eq!(
+            redacted_endpoint("https://openrouter.ai/api/v1/chat/completions"),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        // A port survives; it is part of what a misconfiguration looks like.
+        assert_eq!(
+            redacted_endpoint("http://localhost:8080/v1"),
+            "http://localhost:8080/v1"
+        );
+    }
+
+    /// An `@` that is part of the PATH is not userinfo, and truncating there
+    /// would corrupt a legitimate endpoint. The authority ends at the first
+    /// `/`, which is what makes this safe.
+    #[test]
+    fn an_at_sign_after_the_authority_is_left_alone() {
+        assert_eq!(
+            redacted_endpoint("https://api.example.com/v1/models/me@example/chat"),
+            "https://api.example.com/v1/models/me@example/chat"
+        );
+    }
+
+    /// A value that is not a URL at all still loses the risky parts rather than
+    /// being passed through — the endpoint is caller-supplied and this runs on
+    /// whatever they set.
+    #[test]
+    fn a_value_that_is_not_a_url_still_loses_the_risky_parts() {
+        assert_eq!(redacted_endpoint("not a url"), "not a url");
+        assert_eq!(redacted_endpoint("u:sk-SECRET@host/v1"), "host/v1");
+        assert_eq!(redacted_endpoint(""), "");
+    }
+}
+
 #[cfg(test)]
 mod catalogue_default {
     use super::*;

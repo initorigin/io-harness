@@ -26,6 +26,125 @@ notes are produced from it.
 
 ### Security
 
+## [0.70.0] - 2026-08-29
+
+The harness stops keeping things to itself. Every entry below is the same shape:
+a fact this crate already recorded, or an act it could already perform, that no
+caller could reach — and in one case, a decision the operator made that four code
+paths did not honour.
+
+### Added
+
+- `enabled` on an `[[mcp]]` server and on a `[[plugin]]` bundle, defaulting to
+  `true`, so an operator turns one off without deleting its declaration. A
+  disabled server contributes no tools and is never started; a disabled bundle
+  contributes nothing to skills, templates, agents, MCP servers, hooks or policy.
+  Both stay readable as configured-and-off — `Plugins::disabled()` lists the
+  bundles — because a capability missing from a listing cannot be told apart from
+  one that was never declared. A switched-off bundle claims no id, so switching
+  one off and declaring its replacement beside it works: two bundles sharing an
+  id collide only when both are switched on.
+- A near-miss check for the `enabled` key inside an `[[mcp]]` table. That table is
+  the one section exempt from `deny_unknown_fields`, so `enabld = false` would
+  otherwise be swallowed in silence and the server the operator disabled would
+  run. An unrelated unknown key in the same table is still accepted: the exemption
+  stays, and it is load-bearing for forward compatibility.
+- A public probe for a configured MCP server — start it, report whether it
+  answered and what it offered, shut it down — so a consumer can tell "the policy
+  would refuse this" from "this command is wrong" from "this host is
+  unreachable". Bounded by the server's own `timeout_secs`, handshake included.
+- `Store::session_created_at`, and a preview of `sweep_sessions` that returns the
+  `Pruned` it would produce without deleting anything. The preview and the sweep
+  resolve and measure through one code path, so the preview is the receipt rather
+  than an estimate of it. (#216)
+- `Store::run_file`, a reader for the path `start_child_run` records — which for a
+  child spawned under `worktree = true` is the child's own worktree, not its
+  parent's root. The column had been written since 0.36.0 and read by nothing.
+  (#215)
+- `RunOutcome::VerificationFailed { steps }`, for a run that reached its step cap
+  having failed its criterion. `StepCapReached` had meant both "ran long" and
+  "the work does not hold up", and a caller reasonably read it as "raise
+  `max_steps`" when the real cause was a criterion that was not being met. (#212)
+
+### Changed
+
+- **`Effect::Ask` on `Act::Exec` now raises an approval instead of refusing.** It
+  was compared against `Allow` and refused anything else, so `Ask` behaved as
+  `Deny` — and `Policy::default()` sets `exec = Ask`, so out of the box every git
+  built-in was refused and no approver was ever consulted, with the error naming
+  the program so it read as a missing binary. Fixed at all four sites carrying
+  that comparison, not only the one that was reported: the git spawn, every MCP
+  tool invocation and a spawned agent's worktree write. **This changes what a
+  default-policy run does** — consumers get a pause where they previously got an
+  error. A `Deny` posture still refuses without asking. (#214)
+
+  Two boundaries on that, both deliberate. **A configured MCP server must still
+  be allow-listed to start at all**: `Ask` on the server's own binary remains a
+  refusal, because connecting is configuration rather than an action a human is
+  standing by to approve — so "MCP tool calls now ask" only applies once the
+  server itself may run. And **a verification gate still refuses rather than
+  asking**, because it has no approver and `Verification::passes_guarded` returns
+  a `bool` with nowhere to put a pause; what changed there is only the reason
+  given, which used to say the policy forbade a command it had merely asked
+  about.
+- **BREAKING (behaviour): a run that reached its step cap having failed its
+  criterion now reports `RunOutcome::VerificationFailed { steps }` and persists
+  `"verification_failed"`.** `StepCapReached` now means only that nothing judged
+  the work — a run with no `Verification` still answers it, and so does one that
+  never reached its gate. **Migration:** match the new variant beside
+  `StepCapReached`; a downstream arm reading `StepCapReached` as "raise
+  `max_steps`" will silently stop firing for the runs where that reading was
+  wrong, which is the fix. The new outcome is deliberately **not** terminal to
+  `resume`: a gate is re-run from scratch on the next step, so a repaired machine
+  or a raised budget can still turn it green.
+- A failing verification gate's phase and its recorded output are appended to the
+  next step's request, so a retry is informed rather than blind. Bounded by a line
+  count and a character cap together, and the bound is asserted rather than
+  assumed. A failure that repeats is carried **once**, not once per step: the
+  ledger accumulates for the whole run, so appending a near-identical block per
+  failing step would re-send all of them on every request thereafter. A failure
+  that changes is carried again. (#211)
+- `McpServer` gains a public `enabled` field and is not `#[non_exhaustive]`.
+  **Migration:** a struct-literal construction of `McpServer` stops compiling; use
+  `McpServer::stdio` or `McpServer::http`, which every construction in this
+  workspace and in io-cli already does, or add `enabled: true` to the literal.
+- **Downgrade hazard, and the two halves point opposite ways.** `[[mcp]]` is
+  exempt from `deny_unknown_fields`, so a 0.69.0 binary reading a file that sets
+  `enabled` on a server **ignores the key and runs the server the operator
+  disabled** — silently. `[[plugin]]` is not exempt, so a 0.69.0 binary reading a
+  file that disables a bundle **refuses the whole file**. Neither can be fixed
+  from here; 0.69.0 is already published. An operator who downgrades should remove
+  the `enabled` keys first.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- `ModelReviewer` is constructible over the providers this crate ships. It
+  required `P: Debug` through the `Reviewer` supertrait, which none of
+  `OpenRouter`, `Anthropic` or `OpenAi` satisfied, leaving the only shipped
+  `Reviewer` for the only model-judged criterion unreachable from any downstream
+  crate using our own providers. The bound is gone rather than merely satisfied,
+  so an out-of-tree provider works too. (#213)
+
+### Security
+
+- **`Compatible` no longer prints the operator's API key.** It derived `Debug`
+  while holding the credential as a plain `String`, so `format!("{:?}", provider)`
+  emitted the key verbatim — and it leaked transitively through the derived
+  `Debug` on `Record<P>` and `Fallback<A, B>`. All four shipped providers now
+  carry a hand-written `Debug` that prints the endpoint and the model and never
+  the credential. Found while fixing #213, which had described the same code as a
+  missing implementation.
+- **A credential carried in the endpoint URL is not printed either.** Withholding
+  the `api_key` field is not enough on its own: a base URL is caller-supplied, and
+  gateway and Azure-style deployments routinely carry the key in it, as
+  `https://user:sk-…@host/v1` or `https://host/v1?api-key=sk-…`. The four `Debug`
+  impls now strip userinfo and the query string, keeping scheme, host, port and
+  path — which is what someone debugging a misconfiguration is looking at.
+
 ## [0.69.0] - 2026-08-25
 
 An operator can fold a running turn, and a fold outlives the turn that made it.

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
-# 0.69.0's sabotage pass: break one thing, run the test that claims to catch it,
+# 0.70.0's sabotage pass: break one thing, run the test that claims to catch it,
 # and require that it fails.
 #
-# A test nobody has tried to break is a test that may assert nothing. Three
+# A test nobody has tried to break is a test that may assert nothing. Four
 # releases running have had an arm expose a criterion whose fixture proved
 # nothing — 0.67.0's F3 asserted an absence the fixture made unreachable, 0.68.0's
 # F5 arm survived against the fan-out test because the rule it aimed at was
-# over-determined end to end, and this release moved F6 into a function of its own
-# so the arm below hits the rule rather than a restatement of it. The arms are the
+# over-determined end to end, and 0.69.0 moved F6 into a function of its own so
+# the arm hit the rule rather than a restatement of it. The arms are the
 # release's evidence that its own tests discriminate, not a formality run at the
 # end.
 #
@@ -88,111 +88,181 @@ arm() {
     rm -f "$log"
 }
 
-# ---- F1: a fold sent mid-turn lands at the next step boundary.
-# The drained request is thrown away at the one site that reads it. Every other
-# part of folding is intact — the threshold, `fold_now`, the summariser — so only
-# a test that asserts the OPERATOR caused a fold can notice.
-arm "F1 the drained fold is dropped" \
-    src/run/step.rs \
-    's/\*fold_asked = true;/let _ = \&steered.fold;/' \
-    session_steering a_fold_asked_for_mid_turn_lands_at_the_next_boundary
+# ---- F1: a disabled server contributes nothing and is still visible.
+# The skip moves out of the connect loop, which is exactly the cheap version the
+# design rejected: the server is spawned and its tools reach the roster, so it is
+# switched off in name only. The listing half still passes, which is why the arm
+# has to reach the roster half to prove anything.
+arm "F1 the disabled server is started anyway" \
+    src/mcp.rs \
+    's/            if !server\.enabled \{/            if false {/' \
+    mcp a_disabled_server_contributes_no_tools_and_is_still_configured
 
-# ---- F2: the same turn with nothing sent does not fold.
-# Every drain asks for a fold. F2 is the control that says the fold in F1 came
-# from the operator rather than from a fixture that folds on its own.
-arm "F2 every boundary asks for a fold" \
-    src/run/step.rs \
-    's/if steered\.fold \{/if true {/' \
-    session_steering without_a_send_the_same_turn_does_not_fold
+# ---- F2: a disabled bundle contributes to none of the six.
+# Everything is routed to `loaded` regardless of the flag — the bundle contributes
+# all six and is missing from `disabled()`. A bundle half-off is worse than one
+# fully on, so the test names the subsystem that leaked.
+arm "F2 the flag is read and then ignored" \
+    src/plugin.rs \
+    's/                    if decl\.enabled \{/                    if true {/' \
+    plugin a_disabled_bundle_contributes_none_of_the_six_and_stays_visible
 
-# ---- F3: an off setting stays off.
-# The `enabled()` gate is skipped whenever a fold is forced, which is the exact
-# "an explicit request beats an explicit off" reading the criterion refuses.
-arm "F3 forced folds bypass an off setting" \
-    src/run/memory.rs \
-    's/    if !folding\.enabled\(\) \{\n        return Ok\(0\);\n    \}/    if !folding.enabled() \&\& !forced {\n        return Ok(0);\n    }/' \
-    session_steering a_fold_asked_for_does_not_override_an_off_setting
+# ---- F3a: every `[[mcp]]` file written before this release means what it meant.
+# The serde default flips, so a file that never mentioned `enabled` silently
+# switches every server off. Asserted separately from F1 rather than trusted to
+# `#[serde(default)]`, because this is the failure that would reach every existing
+# operator at once.
+arm "F3a an absent mcp enabled key defaults to off" \
+    src/mcp.rs \
+    's/fn default_enabled\(\) -> bool \{\n    true\n\}/fn default_enabled() -> bool {\n    false\n}/' \
+    mcp a_server_declared_without_the_enabled_key_offers_the_same_roster
 
-# ---- F4: one send, one fold.
-# Read instead of taken, so the flag stays true and every step after the first
-# send folds. Only a turn long enough for a second fold can see it.
-arm "F4 the request is read, not consumed" \
-    src/run/memory.rs \
-    's/let asked_now = depth == 0 && std::mem::take\(asked\);/let asked_now = depth == 0 \&\& *asked;/' \
-    session_steering each_send_folds_once_and_not_every_step_after_it
+# ---- F3b: the same promise for `[[plugin]]`, which has its own default.
+# Two defaults, two arms. One shared helper would have been one arm; they are in
+# different modules on purpose and so the guarantee needs proving twice.
+arm "F3b an absent plugin enabled key defaults to off" \
+    src/plugin.rs \
+    's/fn default_enabled\(\) -> bool \{\n    true\n\}/fn default_enabled() -> bool {\n    false\n}/' \
+    plugin an_absent_enabled_key_is_indistinguishable_from_switched_on
 
-# ---- F5: an interrupt beside a fold ends the turn and buys no summary.
-# The interrupt stops winning when a fold is in the same drain — the plausible
-# bug, not an absurd one: an operator who asked for a summary could be read as
-# wanting the turn to go on. The turn then runs to its bound and folds.
-arm "F5 a fold overrides the interrupt" \
-    src/run/step.rs \
-    's/if steered\.interrupted \{/if steered.interrupted \&\& !steered.fold {/' \
-    session_steering an_interrupt_beside_a_fold_stops_the_turn_and_buys_no_summary
+# ---- F4: the near-miss check catches the typo without closing the exemption.
+# Every unknown key becomes a near miss, which is what "just close the exemption"
+# amounts to in practice. The typo is still caught — so only the second half of
+# F4, the unrelated key that must still be accepted, can see this. That half is
+# the trade the exemption exists to make.
+arm "F4 the near-miss check rejects every unknown key" \
+    src/mcp.rs \
+    's/fn near_miss\(key: &str\) -> bool \{/fn near_miss(key: \&str) -> bool {\n    if true {\n        return true;\n    }/' \
+    config an_unrelated_unknown_key_in_an_mcp_table_is_still_accepted
 
-# ---- F6: a child has no inbox to hear the operator's fold in.
+# ---- F5: the probe shuts the server down again.
+# `std::mem::forget`, NOT a removal of the `cancel()` call. The first version of
+# this arm replaced `cancel()` with a no-op and SURVIVED, and the survival was
+# right: rmcp's `ChildWithCleanup` kills the child on `Drop`, so deleting the
+# explicit shutdown swaps one correct mechanism for another and breaks nothing.
+# Leaking the handle is what actually leaves the server running, and it is the
+# only mutation this criterion's property can see. Recorded rather than quietly
+# re-aimed: the explicit `cancel()` is belt-and-braces for the stdio case and is
+# load-bearing only for a transport with no child process to reap.
+arm "F5 the probe leaks the server handle" \
+    src/mcp.rs \
+    's/    let _ = service\.cancel\(\)\.await;/    std::mem::forget(service);/' \
+    mcp a_probe_leaves_no_child_process_behind
+
+# ---- F6: the sweep preview equals the sweep.
+# The victim set is resolved from the first turn's timestamp instead of the
+# session's. Note what this does NOT break: preview and sweep share the selection,
+# so they still agree with each other and an equality-only test passes. It is
+# caught by the session created before the cutoff whose first turn is after it —
+# the ordinary case the issue names, and the reason the fixture has one.
+arm "F6 the victim set comes from the first turn, not the session" \
+    src/state/sessions.rs \
+    's/"SELECT id FROM sessions WHERE created_at < \?1 ORDER BY id"/"SELECT DISTINCT session_id FROM session_turns WHERE created_at < ?1 ORDER BY session_id"/' \
+    retention a_sweep_preview_is_exactly_the_receipt_the_sweep_then_produces
+
+# ---- F7: a worktree child's recorded root reads back.
+# The reader walks to the parent's row, so it answers with the tree's root rather
+# than the child's own worktree — the precise reconstruction the issue says an
+# operator is forced into today, now wearing the reader's name. The test compares
+# against the filesystem, so it fails; a test comparing against a recomputed path
+# would not.
+arm "F7 the reader answers with the parent's root" \
+    src/state/runs.rs \
+    's/"SELECT file FROM runs WHERE id = \?1"/"SELECT file FROM runs WHERE id = (SELECT COALESCE(parent_run_id, id) FROM runs WHERE id = ?1)"/' \
+    worktree a_worktree_childs_run_row_names_the_directory_its_files_are_in
+
+# ---- F9: a provider's Debug never prints the credential.
+# The hand-written impl gains the field it exists to omit. `#[derive(Debug)]`
+# would have been the more obvious mutation and is not usable: it collides with
+# the hand-written impl and fails to compile, which is not a kill.
+arm "F9 the hand-written Debug prints the key after all" \
+    src/provider/openrouter.rs \
+    's/            \.field\("model", &self\.model\)\n            \.finish_non_exhaustive\(\)/            .field("model", \&self.model)\n            .field("api_key", \&self.api_key)\n            .finish_non_exhaustive()/' \
+    verify openrouter_debug_hides_the_key
+
+# ---- F8: an asking posture is asked on exec.
+# The exec target is removed from the gated set, so the program never reaches an
+# approver and `Git::run`'s own ungated check refuses it exactly as it did before
+# this release — the whole defect, restored in one line.
 #
-# Aimed at the unit assertion over `extras_for`, which is why that function exists
-# (0.69.0). 0.68.0's equivalent arm SURVIVED against the fan-out test because a
-# child's contract is fresh *and* its extras are empty — two locks on one door, so
-# removing either leaves the end-to-end test green. The rule is asserted where it
-# lives, and this arm hands a child the root's inbox.
-arm "F6 a child is handed the root's extras" \
-    src/run.rs \
-    's/        _ => &NO_EXTRAS,/        _ => turn.unwrap_or(\&NO_EXTRAS),/' \
-    --lib a_child_has_no_inbox_to_hear_the_operators_fold_in
+# The first version of this arm flipped `Git::run`'s `Ask` arm to `false` and
+# SURVIVED, correctly: the deny-posture test is killed by the `Deny` arm, which
+# that mutation left intact, so it never touched the path the test exercises.
+# The arm has to remove the GATING, not weaken the backstop underneath it.
+arm "F8 the exec target is never gated" \
+    src/run/dispatch.rs \
+    's/                \(Act::Exec, crate::tools::git::GIT\.to_string\(\)\),\n//' \
+    ask_is_not_deny the_default_policy_asks_about_git_and_a_deferral_pauses_the_run
 
-# ---- F7: the drained state is complete.
-# The fold is dropped on its way out of the inbox, which is precisely what a
-# `pending()` that kept returning a 2-tuple would have done silently.
-arm "F7 the drain forgets the fold" \
-    src/session.rs \
-    's/Steered::Fold => out\.fold = true,/Steered::Fold => {}/' \
-    session_steering a_fold_nobody_read_is_still_in_the_inbox_and_a_late_one_is_an_error
+# ---- F10: a step cap with no criterion is still a step cap.
+# The new variant is returned whenever the cap is reached, which is the obvious
+# wrong version of #212 and passes the criterion's own positive arm. Only a run
+# with NO verification can tell the two apart, which is why F10 has a second arm
+# and why that arm is the one that matters.
+arm "F10 the cap always reports a verification failure" \
+    src/run/outcome.rs \
+    's/pub\(super\) fn capped_outcome\(judged_and_failed: bool, steps: u32\) -> \(&.static str, RunOutcome\) \{\n    if judged_and_failed \{/pub(super) fn capped_outcome(judged_and_failed: bool, steps: u32) -> (\&'"'"'static str, RunOutcome) {\n    if judged_and_failed || true {/' \
+    verification_outcome a_run_with_no_criterion_still_reports_the_plain_step_cap
 
-# ---- F8: the turn after a fold is seeded with the summary.
-# The walk stops finding folds at all, which is 0.68.0's behaviour: every fold is
-# undone at the next turn's first step.
-arm "F8 the seed never looks for a fold" \
-    src/session.rs \
-    's/            if rows\.is_empty\(\) \{/            if true {/' \
-    compaction the_turn_after_a_fold_is_seeded_with_the_summary_and_what_the_fold_left
+# ---- F11: the second attempt is informed by what the gate actually printed.
+# The recorded output is dropped and the section carries only the framing line.
+# The framing still names the phase and the step, so a test asserting that a
+# section arrived would pass; the criterion asserts the gate's own recorded text
+# reaches the request, which is the only thing that makes a retry informed.
+arm "F11 the section is framing without the output" \
+    src/run/outcome.rs \
+    's/    let mut key = phase\.unwrap_or_default\(\);\n    if let Some\(output\) = output \{/    let mut key = phase.unwrap_or_default();\n    if let Some(output) = output.filter(|_| false) {/' \
+    verification_outcome the_step_after_a_gate_failure_is_told_what_the_gate_said
 
-# ---- F9: a session that never folded is seeded exactly as it was.
-# A session with no folds is seeded with an empty paragraph in front of a
-# conversation nothing replaced. Only the control can see it.
-arm "F9 a paragraph is seeded whether or not one exists" \
-    src/session.rs \
-    's/        let Some\(\(consumed, text\)\) = self\.carried_fold\(store, &history, &starts\)\? else \{\n            return Ok\(out\);\n        \};/        let (consumed, text) = self.carried_fold(store, \&history, \&starts)?.unwrap_or((0, String::new()));/' \
-    compaction a_session_that_never_folded_is_seeded_exactly_as_it_was_before
+# ---- F11b: the same failure is carried once, not once per step.
+# The dedup key becomes the framed section, which NAMES THE STEP — so two
+# identical failures never compare equal and the guard is decorative. This is the
+# exact mistake the first implementation made and the arm that catches it: every
+# other assertion about the feedback still passes, because the content reaching
+# the model is unchanged; only the count moves.
+arm "F11b the dedup compares a key that includes the step" \
+    src/run/outcome.rs \
+    's/    let mut key = phase\.unwrap_or_default\(\);/    let mut key = format!("{step}");/' \
+    verification_outcome a_repeated_gate_failure_is_carried_once
 
-# ---- F10: the transcript holds it all and a reopened session seeds the same.
-# The summary replaces every entry before the folding turn rather than the ones
-# the fold consumed, which throws away the tail `keep_recent` kept whole.
-arm "F10 the summary replaces every earlier turn" \
-    src/session.rs \
-    's/            let reached = consumed\.saturating_add\(raw\)\.min\(starts\[at\]\);/            let reached = starts[at];/' \
-    compaction the_transcript_still_holds_it_all_and_a_reopened_session_seeds_the_same
+# ---- F10b: a resumed run does not un-conclude what a previous attempt judged.
+# The seed goes back to `false`, which is what the first implementation had. Every
+# other F10 assertion still passes — a run that reaches its cap in one go is
+# unaffected — and only a resume at the SAME cap, where the loop body never runs,
+# can see it. The durable row is what it corrupts, which is what makes it worth
+# an arm of its own.
+arm "F10b a resumed run starts having judged nothing" \
+    src/run/step.rs \
+    's/    let mut criterion_failed = criterion_already_failed\(store, run_id\);\n    \/\/ 0\.70\.0 — the gate-failure section/    let mut criterion_failed = false;\n    \/\/ 0.70.0 — the gate-failure section/' \
+    verification_outcome resuming_at_the_same_cap_does_not_rewrite_the_verification_failure
 
-# ---- F11: a turn that folded twice seeds the right remainder.
-# The off-by-one: a later fold's prefix begins with the paragraph the earlier one
-# wrote, and forgetting that consumes one conversation entry too many. Invisible
-# to any fixture that folds once.
-arm "F11 a later fold reaches one entry too far" \
-    src/session.rs \
-    's/                    \(row\.folded as usize\)\.saturating_sub\(1\)/                    row.folded as usize/' \
-    compaction a_turn_that_folded_twice_seeds_the_newest_paragraph_and_the_second_folds_remainder
+# ---- HIGH 2: the near-miss check reaches into a profile.
+# The recursion is removed, which is exactly the state the release shipped to
+# review with. The top-level check still passes, so only a profile-declared
+# server can see it — and a profile's `[[mcp]]` is merged over the base and
+# started like any other.
+arm "F4b the near-miss check does not look inside a profile" \
+    src/mcp.rs \
+    's/    if let Some\(profiles\) = table\.get\("profile"\)\.and_then\(toml::Value::as_table\) \{/    if let Some(profiles) = None::<\&toml::value::Table> {/' \
+    config a_near_miss_inside_a_profile_is_refused_and_names_the_profile
 
-# ---- F12: a fold in a later turn stands in for what the first one replaced.
-# The two index spaces are counted as one — `folded` measures the folding turn's
-# own ledger, whose first entry may be the paragraph an earlier turn left behind.
-# Forgetting to carry the earlier fold's reach is the defect a review found in
-# this release's first implementation: everything the first fold replaced comes
-# back beside a paragraph claiming to stand in for it.
-arm "F12 an inherited fold's reach is not carried forward" \
-    src/session.rs \
-    's/            let reached = consumed\.saturating_add\(raw\)\.min\(starts\[at\]\);/            let reached = raw.min(starts[at]);/' \
-    compaction a_fold_in_a_later_turn_stands_in_for_what_the_first_one_replaced
+# ---- MEDIUM 3: a switched-off bundle claims no id.
+# `seen.insert` moves back above the `enabled` branch, so a disabled entry holds
+# the id and the enabled twin beside it is dropped. The duplicate-id test still
+# passes — two ENABLED bundles still collide — so only the swap can see it.
+arm "F2b a disabled bundle reserves its id" \
+    src/plugin.rs \
+    's/                    if decl\.enabled \{\n                        if !seen\.insert\(plugin\.id\.clone\(\)\) \{/                    if true {\n                        if !seen.insert(plugin.id.clone()) {/' \
+    plugin a_disabled_twin_claims_no_id_and_the_enabled_one_loads
+
+# ---- LOW 6: a credential carried in the URL is not printed either.
+# The redactor becomes the identity function. Every existing F9 assertion still
+# passes, because those providers' default endpoints carry no credential — only
+# a caller-supplied base with the key in it can see this.
+arm "F9b the endpoint is printed verbatim" \
+    src/provider/mod.rs \
+    's/pub\(crate\) fn redacted_endpoint\(endpoint: &str\) -> String \{/pub(crate) fn redacted_endpoint(endpoint: \&str) -> String {\n    return endpoint.to_string();/' \
+    verify a_credential_carried_in_the_base_url_is_not_printed_either
 
 echo
 echo "arms killed: $pass   survived: $survived   broken: $broken"

@@ -923,9 +923,10 @@ async fn a_registered_tool_is_refused_by_the_policy_without_being_entered() {
     assert!(
         matches!(
             result.outcome,
-            io_harness::RunOutcome::StepCapReached { .. }
+            io_harness::RunOutcome::VerificationFailed { .. }
         ),
-        "a refusal is not a failed run, got {:?}",
+        "a refusal must not end the run early — the contract's own criterion is \
+         what decides the outcome, got {:?}",
         result.outcome
     );
 }
@@ -955,7 +956,7 @@ async fn a_failing_tool_becomes_an_observation_not_a_failed_run() {
     assert!(
         matches!(
             result.outcome,
-            io_harness::RunOutcome::StepCapReached { .. }
+            io_harness::RunOutcome::VerificationFailed { .. }
         ),
         "a failing tool must not end the run, got {:?}",
         result.outcome
@@ -1095,7 +1096,7 @@ async fn a_spawned_child_inherits_the_toolbox_and_the_call_is_its_own() {
     assert!(
         matches!(
             result.outcome,
-            io_harness::RunOutcome::StepCapReached { .. }
+            io_harness::RunOutcome::VerificationFailed { .. }
         ),
         "got {:?}",
         result.outcome
@@ -1129,7 +1130,7 @@ async fn a_toolbox_survives_a_tree_resume_and_still_reaches_a_child() {
     assert!(
         matches!(
             crashed.outcome,
-            io_harness::RunOutcome::StepCapReached { .. }
+            io_harness::RunOutcome::VerificationFailed { .. }
         ),
         "the first leg must stop mid-task, got {:?}",
         crashed.outcome

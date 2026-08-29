@@ -346,7 +346,7 @@ async fn a_workspace_replay_survives_being_interrupted_and_resumed() {
             .await
             .unwrap();
         assert!(
-            matches!(first.outcome, RunOutcome::StepCapReached { .. }),
+            matches!(first.outcome, RunOutcome::VerificationFailed { .. }),
             "the cap must stop it mid-task, not finish it: {first:?}"
         );
 
@@ -494,7 +494,7 @@ async fn a_single_file_replay_does_survive_being_interrupted_and_resumed() {
         let cut = single(dir.path()).with_max_steps(1);
         let first = io_harness::run(&cut, &p, &store).await.unwrap();
         assert!(
-            matches!(first.outcome, RunOutcome::StepCapReached { .. }),
+            matches!(first.outcome, RunOutcome::VerificationFailed { .. }),
             "the cap must cut it short: {first:?}"
         );
 

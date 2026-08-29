@@ -290,7 +290,7 @@ async fn a_plan_reads_back_in_the_order_the_agent_wrote_it() {
 /// The agent writes a plan it never finishes, and:
 ///
 /// 1. the outcome is the one the verification and the step budget dictate
-///    (`StepCapReached`), not one derived from an unfinished plan;
+///    (`VerificationFailed`), not one derived from an unfinished plan;
 /// 2. `todo_write` produced no `policy_events` row, because it is not gated;
 /// 3. the negative control — a real workspace write in the same run — *did* produce
 ///    one, so the absence above is the todo tool being ungated rather than the
@@ -327,7 +327,7 @@ async fn a_plan_is_inert() {
 
     // 1 — the outcome is the contract's, not the plan's.
     assert!(
-        matches!(result.outcome, RunOutcome::StepCapReached { .. }),
+        matches!(result.outcome, RunOutcome::VerificationFailed { .. }),
         "an unfinished plan must not change the outcome; got {:?}",
         result.outcome
     );
@@ -382,8 +382,9 @@ async fn an_empty_plan_clears_the_list_and_is_not_an_error() {
         "an empty write clears the plan"
     );
     assert!(
-        matches!(result.outcome, RunOutcome::StepCapReached { .. }),
-        "clearing a plan is not a failure; got {:?}",
+        matches!(result.outcome, RunOutcome::VerificationFailed { .. }),
+        "clearing a plan must not end the run; the contract's criterion is what \
+         decides the outcome; got {:?}",
         result.outcome
     );
 }
@@ -407,7 +408,7 @@ async fn a_malformed_plan_is_an_observation_rather_than_the_end_of_the_run() {
         .unwrap();
 
     assert!(
-        matches!(result.outcome, RunOutcome::StepCapReached { .. }),
+        matches!(result.outcome, RunOutcome::VerificationFailed { .. }),
         "a malformed plan must not end the run; got {:?}",
         result.outcome
     );

@@ -2499,7 +2499,24 @@ pub(super) async fn dispatch(
             };
 
             let mut remembered: Vec<Rule> = Vec::new();
-            let mut targets: Vec<(Act, String)> = vec![(repo_act, GIT_DIR.to_string())];
+            // 0.70.0 — spawning `git` is the first question, and until this
+            // release it was the one question that never reached the approver.
+            // `Git::run` asked the policy directly and refused anything that was
+            // not `Allow`, so the default policy's `exec: Ask` refused every git
+            // built-in with a message naming the program — which reads as "there
+            // is no git here" rather than "nobody was asked". Put through the
+            // same gate as the paths, it becomes an approval request and, if the
+            // approver defers, a pause the run can be resumed from.
+            //
+            // First rather than last because it is the coarsest: a run that may
+            // not spawn `git` at all should not be asked about the individual
+            // files it wanted to stage. The target is `GIT` itself, the string
+            // `Git::run` checks, so the approver is asked about what actually
+            // runs.
+            let mut targets: Vec<(Act, String)> = vec![
+                (Act::Exec, crate::tools::git::GIT.to_string()),
+                (repo_act, GIT_DIR.to_string()),
+            ];
             if let Some(act) = path_act {
                 targets.extend(paths.iter().map(|p| (act, p.clone())));
             }
@@ -2615,7 +2632,13 @@ pub(super) async fn dispatch(
                     record_sandbox_step(store, watch, depth, &event);
                 }
             }
-            let git = Git::new(ws.policy(), ws.root(), cap).contained(contained.clone());
+            // `.gated()` because the loop above already put `Act::Exec` on `GIT`
+            // through `gate`: the policy allowed it, or an approver said yes. A
+            // second raw policy check inside `Git::run` would read the same `Ask`
+            // and refuse the call a human had just approved.
+            let git = Git::new(ws.policy(), ws.root(), cap)
+                .contained(contained.clone())
+                .gated();
             // 0.21.0 — a refused git built-in costs a step, not the run.
             //
             // Until here, `Git::run`'s refusal left the loop as `Error::Refused`, so
@@ -2749,23 +2772,39 @@ pub(super) async fn dispatch(
         // An MCP tool. Invoking it is an exec check on its namespaced name, so a
         // policy can allow a server generally and still deny one of its tools.
         name if mcp.owns(name) => {
-            let verdict = ws.policy().check(Act::Exec, name);
-            if verdict.effect != Effect::Allow {
-                let mut ev = PolicyEvent::refusal(step, "exec", name);
-                ev.rule = verdict.rule.clone();
-                ev.layer = verdict.layer.clone();
-                store.record_event(run_id, &ev)?;
-                refused(watch, run_id, depth, &ev);
-                let why = verdict
-                    .rule
-                    .as_deref()
-                    .map(|r| format!(" (rule {r})"))
-                    .unwrap_or_default();
-                return Ok(Dispatched::go(
-                    format!("{name} refused"),
-                    format!("\n[{name} refused]{why} — the policy forbids calling this tool\n"),
-                ));
-            }
+            // 0.70.0 — through `gate`, not a bare policy check. This arm used to
+            // refuse anything that was not `Allow`, which turned `Effect::Ask`
+            // into a silent deny for every MCP tool a policy had not named
+            // outright: the sibling of the git defect, on the surface an operator
+            // is most likely to want a prompt for. A deferral now pauses the run
+            // with a pending row an attached process can answer, exactly as a
+            // write does.
+            let remember = match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Exec,
+                name,
+                None,
+                watch,
+                depth,
+                goal,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => return Ok(Dispatched::go(decision, obs)),
+                Gated::Paused { request_id } => return Ok(Dispatched::Pause { request_id }),
+                // The rewritten form is not honoured: an approver may narrow or
+                // deny, but "call a different MCP tool than the model asked for"
+                // is a substitution this arm has never made and the model's own
+                // arguments would not follow it. `gate` has already re-checked the
+                // rewrite against the policy, so nothing crosses a deny either way.
+                // The remembered rules do travel, so "allow this tool from now on"
+                // sticks for the rest of the run exactly as it does for a write.
+                Gated::Go { remember, .. } => remember,
+            };
             // 0.65.0 — an MCP server declares nothing about whether its tools may
             // be called twice, and this crate cannot see what one does, so every
             // call is `Indeterminate`. Opened before the call and closed after it,
@@ -2788,12 +2827,14 @@ pub(super) async fn dispatch(
             if let Some(id) = attempt {
                 store.close_attempt(id)?;
             }
-            Dispatched::seen(
-                format!("called {name}"),
-                format!("\n[{name}]\n{out}\n"),
-                ObsKind::Mcp,
-                Some(name.to_string()),
-            )
+            Dispatched::Continue {
+                decision: format!("called {name}"),
+                obs: format!("\n[{name}]\n{out}\n"),
+                kind: ObsKind::Mcp,
+                target: Some(name.to_string()),
+                changed: false,
+                remember,
+            }
         }
         other => Dispatched::go(
             format!("unknown tool {other}"),

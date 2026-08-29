@@ -439,12 +439,24 @@ impl Approver for DenyAll {
 /// to prevent — a model answering for a call it just made reports what the run
 /// already believes.
 ///
+/// The provider it holds needs no `Debug` of its own (0.70.0), and never needed
+/// one: [`Approver`] has no `Debug` supertrait, so the bound the derived `Debug`
+/// on this struct imposed bought nothing and shut out every shipped provider,
+/// none of which derive `Debug` because a derived one would print an API key.
+///
 /// ```
-/// # use io_harness::{Approver, ModelApprover};
-/// # fn demo<P: io_harness::Provider + std::fmt::Debug + Send + Sync>(provider: P) {
-/// let approver = ModelApprover::new(provider, "a-different-model");
+/// use io_harness::{Approver, ModelApprover, OpenRouter};
+///
+/// let approver = ModelApprover::new(
+///     OpenRouter::new("sk-not-a-real-key", "a-model"),
+///     "a-different-model",
+/// );
 /// assert_eq!(approver.model(), Some("a-different-model"));
-/// # }
+/// // Nothing of the provider — key included — reaches the formatter.
+/// assert_eq!(
+///     format!("{approver:?}"),
+///     "ModelApprover { model: \"a-different-model\", allow_self: false, .. }"
+/// );
 /// ```
 ///
 /// What it may decide is bounded by what reaches it, and that bound is the whole
@@ -457,11 +469,24 @@ impl Approver for DenyAll {
 ///
 /// A verdict it cannot read is [`Decision::Defer`], never an approval: the failure
 /// mode of a machine standing in for an absent human must be to park the question.
-#[derive(Debug)]
 pub struct ModelApprover<P> {
     provider: P,
     model: String,
     allow_self: bool,
+}
+
+impl<P> std::fmt::Debug for ModelApprover<P> {
+    /// What it will ask and whether it may answer for its own call, and
+    /// deliberately nothing about `P` — the same shape
+    /// [`ModelReviewer`](crate::ModelReviewer) uses. Printing the provider would
+    /// put back the `P: Debug` bound this release removed, and the reason that
+    /// bound was worth removing is that a provider holds a credential.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelApprover")
+            .field("model", &self.model)
+            .field("allow_self", &self.allow_self)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<P> ModelApprover<P> {
@@ -483,7 +508,7 @@ impl<P> ModelApprover<P> {
     ///
     /// ```
     /// # use io_harness::ModelApprover;
-    /// # fn demo<P: io_harness::Provider + std::fmt::Debug + Send + Sync>(provider: P) {
+    /// # fn demo<P: io_harness::Provider + Send + Sync>(provider: P) {
     /// use io_harness::Approver;
     /// let approver = ModelApprover::new(provider, "one-model").allow_self_approval(true);
     /// assert!(approver.self_approval_allowed());
@@ -529,7 +554,7 @@ struct Verdict {
     reason: String,
 }
 
-impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> ModelApprover<P> {
+impl<P: crate::provider::Provider + Send + Sync> ModelApprover<P> {
     /// Render the question, ask, and read the answer.
     async fn ask(&self, request: &Request, context: Option<&ApprovalContext>) -> Decision {
         let mut user = String::new();
@@ -595,7 +620,7 @@ impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> ModelApprover
     }
 }
 
-impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> Approver for ModelApprover<P> {
+impl<P: crate::provider::Provider + Send + Sync> Approver for ModelApprover<P> {
     fn decide<'a>(&'a self, request: &'a Request) -> DecisionFuture<'a> {
         Box::pin(async move { self.ask(request, None).await })
     }

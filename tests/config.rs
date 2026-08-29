@@ -2632,3 +2632,172 @@ fn a_project_scoped_file_may_lower_the_wait_ceiling_and_may_not_raise_it() {
         Some(600),
     );
 }
+
+// ---------------------------------------------------------------------------
+// 0.70.0 — `enabled` on `[[mcp]]`, and the near-miss check that guards it
+// ---------------------------------------------------------------------------
+
+/// One `[[mcp]]` table, plus whatever extra line the case under test needs.
+fn mcp_with(line: &str) -> String {
+    format!(
+        "[[mcp]]\nid = \"gh\"\ntransport = \"stdio\"\ncommand = \"github-mcp-server\"\n{line}\n"
+    )
+}
+
+/// The same server, declared inside a profile instead of at the top level.
+fn profile_mcp_with(line: &str) -> String {
+    format!(
+        "[[profile.prod.mcp]]\nid = \"gh\"\ntransport = \"stdio\"\n\
+         command = \"github-mcp-server\"\n{line}\n"
+    )
+}
+
+/// A near miss inside `[[profile.*.mcp]]` is refused too, and the diagnostic
+/// names the profile.
+///
+/// The hazard is identical to the top-level one and so is the reach: a profile's
+/// `[[mcp]]` array is merged over the base by `Config::with_profile` and the
+/// servers it names are the ones that get started. A check that read only the
+/// top level would leave the whole hazard open on the one path it did not cover
+/// — which is why `refuse_widening`, the validator standing beside this one,
+/// recurses into profile bodies for exactly the same reason.
+#[test]
+fn a_near_miss_inside_a_profile_is_refused_and_names_the_profile() {
+    for spelling in ["enabld", "enable", "Enabled"] {
+        let user_dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _guard = env(user_dir.path());
+        write(
+            project.path(),
+            "io.toml",
+            &profile_mcp_with(&format!("{spelling} = false")),
+        );
+
+        let err = Config::discover(project.path()).unwrap_err().to_string();
+        assert!(err.contains(spelling), "names the key written: {err}");
+        assert!(err.contains("`enabled`"), "names the key meant: {err}");
+        assert!(
+            err.contains("profile.prod.mcp"),
+            "names the profile, not a bare entry index an operator cannot locate \
+             when servers are declared in two places: {err}"
+        );
+    }
+}
+
+/// And the exemption still holds inside a profile: an unrelated unknown key is
+/// accepted there exactly as it is at the top level. Narrowing one hazard is not
+/// a licence to close the table.
+#[test]
+fn an_unrelated_unknown_key_inside_a_profile_is_still_accepted() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        &profile_mcp_with("some_future_key = \"whatever\""),
+    );
+
+    Config::discover(project.path())
+        .expect("an unknown key inside a profile's [[mcp]] is accepted, as at the top level");
+}
+
+/// The profile check on the other entry point too, for the same reason the
+/// top-level one is asserted twice: `from_toml` repeats the validator row.
+#[test]
+fn a_near_miss_inside_a_profile_is_refused_in_parsed_text_too() {
+    let err = Config::from_toml(&profile_mcp_with("enabld = false"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("enabld"), "names the key written: {err}");
+    assert!(err.contains("profile.prod.mcp"), "names the profile: {err}");
+}
+
+/// A server switched off in the file is still declared by it, and carries the
+/// flag through the loader to the contract the run reads.
+///
+/// The listing is the point: `mcp_servers` reports what was *configured*, so an
+/// operator who switched a server off can still see it, and switch it back on by
+/// editing one word rather than retyping the table.
+#[test]
+fn an_mcp_server_switched_off_in_the_file_is_still_listed() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(project.path(), "io.toml", &mcp_with("enabled = false"));
+
+    let config = Config::discover(project.path()).unwrap();
+    assert_eq!(config.mcp_servers().len(), 1, "still declared");
+    assert_eq!(config.mcp_servers()[0].id, "gh");
+    assert!(!config.mcp_servers()[0].enabled, "and switched off");
+
+    let contract = config.apply_to(contract(project.path()));
+    assert_eq!(contract.mcp.len(), 1, "it reaches the contract too");
+    assert!(!contract.mcp[0].enabled);
+
+    // The control, and the compatibility claim of the whole key: the same table
+    // without the line declares a server that runs.
+    write(project.path(), "io.toml", &mcp_with(""));
+    let config = Config::discover(project.path()).unwrap();
+    assert!(
+        config.mcp_servers()[0].enabled,
+        "a file written before the key existed means what it meant"
+    );
+}
+
+/// **F4 — a near-miss spelling of `enabled` is refused, naming the key.**
+///
+/// `[[mcp]]` is exempt from `deny_unknown_fields` because `McpServer` is
+/// `#[serde(flatten)]`-based, so a misspelled key in one of these tables is
+/// normally swallowed. For most keys that costs little. For this one it inverts
+/// the operator's intent: `enabld = false` is somebody switching a server off,
+/// and being dropped leaves it on.
+#[test]
+fn a_near_miss_spelling_of_mcp_enabled_is_refused_naming_it() {
+    for spelling in ["enabld", "enable", "Enabled"] {
+        let user_dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _guard = env(user_dir.path());
+        write(
+            project.path(),
+            "io.toml",
+            &mcp_with(&format!("{spelling} = false")),
+        );
+
+        let err = Config::discover(project.path()).unwrap_err().to_string();
+        assert!(err.contains(spelling), "names the key written: {err}");
+        assert!(err.contains("`enabled`"), "names the key meant: {err}");
+        assert!(err.contains("[[mcp]]"), "names the table: {err}");
+        assert!(err.contains("io.toml"), "and the file: {err}");
+    }
+}
+
+/// The same check on the other entry point. `Config::from_toml` repeats the
+/// validator row rather than sharing one with `read_scope`, so a check added to
+/// one and not the other is a hole a caller parsing text falls straight into.
+#[test]
+fn a_near_miss_spelling_of_mcp_enabled_is_refused_in_parsed_text_too() {
+    let err = Config::from_toml(&mcp_with("enabld = false"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("enabld") && err.contains("`enabled`"), "{err}");
+}
+
+/// The exemption stays. An unknown key inside an `[[mcp]]` table that is *not* a
+/// near miss of `enabled` is still accepted, exactly as before.
+///
+/// This is the control that keeps the check narrow: without it, refusing every
+/// unknown key would pass the test above, and that would be a different change
+/// to the file format than the one 0.70.0 makes.
+#[test]
+fn an_unrelated_unknown_key_in_an_mcp_table_is_still_accepted() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(project.path(), "io.toml", &mcp_with("colour = \"blue\""));
+
+    let config =
+        Config::discover(project.path()).expect("the `[[mcp]]` exemption is narrowed, not closed");
+    assert_eq!(config.mcp_servers().len(), 1);
+    assert!(config.mcp_servers()[0].enabled);
+}

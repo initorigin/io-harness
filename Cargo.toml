@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.69.0"
+version = "0.70.0"
 edition = "2021"
 # `libsqlite3-sys` 0.38.1 sets the floor from 0.23.0 on: its build script — and
 # `rusqlite` 0.40's own source — call the std `cfg_select!` macro, stabilised in
@@ -121,7 +121,7 @@ docx-rs = { version = "0.4", optional = true }
 # ten-day-old extraction crate, and the vetting rule that removed OCR applies to
 # convenience too.
 zip = { version = "8", optional = true, default-features = false, features = ["deflate"] }
-quick-xml = { version = "0.41", optional = true }
+quick-xml = { version = "0.42", optional = true }
 lopdf = { version = "0.44", optional = true }
 pdf-extract = { version = "0.12", optional = true }
 rxing = { version = "0.9", optional = true }
