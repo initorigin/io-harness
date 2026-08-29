@@ -570,17 +570,44 @@ fn a_credential_carried_in_a_base_url_is_not_printed_either() {
 /// than left to the downstream test that would have caught it a release later.
 #[test]
 fn serializing_a_spec_keeps_the_key_the_operator_wrote() {
-    let spec = ProviderSpec::Anthropic {
-        model: "claude-sonnet-4".into(),
-        api_key: Some(KEY.into()),
-    };
+    // Every variant that can carry a key, not one of them. This test asserted
+    // `Anthropic` alone until a sabotage arm landed on `OpenRouter` by accident
+    // and nothing went red — and `OpenRouter` is the variant the consumer this
+    // criterion exists for actually writes. A per-variant `#[serde]` attribute is
+    // exactly the kind of edit that lands on one arm of an enum, so covering one
+    // arm and calling it covered is how the gap gets in.
+    let specs = [
+        ProviderSpec::OpenRouter {
+            model: "anthropic/claude-sonnet-4".into(),
+            api_key: Some(KEY.into()),
+        },
+        ProviderSpec::Anthropic {
+            model: "claude-sonnet-4".into(),
+            api_key: Some(KEY.into()),
+        },
+        ProviderSpec::OpenAi {
+            model: "gpt-5".into(),
+            api_key: Some(KEY.into()),
+        },
+        ProviderSpec::Compatible {
+            model: "some-model".into(),
+            preset: None,
+            base_url: Some("https://gateway.example.test/v1".into()),
+            api_key: Some(KEY.into()),
+            auth: None,
+            name: None,
+            reference_prices: false,
+        },
+    ];
 
-    let json = serde_json::to_string(&spec).unwrap();
-    assert!(
-        json.contains(KEY),
-        "the key an operator typed must survive being written back out: {json}"
-    );
+    for spec in specs {
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(
+            json.contains(KEY),
+            "the key an operator typed must survive being written back out: {json}"
+        );
 
-    let back: ProviderSpec = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, spec, "and must come back equal");
+        let back: ProviderSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spec, "and must come back equal");
+    }
 }
