@@ -175,6 +175,36 @@ arm "F9 the hand-written Debug prints the key after all" \
     's/            \.field\("endpoint", &self\.endpoint\)\n            \.field\("model", &self\.model\)\n            \.finish_non_exhaustive\(\)/            .field("endpoint", \&self.endpoint)\n            .field("model", \&self.model)\n            .field("api_key", \&self.api_key)\n            .finish_non_exhaustive()/' \
     verify openrouter_debug_hides_the_key
 
+# ---- F8: an asking posture is asked on exec.
+# `Ask` is routed to `Allow` rather than to the approver. The approving arms all
+# still pass — the git built-in runs, which is what they check — so only the
+# DENY arm can see it, and it sees it by the approver never being consulted.
+# That is the arm the criterion was written around.
+arm "F8 an asking posture is treated as allow" \
+    src/tools/git.rs \
+    's/            Effect::Ask => !self\.gated,/            Effect::Ask => false,/' \
+    ask_is_not_deny a_deny_posture_refuses_git_without_consulting_the_approver
+
+# ---- F10: a step cap with no criterion is still a step cap.
+# The new variant is returned whenever the cap is reached, which is the obvious
+# wrong version of #212 and passes the criterion's own positive arm. Only a run
+# with NO verification can tell the two apart, which is why F10 has a second arm
+# and why that arm is the one that matters.
+arm "F10 the cap always reports a verification failure" \
+    src/run/outcome.rs \
+    's/pub\(super\) fn capped_outcome\(judged_and_failed: bool, steps: u32\) -> \(&.static str, RunOutcome\) \{\n    if judged_and_failed \{/pub(super) fn capped_outcome(judged_and_failed: bool, steps: u32) -> (\&'"'"'static str, RunOutcome) {\n    if judged_and_failed || true {/' \
+    verification_outcome a_run_with_no_criterion_still_reports_the_plain_step_cap
+
+# ---- F11: the second attempt is informed by what the gate actually printed.
+# The recorded output is dropped and the section carries only the framing line.
+# The framing still names the phase and the step, so a test asserting that a
+# section arrived would pass; the criterion asserts the gate's own recorded text
+# reaches the request, which is the only thing that makes a retry informed.
+arm "F11 the section is framing without the output" \
+    src/run/outcome.rs \
+    's/    if let Some\(output\) = output \{\n        section\.push_str\("The end of what it printed:\\n"\);/    if let Some(output) = output.filter(|_| false) {\n        section.push_str("The end of what it printed:\\n");/' \
+    verification_outcome the_step_after_a_gate_failure_is_told_what_the_gate_said
+
 echo
 echo "arms killed: $pass   survived: $survived   broken: $broken"
 git status --short -- src tests
