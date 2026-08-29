@@ -57,6 +57,19 @@
 //! billed under `<plugin>__<agent>`. Nothing was added to the store to make that
 //! true.
 //!
+//! # Switched off is not absent
+//!
+//! A `[[plugin]]` entry carries an `enabled` flag defaulting to true (0.70.0),
+//! so every file written before the key existed means exactly what it already
+//! meant. An entry written `enabled = false` is still read, validated and held
+//! to the same trust rule — switching a bundle on is a one-character edit, so a
+//! manifest may not smuggle a `[[hook]]` past the project-scope refusal by
+//! shipping it switched off — and then contributes nothing to any of the six. It
+//! is listed on [`Plugins::disabled`] rather than [`Plugins::iter`], because an
+//! operator who turned a bundle off still has to be able to see that it is
+//! declared: a capability missing from every listing reads the same as one
+//! nobody ever wrote down.
+//!
 //! # Nothing here can fail
 //!
 //! [`Plugins`] has no error path. A plugin with no manifest, unparseable TOML, an
@@ -335,8 +348,8 @@ pub struct Dropped {
 // The set
 // ---------------------------------------------------------------------------
 
-/// Every plugin one configuration declared: the ones that loaded and the ones
-/// that did not.
+/// Every plugin one configuration declared: the ones that loaded, the ones that
+/// were switched off, and the ones that did not load at all.
 ///
 /// Cheap to clone and carried by a [`TaskContract`], so a 0.5.0 tree's children
 /// see the same bundles their parent did.
@@ -369,6 +382,10 @@ pub struct Dropped {
 #[derive(Debug, Clone, Default)]
 pub struct Plugins {
     loaded: Vec<Plugin>,
+    /// Read and valid, and switched off (0.70.0). A third bucket rather than a
+    /// flag on `Plugin`, so every place that installs a contribution keeps
+    /// reading `loaded` and none of them can forget the check.
+    disabled: Vec<Plugin>,
     dropped: Vec<Dropped>,
 }
 
@@ -394,12 +411,14 @@ impl Plugins {
         self.loaded.iter().map(|p| p.id.as_str()).collect()
     }
 
-    /// How many loaded.
+    /// How many loaded. Says nothing about [`Plugins::disabled`] or
+    /// [`Plugins::dropped`].
     pub fn len(&self) -> usize {
         self.loaded.len()
     }
 
-    /// Whether none loaded. Says nothing about [`Plugins::dropped`].
+    /// Whether none loaded. Says nothing about [`Plugins::disabled`] or
+    /// [`Plugins::dropped`].
     pub fn is_empty(&self) -> bool {
         self.loaded.is_empty()
     }
@@ -408,6 +427,19 @@ impl Plugins {
     /// dropped.
     pub fn dropped(&self) -> &[Dropped] {
         &self.dropped
+    }
+
+    /// The bundles declared with `enabled = false` (0.70.0): read, valid, and
+    /// contributing nothing.
+    ///
+    /// Not a second [`Plugins::dropped`]. That one is a failure report, and
+    /// everything on it is something an operator has to fix; a bundle here is
+    /// doing exactly what the file asked of it, and its id, description, version
+    /// and [`Plugin::contributions`] are all readable so an operator can see what
+    /// turning it back on would bring. A bundle that is switched off *and*
+    /// broken is [`Dropped`], because a broken bundle is broken either way.
+    pub fn disabled(&self) -> &[Plugin] {
+        &self.disabled
     }
 
     /// `contract` with every plugin's agents, MCP servers and skills directories
@@ -525,34 +557,48 @@ impl Plugins {
     /// project the harness was pointed at, not the directory the declaring file
     /// happens to live in, which is the rule a `[[hook]]`'s `append` already
     /// follows.
-    pub(crate) fn load(declarations: &[(Scope, PathBuf)], root: &Path) -> Self {
+    ///
+    /// A declaration switched off is loaded and validated like any other and
+    /// then routed to [`Plugins::disabled`], because what an operator wants to
+    /// read about a bundle they turned off is what it *is*, and a manifest that
+    /// is refused while switched on is refused while switched off too.
+    pub(crate) fn load(declarations: &[(Scope, Declaration)], root: &Path) -> Self {
         let mut out = Self::default();
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        for (scope, rel) in declarations {
-            let dir = if rel.is_absolute() {
-                rel.clone()
+        for (scope, decl) in declarations {
+            let dir = if decl.path.is_absolute() {
+                decl.path.clone()
             } else {
-                root.join(rel)
+                root.join(&decl.path)
             };
             let fallback = dir
                 .file_name()
                 .map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into());
             match load_one(*scope, &dir) {
                 Ok(plugin) => {
+                    // A switched-off bundle is held to this check like any
+                    // other: two entries claiming one id is a mistake in the
+                    // configuration whichever of them is switched on, and the
+                    // check reserves nothing — a disabled bundle never reaches
+                    // `loaded`, so it holds no contribution name either way.
                     if !seen.insert(plugin.id.clone()) {
                         out.dropped.push(Dropped {
                             id: plugin.id.clone(),
                             path: dir,
                             error: format!(
-                                "a plugin with id `{}` is already loaded; two bundles cannot share \
-                                 an id, because the id is what every name they contribute is \
-                                 namespaced by",
+                                "a plugin with id `{}` is already declared; two bundles cannot \
+                                 share an id, because the id is what every name they contribute \
+                                 is namespaced by",
                                 plugin.id
                             ),
                         });
                         continue;
                     }
-                    out.loaded.push(plugin);
+                    if decl.enabled {
+                        out.loaded.push(plugin);
+                    } else {
+                        out.disabled.push(plugin);
+                    }
                 }
                 Err(error) => out.dropped.push(Dropped {
                     id: fallback,
@@ -715,4 +761,18 @@ fn check_narrowing(manifest: &Manifest, at: &Path) -> Result<()> {
 pub(crate) struct Declaration {
     /// The directory, relative to the discovery root or absolute.
     pub(crate) path: PathBuf,
+    /// Whether this bundle is switched on (0.70.0).
+    ///
+    /// Absent means on, which is what makes the key additive: an `io.toml`
+    /// written before 0.70.0 declares exactly the bundles it always declared. A
+    /// misspelling cannot be mistaken for an operator turning something off,
+    /// because `deny_unknown_fields` above refuses the entry outright.
+    #[serde(default = "default_enabled")]
+    pub(crate) enabled: bool,
+}
+
+/// The `enabled` default for a `[[plugin]]` entry that predates the field. See
+/// [`Declaration::enabled`].
+fn default_enabled() -> bool {
+    true
 }
