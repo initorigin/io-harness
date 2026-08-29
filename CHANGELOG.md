@@ -14,6 +14,20 @@ notes are produced from it.
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.70.0] - 2026-08-29
+
 The harness stops keeping things to itself. Every entry below is the same shape:
 a fact this crate already recorded, or an act it could already perform, that no
 caller could reach — and in one case, a decision the operator made that four code
