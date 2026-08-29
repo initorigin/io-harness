@@ -177,7 +177,7 @@ arm "F7 the reader answers with the parent's root" \
 # the hand-written impl and fails to compile, which is not a kill.
 arm "F9 the hand-written Debug prints the key after all" \
     src/provider/openrouter.rs \
-    's/            \.field\("endpoint", &self\.endpoint\)\n            \.field\("model", &self\.model\)\n            \.finish_non_exhaustive\(\)/            .field("endpoint", \&self.endpoint)\n            .field("model", \&self.model)\n            .field("api_key", \&self.api_key)\n            .finish_non_exhaustive()/' \
+    's/            \.field\("model", &self\.model\)\n            \.finish_non_exhaustive\(\)/            .field("model", \&self.model)\n            .field("api_key", \&self.api_key)\n            .finish_non_exhaustive()/' \
     verify openrouter_debug_hides_the_key
 
 # ---- F8: an asking posture is asked on exec.
