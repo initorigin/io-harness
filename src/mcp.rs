@@ -798,7 +798,11 @@ pub async fn probe_mcp(server: &McpServer, policy: &Policy) -> McpProbe {
                         layer,
                     }
                 }
-                Err(e) => return McpProbe::Unreachable { reason: e.to_string() },
+                Err(e) => {
+                    return McpProbe::Unreachable {
+                        reason: e.to_string(),
+                    }
+                }
             }
             let transport = StreamableHttpClientTransport::with_client(
                 net::http_client(),
@@ -852,7 +856,10 @@ async fn finish_probe<E: std::fmt::Display>(
             reason: format!("could not list tools: {e}"),
         },
         Ok(Ok(tools)) => McpProbe::Answered {
-            tools: tools.iter().map(|t| tool_name(&server.id, &t.name)).collect(),
+            tools: tools
+                .iter()
+                .map(|t| tool_name(&server.id, &t.name))
+                .collect(),
         },
     }
 }
@@ -1206,7 +1213,10 @@ mod tests {
         let err = check_enabled_spelling(&two, Path::new("io.toml"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("entry 1"), "counts to the offending table: {err}");
+        assert!(
+            err.contains("entry 1"),
+            "counts to the offending table: {err}"
+        );
     }
 
     /// F4's control — the exemption stays. An unknown key that is not a near miss
