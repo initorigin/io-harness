@@ -71,6 +71,55 @@ let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?
 
 Run it live: `cargo run --example mcp_run`.
 
+## The target a rule is matched against (0.71.0)
+
+An `allow_net` pattern is matched against a `host:port` string, not against a
+URL. An application that wants to decide about a URL of its own — a preflight
+before a run, a settings screen that says whether a configured endpoint is
+reachable under the current policy — has to reduce it the same way the harness
+does, or its answer is about a different string than the one the run will check.
+So the reduction is public, and it is the only thing `io_harness::net` exports:
+
+```rust
+use io_harness::net::target;
+
+assert_eq!(target("https://api.example.com/v1").as_deref(), Some("api.example.com:443"));
+assert_eq!(target("ws://example.com/socket").as_deref(), Some("example.com:80"));
+// An explicit port wins, and userinfo is not part of the host.
+assert_eq!(target("https://user:pw@example.com:8443/x").as_deref(), Some("example.com:8443"));
+// An IPv6 literal keeps its brackets, which is what makes the `:port` split unambiguous.
+assert_eq!(target("https://[::1]:8080/x").as_deref(), Some("[::1]:8080"));
+```
+
+The port is always present, filled from the scheme when the URL omits it — 443
+for `https` and `wss`, 80 for `http` and `ws` — so a rule that names a port has
+something to match and a rule that does not is still matched by
+`Policy::explain`'s bare-host form.
+
+**`None` is a refusal, not "nothing to check".** This is the whole of what a
+reimplementation gets wrong. `target` answers `None` for a URL with no `://`, an
+empty authority (`https://`), an empty host or an empty port
+(`https://host:/x`), and any scheme that opens no connection a policy could
+govern — `file:`, `data:`, anything outside `http`/`https`/`ws`/`wss`. An
+unrecognised scheme is a refusal rather than a pass-through precisely because "I
+did not recognise this" and "this is harmless" are not the same statement. So
+there is one correct shape for consuming it:
+
+```rust,ignore
+match target(url) {
+    Some(t) => policy_allows(&t),
+    None => false, // NOT `true`, and NOT "skip the check"
+}
+```
+
+A caller that reads `None` as "no target, so nothing to decide" reports
+*permitted* for exactly the URLs the runtime refuses.
+
+0.71.0 also removed a case where the shape was right and the value was not:
+`target("https://user@/x")` used to return `Some(":443")` after dropping the
+userinfo, a hostless target that a permissive policy matches and allows. An
+empty host is no host, so it is `None` now.
+
 ## Asking whether a server actually answers
 
 A policy preflight tells you whether a server is *permitted* to start. It cannot
@@ -115,10 +164,21 @@ approver instead of refusing. An approver that denies produces the observation
 above; one that defers pauses the run with a pending row, and the run resumes
 through `resume_with_decision` exactly as a deferred write does.
 
-A denied **host**, or a configured server that will not start, stops the run
-before anything happens, with `Error::Refused { act: "net", .. }` or
-`Error::Mcp { server, reason }` — because unlike a single tool call, there is no
-useful way for the agent to work around a capability it was told it had.
+A refused **server** stops the run before anything happens — because unlike a
+single tool call, there is no useful way for the agent to work around a
+capability it was told it had. Which error you get is decided by which check said
+no, and the two are not interchangeable:
+
+| What happened | Error |
+| --- | --- |
+| the policy refused a stdio server's binary | `Error::Refused { act: "exec", target: <command>, .. }` |
+| the policy refused a remote server's host | `Error::Refused { act: "net", target: <host:port>, .. }` |
+| the policy **allowed** the server, and then it would not spawn, the handshake failed, or its tools could not be listed | `Error::Mcp { server, reason }` |
+
+`Error::Mcp` is the far side of the policy line rather than the refusal itself.
+A caller mapping errors on the refusal path wants `Error::Refused` — that is the
+one case the check exists for, and matching `Error::Mcp` for it catches a broken
+command instead of a boundary decision.
 
 ## The limit, stated plainly
 

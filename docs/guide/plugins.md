@@ -99,6 +99,61 @@ named. And plugin-supplied policy may only **narrow**: a `[policy]` block may
 carry layers of `deny` rules and nothing else, so an `allow` rule, an `ask` rule
 or a `defaults` block drops the bundle.
 
+## Looking at a directory before declaring it (0.71.0)
+
+An installer downloads a bundle and then has to write a `[[plugin]]` line into
+somebody's configuration before anything will tell it whether that bundle loads.
+That is backwards: the operator finds out by running a job. `Plugins::inspect`
+answers first.
+
+```rust,ignore
+use io_harness::config::Scope;
+use io_harness::Plugins;
+
+let plugin = Plugins::inspect(Scope::User, "downloads/rust-review")?;
+println!("{} contributes {:?}", plugin.id(), plugin.contributions());
+```
+
+No declaration file is written and `Config::discover` is never called. Every
+check a load runs, runs here: the id grammar, the trust rule for `scope`, the
+narrowing rule on `[policy]`, the `[[hook]]` validator, and `${cmd:}` refused in
+a manifest wherever it came from. The error is the string that would have
+appeared on `Plugins::dropped()`, so a preflight and a load cannot disagree.
+
+It is **fallible** where loading a declared set is not, and deliberately: a set
+that dropped one bundle still has the others, while a caller asking about one
+directory is asking a yes-or-no question.
+
+### `scope` is the answer, not a formality
+
+It is the scope the caller intends to *declare* the bundle from, and the result
+differs by it — this is the table above as an API rather than a quirk of the
+loader:
+
+| `scope` | A manifest carrying `[[hook]]` or `[[mcp]]` |
+| --- | --- |
+| `Scope::User`, `Scope::Local` | returned like any other contribution — these are the operator's own files |
+| `Scope::Project` | **refused whole**, not shortened — `io.toml` arrives with a `git clone` |
+
+A bundle that would load from one file and not the other is exactly what an
+installer has to tell an operator *before* it writes anything, and marketplace
+install semantics are the reason: "this bundle wants to run a program on your
+machine, so it can only go in your own file" is a sentence somebody has to be
+shown. `${cmd:}` in a manifest is refused at either scope, so no choice of scope
+buys it.
+
+What comes back is the same `Plugin` a load produces, with an accessor per
+contribution kind — `skills_dir`, `templates_dir`, `agents`, `mcp_servers`,
+`hooks`, `policy_layers` — beside `id`, `description`, `version` and
+`contributions`. `hooks()` is 0.71.0's: `contributions()` has advertised
+`"hooks"` since 0.35.0 and there was no way to read the tables behind it, so an
+installer could say a bundle contributes hooks and not say what they do. The
+same accessors are on `Hook` itself; see [Hooks](hooks.md#reading-the-hooks-that-are-installed-0710).
+
+A bundle's hooks are not namespaced, and nothing was left out: a `[[hook]]`
+contributes no name for an id to prefix — it names events, a path and an argv,
+and all three belong to the operator's tree rather than to the bundle's.
+
 ## Attribution
 
 Every contributed name is namespaced `<plugin>__<name>` as it loads — skills,
@@ -139,6 +194,11 @@ if let Some(bad) = plugins.dropped().first() {
 signature, no checksum and no provenance. The trust rule bounds what an
 *untrusted* bundle may contribute, which is a different claim and the only one
 this crate can honestly make.
+
+**`Plugins::inspect` checks the manifest, not the author.** It answers "would
+this load, and what would it contribute" — which is the whole of what a preflight
+can know. A directory that inspects cleanly is still an unsigned directory, and
+every limit on this page holds for it unchanged.
 
 **Nothing fetches, installs or updates a bundle.** A `[[plugin]]` names a
 directory that already exists on this machine. Distribution is the application's.

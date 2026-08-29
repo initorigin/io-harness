@@ -258,6 +258,56 @@ it, the caller loads it, and nothing happens implicitly.
 `Hooks::is_empty()` says whether the file declared any, so an embedder that would
 rather not install an observer that does nothing can ask first.
 
+## Reading the hooks that are installed (0.71.0)
+
+`is_empty()` is a count, and a count is the wrong answer to the question an
+application layer actually has. A settings screen, a `doctor` command, or
+anything that installs hooks on an operator's behalf needs to say *what* is
+configured — otherwise the operator is told "3 hooks" about a file they were
+trying to debug. `Hooks::declarations()` returns the tables themselves, in
+declaration order, and `Hook` is public with an accessor per key:
+
+```rust
+use io_harness::{Config, OnFailure};
+
+let hooks = Config::discover(&root)?.hooks();
+for hook in hooks.declarations() {
+    let what = match hook.at() {
+        Some(point) => format!("before {point}, tools {:?}", hook.tools()),
+        None if hook.on().is_empty() => "every event".to_string(),
+        None => format!("events {:?}", hook.on()),
+    };
+    let action = match (hook.append(), hook.run()) {
+        (Some(path), _) => format!("append {}", path.display()),
+        (_, Some(argv)) => format!("run {argv:?}"),
+        _ => unreachable!("the loader refuses a table with neither"),
+    };
+    println!("{what}: {action} ({:?}, timeout {:?})", hook.on_failure(), hook.timeout_ms());
+}
+```
+
+Two of those accessors are not plain field reads, and the difference is the
+point:
+
+- **`on_failure()` resolves the kind's default.** A table that wrote nothing
+  still has an answer, and it is not the same answer for both kinds — an event
+  hook continues, a lifecycle hook refuses. There is deliberately no accessor for
+  the raw `Option`, because a reader who took it would have to re-derive that
+  rule to say anything true, and `OnFailure::default()` is `Continue`, which is
+  right for only one of the two.
+- **`timeout_ms()` is the key rather than a resolved number.** It answers "did
+  the operator choose this?", which is what a caller *showing* the table needs;
+  the module's own default fills in when they did not.
+
+`OnFailure` is `#[non_exhaustive]`: match it with a `_ =>` arm. The obvious next
+lifecycle point takes an answer these three do not — an `after_tool` hook decides
+about a result rather than about a call — and paying for the arm once now is what
+keeps that from being a break.
+
+This is the configuration half of the answer. A [capability bundle](plugins.md)
+can contribute hooks too, and `Plugin::hooks()` is the bundle half; after
+`Plugins::apply_to_hooks`, `declarations()` returns both, the file's first.
+
 One `Hooks` covers a whole [tree](composition.md): a child's events reach it with
 the child's own `run_id` and a non-zero `depth`, like any other observer's.
 

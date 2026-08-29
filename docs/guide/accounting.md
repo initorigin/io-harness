@@ -128,6 +128,45 @@ by omission.
 The as-of date is required at construction for the same reason: a price list with
 no date is a claim with no expiry, and yours *will* go stale.
 
+## Reading the table back (0.71.0)
+
+A table you built is also one you can ask about — which models it covers, and
+whether it covers anything at all.
+
+```rust
+use io_harness::pricing::{Price, PriceTable, PriceTier};
+
+let prices = PriceTable::new("2026-07-29")
+    .with("some-vendor/zeta", Price { input: 1_000_000, ..Price::ZERO })
+    .with("some-vendor/alpha", Price { input: 2_000_000, ..Price::ZERO })
+    .with_tiers(
+        "some-vendor/tiers-only",
+        vec![PriceTier { min_prompt_tokens: 200_000, price: Price::ZERO }],
+    );
+
+assert_eq!(prices.models(), vec!["some-vendor/alpha", "some-vendor/zeta"]);
+assert_eq!(prices.len(), 2);
+assert!(!prices.is_empty());
+```
+
+`models()` comes back sorted, because the table is a `BTreeMap` — the same order
+on every call and on every machine, so a rendered list does not reshuffle between
+two reads of the same table. `is_empty()` is the check for the table nobody has
+entered a price into yet, which is the state `PriceTable::new` starts in and the
+state in which every group comes back a floor of zero with all of its calls
+counted as unpriced.
+
+**It lists what the table can *price*, which is not every model it mentions.**
+Base prices and prompt-length tiers are independently keyed maps: `with_tiers`
+can name a model `with` never priced, and such a model is **unpriced** —
+`cost_micros` returns `None` for it, exactly as it does for a model the table
+never heard of, because the tier is a rate that replaces a base price rather than
+one that stands in for a missing one. So `models()` and `len()` are the base
+keys alone and a tier-only model is absent from both. Rendering "the models we
+can price" from the union of the two instead would name a model the table then
+declines to price, and the run would report an unpriced call for a model the
+same UI had just claimed to cover.
+
 ## A search is charged per request
 
 `Price::per_server_tool_request` is the one line in the table that is **not** per

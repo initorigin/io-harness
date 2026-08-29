@@ -76,6 +76,40 @@ the model as a tool result it can adapt to, and the refusal consumes a step, so
 a model retrying it reaches the step cap rather than looping. Only the
 **ask** tier prompts.
 
+### Listing the three effects (0.71.0)
+
+An application that puts the effects in front of an operator — a dropdown, an
+`--effect` flag, a config validator naming what it accepts — needs them as data
+rather than as three variants written out by hand. `Effect::ALL` is that list, in
+the strictness order the derived `Ord` documents, and `Effect::as_str` is the
+word a policy file spells each one with: the deserializer's own spelling, not a
+second one to keep in step with it.
+
+```rust
+use io_harness::Effect;
+
+assert_eq!(Effect::ALL, [Effect::Allow, Effect::Ask, Effect::Deny]);
+assert_eq!(Effect::Ask.as_str(), "ask");
+
+// Strictest-first is `.rev()` on the same list — the precedence
+// `Policy::explain` resolves in, rather than a second list to keep in step.
+let strictest_first: Vec<Effect> = Effect::ALL.into_iter().rev().collect();
+assert_eq!(strictest_first, [Effect::Deny, Effect::Ask, Effect::Allow]);
+```
+
+**`Effect` is not `#[non_exhaustive]`, and `ExecMode` is** — which is why only
+one of the two needs this list to be shipped for you. A hand-written match over
+the three effects is self-policing: a fourth effect stops your build until you
+handle it. A hand-written list of exec modes is not policed at all, because
+`ExecMode` is `#[non_exhaustive]` and your match needs a wildcard arm — a mode
+added in a later release lands in that arm, your build keeps passing, and the
+mode is silently missing from your menu. Only a *removal* would break you, which
+is the wrong way round for the enum that decides where model-produced code may
+write. The enum whose values are the more security-relevant of the two is the one
+that cannot be gated downstream, and that is the whole reason `ExecMode::ALL`
+exists; it is in
+[Running commands](command-execution.md#the-three-modes-0400-0460).
+
 ### How a rule matches
 
 A rule's `pattern` is a glob — `*` matches any run of characters including `/`,
