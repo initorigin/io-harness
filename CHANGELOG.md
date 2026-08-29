@@ -35,9 +35,10 @@ the crate itself printed credentials through a derived `Debug`.
 
 ### Breaking changes
 
-- **BREAKING (behaviour)** — `{:?}` and `{:#?}` of `Config`, `File` and
-  `ProviderSpec` no longer print resolved secrets, and their output is different
-  text than it was. Each type now has a hand-written `Debug` instead of a derived
+- **BREAKING (behaviour)** — `{:?}` and `{:#?}` no longer print resolved secrets
+  for `Config`, `File`, `ProviderSpec`, `McpServer`, `McpTransport`, `LspServer`,
+  `Hook` or `Toolchain`, and their output is different text than it was. Each
+  type now has a hand-written `Debug` instead of a derived
   one: a provider's `api_key` renders as `<redacted>` when set and `None` when
   not, a `Compatible` `base_url` goes through the same endpoint redaction the
   provider types have used since 0.70.0, and `Config`'s `raw` table renders as
@@ -50,6 +51,19 @@ the crate itself printed credentials through a derived `Debug`.
   decided a setting. `Serialize` is deliberately unchanged and still round-trips
   an `api_key` verbatim, so a tool that writes a configuration file back still
   writes the operator's real key.
+
+- **BREAKING (behaviour)** — a plugin manifest is no longer substituted at all.
+  `${env:}` and `${file:}` join `${cmd:}` in being refused, in every scope, and
+  the manifest is now parsed by a reader that does not resolve substitutions at
+  all rather than by the resolving parser with a check after it. Only `${cmd:}`
+  was refused before, which was sufficient while a manifest could be reached only
+  after an operator had written a `[[plugin]]` entry naming it — a trust act.
+  `Plugins::inspect`, new in this release, is pointed at directories nobody has
+  agreed to yet. *Migration:* write the value out literally. A manifest is a
+  third party's file, and there is deliberately no opt-out: if a bundle needs a
+  value from the host environment, the operator supplies it in their own
+  configuration, where substitutions still resolve normally. No manifest in this
+  repository or its fixtures used either form.
 
 ### Added
 
@@ -100,6 +114,16 @@ the crate itself printed credentials through a derived `Debug`.
   authority and the empty host fell through to the scheme's default port. A
   hostless target that a permissive policy would then allow. It is `None`, and
   therefore a refusal, like every other unresolvable URL.
+- `net::target` fail-opened on four more shapes, all of them bracketed. An empty
+  IPv6 host (`https://[]/x`), an empty IPv6 port (`https://[::1]:/x`), a tail
+  after the bracket that is not a port at all (`https://[::1]evil.com/x`), and an
+  unclosed bracket (`https://[/x`) each produced a target instead of a refusal —
+  while the identical shapes without brackets correctly produced none. The IPv6
+  branch funnelled every tail it could not read into the scheme's default port,
+  and the unclosed case escaped that branch entirely and was read as a bare host.
+  The documented contract already said an empty host or an empty port is a
+  refusal, so a consumer written from the documentation was stricter than the
+  crate it was copying from.
 - The Windows containment test's "can execute a program" row probed an arbitrary
   program on `PATH`, which on a CI runner is a rustup shim that starts, fails to
   read the host's own toolchain home, and exits non-zero — so the row reported a
@@ -121,8 +145,20 @@ the crate itself printed credentials through a derived `Debug`.
   on its own; the exposure is an embedder that logs or dumps its effective
   configuration, which is an ordinary thing to build. **Upgrading is the fix**,
   and there is no workaround on an earlier version short of never formatting
-  those three types. Found by sweeping for the class 0.70.0 closed one instance
-  of, rather than from a report.
+  those types. Found by sweeping for the class 0.70.0 closed one instance of,
+  rather than from a report.
+- **The same leak reached one call further out, through the accessors.** Hiding a
+  secret in `Config`'s own `Debug` while `Config::mcp_servers()` handed back a
+  type that still derived `Debug` would have closed the reported shape and left
+  the reachable one open — which is exactly what 0.70.0 did when it fixed four
+  provider types and missed the configuration layer beneath them. So `McpServer`
+  and `McpTransport` (an `Authorization` header, a stdio child's environment and
+  argv), `LspServer` (a child's environment and argv), `Hook` (an argv and an
+  append path) and `Toolchain` (six argv vectors from `[toolchain.*]`) all have
+  hand-written `Debug` impls too. Each shows what an operator needs to recognise
+  the thing — the id, the program, the header and environment *key names* — and
+  hides every value a substitution could have filled. `Serialize` is untouched on
+  every one of them.
 
 ## [0.70.0] - 2026-08-29
 

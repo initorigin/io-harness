@@ -93,9 +93,14 @@ The refusal is **whole**. A project-scoped bundle whose manifest declares a hook
 contributes none of its other five kinds either — a half-applied stranger's
 manifest is the failure the rule exists to prevent.
 
-Two rules apply in every scope. `${cmd:}` inside a manifest is refused wherever
-the declaring file lives, because a bundle is a third party's file however it was
-named. And plugin-supplied policy may only **narrow**: a `[policy]` block may
+Two rules apply in every scope. **A manifest is not substituted at all** —
+`${env:}`, `${file:}` and `${cmd:}` are each refused wherever the declaring file
+lives, because a bundle is a third party's file however it was named. Resolving
+one would read this machine's environment or its files, or run a program on it,
+for a directory nobody has agreed to yet; `${file:}` in particular resolves
+through `Path::join`, where an absolute argument replaces the base entirely.
+Write the value out instead. And plugin-supplied policy may only **narrow**: a
+`[policy]` block may
 carry layers of `deny` rules and nothing else, so an `allow` rule, an `ask` rule
 or a `defaults` block drops the bundle.
 
@@ -116,8 +121,8 @@ println!("{} contributes {:?}", plugin.id(), plugin.contributions());
 
 No declaration file is written and `Config::discover` is never called. Every
 check a load runs, runs here: the id grammar, the trust rule for `scope`, the
-narrowing rule on `[policy]`, the `[[hook]]` validator, and `${cmd:}` refused in
-a manifest wherever it came from. The error is the string that would have
+narrowing rule on `[policy]`, the `[[hook]]` validator, and every substitution
+refused in a manifest wherever it came from. The error is the string that would have
 appeared on `Plugins::dropped()`, so a preflight and a load cannot disagree.
 
 It is **fallible** where loading a declared set is not, and deliberately: a set
@@ -139,8 +144,8 @@ A bundle that would load from one file and not the other is exactly what an
 installer has to tell an operator *before* it writes anything, and marketplace
 install semantics are the reason: "this bundle wants to run a program on your
 machine, so it can only go in your own file" is a sentence somebody has to be
-shown. `${cmd:}` in a manifest is refused at either scope, so no choice of scope
-buys it.
+shown. No substitution in a manifest resolves at either scope, so no choice of
+scope buys one.
 
 What comes back is the same `Plugin` a load produces, with an accessor per
 contribution kind — `skills_dir`, `templates_dir`, `agents`, `mcp_servers`,
