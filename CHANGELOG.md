@@ -41,7 +41,9 @@ paths did not honour.
   contributes nothing to skills, templates, agents, MCP servers, hooks or policy.
   Both stay readable as configured-and-off — `Plugins::disabled()` lists the
   bundles — because a capability missing from a listing cannot be told apart from
-  one that was never declared.
+  one that was never declared. A switched-off bundle claims no id, so switching
+  one off and declaring its replacement beside it works: two bundles sharing an
+  id collide only when both are switched on.
 - A near-miss check for the `enabled` key inside an `[[mcp]]` table. That table is
   the one section exempt from `deny_unknown_fields`, so `enabld = false` would
   otherwise be swallowed in silence and the server the operator disabled would
@@ -96,8 +98,12 @@ paths did not honour.
   `resume`: a gate is re-run from scratch on the next step, so a repaired machine
   or a raised budget can still turn it green.
 - A failing verification gate's phase and its recorded output are appended to the
-  next step's request, so a retry is informed rather than blind. Bounded, and the
-  bound is asserted rather than assumed. (#211)
+  next step's request, so a retry is informed rather than blind. Bounded by a line
+  count and a character cap together, and the bound is asserted rather than
+  assumed. A failure that repeats is carried **once**, not once per step: the
+  ledger accumulates for the whole run, so appending a near-identical block per
+  failing step would re-send all of them on every request thereafter. A failure
+  that changes is carried again. (#211)
 - `McpServer` gains a public `enabled` field and is not `#[non_exhaustive]`.
   **Migration:** a struct-literal construction of `McpServer` stops compiling; use
   `McpServer::stdio` or `McpServer::http`, which every construction in this
@@ -132,6 +138,12 @@ paths did not honour.
   carry a hand-written `Debug` that prints the endpoint and the model and never
   the credential. Found while fixing #213, which had described the same code as a
   missing implementation.
+- **A credential carried in the endpoint URL is not printed either.** Withholding
+  the `api_key` field is not enough on its own: a base URL is caller-supplied, and
+  gateway and Azure-style deployments routinely carry the key in it, as
+  `https://user:sk-…@host/v1` or `https://host/v1?api-key=sk-…`. The four `Debug`
+  impls now strip userinfo and the query string, keeping scheme, host, port and
+  path — which is what someone debugging a misconfiguration is looking at.
 
 ## [0.69.0] - 2026-08-25
 

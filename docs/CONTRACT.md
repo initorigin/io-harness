@@ -3390,10 +3390,16 @@ loaded set and none of them can forget the check.
 rule.** It is loaded, so a broken one is reported as broken whether or not it is
 switched on, and a project-scoped bundle declaring a hook is refused even while
 disabled — switching it on is a one-character edit, and a refusal that can be
-sidestepped by shipping something switched off is not a refusal. It reserves no
-contribution namespace, because it never enters the collection a namespace is
-claimed in. It does still take part in duplicate-id detection: two declarations
-claiming one id is a configuration mistake either way.
+sidestepped by shipping something switched off is not a refusal.
+
+**And it claims no id.** A bundle's id is what namespaces the names it
+contributes, and a disabled one contributes nothing, so holding the id against it
+would be reserving a name nobody uses — and would break the swap this flag exists
+to make easy. Switching `tools-v1` off and declaring `tools-v2` beside it is a
+one-line edit; if the disabled entry held the id, the new bundle would be dropped
+as a duplicate and neither would contribute, with the failure reported against
+the entry the operator did not touch. Two bundles sharing an id collide only when
+**both are switched on**, which is a real clash over a live namespace.
 
 **The `[[mcp]]` exemption stays, and one key inside it is checked anyway.** That
 table cannot carry `deny_unknown_fields` — `McpServer` is `#[serde(flatten)]`-based
@@ -3483,12 +3489,21 @@ never pass, and terminality needs evidence the crate does not have.
 
 **A failing gate now tells the next step what it said.** The failing phase and
 the recorded output arrive as an ordinary `ObsKind::Error` observation on the
-ledger — not as a new prompt section, so the cached prefix keeps its shape — for
-the next step only, and never on the last step, which has no request left to
-inform. It is bounded twice, by a line count and by a character cap, because a
-tail is what is useful about a runner's output and a cap is what makes it safe
-when a single line is enormous. The trace records which attempt was informed and
-which was blind.
+ledger — not as a new prompt section, so the cached prefix keeps its shape — and
+never on the last step, which has no request left to inform. It is bounded twice,
+by a line count and by a character cap, because a tail is what is useful about a
+runner's output and a cap is what makes it safe when a single line is enormous.
+The trace records which attempt was informed and which was blind.
+
+**A repeated failure is carried once.** The ledger accumulates for the whole run,
+so a criterion failing the same way at every step would append a near-identical
+block per step and re-send all of them on every request thereafter — a context
+leak with a plausible-looking cause. Each append is compared against the last
+one, and the comparison is on **what the gate said** — its phase and the tail of
+its output — rather than on the section, which opens by naming the step and so
+would never match itself. A failure that changes is carried again. The ledger is
+never shortened to achieve this: it is tracked by a watermark index, and anything
+that shortens it in place corrupts the store.
 
 **Two gaps are stated rather than closed.** A failing `Verification::Review`
 writes its reasons to `gate_attempts` and nothing to `sandbox_events`, so a
