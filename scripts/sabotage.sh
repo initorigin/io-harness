@@ -136,12 +136,17 @@ arm "F4 the near-miss check rejects every unknown key" \
     config an_unrelated_unknown_key_in_an_mcp_table_is_still_accepted
 
 # ---- F5: the probe shuts the server down again.
-# The teardown is dropped. Every other half of F5 still passes — the four answers
-# are still told apart — so a test that only checked the verdicts would report a
-# healthy probe while leaving a child process per call.
-arm "F5 the probe leaves the server running" \
+# `std::mem::forget`, NOT a removal of the `cancel()` call. The first version of
+# this arm replaced `cancel()` with a no-op and SURVIVED, and the survival was
+# right: rmcp's `ChildWithCleanup` kills the child on `Drop`, so deleting the
+# explicit shutdown swaps one correct mechanism for another and breaks nothing.
+# Leaking the handle is what actually leaves the server running, and it is the
+# only mutation this criterion's property can see. Recorded rather than quietly
+# re-aimed: the explicit `cancel()` is belt-and-braces for the stdio case and is
+# load-bearing only for a transport with no child process to reap.
+arm "F5 the probe leaks the server handle" \
     src/mcp.rs \
-    's/    let _ = service\.cancel\(\)\.await;/    let _ = \&service;/' \
+    's/    let _ = service\.cancel\(\)\.await;/    std::mem::forget(service);/' \
     mcp a_probe_leaves_no_child_process_behind
 
 # ---- F6: the sweep preview equals the sweep.
@@ -176,14 +181,18 @@ arm "F9 the hand-written Debug prints the key after all" \
     verify openrouter_debug_hides_the_key
 
 # ---- F8: an asking posture is asked on exec.
-# `Ask` is routed to `Allow` rather than to the approver. The approving arms all
-# still pass — the git built-in runs, which is what they check — so only the
-# DENY arm can see it, and it sees it by the approver never being consulted.
-# That is the arm the criterion was written around.
-arm "F8 an asking posture is treated as allow" \
-    src/tools/git.rs \
-    's/            Effect::Ask => !self\.gated,/            Effect::Ask => false,/' \
-    ask_is_not_deny a_deny_posture_refuses_git_without_consulting_the_approver
+# The exec target is removed from the gated set, so the program never reaches an
+# approver and `Git::run`'s own ungated check refuses it exactly as it did before
+# this release — the whole defect, restored in one line.
+#
+# The first version of this arm flipped `Git::run`'s `Ask` arm to `false` and
+# SURVIVED, correctly: the deny-posture test is killed by the `Deny` arm, which
+# that mutation left intact, so it never touched the path the test exercises.
+# The arm has to remove the GATING, not weaken the backstop underneath it.
+arm "F8 the exec target is never gated" \
+    src/run/dispatch.rs \
+    's/                \(Act::Exec, crate::tools::git::GIT\.to_string\(\)\),\n//' \
+    ask_is_not_deny the_default_policy_asks_about_git_and_a_deferral_pauses_the_run
 
 # ---- F10: a step cap with no criterion is still a step cap.
 # The new variant is returned whenever the cap is reached, which is the obvious
