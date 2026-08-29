@@ -535,13 +535,21 @@ impl ProviderSpec {
 ///
 /// A newtype rather than a `&str` because `&str`'s own `Debug` quotes it, and
 /// `api_key: "<redacted>"` reads like a key whose value happens to be that text.
-struct Marker(&'static str);
+pub(crate) struct Marker(pub(crate) &'static str);
 
 impl std::fmt::Debug for Marker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.0)
     }
 }
+
+/// The one spelling of a withheld value, for every module that withholds one.
+///
+/// It is a constant rather than a literal repeated per module for the reason this
+/// whole release exists: the seven hand-written `Debug` impls added in 0.71.0 span
+/// five files, and a second spelling of this word would make an operator's output
+/// disagree with itself depending on which type printed it.
+pub(crate) const REDACTED: Marker = Marker("<redacted>");
 
 /// `<redacted>` for a credential that is set, `None` for one that is not.
 ///
@@ -551,11 +559,11 @@ impl std::fmt::Debug for Marker {
 /// misconfigurations with different fixes. Nothing else is said — not the length,
 /// not a prefix, not a suffix — because each of those narrows *which* key it is.
 fn secret<T>(value: &Option<T>) -> Marker {
-    Marker(if value.is_some() {
-        "<redacted>"
+    if value.is_some() {
+        REDACTED
     } else {
-        "None"
-    })
+        Marker("None")
+    }
 }
 
 /// `<set>` for a section a file wrote, `None` for one no file mentioned.

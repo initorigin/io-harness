@@ -11,6 +11,21 @@
 //! `ProviderSpec` at all. Both paths are asserted here, because fixing either one
 //! alone leaves the credential in the first log line anyone writes.
 //!
+//! Hiding them on `Config` is not enough on its own, and that gap is asserted
+//! here too. `File`'s impl omits the `[[mcp]]`, `[[lsp]]` and `[[hook]]` bodies
+//! *because* each of them holds a substituted string — and `Config::mcp_servers`,
+//! `Config::lsp_servers` and `Config::hooks` then hand those bodies straight back
+//! to the caller. A redaction one call deep and a derived `Debug` one call
+//! further on is not a redaction, so `McpTransport`, `McpServer`, `LspServer` and
+//! `Hook` each have a hand-written impl of their own and each is asserted below.
+//!
+//! The same reasoning reaches three more accessors, and they are asserted here
+//! too: `Config::toolchain` overlays a `[toolchain.<ecosystem>]` table's six
+//! argvs onto a detection, `Config::browser` hands back a `[browser]` table whose
+//! extra arguments are how a proxy credential is written, and `Config::agents`
+//! hands back a roster whose `role` is a free-form prompt string. A `${env:}`
+//! fills any of them exactly as it fills a hook's argv.
+//!
 //! Every absence assertion carries a positive control in the same pass:
 //! `f.debug_struct("Config").finish()` hides the secret perfectly and tells an
 //! operator nothing, and it would pass an absence-only test for ever. So the
@@ -41,14 +56,63 @@ const KEY: &str = "sk-SENTINEL-PROVIDER-KEY-DO-NOT-PRINT";
 /// `ProviderSpec`.
 const TOKEN: &str = "SENTINEL-MCP-BEARER-DO-NOT-PRINT";
 
+/// A language server's child environment — the `[[lsp]]` path, which reaches a
+/// formatter through `Config::lsp_servers` and through nothing else.
+const LSP_TOKEN: &str = "SENTINEL-LSP-ENV-DO-NOT-PRINT";
+
+/// A hook's argv — the `[[hook]]` path. An argument is the ordinary way to hand a
+/// child process a credential, and `Hook` became public in this release.
+const HOOK_TOKEN: &str = "SENTINEL-HOOK-ARGV-DO-NOT-PRINT";
+
+/// A `[toolchain.<ecosystem>]` override's argv — six of them per ecosystem, each
+/// an argv the embedding application hands to `exec`.
+const TOOLCHAIN_TOKEN: &str = "SENTINEL-TOOLCHAIN-ARGV-DO-NOT-PRINT";
+
+/// An `[[agent]]` role — a free-form prompt string, which a `${env:}` fills like
+/// every other string in the table.
+const AGENT_TOKEN: &str = "SENTINEL-AGENT-ROLE-DO-NOT-PRINT";
+
+/// A `[browser]` extra argument. `--proxy-server=https://user:pass@host` is the
+/// ordinary way to point a browser at an authenticated proxy, so this is a live
+/// credential path rather than a hypothetical one.
+const BROWSER_TOKEN: &str = "SENTINEL-BROWSER-ARG-DO-NOT-PRINT";
+
+/// Every sentinel, so one helper covers every rendering rather than each test
+/// remembering which secrets its own value can reach.
+const SECRETS: &[&str] = &[
+    KEY,
+    TOKEN,
+    LSP_TOKEN,
+    HOOK_TOKEN,
+    TOOLCHAIN_TOKEN,
+    AGENT_TOKEN,
+    BROWSER_TOKEN,
+];
+
 const KEY_VAR: &str = "IO_HARNESS_SECRETS_TEST_KEY";
 const TOKEN_VAR: &str = "IO_HARNESS_SECRETS_TEST_TOKEN";
+const LSP_VAR: &str = "IO_HARNESS_SECRETS_TEST_LSP";
+const HOOK_VAR: &str = "IO_HARNESS_SECRETS_TEST_HOOK";
+const TOOLCHAIN_VAR: &str = "IO_HARNESS_SECRETS_TEST_TOOLCHAIN";
+const AGENT_VAR: &str = "IO_HARNESS_SECRETS_TEST_AGENT";
+const BROWSER_VAR: &str = "IO_HARNESS_SECRETS_TEST_BROWSER";
 
 /// Hold the environment, and point the user scope at somewhere empty so a config
 /// file on the developer's own machine cannot change what this measures.
 fn env<'a>(user_dir: &Path) -> MutexGuard<'a, ()> {
     let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("IO_CONFIG_HOME", user_dir);
+    for (var, value) in [
+        (KEY_VAR, KEY),
+        (TOKEN_VAR, TOKEN),
+        (LSP_VAR, LSP_TOKEN),
+        (HOOK_VAR, HOOK_TOKEN),
+        (TOOLCHAIN_VAR, TOOLCHAIN_TOKEN),
+        (AGENT_VAR, AGENT_TOKEN),
+        (BROWSER_VAR, BROWSER_TOKEN),
+    ] {
+        std::env::set_var(var, value);
+    }
     guard
 }
 
@@ -63,7 +127,7 @@ fn both_forms<T: std::fmt::Debug>(value: &T) -> [String; 2] {
 /// nothing at all would satisfy the first half for ever.
 fn hides_secrets_shows<T: std::fmt::Debug>(value: &T, expected: &[&str]) {
     for rendered in both_forms(value) {
-        for secret in [KEY, TOKEN] {
+        for &secret in SECRETS {
             assert!(
                 !rendered.contains(secret),
                 "a resolved secret reached a formatter: {rendered}"
@@ -79,11 +143,20 @@ fn hides_secrets_shows<T: std::fmt::Debug>(value: &T, expected: &[&str]) {
     }
 }
 
-/// A discovered config whose provider key and MCP header are both substituted.
+/// A discovered config whose provider key, MCP header, LSP environment and hook
+/// argv are all substituted — one secret per accessor that hands a caller a type
+/// `File`'s own impl refuses to print.
 ///
 /// Discovered rather than parsed, so `sources`, `origins` and the merged `raw`
-/// table are all populated — the fields a derived `Debug` would have printed.
+/// table are all populated — the fields a derived `Debug` would have printed. The
+/// hooks go in `io.local.toml` because a project-scoped file may not declare
+/// them: a hook runs a program and `io.toml` arrives with a `git clone`.
+///
+/// The `Cargo.toml` is not configuration — it is the marker
+/// [`io_harness::toolchain::detect`] needs, because `Config::toolchain` overlays
+/// a `[toolchain.<ecosystem>]` table onto a detection rather than producing one.
 fn loaded(project: &Path) -> Config {
+    std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
     std::fs::write(
         project.join("io.toml"),
         format!(
@@ -91,7 +164,28 @@ fn loaded(project: &Path) -> Config {
              api_key = \"${{env:{KEY_VAR}}}\"\n\n\
              [[mcp]]\nid = \"sentinel-server\"\ntransport = \"http\"\n\
              url = \"https://mcp.example.test/v1\"\n[mcp.headers]\n\
-             Authorization = \"Bearer ${{env:{TOKEN_VAR}}}\"\n"
+             Authorization = \"Bearer ${{env:{TOKEN_VAR}}}\"\n\n\
+             [[mcp]]\nid = \"sentinel-stdio\"\ntransport = \"stdio\"\n\
+             command = \"sentinel-mcp\"\nargs = [\"--token=${{env:{TOKEN_VAR}}}\"]\n\
+             [mcp.env]\nSENTINEL_MCP_TOKEN = \"${{env:{TOKEN_VAR}}}\"\n\n\
+             [[lsp]]\nid = \"sentinel-lsp\"\ncommand = \"sentinel-analyzer\"\n\
+             args = [\"--log=${{env:{LSP_VAR}}}\"]\nextensions = [\".sentinel\"]\n\
+             [lsp.env]\nSENTINEL_LSP_TOKEN = \"${{env:{LSP_VAR}}}\"\n\n\
+             [[agent]]\nname = \"sentinel-agent\"\nmodel = \"sentinel-model\"\n\
+             role = \"You are ${{env:{AGENT_VAR}}}\"\neffort = \"high\"\n\
+             deny_write = true\n\n\
+             [toolchain.cargo]\n\
+             test = [\"sentinel-runner\", \"--token=${{env:{TOOLCHAIN_VAR}}}\"]\n\
+             lint = []\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("io.local.toml"),
+        format!(
+            "[[hook]]\non = [\"refused\"]\n\
+             run = [\"sentinel-gate\", \"--token=${{env:{HOOK_VAR}}}\"]\n\n\
+             [[hook]]\non = [\"refused\"]\nappend = \"sentinel-audit.jsonl\"\n"
         ),
     )
     .unwrap();
@@ -107,8 +201,6 @@ fn a_loaded_config_does_not_print_the_secrets_it_resolved() {
     let user_dir = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let _guard = env(user_dir.path());
-    std::env::set_var(KEY_VAR, KEY);
-    std::env::set_var(TOKEN_VAR, TOKEN);
 
     let config = loaded(project.path());
 
@@ -148,12 +240,281 @@ fn a_loaded_config_does_not_print_the_secrets_it_resolved() {
             "File {",
             "claude-sonnet-4",
             "sentinel-server",
+            "sentinel-lsp",
             // The raw table is rendered as its shape. Key names and value kinds
             // stay, which is what makes the rendering worth reading; the leaf a
             // `${env:}` filled is gone.
             "\"api_key\": string",
         ],
     );
+}
+
+/// The gap `Config`'s own impl leaves: the three accessors that hand a caller
+/// the very arrays `File`'s impl refuses to render.
+///
+/// `format!("{:?}", config)` being clean and `format!("{:?}", config.hooks())`
+/// being a leak is a distinction no caller can be expected to hold, and a log
+/// line is written from whichever one is in scope. Each arm asserts the absence
+/// *and* what an operator still reads, because an impl that printed nothing would
+/// satisfy the absence for ever.
+#[test]
+fn the_accessors_that_hand_back_those_arrays_do_not_print_them_either() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    let config = loaded(project.path());
+
+    // Positive controls first: each secret reached the field it is asserted
+    // absent from below. Without these, every assertion here would pass on a
+    // configuration that simply never resolved anything.
+    let io_harness::McpTransport::Http { headers, .. } = &config.mcp_servers()[0].transport else {
+        panic!("the file named an http server");
+    };
+    assert_eq!(headers["Authorization"], format!("Bearer {TOKEN}"));
+    let io_harness::McpTransport::Stdio {
+        args, env: child, ..
+    } = &config.mcp_servers()[1].transport
+    else {
+        panic!("the file named a stdio server");
+    };
+    assert_eq!(args[0], format!("--token={TOKEN}"), "the argv was filled");
+    assert_eq!(
+        child["SENTINEL_MCP_TOKEN"], TOKEN,
+        "the child env was filled"
+    );
+    assert_eq!(
+        config.lsp_servers()[0].args[0],
+        format!("--log={LSP_TOKEN}")
+    );
+    assert_eq!(config.lsp_servers()[0].env["SENTINEL_LSP_TOKEN"], LSP_TOKEN);
+    let hooks = config.hooks();
+    let declarations = hooks.declarations();
+    assert_eq!(
+        declarations[0].run().unwrap()[1],
+        format!("--token={HOOK_TOKEN}"),
+        "the hook argv reached the field"
+    );
+    assert!(
+        declarations[1].append().is_some(),
+        "the second hook appends"
+    );
+
+    // `[[mcp]]`: the header names stay, their values go, and the endpoint goes
+    // through the same redaction a provider's `base_url` does.
+    hides_secrets_shows(
+        &config.mcp_servers(),
+        &[
+            "sentinel-server",
+            "mcp.example.test",
+            "\"Authorization\": <redacted>",
+            // The stdio half: a spawned server is handed its credential through
+            // an argument or the child environment rather than a header, and
+            // both of those are a different field on a different variant.
+            "sentinel-stdio",
+            "sentinel-mcp",
+            "<1 redacted>",
+            "\"SENTINEL_MCP_TOKEN\": <redacted>",
+        ],
+    );
+
+    // `[[lsp]]`: the program and the suffixes it answers for are what an operator
+    // selects a server by; the child environment is how it is handed a token.
+    hides_secrets_shows(
+        &config.lsp_servers(),
+        &[
+            "sentinel-lsp",
+            "sentinel-analyzer",
+            ".sentinel",
+            "<1 redacted>",
+            "\"SENTINEL_LSP_TOKEN\": <redacted>",
+        ],
+    );
+
+    // `[[hook]]`: the events and the program stay, the arguments are counted.
+    // `<1 redacted>` rather than a bare absence, so "this hook was given no
+    // arguments at all" stays distinguishable from "its arguments are withheld".
+    hides_secrets_shows(&hooks, &["refused", "sentinel-gate", "<1 redacted>"]);
+
+    // The `append` path is a value the same substitution walked, so it is set-or-
+    // not and nothing more. Asserted on the compact form alone: `{:#?}` breaks
+    // `Some(_)` across three lines and this is a claim about one rendering, not
+    // about `std`'s line breaking.
+    assert!(
+        format!("{hooks:?}").contains("append: Some(<redacted>)"),
+        "an operator reads that the hook appends somewhere, and not where: {hooks:?}"
+    );
+}
+
+/// The rest of the class: the three remaining accessors that hand a caller a
+/// type built out of substituted strings.
+///
+/// `Config::toolchain` is the strongest of them — six argvs per ecosystem, each
+/// one an argv the embedding application hands to `exec`, which is structurally
+/// the `[[hook]]` hole one release-note bullet over. `Config::agents` carries a
+/// free-form prompt string. Each arm asserts the absence *and* what an operator
+/// still reads, because an impl that printed nothing would satisfy the absence
+/// for ever.
+#[test]
+fn the_toolchain_overlay_and_the_agent_roster_do_not_print_them_either() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    let config = loaded(project.path());
+
+    // `[toolchain.cargo]` — an override onto a detection, not a detection.
+    let detected = io_harness::toolchain::detect(project.path()).expect("Cargo.toml is a marker");
+    assert_eq!(
+        detected.test,
+        ["cargo", "test"],
+        "the detection is the base"
+    );
+    let tuned = config.toolchain(detected);
+
+    // Positive controls: the override replaced the detection, and the
+    // substitution reached the argv it replaced it with.
+    assert_eq!(
+        tuned.test,
+        vec![
+            "sentinel-runner".to_string(),
+            format!("--token={TOOLCHAIN_TOKEN}")
+        ],
+        "the override reached the argv"
+    );
+    assert_eq!(
+        tuned.build,
+        ["cargo", "build"],
+        "what the file did not name is unchanged"
+    );
+    assert!(
+        tuned.lint.is_empty(),
+        "the file named an empty lint command"
+    );
+
+    hides_secrets_shows(
+        &tuned,
+        &[
+            // What a toolchain is selected and debugged by, and what no file can
+            // write.
+            "cargo",
+            "Cargo.toml",
+            // Each argv keeps its program and counts the rest. `build` is the
+            // untouched detection and is treated exactly as the override is: the
+            // rule is about the field, not about where the value came from.
+            "sentinel-runner",
+            "<1 redacted>",
+            // A job the ecosystem has no command for renders as `[]` rather than
+            // as `[<0 redacted>]` — "there is no linter" and "the linter takes no
+            // arguments" are different answers to the same question.
+            "lint: []",
+        ],
+    );
+
+    // `[[agent]]` — the roster, through the container `Config::agents` returns.
+    let agents = config.agents();
+    let def = agents.get("sentinel-agent").expect("the roster names it");
+    assert_eq!(
+        def.role,
+        Some(format!("You are {AGENT_TOKEN}")),
+        "the role reached the field"
+    );
+
+    hides_secrets_shows(
+        &agents,
+        &[
+            // The name a spawn asks for, the model it asks for, and the boundary
+            // it narrows to — which is the whole reason anyone formats a roster.
+            "sentinel-agent",
+            "sentinel-model",
+            "High",
+            "deny_write: true",
+        ],
+    );
+
+    // Set-or-not and nothing more, the same treatment `Hook::append` gets.
+    // Asserted on the compact form alone: `{:#?}` breaks `Some(_)` across three
+    // lines, and this is a claim about one rendering rather than about `std`'s
+    // line breaking.
+    assert!(
+        format!("{def:?}").contains("role: Some(<redacted>)"),
+        "an operator reads that this agent has a role, and not what it says: {def:?}"
+    );
+}
+
+/// `[browser]`, whose type exists only when the crate is built with the feature.
+///
+/// Gated on the test rather than on the file the way `tests/browser.rs` gates
+/// itself: everything else here compiles without the feature, and a second file
+/// for one test would be a second fixture to keep in step with this one.
+#[cfg(feature = "browser")]
+#[test]
+fn a_credential_in_a_browser_argument_is_not_printed_either() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    // `io.local.toml`: a project-scoped file may not configure a browser, because
+    // `[browser]` names a program to execute and `io.toml` arrives with a clone.
+    std::fs::write(
+        project.path().join("io.local.toml"),
+        format!(
+            "[browser]\nbinary = \"/usr/bin/sentinel-browser\"\n\
+             args = [\"--proxy-server=https://user:${{env:{BROWSER_VAR}}}@proxy.example.test:8080\"]\n\
+             headless = false\nwidth = 1440\n"
+        ),
+    )
+    .unwrap();
+    let config = Config::discover(project.path()).unwrap();
+
+    // Positive control: an authenticated proxy is the ordinary way this field is
+    // written, and the substitution really filled it.
+    let browser = config.browser().expect("the file declared one");
+    assert_eq!(
+        browser.args,
+        vec![format!(
+            "--proxy-server=https://user:{BROWSER_TOKEN}@proxy.example.test:8080"
+        )],
+        "the proxy credential reached the field"
+    );
+    assert_eq!(browser.binary.as_deref(), Some("/usr/bin/sentinel-browser"));
+
+    hides_secrets_shows(
+        browser,
+        &[
+            // The binary this crate is about to spawn — "which browser did it
+            // actually pick" is the first question anyone debugging `[browser]`
+            // asks — and the operator's own numbers beside it.
+            "/usr/bin/sentinel-browser",
+            "<1 redacted>",
+            "headless: false",
+            "1440",
+        ],
+    );
+}
+
+/// The same hazard `ProviderSpec`'s `base_url` carries, on the other type that
+/// takes a caller-written URL: an MCP endpoint behind a gateway is routinely
+/// written with the credential in it, and it is not `headers` that would have
+/// leaked it.
+#[test]
+fn a_credential_carried_in_an_mcp_url_is_not_printed_either() {
+    let config = Config::from_toml(
+        "[[mcp]]\nid = \"gateway\"\ntransport = \"http\"\n\
+         url = \"https://user:sk-SENTINEL-IN-A-URL@mcp.example.test/v1?api-key=sk-SENTINEL-IN-A-URL\"\n",
+    )
+    .unwrap();
+    for rendered in both_forms(&config.mcp_servers()) {
+        assert!(
+            !rendered.contains("sk-SENTINEL-IN-A-URL"),
+            "a credential in the MCP URL reached a formatter: {rendered}"
+        );
+        // Host and id are the control: dropping the field would pass the
+        // assertion above and leave an operator with nothing to look at.
+        for needle in ["mcp.example.test", "gateway"] {
+            assert!(rendered.contains(needle), "{rendered}");
+        }
+    }
 }
 
 /// The unset case is the other half of the operator-facing claim: "this file

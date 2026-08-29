@@ -75,7 +75,16 @@ use std::collections::BTreeMap;
 /// assert!(!bare.deny_write && !bare.deny_net);
 /// assert_eq!(bare.max_steps, None);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+///
+/// `Debug` is hand-written and `Serialize` is not, the same asymmetry
+/// [`McpServer`](crate::McpServer) carries: a roster is ordinarily written as
+/// `[[agent]]` tables, and [`Config`](crate::Config) resolves every `${env:}`,
+/// `${file:}` and `${cmd:}` in a file before the merged table is stored — so
+/// `role`, a free-form prompt string, is plaintext by the time it is here and is
+/// withheld from a formatter while `Serialize` keeps writing it (0.71.0).
+// `Debug` is hand-written below, so the derive is gone — having both is a
+// conflicting-implementation error, not a shadow.
+#[derive(Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct AgentDef {
@@ -155,6 +164,44 @@ pub struct AgentDef {
     /// ```
     #[serde(default)]
     pub worktree: bool,
+}
+
+impl std::fmt::Debug for AgentDef {
+    /// Who this agent is and how much narrower it runs — everything but the text
+    /// of its role.
+    ///
+    /// `name` is the key a `spawn_agent` asks for and the name every trace line
+    /// about the child carries, so it is what the whole rendering is looked up
+    /// by. `model` is verbatim for the reason [`ProviderSpec`](crate::ProviderSpec)
+    /// prints its own: the model a call is about to be made with is the
+    /// most-asked question of a roster, and it is an id a vendor published rather
+    /// than a value a substitution was written for. The three booleans, the step
+    /// cap and the effort are the boundary this definition narrows to, and a
+    /// roster is formatted precisely to check them.
+    ///
+    /// `role` keeps only whether it is set. It is a free-form string a `${env:}`
+    /// fills like any other, it is handed to a child — prepended to its system
+    /// prompt — and the set/unset distinction is the operator-facing half: "this
+    /// agent has no role at all" and "its role did not take" are different
+    /// misconfigurations. An application that means to *show* the text reads
+    /// [`AgentDef::role`], which is deliberate where a `{:?}` in a log line is not.
+    ///
+    /// **This type is `#[non_exhaustive]` and this impl names every field by
+    /// hand.** A field added later is not a compile error here — it is a field
+    /// silently missing from the rendering — so adding one means adding a line
+    /// below, and adding a *secret-bearing* one means adding it redacted.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentDef")
+            .field("name", &self.name)
+            .field("role", &self.role.as_ref().map(|_| crate::config::REDACTED))
+            .field("model", &self.model)
+            .field("max_steps", &self.max_steps)
+            .field("effort", &self.effort)
+            .field("deny_write", &self.deny_write)
+            .field("deny_net", &self.deny_net)
+            .field("worktree", &self.worktree)
+            .finish()
+    }
 }
 
 impl AgentDef {

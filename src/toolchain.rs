@@ -56,7 +56,18 @@ use serde::{Deserialize, Serialize};
 /// # Ok(()) }
 /// # demo().unwrap();
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written and `Serialize` is not, the same asymmetry
+/// [`McpServer`](crate::McpServer) and [`Hook`](crate::hooks::Hook) carry: a
+/// `[toolchain.<ecosystem>]` table may replace any of the six argvs below, and
+/// [`Config::parse`](crate::Config) resolves every `${env:}`, `${file:}` and
+/// `${cmd:}` in a file before the merged table is stored — so by the time an
+/// override is here it is plaintext. The arguments are withheld from a formatter
+/// and written back verbatim for a tool that persists what the operator typed
+/// (0.71.0).
+// `Debug` is hand-written below, so the derive is gone — having both is a
+// conflicting-implementation error, not a shadow.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Toolchain {
     /// What this project is, in one lowercase word — `"cargo"`, `"node"`,
     /// `"python"`, `"go"`. The package manager, where one had to be chosen,
@@ -83,6 +94,49 @@ pub struct Toolchain {
     pub format: Vec<String>,
     /// Run the project. Empty for a library-shaped ecosystem with no entry point.
     pub run: Vec<String>,
+}
+
+/// One argv with its program shown and its arguments counted (0.71.0).
+///
+/// The program is what an [`Act::Exec`](crate::Act::Exec) refusal already names
+/// and the first thing anyone debugging a command that will not run reads. Every
+/// element after it is a leaf a `${env:}` may have filled — passing a credential
+/// to a child on its command line is the ordinary way to do it — so only how many
+/// there were survives. It is the `argv` half of the vocabulary
+/// [`mcp::RedactedArgs`](crate::mcp) holds the count half of, and it lives here
+/// rather than beside it only because this is the module that needs it most.
+///
+/// An **empty** argv renders as `[]` rather than as `[<0 redacted>]`: an ecosystem
+/// with no conventional formatter and a formatter invoked with no arguments are
+/// different facts, and this type is the one place the first of them is common.
+impl std::fmt::Debug for Toolchain {
+    /// What this project is and what each job runs — the program of each argv,
+    /// never its arguments.
+    ///
+    /// `ecosystem` and `marker` are this crate's own detection and no file can
+    /// write them. `manager` a file *can* write, and it stays verbatim for the
+    /// same reason each program name does: it is a tool the harness names in
+    /// prose and hands to `exec`, which the [`Policy`](crate::Policy) then echoes
+    /// back at an operator by name in an [`Act::Exec`](crate::Act::Exec) refusal.
+    ///
+    /// The six argvs keep their program and drop everything after it. `test =
+    /// ["pytest", "--token=${env:CI_TOKEN}"]` is an ordinary override — an
+    /// argument is one of the three documented ways to hand a child a credential —
+    /// and an application that means to *show* an operator a command reads the
+    /// field, which is deliberate where a `{:?}` in a log line is not.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Toolchain")
+            .field("ecosystem", &self.ecosystem)
+            .field("marker", &self.marker)
+            .field("manager", &self.manager)
+            .field("install", &crate::mcp::Argv(&self.install))
+            .field("build", &crate::mcp::Argv(&self.build))
+            .field("test", &crate::mcp::Argv(&self.test))
+            .field("lint", &crate::mcp::Argv(&self.lint))
+            .field("format", &crate::mcp::Argv(&self.format))
+            .field("run", &crate::mcp::Argv(&self.run))
+            .finish()
+    }
 }
 
 impl Toolchain {

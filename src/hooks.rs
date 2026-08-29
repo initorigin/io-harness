@@ -182,7 +182,14 @@ pub enum OnFailure {
 /// # Ok(()) }
 /// # demo().unwrap();
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// `Debug` is hand-written and `Serialize` is not, the same asymmetry
+/// [`McpServer`](crate::McpServer) carries: `run`'s arguments and `append`'s path
+/// have been through the configuration's `${env:}` substitution by the time they
+/// are here, so they are withheld from a formatter and written back verbatim for
+/// a tool that persists what the operator typed (0.71.0).
+// `Debug` is hand-written below, so the derive is gone — having both is a
+// conflicting-implementation error, not a shadow.
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Hook {
     /// The events this hook wants, by the wire tags [`crate::EventKind`] serializes
@@ -221,6 +228,42 @@ pub struct Hook {
     /// The wall-clock ceiling on `run`, in milliseconds.
     #[serde(default)]
     timeout_ms: Option<u64>,
+}
+
+/// One argv with its program shown and its arguments counted.
+///
+/// The program is what an [`Act::Exec`](crate::Act::Exec) refusal already names
+/// and the first thing anyone debugging a hook that will not start reads. Every
+/// element after it is a leaf a `${env:}` may have filled — passing a credential
+/// to a child on its command line is the ordinary way to do it — so only how many
+/// there were survives.
+impl std::fmt::Debug for Hook {
+    /// Which events or lifecycle point this hook wants, which tools it filters
+    /// to, what it does about failure — and, of the two actions, their shape
+    /// rather than their contents.
+    ///
+    /// `on`, `at` and `tools` are verbatim: each is matched against a name this
+    /// crate owns — an event tag, a lifecycle point, a tool name — so a
+    /// substitution written into one is inert rather than secret, and they are
+    /// the whole reason anyone formats a hook. `run` keeps its program and drops
+    /// its arguments. `append` keeps only whether it is set: it is
+    /// a path the same substitution walked, and an application that means to show
+    /// an operator the file reads [`Hook::append`], which is deliberate where a
+    /// `{:?}` in a log line is not.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hook")
+            .field("on", &self.on)
+            .field("at", &self.at)
+            .field("tools", &self.tools)
+            .field(
+                "append",
+                &self.append.as_ref().map(|_| crate::config::REDACTED),
+            )
+            .field("run", &self.run.as_deref().map(crate::mcp::Argv))
+            .field("on_failure", &self.on_failure)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
 }
 
 impl Hook {
