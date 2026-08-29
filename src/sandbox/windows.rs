@@ -1386,7 +1386,7 @@ mod tests {
         // kind of path, and the off-the-profile case runs from a workspace whose
         // ancestors are not the user profile at all. If Windows ever changes
         // this, the table fails and says so.
-        let cases: [(&str, &[&str], bool); 10] = [
+        let cases: [(&str, &[&str], bool); 9] = [
             // The control: a shell builtin needs nothing but `%SystemRoot%`,
             // which carries an ALL APPLICATION PACKAGES ACE of its own. If this
             // fails the container is not usable on this host at all.
@@ -1415,18 +1415,22 @@ mod tests {
                 &["cmd", "/c", "echo written> written.txt"],
                 true,
             ),
-            // An external program: not a shell builtin, not the workspace's own
-            // payload. Aimed at the toolchain binary itself — the same one the
-            // absolute-path row below runs — rather than at the `rustc` on
-            // `PATH`, which is a rustup **shim**: it starts, reads the host's own
-            // `.rustup` home and dies there for reasons that are the host's and
-            // not the container's. At 0.70.0 this row exited 1 with `os error
-            // 183` out of that home on 2 of 2 `pull_request` runs while the same
-            // commit passed it on `push`, so what it measured was whether a
-            // program with a home directory can find its home, not whether the
-            // container can execute a program. `PATH` resolution is still
-            // covered: every `cmd` row above is resolved off `PATH`.
-            ("an external program", &["@RUSTC@", "--version"], true),
+            // There is deliberately no row here for a third-party binary resolved
+            // off `PATH`. There was one until 0.71.0, running `rustc --version`,
+            // and what it actually measured was the host: `rustc` on `PATH` is a
+            // rustup **shim**, so the container started it and it then died
+            // reading the runner's own `.rustup` with `os error 183`. It reported
+            // a containment failure on 2 of 2 `pull_request` runs at 0.70.0 while
+            // the `push` run of the same commit passed it. Re-aiming it at the
+            // toolchain binary made it honest and made it redundant — that is
+            // exactly the absolute-path row below, differing only in the flag —
+            // so it is gone rather than duplicated. The coverage genuinely lost
+            // is a third-party binary found by `PATH`; what remains is `PATH`
+            // resolution of `cmd` (system32, which the container treats
+            // differently) and the toolchain binary by absolute path. Restoring
+            // the lost row needs a program that is on `PATH` and does not need a
+            // home directory to start, which no row here has yet found.
+            //
             // The same batch file by absolute path, in the two forms the path can
             // take. Every remaining failure in this release runs a payload by an
             // absolute path that carries an 8.3 short component, and every case
@@ -1549,8 +1553,12 @@ mod tests {
         // start a program at all, and reading green while it did so.
         assert!(
             !toolchain_rustc.is_empty(),
-            "`rustup which rustc` named nothing, so every row that executes a program was \
-             skipped and this table proved no execution at all:{report}"
+            "`rustup which rustc` named nothing, so the one row that starts a program other \
+             than a shell builtin was skipped and this table proved nothing about executing \
+             one. That is a failure and not a skip on purpose: a host where this cannot be \
+             answered must say so loudly rather than report a green table it did not earn. \
+             A host with a toolchain but no rustup would need a different way to name the \
+             binary before this row can run there:{report}"
         );
         assert!(
             !report.contains("THE CONTAINER DECLINED"),
