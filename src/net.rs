@@ -231,7 +231,14 @@ fn parse_http_date(value: &str) -> Option<SystemTime> {
 /// assert_eq!(target("https://[::1]:8080/x").as_deref(), Some("[::1]:8080"));
 ///
 /// // And the half that matters: these are refusals, not blanks.
-/// for url in ["file:///etc/passwd", "not a url", "https://", "https://host:/x"] {
+/// for url in [
+///     "file:///etc/passwd",
+///     "not a url",
+///     "https://",
+///     "https://host:/x",
+///     "https://[]/x",
+///     "https://[::1]:/x",
+/// ] {
 ///     assert!(target(url).is_none(), "{url}");
 /// }
 ///
@@ -269,12 +276,32 @@ pub fn target(url: &str) -> Option<String> {
         _ => return None,
     };
 
-    if let Some(close) = hostport.strip_prefix('[').and_then(|_| hostport.find(']')) {
-        // IPv6 literal: [::1] or [::1]:8080
+    if hostport.starts_with('[') {
+        // An opening bracket commits the authority to being an IPv6 literal, so
+        // every shape from here is answered here — including the malformed ones.
+        // Falling through to the plain-host path instead is how `https://[/x`
+        // used to come back `Some("[:443")`: no closing bracket, no colon, so the
+        // bracketless branch read the whole thing as a bare host.
+        let Some(close) = hostport.find(']') else {
+            return None;
+        };
+        // IPv6 literal: [::1] or [::1]:8080. Every rejection the plain-host path
+        // below makes, this path must make too. It did not until 0.71.0: an empty
+        // host (`[]`), an empty port (`[::1]:`) and a tail that is not a port at
+        // all (`[::1]evil.com`) all fell into the default-port arm and came back
+        // `Some`, while `https://host:/x` — the same shape without brackets —
+        // correctly came back `None`. A `Some` here is a target a policy may
+        // allow, so a shape this cannot reduce must never produce one.
         let host = &hostport[..=close];
-        return match hostport[close + 1..].strip_prefix(':') {
-            Some(port) if !port.is_empty() => Some(format!("{host}:{port}")),
-            _ => Some(format!("{host}:{default_port}")),
+        if hostport[1..close].is_empty() {
+            return None;
+        }
+        return match &hostport[close + 1..] {
+            "" => Some(format!("{host}:{default_port}")),
+            rest => match rest.strip_prefix(':') {
+                Some(port) if !port.is_empty() => Some(format!("{host}:{port}")),
+                _ => None,
+            },
         };
     }
 
@@ -641,6 +668,16 @@ mod tests {
             "https://host:/x",
             "https://:8080/x",
             "https://user@:8080/x",
+            // The same three shapes wearing brackets. Until 0.71.0 these came
+            // back `Some` while their bracketless twins came back `None`, because
+            // the IPv6 branch funnelled every tail it could not read into the
+            // default port. A gate that tests only the unbracketed spelling of a
+            // rule is a gate the bracketed spelling walks through.
+            "https://[]/x",
+            "https://[]:8080/x",
+            "https://[::1]:/x",
+            "https://[::1]evil.com/x",
+            "https://[/x",
         ] {
             assert_eq!(target(url), None, "{url}");
             let p = Policy::permissive();

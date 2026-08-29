@@ -88,9 +88,17 @@ impl Provider for Dialer {
         &self,
         _request: CompletionRequest,
     ) -> io_harness::Result<CompletionResponse> {
+        // Strip whatever scheme is on the front, not just `http://`. The
+        // refusal cases deliberately wear schemes the boundary does not govern
+        // (`ftp://`, `file://`) pointed at a live listener, and the point of
+        // those entries is that a fail-open would produce a real connection the
+        // sink counts. Trimming only `http://` left the scheme attached, so
+        // `TcpStream::connect` failed to resolve the host and the counter read
+        // zero whether the boundary held or not — a control that cannot fail.
         let authority = self
             .url
-            .trim_start_matches("http://")
+            .split_once("://")
+            .map_or(self.url.as_str(), |(_, rest)| rest)
             .trim_end_matches("/v1");
         let _stream = tokio::net::TcpStream::connect(authority)
             .await
@@ -512,6 +520,17 @@ const UNRESOLVABLE: &[&str] = &[
     "https://host:/x",
     "https://:8080/x",
     "https://user@:8080/x",
+    // The bracketed spelling of the same three. The rustdoc says an empty host or
+    // an empty port is a refusal; until 0.71.0 that was true of `https://host:/x`
+    // and false of `https://[::1]:/x`, so a consumer written from the documented
+    // contract was stricter than the crate it was copying.
+    "https://[]/x",
+    "https://[]:8080/x",
+    "https://[::1]:/x",
+    "https://[::1]evil.com/x",
+    // An opening bracket with no closing one, which used to escape the IPv6
+    // branch entirely and be read as a bare host.
+    "https://[/x",
 ];
 
 /// #221 — the `host:port` normalisation, asserted from *outside* the crate.
