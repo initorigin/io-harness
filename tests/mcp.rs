@@ -419,6 +419,80 @@ async fn a_server_binary_the_policy_denies_is_never_spawned() {
     );
 }
 
+/// The sentences [`McpServer`]'s rustdoc makes about which error a server
+/// produces, checked against the code that produces them.
+///
+/// Until 0.71.0 that doc said a server the policy refused ended the run in
+/// `Error::Mcp`. It never did: the refusal is raised before the process exists,
+/// so a consumer that wrote its error mapping off that sentence missed every
+/// policy refusal — the one case the check is there for. The three arms are
+/// asserted in one test because the claim is the *boundary* between them: a
+/// refusal on either transport before the policy allows, `Error::Mcp` only past
+/// it. Split apart, each arm can keep passing while the sentence joining them
+/// goes back to being wrong.
+#[tokio::test]
+async fn a_refused_server_is_refused_and_error_mcp_is_only_past_the_policy() {
+    let dir = workspace();
+
+    // Stdio, refused: the exec check, naming the command it refused.
+    let command = fixture_server().display().to_string();
+    let store = Store::memory().unwrap();
+    let denied = Policy::default()
+        .layer("app")
+        .allow_read("*")
+        .allow_write("*");
+    let stdio = contract(dir.path(), 2).with_mcp([fixture("fix")]);
+    let err = run_with(
+        &stdio,
+        &Script::new(vec![vec![]]),
+        &store,
+        &denied,
+        &ApproveAll,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Refused { act, target, .. } if act == "exec" && *target == command),
+        "expected an exec refusal naming the command, got {err:?}"
+    );
+
+    // HTTP, refused: the same error, from the net check on the host.
+    let store = Store::memory().unwrap();
+    let remote =
+        contract(dir.path(), 2).with_mcp([McpServer::http("web", "http://mcp.example.com/")]);
+    let err = run_with(
+        &remote,
+        &Script::new(vec![vec![]]),
+        &store,
+        &permitted(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Refused { act, .. } if act == "net"),
+        "expected a net refusal, got {err:?}"
+    );
+
+    // Permitted, and only then: a spawn that fails is `Error::Mcp`.
+    let store = Store::memory().unwrap();
+    let missing = contract(dir.path(), 2)
+        .with_mcp([McpServer::stdio("gone", "definitely-not-a-real-binary-xyz")]);
+    let err = run_with(
+        &missing,
+        &Script::new(vec![vec![]]),
+        &store,
+        &permitted(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Mcp { server, .. } if server == "gone"),
+        "expected an MCP error once the policy allowed the spawn, got {err:?}"
+    );
+}
+
 /// F9 — a server that dies mid-run does not take the run with it.
 #[tokio::test]
 async fn a_server_that_dies_mid_run_becomes_an_observation_not_a_crash() {

@@ -182,7 +182,13 @@ pub enum McpTransport {
 /// The policy line in the example is not decoration. Attaching a server to a
 /// contract makes it *configured*; starting it is an [`Act::Exec`] check on its
 /// binary, so without `allow_exec` naming that binary the run ends in
-/// [`Error::Mcp`] before the server process exists.
+/// [`Error::Refused`] — `act: "exec"`, the command as `target` — before the
+/// server process exists. A remote server is refused the same way by the
+/// [`Act::Net`] check on its host, with `act: "net"`. [`Error::Mcp`] is the far
+/// side of that line: it is returned only once the policy has allowed the
+/// server, when the process will not spawn, the handshake fails, or the tools
+/// cannot be listed. A caller mapping errors on the refusal path wants
+/// [`Error::Refused`], which is the one case the check exists for.
 ///
 /// ```no_run
 /// use io_harness::{run_with, ApproveAll, McpServer, OpenRouter, Policy, Store,
