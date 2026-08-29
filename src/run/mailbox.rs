@@ -366,6 +366,22 @@ pub(super) async fn mailbox_call(
 /// because the crate is writing somewhere the model did not name and an
 /// unchecked write is a claim this crate does not get to make. A policy denying
 /// `.worktrees/**` turns the feature off loudly rather than quietly.
+///
+/// **0.70.0 — through `gate`, and twice.** Both checks used to be raw policy
+/// reads that refused anything that was not `Effect::Allow`: the write here, and
+/// the `Act::Exec` on `git` inside [`Git::run`]. `Policy::default()` sets *both*
+/// of those to [`Effect::Ask`], so a definition declaring `worktree = true`
+/// could never spawn out of the box — the operator saw "the policy refuses to
+/// write .worktrees/…" for a policy that had asked to be asked. Both now reach
+/// the approver, and both write a policy row for the trace.
+///
+/// What this function still cannot do is *pause*. Its result is a `PathBuf` or a
+/// reason, and its caller turns a reason into a spawn that did not happen, so a
+/// [`Decision::Defer`](crate::Decision::Defer) — "a human will decide later" — has
+/// nowhere to go and is reported as the reason instead. The pending row it left
+/// behind stays answerable, and the next attempt at the same spawn derives the
+/// same path and asks again. Making the spawn itself pausable is a change to
+/// `SpawnOutcome` and its caller, not to this function.
 pub(super) async fn worktree_for<P: Provider>(
     tree: &Tree<'_, P>,
     parent_policy: &Policy,
@@ -373,6 +389,7 @@ pub(super) async fn worktree_for<P: Provider>(
     goal: &str,
     parent_run_id: i64,
     step: u32,
+    depth: u32,
 ) -> std::result::Result<PathBuf, String> {
     let slug = format!(
         "{}-{parent_run_id}-{step}-{:08x}",
@@ -386,12 +403,49 @@ pub(super) async fn worktree_for<P: Provider>(
     }
 
     let target = rel.to_string_lossy().into_owned();
-    let verdict = parent_policy.check(Act::Write, &target);
-    if verdict.effect != Effect::Allow {
-        return Err(match verdict.rule {
-            Some(rule) => format!("the policy refuses to write {target} (rule {rule})"),
-            None => format!("the policy refuses to write {target}"),
-        });
+    // The parent's policy over the tree root: `gate` resolves a relative
+    // read/write target through the workspace, which is what stops a slug from
+    // ever naming somewhere outside the root. Built here rather than carried
+    // because `Tree` holds the root and the policy separately and this is the
+    // only place in the file that needs the pair.
+    let ws = Workspace::with_policy(tree.root.clone(), parent_policy.clone());
+    for (act, what) in [
+        (Act::Write, target.as_str()),
+        (Act::Exec, crate::tools::git::GIT),
+    ] {
+        match gate(
+            &ws,
+            tree.approver,
+            tree.store,
+            parent_run_id,
+            step,
+            act,
+            what,
+            None,
+            tree.watch,
+            depth,
+            goal,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        {
+            Gated::Go { target: t, .. } if t != what => {
+                // The path is derived from the spawn's own identity — that
+                // derivation is the whole of the resume story above — so an
+                // approver that rewrites it is asking for a worktree the next
+                // attempt would not find. Refused rather than silently ignored.
+                return Err(format!(
+                    "the approver moved {what} to {t}; a worktree path is derived, not chosen"
+                ));
+            }
+            Gated::Go { .. } => {}
+            Gated::Refused { obs, .. } => return Err(obs.trim().to_string()),
+            Gated::Paused { .. } => {
+                return Err(format!(
+                    "approval for {what} was deferred, and a spawn cannot wait for one"
+                ))
+            }
+        }
     }
 
     let cmd = GitCmd::Worktree {
@@ -399,6 +453,7 @@ pub(super) async fn worktree_for<P: Provider>(
         path: target,
     };
     match Git::new(parent_policy, &tree.root, WORKTREE_ERR_CAP)
+        .gated()
         .run(&cmd)
         .await
     {

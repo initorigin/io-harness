@@ -432,6 +432,18 @@ pub(super) async fn run_from<P: Provider>(
     // still sandboxed (0.6.0). A permissive guard carries the trace so the
     // sandbox lifecycle is recorded for single-file runs too.
     let permissive = Policy::permissive();
+    // 0.70.0 — has the criterion ever judged this run and said no? The loop
+    // cannot ask afterwards: the gate is evaluated inside the step and its answer
+    // is a `bool` that goes out of scope with the iteration, so a tail that wanted
+    // to know would have to re-run the criterion — on a workspace the agent has
+    // stopped editing, at whatever the gate costs, to learn something the loop
+    // already had. The same shape as `marked_prefix` and `routed_model` in the
+    // workspace loop: a fact about the run that only the loop can hold, because a
+    // rule applied to a freshly built request cannot detect its own transition.
+    //
+    // False, not "no gate yet": a run that never reaches its gate has not been
+    // judged, and that is the honest answer for it too.
+    let mut criterion_failed = false;
 
     for step in start_step..=contract.max_steps {
         // A cancellation is acted on here, at the boundary between two steps, and
@@ -578,22 +590,15 @@ pub(super) async fn run_from<P: Provider>(
             finish(store, watch, run_id, 0, step, "success")?;
             return Ok(RunResult::new(RunOutcome::Success { steps: step }, run_id));
         }
+        // `|=` rather than `=`: the question is whether the criterion has *ever*
+        // judged and refused, and a later gate that could not run must not erase
+        // one that already said no.
+        criterion_failed |= gate_judged(&contract.verify);
     }
 
-    finish(
-        store,
-        watch,
-        run_id,
-        0,
-        contract.max_steps,
-        "step_cap_reached",
-    )?;
-    Ok(RunResult::new(
-        RunOutcome::StepCapReached {
-            steps: contract.max_steps,
-        },
-        run_id,
-    ))
+    let (recorded, outcome) = capped_outcome(criterion_failed, contract.max_steps);
+    finish(store, watch, run_id, 0, contract.max_steps, recorded)?;
+    Ok(RunResult::new(outcome, run_id))
 }
 
 /// The workspace loop (0.3 multi-file mode): the agent greps, finds, reads, and
@@ -801,6 +806,13 @@ pub(super) async fn run_workspace_from<P: Provider>(
     // whose summary assembly stubbed, and on a resume — a resumed run has sent this
     // prefix zero times from where it now stands, so it earns the marker again.
     let mut marked_prefix = PrefixGuard::default();
+    // 0.70.0 — has the criterion ever judged this run and said no? Held here for
+    // the same reason `marked_prefix` above is: it is a fact about the run rather
+    // than about a step, and the loop's tail is where it is needed and where the
+    // step it came from is already gone. Not restored on resume, deliberately —
+    // the run is about to evaluate the gate again on its first step, and a
+    // resumed run that ends at its cap will have earned the answer itself.
+    let mut criterion_failed = false;
     // 0.49.0 — what each step of THIS run asked for, so the next step can send it
     // back as an assistant turn.
     //
@@ -1670,22 +1682,42 @@ pub(super) async fn run_workspace_from<P: Provider>(
             return Ok(RunResult::new(RunOutcome::Success { steps: step }, run_id)
                 .with_remembered(remembered));
         }
+        // See the single-file loop: `|=`, and `Verification::None` never counts.
+        criterion_failed |= gate_judged(&contract.verify);
+        // 0.70.0 — and the failure's own words go into the next step's request.
+        // An observation rather than a new prompt section, which is what keeps
+        // 0.44.0's `cache_boundary_for` looking at the same string shape it has
+        // always looked at: this arrives where every tool result arrives, bounded
+        // by the same `entry_cap`, foldable by the same compaction.
+        //
+        // Guarded on there being a next step: the last step of a run has no
+        // request to inform, and a context event for a step that never ran would
+        // say a blind attempt was told.
+        if step < contract.max_steps {
+            if let Some(section) = gate_failure_feedback(store, run_id, step) {
+                store.record_context_event(
+                    run_id,
+                    &ContextEvent::gate_feedback(
+                        step + 1,
+                        format!(
+                            "step {step} gate failure, {} chars",
+                            section.chars().count()
+                        ),
+                    ),
+                )?;
+                ledger.push(Observation::new(
+                    step,
+                    ObsKind::Error,
+                    None,
+                    bound(&section, entry_cap, ObsKind::Error),
+                ));
+            }
+        }
     }
 
-    finish(
-        store,
-        watch,
-        run_id,
-        0,
-        contract.max_steps,
-        "step_cap_reached",
-    )?;
-    Ok(RunResult::new(
-        RunOutcome::StepCapReached {
-            steps: contract.max_steps,
-        },
-        run_id,
-    ))
+    let (recorded, outcome) = capped_outcome(criterion_failed, contract.max_steps);
+    finish(store, watch, run_id, 0, contract.max_steps, recorded)?;
+    Ok(RunResult::new(outcome, run_id))
 }
 
 /// The server half of a diagnostics answer, attributed to the server that gave it.

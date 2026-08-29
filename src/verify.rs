@@ -1039,10 +1039,26 @@ impl<'a> ExecGuard<'a> {
         if verdict.effect == Effect::Allow {
             Ok(())
         } else {
+            // 0.70.0 — `Ask` still refuses here, and now says so honestly. The
+            // tool gate routes `Ask` to an approver; a verification gate has
+            // none. There is no run turn to pause: `check` is reached through
+            // `Verification::passes_guarded`, a public method returning
+            // `Result<bool>` with nowhere to put a pause, and two of its four
+            // call sites are outside any run loop. `Policy::default()`
+            // allow-lists `rustc` and the test binary by name for exactly this
+            // reason. What was wrong was the *reason given* — an `Ask` reported
+            // as "the policy forbids this" sends an operator hunting for a deny
+            // rule that does not exist.
+            let rule = verdict.rule.or(match verdict.effect {
+                Effect::Ask => {
+                    Some("<the policy asks, and a verification gate has no approver>".into())
+                }
+                _ => None,
+            });
             Err(Error::Refused {
                 act: "exec".into(),
                 target: program.to_string(),
-                rule: verdict.rule,
+                rule,
                 layer: verdict.layer,
             })
         }

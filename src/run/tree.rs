@@ -438,6 +438,11 @@ where
         // 0.68.0 — the caller's standing request for a fold, consumed once, and by
         // the root only. `fold_forced` is what enforces both.
         let mut fold_asked = contract.fold_now;
+        // 0.70.0 — see the workspace loop. Per agent, like everything else here:
+        // a child that failed its own criterion composes back into its parent
+        // carrying that, so a parent can tell a child that ran out of room from
+        // one whose work was checked and rejected.
+        let mut criterion_failed = false;
         // And the turn is typed before its first completion is billed, the same
         // order the flat loop writes it in.
         open_turn_kind(tree.store, run_id, extras)?;
@@ -1317,19 +1322,44 @@ where
                 finish(tree.store, tree.watch, run_id, depth, step, "success")?;
                 return Ok(RunOutcome::Success { steps: step });
             }
+            // See the workspace loop: `|=`, and `Verification::None` never counts.
+            criterion_failed |= gate_judged(&contract.verify);
+            // 0.70.0 — and the same feedback into the next step's request, through
+            // the same helper. A contained agent that is told nothing about why its
+            // gate failed is the one that can least afford to guess: it has a
+            // narrower workspace and a smaller budget than its parent.
+            if step < contract.max_steps {
+                if let Some(section) = gate_failure_feedback(tree.store, run_id, step) {
+                    tree.store.record_context_event(
+                        run_id,
+                        &ContextEvent::gate_feedback(
+                            step + 1,
+                            format!(
+                                "step {step} gate failure, {} chars",
+                                section.chars().count()
+                            ),
+                        ),
+                    )?;
+                    ledger.push(Observation::new(
+                        step,
+                        ObsKind::Error,
+                        None,
+                        bound(&section, entry_cap, ObsKind::Error),
+                    ));
+                }
+            }
         }
 
+        let (recorded, outcome) = capped_outcome(criterion_failed, contract.max_steps);
         finish(
             tree.store,
             tree.watch,
             run_id,
             depth,
             contract.max_steps,
-            "step_cap_reached",
+            recorded,
         )?;
-        Ok(RunOutcome::StepCapReached {
-            steps: contract.max_steps,
-        })
+        Ok(outcome)
     })
 }
 
@@ -1579,7 +1609,20 @@ pub(super) async fn spawn_child<'f, P: Provider>(
     // registered agent that never ran.
     let child_root = match def.filter(|d| d.worktree) {
         Some(d) => {
-            match worktree_for(tree, parent_policy, &d.name, goal, parent_run_id, step).await {
+            // `depth`, not `child_depth`: the approval this may raise belongs to
+            // the parent run that is making the worktree, and the child whose
+            // depth that would be does not exist yet (0.70.0).
+            match worktree_for(
+                tree,
+                parent_policy,
+                &d.name,
+                goal,
+                parent_run_id,
+                step,
+                depth,
+            )
+            .await
+            {
                 Ok(root) => Some(root),
                 Err(why) => {
                     return Ok(SpawnOutcome::Settled(SpawnResult::Composed {

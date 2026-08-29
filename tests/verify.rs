@@ -152,12 +152,17 @@ fn reviewer_and_approver_accept_a_provider_with_no_debug() {
     );
 
     let approver = ModelApprover::new(NoDebugProvider, "an-approving-model");
-    let approver: &dyn Approver = &approver;
-    assert_eq!(approver.model(), Some("an-approving-model"));
+    // Formatted as the concrete type, not through the trait object: `Approver`
+    // deliberately has no `Debug` supertrait, so `&dyn Approver` cannot be
+    // formatted at all and asking for it here would assert the opposite of what
+    // this release decided. The coercion below is still the claim — it is what
+    // proves a provider with no `Debug` reaches the trait object.
     assert_eq!(
         format!("{approver:?}"),
         "ModelApprover { model: \"an-approving-model\", allow_self: false, .. }"
     );
+    let approver: &dyn Approver = &approver;
+    assert_eq!(approver.model(), Some("an-approving-model"));
 }
 
 /// And the same two over a real provider — the construction the issue reported
@@ -169,6 +174,10 @@ fn a_shipped_provider_can_be_reviewed_and_approved_with() {
     hides_key_shows(&reviewer, &["a-different-model"]);
 
     let approver = ModelApprover::new(Anthropic::new(SENTINEL, "a-model"), "a-different-model");
-    let approver: &dyn Approver = &approver;
     hides_key_shows(&approver, &["a-different-model"]);
+    // The coercion is the half the issue reported; the redaction above is
+    // asserted on the concrete type, because `Approver` has no `Debug`
+    // supertrait to format through.
+    let approver: &dyn Approver = &approver;
+    assert_eq!(approver.model(), Some("a-different-model"));
 }

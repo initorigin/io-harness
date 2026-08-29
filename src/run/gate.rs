@@ -650,6 +650,23 @@ pub(super) fn policy_verdict(ws: &Workspace, act: Act, target: &str) -> crate::p
     }
 }
 
+/// What a refused action's observation tells the model to do instead.
+///
+/// A path is one of many: a file it may not read usually has a sibling it may,
+/// so "try another path" is advice it can act on. A *program* or a *host* is
+/// not — there is no second `git`, and an MCP tool the policy refuses has no
+/// alternative spelling. Telling a model to try another path there is how one
+/// refusal becomes a retry loop that spends the run's steps on the same answer.
+///
+/// 0.70.0. Before this, every refusal gave the path advice, including the
+/// `Act::Exec` refusals the git and MCP arms now route through here.
+fn advice(act: Act) -> &'static str {
+    match act {
+        Act::Read | Act::Write => "try another path",
+        Act::Exec | Act::Net => "carry on without it",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn gate(
     ws: &Workspace,
@@ -683,7 +700,10 @@ pub(super) async fn gate(
                 .unwrap_or_default();
             Ok(Gated::Refused {
                 decision: format!("{kind} refused"),
-                obs: format!("\n[{kind} refused] {target}{why} — the policy forbids this; try another path\n"),
+                obs: format!(
+                    "\n[{kind} refused] {target}{why} — the policy forbids this; {}\n",
+                    advice(act)
+                ),
             })
         }
         Effect::Allow => Ok(Gated::Go {

@@ -237,6 +237,97 @@ pub(super) async fn evaluate_gate(
     }
 }
 
+/// Did a gate that just answered `false` actually judge anything (0.70.0)?
+///
+/// [`Verification::None`] answers `Ok(false)` from every entry point — `passes`,
+/// `passes_guarded`, `passes_in_guarded` — because there is nothing to check, not
+/// because a check said no. Reading that `false` as a verdict is what would make
+/// an unverified run that spent its budget report
+/// [`RunOutcome::VerificationFailed`], which claims a judgement nobody made.
+///
+/// One function rather than the same `matches!` at the three loop tails: the
+/// three loops must agree about what a failing gate is, and three copies is how
+/// they stop agreeing.
+///
+/// [`Verification::None`]: crate::Verification::None
+pub(super) fn gate_judged(verify: &Verification) -> bool {
+    !matches!(verify, Verification::None)
+}
+
+/// What a loop that ran out of steps reports — the persisted string and the
+/// variant, from one place (0.70.0).
+///
+/// The two must never disagree: `finish` writes the string, `terminal_outcome`
+/// reads it back on a resume, and the variant is what the caller in this process
+/// matches on. Three loop tails each spelling the pair for themselves is three
+/// chances for one of them to write `"step_cap_reached"` beside a
+/// [`RunOutcome::VerificationFailed`].
+///
+/// Neither string is mapped by [`terminal_outcome`], deliberately, and for the
+/// same reason: a capped run resumes. See the note there.
+pub(super) fn capped_outcome(judged_and_failed: bool, steps: u32) -> (&'static str, RunOutcome) {
+    if judged_and_failed {
+        (
+            "verification_failed",
+            RunOutcome::VerificationFailed { steps },
+        )
+    } else {
+        ("step_cap_reached", RunOutcome::StepCapReached { steps })
+    }
+}
+
+/// What the criterion said when it failed at `step`, framed for the next request
+/// (0.70.0).
+///
+/// Read from `sandbox_events`, which is where it is: [`Verification::Command`] is
+/// the criterion this matters for, and on that path `gate_attempts.detail` is
+/// written as the empty string — the phase and the command's own output go to
+/// `gate_phase_failed` and `gate_output` instead. Nothing under `src/run/` read
+/// that table back before this release, so a run that failed its gate at step
+/// three asked the model to try again at step four without telling it what had
+/// gone wrong. The model then guessed, and the run spent its budget guessing.
+///
+/// `None` when the criterion recorded nothing — a `FileContains` gate that simply
+/// did not match has no output, and inventing a section for it would tell the
+/// model only that it failed, which the goal already says.
+///
+/// The *last* row of each kind for the step, because a step evaluates its gate
+/// once but `record_gate_failure` is called by the compile-only gates per phase,
+/// and the phase that failed last is the one that stopped it.
+pub(super) fn gate_failure_feedback(store: &Store, run_id: i64, step: u32) -> Option<String> {
+    let events = store.sandbox_events(run_id).unwrap_or_default();
+    let detail = |kind: &str| {
+        events
+            .iter()
+            .rev()
+            .find(|e| e.step == step && e.kind == kind)
+            .and_then(|e| e.detail.clone())
+            .filter(|d| !d.trim().is_empty())
+    };
+    let phase = detail("gate_phase_failed");
+    let output = detail("gate_output");
+    if phase.is_none() && output.is_none() {
+        return None;
+    }
+    let mut section = format!(
+        "\n[the success criterion ran at step {step} and did not pass{}]\n",
+        match &phase {
+            Some(p) => format!(": {p}"),
+            None => String::new(),
+        }
+    );
+    if let Some(output) = output {
+        section.push_str("The end of what it printed:\n");
+        section.push_str(&last_lines(
+            &output,
+            GATE_FEEDBACK_LINES,
+            GATE_FEEDBACK_CHARS,
+        ));
+        section.push('\n');
+    }
+    Some(section)
+}
+
 /// A criterion's short name, as it is recorded in `gate_attempts.phase`.
 pub(super) fn gate_phase(verify: &Verification) -> &'static str {
     match verify {
@@ -754,6 +845,18 @@ pub(super) fn terminal_outcome(store: &Store, run_id: i64) -> Result<Option<RunO
         // `cancelled` are — a person said no — so a resume reports it rather than
         // asking the model to propose the same approach again.
         "plan_rejected" => Some(RunOutcome::PlanRejected { steps: last }),
+        // 0.70.0: `"verification_failed"` is deliberately absent, exactly as
+        // `"step_cap_reached"` has always been. Every string mapped above is one
+        // nobody in this process can undo — a pass, a person's no, or a run with
+        // no criterion left to check — and a failed criterion is none of those.
+        // The gate is re-run from scratch on the next step, so a resume with a
+        // larger budget, a repaired machine or a human's edit in the workspace
+        // can still turn it green; a `Verification::Command` gate that failed
+        // because the test runner is missing is the plain case. Reporting it as
+        // terminal would refuse to re-drive a run whose criterion could pass,
+        // which is the mirror of the 0.11.0 and 0.12.0 defects above — those
+        // re-drove runs that could not. The new variant tells the CALLER what
+        // happened; it does not decide for them that it is over.
         _ => None,
     }))
 }
