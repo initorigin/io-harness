@@ -13,8 +13,8 @@ use std::time::Duration;
 use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    run_with, run_with_observed, ApproveAll, Error, McpServer, Policy, Provider, RunOutcome, Store,
-    TaskContract, Verification, MCP_TOOL_PREFIX,
+    probe_mcp, run_with, run_with_observed, ApproveAll, Error, McpProbe, McpServer, Policy,
+    Provider, RunOutcome, Store, TaskContract, Verification, MCP_TOOL_PREFIX,
 };
 use serde_json::json;
 
@@ -633,6 +633,259 @@ async fn an_mcp_result_is_folded_into_the_next_prompt() {
         "the second prompt must carry the server's reply, got:\n{}",
         prompts[1]
     );
+}
+
+// ----------------------------------------------------------- `enabled` (0.70.0)
+
+/// F1 — a server switched off contributes nothing to the roster, and is still
+/// there in the configuration.
+///
+/// Both halves matter and they pull in opposite directions. Turning a server off
+/// is not deleting it: the declaration stays, so an operator can turn it back on
+/// by editing one word. But it must contribute *nothing* — and the skip is at
+/// the connect seam, so "nothing" here means no connect event either, not merely
+/// a roster the tools were filtered out of afterwards.
+#[tokio::test]
+async fn a_disabled_server_contributes_no_tools_and_is_still_configured() {
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Script::new(vec![
+        vec![call("mcp__on__echo", json!({"text": "still here"}))],
+        vec![call(
+            "write_file",
+            json!({"path": "src/a.rs", "content": "fn hello() {}"}),
+        )],
+    ]);
+    let off = McpServer {
+        enabled: false,
+        ..fixture("off")
+    };
+    let contract = contract(dir.path(), 4).with_mcp([fixture("on"), off]);
+
+    // The listing half. Every listing surface — `Config::mcp_servers`,
+    // `TaskContract::mcp`, `Plugin::mcp_servers` — reads the servers that were
+    // *configured*, never the ones a session connected to, so this is the same
+    // claim all three make.
+    assert_eq!(contract.mcp.len(), 2, "both servers are configured");
+    assert_eq!(contract.mcp[1].id, "off");
+    assert!(contract.mcp[0].enabled, "the first is on");
+    assert!(!contract.mcp[1].enabled, "the second is off and still listed");
+
+    let result = run_with(&contract, &provider, &store, &permitted(), &ApproveAll)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
+    assert_eq!(
+        contract.mcp.len(),
+        2,
+        "and still configured after the run — a skip, not a deletion"
+    );
+
+    let offered = provider.tools_offered();
+    assert!(
+        !offered.iter().any(|t| t.starts_with("mcp__off__")),
+        "the disabled server offers nothing: {offered:?}"
+    );
+
+    // Every tool of the enabled one, counted against the catalogue that server
+    // was actually discovered to have rather than against a number written down
+    // here — so a sixth tool added to the fixture keeps this honest.
+    let events = store.mcp_events(result.run_id).unwrap();
+    let discovered = events.iter().filter(|e| e.kind == "discovered").count();
+    assert!(discovered > 0, "the enabled server was discovered");
+    assert_eq!(
+        offered.iter().filter(|t| t.starts_with("mcp__on__")).count(),
+        discovered,
+        "every tool of the enabled server is offered: {offered:?}"
+    );
+
+    // And nothing at all happened for the disabled one: no connect, no discover,
+    // no disconnect. This is what a filter over `tool_specs` would have failed —
+    // there the process is spawned and the connect is recorded first.
+    assert!(
+        events.iter().all(|e| e.server != "off"),
+        "the disabled server was never started: {events:?}"
+    );
+}
+
+/// F3 — a configuration with no `enabled` key produces exactly the roster it
+/// produced before the key existed.
+///
+/// Two claims, one behind the other: a server deserialized without the key is
+/// the same value the builder makes, and running it offers the same tools. The
+/// first is why the second holds; the second is what an operator would notice.
+#[tokio::test]
+async fn a_server_declared_without_the_enabled_key_offers_the_same_roster() {
+    let command = serde_json::to_string(&fixture_server().display().to_string()).unwrap();
+    let declared: McpServer = serde_json::from_str(&format!(
+        r#"{{"id":"fix","transport":"stdio","command":{command}}}"#
+    ))
+    .unwrap();
+    assert!(declared.enabled, "an absent `enabled` key means on");
+    assert_eq!(
+        declared,
+        fixture("fix"),
+        "identical to the server the builder makes"
+    );
+
+    let roster = |server: McpServer| async move {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let provider = Script::new(vec![vec![call(
+            "write_file",
+            json!({"path": "src/a.rs", "content": "fn hello() {}"}),
+        )]]);
+        let contract = contract(dir.path(), 3).with_mcp([server]);
+        run_with(&contract, &provider, &store, &permitted(), &ApproveAll)
+            .await
+            .unwrap();
+        let mut tools: Vec<String> = provider
+            .tools_offered()
+            .into_iter()
+            .filter(|t| t.starts_with(MCP_TOOL_PREFIX))
+            .collect();
+        tools.sort();
+        tools
+    };
+
+    let without_the_key = roster(declared).await;
+    assert!(!without_the_key.is_empty(), "the fixture offers tools");
+    assert_eq!(
+        without_the_key,
+        roster(fixture("fix")).await,
+        "the key's absence changes nothing about the roster"
+    );
+}
+
+// -------------------------------------------------------------- the probe (0.70.0)
+
+/// A URL nothing is listening on: bound to learn a free port, then dropped.
+fn closed_port() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}/")
+}
+
+/// F5 — the four things that can be wrong with a server produce four answers a
+/// caller can act on differently.
+///
+/// "It did not work" is the report nobody can use. A refusal needs a policy rule
+/// written, a bad command needs a path fixed, and a dead host needs neither —
+/// which is why these are four variants rather than one error string.
+#[tokio::test]
+async fn a_probe_tells_a_bad_command_a_dead_host_a_refusal_and_a_working_server_apart() {
+    // Short enough that a hang fails the test rather than holding CI for a minute.
+    let quick = Duration::from_secs(5);
+
+    // 1. The policy allows it; the command does not exist.
+    let wrong =
+        McpServer::stdio("missing", "definitely-not-a-real-binary-xyz").with_timeout(quick);
+    let probe = probe_mcp(&wrong, &permitted()).await;
+    assert!(matches!(probe, McpProbe::NotStarted { .. }), "{probe:?}");
+
+    // 2. The URL is allowed and well formed; nothing is behind it.
+    let dead = McpServer::http("dead", closed_port()).with_timeout(quick);
+    let egress = permitted().layer("egress").allow_net("127.0.0.1");
+    let probe = probe_mcp(&dead, &egress).await;
+    assert!(matches!(probe, McpProbe::Unreachable { .. }), "{probe:?}");
+
+    // 3. The command is real and the policy will not have it. Nothing is spawned.
+    let denied = Policy::default()
+        .layer("app")
+        .allow_read("*")
+        .allow_write("*");
+    let probe = probe_mcp(&fixture("fix").with_timeout(quick), &denied).await;
+    assert!(
+        matches!(&probe, McpProbe::Refused { act, .. } if act == "exec"),
+        "{probe:?}"
+    );
+
+    // 4. And a server that works reports what it offered, under the namespaced
+    //    names the model would see and a policy rule would be written against.
+    let probe = probe_mcp(&fixture("fix").with_timeout(quick), &permitted()).await;
+    let McpProbe::Answered { tools } = &probe else {
+        panic!("the fixture answers: {probe:?}")
+    };
+    assert!(
+        tools.iter().any(|t| t == "mcp__fix__echo"),
+        "the catalogue is reported: {tools:?}"
+    );
+    assert!(
+        tools.iter().all(|t| t.starts_with("mcp__fix__")),
+        "namespaced, not bare: {tools:?}"
+    );
+}
+
+/// F5 — a switched-off server reports as disabled, and reports it without
+/// starting anything.
+///
+/// The command is one that would fail loudly if it were run, so `Disabled`
+/// rather than `NotStarted` is itself the proof that nothing was attempted. The
+/// same server switched on is checked immediately after, which is what makes
+/// the first assertion a claim about `enabled` rather than about the command.
+#[tokio::test]
+async fn a_probe_of_a_disabled_server_says_so_without_starting_it() {
+    let off = McpServer {
+        enabled: false,
+        ..McpServer::stdio("off", "definitely-not-a-real-binary-xyz")
+    };
+    assert_eq!(probe_mcp(&off, &permitted()).await, McpProbe::Disabled);
+
+    let on = McpServer {
+        enabled: true,
+        ..off.clone()
+    };
+    let probe = probe_mcp(&on, &permitted()).await;
+    assert!(
+        matches!(probe, McpProbe::NotStarted { .. }),
+        "switched on, the same command is tried and fails: {probe:?}"
+    );
+}
+
+/// F5's non-functional half — a probe leaves no process behind.
+///
+/// Unix only: the check is a process-table read and there is no portable one.
+/// The marker argument is what makes it precise under `cargo test`'s own
+/// parallelism — other tests in this binary spawn the same fixture binary at the
+/// same moment, so counting by program name would count theirs. The fixture
+/// ignores its arguments, so the marker costs nothing and buys a unique needle.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_probe_leaves_no_child_process_behind() {
+    let marker = format!("--probe-marker-{}", std::process::id());
+    let running = || {
+        let out = std::process::Command::new("ps")
+            .args(["-A", "-o", "args="])
+            .output()
+            .expect("ps is available on every unix");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains(&marker))
+            .count()
+    };
+    assert_eq!(running(), 0, "nothing is running under this marker yet");
+
+    let server = fixture("fix")
+        .with_args([marker.as_str()])
+        .with_timeout(Duration::from_secs(5));
+    let probe = probe_mcp(&server, &permitted()).await;
+    assert!(matches!(probe, McpProbe::Answered { .. }), "{probe:?}");
+
+    // The child is killed from a task the transport spawns on drop, so its death
+    // is ordered after the probe returns rather than before it. A bounded wait
+    // rather than a fixed sleep: this fails by running out of attempts, never by
+    // passing early.
+    for _ in 0..40 {
+        if running() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("a child was still running two seconds after the probe returned");
 }
 
 // ------------------------------------------------------ the tool count (0.68.0)
