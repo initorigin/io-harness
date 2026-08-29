@@ -80,9 +80,39 @@ const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const POLL: Duration = Duration::from_millis(5);
 
 /// What a hook's failure means for the run.
+///
+/// It is `#[non_exhaustive]` from the release it becomes public, because the
+/// obvious next lifecycle point takes an answer these three do not: an
+/// `after_tool` hook decides about a result rather than about a call. Paying for
+/// a `_ =>` arm once now is what keeps that addition from being a break, and it
+/// costs nothing while the set is still three.
+///
+/// ```
+/// use io_harness::hooks::OnFailure;
+/// use io_harness::Config;
+///
+/// # fn demo() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// std::fs::write(
+///     dir.path().join("io.local.toml"),
+///     "[[hook]]\non = [\"finished\"]\nrun = [\"notify\"]\n\n\
+///      [[hook]]\nat = \"before_tool\"\nrun = [\"gate\"]\n",
+/// )?;
+///
+/// let hooks = Config::discover(dir.path())?.hooks();
+///
+/// // Neither table wrote an `on_failure`, and the two do not get the same
+/// // answer: `Default` is right for exactly one of the two kinds of hook.
+/// assert_eq!(hooks.declarations()[0].on_failure(), OnFailure::Continue);
+/// assert_eq!(hooks.declarations()[1].on_failure(), OnFailure::Refuse);
+/// assert_eq!(OnFailure::default(), OnFailure::Continue);
+/// # Ok(()) }
+/// # demo().unwrap();
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum OnFailure {
+#[non_exhaustive]
+pub enum OnFailure {
     /// The failure is logged and the run continues. The default, because a
     /// notification that could not be delivered is not a reason to abandon work.
     #[default]
@@ -109,9 +139,52 @@ pub(crate) enum OnFailure {
 /// result is the hole `[[mcp]]` already carries — a misspelled key inside the table
 /// silently accepted. Exactly-one-of `append`/`run` is enforced in code instead,
 /// where the error can name the table's index.
+///
+/// Readable through [`Hooks::declarations`] for a configuration's own tables and
+/// through [`Plugin::hooks`](crate::Plugin::hooks) for a bundle's, so an
+/// application can show an operator *which* hooks are installed rather than only
+/// that some are. Every field is behind an accessor rather than public, because
+/// one of them is not what the file said: [`Hook::on_failure`] resolves the
+/// per-kind default the table left out.
+///
+/// **The `[[hook]]` table is a committed shape from this release.** Making the
+/// type public publishes its `Serialize`/`Deserialize` derives, so the seven keys
+/// below — their names, their types and their `deny_unknown_fields` strictness —
+/// are API: renaming one breaks a file an operator already wrote, and an eighth
+/// is additive only while it carries `#[serde(default)]`. That is accepted
+/// deliberately. The table was already this module's operator-facing contract,
+/// spelled out in the module docs and in `io.toml`, and keeping the type private
+/// would not have made it any less committed — it would only have hidden which
+/// release committed it.
+///
+/// ```
+/// use io_harness::hooks::OnFailure;
+/// use io_harness::Config;
+///
+/// # fn demo() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// std::fs::write(
+///     dir.path().join("io.local.toml"),
+///     "[[hook]]\nat = \"before_tool\"\ntools = [\"write_file\"]\nrun = [\"gate\"]\n",
+/// )?;
+///
+/// let hooks = Config::discover(dir.path())?.hooks();
+/// let hook = &hooks.declarations()[0];
+///
+/// assert_eq!(hook.at(), Some("before_tool"));
+/// assert_eq!(hook.tools().to_vec(), ["write_file"]);
+/// assert!(hook.on().is_empty(), "a lifecycle hook wants no events");
+/// assert_eq!(hook.run(), Some(&["gate".to_string()][..]));
+/// assert_eq!(hook.append(), None);
+/// assert_eq!(hook.timeout_ms(), None, "absent, not the module's own default");
+/// // The one answer that is computed rather than copied.
+/// assert_eq!(hook.on_failure(), OnFailure::Refuse);
+/// # Ok(()) }
+/// # demo().unwrap();
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Hook {
+pub struct Hook {
     /// The events this hook wants, by the wire tags [`crate::EventKind`] serializes
     /// to. Empty means every event.
     #[serde(default)]
@@ -238,17 +311,62 @@ impl Hook {
             && (self.tools.is_empty() || self.tools.iter().any(|n| n == tool))
     }
 
+    /// The event tags this hook named, or empty for every event.
+    ///
+    /// Empty and [`Hook::at`] set is a lifecycle hook, which wants no events at
+    /// all — the two are read together, never one alone.
+    pub fn on(&self) -> &[String] {
+        &self.on
+    }
+
+    /// The lifecycle point it attached to, or `None` for an event hook.
+    pub fn at(&self) -> Option<&str> {
+        self.at.as_deref()
+    }
+
+    /// The tool names a lifecycle hook filters on, or empty for every call.
+    pub fn tools(&self) -> &[String] {
+        &self.tools
+    }
+
+    /// The file it appends to, relative to the discovery root — not to the file
+    /// that declared it.
+    pub fn append(&self) -> Option<&Path> {
+        self.append.as_deref()
+    }
+
+    /// The argv it spawns, program first. Never a string: there is nothing here
+    /// for a shell to interpret.
+    pub fn run(&self) -> Option<&[String]> {
+        self.run.as_deref()
+    }
+
     /// What a failure of this hook does, with its kind's default applied.
     ///
     /// A lifecycle hook that says nothing refuses the call: it was attached to a
     /// point that exists to stop something. An event hook that says nothing lets
     /// the run continue, as it has since 0.28.0.
-    fn on_failure(&self) -> OnFailure {
+    ///
+    /// This is a resolved answer and not the key: a table that wrote no
+    /// `on_failure` still has one, and it is the kind's — never the enum's own
+    /// `Default`, which is [`OnFailure::Continue`] and is right for only one of
+    /// the two kinds. There is deliberately no accessor for the raw
+    /// `Option`, because a reader who took it would have to re-derive this rule
+    /// to say anything true.
+    pub fn on_failure(&self) -> OnFailure {
         self.on_failure.unwrap_or(if self.at.is_some() {
             OnFailure::Refuse
         } else {
             OnFailure::Continue
         })
+    }
+
+    /// The wall-clock ceiling the table wrote for `run`, or `None` for the
+    /// module's own default. The key rather than a resolved number, because a
+    /// caller that wants to *show* the table needs to know whether the operator
+    /// chose the value.
+    pub fn timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms
     }
 
     /// Do the hook's one thing, and say why if it did not happen.
@@ -476,7 +594,39 @@ impl Hooks {
 
     /// The tables these hooks were built from, so a plugin's can be added to a
     /// configuration's without a second [`Observer`] to install (0.35.0).
-    pub(crate) fn declarations(&self) -> &[Hook] {
+    ///
+    /// Public since the release that made [`Hook`] public, and for the reason
+    /// [`Hooks::is_empty`] alone was not enough: an application that installs
+    /// hooks on an operator's behalf could say *how many* were configured and
+    /// nothing about what any of them does. This is the configuration half of
+    /// that answer; [`Plugin::hooks`](crate::Plugin::hooks) is the bundle half,
+    /// and after [`Plugins::apply_to_hooks`](crate::Plugins::apply_to_hooks) this
+    /// returns both, in that order.
+    ///
+    /// ```
+    /// use io_harness::hooks::OnFailure;
+    /// use io_harness::Config;
+    ///
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// // `io.local.toml`: a `[[hook]]` is refused in the committed `io.toml`.
+    /// std::fs::write(
+    ///     dir.path().join("io.local.toml"),
+    ///     "[[hook]]\non = [\"finished\"]\nrun = [\"notify\"]\ntimeout_ms = 250\n",
+    /// )?;
+    ///
+    /// let hooks = Config::discover(dir.path())?.hooks();
+    /// let table = &hooks.declarations()[0];
+    /// assert_eq!(table.on().to_vec(), ["finished"]);
+    /// assert_eq!(table.run(), Some(&["notify".to_string()][..]));
+    /// assert_eq!(table.at(), None);
+    /// assert_eq!(table.timeout_ms(), Some(250));
+    /// // The table wrote no `on_failure`; an event hook's own default is read.
+    /// assert_eq!(table.on_failure(), OnFailure::Continue);
+    /// # Ok(()) }
+    /// # demo().unwrap();
+    /// ```
+    pub fn declarations(&self) -> &[Hook] {
         &self.hooks
     }
 

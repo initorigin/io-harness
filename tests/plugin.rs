@@ -11,10 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+use io_harness::config::Scope;
+use io_harness::hooks::OnFailure;
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    run_with, Act, ApproveAll, Config, Effect, EventKind, Observer, Policy, Provider, RunEvent,
-    Store, TaskContract, Verification, MCP_TOOL_PREFIX,
+    run_with, Act, ApproveAll, Config, Effect, EventKind, Observer, Plugins, Policy, Provider,
+    RunEvent, Store, TaskContract, Verification, MCP_TOOL_PREFIX,
 };
 use serde_json::json;
 
@@ -1128,4 +1130,244 @@ fn run_subsystem_source() -> String {
         );
     }
     all
+}
+
+// ---------------------------------------------------- 0.71.0, #223 and #224
+
+/// Two `[[hook]]` tables that differ in **every one** of the seven keys, so an
+/// accessor wired to the wrong field cannot pass by reading a neighbour that
+/// happens to hold the same value.
+///
+/// The first writes `on_failure` and the second omits it, which is the pair that
+/// separates a copied answer from a computed one: `cancel` is the key the table
+/// wrote, and `refuse` is a value that appears in no file anywhere — a lifecycle
+/// hook's own default, and not the enum's, which is `continue`.
+///
+/// The byte-identical text is in `tests/hooks.rs`, against the other holder of
+/// this fact. Deliberately duplicated rather than shared: these are separate test
+/// binaries, and the point of the pair is that the two halves are independent.
+const SEVEN_KEYS: &str = "\
+[[hook]]
+on = [\"finished\", \"refused\"]
+append = \"audit.jsonl\"
+on_failure = \"cancel\"
+
+[[hook]]
+at = \"before_tool\"
+tools = [\"read_file\"]
+run = [\"gate\", \"--strict\"]
+timeout_ms = 1234
+";
+
+/// **#223**, the plugin half. Before this release `Plugin` had an accessor for
+/// five of its six contribution kinds and [`Plugin::contributions`] advertised
+/// `"hooks"` for the sixth — an application could learn that a bundle brought
+/// hooks and nothing whatever about what they do.
+///
+/// The configuration half of the identical assertion lives in `tests/hooks.rs`,
+/// against `Hooks::declarations`. A manifest's `[[hook]]` array and a
+/// configuration's are two different holders of the same shape, so a test against
+/// one proves nothing about the other.
+#[test]
+fn a_bundle_hook_is_readable_key_by_key_and_not_merely_counted() {
+    let dir = tmp();
+    let root = dir.path();
+    write(
+        &root.join("bundles/gated/plugin.toml"),
+        &format!("name = \"gated\"\n\n{SEVEN_KEYS}"),
+    );
+    // `io.local.toml`: only a trusted scope may declare a bundle that runs a
+    // program, which is the rule the whole of `tests/plugin.rs` already asserts.
+    write(
+        &root.join("io.local.toml"),
+        "[[plugin]]\npath = \"bundles/gated\"\n",
+    );
+
+    let plugins = Config::discover(root).unwrap().plugins();
+    assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
+    let plugin = plugins.get("gated").unwrap();
+    assert_eq!(
+        plugin.contributions(),
+        vec!["hooks"],
+        "the countable answer, which is all 0.70.0 had"
+    );
+
+    let tables = plugin.hooks();
+    assert_eq!(tables.len(), 2, "both tables, in declaration order");
+
+    let event = &tables[0];
+    assert_eq!(event.on().to_vec(), ["finished", "refused"]);
+    assert_eq!(event.at(), None);
+    assert!(event.tools().is_empty());
+    assert_eq!(event.append(), Some(Path::new("audit.jsonl")));
+    assert_eq!(event.run(), None);
+    assert_eq!(
+        event.on_failure(),
+        OnFailure::Cancel,
+        "the key this table wrote, carried through unchanged"
+    );
+    assert_eq!(
+        event.timeout_ms(),
+        None,
+        "absent, and reported absent rather than as the module's own 5000"
+    );
+
+    let gate = &tables[1];
+    assert!(gate.on().is_empty());
+    assert_eq!(gate.at(), Some("before_tool"));
+    assert_eq!(gate.tools().to_vec(), ["read_file"]);
+    assert_eq!(gate.append(), None);
+    assert_eq!(
+        gate.run(),
+        Some(&["gate".to_string(), "--strict".to_string()][..]),
+        "the argv whole, program first"
+    );
+    assert_eq!(
+        gate.on_failure(),
+        OnFailure::Refuse,
+        "computed, never copied: no file wrote `refuse`, and the enum's own default \
+         is `continue` — a reader that returned either would be lying about what \
+         this hook does to a call"
+    );
+    assert_eq!(
+        gate.timeout_ms(),
+        Some(1234),
+        "present, and the value written"
+    );
+}
+
+/// A bundle carrying the two contributions only a trusted scope may declare.
+fn executing_bundle(root: &Path) -> PathBuf {
+    let dir = root.join("bundles/installer");
+    write(
+        &dir.join("plugin.toml"),
+        "name = \"installer\"\n\
+         description = \"downloaded, not yet declared\"\n\
+         \n\
+         [[hook]]\non = [\"finished\"]\nrun = [\"notify\"]\n\
+         \n\
+         [[mcp]]\nid = \"docs\"\ntransport = \"stdio\"\ncommand = \"echo\"\n",
+    );
+    dir
+}
+
+/// **#224**. A downloaded directory can be read and validated before a line is
+/// written into an operator's configuration — no `[[plugin]]` entry, no
+/// `Config::discover`, no temporary file.
+///
+/// And the answer depends on the scope the caller intends to declare it from,
+/// which is the marketplace-install semantics rather than a quirk: the operator's
+/// own files get the hook and the MCP server, and the committed `io.toml` that
+/// arrives with a `git clone` is refused the manifest whole.
+#[test]
+fn inspect_reads_an_undeclared_bundle_and_answers_by_the_scope_it_was_asked_about() {
+    let dir = tmp();
+    let root = dir.path();
+    let bundle = executing_bundle(root);
+    assert!(
+        !root.join("io.toml").exists() && !root.join("io.local.toml").exists(),
+        "nothing was declared: this is the whole point of the call"
+    );
+
+    for scope in [Scope::User, Scope::Local] {
+        let plugin = Plugins::inspect(scope, &bundle).unwrap();
+        assert_eq!(plugin.id(), "installer");
+        assert_eq!(plugin.root(), bundle.as_path());
+        assert_eq!(plugin.description(), Some("downloaded, not yet declared"));
+        assert_eq!(
+            plugin.contributions(),
+            vec!["mcp", "hooks"],
+            "{scope:?}: what declaring it would bring"
+        );
+        assert_eq!(plugin.hooks().len(), 1, "{scope:?}");
+        assert_eq!(
+            plugin.hooks()[0].run(),
+            Some(&["notify".to_string()][..]),
+            "{scope:?}: the argv an operator would be agreeing to run"
+        );
+        assert_eq!(
+            plugin.mcp_servers()[0].id,
+            "installer__docs",
+            "{scope:?}: namespaced exactly as a real load namespaces it"
+        );
+    }
+
+    // The committed file: refused whole, and the refusal names the offending key
+    // rather than handing back a shortened bundle.
+    let err = Plugins::inspect(Scope::Project, &bundle)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("may not contribute"), "{err}");
+    assert!(err.contains("hook"), "{err}");
+}
+
+/// **#224**. `${cmd:}` is refused inside a manifest in *every* scope, including
+/// the operator's own — a bundle is a third party's directory even when the
+/// caller inspecting it is trusted.
+#[test]
+fn inspect_refuses_a_manifest_substitution_at_every_scope() {
+    let dir = tmp();
+    let root = dir.path();
+    let bundle = root.join("bundles/sneaky");
+    write(
+        &bundle.join("plugin.toml"),
+        "name = \"sneaky\"\ndescription = \"${cmd:echo hello}\"\n",
+    );
+
+    for scope in [Scope::User, Scope::Local, Scope::Project] {
+        let err = Plugins::inspect(scope, &bundle).unwrap_err().to_string();
+        assert!(err.contains("cmd"), "{scope:?}: {err}");
+    }
+}
+
+/// **#224**. A preflight and a load must not disagree about why a bundle is
+/// unusable: the string `inspect` returns is the string the loader would have put
+/// on `Plugins::dropped`, for each of the three refusals a manifest can earn.
+///
+/// Asserted as string equality against the loader's own output rather than
+/// against wording copied into this file, which would only assert that today
+/// agrees with a copy of today.
+#[test]
+fn an_inspect_refusal_is_the_string_the_loader_would_have_dropped() {
+    let cases: [(&str, &str, Scope, &str); 3] = [
+        // A name the id grammar does not admit.
+        (
+            "badid",
+            "name = \"Bad_Id\"\n",
+            Scope::Local,
+            "io.local.toml",
+        ),
+        // An executing contribution named from the file a clone delivers.
+        (
+            "untrusted",
+            "name = \"untrusted\"\n\n[[hook]]\non = [\"finished\"]\nrun = [\"notify\"]\n",
+            Scope::Project,
+            "io.toml",
+        ),
+        // A table the hook validator refuses: an event this crate never emits.
+        (
+            "badhook",
+            "name = \"badhook\"\n\n[[hook]]\non = [\"finshed\"]\nappend = \"a.jsonl\"\n",
+            Scope::Local,
+            "io.local.toml",
+        ),
+    ];
+
+    for (name, manifest, scope, scope_file) in cases {
+        let dir = tmp();
+        let root = dir.path();
+        let bundle = root.join(format!("bundles/{name}"));
+        write(&bundle.join("plugin.toml"), manifest);
+        write(
+            &root.join(scope_file),
+            &format!("[[plugin]]\npath = \"bundles/{name}\"\n"),
+        );
+
+        let plugins = Config::discover(root).unwrap().plugins();
+        assert_eq!(plugins.len(), 0, "{name}: nothing loaded");
+        let dropped = plugins.dropped()[0].error.clone();
+
+        let inspected = Plugins::inspect(scope, &bundle).unwrap_err().to_string();
+        assert_eq!(inspected, dropped, "{name}");
+    }
 }

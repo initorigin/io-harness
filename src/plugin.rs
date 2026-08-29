@@ -281,6 +281,20 @@ impl Plugin {
         &self.manifest.mcp
     }
 
+    /// The hooks it contributes, in declaration order.
+    ///
+    /// Not namespaced, and nothing was left out: a `[[hook]]` contributes no
+    /// name for an id to prefix — it names events, a path and an argv, and all
+    /// three belong to the operator's tree rather than to the bundle's.
+    ///
+    /// Empty unless the `[[plugin]]` entry was declared in a scope that may
+    /// contribute one; a manifest carrying a `[[hook]]` and declared in the
+    /// committed `io.toml` is refused whole rather than shortened here. See the
+    /// module docs.
+    pub fn hooks(&self) -> &[Hook] {
+        &self.manifest.hook
+    }
+
     /// The policy layers it contributes, namespaced. Deny rules only.
     pub fn policy_layers(&self) -> &[Layer] {
         self.manifest
@@ -548,6 +562,64 @@ impl Plugins {
             .iter()
             .filter_map(|p| p.skills_dir().map(|d| (p.id.clone(), d)))
             .collect()
+    }
+
+    /// Read and validate one bundle directory without declaring it (0.71.0).
+    ///
+    /// The same loader [`Config::plugins`](crate::Config::plugins) runs, reached
+    /// without the `[[plugin]]` entry — so an installer can show what a
+    /// downloaded directory contributes, and *whether it would load at all*,
+    /// before writing a line into an operator's configuration. Every check runs:
+    /// the id grammar, the trust rule for `scope`, the narrowing rule, the
+    /// `[[hook]]` validator, and `${cmd:}` refused in a manifest wherever it came
+    /// from. The error is the string that would have appeared on
+    /// [`Plugins::dropped`], so a preflight and a load cannot disagree.
+    ///
+    /// Fallible where loading a declared set is not, and deliberately: a set that
+    /// dropped a bundle still has the others, while a caller asking about one
+    /// directory is asking a yes-or-no question.
+    ///
+    /// # `scope` is the answer, not a formality
+    ///
+    /// It is the scope the caller intends to *declare* the bundle from, and the
+    /// result differs by it on purpose — this is the marketplace-install
+    /// semantics of the module's first rule, not a quirk of the loader:
+    ///
+    /// - [`Scope::User`] and [`Scope::Local`] are the operator's own files, so a
+    ///   manifest's `[[hook]]` and `[[mcp]]` are returned like any other
+    ///   contribution.
+    /// - [`Scope::Project`] is the committed `io.toml` that arrives with a
+    ///   `git clone`, so the same manifest is **refused whole** — not shortened.
+    ///   A bundle that would only load from one of the two is exactly what an
+    ///   installer has to tell an operator before it writes anything.
+    ///
+    /// ```
+    /// use io_harness::config::Scope;
+    /// use io_harness::Plugins;
+    ///
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// let bundle = dir.path().join("rust-review");
+    /// std::fs::create_dir(&bundle)?;
+    /// std::fs::write(
+    ///     bundle.join("plugin.toml"),
+    ///     "name = \"rust-review\"\n\n\
+    ///      [[hook]]\non = [\"finished\"]\nrun = [\"notify\"]\n",
+    /// )?;
+    ///
+    /// // Nothing was declared and no configuration was discovered.
+    /// let plugin = Plugins::inspect(Scope::User, &bundle)?;
+    /// assert_eq!(plugin.id(), "rust-review");
+    /// assert_eq!(plugin.hooks()[0].on().to_vec(), ["finished"]);
+    ///
+    /// // The same directory, named from the file a clone delivers.
+    /// let err = Plugins::inspect(Scope::Project, &bundle).unwrap_err();
+    /// assert!(err.to_string().contains("may not contribute"), "{err}");
+    /// # Ok(()) }
+    /// # demo().unwrap();
+    /// ```
+    pub fn inspect(scope: Scope, dir: impl AsRef<Path>) -> Result<Plugin> {
+        load_one(scope, dir.as_ref())
     }
 
     /// Load every declared plugin. Infallible by construction: see the module
