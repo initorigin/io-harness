@@ -1415,8 +1415,18 @@ mod tests {
                 &["cmd", "/c", "echo written> written.txt"],
                 true,
             ),
-            // A program on PATH, through its launcher and toolchain home.
-            ("a program on PATH", &["rustc", "--version"], true),
+            // An external program: not a shell builtin, not the workspace's own
+            // payload. Aimed at the toolchain binary itself — the same one the
+            // absolute-path row below runs — rather than at the `rustc` on
+            // `PATH`, which is a rustup **shim**: it starts, reads the host's own
+            // `.rustup` home and dies there for reasons that are the host's and
+            // not the container's. At 0.70.0 this row exited 1 with `os error
+            // 183` out of that home on 2 of 2 `pull_request` runs while the same
+            // commit passed it on `push`, so what it measured was whether a
+            // program with a home directory can find its home, not whether the
+            // container can execute a program. `PATH` resolution is still
+            // covered: every `cmd` row above is resolved off `PATH`.
+            ("an external program", &["@RUSTC@", "--version"], true),
             // The same batch file by absolute path, in the two forms the path can
             // take. Every remaining failure in this release runs a payload by an
             // absolute path that carries an 8.3 short component, and every case
@@ -1532,6 +1542,15 @@ mod tests {
         assert_eq!(
             failed, 0,
             "the AppContainer did not behave as the grant set says it does:{report}"
+        );
+        // Both program rows resolve through `rustup which rustc`, and a host that
+        // cannot answer it skips them as "not runnable here" — which would leave
+        // the table asserting containment with nothing proving the container can
+        // start a program at all, and reading green while it did so.
+        assert!(
+            !toolchain_rustc.is_empty(),
+            "`rustup which rustc` named nothing, so every row that executes a program was \
+             skipped and this table proved no execution at all:{report}"
         );
         assert!(
             !report.contains("THE CONTAINER DECLINED"),
