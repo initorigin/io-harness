@@ -139,6 +139,49 @@ impl Store {
             .ok())
     }
 
+    /// When a session was opened, or `None` if no such session exists (0.70.0).
+    ///
+    /// The value is the text SQLite's own column default wrote —
+    /// `strftime('%Y-%m-%dT%H:%M:%fZ','now')`, so RFC 3339 in UTC to the
+    /// millisecond. Nothing in this crate ever writes the column, which is why
+    /// the format is a property of the storage rather than of a caller.
+    ///
+    /// **This is the exact value [`Store::sweep_sessions`] compares `before`
+    /// against**, and that equivalence is the whole reason the reader exists.
+    /// The sweep takes a string because the column is one; without a way to read
+    /// the column back, an operator choosing a cutoff was guessing at the format
+    /// of the thing they were being compared to, and a cutoff in any other shape
+    /// compares as a string against text it does not resemble. Read one session's
+    /// stamp and a cutoff can be built from something the store actually holds.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let session = store.create_session("/repo")?;
+    ///
+    /// let created = store.session_created_at(session)?.expect("it was just made");
+    /// // The comparison is strictly before, so the stamp itself does not take
+    /// // the session that carries it, and any later cutoff does.
+    /// assert_eq!(store.sweep_preview(&created)?.sessions, 0);
+    /// assert_eq!(store.sweep_preview("2999-01-01T00:00:00.000Z")?.sessions, 1);
+    ///
+    /// assert!(store.session_created_at(9_999)?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn session_created_at(&self, session_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT created_at FROM sessions WHERE id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .ok())
+    }
+
     /// Which turn a session is currently answering from.
     pub fn session_head(&self, session_id: i64) -> Result<Option<i64>> {
         Ok(self
@@ -379,6 +422,97 @@ impl Store {
         self.prune(&[session_id], Vec::new())
     }
 
+    /// Which sessions a cutoff selects, split into the ones that may go and the
+    /// ones the resumable-run refusal keeps.
+    ///
+    /// The whole of the sweep's *decision* lives here, and nothing else runs the
+    /// candidate query or the refusal. That is what lets [`Store::sweep_preview`]
+    /// and [`Store::sweep_sessions`] be one answer rather than two answers that
+    /// happen to agree: the preview cannot select a different set from the sweep,
+    /// because there is only one place a set is selected.
+    ///
+    /// The refusal is evaluated for every candidate before anything is deleted,
+    /// which is also what keeps the removal itself to one pass.
+    fn sweep_victims(&self, before: &str) -> Result<(Vec<i64>, Vec<i64>)> {
+        let mut candidates = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM sessions WHERE created_at < ?1 ORDER BY id")?;
+            let rows = stmt.query_map([before], |r| r.get::<_, i64>(0))?;
+            for row in rows {
+                candidates.push(row?);
+            }
+        }
+
+        let mut doomed = Vec::new();
+        let mut refused = Vec::new();
+        for session in candidates {
+            if self.holds_resumable_run(session)? {
+                refused.push(session);
+            } else {
+                doomed.push(session);
+            }
+        }
+        Ok((doomed, refused))
+    }
+
+    /// What [`Store::sweep_sessions`] would report for `before`, without removing
+    /// anything (0.70.0).
+    ///
+    /// **This is the sweep's own computation, stopped one step short of the
+    /// `DELETE`.** The selection comes from `sweep_victims` and the counts from
+    /// `prune_plan`, and those are the only two places the sweep gets either —
+    /// the sweep then hands the very sets `prune_plan` measured to its own
+    /// statements rather than deriving them again. A preview that merely
+    /// resembled the sweep would be worth nothing to the operator deciding
+    /// whether to run it; this one cannot disagree with the sweep without the
+    /// sweep disagreeing with itself.
+    ///
+    /// So [`Pruned::refused`] is populated here exactly as a sweep populates it.
+    /// Reading the preview is how an operator finds out *which* sessions a cutoff
+    /// would take and which of them are still live work, while the answer is
+    /// still recoverable — which for a call that cannot be undone is the whole
+    /// point.
+    ///
+    /// **The one thing it cannot promise is that nothing changes in between.** A
+    /// run that finishes between the preview and the sweep makes its session
+    /// sweepable, and a run started or resumed on an old session makes that
+    /// session refused; either way the sweep answers for the store's state when
+    /// the sweep runs, not when the preview did. On a store nobody else is
+    /// writing to they are the same value.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let session = store.create_session("/repo")?;
+    /// let run = store.start_run("a goal", "/repo")?;
+    /// let turn = store.record_turn(session, None, run, "a question")?;
+    /// store.finish_turn(turn, Some("an answer"), "ok")?;
+    ///
+    /// // Still `Running`, so the preview names the refusal rather than a
+    /// // removal — and it names it while the session is still there.
+    /// let preview = store.sweep_preview("2999-01-01T00:00:00.000Z")?;
+    /// assert_eq!(preview.sessions, 0);
+    /// assert_eq!(preview.refused, vec![session]);
+    ///
+    /// store.set_status(run, "completed")?;
+    /// let preview = store.sweep_preview("2999-01-01T00:00:00.000Z")?;
+    /// assert_eq!(preview.sessions, 1);
+    /// // Previewing twice answers the same, because the first took nothing.
+    /// assert_eq!(store.sweep_preview("2999-01-01T00:00:00.000Z")?, preview);
+    /// // And the sweep it described reports exactly it.
+    /// assert_eq!(store.sweep_sessions("2999-01-01T00:00:00.000Z")?, preview);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn sweep_preview(&self, before: &str) -> Result<Pruned> {
+        let (doomed, refused) = self.sweep_victims(before)?;
+        Ok(self.prune_plan(&doomed, refused)?.2)
+    }
+
     /// Remove every session created strictly before `before`.
     ///
     /// `before` is a timestamp string compared against `sessions.created_at`,
@@ -398,6 +532,8 @@ impl Store {
     ///
     /// **One pass over the schema however many sessions are swept.** The run set
     /// is collected for all of them first and each table is deleted from once.
+    ///
+    /// [`Store::sweep_preview`] answers what this would report, without doing it.
     ///
     /// ```
     /// use io_harness::Store;
@@ -422,28 +558,7 @@ impl Store {
     /// # }
     /// ```
     pub fn sweep_sessions(&self, before: &str) -> Result<Pruned> {
-        let mut candidates = Vec::new();
-        {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM sessions WHERE created_at < ?1 ORDER BY id")?;
-            let rows = stmt.query_map([before], |r| r.get::<_, i64>(0))?;
-            for row in rows {
-                candidates.push(row?);
-            }
-        }
-
-        // The refusal is evaluated for every candidate before anything is
-        // deleted, which is also what keeps the removal itself to one pass.
-        let mut doomed = Vec::new();
-        let mut refused = Vec::new();
-        for session in candidates {
-            if self.holds_resumable_run(session)? {
-                refused.push(session);
-            } else {
-                doomed.push(session);
-            }
-        }
+        let (doomed, refused) = self.sweep_victims(before)?;
         self.prune(&doomed, refused)
     }
 
@@ -621,35 +736,12 @@ impl Store {
         sessions: &[i64],
         refused: Vec<i64>,
     ) -> Result<(Pruned, usize)> {
-        let sessions = self.existing_sessions(sessions)?;
+        let (sessions, runs, pruned) = self.prune_plan(sessions, refused)?;
         if sessions.is_empty() {
-            return Ok((
-                Pruned {
-                    refused,
-                    ..Pruned::default()
-                },
-                0,
-            ));
+            return Ok((pruned, 0));
         }
-        let runs = Self::session_run_ids(&self.conn, &sessions)?;
         let session_list = id_list(&sessions);
         let run_list = id_list(&runs);
-
-        // Measured first. After the transaction none of it is answerable.
-        let turns = self.count_rows("session_turns", "session_id", &session_list)?;
-        let mut rows = turns + sessions.len() as i64;
-        let mut bytes = self.sum_text("session_turns", "session_id", &session_list, false)?
-            + self.sum_text("sessions", "id", &session_list, false)?;
-        let mut restore_points = 0;
-        if !runs.is_empty() {
-            rows += runs.len() as i64;
-            bytes += self.sum_text("runs", "id", &run_list, false)?;
-            restore_points = self.count_rows("snapshots", "run_id", &run_list)?;
-            for (table, key) in RUN_TABLES {
-                rows += self.count_rows(table, key, &run_list)?;
-                bytes += self.sum_text(table, key, &run_list, false)?;
-            }
-        }
 
         let mut statements = 0;
         let tx = self.conn.unchecked_transaction()?;
@@ -670,18 +762,73 @@ impl Store {
         statements += 2;
         tx.commit()?;
 
-        Ok((
-            Pruned {
-                sessions: sessions.len() as u64,
-                turns: turns.max(0) as u64,
-                runs: runs.len() as u64,
-                rows: rows.max(0) as u64,
-                bytes: bytes.max(0) as u64,
-                restore_points: restore_points.max(0) as u64,
-                refused,
-            },
-            statements,
-        ))
+        Ok((pruned, statements))
+    }
+
+    /// What a removal of `sessions` would take, and the two id sets it would take
+    /// it from (0.70.0).
+    ///
+    /// The measurement half of [`Store::prune_counted`], lifted out so
+    /// [`Store::sweep_preview`] can stop here. Everything is measured before
+    /// anything is deleted — after the transaction there is nothing left to
+    /// count — so the measurement was always a separate step; this only gives it
+    /// a name and one caller more.
+    ///
+    /// It returns the sessions and the runs alongside the [`Pruned`], and the
+    /// deletion uses **those** rather than resolving the tree a second time.
+    /// That is what makes the preview an equality rather than an estimate: there
+    /// is no second derivation to drift from the first, and a change to what gets
+    /// counted moves what gets deleted with it.
+    ///
+    /// The sessions come back filtered to those that exist, because an id that is
+    /// not in the store contributes nothing to either half. A caller that asked
+    /// only about absent sessions gets an empty first element and a [`Pruned`]
+    /// carrying nothing but `refused`.
+    fn prune_plan(
+        &self,
+        sessions: &[i64],
+        refused: Vec<i64>,
+    ) -> Result<(Vec<i64>, Vec<i64>, Pruned)> {
+        let sessions = self.existing_sessions(sessions)?;
+        if sessions.is_empty() {
+            return Ok((
+                sessions,
+                Vec::new(),
+                Pruned {
+                    refused,
+                    ..Pruned::default()
+                },
+            ));
+        }
+        let runs = Self::session_run_ids(&self.conn, &sessions)?;
+        let session_list = id_list(&sessions);
+        let run_list = id_list(&runs);
+
+        let turns = self.count_rows("session_turns", "session_id", &session_list)?;
+        let mut rows = turns + sessions.len() as i64;
+        let mut bytes = self.sum_text("session_turns", "session_id", &session_list, false)?
+            + self.sum_text("sessions", "id", &session_list, false)?;
+        let mut restore_points = 0;
+        if !runs.is_empty() {
+            rows += runs.len() as i64;
+            bytes += self.sum_text("runs", "id", &run_list, false)?;
+            restore_points = self.count_rows("snapshots", "run_id", &run_list)?;
+            for (table, key) in RUN_TABLES {
+                rows += self.count_rows(table, key, &run_list)?;
+                bytes += self.sum_text(table, key, &run_list, false)?;
+            }
+        }
+
+        let pruned = Pruned {
+            sessions: sessions.len() as u64,
+            turns: turns.max(0) as u64,
+            runs: runs.len() as u64,
+            rows: rows.max(0) as u64,
+            bytes: bytes.max(0) as u64,
+            restore_points: restore_points.max(0) as u64,
+            refused,
+        };
+        Ok((sessions, runs, pruned))
     }
 }
 

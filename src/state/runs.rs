@@ -196,6 +196,55 @@ impl Store {
             .flatten())
     }
 
+    /// Where a run worked, or `None` if no such run exists (0.70.0).
+    ///
+    /// `runs.file` is the run's **own** scope, recorded when the row was made:
+    /// the workspace root for a run started from
+    /// [`TaskContract::workspace`](crate::TaskContract::workspace), and the single
+    /// file for one started from [`TaskContract::new`](crate::TaskContract::new).
+    /// The name follows the column rather than improving on it, because those two
+    /// are not the same kind of path and a reader called `run_directory` would be
+    /// lying about half of them. [`Store::run_root`] is already taken and means
+    /// something else entirely — the id of the run at the top of the tree.
+    ///
+    /// **"Own" is the load-bearing word for a child.** A child spawned under a
+    /// definition carrying `worktree = true` works in its own checkout under
+    /// `.worktrees/`, and that is what [`Store::start_child_run`] is handed and
+    /// what this returns — not the parent's root. The run row is what an operator
+    /// reads to find where a child's files went, so a child that worked elsewhere
+    /// must not send them to the directory it was spawned from. Recomputing the
+    /// path instead of reading it here would put them back where they started,
+    /// because the derivation needs the run id, the step and the goal digest that
+    /// only the spawn had.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let root = store.start_run("coordinate", "/repo")?;
+    /// // What a `worktree = true` child is started with: its own checkout.
+    /// let child = store.start_child_run("scout", "/repo/.worktrees/scout-1-0", root, 1)?;
+    ///
+    /// assert_eq!(store.run_file(root)?.as_deref(), Some("/repo"));
+    /// assert_eq!(
+    ///     store.run_file(child)?.as_deref(),
+    ///     Some("/repo/.worktrees/scout-1-0"),
+    ///     "the child's own root, not the parent's"
+    /// );
+    /// assert!(store.run_file(9_999)?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn run_file(&self, run_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT file FROM runs WHERE id = ?1", [run_id], |r| {
+                r.get(0)
+            })
+            .ok())
+    }
+
     /// The durable run status as a typed [`RunStatus`], if the run exists.
     pub fn run_status(&self, run_id: i64) -> Result<Option<RunStatus>> {
         Ok(self.status(run_id)?.map(|s| RunStatus::from_str(&s)))

@@ -768,6 +768,160 @@ fn the_sweeps_cutoff_is_strictly_before_and_the_boundary_is_the_assertion() {
     assert!(store.session_size(newer).expect("a size").is_some());
 }
 
+/// 0.70.0 F6. The preview is not *like* the sweep, it is the sweep's own answer:
+/// asserted as full struct equality on `Pruned`, `refused` included, rather
+/// than as a bound one implementation could satisfy while disagreeing.
+///
+/// The discriminating session is `/d`: created before the cutoff, with its only
+/// turn stamped after it. The sweep selects on the *session's* stamp, so it goes
+/// — and a preview built from a turn's timestamp, which is the obvious way to
+/// write a second implementation, would have left it out and still passed every
+/// count on the other three.
+#[test]
+fn a_sweep_preview_is_exactly_the_receipt_the_sweep_then_produces() {
+    let (_dir, store, path) = on_disk();
+    let old_finished = seed_session(&store, "/a", 2, 2, "alpha");
+    let old_resumable = seed_session(&store, "/b", 1, 2, "beta");
+    let recent = seed_session(&store, "/c", 1, 1, "gamma");
+    let old_but_recently_used = seed_session(&store, "/d", 1, 1, "delta");
+
+    let conn = Connection::open(&path).expect("the store, read directly");
+    let cutoff = "2026-01-01T00:00:00.000Z";
+    for session in [old_finished, old_resumable, old_but_recently_used] {
+        backdate(&conn, session, "2025-06-01T00:00:00.000Z");
+    }
+    backdate(&conn, recent, "2026-06-01T00:00:00.000Z");
+    conn.execute(
+        "UPDATE session_turns SET created_at = ?1 WHERE session_id = ?2",
+        rusqlite::params!["2026-06-01T00:00:00.000Z", old_but_recently_used],
+    )
+    .expect("a turn stamped long after the session that holds it");
+
+    for session in [old_finished, recent, old_but_recently_used] {
+        for run in tree_of(&conn, session) {
+            store.set_status(run, "completed").expect("a status");
+        }
+    }
+    // Left resumable on purpose: without a refusal in the set, `refused` is a
+    // pair of empty vectors comparing equal and the equality asserts nothing
+    // about it.
+    store
+        .set_status(tree_of(&conn, old_resumable)[0], "paused")
+        .expect("a status");
+
+    let preview = store.sweep_preview(cutoff).expect("the preview");
+    assert_eq!(
+        preview.sessions, 2,
+        "the two backdated sessions the refusal did not keep"
+    );
+    assert_eq!(
+        preview.refused,
+        vec![old_resumable],
+        "the refusal is in the preview, or the preview is not the sweep's answer"
+    );
+    assert!(
+        preview.bytes > 0 && preview.runs > 0,
+        "a preview that measured nothing would compare equal to a sweep that \
+         took nothing: {preview:?}"
+    );
+
+    // It took nothing while saying all that. Every session is still there, and
+    // the same question gets the same answer.
+    for session in [old_finished, old_resumable, recent, old_but_recently_used] {
+        assert!(
+            store.session_size(session).expect("a size").is_some(),
+            "session {session} survived the preview"
+        );
+    }
+    assert_eq!(
+        store.sweep_preview(cutoff).expect("the preview"),
+        preview,
+        "previewing twice answers the same, because the first preview deleted nothing"
+    );
+
+    let swept = store.sweep_sessions(cutoff).expect("the sweep");
+    assert_eq!(
+        swept, preview,
+        "the whole receipt, not a bound: sessions, turns, runs, rows, bytes, \
+         restore points and refused"
+    );
+
+    assert!(
+        store
+            .session_size(old_but_recently_used)
+            .expect("a size")
+            .is_none(),
+        "a session created before the cutoff goes however recent its turns are"
+    );
+    assert!(store.session_size(recent).expect("a size").is_some());
+    assert!(store.session_size(old_resumable).expect("a size").is_some());
+}
+
+/// 0.70.0. What `session_created_at` reports is the value the sweep's cutoff is
+/// compared against — tied to the filter in both directions rather than read
+/// back in isolation, where any string the column happened to hold would pass.
+#[test]
+fn a_sessions_created_at_is_the_value_the_sweeps_cutoff_is_compared_against() {
+    let (_dir, store, path) = on_disk();
+    let session = seed_session(&store, "/repo", 1, 1, "alpha");
+
+    // The column default's own shape, before anything moves it: RFC 3339 in UTC
+    // to the millisecond, which is what makes a cutoff written by hand
+    // comparable to it at all.
+    let natural = store
+        .session_created_at(session)
+        .expect("the read")
+        .expect("the session exists");
+    assert_eq!(natural.len(), 24, "{natural}");
+    assert_eq!(&natural[10..11], "T", "{natural}");
+    assert_eq!(&natural[19..20], ".", "{natural}");
+    assert!(natural.ends_with('Z'), "{natural}");
+
+    let conn = Connection::open(&path).expect("the store, read directly");
+    backdate(&conn, session, "2026-01-01T00:00:00.500Z");
+    for run in tree_of(&conn, session) {
+        store.set_status(run, "completed").expect("a status");
+    }
+
+    let created = store
+        .session_created_at(session)
+        .expect("the read")
+        .expect("the session exists");
+    assert_eq!(
+        created, "2026-01-01T00:00:00.500Z",
+        "the stored text, neither parsed nor reformatted on the way out"
+    );
+
+    // One millisecond either side of the value the reader just gave, which is
+    // the whole margin the comparison has.
+    assert_eq!(
+        store
+            .sweep_preview("2026-01-01T00:00:00.499Z")
+            .expect("a preview")
+            .sessions,
+        0,
+        "a cutoff one millisecond earlier excludes it"
+    );
+    assert_eq!(
+        store.sweep_preview(&created).expect("a preview").sessions,
+        0,
+        "and its own stamp does not take it: the comparison is strictly before"
+    );
+    assert_eq!(
+        store
+            .sweep_preview("2026-01-01T00:00:00.501Z")
+            .expect("a preview")
+            .sessions,
+        1,
+        "a cutoff one millisecond later includes it"
+    );
+
+    assert!(
+        store.session_created_at(9_999).expect("the read").is_none(),
+        "a session the store does not have was not created at anything"
+    );
+}
+
 /// F12. A prune alone does not shrink the file; a compaction does.
 #[test]
 fn a_prune_frees_pages_into_the_file_and_a_compaction_returns_them() {
