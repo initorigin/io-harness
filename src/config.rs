@@ -129,6 +129,7 @@ use crate::error::{Error, Result};
 use crate::mcp::McpServer;
 use crate::policy::{Defaults, Effect, Layer, Policy};
 use crate::pricing::{Price, PriceTable};
+use crate::provider::redacted_endpoint;
 use crate::resilience::{RetryPolicy, StallPolicy};
 use crate::sandbox::SandboxConfig;
 use crate::toolchain::Toolchain;
@@ -221,7 +222,12 @@ pub struct Origin {
 ///
 /// `deny_unknown_fields` is on every section: an unknown key is the failure this
 /// module exists to make loud.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written below rather than derived (0.71.0): every string in
+/// here has already been through [`substitute`], so a derived one would print
+/// resolved `${env:}`/`${file:}`/`${cmd:}` values — a provider's `api_key`, an
+/// `[[mcp]]` server's `Authorization` header, an `[[lsp]]` child's environment.
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
     #[serde(default)]
@@ -346,7 +352,13 @@ struct File {
 /// It is `#[non_exhaustive]` from the first release it exists, because a later one
 /// adds a variant: a consumer matching it needs a `_ =>` arm, and paying that once
 /// now is what keeps the addition from being a break.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written and prints `api_key` as `<redacted>` when it is set and
+/// `None` when it is not (0.71.0) — the distinction an operator needs, without the
+/// credential. `Serialize` is untouched: an application layer persists a spec the
+/// operator typed, and a redacted round trip would write the placeholder into their
+/// settings file.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ProviderSpec {
@@ -498,6 +510,210 @@ impl ProviderSpec {
     }
 }
 
+// ---------------------------------------------------------------------------
+// What a formatter is allowed to see (0.71.0)
+// ---------------------------------------------------------------------------
+//
+// `parse` resolves every `${env:}`, `${file:}` and `${cmd:}` *before* the table is
+// stored, so from that point on a configuration is a bag of plaintext secrets: a
+// provider's `api_key`, an `[[mcp]]` server's `Authorization` header, the
+// environment handed to an `[[lsp]]` child, whatever an application layer keeps
+// under `[app]`. Deriving `Debug` on `Config`, `File` or `ProviderSpec` puts all of
+// it in the first log line anyone writes while debugging a misconfiguration — and
+// puts it there twice, because `Config` keeps both the typed sections and the raw
+// table they came from.
+//
+// The three impls below print the *shape* instead. `f.debug_struct("Config")
+// .finish()` would also hide the secrets, and is rejected: an operator formats a
+// config precisely when it is behaving unexpectedly, and an empty rendering answers
+// nothing. Key names, nesting, value kinds, section presence and the ids of the
+// things a file declared are all safe — none of them is a value a substitution
+// filled in — and together they are what the question "why did this config do that"
+// is actually asking.
+
+/// A bare word standing in for a value a formatter must not print.
+///
+/// A newtype rather than a `&str` because `&str`'s own `Debug` quotes it, and
+/// `api_key: "<redacted>"` reads like a key whose value happens to be that text.
+pub(crate) struct Marker(pub(crate) &'static str);
+
+impl std::fmt::Debug for Marker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// The one spelling of a withheld value, for every module that withholds one.
+///
+/// It is a constant rather than a literal repeated per module for the reason this
+/// whole release exists: the seven hand-written `Debug` impls added in 0.71.0 span
+/// five files, and a second spelling of this word would make an operator's output
+/// disagree with itself depending on which type printed it.
+pub(crate) const REDACTED: Marker = Marker("<redacted>");
+
+/// `<redacted>` for a credential that is set, `None` for one that is not.
+///
+/// The distinction is deliberate and is the whole operator-facing value of the
+/// field: "this file supplied a key and it was still wrong" and "this file supplied
+/// no key, so the provider read its own environment variable" are different
+/// misconfigurations with different fixes. Nothing else is said — not the length,
+/// not a prefix, not a suffix — because each of those narrows *which* key it is.
+fn secret<T>(value: &Option<T>) -> Marker {
+    if value.is_some() {
+        REDACTED
+    } else {
+        Marker("None")
+    }
+}
+
+/// `<set>` for a section a file wrote, `None` for one no file mentioned.
+///
+/// A section's contents are omitted rather than redacted key by key: every one of
+/// them has been through [`substitute`], and a rule that lists the fields safe to
+/// print is a rule that goes stale the next time a section gains a field. The key
+/// names and value kinds are still visible through [`TableShape`] on `Config`'s raw
+/// table, which is where the detail belongs.
+fn section<T>(value: &Option<T>) -> Marker {
+    Marker(if value.is_some() { "<set>" } else { "None" })
+}
+
+/// The shape of one parsed TOML value: nesting and kinds, never a leaf's value.
+struct Shape<'a>(&'a toml::Value);
+
+impl std::fmt::Debug for Shape<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            toml::Value::Table(table) => std::fmt::Debug::fmt(&TableShape(table), f),
+            toml::Value::Array(items) => f.debug_list().entries(items.iter().map(Shape)).finish(),
+            // Every leaf collapses to its kind. A string is the only one a
+            // substitution can fill, but an integer or a boolean printed beside it
+            // would invite the next field to be printed too.
+            toml::Value::String(_) => f.write_str("string"),
+            toml::Value::Integer(_) => f.write_str("integer"),
+            toml::Value::Float(_) => f.write_str("float"),
+            toml::Value::Boolean(_) => f.write_str("boolean"),
+            toml::Value::Datetime(_) => f.write_str("datetime"),
+        }
+    }
+}
+
+/// The same, for a table — the form `Config`'s raw merge and `[app]` are held in.
+struct TableShape<'a>(&'a toml::value::Table);
+
+impl std::fmt::Debug for TableShape<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|(key, value)| (key, Shape(value))))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ProviderSpec {
+    /// Every field but `api_key` verbatim; `api_key` as `<redacted>` when it is
+    /// set and `None` when it is not.
+    ///
+    /// The model id is the field an operator is usually looking for, so it is
+    /// printed exactly as written. `base_url` goes through the same endpoint
+    /// redaction the providers' own impls use: a gateway or Azure-style endpoint
+    /// routinely carries the credential inside the URL, and printing it verbatim
+    /// would reopen the leak through the neighbouring field.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OpenRouter { model, api_key } => f
+                .debug_struct("OpenRouter")
+                .field("model", model)
+                .field("api_key", &secret(api_key))
+                .finish(),
+            Self::Anthropic { model, api_key } => f
+                .debug_struct("Anthropic")
+                .field("model", model)
+                .field("api_key", &secret(api_key))
+                .finish(),
+            Self::OpenAi { model, api_key } => f
+                .debug_struct("OpenAi")
+                .field("model", model)
+                .field("api_key", &secret(api_key))
+                .finish(),
+            Self::Compatible {
+                model,
+                preset,
+                base_url,
+                api_key,
+                auth,
+                name,
+                reference_prices,
+            } => f
+                .debug_struct("Compatible")
+                .field("model", model)
+                .field("preset", preset)
+                .field("base_url", &base_url.as_deref().map(redacted_endpoint))
+                .field("api_key", &secret(api_key))
+                .field("auth", auth)
+                .field("name", name)
+                .field("reference_prices", reference_prices)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for File {
+    /// Which sections a file set, and the ids of what it declared.
+    ///
+    /// `[[provider]]` is the one array printed in full, through
+    /// [`ProviderSpec`]'s own impl, because the model a run is about to use is
+    /// the single most-asked question of a configuration and that impl already
+    /// withholds the key. Everything else is named and counted rather than
+    /// rendered: `[[mcp]]` carries `Authorization` headers, `[[lsp]]` carries a
+    /// child's environment, `[[hook]]` carries an argv, and each of those is a
+    /// string a `${env:}` may have filled.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("File");
+        s.field("policy", &section(&self.policy));
+        s.field("sandbox", &section(&self.sandbox));
+        s.field("run", &section(&self.run));
+        s.field("memory", &section(&self.memory));
+        s.field("prices", &section(&self.prices));
+        s.field("web", &section(&self.web));
+        s.field("instructions", &section(&self.instructions));
+        #[cfg(feature = "browser")]
+        s.field("browser", &section(&self.browser));
+        s.field("toolchain", &self.toolchain.keys());
+        s.field("provider", &self.provider);
+        s.field("mcp", &self.mcp.iter().map(|m| &m.id).collect::<Vec<_>>());
+        s.field("lsp", &self.lsp.iter().map(|l| &l.id).collect::<Vec<_>>());
+        s.field(
+            "agent",
+            &self.agent.iter().map(|a| &a.name).collect::<Vec<_>>(),
+        );
+        s.field("hook", &self.hook.len());
+        s.field("plugin", &self.plugin.len());
+        s.field("app", &self.app.as_ref().map(TableShape));
+        s.field("profile", &self.profile.keys());
+        s.finish()
+    }
+}
+
+impl std::fmt::Debug for Config {
+    /// Which files were read, what they set, and the shape of the merged table.
+    ///
+    /// `origins` is printed whole: it is a map from a dotted key *name* to the
+    /// files that decided it, and holds no value from any of them — which makes
+    /// it the most useful thing here and one of the few carrying no risk.
+    /// `instructions` and `plugin_decls` are counted, being file contents and
+    /// declared paths respectively.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("Config");
+        s.field("dir", &self.dir);
+        s.field("sources", &self.sources);
+        s.field("file", &self.file);
+        s.field("raw", &TableShape(&self.raw));
+        s.field("origins", &self.origins);
+        s.field("instructions", &self.instructions.len());
+        s.field("plugin_decls", &self.plugin_decls.len());
+        s.finish()
+    }
+}
+
 /// Which files carry a repository's own instructions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -628,7 +844,14 @@ struct PricesSection {
 /// assert!(empty.is_empty());
 /// assert!(empty.policy().is_none(), "no [policy] section is not an empty policy");
 /// ```
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` is hand-written (0.71.0). A loaded config holds the merged table with
+/// every `${env:}`, `${file:}` and `${cmd:}` already resolved, so a derived one
+/// printed the operator's credentials — twice, once through the typed sections and
+/// once through the raw table. What it prints instead is the *structure*: which
+/// scopes were read, which sections a file set, and the key names, nesting and
+/// value kinds of the merged table. No leaf value, ever.
+#[derive(Clone, Default)]
 pub struct Config {
     file: File,
     sources: Vec<(Scope, PathBuf)>,
@@ -998,6 +1221,13 @@ impl Config {
     ///
     /// assert!(matches!(config.provider_spec(), Some(ProviderSpec::Anthropic { .. })));
     /// assert!(Config::from_toml("").unwrap().provider_spec().is_none());
+    ///
+    /// // 0.71.0 — formatting a spec says whether a key was written, never what it
+    /// // was. `Serialize` is untouched: what an operator typed is what is persisted.
+    /// let rendered = format!("{:?}", config.provider_spec().unwrap());
+    /// assert!(rendered.contains("api_key: <redacted>"), "{rendered}");
+    /// assert!(rendered.contains("claude-sonnet-4"), "{rendered}");
+    /// assert!(!rendered.contains("sk-written-here"), "{rendered}");
     /// ```
     pub fn provider_spec(&self) -> Option<&ProviderSpec> {
         self.file.provider.first()

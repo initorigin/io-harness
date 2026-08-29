@@ -629,9 +629,66 @@ pub struct TaskContract {
     pub max_parallel_reads: usize,
 }
 
+/// Steps a single-file task gets when the caller says nothing (0.71.0).
+///
+/// The budget [`TaskContract::new`] installs, and the number a caller who wanted
+/// "the default, plus a little" had to guess at until this constant existed. The
+/// constructor reads it rather than a literal, so the value documented here and
+/// the value a contract carries cannot drift apart.
+///
+/// A repo-wide task gets more — see [`DEFAULT_WORKSPACE_MAX_STEPS`].
+///
+/// ```
+/// use io_harness::{TaskContract, Verification, DEFAULT_MAX_STEPS};
+///
+/// let contract = TaskContract::new("fix the parser", "src/parse.rs", Verification::None);
+/// assert_eq!(contract.max_steps, DEFAULT_MAX_STEPS);
+///
+/// // Readable means composable: ask for twice the default without hard-coding
+/// // what the default is.
+/// let patient = contract.with_max_steps(DEFAULT_MAX_STEPS * 2);
+/// assert_eq!(patient.max_steps, 16);
+/// ```
+pub const DEFAULT_MAX_STEPS: u32 = 8;
+
+/// Steps a workspace task gets when the caller says nothing (0.71.0).
+///
+/// Higher than [`DEFAULT_MAX_STEPS`] on purpose: a task that may grep, read and
+/// write across a tree spends turns finding the files a single-file task is
+/// handed. [`TaskContract::workspace`] reads this constant.
+///
+/// ```
+/// use io_harness::{TaskContract, DEFAULT_MAX_STEPS, DEFAULT_WORKSPACE_MAX_STEPS};
+///
+/// let contract = TaskContract::workspace("port the parser", "/tmp/repo");
+/// assert_eq!(contract.max_steps, DEFAULT_WORKSPACE_MAX_STEPS);
+///
+/// // The two constructors deliberately differ, and the difference is now
+/// // something a caller can read rather than measure.
+/// assert!(DEFAULT_WORKSPACE_MAX_STEPS > DEFAULT_MAX_STEPS);
+/// ```
+pub const DEFAULT_WORKSPACE_MAX_STEPS: u32 = 12;
+
+/// Retries a task gets when the caller says nothing (0.71.0).
+///
+/// The same for both constructors — how a run is scoped changes how many turns
+/// it needs, not how many times a failed attempt is worth repeating. Both read
+/// this constant.
+///
+/// ```
+/// use io_harness::{TaskContract, Verification, DEFAULT_MAX_RETRIES};
+///
+/// let single = TaskContract::new("fix the parser", "src/parse.rs", Verification::None);
+/// let repo = TaskContract::workspace("port the parser", "/tmp/repo");
+/// assert_eq!(single.max_retries, DEFAULT_MAX_RETRIES);
+/// assert_eq!(repo.max_retries, DEFAULT_MAX_RETRIES);
+/// ```
+pub const DEFAULT_MAX_RETRIES: u32 = 2;
+
 impl TaskContract {
     /// Minimal contract: goal, target file, and a success criterion.
-    /// Defaults to 8 steps, no time/token budget, 2 retries, no constraints.
+    /// Defaults to [`DEFAULT_MAX_STEPS`] steps, no time/token budget,
+    /// [`DEFAULT_MAX_RETRIES`] retries, no constraints.
     pub fn new(goal: impl Into<String>, file: impl Into<PathBuf>, verify: Verification) -> Self {
         Self {
             goal: goal.into(),
@@ -647,10 +704,10 @@ impl TaskContract {
             reviewer: None,
             tool_hooks: None,
             routing: None,
-            max_steps: 8,
+            max_steps: DEFAULT_MAX_STEPS,
             max_duration: None,
             max_tokens: None,
-            max_retries: 2,
+            max_retries: DEFAULT_MAX_RETRIES,
             mcp: Vec::new(),
             lsp: Vec::new(),
             #[cfg(feature = "browser")]
@@ -707,8 +764,10 @@ impl TaskContract {
     /// criterion positionally: a single-file task names one file and one thing that
     /// must become true of it, so there is no honest default to fall back to there.
     ///
-    /// The rest of the defaults match [`TaskContract::new`] (12 steps here, since
-    /// repo tasks take more turns), no time/token budget, 2 retries.
+    /// The rest of the defaults match [`TaskContract::new`]
+    /// ([`DEFAULT_WORKSPACE_MAX_STEPS`] here rather than [`DEFAULT_MAX_STEPS`],
+    /// since repo tasks take more turns), no time/token budget,
+    /// [`DEFAULT_MAX_RETRIES`] retries.
     pub fn workspace(goal: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         Self {
@@ -725,10 +784,10 @@ impl TaskContract {
             tool_hooks: None,
             routing: None,
             effort: None,
-            max_steps: 12,
+            max_steps: DEFAULT_WORKSPACE_MAX_STEPS,
             max_duration: None,
             max_tokens: None,
-            max_retries: 2,
+            max_retries: DEFAULT_MAX_RETRIES,
             mcp: Vec::new(),
             lsp: Vec::new(),
             #[cfg(feature = "browser")]

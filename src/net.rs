@@ -7,11 +7,14 @@
 //!
 //! Three pieces live here, and they are deliberately the *only* way out:
 //!
-//! - [`http_client`] is the one `reqwest::Client` constructor in the crate, so
+//! - `http_client` is the one `reqwest::Client` constructor in the crate, so
 //!   redirect behaviour is decided once rather than per call site.
 //! - [`target`] turns a URL into the `host:port` string the policy sees, so
-//!   every act sees a target in the same shape.
-//! - [`NetGuard`] evaluates that target against a [`Policy`] and records the
+//!   every act sees a target in the same shape. It is the one piece of this
+//!   module a caller outside the crate can reach, because it is the one piece a
+//!   caller has any reason to reimplement — see its own docs for the `None`
+//!   contract that reimplementation has to get right.
+//! - `NetGuard` evaluates that target against a [`Policy`] and records the
 //!   verdict, mirroring [`crate::ExecGuard`] so the two boundaries read alike.
 //!
 //! What this cannot do is govern a connection some *other* process opens. A
@@ -40,10 +43,10 @@ use crate::state::{PolicyEvent, Store};
 ///
 /// A caller who needs a different deadline overrides it per provider with
 /// `with_timeout` ([`crate::OpenRouter::with_timeout`],
-/// [`crate::Anthropic::with_timeout`], [`crate::OpenAi::with_timeout`]). This
-/// module is private, so the value reaches callers re-exported from each of those
-/// provider modules — a default you are told to reason about has to be one you
-/// can read.
+/// [`crate::Anthropic::with_timeout`], [`crate::OpenAi::with_timeout`]). The
+/// value reaches those callers re-exported at the crate root and from each of
+/// those provider modules — a default you are told to reason about has to be one
+/// you can read.
 ///
 /// ```no_run
 /// use io_harness::{OpenRouter, REQUEST_TIMEOUT};
@@ -175,24 +178,97 @@ fn parse_http_date(value: &str) -> Option<SystemTime> {
 
 /// The policy target for `url`: its host and port as `host:port`.
 ///
-/// The port is always present, filled from the scheme when the URL omits it, so
-/// a rule that names a port has something to match and a rule that does not is
-/// still matched by [`Policy::explain`]'s bare-host form. An IPv6 literal keeps
-/// its brackets (`[::1]:443`), which is what makes the trailing `:port` split
-/// unambiguous.
+/// # `None` is a refusal
 ///
-/// Returns `None` when there is no host to check — a malformed URL, or a scheme
-/// like `file:` that never opens a connection. A `None` is not permission to
-/// proceed: [`NetGuard::check`] treats it as unresolvable and refuses.
-pub(crate) fn target(url: &str) -> Option<String> {
+/// This is the whole contract, and it is the half a reimplementation gets wrong.
+/// `None` does **not** mean "no target", "nothing to check", or "no rule
+/// applies". It means **this URL must not be connected to**. `NetGuard::check`
+/// turns it straight into [`Error::Refused`] without consulting the policy at
+/// all — even a policy that allows everything cannot allow a host it cannot see,
+/// and an unchecked connection is the single thing this boundary exists to
+/// prevent.
+///
+/// So a caller that reads `None` as "there is nothing here to check" and carries
+/// on reports **permitted** for a URL the harness itself refuses. That is the
+/// fail-open direction: silently wrong, wrong in the permissive direction, and
+/// invisible to everything downstream. A permission check may fail closed and
+/// annoy someone; it may never fail open. If you copy this function — to preview
+/// a verdict, to render a policy, to lint a config — copy the `None` handling
+/// with it: every `None` is a deny.
+///
+/// # What a `Some` contains
+///
+/// The port is always present, filled from the scheme when the URL omits it
+/// (`https` and `wss` → 443, `http` and `ws` → 80), so a rule that names a port
+/// has something to match and a rule that does not is still matched by
+/// [`Policy::explain`]'s bare-host form. Userinfo is dropped — credentials are
+/// not part of the host. An IPv6 literal keeps its brackets (`[::1]:443`), which
+/// is what makes the trailing `:port` split unambiguous.
+///
+/// # What produces a `None`
+///
+/// A URL with no `://`; an empty authority (`https://`); an empty host or an
+/// empty port (`https://host:/x`); and any scheme that opens no connection for a
+/// policy to govern — `file:`, `data:`, anything outside
+/// `http`/`https`/`ws`/`wss`. An unrecognised scheme is a refusal rather than a
+/// pass-through precisely because "I did not recognise this" and "this is
+/// harmless" are not the same statement.
+///
+/// ```
+/// use io_harness::net::target;
+///
+/// // The port comes from the scheme when the URL omits it.
+/// let got = target("https://api.example.com/v1");
+/// assert_eq!(got.as_deref(), Some("api.example.com:443"));
+/// assert_eq!(target("ws://example.com/socket").as_deref(), Some("example.com:80"));
+///
+/// // An explicit port wins, and userinfo is not part of the host.
+/// let got = target("https://user:pw@example.com:8443/x");
+/// assert_eq!(got.as_deref(), Some("example.com:8443"));
+///
+/// // An IPv6 literal keeps its brackets, with and without a port.
+/// assert_eq!(target("https://[::1]/x").as_deref(), Some("[::1]:443"));
+/// assert_eq!(target("https://[::1]:8080/x").as_deref(), Some("[::1]:8080"));
+///
+/// // And the half that matters: these are refusals, not blanks.
+/// for url in [
+///     "file:///etc/passwd",
+///     "not a url",
+///     "https://",
+///     "https://host:/x",
+///     "https://[]/x",
+///     "https://[::1]:/x",
+/// ] {
+///     assert!(target(url).is_none(), "{url}");
+/// }
+///
+/// // Which means the only correct way to consume it is this shape —
+/// // `None` takes the deny arm, never the "carry on" arm.
+/// fn may_connect(url: &str) -> bool {
+///     match target(url) {
+///         Some(t) => policy_allows(&t),
+///         None => false, // NOT `true`, and NOT "skip the check"
+///     }
+/// }
+/// # fn policy_allows(_t: &str) -> bool { true }
+/// assert!(!may_connect("file:///etc/passwd"));
+/// assert!(may_connect("https://api.example.com/v1"));
+/// ```
+pub fn target(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     // Authority ends at the first '/', '?', or '#'.
     let authority = rest
         .split(['/', '?', '#'])
         .next()
         .filter(|a| !a.is_empty())?;
-    // Drop any userinfo; credentials are not part of the host.
+    // Drop any userinfo; credentials are not part of the host. Dropping it can
+    // empty the authority (`https://user@/x`), and an empty host is no host: the
+    // `None` below is a refusal, whereas falling through would have built the
+    // hostless target `:443` for a permissive policy to cheerfully allow.
     let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if hostport.is_empty() {
+        return None;
+    }
 
     let default_port = match scheme.to_ascii_lowercase().as_str() {
         "https" | "wss" => "443",
@@ -200,12 +276,30 @@ pub(crate) fn target(url: &str) -> Option<String> {
         _ => return None,
     };
 
-    if let Some(close) = hostport.strip_prefix('[').and_then(|_| hostport.find(']')) {
-        // IPv6 literal: [::1] or [::1]:8080
+    if hostport.starts_with('[') {
+        // An opening bracket commits the authority to being an IPv6 literal, so
+        // every shape from here is answered here — including the malformed ones.
+        // Falling through to the plain-host path instead is how `https://[/x`
+        // used to come back `Some("[:443")`: no closing bracket, no colon, so the
+        // bracketless branch read the whole thing as a bare host.
+        let close = hostport.find(']')?;
+        // IPv6 literal: [::1] or [::1]:8080. Every rejection the plain-host path
+        // below makes, this path must make too. It did not until 0.71.0: an empty
+        // host (`[]`), an empty port (`[::1]:`) and a tail that is not a port at
+        // all (`[::1]evil.com`) all fell into the default-port arm and came back
+        // `Some`, while `https://host:/x` — the same shape without brackets —
+        // correctly came back `None`. A `Some` here is a target a policy may
+        // allow, so a shape this cannot reduce must never produce one.
         let host = &hostport[..=close];
-        return match hostport[close + 1..].strip_prefix(':') {
-            Some(port) if !port.is_empty() => Some(format!("{host}:{port}")),
-            _ => Some(format!("{host}:{default_port}")),
+        if hostport[1..close].is_empty() {
+            return None;
+        }
+        return match &hostport[close + 1..] {
+            "" => Some(format!("{host}:{default_port}")),
+            rest => match rest.strip_prefix(':') {
+                Some(port) if !port.is_empty() => Some(format!("{host}:{port}")),
+                _ => None,
+            },
         };
     }
 
@@ -529,27 +623,71 @@ mod tests {
             ("https://user:pw@example.com/x", "example.com:443"),
             ("https://[::1]/x", "[::1]:443"),
             ("https://[::1]:8080/x", "[::1]:8080"),
+            // The websocket schemes take the same defaults as their HTTP twins;
+            // an MCP server reached over `wss` is governed like any other host.
+            ("wss://mcp.example.com/sse", "mcp.example.com:443"),
+            ("ws://127.0.0.1/sse", "127.0.0.1:80"),
+            ("wss://[fe80::1]/sse", "[fe80::1]:443"),
+            // The scheme is matched case-insensitively; the host is not rewritten.
+            ("HTTPS://example.com/x", "example.com:443"),
         ] {
             assert_eq!(target(url).as_deref(), Some(want), "{url}");
         }
     }
 
+    /// The headline of issue #221, asserted where both halves are reachable:
+    /// every input `target` answers `None` for is *refused* by the guard, under a
+    /// policy that allows everything.
+    ///
+    /// The two assertions are in one loop on purpose. A reimplementation that
+    /// reads `None` as "nothing to check" passes the first and fails the second,
+    /// and that is exactly the fail-open reading this test exists to make
+    /// impossible to hold — the `None` is the refusal, not a gap before one.
     #[test]
     fn an_uncheckable_url_is_refused_not_waved_through() {
         for url in [
             "",
             "not a url",
+            "https:/only-one-slash",
+            // A scheme that opens no connection, and one that opens a connection
+            // this crate does not govern. Both refuse: "unrecognised" is not
+            // "harmless".
             "file:///etc/passwd",
+            "data:text/plain,hello",
+            "ftp://files.example.com/x",
+            "gopher://example.com/x",
+            // Empty-authority shapes, including the one where dropping userinfo
+            // is what empties it.
             "https://",
+            "https:///path",
+            "https://user@/x",
+            "https://@/x",
+            // Empty host or empty port.
             "https://host:/x",
+            "https://:8080/x",
+            "https://user@:8080/x",
+            // The same three shapes wearing brackets. Until 0.71.0 these came
+            // back `Some` while their bracketless twins came back `None`, because
+            // the IPv6 branch funnelled every tail it could not read into the
+            // default port. A gate that tests only the unbracketed spelling of a
+            // rule is a gate the bracketed spelling walks through.
+            "https://[]/x",
+            "https://[]:8080/x",
+            "https://[::1]:/x",
+            "https://[::1]evil.com/x",
+            "https://[/x",
         ] {
             assert_eq!(target(url), None, "{url}");
             let p = Policy::permissive();
             // Even a policy that allows everything cannot allow what it cannot see.
-            assert!(matches!(
-                NetGuard::new(&p).check(url),
-                Err(Error::Refused { .. })
-            ));
+            assert!(
+                matches!(
+                    NetGuard::new(&p).check(url),
+                    Err(Error::Refused { act, target, .. })
+                        if act == "net" && target == url
+                ),
+                "{url} produced no target, so the guard must refuse it"
+            );
         }
     }
 

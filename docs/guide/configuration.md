@@ -103,7 +103,11 @@ and the crate root is where the run's own types live.
 
 **An empty slice is an answer.** No file set the key, so the value is this
 crate's default, and a default has no file. Naming one would be an invention, and
-"the harness decided this" is exactly what the operator needs to be told.
+"the harness decided this" is exactly what the operator needs to be told. Since
+0.71.0 some of those defaults have *names* — `run.max_steps` unset is
+`DEFAULT_MAX_STEPS`, in the `[run]` section below — and that changes nothing
+here: a constant is not a file, and an origin reports files. A value you
+can name and a value nobody wrote down are still the same answer.
 
 **One entry, except where a key genuinely has more than one author.**
 `[[policy.layers]]` and `[[agent]]` append across scopes rather than replace, so
@@ -208,6 +212,28 @@ share = 0.5
 [run.commit_identity]
 name = "io-harness agent"
 email = "agent@io-harness.invalid"
+```
+
+A key this table omits falls to the contract's own default, and since 0.71.0
+three of those defaults are named constants rather than literals buried in a
+constructor:
+
+| Constant | Value | Where it lands |
+| --- | --- | --- |
+| `DEFAULT_MAX_STEPS` | 8 | `TaskContract::new` |
+| `DEFAULT_WORKSPACE_MAX_STEPS` | 12 | `TaskContract::workspace` |
+| `DEFAULT_MAX_RETRIES` | 2 | both |
+
+Two step budgets, kept apart on purpose: a repo-wide task spends turns finding
+the files a single-file task is handed. The constructors read the constants, so
+the number written here and the number a contract carries cannot drift. And a
+caller who wants "the default, plus a little" writes it rather than guessing:
+
+```rust
+use io_harness::{TaskContract, Verification, DEFAULT_MAX_STEPS};
+
+let patient = TaskContract::new("fix the parser", "src/parse.rs", Verification::None)
+    .with_max_steps(DEFAULT_MAX_STEPS * 2);
 ```
 
 `max_read_chars` is the one key here whose absence is not simply a default. Left
@@ -336,6 +362,21 @@ file named in three lines of their own code.
 
 `ProviderSpec` is `#[non_exhaustive]`: match it with a `_ =>` arm, because a later
 release adds a variant.
+
+**Printing a spec does not print the key (0.71.0).** `Debug` is hand-written:
+every field is verbatim except `api_key`, which renders as `<redacted>` when the
+file wrote one and `None` when it did not.
+
+```text
+Anthropic { model: "claude-sonnet-4", api_key: <redacted> }
+```
+
+That distinction is the whole operator-facing value of the field — "a key was
+supplied and it was still wrong" and "no key was supplied, so the provider read
+its own environment variable" are different misconfigurations with different
+fixes — and nothing beyond it is said, not a length, not a prefix. `Serialize` is
+deliberately **unchanged** and still writes the real key: a tool that saves the
+operator's settings file must not replace their credential with a placeholder.
 
 Unlike `[[policy.layers]]` and `[[agent]]`, the chain is **replaced** by a later
 scope rather than appended to. A half-appended fallback chain is not a chain.
@@ -592,6 +633,39 @@ the key and the file. None of them is ever an empty string — an empty string i
 boundary rule is a rule that matches nothing, and a config that silently disarms
 itself is the worst thing this feature could do.
 
+## Printing a config does not print what is in it (0.71.0)
+
+A resolved `Config` holds everything the substitutions above fetched: the
+provider key, the `Authorization` header a `${cmd:}` helper produced, whatever a
+`${file:}` read. Until 0.71.0 `Debug` was derived, so one
+`tracing::debug!("{config:?}")` wrote every one of them out — *twice*, once from
+the typed `File` and once from the merged `raw` table that both hold the same
+resolved string. Every release before this one did that.
+
+`Debug` on `Config`, on the `File` behind it and on `ProviderSpec` is hand-written
+now, and none of the three prints a leaf a substitution could have filled:
+
+| Printed | As |
+| --- | --- |
+| which files were read, in merge order | verbatim — `sources` holds paths, not values |
+| `origins` | verbatim — a map from a dotted key *name* to the files that decided it |
+| a section a file set (`[policy]`, `[run]`, `[web]`, …) | `<set>`, or `None` where no file mentioned it |
+| the merged `raw` table, and `[app]` | key names, nesting and leaf **kinds** — `string`, `integer`, `boolean` — never a leaf |
+| `[[mcp]]`, `[[lsp]]`, `[[agent]]` | their ids and names only; each carries headers, a child environment or an argv |
+| `[[hook]]`, `[[plugin]]` | counted |
+| `[[provider]]` | in full, through `ProviderSpec`'s own impl, which withholds the key |
+
+`[[provider]]` is the one array rendered whole because the model a run is about
+to use is the most-asked question of a configuration, and that impl already
+holds the key back. A section's contents are omitted rather than filtered key by
+key, because a list of the fields safe to print goes stale the next time a
+section gains a field.
+
+The shape is still there — an operator debugging a config wants to know that
+`policy.defaults.exec` was set, in which file, and to what *kind* of value — so
+this is a narrower print rather than a blank one. And it is `Debug` alone:
+`Serialize` writes what the operator typed, for the reason given above.
+
 ## A project file may narrow, and may never widen (0.27.0)
 
 `io.toml` is committed. It travels with a `git clone`, and until 0.27.0 a cloned
@@ -727,6 +801,13 @@ and a price it returns is that host's opinion rather than an invoice. It is off 
 default, it is `Act::Net`-checked like anything else this crate dials, and a policy
 that denies that host fails the run instead of silently reporting every call
 unpriced.
+
+**Redaction is `Debug`'s alone, and it is not a secret store.** The hand-written
+impls keep a resolved credential out of a log line. They do not keep it out of
+memory, out of `Serialize`, or out of the accessor that hands it to you —
+`config.provider_spec()` returns the real key, because that is what a caller
+asks for it. One specific leak is closed, formatting, and nothing else is
+claimed. A `${cmd:}` helper's output is still a string in this process.
 
 **`${` always begins a substitution.** There is no escape, so a literal `${` in a
 value — in a glob pattern, say — is not expressible. An unknown prefix is an

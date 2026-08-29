@@ -184,6 +184,8 @@ behaviour change and worth knowing if a gate starts failing on Linux only.
 
 ## See also
 
+- [Running commands](command-execution.md) — the `ExecMode` that decides where a
+  contained command may write, and `ExecMode::ALL` for listing the modes
 - [Verification](verification.md) — what the gate the sandbox confines actually proves
 - [Permissions and approval](permissions.md) — `Act::Exec` decides *whether* a command runs at all
 - [Agent composition](composition.md) — why concurrent agents made isolation urgent

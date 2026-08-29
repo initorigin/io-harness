@@ -398,6 +398,43 @@ egress is the one thing that does not follow: a process inside that container
 cannot reach the loopback proxy the rules are enforced by, so its network answer
 is the capability alone.
 
+### Listing the modes (0.71.0)
+
+`ExecMode::ALL` is the three modes as data, widest confinement first, for an
+application that offers them to an operator — a `--exec-mode` flag, a settings
+screen, a config validator. `ExecMode::as_str` is the label each one carries in
+the trace, in the agent's own boundary prompt, and as the `[sandbox] mode` key in
+a config file.
+
+```rust
+use io_harness::ExecMode;
+
+assert_eq!(
+    ExecMode::ALL,
+    [ExecMode::ReadOnly, ExecMode::WorkspaceWrite, ExecMode::FullAccess]
+);
+assert_eq!(ExecMode::ReadOnly.as_str(), "read-only");
+```
+
+**The list has to come from here, because a hand-written one is not
+self-policing.** `ExecMode` is `#[non_exhaustive]`, so a match on it outside this
+crate needs a wildcard arm; a mode added in a later release lands in that arm
+rather than in your menu, and your build keeps passing while the menu quietly
+stops offering the whole boundary. Only *removing* a mode would break you. That
+is the opposite of [`Effect`](permissions.md#listing-the-three-effects-0710),
+which is not `#[non_exhaustive]`: a stale hand-written list of effects stops
+compiling the day it goes stale. The enum that decides where model-produced code
+may write is the one whose list cannot be policed downstream.
+
+`ALL` is kept complete in-crate by an exhaustive `match`, not by asserting its
+length — a length check against a literal `3` is the same stale hand-written list
+moved inside the fix.
+
+Only the *menu* half was ever at risk. Reading a mode back has always been
+strict: `[sandbox] mode` deserializes through `ExecMode`'s own kebab-case labels
+with no `#[serde(other)]` arm, so an unrecognised string in a config file is a
+hard error rather than a silent fall back to the default.
+
 ## Where it shows up afterwards
 
 | Question | Where |

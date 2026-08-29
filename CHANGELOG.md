@@ -26,6 +26,140 @@ notes are produced from it.
 
 ### Security
 
+## [0.71.0] - 2026-08-29
+
+The crate answers for its own schema, and stops answering with the operator's
+key. 0.70.0 made every fact this crate records reachable; its schema stayed
+private, so a consumer built a copy — and one of those copies fails open, while
+the crate itself printed credentials through a derived `Debug`.
+
+### Breaking changes
+
+- **BREAKING (behaviour)** — `{:?}` and `{:#?}` no longer print resolved secrets
+  for `Config`, `File`, `ProviderSpec`, `McpServer`, `McpTransport`, `LspServer`,
+  `Hook` or `Toolchain`, and their output is different text than it was. Each
+  type now has a hand-written `Debug` instead of a derived
+  one: a provider's `api_key` renders as `<redacted>` when set and `None` when
+  not, a `Compatible` `base_url` goes through the same endpoint redaction the
+  provider types have used since 0.70.0, and `Config`'s `raw` table renders as
+  key names, nesting and leaf *kinds* rather than leaf values. Structure an
+  operator needs is intact — the scopes read, the sections present, the model
+  ids, the MCP server ids. *Migration:* nothing to write, and nothing was
+  parseable before — `Debug` is not a stable format. If you logged a `Config` to
+  see a configured value, read it through the typed accessor instead:
+  `config.provider_spec()` for a provider, `config.origin(key)` for which file
+  decided a setting. `Serialize` is deliberately unchanged and still round-trips
+  an `api_key` verbatim, so a tool that writes a configuration file back still
+  writes the operator's real key.
+
+- **BREAKING (behaviour)** — a plugin manifest is no longer substituted at all.
+  `${env:}` and `${file:}` join `${cmd:}` in being refused, in every scope, and
+  the manifest is now parsed by a reader that does not resolve substitutions at
+  all rather than by the resolving parser with a check after it. Only `${cmd:}`
+  was refused before, which was sufficient while a manifest could be reached only
+  after an operator had written a `[[plugin]]` entry naming it — a trust act.
+  `Plugins::inspect`, new in this release, is pointed at directories nobody has
+  agreed to yet. *Migration:* write the value out literally. A manifest is a
+  third party's file, and there is deliberately no opt-out: if a bundle needs a
+  value from the host environment, the operator supplies it in their own
+  configuration, where substitutions still resolve normally. No manifest in this
+  repository or its fixtures used either form.
+
+### Added
+
+- `Effect::ALL` and `ExecMode::ALL`, so an application reads an enum's legal
+  values instead of hand-writing a menu that a later variant makes silently
+  stale, plus `Effect::as_str` for the wire word of a held effect. Completeness
+  is guarded in-crate by an exhaustive `match`, which is the only mechanism that
+  makes a new variant break a build rather than quietly shrink a list — a length
+  check against a literal would not. (#218)
+- `DEFAULT_MAX_STEPS`, `DEFAULT_WORKSPACE_MAX_STEPS` and `DEFAULT_MAX_RETRIES`,
+  the defaults behind `run.max_steps` and `run.max_retries`, which were bare
+  literals no caller could name. Both step budgets are named and both are kept —
+  a repo task takes more turns than a single one, and collapsing them would have
+  changed the budget of every caller of one constructor. The constructors read
+  the constants, so the name cannot drift from the value. (#219)
+- `PriceTable::models()`, `len()` and `is_empty()`, matching the shape `Agents`
+  already had. `models()` lists what the table can actually price: a model given
+  tiers but no base price is unpriced, and is excluded rather than listed as
+  something `price()` will then decline to answer for. (#220)
+- `net::target` is public, and `net` is a public module exporting it and nothing
+  else. It normalises a URL to the `host:port` the runtime will check, and its
+  documentation states the half a reimplementation gets wrong: **`None` is a
+  refusal, not "nothing to check"**. (#221)
+- `Hook` and `OnFailure` are public, with an accessor for each of a hook's seven
+  fields, so a hook can be displayed rather than only counted. `Plugin::hooks()`
+  completes the accessor set that `contributions()` already advertised, and
+  `Hooks::declarations()` is public so an operator's own configured hooks are
+  enumerable too — the plugin half alone would have left the configuration half
+  blind. (#223)
+- `Plugins::inspect`, which reads and fully validates a plugin bundle on disk
+  without a declaration file being written first. Every check the normal load
+  path runs still runs, including the scope asymmetry that makes it useful: at
+  user scope a bundle's hooks and MCP servers are returned, at project scope they
+  are refused, and a manifest carrying a `${cmd:}` substitution is refused at
+  either. (#224)
+
+### Fixed
+
+- `McpServer`'s documentation named `Error::Mcp` for a server the policy refuses.
+  The refusal is `Error::Refused` — `act: "exec"` for a stdio server's binary,
+  `act: "net"` for a remote server's host — and `Error::Mcp` is returned only
+  once the policy has allowed the server and the process will not start. A
+  consumer had already written its error mapping against the wrong sentence and
+  would have missed every policy refusal. The corrected text is now asserted by a
+  test rather than merely edited to match a reading of the code. (#221)
+- `net::target` returned `Some(":443")` for a URL whose authority was nothing but
+  userinfo (`https://user@/x`), because dropping the credentials can empty the
+  authority and the empty host fell through to the scheme's default port. A
+  hostless target that a permissive policy would then allow. It is `None`, and
+  therefore a refusal, like every other unresolvable URL.
+- `net::target` fail-opened on four more shapes, all of them bracketed. An empty
+  IPv6 host (`https://[]/x`), an empty IPv6 port (`https://[::1]:/x`), a tail
+  after the bracket that is not a port at all (`https://[::1]evil.com/x`), and an
+  unclosed bracket (`https://[/x`) each produced a target instead of a refusal —
+  while the identical shapes without brackets correctly produced none. The IPv6
+  branch funnelled every tail it could not read into the scheme's default port,
+  and the unclosed case escaped that branch entirely and was read as a bare host.
+  The documented contract already said an empty host or an empty port is a
+  refusal, so a consumer written from the documentation was stricter than the
+  crate it was copying from.
+- The Windows containment test's "can execute a program" row probed an arbitrary
+  program on `PATH`, which on a CI runner is a rustup shim that starts, fails to
+  read the host's own toolchain home, and exits non-zero — so the row reported a
+  containment failure for a reason that was the host's, not the container's. It
+  now runs the toolchain binary the same report table already uses, and the test
+  refuses to pass at all if no program row could be executed.
+
+### Security
+
+- **Every release up to and including 0.70.0 prints the operator's resolved
+  configuration secrets on `{:?}` of a `Config`, a `File` or a `ProviderSpec`.**
+  All three derived `Debug`. `ProviderSpec` carries `api_key` in all four
+  variants and is handed out by `Config::provider_spec()`; worse, `Config` holds
+  the merged `raw` TOML table, which configuration parsing has *already*
+  substituted every `${env:}`, `${file:}` and `${cmd:}` into — so a single
+  `{:?}` printed each secret twice, through the typed field and through the raw
+  table, including MCP `Authorization` headers that never touch `ProviderSpec`
+  at all. Nothing inside the crate printed one, so no io-harness run leaked a key
+  on its own; the exposure is an embedder that logs or dumps its effective
+  configuration, which is an ordinary thing to build. **Upgrading is the fix**,
+  and there is no workaround on an earlier version short of never formatting
+  those types. Found by sweeping for the class 0.70.0 closed one instance of,
+  rather than from a report.
+- **The same leak reached one call further out, through the accessors.** Hiding a
+  secret in `Config`'s own `Debug` while `Config::mcp_servers()` handed back a
+  type that still derived `Debug` would have closed the reported shape and left
+  the reachable one open — which is exactly what 0.70.0 did when it fixed four
+  provider types and missed the configuration layer beneath them. So `McpServer`
+  and `McpTransport` (an `Authorization` header, a stdio child's environment and
+  argv), `LspServer` (a child's environment and argv), `Hook` (an argv and an
+  append path) and `Toolchain` (six argv vectors from `[toolchain.*]`) all have
+  hand-written `Debug` impls too. Each shows what an operator needs to recognise
+  the thing — the id, the program, the header and environment *key names* — and
+  hides every value a substitution could have filled. `Serialize` is untouched on
+  every one of them.
+
 ## [0.70.0] - 2026-08-29
 
 The harness stops keeping things to itself. Every entry below is the same shape:

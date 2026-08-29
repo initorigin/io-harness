@@ -867,8 +867,13 @@ name a program this machine would run, and `io.toml` is the file a `git clone`
 delivers — the 0.28.0 rule for `[[hook]]`, applied to a new declaration site. The
 refusal is whole: a project-scoped bundle whose manifest declares one contributes
 none of its other kinds either, because a half-applied stranger's manifest is the
-failure the rule exists to prevent. `${cmd:}` inside a manifest is refused in
-every scope.
+failure the rule exists to prevent. **A manifest is not substituted at all**:
+`${env:}`, `${file:}` and `${cmd:}` are each refused in every scope, as of
+0.71.0. Before that only `${cmd:}` was, which was enough while a manifest could
+be reached only after an operator had written a `[[plugin]]` entry naming it —
+a trust act. `Plugins::inspect` is pointed at directories nobody has agreed to
+yet, so the other two became reachable on untrusted input, and reading a host's
+environment or its files is the same class of act as running a program on it.
 
 **This does not narrow the standing `[[mcp]]` gap in `io.toml` itself.** A
 project-scoped `io.toml` may still name an MCP command directly, and an unknown
@@ -3516,3 +3521,31 @@ the child's **own** worktree rather than its parent's root, which is the whole
 reason the column was written in 0.36.0 and the reason reconstructing it from the
 parent's root is wrong. It is named after the column and not after the tree case:
 for a single-file run it holds that file's path, so it is not always a directory.
+
+## What a `[[hook]]` block commits this crate to (0.71.0)
+
+`Hook` and `OnFailure` are public as of 0.71.0, and that is a wider promise than
+the two names suggest. `Hook` derives `Serialize`, `Deserialize` and
+`#[serde(deny_unknown_fields)]`, so **the shape of a `[[hook]]` block in a
+configuration file or a plugin manifest is now part of this crate's public
+contract**: its seven keys — `on`, `at`, `tools`, `append`, `run`, `on_failure`
+and `timeout_ms` — are named here, and renaming one, changing what one accepts,
+or making an existing file stop parsing is a break under the rules above.
+
+This is recorded rather than discovered on purpose. The shape was already load
+bearing before the type was public: operators author these blocks by hand,
+`docs/guide/hooks.md` documents them, and `deny_unknown_fields` means a key this
+crate stops recognising is a hard parse error rather than a warning. Making the
+type public did not create the commitment; it made it visible, and this section
+is where a future release is expected to look before editing the struct.
+
+Adding a key remains compatible — `Hook`'s fields are private, reached through
+accessors, so a new field breaks no struct literal, and a new optional key breaks
+no existing file. `OnFailure` is `#[non_exhaustive]` for the same reason: it has
+three variants today and a fourth is foreseeable, so a downstream `match` must
+carry a wildcard arm from the start rather than acquire one in a later release.
+
+Two things are deliberately *not* promised. The `Debug` rendering of a `Hook` is
+not a format — nothing may parse it — and the order `Hooks::declarations()`
+returns is declaration order within a scope, not a stable global ordering across
+scopes.

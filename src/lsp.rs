@@ -87,7 +87,14 @@ fn default_timeout_secs() -> u64 {
 /// `McpServer` this carries `deny_unknown_fields`: there is no `#[serde(flatten)]`
 /// here to forbid it, and a misspelled key in a table that names a program to
 /// spawn is worth rejecting rather than ignoring.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written and `Serialize` is not, exactly as on
+/// [`McpServer`](crate::McpServer): [`args`](Self::args) and [`env`](Self::env)
+/// have been through the configuration's `${env:}` substitution by the time they
+/// are here, so they are redacted for a formatter and written back verbatim for
+/// a tool that persists what the operator typed (0.71.0).
+// `Debug` is hand-written below: a derived one prints `env` and `args` verbatim.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LspServer {
     /// Short name for this server, used in the trace and in every error about
@@ -113,6 +120,29 @@ pub struct LspServer {
     /// Per-request timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+impl std::fmt::Debug for LspServer {
+    /// Everything an operator selects a server *by*, and the names — never the
+    /// values — of what its child process was handed.
+    ///
+    /// `command` and `extensions` stay verbatim on the rule this crate's other
+    /// redacting impls follow (see `mcp`): a value the harness executes or
+    /// matches a filename against is already named back at the operator by an
+    /// [`Act::Exec`](crate::Act::Exec) refusal or a "no server answers for this
+    /// file" one, and it is what they debug with. `args` and `env` are the two
+    /// documented ways to hand a child a credential, and a `${env:}` in this
+    /// table is written for exactly that.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LspServer")
+            .field("id", &self.id)
+            .field("command", &self.command)
+            .field("args", &crate::mcp::RedactedArgs(self.args.len()))
+            .field("env", &crate::mcp::RedactedMap(&self.env))
+            .field("extensions", &self.extensions)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 impl LspServer {

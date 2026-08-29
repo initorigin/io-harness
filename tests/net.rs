@@ -88,9 +88,17 @@ impl Provider for Dialer {
         &self,
         _request: CompletionRequest,
     ) -> io_harness::Result<CompletionResponse> {
+        // Strip whatever scheme is on the front, not just `http://`. The
+        // refusal cases deliberately wear schemes the boundary does not govern
+        // (`ftp://`, `file://`) pointed at a live listener, and the point of
+        // those entries is that a fail-open would produce a real connection the
+        // sink counts. Trimming only `http://` left the scheme attached, so
+        // `TcpStream::connect` failed to resolve the host and the counter read
+        // zero whether the boundary held or not — a control that cannot fail.
         let authority = self
             .url
-            .trim_start_matches("http://")
+            .split_once("://")
+            .map_or(self.url.as_str(), |(_, rest)| rest)
             .trim_end_matches("/v1");
         let _stream = tokio::net::TcpStream::connect(authority)
             .await
@@ -484,6 +492,145 @@ async fn a_provider_with_no_endpoint_runs_under_a_network_deny_policy() {
     assert!(
         !store.events(1).unwrap().iter().any(|e| e.act == "net"),
         "no connection, no network verdict"
+    );
+}
+
+/// Every URL shape `net::target` answers `None` for.
+///
+/// One table, read by both tests below, because the whole point of #221 is that
+/// the two halves are the *same* fact: the `None` the first test asserts *is*
+/// the run-level refusal the second one observes, not a separate question.
+const UNRESOLVABLE: &[&str] = &[
+    "",
+    "not a url",
+    "https:/only-one-slash",
+    // A scheme that opens no connection, and schemes this crate does not govern.
+    // "unrecognised" is not "harmless".
+    "file:///etc/passwd",
+    "data:text/plain,hello",
+    "ftp://files.example.com/x",
+    "gopher://example.com/x",
+    // Empty-authority shapes, including the one where dropping the userinfo is
+    // what empties it.
+    "https://",
+    "https:///path",
+    "https://user@/x",
+    "https://@/x",
+    // Empty host, empty port.
+    "https://host:/x",
+    "https://:8080/x",
+    "https://user@:8080/x",
+    // The bracketed spelling of the same three. The rustdoc says an empty host or
+    // an empty port is a refusal; until 0.71.0 that was true of `https://host:/x`
+    // and false of `https://[::1]:/x`, so a consumer written from the documented
+    // contract was stricter than the crate it was copying.
+    "https://[]/x",
+    "https://[]:8080/x",
+    "https://[::1]:/x",
+    "https://[::1]evil.com/x",
+    // An opening bracket with no closing one, which used to escape the IPv6
+    // branch entirely and be read as a bare host.
+    "https://[/x",
+];
+
+/// #221 — the `host:port` normalisation, asserted from *outside* the crate.
+///
+/// `net::target` is public for one reason: consumers were reimplementing it, and
+/// a reimplementation that reads its `None` as "nothing to check" reports
+/// permitted for a URL this crate refuses. This is the table such a copy has to
+/// match, in the same file as the run-level proof that a `None` really is a
+/// refusal — so the two can never drift into looking unrelated.
+#[test]
+fn the_public_target_helper_normalises_a_url_to_host_and_port() {
+    for (url, want) in [
+        // The port is filled from the scheme when the URL omits it.
+        ("https://api.example.com/v1", "api.example.com:443"),
+        ("http://example.com", "example.com:80"),
+        ("wss://mcp.example.com/sse", "mcp.example.com:443"),
+        ("ws://127.0.0.1/sse", "127.0.0.1:80"),
+        // An explicit port wins over the scheme's default.
+        ("https://example.com:8443/x?y=1#z", "example.com:8443"),
+        ("http://127.0.0.1:8931/mcp", "127.0.0.1:8931"),
+        // Userinfo is dropped: credentials are not part of the host.
+        ("https://user:pw@example.com/x", "example.com:443"),
+        ("https://token@example.com:8443/x", "example.com:8443"),
+        // An IPv6 literal keeps its brackets, with and without an explicit port —
+        // which is what makes the trailing `:port` split unambiguous.
+        ("https://[::1]/x", "[::1]:443"),
+        ("https://[::1]:8080/x", "[::1]:8080"),
+        ("wss://[fe80::1]/sse", "[fe80::1]:443"),
+        ("http://[2001:db8::1]:9000/x", "[2001:db8::1]:9000"),
+        // The scheme is matched case-insensitively; the host is not rewritten.
+        ("HTTPS://example.com/x", "example.com:443"),
+    ] {
+        assert_eq!(io_harness::net::target(url).as_deref(), Some(want), "{url}");
+    }
+
+    for url in UNRESOLVABLE {
+        assert_eq!(
+            io_harness::net::target(url),
+            None,
+            "{url} must not resolve to a target"
+        );
+    }
+}
+
+/// #221, the half that is easy to miss — a `None` from `net::target` is a
+/// *refusal*, proved at the run level under a policy that allows everything.
+///
+/// The permissive policy is the whole design of this test. Nothing here can say
+/// no except the unresolvable target itself, so a harness that read `None` as
+/// "there is nothing to check" would authorize the run and dial. The connection
+/// counter is what turns "it was refused" from a claim about a return value into
+/// an observation about a socket.
+#[tokio::test]
+async fn a_provider_endpoint_that_resolves_to_no_target_is_refused_under_an_allow_all_policy() {
+    let sink = Sink::start();
+    let policy = Policy::permissive();
+    assert_eq!(
+        policy.check(Act::Net, "anything:443").effect,
+        Effect::Allow,
+        "the policy under test allows every host, so only the URL can refuse"
+    );
+
+    let endpoints = UNRESOLVABLE
+        .iter()
+        .map(|u| u.to_string())
+        // The same table, plus two entries pointed at the live listener: a real,
+        // accepting address wearing a scheme the boundary cannot govern. If the
+        // refusal does not happen there is something on the other end to connect
+        // to, so the counter below can tell the difference.
+        .chain([
+            format!("ftp://{}/v1", sink.addr),
+            format!("file://{}/v1", sink.addr),
+        ]);
+
+    for endpoint in endpoints {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let provider = Dialer::new(endpoint.clone());
+
+        let err = run_with(
+            &contract(dir.path()),
+            &provider,
+            &store,
+            &policy,
+            &ApproveAll,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Refused { act, target, .. }
+                if act == "net" && target == &endpoint),
+            "{endpoint}: expected a net refusal naming the URL, got {err:?}"
+        );
+    }
+
+    assert_eq!(
+        sink.connections(),
+        0,
+        "no socket may be opened for a URL the boundary could not resolve"
     );
 }
 

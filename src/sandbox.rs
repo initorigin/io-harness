@@ -396,6 +396,37 @@ pub enum ExecMode {
 }
 
 impl ExecMode {
+    /// Every mode, widest confinement first:
+    /// [`ReadOnly`](ExecMode::ReadOnly),
+    /// [`WorkspaceWrite`](ExecMode::WorkspaceWrite),
+    /// [`FullAccess`](ExecMode::FullAccess).
+    ///
+    /// The enum is `#[non_exhaustive]`, so a caller outside this crate cannot
+    /// write the list itself without a wildcard arm that silently swallows the
+    /// next mode. This is that list, kept complete by an in-crate exhaustive
+    /// `match` that stops compiling when a mode is added.
+    ///
+    /// ```
+    /// use io_harness::ExecMode;
+    ///
+    /// assert_eq!(
+    ///     ExecMode::ALL,
+    ///     [ExecMode::ReadOnly, ExecMode::WorkspaceWrite, ExecMode::FullAccess]
+    /// );
+    ///
+    /// // Widening order: every mode is satisfied by the last one, and the
+    /// // narrowest is satisfied by all of them.
+    /// for mode in ExecMode::ALL {
+    ///     assert!(mode.satisfied_by(ExecMode::FullAccess));
+    ///     assert_eq!(mode.narrower(ExecMode::ReadOnly), ExecMode::ReadOnly);
+    /// }
+    /// ```
+    pub const ALL: [ExecMode; 3] = [
+        ExecMode::ReadOnly,
+        ExecMode::WorkspaceWrite,
+        ExecMode::FullAccess,
+    ];
+
     /// A stable label for the trace, the prompt and logs.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -2110,6 +2141,32 @@ mod tests {
 
     fn spec<'a>(argv: &'a [String], dir: &'a Path, limits: &'a SandboxLimits) -> RunSpec<'a> {
         RunSpec::new(argv, dir, limits)
+    }
+
+    /// The completeness guard for [`ExecMode::ALL`].
+    ///
+    /// `ExecMode` is `#[non_exhaustive]`, so this `match` can only be written
+    /// inside the crate — and inside the crate it is exhaustive, which is what
+    /// makes a fourth mode a compile error here instead of a mode silently
+    /// missing from every list built on `ALL`. A length assertion against a
+    /// literal would keep compiling and prove nothing.
+    #[test]
+    fn all_lists_every_exec_mode_exactly_once() {
+        let (mut read_only, mut workspace, mut full) = (false, false, false);
+        for mode in ExecMode::ALL {
+            let seen = match mode {
+                ExecMode::ReadOnly => &mut read_only,
+                ExecMode::WorkspaceWrite => &mut workspace,
+                ExecMode::FullAccess => &mut full,
+            };
+            assert!(!*seen, "{mode:?} appears twice in ExecMode::ALL");
+            *seen = true;
+        }
+        assert!(
+            read_only && workspace && full,
+            "ExecMode::ALL is missing a variant: \
+             read_only={read_only} workspace={workspace} full={full}"
+        );
     }
 
     #[tokio::test]
