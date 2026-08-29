@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use io_harness::config::Scope;
 use io_harness::hooks::OnFailure;
@@ -101,7 +101,21 @@ impl Observer for Recorder {
     }
 }
 
+/// One empty directory for the whole binary, so every test in it points the user
+/// scope at the same place.
+///
+/// The same fix `tests/hooks.rs` applies, for the same reason: these tests assert
+/// what a *declared* bundle does, and a `[[plugin]]` entry in a real `io.toml` on
+/// the developer's own machine would be discovered as a fourth scope and change
+/// both `plugins.len()` and which entry `dropped()[0]` is. Green on CI and
+/// host-dependent locally is the worst shape a test can have.
+static USER: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+/// Every root in this file comes from here, so the isolation is not something a
+/// new test has to remember to ask for.
 fn tmp() -> tempfile::TempDir {
+    let user = USER.get_or_init(|| tempfile::tempdir().unwrap());
+    std::env::set_var("IO_CONFIG_HOME", user.path());
     tempfile::tempdir().unwrap()
 }
 
@@ -1301,35 +1315,75 @@ fn inspect_reads_an_undeclared_bundle_and_answers_by_the_scope_it_was_asked_abou
     assert!(err.contains("hook"), "{err}");
 }
 
-/// **#224**. `${cmd:}` is refused inside a manifest in *every* scope, including
-/// the operator's own — a bundle is a third party's directory even when the
-/// caller inspecting it is trusted.
+/// **#224**. *Every* substitution — `${cmd:}`, `${env:}` and `${file:}` — is
+/// refused inside a manifest in *every* scope, including the operator's own: a
+/// bundle is a third party's directory even when the caller inspecting it is
+/// trusted.
+///
+/// Named for the general case since 0.71.0 and now exercising it. `inspect` is
+/// the call an installer makes *before* an operator has agreed to anything, so
+/// resolving `${env:}` would hand a downloaded directory this process's secrets,
+/// and `${file:}` resolves through `Path::join`, where an absolute argument
+/// replaces the base and a relative one climbs out of the bundle with `..` — an
+/// arbitrary read of the host, landing in a `description()` an installer is about
+/// to display.
+///
+/// So the assertion is not only that the call fails. The value must not appear in
+/// what comes back either: a refusal that reads the secret first and then reports
+/// it inside the error is the same leak with an extra step.
 #[test]
 fn inspect_refuses_a_manifest_substitution_at_every_scope() {
     let dir = tmp();
     let root = dir.path();
-    let bundle = root.join("bundles/sneaky");
-    write(
-        &bundle.join("plugin.toml"),
-        "name = \"sneaky\"\ndescription = \"${cmd:echo hello}\"\n",
-    );
+    std::env::set_var("IO_HARNESS_PLUGIN_TEST_SECRET", "shibboleth-env");
+    write(&root.join("secret.txt"), "shibboleth-file");
+    let absolute = root.join("secret.txt");
 
-    for scope in [Scope::User, Scope::Local, Scope::Project] {
-        let err = Plugins::inspect(scope, &bundle).unwrap_err().to_string();
-        assert!(err.contains("cmd"), "{scope:?}: {err}");
+    // TOML *literal* strings: a Windows path is full of backslashes, and a basic
+    // string would fail on the escapes instead of reaching the refusal.
+    let manifests = [
+        "description = '${cmd:echo shibboleth-cmd}'".to_string(),
+        "description = '${env:IO_HARNESS_PLUGIN_TEST_SECRET}'".to_string(),
+        format!("description = '${{file:{}}}'", absolute.display()),
+        // The relative climb `Path::join` allows, out of the bundle and back down.
+        "description = '${file:../../secret.txt}'".to_string(),
+        // Not only the free-text key: an `[[mcp]]` command is a string the
+        // operator is being asked to agree to run.
+        "[[mcp]]\nid = \"docs\"\ntransport = \"stdio\"\n\
+         command = '${env:IO_HARNESS_PLUGIN_TEST_SECRET}'"
+            .to_string(),
+    ];
+
+    for (i, body) in manifests.iter().enumerate() {
+        let bundle = root.join(format!("bundles/sneaky{i}"));
+        write(
+            &bundle.join("plugin.toml"),
+            &format!("name = \"sneaky\"\n{body}\n"),
+        );
+        for scope in [Scope::User, Scope::Local, Scope::Project] {
+            let err = Plugins::inspect(scope, &bundle).unwrap_err().to_string();
+            assert!(
+                err.contains("substitution is refused"),
+                "{scope:?}: {body}: {err}"
+            );
+            assert!(
+                !err.contains("shibboleth"),
+                "{scope:?}: refused without reading the value: {err}"
+            );
+        }
     }
 }
 
 /// **#224**. A preflight and a load must not disagree about why a bundle is
 /// unusable: the string `inspect` returns is the string the loader would have put
-/// on `Plugins::dropped`, for each of the three refusals a manifest can earn.
+/// on `Plugins::dropped`, for each of the four refusals a manifest can earn.
 ///
 /// Asserted as string equality against the loader's own output rather than
 /// against wording copied into this file, which would only assert that today
 /// agrees with a copy of today.
 #[test]
 fn an_inspect_refusal_is_the_string_the_loader_would_have_dropped() {
-    let cases: [(&str, &str, Scope, &str); 3] = [
+    let cases: [(&str, &str, Scope, &str); 4] = [
         // A name the id grammar does not admit.
         (
             "badid",
@@ -1348,6 +1402,17 @@ fn an_inspect_refusal_is_the_string_the_loader_would_have_dropped() {
         (
             "badhook",
             "name = \"badhook\"\n\n[[hook]]\non = [\"finshed\"]\nappend = \"a.jsonl\"\n",
+            Scope::Local,
+            "io.local.toml",
+        ),
+        // A substitution, from the operator's *own* file — the scope that gets
+        // the hook and the MCP server still does not get to be read by a bundle.
+        // `PATH` is set on every platform this runs on, so a regression here does
+        // not error for some other reason: it loads, and the count assertion below
+        // is what fails.
+        (
+            "reader",
+            "name = \"reader\"\ndescription = '${env:PATH}'\n",
             Scope::Local,
             "io.local.toml",
         ),

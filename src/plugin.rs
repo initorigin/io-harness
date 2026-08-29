@@ -41,8 +41,11 @@
 //! contribute skills, templates, agents and deny rules, and may not contribute a
 //! `[[hook]]` or an `[[mcp]]` — both name a program this machine will run. The
 //! same plugin declared in `io.local.toml` or the user-scope file contributes all
-//! six. `${cmd:}` is refused inside a manifest in *every* scope, because a
-//! manifest is a third party's file wherever it was named from.
+//! six. A `${env:}`, `${file:}` or `${cmd:}` substitution is refused inside a
+//! manifest in *every* scope (0.71.0), because a manifest is a third party's file
+//! wherever it was named from: the first two read this machine's environment and
+//! files, the third runs a program on it, and a downloaded directory gets none of
+//! the three.
 //!
 //! **A bundle may take capability away and may never hand it out.** A `[policy]`
 //! block may carry layers of [`Effect::Deny`](crate::Effect) rules and nothing
@@ -571,9 +574,14 @@ impl Plugins {
     /// downloaded directory contributes, and *whether it would load at all*,
     /// before writing a line into an operator's configuration. Every check runs:
     /// the id grammar, the trust rule for `scope`, the narrowing rule, the
-    /// `[[hook]]` validator, and `${cmd:}` refused in a manifest wherever it came
-    /// from. The error is the string that would have appeared on
+    /// `[[hook]]` validator, and every `${...}` substitution refused in a manifest
+    /// wherever it came from. The error is the string that would have appeared on
     /// [`Plugins::dropped`], so a preflight and a load cannot disagree.
+    ///
+    /// Nothing about the host is read to answer: this call is what an installer
+    /// makes *before* an operator has agreed to anything, so a manifest asking for
+    /// `${env:AWS_SECRET_ACCESS_KEY}` or `${file:~/.ssh/id_rsa}` is refused rather
+    /// than resolved into a string this call hands back to be displayed.
     ///
     /// Fallible where loading a declared set is not, and deliberately: a set that
     /// dropped a bundle still has the others, while a caller asking about one
@@ -710,16 +718,14 @@ fn load_one(scope: Scope, dir: &Path) -> Result<Plugin> {
     let text = std::fs::read_to_string(&file)
         .map_err(|e| crate::Error::Config(format!("{}: {e}", file.display())))?;
 
-    // Parsed as the project scope in *every* scope, so `${cmd:}` is refused in a
-    // manifest wherever it was declared from: a bundle is a third party's
-    // directory even when the file naming it is the operator's own.
-    let table = crate::config::parse(Scope::Project, &text, &file)?;
-    let mut manifest: Manifest =
-        toml::Value::Table(table)
-            .try_into()
-            .map_err(|e: toml::de::Error| {
-                crate::Error::Config(format!("{}: {}", file.display(), e.message()))
-            })?;
+    // Parsed and *not* substituted, in every scope: see `refuse_substitutions`.
+    let value: toml::Value = toml::from_str(&text).map_err(|e: toml::de::Error| {
+        crate::Error::Config(format!("{}: {}", file.display(), e.message()))
+    })?;
+    refuse_substitutions(&value, &mut Vec::new(), &file)?;
+    let mut manifest: Manifest = value.try_into().map_err(|e: toml::de::Error| {
+        crate::Error::Config(format!("{}: {}", file.display(), e.message()))
+    })?;
 
     check_id(&manifest.name, &file)?;
     if scope == Scope::Project {
@@ -746,6 +752,54 @@ fn load_one(scope: Scope, dir: &Path) -> Result<Plugin> {
         root: dir.to_path_buf(),
         manifest,
     })
+}
+
+/// Refuse every `${...}` substitution inside a manifest, in every scope (0.71.0).
+///
+/// `${cmd:}` has been refused here since 0.35.0 because it runs a program on this
+/// machine. `${env:}` and `${file:}` *read* one, which is the same class of act:
+/// `${env:AWS_SECRET_ACCESS_KEY}` is whatever the resolving process was started
+/// with, and `${file:}` resolves through `Path::join`, where an absolute argument
+/// replaces the base and a relative one climbs out of the bundle with `..` — an
+/// arbitrary read of the host. A manifest is the one file here nobody has agreed
+/// to: [`Plugins::inspect`] resolves it precisely so an operator can decide
+/// whether to declare the directory at all, and a value that reached
+/// [`Plugin::description`] or [`Plugin::mcp_servers`] would be displayed and
+/// logged before that decision was made. So a bundle is a third party's directory
+/// even when the file naming it is the operator's own, and it does not get to read
+/// this host.
+///
+/// Refused on the shared load path rather than inside `inspect`, so a preflight
+/// and a load cannot disagree about what a bundle is.
+fn refuse_substitutions(value: &toml::Value, key: &mut Vec<String>, file: &Path) -> Result<()> {
+    match value {
+        toml::Value::String(s) if s.contains("${") => Err(crate::Error::Config(format!(
+            "{}: key `{}`: a `${{env:}}`, `${{file:}}` or `${{cmd:}}` substitution is refused \
+             inside a {PLUGIN_FILE} in every scope, because a bundle is a third party's \
+             directory even when the file naming it is the operator's own — resolving one \
+             would read this machine's environment or its files, or run a program on it, for \
+             a directory nobody has agreed to yet. Write the value out.",
+            file.display(),
+            key.join(".")
+        ))),
+        toml::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                key.push(format!("[{i}]"));
+                refuse_substitutions(item, key, file)?;
+                key.pop();
+            }
+            Ok(())
+        }
+        toml::Value::Table(table) => {
+            for (k, v) in table {
+                key.push(k.clone());
+                refuse_substitutions(v, key, file)?;
+                key.pop();
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// `<plugin>__<name>`.
