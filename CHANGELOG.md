@@ -45,9 +45,10 @@ paths did not honour.
   child spawned under `worktree = true` is the child's own worktree, not its
   parent's root. The column had been written since 0.36.0 and read by nothing.
   (#215)
-- A `RunOutcome` variant for a run that finished and failed its verification, so
-  that case is no longer reported as `StepCapReached`. The enum is
-  `#[non_exhaustive]`; a caller with a wildcard arm is unaffected. (#212)
+- `RunOutcome::VerificationFailed { steps }`, for a run that reached its step cap
+  having failed its criterion. `StepCapReached` had meant both "ran long" and
+  "the work does not hold up", and a caller reasonably read it as "raise
+  `max_steps`" when the real cause was a criterion that was not being met. (#212)
 
 ### Changed
 
@@ -57,10 +58,29 @@ paths did not honour.
   built-in was refused and no approver was ever consulted, with the error naming
   the program so it read as a missing binary. Fixed at all four sites carrying
   that comparison, not only the one that was reported: the git spawn, every MCP
-  tool invocation, the verification and gate commands, and a spawned agent's
-  worktree write. **This changes what a default-policy run does** — consumers get
-  a pause where they previously got an error. A `Deny` posture still refuses
-  without asking. (#214)
+  tool invocation and a spawned agent's worktree write. **This changes what a
+  default-policy run does** — consumers get a pause where they previously got an
+  error. A `Deny` posture still refuses without asking. (#214)
+
+  Two boundaries on that, both deliberate. **A configured MCP server must still
+  be allow-listed to start at all**: `Ask` on the server's own binary remains a
+  refusal, because connecting is configuration rather than an action a human is
+  standing by to approve — so "MCP tool calls now ask" only applies once the
+  server itself may run. And **a verification gate still refuses rather than
+  asking**, because it has no approver and `Verification::passes_guarded` returns
+  a `bool` with nowhere to put a pause; what changed there is only the reason
+  given, which used to say the policy forbade a command it had merely asked
+  about.
+- **BREAKING (behaviour): a run that reached its step cap having failed its
+  criterion now reports `RunOutcome::VerificationFailed { steps }` and persists
+  `"verification_failed"`.** `StepCapReached` now means only that nothing judged
+  the work — a run with no `Verification` still answers it, and so does one that
+  never reached its gate. **Migration:** match the new variant beside
+  `StepCapReached`; a downstream arm reading `StepCapReached` as "raise
+  `max_steps`" will silently stop firing for the runs where that reading was
+  wrong, which is the fix. The new outcome is deliberately **not** terminal to
+  `resume`: a gate is re-run from scratch on the next step, so a repaired machine
+  or a raised budget can still turn it green.
 - A failing verification gate's phase and its recorded output are appended to the
   next step's request, so a retry is informed rather than blind. Bounded, and the
   bound is asserted rather than assumed. (#211)

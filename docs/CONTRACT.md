@@ -3421,6 +3421,80 @@ problems with four different fixes. It is bounded by the server's own
 not bound, so a server that accepts a connection and then says nothing is reported
 rather than hanging the caller. A disabled server answers without being started.
 
+## What an asking posture asks, and where it still cannot (0.70.0)
+
+**`Effect::Ask` on `Act::Exec` reaches an approver.** It had been compared
+against `Allow` and refused anything else, so `Ask` behaved as `Deny` — and
+because `Policy::default()` sets `exec = Ask`, every git built-in was refused out
+of the box with an error naming the program, which reads as a missing binary. The
+comparison appeared at four sites and all four are fixed: the git spawn, every
+MCP tool invocation, and both checks in a spawned agent's worktree creation (the
+write *and* the `git` exec beneath it — gating only the first would have left
+`worktree = true` dead under the default policy).
+
+**A `Deny` posture still refuses without asking, and that is the arm that
+matters.** The fix is not `!= Deny`; that would turn `Ask` into `Allow` for any
+caller reaching the tool without a run loop. `Git` carries a flag saying its
+caller has already gated, so the ungated path keeps the whole check and the gated
+path cannot re-derive an `Ask` underneath an approval a human has just given.
+
+**Two places still refuse an `Ask`, both on purpose.**
+
+- **Starting a configured MCP server.** Connecting is configuration, not an act a
+  human is standing by to approve, so the server's own binary must be allowed
+  rather than asked. The consequence is worth stating plainly: under a bare
+  `Policy::default()` no MCP server starts, so the tool-call approval above is
+  only reachable once the server itself may run.
+- **A verification gate's own commands.** `ExecGuard` has no approver, and there
+  is no channel for a pause: `Verification::passes_guarded` is public and returns
+  `Result<bool>`, and two of its four call sites are outside any run loop.
+  `Policy::default()` allow-lists `rustc` and the test binary by name for exactly
+  this reason. What 0.70.0 changes there is only the *reason given* — an `Ask`
+  had been reported as "the policy forbids this", sending an operator hunting for
+  a deny rule that does not exist.
+
+**An approved exec has no filesystem effect, and approving it grants the
+program.** A deferred `exec` resumes the way a deferred `net` does and not the
+way a `write` does: nothing is written, the pending row is resolved, and the
+program is allowed for the remainder of the run. Both halves are load-bearing —
+routing an `exec` through the write path would create an empty file named after
+the program and resume without ever running the command, and without the grant
+the model re-issues the call and the approver is asked again for what they have
+just allowed.
+
+## What a step cap means now, and what a failed gate tells the next step (0.70.0)
+
+**`StepCapReached` means only that nothing judged the work.** A run that reached
+its cap having failed its criterion answers `RunOutcome::VerificationFailed`
+instead. The two had been one answer, and a caller reading it as "raise
+`max_steps`" was wrong precisely when the criterion was the problem. A run with
+no `Verification`, and a run that never reached its gate, still answer
+`StepCapReached` — `Verification::None` reports `Ok(false)` from the gate, so
+"the gate returned false" is not "the criterion failed" and the distinction is
+made explicitly rather than inferred.
+
+**It is not terminal to `resume`.** Every outcome `terminal_outcome` maps is one
+nobody in-process can undo: a pass, or a person's no. A failed criterion is
+neither — the gate is re-run from scratch on the next step, so a raised budget, a
+repaired machine or an edit in the workspace can turn it green, and a
+`Verification::Command` failing because its runner is absent is a machine to fix
+rather than a verdict on the work. Nothing here can know that a criterion will
+never pass, and terminality needs evidence the crate does not have.
+
+**A failing gate now tells the next step what it said.** The failing phase and
+the recorded output arrive as an ordinary `ObsKind::Error` observation on the
+ledger — not as a new prompt section, so the cached prefix keeps its shape — for
+the next step only, and never on the last step, which has no request left to
+inform. It is bounded twice, by a line count and by a character cap, because a
+tail is what is useful about a runner's output and a cap is what makes it safe
+when a single line is enormous. The trace records which attempt was informed and
+which was blind.
+
+**Two gaps are stated rather than closed.** A failing `Verification::Review`
+writes its reasons to `gate_attempts` and nothing to `sandbox_events`, so a
+review still tells the model nothing. And the single-file loop has no ledger, so
+it gains the outcome and not the feedback.
+
 **A run's recorded path is readable (0.70.0).** `Store::run_file` returns the
 value written when the run began — for a child spawned under `worktree = true`,
 the child's **own** worktree rather than its parent's root, which is the whole
