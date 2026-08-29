@@ -101,7 +101,7 @@ fn models_lists_what_the_table_can_price_and_nothing_else() {
 #[test]
 fn len_and_is_empty_agree_with_models() {
     let table = table(true);
-    assert_eq!(table.len(), table.models().iter().count());
+    assert_eq!(table.len(), table.models().len());
     assert_eq!(table.len(), 2, "not 3 — the tier-only model is not priced");
     assert!(!table.is_empty());
 
