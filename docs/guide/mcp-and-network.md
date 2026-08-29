@@ -106,8 +106,14 @@ An out-of-policy **tool call** is an observation the model can adapt to, not a
 crashed run — the same treatment a refused path already gets:
 
 ```text
-[mcp__files__delete_everything refused] (rule mcp__files__delete_*) — the policy forbids calling this tool
+[exec refused] mcp__files__delete_everything (rule mcp__files__delete_*) — the policy forbids this; carry on without it
 ```
+
+Since 0.70.0 the call goes through the same approval gate a write does, so a
+policy whose `exec` effect is `Ask` — which `Policy::default()`'s is — asks the
+approver instead of refusing. An approver that denies produces the observation
+above; one that defers pauses the run with a pending row, and the run resumes
+through `resume_with_decision` exactly as a deferred write does.
 
 A denied **host**, or a configured server that will not start, stops the run
 before anything happens, with `Error::Refused { act: "net", .. }` or

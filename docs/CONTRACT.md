@@ -3172,6 +3172,23 @@ somebody's decision about that session. The cutoff is a string because
 `sessions.created_at` is a `strftime('%Y-%m-%dT%H:%M:%fZ','now')` text column and
 a string comparison is what the storage performs.
 
+**The preview is the receipt, not an estimate of it (0.70.0).**
+`Store::sweep_preview(before)` returns the `Pruned` that `sweep_sessions(before)`
+would produce, and deletes nothing. It can be trusted as equality rather than as
+a bound because both go through the same two private steps: one selection, which
+resolves the candidates and applies the resumable refusal, and one measurement,
+which counts and sizes what was selected. The deletion then consumes the very
+sets the measurement returned rather than resolving them again — a preview
+computed one way and a deletion performed another is precisely the defect this
+exists to avoid. The one thing it cannot promise is quiescence: a run that starts
+or finishes between the two calls moves the answer, because the refusal is a
+question about the store's state and not about the cutoff.
+
+`Store::session_created_at` exposes the column the cutoff is compared against.
+The nearest substitute — a session's first turn — is always **later** than the
+session row, so a preview built on it understates the deletion, which is the
+dangerous direction for a caller deciding whether to proceed.
+
 **What an archive keeps.** `Store::archive_session` keeps every row and empties
 every column that holds words. The counts, timings, tokens, cost, file paths,
 line counts, verdicts, statuses and kinds all survive; the prompts, replies, tool
@@ -3350,3 +3367,63 @@ than at the clock.
   Their `spawns` rows carry an empty `as_name`; they cannot be addressed, and what
   they send is attributed to a derived name. Only a resume across that version
   boundary reaches this.
+
+## What switched off means, and what a probe answers (0.70.0)
+
+**Switched off is not absent, and the distinction is the whole feature.** An MCP
+server and a plugin bundle each carry `enabled`, defaulting to `true`. A
+capability that vanished from every listing when it was disabled could not be
+told apart from one that was never declared, and nothing would be left for an
+operator to switch back on. So a disabled thing contributes nothing and is still
+listed, marked.
+
+**Where the flag is honoured decides what it means.** For a server it is read at
+the head of the connect loop, not over the assembled roster: the server is never
+started, no socket is dialled, no session entry exists, and the namespaced tool
+names it would have offered belong to nobody. Filtering the roster instead would
+have left a disabled server running and its tools callable — the defect wearing a
+fix's clothes. For a bundle the same reasoning puts it in a third collection
+beside the loaded and the dropped, so all six contribution sites keep reading the
+loaded set and none of them can forget the check.
+
+**A disabled bundle is still validated, and still held to its scope's trust
+rule.** It is loaded, so a broken one is reported as broken whether or not it is
+switched on, and a project-scoped bundle declaring a hook is refused even while
+disabled — switching it on is a one-character edit, and a refusal that can be
+sidestepped by shipping something switched off is not a refusal. It reserves no
+contribution namespace, because it never enters the collection a namespace is
+claimed in. It does still take part in duplicate-id detection: two declarations
+claiming one id is a configuration mistake either way.
+
+**The `[[mcp]]` exemption stays, and one key inside it is checked anyway.** That
+table cannot carry `deny_unknown_fields` — `McpServer` is `#[serde(flatten)]`-based
+and serde refuses the two together — which is what keeps a newer server key
+forward-compatible with an older binary. But `enabled` is the one key whose
+misspelling *inverts* the operator's intent rather than merely being ignored, so a
+near-miss spelling of that key alone is refused by name while an unrelated unknown
+key in the same table is still accepted. The narrow check is what lets the broad
+exemption survive.
+
+**The two halves of the flag have opposite downgrade shapes, and the dangerous one
+is silent.** A 0.69.0 binary reading a file that disables a *server* ignores the
+key — under the exemption — and runs the server the operator switched off. A
+0.69.0 binary reading a file that disables a *bundle* refuses the whole file,
+because `[[plugin]]` is not exempt. Neither can be fixed from here: 0.69.0 is
+published. An operator who downgrades removes the `enabled` keys first.
+
+**A probe answers a different question from a preflight.** A policy preflight says
+whether a server is *permitted* to start; a wrong command and an unreachable host
+both pass it. `probe_mcp` starts one configured server, reports whether it
+answered and what it offered, and shuts it down — reporting refused, not-started,
+unreachable, timed out and answered apart, because those are four different
+problems with four different fixes. It is bounded by the server's own
+`timeout_secs` **including the handshake**, which the run loop's own connect does
+not bound, so a server that accepts a connection and then says nothing is reported
+rather than hanging the caller. A disabled server answers without being started.
+
+**A run's recorded path is readable (0.70.0).** `Store::run_file` returns the
+value written when the run began — for a child spawned under `worktree = true`,
+the child's **own** worktree rather than its parent's root, which is the whole
+reason the column was written in 0.36.0 and the reason reconstructing it from the
+parent's root is wrong. It is named after the column and not after the tree case:
+for a single-file run it holds that file's path, so it is not always a directory.
