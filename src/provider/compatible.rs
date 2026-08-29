@@ -177,7 +177,7 @@ pub(crate) fn preset_list() -> String {
 /// be making on the operator's behalf. `[[provider]]` in `io.toml` with
 /// `api_key = "${env:GROQ_API_KEY}"` names the variable in the operator's own
 /// file, and has done since 0.19.0.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Compatible {
     client: reqwest::Client,
     api_key: String,
@@ -365,6 +365,24 @@ impl Compatible {
             on_call,
         )
         .await
+    }
+}
+
+impl std::fmt::Debug for Compatible {
+    /// Hand-written for exactly one reason, and this type is the one that had
+    /// already paid for it: until 0.70.0 it *derived* `Debug` while holding a
+    /// plain `api_key`, so `{:?}` on a `Compatible` — or on any
+    /// [`Record`](crate::provider::Record),
+    /// [`Fallback`](crate::provider::Fallback) or caller struct holding one —
+    /// printed the operator's credential verbatim. The vendor label, the base
+    /// and the model are what a misconfiguration is diagnosed from; the key is
+    /// not printed at all, not even its length.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Compatible")
+            .field("name", &self.name)
+            .field("base", &self.base)
+            .field("model", &self.model)
+            .finish_non_exhaustive()
     }
 }
 

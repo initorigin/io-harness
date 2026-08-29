@@ -96,6 +96,22 @@ impl OpenAi {
     }
 }
 
+impl std::fmt::Debug for OpenAi {
+    /// Hand-written for exactly one reason: a derived `Debug` would print
+    /// `api_key`, and one `{:?}` on anything holding this provider — a
+    /// [`Record`](crate::provider::Record), a
+    /// [`Fallback`](crate::provider::Fallback), a caller's own config struct —
+    /// would put the operator's credential in a log. The endpoint and the model
+    /// are what a misconfiguration is diagnosed from; the key is not printed at
+    /// all, not even its length.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAi")
+            .field("endpoint", &self.endpoint)
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Provider for OpenAi {
     /// 0.45.0 — stated rather than derived from the slug, for the reason
     /// [`Anthropic`](crate::Anthropic) states its own.
