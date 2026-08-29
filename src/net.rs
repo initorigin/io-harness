@@ -282,9 +282,7 @@ pub fn target(url: &str) -> Option<String> {
         // Falling through to the plain-host path instead is how `https://[/x`
         // used to come back `Some("[:443")`: no closing bracket, no colon, so the
         // bracketless branch read the whole thing as a bare host.
-        let Some(close) = hostport.find(']') else {
-            return None;
-        };
+        let close = hostport.find(']')?;
         // IPv6 literal: [::1] or [::1]:8080. Every rejection the plain-host path
         // below makes, this path must make too. It did not until 0.71.0: an empty
         // host (`[]`), an empty port (`[::1]:`) and a tail that is not a port at
