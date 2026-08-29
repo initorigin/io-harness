@@ -463,7 +463,7 @@ async fn an_unknown_agent_name_yields_an_error_observation_and_no_child() {
         steps.iter().map(|s| &s.result).collect::<Vec<_>>()
     );
     assert!(
-        matches!(result.outcome, RunOutcome::StepCapReached { .. }),
+        matches!(result.outcome, RunOutcome::VerificationFailed { .. }),
         "an unknown name costs a step, it does not end the run; got {:?}",
         result.outcome
     );

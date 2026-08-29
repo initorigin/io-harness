@@ -196,7 +196,10 @@ async fn the_concurrency_cap_runs_the_whole_fleet_eight_at_a_time() {
     .await
     .unwrap();
 
-    assert!(matches!(result.outcome, RunOutcome::StepCapReached { .. }));
+    assert!(matches!(
+        result.outcome,
+        RunOutcome::VerificationFailed { .. }
+    ));
     assert_eq!(
         store.children(result.run_id).unwrap().len(),
         fanout,

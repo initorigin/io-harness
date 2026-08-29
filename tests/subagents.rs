@@ -353,7 +353,10 @@ async fn one_approver_serves_the_whole_tree_deny() {
     .unwrap();
 
     // The denied child never produced the file, so the parent cannot verify.
-    assert!(matches!(result.outcome, RunOutcome::StepCapReached { .. }));
+    assert!(matches!(
+        result.outcome,
+        RunOutcome::VerificationFailed { .. }
+    ));
     assert!(!dir.path().join("out.txt").exists());
     let child = store.children(result.run_id).unwrap()[0];
     let denied = store
@@ -503,7 +506,10 @@ async fn concurrent_fanout_to_over_100_stays_bounded_and_completes() {
     .unwrap();
 
     // The whole tree completed without deadlock.
-    assert!(matches!(result.outcome, RunOutcome::StepCapReached { .. }));
+    assert!(matches!(
+        result.outcome,
+        RunOutcome::VerificationFailed { .. }
+    ));
     // Every requested child ran.
     assert_eq!(store.children(result.run_id).unwrap().len(), fanout);
     // Concurrency was real but never exceeded max_concurrent.
@@ -775,9 +781,9 @@ async fn a_tree_halts_on_its_duration_ceiling_instead_of_ignoring_it() {
     );
 }
 
-/// The ceiling is opt-in: with none set, the same run reaches its step cap as it
-/// always did. A limit that changes an unbounded run's behaviour is a regression
-/// however correct it is when asked for.
+/// The ceiling is opt-in: with none set, the same run spends its whole step
+/// budget as it always did. A limit that changes an unbounded run's behaviour is
+/// a regression however correct it is when asked for.
 #[tokio::test]
 async fn a_tree_with_no_duration_ceiling_is_unaffected() {
     let dir = ws();
@@ -808,7 +814,7 @@ async fn a_tree_with_no_duration_ceiling_is_unaffected() {
     .unwrap();
 
     assert!(
-        matches!(result.outcome, RunOutcome::StepCapReached { steps: 3 }),
+        matches!(result.outcome, RunOutcome::VerificationFailed { steps: 3 }),
         "got {:?}",
         result.outcome
     );

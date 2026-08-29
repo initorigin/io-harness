@@ -669,7 +669,10 @@ async fn a_disabled_server_contributes_no_tools_and_is_still_configured() {
     assert_eq!(contract.mcp.len(), 2, "both servers are configured");
     assert_eq!(contract.mcp[1].id, "off");
     assert!(contract.mcp[0].enabled, "the first is on");
-    assert!(!contract.mcp[1].enabled, "the second is off and still listed");
+    assert!(
+        !contract.mcp[1].enabled,
+        "the second is off and still listed"
+    );
 
     let result = run_with(&contract, &provider, &store, &permitted(), &ApproveAll)
         .await
@@ -697,7 +700,10 @@ async fn a_disabled_server_contributes_no_tools_and_is_still_configured() {
     let discovered = events.iter().filter(|e| e.kind == "discovered").count();
     assert!(discovered > 0, "the enabled server was discovered");
     assert_eq!(
-        offered.iter().filter(|t| t.starts_with("mcp__on__")).count(),
+        offered
+            .iter()
+            .filter(|t| t.starts_with("mcp__on__"))
+            .count(),
         discovered,
         "every tool of the enabled server is offered: {offered:?}"
     );
@@ -782,8 +788,7 @@ async fn a_probe_tells_a_bad_command_a_dead_host_a_refusal_and_a_working_server_
     let quick = Duration::from_secs(5);
 
     // 1. The policy allows it; the command does not exist.
-    let wrong =
-        McpServer::stdio("missing", "definitely-not-a-real-binary-xyz").with_timeout(quick);
+    let wrong = McpServer::stdio("missing", "definitely-not-a-real-binary-xyz").with_timeout(quick);
     let probe = probe_mcp(&wrong, &permitted()).await;
     assert!(matches!(probe, McpProbe::NotStarted { .. }), "{probe:?}");
 

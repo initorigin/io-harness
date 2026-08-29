@@ -533,8 +533,9 @@ async fn an_unknown_skill_name_is_an_observation_listing_what_exists() {
         "no body may be loaded for a name that does not exist"
     );
     assert!(
-        matches!(result.outcome, RunOutcome::StepCapReached { .. }),
-        "an unknown skill is not a failed run, got {:?}",
+        matches!(result.outcome, RunOutcome::VerificationFailed { .. }),
+        "an unknown skill must not end the run early — the contract's own \
+         criterion is what decides the outcome, got {:?}",
         result.outcome
     );
 }

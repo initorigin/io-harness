@@ -2727,8 +2727,8 @@ fn an_unrelated_unknown_key_in_an_mcp_table_is_still_accepted() {
     let _guard = env(user_dir.path());
     write(project.path(), "io.toml", &mcp_with("colour = \"blue\""));
 
-    let config = Config::discover(project.path())
-        .expect("the `[[mcp]]` exemption is narrowed, not closed");
+    let config =
+        Config::discover(project.path()).expect("the `[[mcp]]` exemption is narrowed, not closed");
     assert_eq!(config.mcp_servers().len(), 1);
     assert!(config.mcp_servers()[0].enabled);
 }
