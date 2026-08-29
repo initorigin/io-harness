@@ -98,6 +98,57 @@ pub enum Effect {
     Deny,
 }
 
+impl Effect {
+    /// Every effect, in the strictness order the derived `Ord` documents:
+    /// `Allow`, `Ask`, `Deny`.
+    ///
+    /// This crate walks the effects in both directions — the agent's boundary
+    /// prompt reads permissive-first, [`Policy::explain`] resolves deny-first —
+    /// and the second direction is `.rev()` on this one list rather than a
+    /// second list written out by hand. A hand-written list is what goes stale
+    /// when a fourth effect arrives: it keeps compiling and quietly stops
+    /// covering everything.
+    ///
+    /// ```
+    /// use io_harness::Effect;
+    ///
+    /// assert_eq!(Effect::ALL, [Effect::Allow, Effect::Ask, Effect::Deny]);
+    ///
+    /// // The declaration order is the strictness order, so it is already sorted
+    /// // and reversing it walks strictest-first.
+    /// let mut sorted = Effect::ALL;
+    /// sorted.sort();
+    /// assert_eq!(sorted, Effect::ALL);
+    ///
+    /// // Reversed is the precedence `Policy::explain` resolves in.
+    /// let strictest_first: Vec<Effect> = Effect::ALL.into_iter().rev().collect();
+    /// assert_eq!(strictest_first, [Effect::Deny, Effect::Ask, Effect::Allow]);
+    /// ```
+    pub const ALL: [Effect; 3] = [Effect::Allow, Effect::Ask, Effect::Deny];
+
+    /// The word a policy file spells this effect with — the deserializer's own
+    /// spelling, not a second one to keep in sync with it.
+    ///
+    /// ```
+    /// use io_harness::Effect;
+    ///
+    /// assert_eq!(Effect::Ask.as_str(), "ask");
+    ///
+    /// // Every effect round-trips through the format an operator's config uses.
+    /// for effect in Effect::ALL {
+    ///     let json = format!("\"{}\"", effect.as_str());
+    ///     assert_eq!(serde_json::from_str::<Effect>(&json).unwrap(), effect);
+    /// }
+    /// ```
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Effect::Allow => "allow",
+            Effect::Ask => "ask",
+            Effect::Deny => "deny",
+        }
+    }
+}
+
 /// One rule: an effect applied to an action whose target matches `pattern`.
 ///
 /// `pattern` is a glob (`*` any run including `/`, `?` one character) matched
@@ -563,7 +614,9 @@ impl Policy {
             }
             _ => vec![target],
         };
-        for effect in [Effect::Deny, Effect::Ask, Effect::Allow] {
+        // Strictest-first: `Effect::ALL` is in strictness order, so deny-first
+        // is that order reversed. The `.rev()` is the precedence rule.
+        for effect in Effect::ALL.into_iter().rev() {
             for layer in &self.layers {
                 for rule in &layer.rules {
                     if rule.act == act
@@ -776,6 +829,42 @@ mod tests {
             .allow_write("src/*")
             .deny_read("secrets/*")
             .deny_write("secrets/*")
+    }
+
+    /// The completeness guard for [`Effect::ALL`], and the only thing in the
+    /// crate that a fourth effect cannot slip past.
+    ///
+    /// The `match` is exhaustive, so adding a variant fails to compile *here*
+    /// rather than being quietly skipped by every site that iterates `ALL`. A
+    /// length assertion against a literal would not: it is the same stale
+    /// hand-written list, moved into the fix.
+    #[test]
+    fn all_lists_every_effect_exactly_once() {
+        let (mut allow, mut ask, mut deny) = (false, false, false);
+        for effect in Effect::ALL {
+            let seen = match effect {
+                Effect::Allow => &mut allow,
+                Effect::Ask => &mut ask,
+                Effect::Deny => &mut deny,
+            };
+            assert!(!*seen, "{effect:?} appears twice in Effect::ALL");
+            *seen = true;
+        }
+        assert!(
+            allow && ask && deny,
+            "Effect::ALL is missing a variant: allow={allow} ask={ask} deny={deny}"
+        );
+    }
+
+    /// `as_str` is the deserializer's own spelling, checked against the
+    /// deserializer rather than against a second hand-written table.
+    #[test]
+    fn every_effect_round_trips_through_its_own_word() {
+        for effect in Effect::ALL {
+            let json = format!("\"{}\"", effect.as_str());
+            assert_eq!(serde_json::from_str::<Effect>(&json).unwrap(), effect);
+            assert_eq!(serde_json::to_string(&effect).unwrap(), json);
+        }
     }
 
     #[test]

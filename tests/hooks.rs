@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use io_harness::hooks::OnFailure;
 use io_harness::observe::{Flow, Observer, RunEvent};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{
@@ -445,5 +446,92 @@ async fn f5_a_failing_hook_stops_the_run_only_when_the_operator_asked_it_to() {
     assert!(
         matches!(outcome, io_harness::RunOutcome::VerificationFailed { .. }),
         "the default is continue: {outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 0.71.0 — a configured hook is readable, not merely countable (#223)
+// ---------------------------------------------------------------------------
+
+/// Two tables that differ in **every one** of the seven keys, so an accessor
+/// wired to the wrong field cannot pass by reading a neighbour that happens to
+/// hold the same value.
+///
+/// The first writes `on_failure` and the second omits it, which is the pair that
+/// separates a copied answer from a computed one: `cancel` is the key the table
+/// wrote, and `refuse` is a value that appears in no file anywhere — a lifecycle
+/// hook's own default, and not the enum's, which is `continue`.
+const SEVEN_KEYS: &str = "\
+[[hook]]
+on = [\"finished\", \"refused\"]
+append = \"audit.jsonl\"
+on_failure = \"cancel\"
+
+[[hook]]
+at = \"before_tool\"
+tools = [\"read_file\"]
+run = [\"gate\", \"--strict\"]
+timeout_ms = 1234
+";
+
+/// **#223**, the configuration half. `Hooks::declarations` hands back every table
+/// an operator configured with all seven keys readable.
+///
+/// The plugin half of the identical assertion lives in `tests/plugin.rs`: the two
+/// are different holders of the same fact — a configuration's `[[hook]]` array
+/// and a manifest's — and a test against one proves nothing about the other.
+#[test]
+fn a_configured_hook_is_readable_key_by_key_and_not_merely_counted() {
+    empty_user_scope();
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join("io.local.toml"), SEVEN_KEYS).unwrap();
+
+    let hooks = Config::discover(ws.path()).unwrap().hooks();
+    assert!(
+        !hooks.is_empty(),
+        "the countable answer, which is what 0.70.0 had"
+    );
+
+    let tables = hooks.declarations();
+    assert_eq!(tables.len(), 2, "both tables, in declaration order");
+
+    let event = &tables[0];
+    assert_eq!(event.on().to_vec(), ["finished", "refused"]);
+    assert_eq!(event.at(), None);
+    assert!(event.tools().is_empty());
+    assert_eq!(event.append(), Some(Path::new("audit.jsonl")));
+    assert_eq!(event.run(), None);
+    assert_eq!(
+        event.on_failure(),
+        OnFailure::Cancel,
+        "the key this table wrote, carried through unchanged"
+    );
+    assert_eq!(
+        event.timeout_ms(),
+        None,
+        "absent, and reported absent rather than as the module's own 5000"
+    );
+
+    let gate = &tables[1];
+    assert!(gate.on().is_empty());
+    assert_eq!(gate.at(), Some("before_tool"));
+    assert_eq!(gate.tools().to_vec(), ["read_file"]);
+    assert_eq!(gate.append(), None);
+    assert_eq!(
+        gate.run(),
+        Some(&["gate".to_string(), "--strict".to_string()][..]),
+        "the argv whole, program first"
+    );
+    assert_eq!(
+        gate.on_failure(),
+        OnFailure::Refuse,
+        "computed, never copied: no file wrote `refuse`, and the enum's own default \
+         is `continue` — a reader that returned either would be lying about what \
+         this hook does to a call"
+    );
+    assert_eq!(
+        gate.timeout_ms(),
+        Some(1234),
+        "present, and the value written"
     );
 }

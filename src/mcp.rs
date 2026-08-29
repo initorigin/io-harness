@@ -95,6 +95,139 @@ fn default_enabled() -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// Redaction wrappers, for the hand-written `Debug` impls in this module,
+// `lsp` and `hooks` (0.71.0)
+// ---------------------------------------------------------------------------
+//
+// `Config::parse` resolves every `${env:}`, `${file:}` and `${cmd:}` before it
+// stores the merged table, so by the time a `[[mcp]]`, `[[lsp]]` or `[[hook]]`
+// table has become one of these types every string in it is plaintext.
+// `Config`'s own impl already withholds those arrays — but it hands each of them
+// straight back through `Config::mcp_servers`, `Config::lsp_servers` and
+// `Config::hooks`, so a derived `Debug` one call further on undid it.
+//
+// Three of them rather than a blanket "print nothing", for the reason `config.rs`
+// gives at length: an operator formats a configuration precisely when it is
+// misbehaving, and `f.debug_struct("McpServer").finish()` answers nothing. The
+// line drawn here is: **a value the harness will execute or dial stays, a value
+// it will hand to a child stays hidden.** A command, a URL's host and a file
+// suffix are already printed back at the operator by the policy layer's own
+// refusals (`act: "exec"`, the command as `target`), so hiding them here would be
+// theatre that costs the field they debug with. An argument, a header value and
+// an environment value are the three documented ways to hand a process a
+// credential, and they are the ones a `${env:}` is actually written for.
+
+/// A bare word standing in for a value a formatter must not print.
+///
+/// A newtype rather than a `&str` because `&str`'s own `Debug` quotes it, and
+/// `Authorization: "<redacted>"` reads like a header whose value happens to be
+/// that text. The same reason `config::Marker` exists; it is private to that
+/// module and this one is `pub(crate)` so `lsp` and `hooks` share one vocabulary.
+/// Which keys a map set, never what any of them is set to.
+///
+/// The key names are the operator-facing half and they are safe: `Authorization`
+/// and `GITHUB_TOKEN` are names an operator typed, not values a substitution
+/// filled. "This server sends no `Authorization` at all" and "it sends one and
+/// the server still rejected it" are different misconfigurations with different
+/// fixes, and only the key names tell them apart.
+pub(crate) struct RedactedMap<'a>(pub(crate) &'a BTreeMap<String, String>);
+
+impl std::fmt::Debug for RedactedMap<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|key| (key, crate::config::REDACTED)))
+            .finish()
+    }
+}
+
+/// How many arguments a child was given, never what they said.
+///
+/// An argv has no key names to fall back on, so the count is all that is left
+/// that is not a leaf value — and it is still worth printing: `args: <0 redacted>`
+/// against a table that clearly wrote some is a hook whose arguments went
+/// somewhere else.
+pub(crate) struct RedactedArgs(pub(crate) usize);
+
+impl std::fmt::Debug for RedactedArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} redacted>", self.0)
+    }
+}
+
+/// A whole argv: the program it runs, then how many arguments it was given.
+///
+/// The split is the rule this module encodes, applied to one vector. Element
+/// zero is a program the harness executes, so an `Act::Exec` refusal already
+/// prints it back at the operator and hiding it here would only make the same
+/// name harder to find. Everything after it is a value handed to a child, which
+/// is one of the three documented ways to pass a process a credential.
+///
+/// An empty argv renders as an empty list rather than `[<0 redacted>]`: several
+/// `[toolchain.*]` jobs are legitimately empty, and claiming a program that is
+/// not there reads as a redaction rather than as an absence.
+pub(crate) struct Argv<'a>(pub(crate) &'a [String]);
+
+impl std::fmt::Debug for Argv<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return f.debug_list().finish();
+        }
+        f.debug_list()
+            .entries(self.0.first())
+            .entry(&RedactedArgs(self.0.len() - 1))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for McpTransport {
+    /// The kind, the program or the endpoint, and the *names* of whatever was
+    /// set alongside them.
+    ///
+    /// `command` is verbatim: it is what an [`Act::Exec`] refusal already names,
+    /// and it is the first thing anyone debugging a server that will not start
+    /// looks at. `url` goes through the same endpoint redaction the providers'
+    /// own impls use — a gateway endpoint routinely carries its credential as
+    /// userinfo or a query parameter, so printing it whole would reopen the leak
+    /// through the field beside the redacted one.
+    ///
+    /// [`Act::Exec`]: crate::Act::Exec
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdio { command, args, env } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", &RedactedArgs(args.len()))
+                .field("env", &RedactedMap(env))
+                .finish(),
+            Self::Http { url, headers } => f
+                .debug_struct("Http")
+                .field("url", &crate::provider::redacted_endpoint(url))
+                .field("headers", &RedactedMap(headers))
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for McpServer {
+    /// Everything but the transport verbatim, and the transport through its own
+    /// impl.
+    ///
+    /// The id is the name every tool this server offers is prefixed with and the
+    /// name every trace line about it carries, so it is the one field the whole
+    /// rendering is looked up by. `timeout_secs` and `enabled` are an operator's
+    /// own numbers; a server that is configured but switched off is the
+    /// misconfiguration this printing exists to make visible.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpServer")
+            .field("id", &self.id)
+            .field("transport", &self.transport)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
 /// How to reach one MCP server.
 ///
 /// The two variants are not interchangeable configuration: they are checked by
@@ -149,7 +282,9 @@ fn default_enabled() -> bool {
 /// fields rather than nesting.
 ///
 /// [`Act::Net`]: crate::Act::Net
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Debug` is hand-written above: a derived one prints `headers` and `env`
+// verbatim, and both are strings `Config::parse` filled from a `${env:}`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub enum McpTransport {
     /// Spawn the server as a child process and speak over its stdio.
@@ -182,7 +317,13 @@ pub enum McpTransport {
 /// The policy line in the example is not decoration. Attaching a server to a
 /// contract makes it *configured*; starting it is an [`Act::Exec`] check on its
 /// binary, so without `allow_exec` naming that binary the run ends in
-/// [`Error::Mcp`] before the server process exists.
+/// [`Error::Refused`] — `act: "exec"`, the command as `target` — before the
+/// server process exists. A remote server is refused the same way by the
+/// [`Act::Net`] check on its host, with `act: "net"`. [`Error::Mcp`] is the far
+/// side of that line: it is returned only once the policy has allowed the
+/// server, when the process will not spawn, the handshake fails, or the tools
+/// cannot be listed. A caller mapping errors on the refusal path wants
+/// [`Error::Refused`], which is the one case the check exists for.
 ///
 /// ```no_run
 /// use io_harness::{run_with, ApproveAll, McpServer, OpenRouter, Policy, Store,
@@ -231,7 +372,12 @@ pub enum McpTransport {
 ///
 /// `Serialize`/`Deserialize` because an application layer expresses these in
 /// their own config files, the same way they already express a [`Policy`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Debug` is hand-written and `Serialize` is not: a header or environment value
+/// here has been through the configuration's `${env:}` substitution, so it is
+/// redacted for a formatter and written back verbatim for a tool that persists
+/// what the operator typed (0.71.0).
+// `Debug` is hand-written above, for the transport it carries.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServer {
     /// Short name for this server, used in tool names and in the trace. Keep it
     /// stable: renaming it renames every tool the model sees.

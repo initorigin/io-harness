@@ -240,6 +240,57 @@ impl PriceTable {
         self.tiers.get(model).map_or(&[], |t| t.as_slice())
     }
 
+    /// Every model this table can price, sorted (0.71.0).
+    ///
+    /// The models [`PriceTable::price`] and [`PriceTable::cost_micros`] will
+    /// answer for, which is not every model the table mentions: [`PriceTier`]s
+    /// are keyed separately, and a model given tiers but no base price is
+    /// unpriced — `cost_micros` returns `None` for it. Listing it here would
+    /// promise a cost the table cannot produce.
+    ///
+    /// ```
+    /// use io_harness::pricing::{Price, PriceTable, PriceTier};
+    ///
+    /// let prices = PriceTable::new("2026-07-29")
+    ///     .with("some-vendor/zeta", Price { input: 1_000_000, ..Price::ZERO })
+    ///     .with("some-vendor/alpha", Price { input: 2_000_000, ..Price::ZERO })
+    ///     .with_tiers(
+    ///         "some-vendor/tiers-only",
+    ///         vec![PriceTier { min_prompt_tokens: 200_000, price: Price::ZERO }],
+    ///     );
+    ///
+    /// assert_eq!(prices.models(), vec!["some-vendor/alpha", "some-vendor/zeta"]);
+    /// assert!(
+    ///     !prices.models().contains(&"some-vendor/tiers-only"),
+    ///     "tiers with no base price cannot be priced, so the model is not listed",
+    /// );
+    /// ```
+    pub fn models(&self) -> Vec<&str> {
+        self.prices.keys().map(String::as_str).collect()
+    }
+
+    /// How many models this table can price (0.71.0).
+    ///
+    /// ```
+    /// use io_harness::pricing::{Price, PriceTable};
+    ///
+    /// assert_eq!(PriceTable::new("2026-07-29").with("a", Price::ZERO).len(), 1);
+    /// ```
+    pub fn len(&self) -> usize {
+        self.prices.len()
+    }
+
+    /// Whether the table prices nothing (0.71.0).
+    ///
+    /// ```
+    /// use io_harness::pricing::PriceTable;
+    ///
+    /// assert!(PriceTable::new("2026-07-29").is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.prices.is_empty()
+    }
+
     /// The rate that prices a prompt of `prompt_tokens` on `model`: the highest
     /// tier at or below it, or the base price when it reaches none.
     fn rate(&self, model: &str, prompt_tokens: u64) -> Option<Price> {

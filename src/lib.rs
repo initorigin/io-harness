@@ -503,7 +503,7 @@ mod harness;
 pub mod hooks;
 pub mod lsp;
 pub mod mcp;
-mod net;
+pub mod net;
 pub mod observe;
 pub mod plugin;
 pub mod policy;
@@ -532,18 +532,22 @@ pub use browser::BrowserConfig;
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
 pub use context::{Compaction, ContextBudget};
-pub use contract::{Preset, Routing, SystemPrompt, TaskContract};
+pub use contract::{
+    Preset, Routing, SystemPrompt, TaskContract, DEFAULT_MAX_RETRIES, DEFAULT_MAX_STEPS,
+    DEFAULT_WORKSPACE_MAX_STEPS,
+};
 pub use error::{Error, ProviderErrorKind, Result, StorageErrorKind};
 pub use harness::Harness;
-pub use hooks::Hooks;
+pub use hooks::{Hook, Hooks, OnFailure};
 pub use lsp::LspServer;
 pub use mcp::{probe_mcp, McpProbe, McpServer, McpTransport, MCP_TOOL_PREFIX};
-// The `net` module itself stays private, so the default request deadline is
-// surfaced here as well as from each provider module. A caller overriding it with
-// `with_timeout` should be able to name the value they are overriding without
-// reaching into a provider's namespace to find it.
+// The `net` module is public as of 0.71.0, but it exports exactly one function —
+// `target` — and the default request deadline keeps this crate-root re-export it
+// has always had. A caller overriding it with `with_timeout` should be able to
+// name the value they are overriding without reaching into a provider's
+// namespace, or into a module whose only other public item is a policy helper.
 pub use attach::{Attach, Waiting, POLL_LIMIT};
-pub use net::REQUEST_TIMEOUT;
+pub use net::{target, REQUEST_TIMEOUT};
 pub use observe::{Broadcast, EventKind, Flow, Ignore, Observer, RunEvent};
 pub use plugin::{Dropped, Plugin, Plugins, MAX_ID, NAMESPACE, PLUGIN_FILE};
 pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};

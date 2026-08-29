@@ -50,7 +50,10 @@ const BUSY_TIMEOUT src/state.rs
 const CHECKPOINT_FORMAT src/state.rs
 const DEFAULT_EXEC_TIMEOUT src/tools/exec.rs
 const DEFAULT_LEASE_TTL src/run.rs
+const DEFAULT_MAX_RETRIES src/contract.rs
+const DEFAULT_MAX_STEPS src/contract.rs
 const DEFAULT_MAX_WAIT src/run.rs
+const DEFAULT_WORKSPACE_MAX_STEPS src/contract.rs
 const GLOBAL_MEMORY_WORKSPACE src/state.rs
 const IMAGE_MEDIA_TYPES src/provider/mod.rs (feature = "media")
 const MAX_ID src/plugin.rs
@@ -91,6 +94,7 @@ enum McpTransport src/mcp.rs
 enum MemoryForget src/state.rs
 enum MemoryKind src/state.rs
 enum Message src/provider/mod.rs
+enum OnFailure src/hooks.rs
 enum PlanVerdict src/approve.rs
 enum PriceSource src/provider/mod.rs
 enum Progressing src/resilience.rs
@@ -119,6 +123,7 @@ fn rewind_run_observed src/run.rs
 fn rewind_step src/run.rs
 fn rewind_step_observed src/run.rs
 fn select src/sandbox.rs
+fn target src/net.rs
 struct AcceptPlan src/approve.rs
 struct AgentDef src/agent.rs
 struct AgentEvent src/state.rs
@@ -154,6 +159,7 @@ struct FixedResponder src/approve.rs
 struct FleetTally src/containment.rs
 struct GateAttempt src/state.rs
 struct Harness src/harness.rs
+struct Hook src/hooks.rs
 struct Hooks src/hooks.rs
 struct Identity src/tools/git.rs
 struct Ignore src/observe.rs

@@ -101,7 +101,17 @@ fn default_headless() -> bool {
 /// assert_eq!(named.binary.as_deref(), Some("/usr/bin/chromium"));
 /// assert_eq!(named.width, 1920);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Debug` is hand-written and `Serialize` is not, the same asymmetry
+/// [`McpServer`](crate::McpServer) carries: `[browser]` is a table
+/// [`Config`](crate::Config) has resolved every `${env:}`, `${file:}` and
+/// `${cmd:}` in before it is here, and `--proxy-server=https://user:pass@host` is
+/// the ordinary way to point a browser at an authenticated proxy — so the extra
+/// arguments are withheld from a formatter and written back verbatim for a tool
+/// that persists what the operator typed (0.71.0).
+// `Debug` is hand-written below, so the derive is gone — having both is a
+// conflicting-implementation error, not a shadow.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrowserConfig {
     /// The browser executable. `None` resolves it from a documented ordered list
     /// of well-known names — see [`RESOLUTION_ORDER`] — so an operator reads
@@ -125,6 +135,39 @@ pub struct BrowserConfig {
     /// Per-action bound in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+impl std::fmt::Debug for BrowserConfig {
+    /// The binary and every number an operator chose, and how many extra
+    /// arguments there were rather than what they said.
+    ///
+    /// `binary` is verbatim: it is the program this crate is about to spawn, it is
+    /// what an [`Act::Exec`] refusal already names, and "which browser did it
+    /// actually pick" is the first question anyone debugging `[browser]` asks —
+    /// `None`, meaning [`RESOLUTION_ORDER`] decides, is itself the answer half the
+    /// time. `headless`, the viewport and the bound are the operator's own
+    /// numbers and carry nothing a substitution would be written for.
+    ///
+    /// `args` is the one field withheld. It is appended to the command line of a
+    /// process this crate starts, which makes it the credential path `[[mcp]]`'s
+    /// `args` is — and a proxy with userinfo in its URL is the ordinary shape of
+    /// it here, not an exotic one. The count survives, so "this run passes no
+    /// extra arguments" stays distinguishable from "its arguments are withheld".
+    ///
+    /// The module is behind `feature = "browser"` whole, so this impl needs no
+    /// gate of its own.
+    ///
+    /// [`Act::Exec`]: crate::Act::Exec
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserConfig")
+            .field("binary", &self.binary)
+            .field("args", &crate::mcp::RedactedArgs(self.args.len()))
+            .field("headless", &self.headless)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 impl Default for BrowserConfig {
