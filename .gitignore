@@ -19,3 +19,17 @@ io.local.toml
 # gate evidence are the maintainer's working notes, written by tooling rather
 # than by hand. They are not a contributor-facing surface and are never committed.
 .ultraship/
+
+# SQLite's write-ahead log and shared-memory sidecars. They appear beside a
+# committed fixture the moment anything opens it — a test run, a `sqlite3` query
+# while inspecting it — and they are transient state, not fixture content: the
+# `.sqlite3` file is checkpointed and complete on close, which is what the
+# cross-version tests copy and read.
+#
+# They were committed once, in 0.72.0, and the reason it mattered is worth the
+# rule: `.gitattributes` marks `tests/fixtures/**/*.sqlite3` binary, and these two
+# do not match that glob, so they went in under `tests/fixtures/** text eol=lf`
+# and git was free to rewrite bytes inside them. A stale WAL beside a database is
+# also something SQLite may try to recover from.
+*.sqlite3-wal
+*.sqlite3-shm
