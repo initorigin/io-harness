@@ -25,9 +25,9 @@ use std::sync::{Arc, Mutex};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    resume_with_answer, run_with, AnswerFuture, AnswersFuture, ApproveAll, Choice, Containment,
-    EventKind, Policy, Provider, Question, Responder, ResponderNone, RunOutcome, Store,
-    TaskContract, Verification,
+    resume_with_answer, run_with, AnswerFuture, AnswersFuture, ApproveAll, Choice, EventKind,
+    Policy, Provider, Question, Responder, ResponderNone, RunOutcome, Store, TaskContract,
+    Verification,
 };
 use serde_json::{json, Value};
 
@@ -379,13 +379,16 @@ async fn an_unanswered_batch_parks_one_row_and_resumes_through_the_existing_func
         assert!(rows[0].question.contains(text), "{}", rows[0].question);
     }
 
-    // The answer set arrives as one text through the function that already existed.
+    // The answer set arrives as one text through the function that already existed,
+    // with the signature it already had — which is what "no plural resume surface"
+    // means in practice.
     let resumed = resume_with_answer(
+        &contract,
+        &AsksOnce::new(json!({})),
         &store,
         result.run_id,
         question_id,
         "sqlite; linux and windows; io",
-        &AsksOnce::new(json!({})),
         &open_policy(),
         &ApproveAll,
     )
@@ -421,16 +424,37 @@ fn answering_a_batch_twice_changes_nothing() {
 /// `QuestionAnswered` is emitted once per answer.
 #[tokio::test]
 async fn a_batch_emits_one_questions_asked_and_one_answered_per_answer() {
+    /// Collects the event stream, which is where `QuestionsAsked` is observable.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        events: Mutex<Vec<io_harness::RunEvent>>,
+    }
+
+    impl io_harness::Observer for Recorder {
+        fn event(&self, event: &io_harness::RunEvent) -> io_harness::Flow {
+            self.events.lock().unwrap().push(event.clone());
+            io_harness::Flow::Continue
+        }
+    }
+
     let dir = ws();
     let store = Store::memory().unwrap();
     let contract = never_passes(dir.path(), 3).with_responder(Arc::new(AllAtOnce::default()));
     let provider = AsksOnce::new(three_questions());
+    let watcher = Recorder::default();
 
-    let result = run_with(&contract, &provider, &store, &open_policy(), &ApproveAll)
-        .await
-        .unwrap();
+    io_harness::run_with_observed(
+        &contract,
+        &provider,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+        &watcher,
+    )
+    .await
+    .unwrap();
 
-    let events = store.events(result.run_id).unwrap();
+    let events = watcher.events.lock().unwrap().clone();
     let batches: Vec<&Vec<Question>> = events
         .iter()
         .filter_map(|e| match &e.kind {
@@ -463,22 +487,14 @@ async fn a_batch_emits_one_questions_asked_and_one_answered_per_answer() {
 
 // ------------------------------------------- O10, O11, O13, O14: the shapes it keeps
 
-/// O10 — `ask_questions` is reserved, and a custom tool cannot claim the name.
+/// O10 — the name the reserved set has to carry. The set itself is `pub(crate)`, so
+/// the assertion that a custom tool cannot claim it lives in `tests/custom_tools.rs`
+/// beside every other reserved name rather than being re-machined here; this pins the
+/// constant's value, which is the half that would silently drift.
 #[test]
-fn the_batch_tool_name_is_reserved() {
-    use io_harness::tools::Toolbox;
-
-    let claimed = Toolbox::default().with(io_harness::tools::Tool::new(
-        io_harness::ASK_QUESTIONS_TOOL,
-        "not yours",
-        json!({ "type": "object" }),
-        |_| Box::pin(async { Ok(String::new()) }),
-    ));
-    assert!(
-        claimed.is_err(),
-        "a custom tool must not be able to claim `{}`",
-        io_harness::ASK_QUESTIONS_TOOL
-    );
+fn the_batch_tool_is_named_what_the_reserved_set_reserves() {
+    assert_eq!(io_harness::ASK_QUESTIONS_TOOL, "ask_questions");
+    assert_ne!(io_harness::ASK_QUESTIONS_TOOL, io_harness::ASK_QUESTION_TOOL);
 }
 
 /// O11 — `multiple` round-trips through the tool, through the store, and reaches a
@@ -642,5 +658,4 @@ async fn asking_is_not_gated_by_the_policy() {
         .unwrap();
 
     assert_eq!(store.questions(result.run_id).unwrap().len(), 1);
-    let _ = Containment::default();
 }

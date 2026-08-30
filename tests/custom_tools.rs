@@ -256,6 +256,11 @@ async fn a_registered_tool_may_not_shadow_a_built_in() {
         "read_file",
         "spawn_agent",
         "read_skill",
+        // 0.72.0's plural question tool. A built-in that dispatch tests before any
+        // registered tool must be reserved, or a custom tool taking the name passes
+        // validation and is then permanently unreachable — the exact gap the
+        // `NAMES_0_16_2_MISSED` list below exists to record.
+        "ask_questions",
     ] {
         let dir = ws();
         let contract =
