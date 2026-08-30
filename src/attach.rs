@@ -377,7 +377,9 @@ impl<'a> Attach<'a> {
                         question_id: q.id,
                         step: q.step,
                         question: q.question,
-                        choices: q.choices,
+                        // Labels: `Waiting` is the resume surface, and 0.72.0
+                        // deliberately does not grow a plural half of it.
+                        choices: q.choices.into_iter().map(|c| c.label).collect(),
                     });
                 }
             }

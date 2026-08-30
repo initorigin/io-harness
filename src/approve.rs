@@ -756,6 +756,157 @@ mod tests {
 // 0.21.0 — asking the operator what they MEANT, which is not asking permission
 // ===========================================================================
 
+/// One option a [`Question`] is offering, and what taking it would mean.
+///
+/// Until 0.72.0 an offer was a bare `String`, so an operator picking between five
+/// labels had nothing telling them what any of them cost — the crate recorded what
+/// was asked and almost nothing about what was offered. The two optional fields are
+/// two different things and the tool descriptions say so:
+///
+/// * `description` is one sentence naming what the option means, drawn beside the
+///   label wherever the offers are listed.
+/// * `preview` is a short concrete block showing what taking it would actually do —
+///   the config it writes, the command it runs — drawn only when an interface asks
+///   for it. It is a snippet, not a document: a model that exceeds the bound is told
+///   what was cut rather than having it silently trimmed.
+///
+/// A model that has only a sentence sets `description`; one that can show the thing
+/// sets `preview`.
+///
+/// ```
+/// use io_harness::Choice;
+///
+/// // A bare label is still a choice, which is what keeps every 0.71.0 call compiling.
+/// assert_eq!(Choice::from("io.toml").label, "io.toml");
+///
+/// let described = Choice::new("io.local.toml")
+///     .describe("Gitignored, so the change stays on this machine.")
+///     .preview("[provider]\nkey = \"...\"");
+/// assert_eq!(described.description.as_deref(), Some("Gitignored, so the change stays on this machine."));
+/// assert!(described.preview.is_some());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct Choice {
+    /// The option itself, as an operator reads it and as an answer spells it.
+    pub label: String,
+    /// One sentence saying what taking this option means. `None` when the label
+    /// speaks for itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// A short concrete block showing what taking it would do. `None` when there is
+    /// nothing to show, which is most of the time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+impl Choice {
+    /// A bare offer, with nothing said about it yet.
+    ///
+    /// ```
+    /// use io_harness::Choice;
+    ///
+    /// let c = Choice::new("keep the column");
+    /// assert!(c.description.is_none() && c.preview.is_none());
+    /// ```
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Say in one sentence what taking this option means.
+    ///
+    /// ```
+    /// use io_harness::Choice;
+    ///
+    /// let c = Choice::new("drop it").describe("Irreversible without a restore.");
+    /// assert_eq!(c.description.as_deref(), Some("Irreversible without a restore."));
+    /// ```
+    pub fn describe(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Show a short block of what taking it would actually do.
+    ///
+    /// ```
+    /// use io_harness::Choice;
+    ///
+    /// let c = Choice::new("use sqlite").preview("url = \"sqlite://io.db\"");
+    /// assert_eq!(c.preview.as_deref(), Some("url = \"sqlite://io.db\""));
+    /// ```
+    pub fn preview(mut self, preview: impl Into<String>) -> Self {
+        self.preview = Some(preview.into());
+        self
+    }
+}
+
+impl From<String> for Choice {
+    fn from(label: String) -> Self {
+        Self::new(label)
+    }
+}
+
+impl From<&str> for Choice {
+    fn from(label: &str) -> Self {
+        Self::new(label)
+    }
+}
+
+/// Reads both spellings, and that is not a convenience.
+///
+/// Every `pending_questions` row written by 0.71.0 and earlier holds `choices` as a
+/// JSON array of plain strings. A deserializer that understood only the object form
+/// would fail to load every parked question in every existing store — a
+/// data-loss-shaped defect in a release that changed no data. A JSON string becomes
+/// a `Choice` with that label and nothing else; a JSON object is read by field.
+///
+/// ```
+/// use io_harness::Choice;
+///
+/// // The 0.71.0 spelling.
+/// let old: Vec<Choice> = serde_json::from_str(r#"["a", "b"]"#).unwrap();
+/// assert_eq!(old.len(), 2);
+/// assert_eq!(old[0].label, "a");
+/// assert!(old[0].description.is_none());
+///
+/// // The 0.72.0 spelling.
+/// let new: Choice = serde_json::from_str(r#"{"label": "a", "description": "the first"}"#).unwrap();
+/// assert_eq!(new.description.as_deref(), Some("the first"));
+/// ```
+impl<'de> serde::Deserialize<'de> for Choice {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Spelling {
+            Label(String),
+            Described {
+                label: String,
+                #[serde(default)]
+                description: Option<String>,
+                #[serde(default)]
+                preview: Option<String>,
+            },
+        }
+        Ok(match Spelling::deserialize(deserializer)? {
+            Spelling::Label(label) => Self::new(label),
+            Spelling::Described {
+                label,
+                description,
+                preview,
+            } => Self {
+                label,
+                description,
+                preview,
+            },
+        })
+    }
+}
+
 /// A question the agent is asking the operator about **intent**.
 ///
 /// The distinction from [`Request`] is the whole reason this type exists, and the
@@ -779,9 +930,11 @@ mod tests {
 ///     .with_choices(["io.toml", "io.local.toml"]);
 ///
 /// assert_eq!(q.question, "Which config should I edit?");
-/// assert_eq!(q.choices, ["io.toml", "io.local.toml"]);
+/// assert_eq!(q.choices.len(), 2);
+/// assert_eq!(q.choices[0].label, "io.toml");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct Question {
     /// What the agent wants to know.
     pub question: String,
@@ -791,7 +944,22 @@ pub struct Question {
     /// Options the agent is offering, if any. A UI renders these as buttons; an
     /// answer is **not** obliged to be one of them, because an operator whose real
     /// answer is "neither, do this instead" must not be forced to pick a wrong one.
-    pub choices: Vec<String>,
+    ///
+    /// [`Choice`] since 0.72.0, so an offer can say what it means. The
+    /// deserializer still reads the array of plain strings every earlier release
+    /// wrote, which is what lets an existing store load without a migration.
+    pub choices: Vec<Choice>,
+    /// Whether more than one of the offered [`choices`](Self::choices) may be taken.
+    ///
+    /// An offer of several, not a demand for several — plenty of real questions are
+    /// not pick-one, and before 0.72.0 a model either asked five yes-or-no questions
+    /// or asked one and hoped the prose answer was legible. Default `false`, so every
+    /// question written before this field existed keeps its present meaning.
+    ///
+    /// [`Question::answer_of`] is how a several-part answer is spelled, so two
+    /// interfaces answering the same question produce the same text.
+    #[serde(default)]
+    pub multiple: bool,
 }
 
 impl Question {
@@ -830,14 +998,62 @@ impl Question {
     ///
     /// let q = Question::new("Which?").with_choices(["a", "b"]);
     /// assert_eq!(q.choices.len(), 2);
+    ///
+    /// // A described offer goes through the same builder, because a second builder
+    /// // for a second spelling is the defect this line of products keeps paying for.
+    /// use io_harness::Choice;
+    /// let described = Question::new("Which?")
+    ///     .with_choices([Choice::new("a").describe("the cheap one")]);
+    /// assert_eq!(described.choices[0].description.as_deref(), Some("the cheap one"));
     /// ```
     pub fn with_choices<I, S>(mut self, choices: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<Choice>,
     {
         self.choices = choices.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// Say that more than one of the offered choices may be taken.
+    ///
+    /// ```
+    /// use io_harness::Question;
+    ///
+    /// let q = Question::new("Which platforms?").with_choices(["linux", "windows"]).multiple();
+    /// assert!(q.multiple);
+    /// ```
+    pub fn multiple(mut self) -> Self {
+        self.multiple = true;
+        self
+    }
+
+    /// How a several-part answer is spelled, stated once by the crate rather than
+    /// once per interface.
+    ///
+    /// The answer stays a `String`: what goes back is prose the model reads, nothing
+    /// re-parses it into choices again, and a richer return type would be a second
+    /// representation of a fact that already has one. Two interfaces answering the
+    /// same [`multiple`](Self::multiple) question produce the same text because both
+    /// call this.
+    ///
+    /// ```
+    /// use io_harness::Question;
+    ///
+    /// assert_eq!(Question::answer_of(["Linux", "Windows"]), "Linux, Windows");
+    /// assert_eq!(Question::answer_of(["Linux"]), "Linux");
+    /// assert_eq!(Question::answer_of([] as [&str; 0]), "");
+    /// ```
+    pub fn answer_of<I, S>(selected: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        selected
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -863,6 +1079,30 @@ impl Question {
 /// assert!(rt.block_on(AlwaysDeclines.answer(&Question::new("Which?"))).is_none());
 /// ```
 pub type AnswerFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
+
+/// The future [`Responder::answer_all`] returns: one `Option<String>` per question,
+/// in the order they were asked (0.72.0).
+///
+/// Boxed for the same object-safety reason [`AnswerFuture`] is. `Vec<Option<String>>`
+/// rather than `Option<Vec<String>>` because declining is per question — a responder
+/// that can answer two of three says so, and the run parks on what is left.
+///
+/// ```
+/// use io_harness::{AnswersFuture, Question, Responder, ResponderNone};
+///
+/// let batch = [Question::new("which?"), Question::new("why?")];
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+///
+/// // The default body loops `answer`, so a responder that never heard of batching
+/// // still answers a batch — one question at a time, which is what it could always do.
+/// let answers: Vec<Option<String>> = rt.block_on(ResponderNone.answer_all(&batch));
+/// assert_eq!(answers.len(), 2);
+/// assert!(answers.iter().all(Option::is_none));
+///
+/// // The alias names the future that produced them.
+/// let _: fn(&ResponderNone, &[Question]) -> AnswersFuture<'_> = |r, qs| r.answer_all(qs);
+/// ```
+pub type AnswersFuture<'a> = Pin<Box<dyn Future<Output = Vec<Option<String>>> + Send + 'a>>;
 
 /// Answers an agent's question about intent, in this process.
 ///
@@ -892,7 +1132,7 @@ pub type AnswerFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send +
 ///
 /// impl Responder for FirstChoice {
 ///     fn answer<'a>(&'a self, question: &'a Question) -> AnswerFuture<'a> {
-///         Box::pin(async move { question.choices.first().cloned() })
+///         Box::pin(async move { question.choices.first().map(|c| c.label.clone()) })
 ///     }
 /// }
 ///
@@ -910,6 +1150,53 @@ pub type AnswerFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send +
 pub trait Responder: Send + Sync + fmt::Debug {
     /// Answer one question, or return `None` to let the run pause for a human.
     fn answer<'a>(&'a self, question: &'a Question) -> AnswerFuture<'a>;
+
+    /// Answer a batch of independent questions, or decline any of them (0.72.0).
+    ///
+    /// **Nothing that implements this trait today has to change.** The default body
+    /// awaits [`answer`](Self::answer) once per question in order, so an interface
+    /// that never heard of batching still answers a batch — one question at a time,
+    /// which is what it could always do. An interface that wants one overlay for five
+    /// questions overrides it, which is the whole reason the method exists: until
+    /// 0.72.0 `answer` took one question and blocked, so an interface downstream could
+    /// only render what reached it, and questions reached it one at a time.
+    ///
+    /// The returned vector is one entry per question, in the order given. Declining is
+    /// per question rather than per batch — a responder that can answer two of three
+    /// says so.
+    ///
+    /// ```
+    /// use io_harness::{AnswersFuture, Question, Responder};
+    ///
+    /// /// Answers every question in one pass, which is the point of overriding.
+    /// #[derive(Debug)]
+    /// struct AllAtOnce;
+    ///
+    /// impl Responder for AllAtOnce {
+    ///     fn answer<'a>(&'a self, _q: &'a Question) -> io_harness::AnswerFuture<'a> {
+    ///         Box::pin(async { Some("one at a time".to_string()) })
+    ///     }
+    ///
+    ///     fn answer_all<'a>(&'a self, questions: &'a [Question]) -> AnswersFuture<'a> {
+    ///         Box::pin(async move {
+    ///             questions.iter().map(|q| Some(format!("all at once: {}", q.question))).collect()
+    ///         })
+    ///     }
+    /// }
+    ///
+    /// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    /// let answers = rt.block_on(AllAtOnce.answer_all(&[Question::new("which?")]));
+    /// assert_eq!(answers[0].as_deref(), Some("all at once: which?"));
+    /// ```
+    fn answer_all<'a>(&'a self, questions: &'a [Question]) -> AnswersFuture<'a> {
+        Box::pin(async move {
+            let mut answers = Vec::with_capacity(questions.len());
+            for question in questions {
+                answers.push(self.answer(question).await);
+            }
+            answers
+        })
+    }
 }
 
 /// Answers nothing, so every question pauses the run for a human.
@@ -987,34 +1274,96 @@ impl Responder for FixedResponder {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StdinResponder;
 
+/// Draw one question and its offers on the terminal.
+///
+/// Split out of [`StdinResponder::answer`] so the batch override can print every
+/// question before reading the first answer, and the two cannot draw an offer
+/// differently.
+fn print_question(question: &Question, ordinal: Option<(usize, usize)>) {
+    match ordinal {
+        Some((i, of)) => println!("\n[the agent is asking — {} of {of}] {}", i, question.question),
+        None => println!("\n[the agent is asking] {}", question.question),
+    }
+    if let Some(context) = &question.context {
+        println!("  context: {context}");
+    }
+    for (i, choice) in question.choices.iter().enumerate() {
+        println!("  {}) {}", i + 1, choice.label);
+        if let Some(description) = &choice.description {
+            println!("     {description}");
+        }
+        for line in choice.preview.iter().flat_map(|p| p.lines()) {
+            println!("     | {line}");
+        }
+    }
+    if question.multiple && !question.choices.is_empty() {
+        println!("  (more than one may be taken — separate the numbers with commas)");
+    }
+}
+
+/// A typed line read as a selection of offered choices, or `None` when it is not one.
+///
+/// Several numbers are only a selection when the question said several may be taken;
+/// on a pick-one question `1,3` is prose and goes back as prose. The selected labels
+/// are joined by [`Question::answer_of`] rather than here, so this responder and any
+/// other interface spell a several-part answer identically — which is what O13 asserts
+/// against the helper rather than against a literal.
+fn selection(question: &Question, line: &str) -> Option<String> {
+    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+    if parts.len() > 1 && !question.multiple {
+        return None;
+    }
+    let mut labels = Vec::with_capacity(parts.len());
+    for part in parts {
+        let n = part.parse::<usize>().ok()?;
+        let choice = question.choices.get(n.checked_sub(1)?)?;
+        labels.push(choice.label.as_str());
+    }
+    Some(Question::answer_of(labels))
+}
+
+/// Read one line, or `None` for an empty line or a closed stdin.
+fn read_answer(question: &Question) -> Option<String> {
+    use std::io::Write;
+    print!("your answer (empty to decide later): ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return None;
+    }
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    // A bare number picks an offered choice, which is what anyone types.
+    Some(selection(question, line).unwrap_or_else(|| line.to_string()))
+}
+
 impl Responder for StdinResponder {
     fn answer<'a>(&'a self, question: &'a Question) -> AnswerFuture<'a> {
         Box::pin(async move {
-            use std::io::Write;
-            println!("\n[the agent is asking] {}", question.question);
-            if let Some(context) = &question.context {
-                println!("  context: {context}");
+            print_question(question, None);
+            read_answer(question)
+        })
+    }
+
+    /// Prints the whole batch before reading the first answer, which is the point of
+    /// a batch: an operator sees what they are being asked as a set and can decide in
+    /// what order to answer it. The default loop would interleave them one at a time
+    /// and lose exactly that.
+    fn answer_all<'a>(&'a self, questions: &'a [Question]) -> AnswersFuture<'a> {
+        Box::pin(async move {
+            for (i, question) in questions.iter().enumerate() {
+                print_question(question, Some((i + 1, questions.len())));
             }
-            for (i, choice) in question.choices.iter().enumerate() {
-                println!("  {}) {choice}", i + 1);
-            }
-            print!("your answer (empty to decide later): ");
-            let _ = std::io::stdout().flush();
-            let mut line = String::new();
-            if std::io::stdin().read_line(&mut line).is_err() {
-                return None;
-            }
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            // A bare number picks an offered choice, which is what anyone types.
-            if let Ok(n) = line.parse::<usize>() {
-                if n >= 1 && n <= question.choices.len() {
-                    return Some(question.choices[n - 1].clone());
-                }
-            }
-            Some(line.to_string())
+            questions
+                .iter()
+                .enumerate()
+                .map(|(i, question)| {
+                    println!("\n[{} of {}] {}", i + 1, questions.len(), question.question);
+                    read_answer(question)
+                })
+                .collect()
         })
     }
 }
