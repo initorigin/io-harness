@@ -1420,7 +1420,7 @@ that as the defect it would be.
 and `read_file`. Everything else built in runs one at a time, in order, exactly as
 it did before — `write_file`, `edit_file`, `exec`, the four shell tools, the git
 built-ins, `list_dir`, `view_image`, spawn, `remember`, `todo_write`,
-`ask_question`, `propose_plan`, and every built-in added since. That list names
+`ask_question`, `ask_questions`, `propose_plan`, and every built-in added since. That list names
 the tools this paragraph was written against and is deliberately not maintained
 as an enumeration: the rule is the enumeration — three names are read-only and
 everything else built in is not. That includes the git readers and `list_dir`,
@@ -3045,6 +3045,33 @@ not make a denied write permitted.
 - **`answered_by` distinguishes a machine from a person.** A `Responder` in the
   run's own process and a human answering after a pause are different facts about
   a run, and the trace keeps them apart.
+- **Several independent questions may be asked in one call (0.72.0).**
+  `ask_questions` takes an array of question objects, parsed strictly per index
+  with the failing index named, at most ten per call and capped-and-told rather
+  than truncated. `ask_question` is unchanged and remains the tool for one
+  question. Questions whose answers depend on each other belong in separate
+  calls: the harness cannot detect a dependent pair and does not try, the tool
+  descriptions say so, and this is a known limitation rather than a solved
+  problem.
+- **A batch is one parked question.** One `pending_questions` row, one
+  `question_id`, one `RunOutcome::AwaitingAnswer`, one `Waiting::Question`, and
+  the same four `resume_*_with_answer` functions with the signatures they have.
+  Answering is all-or-nothing — one conditional update on one row, which is what
+  a submitted answer set means. The row's question text is the whole ask, so a
+  reader that predates batching sees all of it rather than the first of it.
+- **`Responder::answer_all` is defaulted, so no implementor had to change.** Its
+  default body loops `answer` once per question in order; an interface that wants
+  one overlay for several questions overrides it. The trait stays
+  dyn-compatible.
+- **An offer can explain itself (0.72.0).** `Question::choices` is
+  `Vec<Choice>` — a label with an optional sentence and an optional preview —
+  and the deserializer reads the array of plain strings every earlier release
+  wrote, so no store needs a migration. A preview is bounded at twelve lines or
+  eight hundred bytes and cut at a line boundary, with control characters and
+  escape sequences stripped, because a model writes it and a terminal draws it.
+  `Question::multiple` says several offers may be taken and
+  `Question::answer_of` spells such an answer, once, so two interfaces produce
+  the same text. An answer is still not obliged to be one of the offers.
 - **A child's question pauses the whole tree**, as a child's deferred approval
   does, and `resume_tree_with_answer` takes the *root's* run id.
 

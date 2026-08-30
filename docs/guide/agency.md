@@ -102,7 +102,7 @@ struct FromUi;
 
 impl Responder for FromUi {
     fn answer<'a>(&'a self, question: &'a Question) -> AnswerFuture<'a> {
-        Box::pin(async move { question.choices.first().cloned() })
+        Box::pin(async move { question.choices.first().map(|c| c.label.clone()) })
     }
 }
 
@@ -127,6 +127,107 @@ would rather not answer here" and pauses the run.
 `Question::choices` is an offer, not a menu. An answer need not be one of them,
 because an operator whose real answer is "neither, do this instead" must not be
 forced to pick a wrong one.
+
+### An offer that explains itself (0.72.0)
+
+A choice used to be a bare `String`, so an operator picking between five labels
+had nothing telling them what any of them cost — the crate recorded what was
+asked and almost nothing about what was offered. `Choice` carries a label plus
+two optional things, and they are different:
+
+- `description` is one sentence naming what the option means, drawn beside the
+  label wherever the offers are listed.
+- `preview` is a short concrete block showing what taking it would actually do —
+  the config it writes, the command it runs — drawn only when an interface asks
+  for it. It is bounded at twelve lines or eight hundred bytes, cut at a line
+  boundary with the model told what was cut, because every consumer renders it
+  inside a terminal viewport and a model writes it.
+
+```rust
+use io_harness::{Choice, Question};
+
+let q = Question::new("Which store should the run use?")
+    .with_choices([
+        Choice::new("sqlite").describe("Bundled. Nothing to run alongside."),
+        Choice::new("postgres")
+            .describe("Needs a server you already operate.")
+            .preview("url = \"postgres://localhost/io\""),
+    ]);
+assert_eq!(q.choices[0].description.as_deref(), Some("Bundled. Nothing to run alongside."));
+```
+
+`with_choices(["a", "b"])` still compiles and means what it always did, through
+`From<&str> for Choice`. `Question` is `#[non_exhaustive]` as of the same
+release: build one with `Question::new` and the builders rather than a struct
+literal.
+
+Some questions are not pick-one — which platforms to target, which gates to run,
+which of five findings to fix. `Question::multiple()` says so, and
+`Question::answer_of` is how a several-part answer is spelled, stated once by the
+crate so two interfaces answering the same question produce the same text:
+
+```rust
+use io_harness::Question;
+
+let q = Question::new("Which platforms?")
+    .with_choices(["Linux", "Windows", "macOS"])
+    .multiple();
+assert!(q.multiple);
+assert_eq!(Question::answer_of(["Linux", "Windows"]), "Linux, Windows");
+```
+
+The answer stays a `String`. What goes back is prose the model reads; nothing
+re-parses it into choices again, and an answer is still not obliged to be one of
+— or a subset of — the offers.
+
+### Several questions in one breath (0.72.0)
+
+`Responder::answer` takes one question and blocks, so a model that needed five
+facts spent five round trips and an interface downstream could only render what
+reached it — one question at a time. It cannot batch what arrives serially.
+
+`ask_questions` is the plural tool, taking an array of question objects parsed
+strictly per index, at most ten per call. `ask_question` is unchanged and is
+still the right tool for one question. The split matters: **questions whose
+answers depend on each other belong in separate calls.** An operator cannot
+answer question two before question one, and a batch that asks them together
+gets a guess.
+
+`Responder` gains `answer_all`, and **nothing that implements the trait today has
+to change**:
+
+```rust
+use io_harness::{AnswerFuture, AnswersFuture, Question, Responder};
+
+/// One overlay for the whole ask, instead of five in a row.
+#[derive(Debug)]
+struct OneOverlay;
+
+impl Responder for OneOverlay {
+    fn answer<'a>(&'a self, question: &'a Question) -> AnswerFuture<'a> {
+        Box::pin(async move { question.choices.first().map(|c| c.label.clone()) })
+    }
+
+    fn answer_all<'a>(&'a self, questions: &'a [Question]) -> AnswersFuture<'a> {
+        // Draw them together, collect the answers together. One entry per
+        // question, in order; `None` declines that one and parks the run.
+        Box::pin(async move {
+            questions.iter().map(|q| q.choices.first().map(|c| c.label.clone())).collect()
+        })
+    }
+}
+```
+
+The default body loops `answer` once per question in order, so a responder that
+never heard of batching still answers a batch — one question at a time, which is
+what it could always do. The trait stays dyn-compatible, so `Arc<dyn Responder>`
+is unaffected.
+
+A batch is **one** parked question. `RunOutcome::AwaitingAnswer`,
+`Waiting::Question`, `Attach::answer_question` and all four `resume_*_with_answer`
+functions keep the signatures they have, the row's question text is the whole ask
+rather than the first of it, and answering is all-or-nothing — which is what a
+submitted answer set means anyway.
 
 ### Answered by nobody, then by a human tomorrow
 
@@ -467,8 +568,8 @@ loop forgotten. Stall detection is also still a heuristic on a signal rather tha
 proof: an agent making real progress the harness cannot see could in principle be
 flagged, which is why the window is configurable and can be disabled.
 
-**These tools are workspace tools.** `todo_write` and `ask_question` are offered by
-the workspace loop and inside a tree. A single-file run (`TaskContract::new` plus
+**These tools are workspace tools.** `todo_write`, `ask_question` and
+`ask_questions` are offered by the workspace loop and inside a tree. A single-file run (`TaskContract::new` plus
 `run`) is offered one tool and has neither.
 
 **A plain session turn has no responder.** An unbounded `Session::turn` builds its

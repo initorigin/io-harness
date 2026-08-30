@@ -163,7 +163,12 @@ async fn a_responder_answers_and_the_answer_changes_what_the_agent_does() {
             Some("responder"),
             "an in-process answer and a human's must be distinguishable"
         );
-        assert_eq!(questions[0].choices, ["a.txt", "b.txt"]);
+        let labels: Vec<&str> = questions[0]
+            .choices
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(labels, ["a.txt", "b.txt"]);
     }
 }
 
@@ -258,7 +263,8 @@ async fn an_unanswerable_question_pauses_the_run_and_survives_the_process() {
         .expect("the question must have survived the process");
     assert_eq!(q.question, "Which file should I write?");
     assert_eq!(q.context.as_deref(), Some("There is a.txt and b.txt."));
-    assert_eq!(q.choices, ["a.txt", "b.txt"]);
+    let labels: Vec<&str> = q.choices.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(labels, ["a.txt", "b.txt"]);
     assert!(!q.resolved && q.answer.is_none());
 
     let contract = never_passes(dir.path(), 4);
@@ -606,7 +612,7 @@ async fn a_responder_may_answer_some_questions_and_decline_others() {
     struct OnlyChoices;
     impl Responder for OnlyChoices {
         fn answer<'a>(&'a self, question: &'a Question) -> AnswerFuture<'a> {
-            Box::pin(async move { question.choices.first().cloned() })
+            Box::pin(async move { question.choices.first().map(|c| c.label.clone()) })
         }
     }
 

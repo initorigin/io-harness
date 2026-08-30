@@ -368,6 +368,41 @@ pub const TODO_WRITE_TOOL: &str = "todo_write";
 /// assert_eq!(ASK_QUESTION_TOOL, "ask_question");
 /// ```
 pub const ASK_QUESTION_TOOL: &str = "ask_question";
+/// The name the model uses to ask several **independent** questions at once (0.72.0).
+///
+/// [`ASK_QUESTION_TOOL`] is unchanged and is still the right tool for one question.
+/// This one exists because `Responder::answer` takes one question and blocks, so a
+/// model that needed five facts spent five round trips and an interface downstream
+/// could only render what reached it — one question at a time. It cannot batch what
+/// arrives serially.
+///
+/// The batch is for facts that do not depend on each other. Questions whose answers
+/// depend on one another belong in separate calls: an operator cannot answer question
+/// two before question one, and a batch that asks them together gets a guess.
+///
+/// ```
+/// use io_harness::ASK_QUESTIONS_TOOL;
+///
+/// assert_eq!(ASK_QUESTIONS_TOOL, "ask_questions");
+/// ```
+pub const ASK_QUESTIONS_TOOL: &str = "ask_questions";
+/// The most questions one [`ASK_QUESTIONS_TOOL`] call may carry.
+///
+/// Capped and *told*, following `todo_write` rather than truncating silently — the
+/// number is in the tool's own description so the model reads it before it sends
+/// rather than only in the error afterwards. Ten is what one terminal overlay can
+/// plausibly present with its context lines still readable.
+pub(crate) const QUESTIONS_MAX: usize = 10;
+/// The most lines a [`Choice`](crate::Choice)'s preview may carry.
+///
+/// A preview is a snippet, not a document. The bound exists because this value is
+/// rendered inside a terminal viewport by every consumer and is written by a model, so
+/// a harness that accepted an unbounded block would have moved the problem to each of
+/// them.
+pub(crate) const PREVIEW_MAX_LINES: usize = 12;
+/// The most bytes a [`Choice`](crate::Choice)'s preview may carry, whichever bound is
+/// reached first. Cut at a line boundary, never mid-word.
+pub(crate) const PREVIEW_MAX_BYTES: usize = 800;
 /// The tool the agent proposes a plan with, offered only while a
 /// [`PlanGate`](crate::PlanGate) is registered and unsatisfied (0.31.0).
 ///

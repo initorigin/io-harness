@@ -26,6 +26,79 @@ notes are produced from it.
 
 ### Security
 
+## [0.72.0] - 2026-08-30
+
+An agent can ask everything it needs in one breath, and each offer can explain
+itself. `ask_question` took one question and the run blocked inside
+`Responder::answer` before the model could ask a second, so a model that needed
+five facts spent five round trips and an interface downstream could not gather
+them into one surface — it can only render what reaches it, and they reached it
+one at a time. A choice was a bare `String`, so an operator picked between five
+labels with nothing saying what any of them cost. Both are the same gap: the
+harness recorded what was asked and almost nothing about what was offered.
+
+### Breaking changes
+
+- **BREAKING (source)** — `Question::choices` is now `Vec<Choice>` rather than
+  `Vec<String>`, and `Question` is `#[non_exhaustive]`.
+
+  *Migration:* a caller *building* choices needs no change at all:
+  `with_choices(["a", "b"])` still compiles and means what it did, through
+  `From<&str> for Choice`. A caller *reading* them adapts by `.label` —
+  `question.choices.first().cloned()` becomes
+  `question.choices.first().map(|c| c.label.clone())`, and
+  `assert_eq!(q.choices, ["a", "b"])` becomes a comparison over
+  `q.choices.iter().map(|c| c.label.as_str())`. A caller constructing `Question`
+  with a struct literal moves to `Question::new` plus the builders, which is what
+  `#[non_exhaustive]` now requires.
+
+  **No data migration.** Every `pending_questions` row written by 0.71.0 and
+  earlier holds `choices` as a JSON array of plain strings, and `Choice`'s
+  deserializer reads both spellings — a string becomes a label with no
+  description, an object is read by field. `CHECKPOINT_FORMAT` stays 7, the two
+  new columns are nullable, and a 0.71.0 binary still opens and resumes a store
+  0.72.0 wrote. Both directions are proven against a real 0.71.0 from crates.io
+  rather than asserted.
+
+### Added
+
+- **`Choice`** — an offered option as a label plus an optional `description` (one
+  sentence naming what taking it means) and an optional `preview` (a short
+  concrete block showing what it would actually do). A preview is bounded at
+  twelve lines or eight hundred bytes, cut at a line boundary with the model told
+  what was cut, and stripped of control characters and escape sequences — a model
+  writes this value and every consumer draws it into a terminal.
+- **`Question::multiple`** and the `Question::multiple()` builder — whether more
+  than one of the offers may be taken. An offer of several, not a demand for
+  several; default `false`, so every existing question keeps its meaning. A
+  `multiple` question with no choices is a parse error.
+- **`Question::answer_of`** — one spelling for a several-part answer, stated by
+  the harness rather than by each interface, so two interfaces answering the same
+  question produce the same text. The answer stays a `String`.
+- **`ask_questions`** — a second built-in tool taking an array of question
+  objects, parsed strictly per index with the failing index named, at most ten per
+  call. `ask_question` is unchanged and is still the right tool for one question;
+  questions whose answers depend on each other belong in separate calls.
+- **`Responder::answer_all`** and **`AnswersFuture`** — a second trait method with
+  a default body that loops `answer` in order, so the trait stays dyn-compatible
+  and no existing implementor changes. An interface that wants one overlay for
+  five questions overrides it; `StdinResponder` does, printing the whole batch
+  before reading the first answer.
+- **`EventKind::QuestionsAsked`** — one event carrying the whole batch, so an
+  observer can tell three questions asked together from three asked in sequence.
+  `QuestionAsked` is not also emitted for a batch; `QuestionAnswered` stays
+  singular and is emitted once per answer.
+- **`Store::put_questions`**, and two nullable JSON columns on
+  `pending_questions`, so a batch is one durable row.
+
+### Changed
+
+- A batched ask parks the run exactly as a single one does: one row, one
+  `question_id`, one `RunOutcome::AwaitingAnswer`, one `Waiting::Question`, and
+  the same four `resume_*_with_answer` functions with the signatures they have.
+  The row's question text is the whole ask rather than the first of it, so a
+  reader that predates batching still sees all of it.
+
 ## [0.71.0] - 2026-08-29
 
 The crate answers for its own schema, and stops answering with the operator's
