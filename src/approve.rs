@@ -1146,8 +1146,11 @@ pub type AnswerFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send +
 /// assert_eq!(answers.len(), 2);
 /// assert!(answers.iter().all(Option::is_none));
 ///
-/// // The alias names the future that produced them.
-/// let _: fn(&ResponderNone, &[Question]) -> AnswersFuture<'_> = |r, qs| r.answer_all(qs);
+/// // The alias names the future that produced them, and is what an override returns.
+/// fn batched<'a>(r: &'a ResponderNone, qs: &'a [Question]) -> AnswersFuture<'a> {
+///     r.answer_all(qs)
+/// }
+/// assert_eq!(rt.block_on(batched(&ResponderNone, &batch)).len(), 2);
 /// ```
 pub type AnswersFuture<'a> = Pin<Box<dyn Future<Output = Vec<Option<String>>> + Send + 'a>>;
 

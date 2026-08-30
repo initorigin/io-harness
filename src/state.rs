@@ -2115,7 +2115,10 @@ fn turn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
 /// // Unanswered, and readable by whatever process is going to answer it.
 /// let q = store.question(id)?.expect("just written");
 /// assert!(!q.resolved && q.answer.is_none());
-/// assert_eq!(q.choices, ["io.toml", "io.local.toml"]);
+/// // `choices` is a `Vec<Choice>` since 0.72.0, so an offer can carry a sentence
+/// // saying what it means. Read the label to compare against a bare string.
+/// let labels: Vec<&str> = q.choices.iter().map(|c| c.label.as_str()).collect();
+/// assert_eq!(labels, ["io.toml", "io.local.toml"]);
 ///
 /// store.answer_question(id, "io.local.toml", "human")?;
 /// let q = store.question(id)?.unwrap();
