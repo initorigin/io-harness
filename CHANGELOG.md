@@ -42,7 +42,7 @@ harness recorded what was asked and almost nothing about what was offered.
 - **BREAKING (source)** — `Question::choices` is now `Vec<Choice>` rather than
   `Vec<String>`, and `Question` is `#[non_exhaustive]`.
 
-  **Migration.** A caller *building* choices needs no change at all:
+  *Migration:* a caller *building* choices needs no change at all:
   `with_choices(["a", "b"])` still compiles and means what it did, through
   `From<&str> for Choice`. A caller *reading* them adapts by `.label` —
   `question.choices.first().cloned()` becomes
