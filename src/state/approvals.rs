@@ -179,15 +179,78 @@ impl Store {
         step: u32,
         q: &crate::approve::Question,
     ) -> Result<i64> {
+        self.insert_question(run_id, step, q, None)
+    }
+
+    /// Persist a whole batch as **one** parked question, and return its id (0.72.0).
+    ///
+    /// One row, so the resume surface does not grow a plural half:
+    /// [`RunOutcome::AwaitingAnswer`](crate::RunOutcome::AwaitingAnswer),
+    /// [`Waiting::Question`](crate::Waiting::Question),
+    /// [`Attach::answer_question`](crate::Attach::answer_question) and the four
+    /// `resume_*_with_answer` functions keep the signatures they have. The row's
+    /// `question` column is the batch rendered as one text, so a human reading
+    /// `pending_questions` — or answering through a resume, which supplies one string
+    /// — sees the whole ask rather than the first of it.
+    ///
+    /// An empty batch is a caller's bug and is refused rather than parking a row
+    /// nobody can answer.
+    ///
+    /// ```
+    /// use io_harness::{Question, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// let batch = [Question::new("which database?"), Question::new("which port?")];
+    /// let id = store.put_questions(run_id, 2, &batch)?;
+    ///
+    /// let row = store.question(id)?.unwrap();
+    /// assert_eq!(row.questions.len(), 2);
+    /// assert!(row.question.contains("which port?"), "the whole ask is readable: {}", row.question);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn put_questions(
+        &self,
+        run_id: i64,
+        step: u32,
+        questions: &[crate::approve::Question],
+    ) -> Result<i64> {
+        let Some(first) = questions.first() else {
+            return Err(Error::Resume {
+                reason: "a batch with no questions is not an ask".to_string(),
+            });
+        };
+        // The batch as one question, so every reader that predates batching — a
+        // resume, an audit of the table, an attached process — sees all of it.
+        let mut rendered = String::new();
+        for (i, q) in questions.iter().enumerate() {
+            rendered.push_str(&format!("{}. {}\n", i + 1, q.question));
+        }
+        let mut row = crate::approve::Question::new(rendered.trim_end());
+        row.context = first.context.clone();
+        self.insert_question(run_id, step, &row, Some(questions))
+    }
+
+    /// The one INSERT, so the singular and the batch cannot drift in what they write.
+    fn insert_question(
+        &self,
+        run_id: i64,
+        step: u32,
+        q: &crate::approve::Question,
+        batch: Option<&[crate::approve::Question]>,
+    ) -> Result<i64> {
         let choices = if q.choices.is_empty() {
             None
         } else {
             Some(serde_json::to_string(&q.choices).unwrap_or_default())
         };
+        let questions = batch.map(|b| serde_json::to_string(b).unwrap_or_default());
         self.conn.execute(
-            "INSERT INTO pending_questions (run_id, step, question, context, choices)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![run_id, step, q.question, q.context, choices],
+            "INSERT INTO pending_questions (run_id, step, question, context, choices, questions)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![run_id, step, q.question, q.context, choices, questions],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -195,7 +258,7 @@ impl Store {
     /// Read one question by id, answered or not.
     pub fn question(&self, question_id: i64) -> Result<Option<PendingQuestion>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, step, question, context, choices, answer, answered_by, resolved
+            "SELECT id, run_id, step, question, context, choices, answer, answered_by, resolved, questions, answers
              FROM pending_questions WHERE id = ?1",
         )?;
         let mut rows = stmt.query([question_id])?;
@@ -220,7 +283,7 @@ impl Store {
         question: &str,
     ) -> Result<Option<PendingQuestion>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, step, question, context, choices, answer, answered_by, resolved
+            "SELECT id, run_id, step, question, context, choices, answer, answered_by, resolved, questions, answers
              FROM pending_questions
              WHERE run_id = ?1 AND step = ?2 AND question = ?3 AND resolved = 1
              ORDER BY id DESC LIMIT 1",
@@ -283,10 +346,45 @@ impl Store {
         }
     }
 
+    /// Record a batch's per-question answers and mark the row resolved (0.72.0).
+    ///
+    /// The same single conditional `UPDATE` [`Self::answer_question`] is, for the same
+    /// reason: an answer set is all of it or none of it, which is what a submitted form
+    /// means, and what keeps the compare-and-swap a compare-and-swap when a second
+    /// process is answering the same live run. Returns whether *this* call is the one
+    /// that answered it.
+    ///
+    /// `assembled` is what the model reads; `answers` is the per-question breakdown an
+    /// interface draws beside each question. A resume writes only the former, because a
+    /// human resuming a run supplies one text — see [`Self::answer_question`].
+    pub(crate) fn answer_questions(
+        &self,
+        question_id: i64,
+        assembled: &str,
+        answers: &[Option<String>],
+        by: &str,
+    ) -> Result<bool> {
+        let answers = serde_json::to_string(answers).unwrap_or_default();
+        let changed = self.conn.execute(
+            "UPDATE pending_questions SET answer = ?2, answers = ?3, answered_by = ?4, resolved = 1
+             WHERE id = ?1 AND resolved = 0",
+            rusqlite::params![question_id, assembled, answers, by],
+        )?;
+        if changed == 1 {
+            return Ok(true);
+        }
+        match self.question(question_id)? {
+            None => Err(Error::Resume {
+                reason: format!("no question {question_id} to answer"),
+            }),
+            Some(_) => Ok(false),
+        }
+    }
+
     /// Every question asked on a run, in the order they were asked.
     pub fn questions(&self, run_id: i64) -> Result<Vec<PendingQuestion>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, step, question, context, choices, answer, answered_by, resolved
+            "SELECT id, run_id, step, question, context, choices, answer, answered_by, resolved, questions, answers
              FROM pending_questions WHERE run_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map([run_id], question_row)?;
