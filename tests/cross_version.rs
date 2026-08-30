@@ -291,11 +291,17 @@ fn is_added_since_0_22_0(stmt: &str) -> bool {
 /// had no addresses, where a nullable column would make every reader decide
 /// separately what `NULL` meant. A 0.29.0 binary selects the columns it knows by
 /// name and never sees it.
+/// 0.72.0 adds the fifth: `pending_questions` gains `questions` and `answers`, so a
+/// batched ask is one durable row rather than a plural resume surface. Both nullable
+/// and both NULL for every row any earlier release wrote, which is what a singular ask
+/// still writes today. A 0.71.0 binary names neither — `tests/cross_version_0_71_0.rs`
+/// has a real one read a store this release wrote rather than asserting it on paper.
 const COLUMNS_ADDED_SINCE_0_22_0: &[(&str, &[&str])] = &[
     ("memory", &["kind TEXT", "pinned INTEGER"]),
     ("runs", &["turn_kind TEXT"]),
     ("edits", &["hunk TEXT"]),
     ("spawns", &["as_name TEXT NOT NULL DEFAULT ''"]),
+    ("pending_questions", &["questions TEXT", "answers TEXT"]),
 ];
 
 /// Whether `new` is `old` with exactly the declared columns added, and nothing

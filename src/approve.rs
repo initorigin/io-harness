@@ -785,17 +785,20 @@ mod tests {
 /// assert_eq!(described.description.as_deref(), Some("Gitignored, so the change stays on this machine."));
 /// assert!(described.preview.is_some());
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Choice {
     /// The option itself, as an operator reads it and as an answer spells it.
     pub label: String,
     /// One sentence saying what taking this option means. `None` when the label
     /// speaks for itself.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Omitted from the serialized form when `None`, exactly as `PlanStep::agent` is —
+    /// though by the hand-written `Serialize` below rather than by
+    /// `skip_serializing_if`, because a `Choice` with neither optional field is written
+    /// as a bare string and has no fields to skip.
     pub description: Option<String>,
     /// A short concrete block showing what taking it would do. `None` when there is
     /// nothing to show, which is most of the time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
 }
 
@@ -875,6 +878,50 @@ impl From<&str> for Choice {
 /// let new: Choice = serde_json::from_str(r#"{"label": "a", "description": "the first"}"#).unwrap();
 /// assert_eq!(new.description.as_deref(), Some("the first"));
 /// ```
+/// Writes the **plain** spelling when there is nothing extra to say, and that is a
+/// compatibility guarantee rather than a formatting preference.
+///
+/// A derived `Serialize` would write `{"label": "yes"}` for every offer, including one
+/// carrying neither optional field — so a store this release wrote would hand a 0.71.0
+/// binary, whose column type is `Vec<String>`, JSON it cannot parse, and **every**
+/// question in it would read back with no offers at all. Not only described ones: all
+/// of them. The cross-version test caught exactly that.
+///
+/// So a bare label round-trips as a bare label, byte for byte as 0.71.0 wrote it, and
+/// only an offer that actually carries a description or a preview costs an older reader
+/// its offers — which is the narrowest the loss can be made.
+///
+/// ```
+/// use io_harness::Choice;
+///
+/// // Nothing extra to say: the 0.71.0 spelling, which an older binary can still read.
+/// assert_eq!(serde_json::to_string(&Choice::new("yes")).unwrap(), r#""yes""#);
+///
+/// // Something to say: the object spelling, because there is nowhere else to put it.
+/// let described = serde_json::to_string(&Choice::new("yes").describe("keep it")).unwrap();
+/// assert!(described.starts_with('{'), "{described}");
+/// ```
+impl serde::Serialize for Choice {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        if self.description.is_none() && self.preview.is_none() {
+            return serializer.serialize_str(&self.label);
+        }
+        let mut out = serializer.serialize_struct("Choice", 3)?;
+        out.serialize_field("label", &self.label)?;
+        if let Some(description) = &self.description {
+            out.serialize_field("description", description)?;
+        }
+        if let Some(preview) = &self.preview {
+            out.serialize_field("preview", preview)?;
+        }
+        out.end()
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for Choice {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where

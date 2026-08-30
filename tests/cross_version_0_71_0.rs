@@ -232,15 +232,25 @@ fn a_current_store_is_read_by_a_0_71_0_binary() {
     let rows = seen["runs"][0]["questions"].as_array().unwrap();
     assert_eq!(rows.len(), 3, "0.71.0 must see all three rows: {rows:#?}");
 
-    // The described ask. Its text and its answer survive; only the offers are opaque
-    // to a reader whose type for them is `Vec<String>`.
+    // The described ask, and the ONE thing a 0.71.0 reader loses. Its text, its answer
+    // and its attribution survive; the offers are opaque, because a described choice
+    // has nowhere to live in a `Vec<String>` and this release will not write a lie into
+    // the column to pretend otherwise.
     assert_eq!(rows[0]["question"], "Which config should I edit?");
     assert_eq!(rows[0]["answer"], "io.toml");
     assert_eq!(rows[0]["answered_by"], "human");
     assert_eq!(rows[0]["resolved"], true);
+    assert_eq!(
+        rows[0]["choices"],
+        serde_json::json!([]),
+        "a described offer is the one thing an older reader cannot see"
+    );
 
-    // The plain ask is fully legible, which is the half that matters: a 0.72.0 store
-    // is not wholesale unreadable to the previous release.
+    // The plain ask is FULLY legible, and this is the assertion that earns its keep.
+    // A derived `Serialize` on `Choice` writes `{{\"label\": \"yes\"}}` for a bare label
+    // too, and this row then read back as `[]` — every offer in every question lost to
+    // a 0.71.0 binary, not merely the described ones. `Choice` serializes a bare label
+    // as a bare string precisely so this row survives.
     assert_eq!(rows[1]["question"], "Keep it?");
     assert_eq!(rows[1]["choices"], serde_json::json!(["yes", "no"]));
 
