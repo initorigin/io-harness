@@ -1,0 +1,115 @@
+{
+  "composition": [
+    {
+      "answer": null,
+      "answered_by": null,
+      "choices": [
+        "io.toml",
+        "io.local.toml"
+      ],
+      "context": "There is a committed io.toml and a gitignored io.local.toml.",
+      "id": 1,
+      "question": "Which config should I edit?",
+      "resolved": false,
+      "step": 2
+    },
+    {
+      "answer": "keep it",
+      "answered_by": "human",
+      "choices": [
+        "drop it",
+        "keep it"
+      ],
+      "context": null,
+      "id": 2,
+      "question": "Should the old column be dropped or kept?",
+      "resolved": true,
+      "step": 5
+    },
+    {
+      "answer": "a lexer bug",
+      "answered_by": "responder",
+      "choices": [],
+      "context": "Nothing in the diff explains it.",
+      "id": 3,
+      "question": "Why did the parser change?",
+      "resolved": true,
+      "step": 7
+    },
+    {
+      "answer": null,
+      "answered_by": null,
+      "choices": [
+        "Linux, and the BSDs",
+        "Windows (\"NT\")"
+      ],
+      "context": null,
+      "id": 4,
+      "question": "Which platforms?",
+      "resolved": false,
+      "step": 9
+    }
+  ],
+  "provider": "fixture-provider",
+  "read_back": [
+    {
+      "answer": null,
+      "answered_by": null,
+      "choices": [
+        "io.toml",
+        "io.local.toml"
+      ],
+      "context": "There is a committed io.toml and a gitignored io.local.toml.",
+      "id": 1,
+      "question": "Which config should I edit?",
+      "resolved": false,
+      "run_id": 1,
+      "step": 2
+    },
+    {
+      "answer": "keep it",
+      "answered_by": "human",
+      "choices": [
+        "drop it",
+        "keep it"
+      ],
+      "context": null,
+      "id": 2,
+      "question": "Should the old column be dropped or kept?",
+      "resolved": true,
+      "run_id": 1,
+      "step": 5
+    },
+    {
+      "answer": "a lexer bug",
+      "answered_by": "responder",
+      "choices": [],
+      "context": "Nothing in the diff explains it.",
+      "id": 3,
+      "question": "Why did the parser change?",
+      "resolved": true,
+      "run_id": 1,
+      "step": 7
+    },
+    {
+      "answer": null,
+      "answered_by": null,
+      "choices": [
+        "Linux, and the BSDs",
+        "Windows (\"NT\")"
+      ],
+      "context": null,
+      "id": 4,
+      "question": "Which platforms?",
+      "resolved": false,
+      "run_id": 1,
+      "step": 9
+    }
+  ],
+  "run_id": 1,
+  "unanswered_ids": [
+    1,
+    4
+  ],
+  "writer": "io-harness 0.71.0"
+}

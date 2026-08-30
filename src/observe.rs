@@ -495,6 +495,21 @@ pub enum EventKind {
         /// choices; an answer is not obliged to be one of them.
         choices: Vec<String>,
     },
+    /// The agent asked several questions **together**, in one call (0.72.0).
+    ///
+    /// A fact the stream could not previously carry. Three questions asked as a batch
+    /// and three asked in sequence produced the same three
+    /// [`QuestionAsked`](EventKind::QuestionAsked) events, so an interface could not
+    /// tell a form from a corridor — which is exactly the difference it has to render.
+    ///
+    /// [`QuestionAsked`](EventKind::QuestionAsked) is **not** also emitted for a batch,
+    /// and [`QuestionAnswered`](EventKind::QuestionAnswered) still is, once per answer:
+    /// an answer is an independent fact and a UI shows each one beside its own question.
+    QuestionsAsked {
+        /// Every question of the batch, in the order the agent asked them, with the
+        /// offers each one carried.
+        questions: Vec<crate::approve::Question>,
+    },
     /// The question was answered and the run went on (0.21.0).
     ///
     /// Emitted whether a `Responder` in this process answered or a human did after a
@@ -1256,6 +1271,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "memory_forgot",
     "todo_wrote",
     "question_asked",
+    "questions_asked",
     "question_answered",
     "plan_proposed",
     "plan_decided",
@@ -1904,6 +1920,12 @@ mod tests {
                 question: "which database?".into(),
                 choices: vec!["sqlite".into(), "postgres".into()],
             },
+            // 0.72.0. In the vector in the same commit as the variant, which is the
+            // lesson the three above cost seven releases to learn.
+            EventKind::QuestionsAsked {
+                questions: vec![crate::approve::Question::new("which database?")
+                    .with_choices([crate::approve::Choice::new("sqlite").describe("bundled")])],
+            },
             EventKind::QuestionAnswered {
                 answer: "sqlite".into(),
                 by: "human".into(),
@@ -1973,6 +1995,7 @@ mod tests {
                 | EventKind::Token { .. }
                 | EventKind::TodoWrote { .. }
                 | EventKind::QuestionAsked { .. }
+                | EventKind::QuestionsAsked { .. }
                 | EventKind::QuestionAnswered { .. }
                 | EventKind::PlanProposed { .. }
                 | EventKind::PlanDecided { .. }

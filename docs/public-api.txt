@@ -46,6 +46,7 @@ async_fn run_tree_observed src/run.rs
 async_fn run_with src/run.rs
 async_fn run_with_observed src/run.rs
 const ASK_QUESTION_TOOL src/tools/mod.rs
+const ASK_QUESTIONS_TOOL src/tools/mod.rs
 const BUSY_TIMEOUT src/state.rs
 const CHECKPOINT_FORMAT src/state.rs
 const DEFAULT_EXEC_TIMEOUT src/tools/exec.rs
@@ -137,6 +138,7 @@ struct AssistantTurn src/state.rs
 struct Attach src/attach.rs
 struct Broadcast src/observe.rs
 struct ChangeReview src/verify.rs
+struct Choice src/approve.rs
 struct BrowserConfig src/browser.rs
 struct CheckpointEvent src/state.rs
 struct Citation src/web.rs
@@ -256,6 +258,7 @@ trait Reviewer src/verify.rs
 trait Sandbox src/sandbox.rs
 trait Tool src/tools/custom.rs
 type AnswerFuture src/approve.rs
+type AnswersFuture src/approve.rs
 type PlanReview src/approve.rs
 type Result src/error.rs
 type Reviewing src/verify.rs

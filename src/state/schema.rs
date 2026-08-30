@@ -481,9 +481,27 @@ impl Store {
                  answer      TEXT,
                  answered_by TEXT,
                  resolved    INTEGER NOT NULL DEFAULT 0,
-                 asked_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                 asked_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                 questions   TEXT,
+                 answers     TEXT
              );",
         )?;
+
+        // 0.72.0 — a batched ask is ONE parked question, so the resume surface does
+        // not grow a plural half: `questions` holds the whole batch and `answers` the
+        // per-question replies, both NULL for a singular ask. The other half of the
+        // two-part additive idiom this crate has used since 0.13.0 — the `CREATE
+        // TABLE` above covers a fresh store, and `let _ =` swallows the error a store
+        // that already has the table raises for a column it already has.
+        //
+        // Deliberately NOT a `CHECKPOINT_FORMAT` bump: no checkpoint layout changed,
+        // and bumping it would make [`Store::check_resumable`] refuse every store
+        // 0.71.0 wrote over two columns a 0.71.0 binary never queries.
+        let _ = conn.execute(
+            "ALTER TABLE pending_questions ADD COLUMN questions TEXT",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE pending_questions ADD COLUMN answers TEXT", []);
 
         // 0.22.0 — provider-executed web search and fetch. Two more additive
         // tables and, for the same reasons as the two above, NOT a

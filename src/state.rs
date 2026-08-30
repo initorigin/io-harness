@@ -2115,7 +2115,10 @@ fn turn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
 /// // Unanswered, and readable by whatever process is going to answer it.
 /// let q = store.question(id)?.expect("just written");
 /// assert!(!q.resolved && q.answer.is_none());
-/// assert_eq!(q.choices, ["io.toml", "io.local.toml"]);
+/// // `choices` is a `Vec<Choice>` since 0.72.0, so an offer can carry a sentence
+/// // saying what it means. Read the label to compare against a bare string.
+/// let labels: Vec<&str> = q.choices.iter().map(|c| c.label.as_str()).collect();
+/// assert_eq!(labels, ["io.toml", "io.local.toml"]);
 ///
 /// store.answer_question(id, "io.local.toml", "human")?;
 /// let q = store.question(id)?.unwrap();
@@ -2148,8 +2151,21 @@ pub struct PendingQuestion {
     /// What the agent already knew, if it said.
     pub context: Option<String>,
     /// Options the agent offered. An answer need not be one of them.
-    pub choices: Vec<String>,
-    /// The answer, once there is one.
+    ///
+    /// [`Choice`](crate::Choice) since 0.72.0. A row written by 0.71.0 holds these as
+    /// a JSON array of plain strings and reads back as labels with no description —
+    /// the deserializer accepts both spellings, which is what lets an existing store
+    /// load without a migration.
+    pub choices: Vec<crate::approve::Choice>,
+    /// Every question of a batched ask, when this row is one (0.72.0). Empty for the
+    /// singular `ask_question`, whose one question is [`Self::question`].
+    pub questions: Vec<crate::approve::Question>,
+    /// The per-question answers of a batched ask, in the order of
+    /// [`Self::questions`]. Empty until the batch is answered, and empty for an
+    /// answer that arrived through a resume — that one is the assembled
+    /// [`Self::answer`], because a human resuming a run supplies one text.
+    pub answers: Vec<Option<String>>,
+    /// The answer, once there is one. For a batch, the assembled reply the model reads.
     pub answer: Option<String>,
     /// `"responder"` if a [`Responder`](crate::Responder) in the run's own process
     /// answered, `"human"` if the answer arrived through a resume after a pause.
@@ -2162,19 +2178,28 @@ pub struct PendingQuestion {
 /// Read one `pending_questions` row. One place, so the three queries that read the
 /// table cannot drift in their column order.
 fn question_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PendingQuestion> {
-    let choices: Option<String> = r.get(5)?;
+    /// A nullable JSON column, or the empty value when it is NULL or unreadable.
+    fn json<T: serde::de::DeserializeOwned + Default>(
+        r: &rusqlite::Row<'_>,
+        at: usize,
+    ) -> rusqlite::Result<T> {
+        let raw: Option<String> = r.get(at)?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default())
+    }
     Ok(PendingQuestion {
         id: r.get(0)?,
         run_id: r.get(1)?,
         step: r.get(2)?,
         question: r.get(3)?,
         context: r.get(4)?,
-        choices: choices
-            .and_then(|c| serde_json::from_str(&c).ok())
-            .unwrap_or_default(),
+        choices: json(r, 5)?,
         answer: r.get(6)?,
         answered_by: r.get(7)?,
         resolved: r.get::<_, i64>(8)? != 0,
+        questions: json(r, 9)?,
+        answers: json(r, 10)?,
     })
 }
 

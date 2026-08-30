@@ -332,6 +332,185 @@ pub(super) fn parse_plan(
     Ok(Plan::new(steps))
 }
 
+/// Read one offered choice, in either spelling, or say what was wrong with it.
+///
+/// A JSON string is a bare label; an object is read by field. Strict for the reason
+/// [`parse_plan`] is: this is what an operator is about to be shown, and a malformed
+/// offer the crate silently dropped would be answered on false terms.
+fn parse_choice(raw: &serde_json::Value, at: &str) -> std::result::Result<Choice, String> {
+    if let Some(label) = raw.as_str() {
+        return match label.trim().is_empty() {
+            // The rule `parse_plan` already holds for an empty `intent`, rather than a
+            // second rule invented for the same shape.
+            true => Err(format!("{at} has an empty label")),
+            false => Ok(Choice::new(label.trim())),
+        };
+    }
+    let object = raw
+        .as_object()
+        .ok_or_else(|| format!("{at} must be a string or a {{label, description?}} object"))?;
+    let label = object
+        .get("label")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .ok_or_else(|| format!("{at} needs a non-empty `label`"))?;
+    let mut choice = Choice::new(label);
+    if let Some(description) = object
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        choice = choice.describe(description);
+    }
+    if let Some(preview) = object
+        .get("preview")
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.trim().is_empty())
+    {
+        choice = choice.preview(bound_preview(preview));
+    }
+    Ok(choice)
+}
+
+/// Cut an over-long preview at a line boundary, and say so in the text itself.
+///
+/// `todo_write`'s cap-and-tell idiom rather than a silent trim: the model wrote this
+/// and gets to see that it was cut. Never mid-word, because every consumer draws it
+/// into a terminal viewport. Control characters and escape sequences go too — this
+/// value is written by a model and rendered by a terminal, which is the pair that
+/// makes an unfiltered escape a real problem rather than a cosmetic one.
+fn bound_preview(preview: &str) -> String {
+    let clean: String = preview
+        .lines()
+        .map(|line| {
+            line.chars()
+                .filter(|c| !c.is_control() && *c != '\u{9b}')
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut kept = String::new();
+    let mut cut = false;
+    for (i, line) in clean.lines().enumerate() {
+        if i >= PREVIEW_MAX_LINES || kept.len() + line.len() + 1 > PREVIEW_MAX_BYTES {
+            cut = true;
+            break;
+        }
+        if i > 0 {
+            kept.push('\n');
+        }
+        kept.push_str(line);
+    }
+    if cut {
+        kept.push_str(&format!(
+            "\n[preview cut: at most {PREVIEW_MAX_LINES} lines or {PREVIEW_MAX_BYTES} bytes]"
+        ));
+    }
+    kept
+}
+
+/// Read one question object — the shape both question tools share.
+fn parse_question(raw: &serde_json::Value, at: &str) -> std::result::Result<Question, String> {
+    let text = raw
+        .get("question")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .ok_or_else(|| format!("{at} needs a non-empty `question`"))?;
+    let mut question = Question::new(text);
+    if let Some(context) = raw
+        .get("context")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        question = question.with_context(context);
+    }
+    if let Some(list) = raw.get("choices") {
+        let list = list
+            .as_array()
+            .ok_or_else(|| format!("{at}: `choices` must be a list"))?;
+        let mut choices = Vec::with_capacity(list.len());
+        for (i, choice) in list.iter().enumerate() {
+            choices.push(parse_choice(choice, &format!("{at}, choice {}", i + 1))?);
+        }
+        question = question.with_choices(choices);
+    }
+    if raw.get("multiple").and_then(|v| v.as_bool()) == Some(true) {
+        // There is nothing to take more than one of. Refused rather than accepted
+        // and ignored, because a UI that trusts the flag would draw checkboxes over
+        // an empty list.
+        if question.choices.is_empty() {
+            return Err(format!("{at} says `multiple` but offers no `choices`"));
+        }
+        question = question.multiple();
+    }
+    Ok(question)
+}
+
+/// Read one question out of an `ask_question` argument object (0.72.0).
+///
+/// The singular tool gained described choices and `multiple` in 0.72.0 and nothing
+/// else. It shares [`parse_question`] with the batch so the two tools cannot disagree
+/// about what an offer is.
+pub(super) fn parse_one_question(
+    args: &serde_json::Value,
+) -> std::result::Result<Question, String> {
+    parse_question(args, "the question")
+}
+
+/// Read an `ask_questions` argument object into the batch, or say what was wrong.
+///
+/// Strict **per index**, with the failing index named, exactly as [`parse_plan`] is
+/// for steps: an operator about to answer five questions must be answering the five
+/// that were asked.
+pub(super) fn parse_questions(
+    args: &serde_json::Value,
+) -> std::result::Result<Vec<Question>, String> {
+    let list = args
+        .get("questions")
+        .ok_or_else(|| "`questions` is required: send the whole ask as a list".to_string())?
+        .as_array()
+        .ok_or_else(|| "`questions` must be a list of question objects".to_string())?;
+    if list.is_empty() {
+        return Err(
+            "an ask with no questions is not an ask; say what you need to know".to_string(),
+        );
+    }
+    if list.len() > QUESTIONS_MAX {
+        return Err(format!(
+            "{} questions is more than the {QUESTIONS_MAX} one ask may carry; \
+             send the ones you need to start with and ask the rest after",
+            list.len()
+        ));
+    }
+    let mut questions = Vec::with_capacity(list.len());
+    for (i, raw) in list.iter().enumerate() {
+        questions.push(parse_question(raw, &format!("question {}", i + 1))?);
+    }
+    Ok(questions)
+}
+
+/// The batch's answers as the one block the model reads.
+///
+/// Many in, one block out — `todo_write`'s precedent. Each answer is drawn beside the
+/// question it answers, because a bare list of five sentences is not readable as an
+/// answer set and the model would have to re-derive the pairing.
+pub(super) fn assemble_answers(questions: &[Question], answers: &[Option<String>]) -> String {
+    let mut out = String::new();
+    for (i, question) in questions.iter().enumerate() {
+        let answer = answers
+            .get(i)
+            .and_then(Option::as_deref)
+            .unwrap_or("(not answered)");
+        out.push_str(&format!("{}. {}\n   {answer}\n", i + 1, question.question));
+    }
+    out.trim_end().to_string()
+}
+
 pub(super) enum Dispatched {
     /// The call resolved; fold `obs` into the observation log and carry any
     /// rules an approver asked to remember.
