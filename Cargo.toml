@@ -41,20 +41,22 @@ categories = ["asynchronous", "api-bindings"]
 # guide pages, and a package that ships the links without the pages is worse
 # than one that ships neither.
 #
-# The four crates under `tests/fixtures/` are excluded because each is a
+# The five crates under `tests/fixtures/` are excluded because each is a
 # separate cargo package with its own manifest, and one of them deliberately
 # fails to resolve. They exist to be run from a git checkout by CI, never from
 # the published package. The fixtures they *produce* — the 0.22.0- and
 # 0.29.0-written databases under `tests/fixtures/store-0.22.0/` and
 # `tests/fixtures/store-0.29.0/` — are NOT excluded, because the two
 # cross-version test files read them and `cargo package` verifies the tests
-# compile.
+# compile. `tests/fixtures/store-0.71.0/` joins them in 0.72.0 for the same
+# reason.
 exclude = [
     ".ultraship",
     ".env",
     ".github",
     "tests/fixtures/gen-0.22.0",
     "tests/fixtures/gen-0.29.0",
+    "tests/fixtures/gen-0.71.0",
     "tests/fixtures/links-consumer",
     "tests/fixtures/throughput-0.22.0",
 ]

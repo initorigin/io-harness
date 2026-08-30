@@ -620,6 +620,52 @@ jobs:
           fi
           echo "still pinned to =0.29.0"
 
+  # The same job for 0.72.0's own boundary, and a second one rather than a step
+  # added to the first: the two pins are independent evidence about different
+  # schema changes, and folding them together would mean one crates.io outage
+  # taking out both claims. No dots in the job id — that is a parse-time failure
+  # of the whole workflow, which is a 0-second run and not a test failure.
+  cross-version-0-71-0:
+    name: cross-version-0.71.0 (0.71.0 reads a store this tree wrote)
+    runs-on: ubuntu-latest
+    # Compiles the previous release from crates.io with a bundled SQLite, then this
+    # tree's test binary. 20 minutes, in line with the other single-OS jobs.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # The pinned generator: `io-harness = "=0.71.0"` from crates.io, in its own
+      # workspace with its own target directory, so it never drags a second
+      # `libsqlite3-sys` into this crate's build.
+      - name: build the pinned 0.71.0 binary
+        working-directory: tests/fixtures/gen-0.71.0
+        run: cargo build
+      # `--ignored` because that test is ignored by default — it needs the binary the
+      # step above just produced, and a test that silently passes when its subject is
+      # missing is worse than one that is visibly not run.
+      - name: a 0.71.0 binary reads a store this tree wrote
+        run: cargo test --test cross_version_0_71_0 -- --ignored --exact a_current_store_is_read_by_a_0_71_0_binary
+      # The control. The generator is supposed to be the PREVIOUS release, and the one
+      # way this job quietly stops proving anything is that pin drifting to a version
+      # that already knows about the new columns. Checked here rather than trusted,
+      # because the failure is silent by construction.
+      - name: the generator is still pinned to 0.71.0
+        run: |
+          set -uo pipefail
+          if ! grep -q '^io-harness = "=0.71.0"$' tests/fixtures/gen-0.71.0/Cargo.toml; then
+            echo "::error::tests/fixtures/gen-0.71.0 is no longer pinned to =0.71.0."
+            echo "That pin is what makes this job evidence rather than a label:"
+            echo "with it drifted, the 'older binary' is not older and the"
+            echo "backwards-compatibility claim is unproven."
+            exit 1
+          fi
+          echo "still pinned to =0.71.0"
+
   # OP1 — the docs.rs build, reproduced. This job exists because of a defect no
   # other job in this file could see.
   #
