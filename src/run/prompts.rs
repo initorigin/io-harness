@@ -1046,6 +1046,28 @@ pub(super) fn write_document(
     }
 }
 
+/// The JSON schema of one offered choice, shared by both question tools.
+///
+/// One shape in one place: a model that learns `ask_question`'s offers already knows
+/// `ask_questions`'s, and the two cannot drift into a plain spelling beside a rich one.
+/// The string form is legal and is what a model that has nothing to add should send.
+fn choice_schema() -> serde_json::Value {
+    json!({
+        "anyOf": [
+            { "type": "string", "description": "Just the label." },
+            {
+                "type": "object",
+                "properties": {
+                    "label": { "type": "string", "description": "The option, as the operator reads it." },
+                    "description": { "type": "string", "description": "Optional: one sentence saying what taking this option means." },
+                    "preview": { "type": "string", "description": format!("Optional: a short concrete block showing what taking it would do — the config it writes, the command it runs. At most {PREVIEW_MAX_LINES} lines or {PREVIEW_MAX_BYTES} bytes; longer is cut at a line boundary and you are told.") }
+                },
+                "required": ["label"]
+            }
+        ]
+    })
+}
+
 pub(super) fn workspace_tools() -> Vec<ToolSpec> {
     #[allow(unused_mut)]
     let mut v = vec![
@@ -1291,16 +1313,51 @@ pub(super) fn workspace_tools() -> Vec<ToolSpec> {
                           the answer is no. Use it for intent: which of two files they meant, \
                           whether to keep or drop something, which behaviour is correct. Offer \
                           choices when you have them. Do not ask what you could find out by \
-                          looking."
+                          looking. For SEVERAL independent questions at once, use ask_questions \
+                          instead — one call, one answer set, one round trip."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "question": { "type": "string", "description": "The question, in one sentence." },
                     "context": { "type": "string", "description": "Optional: what you already established, so they can answer without re-deriving it." },
-                    "choices": { "type": "array", "items": { "type": "string" }, "description": "Optional options you are offering. The answer need not be one of them." }
+                    "choices": { "type": "array", "items": choice_schema(), "description": "Optional options you are offering. A choice is a plain string, or an object with a label and an optional description and preview. The answer need not be one of them." },
+                    "multiple": { "type": "boolean", "description": "Optional: true if more than one of the choices may be taken. An offer of several, not a demand for several. Requires choices." }
                 },
                 "required": ["question"]
+            }),
+        },
+        ToolSpec {
+            name: ASK_QUESTIONS_TOOL.to_string(),
+            description: format!(
+                "Ask the operator SEVERAL independent questions in one call, so they answer them \
+                 as one set instead of one at a time with a round trip between each. Same rules as \
+                 ask_question — it is about intent, never about permission, and the answers \
+                 authorize nothing. Use this when you need more than one fact before you can start \
+                 and none of the answers changes what the others mean. Questions whose answers \
+                 DEPEND on each other belong in separate ask_question calls: the operator cannot \
+                 answer the second before the first, and asking them together gets you a guess. \
+                 At most {QUESTIONS_MAX} questions per call."
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "description": format!("The whole ask, in order. At most {QUESTIONS_MAX}."),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": { "type": "string", "description": "One question, in one sentence." },
+                                "context": { "type": "string", "description": "Optional: what you already established for this question." },
+                                "choices": { "type": "array", "items": choice_schema(), "description": "Optional options you are offering for this question. The answer need not be one of them." },
+                                "multiple": { "type": "boolean", "description": "Optional: true if more than one of this question's choices may be taken. Requires choices." }
+                            },
+                            "required": ["question"]
+                        }
+                    }
+                },
+                "required": ["questions"]
             }),
         },
         ToolSpec {

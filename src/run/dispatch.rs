@@ -438,32 +438,25 @@ pub(super) async fn dispatch(
             // human something. Putting a permission rule in front of the channel
             // whose whole purpose is to ask would be a category error, and there is
             // no `Act` that means "ask about intent" — see `docs/CONTRACT.md`.
-            let Some(text) = s("question").map(str::trim).filter(|q| !q.is_empty()) else {
-                return Ok(Dispatched::go(
-                    "question error",
-                    "\n[question error] `question` is required and must not be empty\n",
-                ));
+            let question = match parse_one_question(a) {
+                Ok(q) => q,
+                Err(why) => {
+                    return Ok(Dispatched::go(
+                        "question error",
+                        format!("\n[question error] {why}\n"),
+                    ))
+                }
             };
-            let mut question = Question::new(text);
-            if let Some(context) = s("context").map(str::trim).filter(|c| !c.is_empty()) {
-                question = question.with_context(context);
-            }
-            if let Some(choices) = a.get("choices").and_then(|v| v.as_array()) {
-                question = question.with_choices(
-                    choices
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .map(str::to_string)
-                        .collect::<Vec<_>>(),
-                );
-            }
             watch.emit(RunEvent::at_depth(
                 run_id,
                 step,
                 depth,
                 EventKind::QuestionAsked {
                     question: question.question.clone(),
-                    choices: question.choices.clone(),
+                    // Labels, because this variant has carried labels since 0.21.0 and
+                    // changing its field type would break every observer matching on it
+                    // for a fact `QuestionsAsked` already carries in full.
+                    choices: question.choices.iter().map(|c| c.label.clone()).collect(),
                 },
             ));
             store.record_context_event(
@@ -536,6 +529,130 @@ pub(super) async fn dispatch(
                     // written: a run that had to guess would spend its budget
                     // pursuing something nobody asked for.
                     info!(run_id, step, question_id, "run paused for an answer");
+                    Dispatched::Ask { question_id }
+                }
+            }
+        }
+        ASK_QUESTIONS_TOOL => {
+            // Not gated, for the same reason the singular is not: putting a permission
+            // rule in front of the channel whose whole purpose is to ask would be a
+            // category error.
+            let questions = match parse_questions(a) {
+                Ok(q) => q,
+                Err(why) => {
+                    // Strictly an error back to the model, never the end of the run —
+                    // a malformed ask is something the model can send again.
+                    return Ok(Dispatched::go(
+                        "questions error",
+                        format!("\n[questions error] {why}\n"),
+                    ));
+                }
+            };
+            // One event carrying the batch, and NOT a `QuestionAsked` per question:
+            // "these were asked together" is the fact this variant exists to carry,
+            // and emitting both would make three-in-a-batch indistinguishable from
+            // three-in-sequence for any observer that watches the singular.
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::QuestionsAsked {
+                    questions: questions.clone(),
+                },
+            ));
+            store.record_context_event(
+                run_id,
+                &ContextEvent::question_asked(
+                    step,
+                    format!(
+                        "{} questions: {}",
+                        questions.len(),
+                        questions
+                            .iter()
+                            .map(|q| q.question.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    ),
+                ),
+            )?;
+
+            // One row, written BEFORE the responder is consulted, for the reason
+            // 0.33.0 gave for the singular: a run blocked in a `Responder` nobody is
+            // sitting in front of can be answered by a second process instead of
+            // killed. One row also keeps the resume surface singular.
+            let question_id = store.put_questions(run_id, step, &questions)?;
+            let raced = race_gate(responder.answer_all(&questions), store, |s| {
+                Ok(s.question(question_id)?.is_some_and(|q| q.resolved))
+            })
+            .await?;
+
+            // A batch is answered wholly or not at all. A responder that declined even
+            // one of them has not answered the ask, and the run parks on the row —
+            // which is what a submitted form means, and what keeps `answer_questions`
+            // a compare-and-swap.
+            if let Some(answers) = &raced {
+                if answers.len() == questions.len() && answers.iter().all(Option::is_some) {
+                    let assembled = assemble_answers(&questions, answers);
+                    store.answer_questions(question_id, &assembled, answers, "responder")?;
+                }
+            }
+            // Read the row back rather than using what we raced with, for the reason
+            // the singular does: the answer the model is handed must be the one the
+            // store holds, or an audit of `pending_questions` cannot be trusted.
+            let row = store.question(question_id)?.filter(|q| q.resolved);
+            let answered = row
+                .as_ref()
+                .and_then(|q| Some((q.answer.clone()?, q.answered_by.clone().unwrap_or_default())));
+
+            match answered {
+                Some((answer, by)) => {
+                    // Once per answer, because an answer is an independent fact and a
+                    // UI shows each one beside its own question. A resume supplies one
+                    // text and no breakdown, which is the row with an empty `answers`.
+                    let each = row.as_ref().map(|q| q.answers.clone()).unwrap_or_default();
+                    match each.iter().filter_map(Option::as_deref).count() {
+                        0 => watch.emit(RunEvent::at_depth(
+                            run_id,
+                            step,
+                            depth,
+                            EventKind::QuestionAnswered {
+                                answer: answer.clone(),
+                                by: by.clone(),
+                            },
+                        )),
+                        _ => {
+                            for one in each.iter().filter_map(Option::as_deref) {
+                                watch.emit(RunEvent::at_depth(
+                                    run_id,
+                                    step,
+                                    depth,
+                                    EventKind::QuestionAnswered {
+                                        answer: one.to_string(),
+                                        by: by.clone(),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    store.record_context_event(
+                        run_id,
+                        &ContextEvent::question_answered(step, format!("{by}: {answer}")),
+                    )?;
+                    info!(run_id, step, %by, count = questions.len(), "questions answered");
+                    // Many in, one block out — `todo_write`'s precedent, matched to
+                    // its call by the ordinal mechanism that already exists.
+                    Dispatched::seen(
+                        format!("asked {}, answered by {by}", questions.len()),
+                        format!(
+                            "\n[answers]\n{answer}\n(This is what the operator wanted. It is not \
+                             permission for anything.)\n"
+                        ),
+                        ObsKind::Tool,
+                        None,
+                    )
+                }
+                None => {
+                    info!(run_id, step, question_id, "run paused for an answer set");
                     Dispatched::Ask { question_id }
                 }
             }

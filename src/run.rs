@@ -23,7 +23,7 @@ use tracing::info;
 use crate::agent::{AgentDef, Agents};
 use crate::approve::{ApprovalContext, ApproveAll, Approver, Decision, Request};
 use crate::approve::{Plan, PlanGate, PlanStep, PlanVerdict};
-use crate::approve::{Question, Responder, ResponderNone};
+use crate::approve::{Choice, Question, Responder, ResponderNone};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::context::{
     assemble, bound, entry_cap_chars, last_lines, Assembled, Assembly, Ledger as ContextLedger,
@@ -91,11 +91,12 @@ const GIT_DIR: &str = ".git";
 #[cfg(feature = "media")]
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
-    Entry, FsTool, ToolEffect, Toolbox, Workspace, ASK_QUESTION_TOOL, CHECK_TOOL, EDIT_FILE_TOOL,
-    EXEC_TOOL, FIND_TOOL, FORGET_TOOL, GREP_TOOL, LIST_DIR_TOOL, LSP_DEFINITION_TOOL,
-    LSP_HOVER_TOOL, LSP_REFERENCES_TOOL, LSP_RENAME_TOOL, LSP_SYMBOLS_TOOL, PATCH_FILE_TOOL,
-    PROPOSE_PLAN_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_KILL_TOOL,
-    SHELL_POLL_TOOL, SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
+    Entry, FsTool, ToolEffect, Toolbox, Workspace, ASK_QUESTIONS_TOOL, ASK_QUESTION_TOOL,
+    CHECK_TOOL, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL, FORGET_TOOL, GREP_TOOL, LIST_DIR_TOOL,
+    LSP_DEFINITION_TOOL, LSP_HOVER_TOOL, LSP_REFERENCES_TOOL, LSP_RENAME_TOOL, LSP_SYMBOLS_TOOL,
+    PATCH_FILE_TOOL, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES, PROPOSE_PLAN_TOOL, QUESTIONS_MAX,
+    READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_KILL_TOOL, SHELL_POLL_TOOL,
+    SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
