@@ -163,7 +163,11 @@ async fn a_responder_answers_and_the_answer_changes_what_the_agent_does() {
             Some("responder"),
             "an in-process answer and a human's must be distinguishable"
         );
-        let labels: Vec<&str> = questions[0].choices.iter().map(|c| c.label.as_str()).collect();
+        let labels: Vec<&str> = questions[0]
+            .choices
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect();
         assert_eq!(labels, ["a.txt", "b.txt"]);
     }
 }

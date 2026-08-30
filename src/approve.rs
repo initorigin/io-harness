@@ -1328,7 +1328,10 @@ pub struct StdinResponder;
 /// differently.
 fn print_question(question: &Question, ordinal: Option<(usize, usize)>) {
     match ordinal {
-        Some((i, of)) => println!("\n[the agent is asking — {} of {of}] {}", i, question.question),
+        Some((i, of)) => println!(
+            "\n[the agent is asking — {} of {of}] {}",
+            i, question.question
+        ),
         None => println!("\n[the agent is asking] {}", question.question),
     }
     if let Some(context) = &question.context {

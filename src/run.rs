@@ -22,8 +22,8 @@ use tracing::info;
 
 use crate::agent::{AgentDef, Agents};
 use crate::approve::{ApprovalContext, ApproveAll, Approver, Decision, Request};
-use crate::approve::{Plan, PlanGate, PlanStep, PlanVerdict};
 use crate::approve::{Choice, Question, Responder, ResponderNone};
+use crate::approve::{Plan, PlanGate, PlanStep, PlanVerdict};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::context::{
     assemble, bound, entry_cap_chars, last_lines, Assembled, Assembly, Ledger as ContextLedger,

@@ -299,7 +299,9 @@ fn a_batching_responder_is_still_a_trait_object() {
 /// error naming the failing index or the cap, and **none of them ends the run**.
 #[tokio::test]
 async fn a_malformed_ask_is_an_observation_naming_the_index_rather_than_the_end_of_the_run() {
-    let over_cap: Vec<Value> = (0..11).map(|i| json!({ "question": format!("q{i}?") })).collect();
+    let over_cap: Vec<Value> = (0..11)
+        .map(|i| json!({ "question": format!("q{i}?") }))
+        .collect();
     let cases: [(Value, &str); 6] = [
         (json!({ "questions": [] }), "no questions"),
         (
@@ -366,7 +368,10 @@ async fn an_unanswered_batch_parks_one_row_and_resumes_through_the_existing_func
         .unwrap();
 
     let RunOutcome::AwaitingAnswer { question_id, .. } = result.outcome else {
-        panic!("an unanswered batch must park the run: {:?}", result.outcome);
+        panic!(
+            "an unanswered batch must park the run: {:?}",
+            result.outcome
+        );
     };
 
     let rows = store.questions(result.run_id).unwrap();
@@ -394,12 +399,18 @@ async fn an_unanswered_batch_parks_one_row_and_resumes_through_the_existing_func
     )
     .await
     .unwrap();
-    assert!(!matches!(resumed.outcome, RunOutcome::AwaitingAnswer { .. }));
+    assert!(!matches!(
+        resumed.outcome,
+        RunOutcome::AwaitingAnswer { .. }
+    ));
 
     let after = store.question(question_id).unwrap().unwrap();
     assert!(after.resolved);
     assert_eq!(after.answered_by.as_deref(), Some("human"));
-    assert_eq!(after.answer.as_deref(), Some("sqlite; linux and windows; io"));
+    assert_eq!(
+        after.answer.as_deref(),
+        Some("sqlite; linux and windows; io")
+    );
 }
 
 /// O7 — a batch is answered wholly or not at all, and a second attempt on a resolved
@@ -414,7 +425,10 @@ fn answering_a_batch_twice_changes_nothing() {
 
     assert!(store.answer_question(id, "first", "human").unwrap());
     assert!(!store.answer_question(id, "second", "attached").unwrap());
-    assert_eq!(store.question(id).unwrap().unwrap().answer.as_deref(), Some("first"));
+    assert_eq!(
+        store.question(id).unwrap().unwrap().answer.as_deref(),
+        Some("first")
+    );
 }
 
 // ---------------------------------------------------------------- O8: the events
@@ -494,7 +508,10 @@ async fn a_batch_emits_one_questions_asked_and_one_answered_per_answer() {
 #[test]
 fn the_batch_tool_is_named_what_the_reserved_set_reserves() {
     assert_eq!(io_harness::ASK_QUESTIONS_TOOL, "ask_questions");
-    assert_ne!(io_harness::ASK_QUESTIONS_TOOL, io_harness::ASK_QUESTION_TOOL);
+    assert_ne!(
+        io_harness::ASK_QUESTIONS_TOOL,
+        io_harness::ASK_QUESTION_TOOL
+    );
 }
 
 /// O11 — `multiple` round-trips through the tool, through the store, and reaches a
@@ -525,8 +542,9 @@ async fn multiple_round_trips_and_defaults_to_false() {
 
     // A row whose JSON has no `multiple` key at all — which is every row any earlier
     // release wrote — reads back as `false` rather than failing to parse.
-    let old: Question = serde_json::from_str(r#"{"question":"which?","context":null,"choices":["a"]}"#)
-        .expect("a 0.71.0-shaped question must still deserialize");
+    let old: Question =
+        serde_json::from_str(r#"{"question":"which?","context":null,"choices":["a"]}"#)
+            .expect("a 0.71.0-shaped question must still deserialize");
     assert!(!old.multiple);
     assert_eq!(old.choices[0].label, "a");
 }
@@ -573,7 +591,9 @@ fn every_choice_shape_round_trips_through_the_store() {
             run,
             1,
             &Question::new("Which?").with_choices([
-                Choice::new("both").describe("a sentence").preview("a block"),
+                Choice::new("both")
+                    .describe("a sentence")
+                    .preview("a block"),
                 Choice::new("neither"),
                 Choice::from("bare"),
             ]),
@@ -596,8 +616,14 @@ fn every_choice_shape_round_trips_through_the_store() {
 /// by a model and drawn into a terminal by every consumer.
 #[tokio::test]
 async fn an_over_long_preview_is_cut_at_a_line_boundary_and_the_model_is_told() {
-    let many_lines = (0..40).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
-    let long_lines = (0..8).map(|i| format!("{i} {}", "x".repeat(200))).collect::<Vec<_>>().join("\n");
+    let many_lines = (0..40)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let long_lines = (0..8)
+        .map(|i| format!("{i} {}", "x".repeat(200)))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let dir = ws();
     let store = Store::memory().unwrap();
@@ -620,22 +646,41 @@ async fn an_over_long_preview_is_cut_at_a_line_boundary_and_the_model_is_told() 
     let choices = &store.questions(result.run_id).unwrap()[0].questions[0].choices;
 
     let lines = choices[0].preview.as_deref().unwrap();
-    assert!(lines.contains("[preview cut"), "the model must be told: {lines}");
+    assert!(
+        lines.contains("[preview cut"),
+        "the model must be told: {lines}"
+    );
     assert!(lines.starts_with("line 0"), "kept from the start: {lines}");
     // Cut at a line boundary: every kept line is a whole one.
     assert!(
-        lines.lines().take_while(|l| !l.starts_with("[preview cut")).all(|l| l.starts_with("line ")),
+        lines
+            .lines()
+            .take_while(|l| !l.starts_with("[preview cut"))
+            .all(|l| l.starts_with("line ")),
         "no line was cut mid-way: {lines}"
     );
 
     let bytes = choices[1].preview.as_deref().unwrap();
-    assert!(bytes.contains("[preview cut"), "the byte bound must also tell: {bytes}");
-    assert!(bytes.len() < 1_000, "and must actually bound it: {}", bytes.len());
+    assert!(
+        bytes.contains("[preview cut"),
+        "the byte bound must also tell: {bytes}"
+    );
+    assert!(
+        bytes.len() < 1_000,
+        "and must actually bound it: {}",
+        bytes.len()
+    );
 
     // The escape and the bell are gone; the text around them is not.
     let escapes = choices[2].preview.as_deref().unwrap();
-    assert!(!escapes.contains('\u{1b}') && !escapes.contains('\u{7}'), "{escapes:?}");
-    assert!(escapes.contains("before") && escapes.contains("after"), "{escapes:?}");
+    assert!(
+        !escapes.contains('\u{1b}') && !escapes.contains('\u{7}'),
+        "{escapes:?}"
+    );
+    assert!(
+        escapes.contains("before") && escapes.contains("after"),
+        "{escapes:?}"
+    );
 
     // The rest of the question is unaffected — a cut preview is not a rejected offer.
     assert_eq!(choices.len(), 3);

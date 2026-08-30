@@ -476,7 +476,9 @@ pub(super) fn parse_questions(
         .as_array()
         .ok_or_else(|| "`questions` must be a list of question objects".to_string())?;
     if list.is_empty() {
-        return Err("an ask with no questions is not an ask; say what you need to know".to_string());
+        return Err(
+            "an ask with no questions is not an ask; say what you need to know".to_string(),
+        );
     }
     if list.len() > QUESTIONS_MAX {
         return Err(format!(

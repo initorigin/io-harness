@@ -497,7 +497,10 @@ impl Store {
         // Deliberately NOT a `CHECKPOINT_FORMAT` bump: no checkpoint layout changed,
         // and bumping it would make [`Store::check_resumable`] refuse every store
         // 0.71.0 wrote over two columns a 0.71.0 binary never queries.
-        let _ = conn.execute("ALTER TABLE pending_questions ADD COLUMN questions TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE pending_questions ADD COLUMN questions TEXT",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE pending_questions ADD COLUMN answers TEXT", []);
 
         // 0.22.0 — provider-executed web search and fetch. Two more additive

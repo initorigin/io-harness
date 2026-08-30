@@ -124,7 +124,9 @@ fn a_0_71_0_store_reads_its_string_choices_back_as_described_choices() {
     assert!(!parked.is_empty(), "the fixture must park at least one row");
     for id in parked {
         let id = id.as_i64().unwrap();
-        assert!(store.answer_question(id, "answered under 0.72.0", "human").unwrap());
+        assert!(store
+            .answer_question(id, "answered under 0.72.0", "human")
+            .unwrap());
         let after = store.question(id).unwrap().unwrap();
         assert!(after.resolved);
         assert_eq!(after.answer.as_deref(), Some("answered under 0.72.0"));
@@ -198,10 +200,16 @@ fn a_current_store_is_read_by_a_0_71_0_binary() {
                     .with_choices([io_harness::Choice::new("io.toml").describe("committed")]),
             )
             .unwrap();
-        store.answer_question(described, "io.toml", "human").unwrap();
+        store
+            .answer_question(described, "io.toml", "human")
+            .unwrap();
         // A plain ask, whose column is byte-identical to what 0.71.0 would write.
         store
-            .put_question(run, 3, &Question::new("Keep it?").with_choices(["yes", "no"]))
+            .put_question(
+                run,
+                3,
+                &Question::new("Keep it?").with_choices(["yes", "no"]),
+            )
             .unwrap();
         // A batch: one row, both new columns populated. The backwards claim for this
         // release is that these cost a 0.71.0 reader nothing, and it is executed here
