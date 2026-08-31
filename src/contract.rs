@@ -1325,8 +1325,16 @@ impl TaskContract {
             Some(dir) => crate::skills::Skills::discover(dir)?,
             None => crate::skills::Skills::none(),
         };
-        for (id, dir) in self.plugins.skill_dirs() {
-            skills = skills.merged(crate::skills::Skills::discover(dir)?.namespaced(&id))?;
+        // Iterated as plugins rather than as `(id, dir)` pairs because a
+        // contributed skill's companion files resolve beneath the *bundle*
+        // root, not beneath its skills directory, and only the plugin knows it.
+        for plugin in self.plugins.iter() {
+            let Some(dir) = plugin.skills_dir() else {
+                continue;
+            };
+            skills = skills.merged(
+                crate::skills::Skills::discover(dir)?.namespaced(plugin.id(), plugin.root()),
+            )?;
         }
         Ok(skills)
     }
