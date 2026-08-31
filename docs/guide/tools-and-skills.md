@@ -259,6 +259,18 @@ Always write the down-migration first...
   `Act::Read` over the skills directory keeps the catalogue in the prompt and the
   bodies out of the context, with the refusal in the trace. An unknown skill name
   returns an observation listing what does exist, not an error.
+- **A skill can read the files it points at (0.73.0)** — `read_skill` takes an
+  optional `path`, so a skill whose instructions say *read `shared/state-model.md`*
+  names a file the model has a tool for rather than a reason to reach for the
+  shell. It resolves beneath the skill's own root, which for a skill a plugin
+  contributed is the **bundle's** root rather than its `skills/` directory, so a
+  bundle's shared prose sitting beside its skills is in reach. A directory comes
+  back as a sorted listing. An absolute path, a `..`, and a symlink whose target
+  canonicalises outside that root are each refused with an observation and no
+  read, and a path that simply is not there says so rather than reading as an
+  attempted escape. The resolved path passes the same `Act::Read` gate the body
+  does, so a policy denying the bundle denies its companion files too — asking
+  for a file as a `path` is not a way around a denied directory.
 - **A bad directory fails honestly** — a missing path, a path that is not a
   directory, more than `MAX_SKILLS` (64) skills, or two skills with the same name
   is an `Error::Config` at run start. A rejected set, not a silently truncated one

@@ -419,16 +419,22 @@ fn a_bundle_agent_is_registered_under_its_namespaced_name_only() {
 
 // ------------------------------------------------------------------ F4
 
-/// **F4**, both arms. A project-scoped declaration may not contribute a hook or
-/// an MCP server; the same directory declared locally may. The discriminating
+/// **F4**, all three arms. A project-scoped declaration may not contribute a
+/// hook, an MCP server or — since 0.73.0 — a `[[bin]]`; the same directory
+/// declared locally may. The discriminating
 /// assertion on the refused arm is that the bundle contributes **nothing** — a
 /// loader that dropped the offending array and kept the rest would satisfy a
 /// weaker claim while leaving a stranger's manifest half-applied.
+///
+/// The `bin` arm is the same argument with a third key attached: a `[[bin]]`
+/// names a program on this machine and exists so that something will go looking
+/// for it, and `io.toml` arrives with a `git clone`.
 #[test]
 fn a_project_scoped_bundle_contributes_nothing_that_runs_a_program() {
-    for offending in ["hook", "mcp"] {
+    for offending in ["hook", "mcp", "bin"] {
         let body = match offending {
             "hook" => "[[hook]]\non = [\"finished\"]\nappend = \"audit.jsonl\"\n".to_string(),
+            "bin" => "[[bin]]\nname = \"review\"\npath = \"bin/review.mjs\"\n".to_string(),
             _ => format!(
                 "[[mcp]]\nid = \"fixture\"\ntransport = \"stdio\"\ncommand = {:?}\n",
                 fixture_server().display().to_string()
@@ -798,11 +804,16 @@ fn a_manifest_may_not_run_a_command_in_any_scope() {
 
 // --------------------------------------------------- 0.70.0, `enabled`
 
-/// The `bundle()` above grown to all six contribution kinds — its four plus a
-/// hook and an MCP server, which only a locally declared bundle may contribute.
-/// Six is the number that matters here: a disabled bundle has to contribute
-/// none of them, and a bundle declaring four would leave two untested.
-fn six_kind_bundle(root: &Path, id: &str) -> PathBuf {
+/// The `bundle()` above grown to all seven contribution kinds — its four plus a
+/// hook, an MCP server and a `[[bin]]` (0.73.0), the three only a locally
+/// declared bundle may contribute.
+/// Seven is the number that matters here: a disabled bundle has to contribute
+/// none of them, and a bundle declaring four would leave three untested.
+///
+/// `bin/review.mjs` is deliberately never written to disk. A `[[bin]]` is
+/// resolved and never stat'd, and a fixture that created the file would let a
+/// loader that had started checking the filesystem pass.
+fn seven_kind_bundle(root: &Path, id: &str) -> PathBuf {
     let dir = bundle(root, id);
     let manifest = std::fs::read_to_string(dir.join("plugin.toml")).unwrap();
     write(
@@ -811,6 +822,8 @@ fn six_kind_bundle(root: &Path, id: &str) -> PathBuf {
             "{manifest}\n\
              [[hook]]\non = [\"finished\"]\nappend = \"audit.jsonl\"\n\
              \n\
+             [[bin]]\nname = \"review\"\npath = \"bin/review.mjs\"\n\
+             \n\
              [[mcp]]\nid = \"fixture\"\ntransport = \"stdio\"\ncommand = {:?}\n",
             fixture_server().display().to_string()
         ),
@@ -818,17 +831,17 @@ fn six_kind_bundle(root: &Path, id: &str) -> PathBuf {
     dir
 }
 
-/// **F2** (0.70.0). A bundle declaring all six contribution kinds and switched
+/// **F2** (0.70.0). A bundle declaring all seven contribution kinds and switched
 /// off contributes none of them, and is still listed as declared-and-off. The
 /// positive control is the identical tree with the flag absent, which
-/// contributes all six — without it a loader that had stopped loading anything
+/// contributes all seven — without it a loader that had stopped loading anything
 /// at all would pass every absence assertion below.
 #[tokio::test]
-async fn a_disabled_bundle_contributes_none_of_the_six_and_stays_visible() {
+async fn a_disabled_bundle_contributes_none_of_the_seven_and_stays_visible() {
     for enabled in [true, false] {
         let dir = tmp();
         let root = dir.path();
-        six_kind_bundle(root, "rust-review");
+        seven_kind_bundle(root, "rust-review");
         write(
             &root.join("io.local.toml"),
             &format!(
@@ -848,11 +861,19 @@ async fn a_disabled_bundle_contributes_none_of_the_six_and_stays_visible() {
         );
         if !enabled {
             // Readable as declared-and-off: the id it would namespace by, and
-            // the six kinds turning it back on would bring.
+            // the seven kinds turning it back on would bring.
             assert_eq!(plugins.disabled()[0].id(), "rust-review");
             assert_eq!(
                 plugins.disabled()[0].contributions(),
-                vec!["skills", "templates", "agents", "mcp", "hooks", "policy"],
+                vec![
+                    "skills",
+                    "templates",
+                    "agents",
+                    "mcp",
+                    "hooks",
+                    "bin",
+                    "policy"
+                ],
                 "a switched-off bundle still says what it holds"
             );
         }
@@ -883,6 +904,11 @@ async fn a_disabled_bundle_contributes_none_of_the_six_and_stays_visible() {
             "templates, enabled = {enabled}"
         );
         assert_eq!(!hooks.is_empty(), enabled, "hooks, enabled = {enabled}");
+        assert_eq!(
+            plugins.get("rust-review").map_or(0, |p| p.bin().len()),
+            usize::from(enabled),
+            "executables, enabled = {enabled}"
+        );
 
         // And the skill catalogue, discovered at run start rather than here.
         let provider = Script::of(vec![vec![]]);
@@ -1376,14 +1402,14 @@ fn inspect_refuses_a_manifest_substitution_at_every_scope() {
 
 /// **#224**. A preflight and a load must not disagree about why a bundle is
 /// unusable: the string `inspect` returns is the string the loader would have put
-/// on `Plugins::dropped`, for each of the four refusals a manifest can earn.
+/// on `Plugins::dropped`, for each of the five refusals a manifest can earn.
 ///
 /// Asserted as string equality against the loader's own output rather than
 /// against wording copied into this file, which would only assert that today
 /// agrees with a copy of today.
 #[test]
 fn an_inspect_refusal_is_the_string_the_loader_would_have_dropped() {
-    let cases: [(&str, &str, Scope, &str); 4] = [
+    let cases: [(&str, &str, Scope, &str); 5] = [
         // A name the id grammar does not admit.
         (
             "badid",
@@ -1416,6 +1442,15 @@ fn an_inspect_refusal_is_the_string_the_loader_would_have_dropped() {
             Scope::Local,
             "io.local.toml",
         ),
+        // 0.73.0. A `[[bin]]` that climbs out of the bundle. From the operator's
+        // own file, so it is the containment rule being refused and not the
+        // project-scope one the case above already covers.
+        (
+            "escapee",
+            "name = \"escapee\"\n\n[[bin]]\nname = \"ssh\"\npath = \"../../../bin/ssh\"\n",
+            Scope::Local,
+            "io.local.toml",
+        ),
     ];
 
     for (name, manifest, scope, scope_file) in cases {
@@ -1434,5 +1469,238 @@ fn an_inspect_refusal_is_the_string_the_loader_would_have_dropped() {
 
         let inspected = Plugins::inspect(scope, &bundle).unwrap_err().to_string();
         assert_eq!(inspected, dropped, "{name}");
+    }
+}
+
+// ------------------------------------------------------- 0.73.0, `[[bin]]`
+
+/// **C1**. A manifest carrying `[[bin]]` loads; every entry comes back from
+/// [`Plugin::bin`] with its path joined onto the plugin root and absolute; and
+/// `contributions()` reports `bin`.
+///
+/// Declared from `io.local.toml`, because a `[[bin]]` names a program on this
+/// machine and the project scope refuses one — the other half of that rule is
+/// `a_project_scoped_bundle_contributes_nothing_that_runs_a_program`.
+///
+/// Nothing under `bin/` is ever created, and the last assertion is that the
+/// resolved paths do **not** exist. Loading performs no filesystem check of any
+/// kind: an executable a bundle ships is ordinarily produced by the bundle's own
+/// build, so a manifest whose validity depended on whether that build had run
+/// would be valid on Tuesday and dropped on Wednesday.
+#[test]
+fn a_bundle_bin_is_resolved_onto_the_plugin_root_and_reported() {
+    let dir = tmp();
+    let root = dir.path();
+    let plugin = root.join("bundles/ultraship");
+    write(
+        &plugin.join("plugin.toml"),
+        "name = \"ultraship\"\n\
+         \n\
+         [[bin]]\nname = \"ultraship\"\npath = \"bin/ultraship.mjs\"\n\
+         \n\
+         [[bin]]\nname = \"ultraship-doctor\"\npath = \"bin/doctor/main.mjs\"\n",
+    );
+    write(
+        &root.join("io.local.toml"),
+        "[[plugin]]\npath = \"bundles/ultraship\"\n",
+    );
+
+    let plugins = Config::discover(root).unwrap().plugins();
+    assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
+    let loaded = plugins.get("ultraship").unwrap();
+
+    assert_eq!(
+        loaded.contributions(),
+        vec!["bin"],
+        "the seventh kind, reported like the six before it"
+    );
+    assert_eq!(
+        loaded.bin(),
+        vec![
+            ("ultraship", plugin.join("bin/ultraship.mjs")),
+            ("ultraship-doctor", plugin.join("bin/doctor/main.mjs")),
+        ],
+        "every entry, in declaration order, joined onto the plugin root"
+    );
+
+    for (name, path) in loaded.bin() {
+        assert!(path.is_absolute(), "{name}: {}", path.display());
+        assert!(
+            path.starts_with(loaded.root()),
+            "{name}: inside the bundle: {}",
+            path.display()
+        );
+        assert!(
+            !path.exists(),
+            "{name}: resolved without ever having been built"
+        );
+    }
+}
+
+/// **C2**, the forward direction. A `plugin.toml` written for 0.72.0 — one with
+/// no `[[bin]]` — loads on 0.73.0 exactly as it always did.
+///
+/// Asserted by summarising the whole tree twice: once from the 0.72.0 manifest,
+/// once from the identical manifest with a `[[bin]]` appended. Everything the
+/// older file already produced must be byte-for-byte the same on both sides, and
+/// the only difference must be the new kind — a loader that shifted an id,
+/// reordered `contributions()` or dropped a layer while adding the key would
+/// fail here rather than in whichever release noticed.
+///
+/// **Backward it is not additive, and nothing here can assert that.** `Manifest`
+/// carries `#[serde(deny_unknown_fields)]`, so a manifest declaring `[[bin]]` is
+/// dropped *whole* by 0.72.0 and earlier rather than partially honoured. That is
+/// stated in the CHANGELOG and in the plugin guide; the only direction a test in
+/// this crate can run is this one.
+#[test]
+fn a_manifest_with_no_bin_loads_exactly_as_a_0_72_0_manifest_did() {
+    let summarise = |extra: &str| {
+        let dir = tmp();
+        let root = dir.path();
+        let plugin = seven_kind_bundle(root, "rust-review");
+        // Back to the 0.72.0 shape — every key that release knew, and no other —
+        // then whatever this arm appends.
+        let manifest = std::fs::read_to_string(plugin.join("plugin.toml")).unwrap();
+        let manifest = manifest.replace(
+            "[[bin]]\nname = \"review\"\npath = \"bin/review.mjs\"\n",
+            "",
+        );
+        assert!(!manifest.contains("[[bin]]"), "the 0.72.0 shape");
+        write(&plugin.join("plugin.toml"), &format!("{manifest}{extra}"));
+        write(
+            &root.join("io.local.toml"),
+            "[[plugin]]\npath = \"bundles/rust-review\"\n",
+        );
+
+        let config = Config::discover(root).unwrap();
+        let plugins = config.plugins();
+        assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
+        let loaded = plugins.get("rust-review").unwrap();
+        let contract = plugins.apply_to(contract(root));
+        let policy = plugins.apply_to_policy(Policy::permissive());
+        let templates = plugins.templates().unwrap();
+        let hooks = plugins.apply_to_hooks(config.hooks(), root);
+        (
+            loaded.contributions(),
+            (
+                plugins.names().join(","),
+                loaded.description().map(String::from),
+                loaded
+                    .skills_dir()
+                    .map(|d| d.strip_prefix(root).unwrap().to_path_buf()),
+                contract.agents.names().join(","),
+                contract
+                    .mcp
+                    .iter()
+                    .map(|s| s.id.clone())
+                    .collect::<Vec<_>>(),
+                policy
+                    .layers
+                    .iter()
+                    .map(|l| l.name.clone())
+                    .collect::<Vec<_>>(),
+                templates.names().join(","),
+                hooks.declarations().len(),
+            ),
+            loaded
+                .bin()
+                .into_iter()
+                .map(|(n, p)| (n.to_string(), p.strip_prefix(root).unwrap().to_path_buf()))
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    let without = summarise("");
+    let with = summarise("\n[[bin]]\nname = \"review\"\npath = \"bin/review.mjs\"\n");
+
+    assert_eq!(
+        without.0,
+        vec!["skills", "templates", "agents", "mcp", "hooks", "policy"],
+        "the answer 0.72.0 gave, written out rather than compared to a copy of today"
+    );
+    assert!(without.2.is_empty(), "no `[[bin]]`, no executables");
+    assert_eq!(
+        without.1, with.1,
+        "everything a 0.72.0 manifest already produced is untouched by the new key"
+    );
+    assert_eq!(
+        with.0,
+        vec![
+            "skills",
+            "templates",
+            "agents",
+            "mcp",
+            "hooks",
+            "bin",
+            "policy"
+        ],
+        "the new kind reads after `hooks` and before `policy`"
+    );
+    assert_eq!(with.2.len(), 1, "and the entry is there");
+    // The comparison is only worth anything if both sides loaded something.
+    assert_eq!(
+        without.1 .0, "rust-review",
+        "the bundle loaded on both sides"
+    );
+}
+
+/// **C3**. A `[[bin]]` whose `path` is absolute, or climbs out of the plugin
+/// root with `..`, is refused at load: the bundle is dropped whole and the
+/// message names the offending entry.
+///
+/// The offender is the *second* table in every case, so the reported index is a
+/// real index rather than a constant `bin[0]`. And the refusal is lexical — no
+/// case here touches a path that exists.
+#[test]
+fn a_bin_path_that_leaves_the_plugin_root_drops_the_bundle_and_names_the_entry() {
+    let cases = [
+        // Absolute on Unix; a bare root on Windows, which `is_absolute` calls
+        // relative and a component walk still refuses.
+        ("/usr/bin/ssh", "is an absolute path"),
+        (
+            "../../../bin/ssh",
+            "climbs out of the plugin root with `..`",
+        ),
+        // Buried mid-path, which a `starts_with("..")` test would miss.
+        (
+            "bin/../../../ssh",
+            "climbs out of the plugin root with `..`",
+        ),
+    ];
+
+    for (path, reason) in cases {
+        let dir = tmp();
+        let root = dir.path();
+        write(
+            &root.join("bundles/escapee/plugin.toml"),
+            &format!(
+                "name = \"escapee\"\n\
+                 skills = \"skills\"\n\
+                 \n\
+                 [[bin]]\nname = \"ok\"\npath = \"bin/ok.mjs\"\n\
+                 \n\
+                 [[bin]]\nname = \"ssh\"\npath = {path:?}\n"
+            ),
+        );
+        write(
+            &root.join("io.local.toml"),
+            "[[plugin]]\npath = \"bundles/escapee\"\n",
+        );
+
+        let plugins = Config::discover(root).unwrap().plugins();
+        assert_eq!(plugins.len(), 0, "{path}: nothing loaded");
+        assert_eq!(plugins.dropped().len(), 1, "{path}");
+        let error = &plugins.dropped()[0].error;
+        assert!(
+            error.contains("bin[1]"),
+            "{path}: the entry's index: {error}"
+        );
+        assert!(error.contains("`ssh`"), "{path}: the entry's name: {error}");
+        assert!(error.contains(reason), "{path}: why: {error}");
+
+        // Dropped whole, not shortened: the skills the same manifest declared did
+        // not reach anything either.
+        let contract = plugins.apply_to(contract(root));
+        assert!(contract.plugins.is_empty(), "{path}: no bundle survived");
     }
 }

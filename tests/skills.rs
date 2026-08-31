@@ -3,12 +3,13 @@
 //! that read.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::skills::{Skills, MAX_SKILLS};
 use io_harness::{
-    run_with, ApproveAll, Policy, Provider, RunOutcome, Store, TaskContract, Verification,
+    run_with, ApproveAll, Config, Policy, Provider, RunOutcome, RunResult, Store, TaskContract,
+    Verification,
 };
 use serde_json::json;
 
@@ -644,4 +645,446 @@ async fn an_absolute_path_still_cannot_escape_the_workspace_root() {
         !planted.exists(),
         "an absolute write must not land outside the root"
     );
+}
+
+// ------------------------------------------- 0.73.0: `read_skill`'s `path`
+
+/// One empty directory as the user scope for this whole binary, so a
+/// `[[plugin]]` in the developer's own configuration is never discovered as a
+/// fourth scope. The isolation `tests/plugin.rs` takes, for the same reason:
+/// green on CI and host-dependent locally is the worst shape a test can have.
+static USER: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+/// A bundle beside a standalone skills directory, and the contract carrying
+/// both.
+///
+/// The two roots are the whole point. `kit__codex` is contributed by a plugin,
+/// so its root is the **bundle** and it reaches the `shared/` sitting beside
+/// `skills/`; `solo` is discovered from the contract's own directory, so its
+/// root is its own. Which is why `references/codex-tools.md` exists twice, once
+/// under each — a resolver that used one root for both would return the wrong
+/// file rather than no file, and only distinct contents catch that.
+fn companions(root: &std::path::Path) -> TaskContract {
+    write(
+        &root.join("bundles/kit/plugin.toml"),
+        "name = \"kit\"\ndescription = \"a bundle\"\nskills = \"skills\"\n",
+    );
+    write(
+        &root.join("bundles/kit/shared/state-model.md"),
+        "STATE MODEL LINE\n",
+    );
+    write(
+        &root.join("bundles/kit/shared/glossary.md"),
+        "GLOSSARY LINE\n",
+    );
+    write(&root.join("bundles/kit/shared/adr/0001.md"), "ADR LINE\n");
+    write(
+        &root.join("bundles/kit/skills/codex/SKILL.md"),
+        "---\nname: codex\ndescription: how to codex\n---\n\nCODEX BODY LINE\n",
+    );
+    write(
+        &root.join("bundles/kit/skills/codex/references/codex-tools.md"),
+        "BUNDLE TOOLS LINE\n",
+    );
+    write(
+        &root.join("io.local.toml"),
+        "[[plugin]]\npath = \"bundles/kit\"\n",
+    );
+
+    let dir = root.join("skills");
+    write(
+        &dir.join("solo/SKILL.md"),
+        "---\nname: solo\ndescription: how to solo\n---\n\nSOLO BODY LINE\n",
+    );
+    write(
+        &dir.join("solo/references/codex-tools.md"),
+        "STANDALONE TOOLS LINE\n",
+    );
+
+    let user = USER.get_or_init(|| tempfile::tempdir().unwrap());
+    std::env::set_var("IO_CONFIG_HOME", user.path());
+    Config::discover(root)
+        .unwrap()
+        .plugins()
+        .apply_to(never_passes(root, &dir).with_max_steps(2))
+}
+
+/// One scripted `read_skill` call, run to whatever end the contract reaches.
+/// The string is the next turn's observations, where the result of the call is
+/// the newest entry.
+async fn read_skill(
+    contract: &TaskContract,
+    policy: &Policy,
+    args: serde_json::Value,
+) -> (Store, RunResult, String) {
+    let provider = MockScript::scripted(vec![vec![call("read_skill", args)]]);
+    let store = Store::memory().unwrap();
+    let result = run_with(contract, &provider, &store, policy, &ApproveAll)
+        .await
+        .expect("a companion-path call must never fail the run");
+    let obs = provider.request(1).user.clone();
+    (store, result, obs)
+}
+
+/// The run reached its ordinary end — its own criterion decided the outcome,
+/// not the tool call — and the step is in the trace. `tests/shell.rs` asserts a
+/// refusal the same way, because "returned no error" is not the same claim.
+fn the_run_continued(store: &Store, result: &RunResult) {
+    assert!(
+        matches!(result.outcome, RunOutcome::VerificationFailed { .. }),
+        "the contract's own criterion must decide the outcome, got {:?}",
+        result.outcome
+    );
+    assert!(
+        !store.steps(result.run_id).unwrap().is_empty(),
+        "the refusal is a recorded step"
+    );
+}
+
+/// Nothing was opened. `read skill …` is the decision a completed read writes
+/// and the only place it is written, so its absence is the assertion.
+fn nothing_was_read(store: &Store, result: &RunResult) {
+    for step in store.steps(result.run_id).unwrap() {
+        assert!(
+            !step.decision.starts_with("read skill"),
+            "no read may happen, got the decision {:?}",
+            step.decision
+        );
+    }
+}
+
+/// A policy that forbids everything under one directory, on top of an otherwise
+/// open stack — the shape `a_denied_skills_directory_refuses_the_read` uses for
+/// the body, reused here for a companion path.
+fn denying(dir: &std::path::Path) -> Policy {
+    let canon = std::fs::canonicalize(dir).unwrap();
+    Policy::default()
+        .layer("base")
+        .allow_read("*")
+        .allow_write("*")
+        .allow_exec("*")
+        .deny_read(format!("{}/*", canon.display()))
+}
+
+/// C2 — a bundle's skill reads the `shared/` file beside its `skills/`
+/// directory, and the decision names both the skill and the path.
+#[tokio::test]
+async fn a_bundle_skill_reads_a_shared_file_beside_its_skills_directory() {
+    let root = tmp();
+    let contract = companions(root.path());
+    let (store, result, obs) = read_skill(
+        &contract,
+        &Policy::permissive(),
+        json!({ "name": "kit__codex", "path": "shared/state-model.md" }),
+    )
+    .await;
+
+    assert!(
+        obs.contains("STATE MODEL LINE"),
+        "the companion file's contents must reach the next turn, got: {obs}"
+    );
+    assert!(
+        !obs.contains("CODEX BODY LINE"),
+        "a companion read is not also a body read, got: {obs}"
+    );
+    let decision = store.steps(result.run_id).unwrap()[0].decision.clone();
+    assert!(
+        decision.contains("kit__codex") && decision.contains("shared/state-model.md"),
+        "the decision must name the skill and the path, got {decision:?}"
+    );
+    the_run_continued(&store, &result);
+}
+
+/// C3 — a file inside the skill's own directory resolves under either root: the
+/// bundle's, for a contributed skill, and the skill's own, for a standalone one.
+/// The two files differ, so a resolver using the wrong root fails here.
+#[tokio::test]
+async fn a_reference_beside_the_skill_resolves_for_a_bundle_and_a_standalone_skill() {
+    for (skill, expected, other) in [
+        ("kit__codex", "BUNDLE TOOLS LINE", "STANDALONE TOOLS LINE"),
+        ("solo", "STANDALONE TOOLS LINE", "BUNDLE TOOLS LINE"),
+    ] {
+        let root = tmp();
+        let contract = companions(root.path());
+        let (store, result, obs) = read_skill(
+            &contract,
+            &Policy::permissive(),
+            json!({ "name": skill, "path": "references/codex-tools.md" }),
+        )
+        .await;
+
+        assert!(
+            obs.contains(expected),
+            "{skill} must read its own reference, got: {obs}"
+        );
+        assert!(
+            !obs.contains(other),
+            "{skill} must not reach the other skill's copy, got: {obs}"
+        );
+        the_run_continued(&store, &result);
+    }
+}
+
+/// C4 — an absolute path is refused, named, and never opened.
+#[tokio::test]
+async fn an_absolute_companion_path_is_refused_and_nothing_is_read() {
+    let root = tmp();
+    let contract = companions(root.path());
+    let (store, result, obs) = read_skill(
+        &contract,
+        &Policy::permissive(),
+        json!({ "name": "kit__codex", "path": "/etc/passwd" }),
+    )
+    .await;
+
+    assert!(
+        obs.contains("kit__codex") && obs.contains("/etc/passwd") && obs.contains("refused"),
+        "the observation must name the skill, the path and the refusal, got: {obs}"
+    );
+    nothing_was_read(&store, &result);
+    the_run_continued(&store, &result);
+}
+
+/// C4 — a path climbing out with `..` is refused, and the file it pointed at
+/// stays unread. Planted deliberately: only a real file above the root can tell
+/// "refused" apart from "there was nothing there anyway".
+#[tokio::test]
+async fn a_parent_traversal_is_refused_and_the_file_above_stays_unread() {
+    let root = tmp();
+    let contract = companions(root.path());
+    // Two levels up from `bundles/kit` is the workspace root.
+    write(&root.path().join("secrets"), "ESCAPED SECRET LINE\n");
+
+    let (store, result, obs) = read_skill(
+        &contract,
+        &Policy::permissive(),
+        json!({ "name": "kit__codex", "path": "../../secrets" }),
+    )
+    .await;
+
+    assert!(
+        obs.contains("kit__codex") && obs.contains("../../secrets") && obs.contains("refused"),
+        "the observation must name the skill, the path and the refusal, got: {obs}"
+    );
+    assert!(
+        !obs.contains("ESCAPED SECRET LINE"),
+        "the file above the root must not be read, got: {obs}"
+    );
+    nothing_was_read(&store, &result);
+    the_run_continued(&store, &result);
+}
+
+/// C4 — a symlink *inside* the bundle whose target canonicalises outside it is
+/// refused. Nothing lexical can see this one: the path has no `..` and is not
+/// absolute, so only canonicalising both sides catches it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlink_out_of_the_bundle_is_refused_and_its_target_stays_unread() {
+    let root = tmp();
+    let outside = tmp();
+    let secret = outside.path().join("secret.txt");
+    write(&secret, "SYMLINK SECRET LINE\n");
+    let contract = companions(root.path());
+    std::os::unix::fs::symlink(&secret, root.path().join("bundles/kit/escape.md")).unwrap();
+
+    let (store, result, obs) = read_skill(
+        &contract,
+        &Policy::permissive(),
+        json!({ "name": "kit__codex", "path": "escape.md" }),
+    )
+    .await;
+
+    assert!(
+        obs.contains("kit__codex") && obs.contains("escape.md") && obs.contains("refused"),
+        "the observation must name the skill, the path and the refusal, got: {obs}"
+    );
+    assert!(
+        !obs.contains("SYMLINK SECRET LINE"),
+        "the link's target must not be read, got: {obs}"
+    );
+    nothing_was_read(&store, &result);
+    the_run_continued(&store, &result);
+}
+
+/// C5 — a path that is not there says so, names what was asked for, and lists
+/// nothing else. A typo is not an attack and must not read as one, and the
+/// observation must not become a way to enumerate the bundle.
+#[tokio::test]
+async fn a_missing_companion_path_says_so_without_listing_the_directory() {
+    let root = tmp();
+    let contract = companions(root.path());
+    let (store, result, obs) = read_skill(
+        &contract,
+        &Policy::permissive(),
+        json!({ "name": "kit__codex", "path": "shared/gone.md" }),
+    )
+    .await;
+
+    assert!(
+        obs.contains("kit__codex") && obs.contains("shared/gone.md"),
+        "the observation must name the skill and the path, got: {obs}"
+    );
+    for leaked in ["state-model.md", "glossary.md", "adr/", "GLOSSARY LINE"] {
+        assert!(
+            !obs.contains(leaked),
+            "a missing path must not enumerate the directory ({leaked}), got: {obs}"
+        );
+    }
+    assert!(
+        !obs.contains("refused"),
+        "a file that is simply not there must not read as a refusal, got: {obs}"
+    );
+    nothing_was_read(&store, &result);
+    the_run_continued(&store, &result);
+}
+
+/// C6 — a companion read is a policy-checked read like the body. A policy
+/// denying the bundle refuses it with the gate's own refusal shape, attributably.
+#[tokio::test]
+async fn a_denied_bundle_refuses_a_companion_read_the_way_it_refuses_the_body() {
+    let root = tmp();
+    let contract = companions(root.path());
+    let policy = denying(&root.path().join("bundles/kit"));
+    let (store, result, obs) = read_skill(
+        &contract,
+        &policy,
+        json!({ "name": "kit__codex", "path": "shared/state-model.md" }),
+    )
+    .await;
+
+    let refusal = store
+        .events(result.run_id)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == "refusal" && e.act == "read")
+        .expect("the refusal must be in the trace");
+    assert!(
+        refusal.target.contains("state-model.md"),
+        "the refusal must name the file, got {:?}",
+        refusal.target
+    );
+    assert_eq!(refusal.layer.as_deref(), Some("base"));
+    assert_eq!(
+        store.steps(result.run_id).unwrap()[0].decision,
+        "read refused",
+        "the same refusal shape the body read produces"
+    );
+    assert!(
+        !obs.contains("STATE MODEL LINE"),
+        "a refused companion file must never enter the observations, got: {obs}"
+    );
+    the_run_continued(&store, &result);
+}
+
+/// C7 — a directory comes back as its entries, sorted, and the entries alone:
+/// listing a directory is not reading what is in it.
+#[tokio::test]
+async fn a_directory_path_returns_its_entries_sorted() {
+    let root = tmp();
+    let contract = companions(root.path());
+    let (store, result, obs) = read_skill(
+        &contract,
+        &Policy::permissive(),
+        json!({ "name": "kit__codex", "path": "shared/" }),
+    )
+    .await;
+
+    let at = |needle: &str| {
+        obs.find(needle)
+            .unwrap_or_else(|| panic!("no {needle} in the listing: {obs}"))
+    };
+    assert!(
+        obs.contains("3 entries"),
+        "the listing says how much there was, got: {obs}"
+    );
+    // Sorted, so two runs over one bundle read alike. `adr/` carries its slash
+    // so the model can tell what it may list next.
+    assert!(
+        at("adr/") < at("glossary.md") && at("glossary.md") < at("state-model.md"),
+        "the entries must be sorted, got: {obs}"
+    );
+    assert!(
+        !obs.contains("GLOSSARY LINE"),
+        "a listing must not carry the files' contents, got: {obs}"
+    );
+    the_run_continued(&store, &result);
+}
+
+/// C7 — the escape check and the gate apply to a directory exactly as to a file.
+#[tokio::test]
+async fn a_directory_path_is_escaped_checked_and_gated_like_a_file() {
+    // Out of the root: refused before any filesystem call, nothing listed.
+    let root = tmp();
+    let contract = companions(root.path());
+    let (store, result, obs) = read_skill(
+        &contract,
+        &Policy::permissive(),
+        json!({ "name": "kit__codex", "path": "../" }),
+    )
+    .await;
+    assert!(
+        obs.contains("refused"),
+        "a directory leaving the root is refused, got: {obs}"
+    );
+    assert!(
+        !obs.contains("entries"),
+        "and nothing is listed, got: {obs}"
+    );
+    nothing_was_read(&store, &result);
+    the_run_continued(&store, &result);
+
+    // Denied by the policy: refused by the gate, with no listing.
+    let root = tmp();
+    let contract = companions(root.path());
+    let policy = denying(&root.path().join("bundles/kit"));
+    let (store, result, obs) = read_skill(
+        &contract,
+        &policy,
+        json!({ "name": "kit__codex", "path": "shared/" }),
+    )
+    .await;
+    assert_eq!(
+        store.steps(result.run_id).unwrap()[0].decision,
+        "read refused"
+    );
+    assert!(
+        !obs.contains("state-model.md"),
+        "a denied directory must not be listed, got: {obs}"
+    );
+    the_run_continued(&store, &result);
+}
+
+/// An empty `path` is the skill's root itself, and so lists it. A deliberate
+/// answer to "what is in this bundle?", written down here so it stays one.
+#[tokio::test]
+async fn an_empty_path_lists_the_skills_own_root() {
+    let root = tmp();
+    let contract = companions(root.path());
+    let (store, result, obs) = read_skill(
+        &contract,
+        &Policy::permissive(),
+        json!({ "name": "kit__codex", "path": "" }),
+    )
+    .await;
+
+    // Nearest first, exactly as a named path resolves: an empty path is the
+    // skill's OWN directory, not the bundle root. Anything else would make the
+    // one path that names no file follow a different rule from every path that
+    // does.
+    for entry in ["SKILL.md", "references/"] {
+        assert!(
+            obs.contains(entry),
+            "the skill's own directory must be listed, naming {entry}, got: {obs}"
+        );
+    }
+    assert!(
+        !obs.contains("plugin.toml"),
+        "and it is the skill's directory, not the bundle root, got: {obs}"
+    );
+    let decision = store.steps(result.run_id).unwrap()[0].decision.clone();
+    assert!(
+        decision.contains("kit__codex ."),
+        "the root listing is not the body read, and the trace says so"
+    );
+    the_run_continued(&store, &result);
 }

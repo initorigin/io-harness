@@ -1,0 +1,37 @@
+# Pinned to io-harness 0.72.0 — the PREVIOUS release — on purpose, with an `=`
+# requirement so cargo cannot drift it forward. Never bump this. Its whole job is to
+# write a SQLite database exactly the way 0.72.0 wrote one, and to read a database
+# back exactly the way 0.72.0 reads one, so `tests/cross_version_0_72_0.rs` can prove
+# 0.73.0 reads a 0.72.0 store and 0.72.0 reads a 0.73.0 one. A fixture written by the
+# current tree and labelled "0.72.0" would prove nothing; bumping this dependency
+# turns the evidence back into a label.
+#
+# This crate exists because of what 0.72.0 cost. 0.72.0 changed `Question::choices`
+# from `Vec<String>` to `Vec<Choice>`, and its entire green suite could not see the
+# consequence, because every test in it read rows the same tree had just written. Only
+# a real previous-release binary could. The rule 0.72.0 wrote for itself is that every
+# release after it carries the same fixture against its own predecessor, whether or
+# not that release believes it changed anything a store can see — 0.73.0 believes it
+# did not, and this crate is how that belief is checked rather than asserted.
+#
+# It is listed in the root manifest's `exclude`, so it is never packaged, and it is
+# built with its own `target/` (run it from this directory) so it never drags a second
+# `libsqlite3-sys` into the main crate's build.
+[package]
+name = "gen-0-72-0"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Empty on purpose: without it cargo walks up and tries to join the io-harness package
+# as a workspace member, which fails because the root manifest excludes this directory.
+[workspace]
+
+[dependencies]
+io-harness = "=0.72.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "sync"] }
+serde_json = "1"
+# No `tempfile` here on purpose. The workspace has to be a relative path under the
+# output directory, so that no machine-specific absolute path is baked into
+# `runs.file` in a committed fixture — and a temp directory is by definition neither
+# relative nor committed.

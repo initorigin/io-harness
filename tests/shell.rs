@@ -455,3 +455,102 @@ async fn a_refused_construct_names_itself_and_the_run_continues() {
         "the refusal is a recorded step"
     );
 }
+
+#[tokio::test]
+async fn a_stream_merge_before_a_pipe_is_refused_and_the_run_takes_another_step() {
+    // The line shape that ended a live session in 0.72.0: `2>&1` on a stage whose
+    // stdout is piped. It used to be an `Error::Config` raised at spawn time,
+    // which propagated out of the run entirely; it is now a parse refusal the
+    // model reads and gets to rewrite.
+    let dir = fixture();
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![
+        vec![shell_call("rustc --version 2>&1 | rustc --print sysroot")],
+        vec![shell_call("rustc --version 2>&1")],
+    ]);
+    let result = run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let steps = store.steps(result.run_id).unwrap();
+    assert!(
+        steps[0].decision.starts_with("shell refused:"),
+        "the refusal is the decision, not an error that ends the run: {:?}",
+        steps[0].decision
+    );
+    assert!(
+        steps[0]
+            .decision
+            .contains("a stream merge on a piped stage"),
+        "and it names the construct: {:?}",
+        steps[0].decision
+    );
+    let obs = observation(&store, result.run_id);
+    assert!(
+        obs.contains("Put the redirect on the last stage of the pipeline."),
+        "the model is told the fix: {obs}"
+    );
+    // The whole point of moving the check: the run keeps going, and the rewritten
+    // line runs. One ordinary shell idiom no longer costs a session.
+    assert!(
+        steps.len() >= 2,
+        "the run took another step after the refusal: {} step(s)",
+        steps.len()
+    );
+    assert!(
+        steps[1].decision.contains("exit 0"),
+        "and the rewritten line ran: {:?}",
+        steps[1].decision
+    );
+}
+
+#[tokio::test]
+async fn a_stream_merge_on_a_last_stage_still_runs() {
+    // The anti-widening gate. Each of these puts `2>&1` on its pipeline's *last*
+    // stage, each was legal in 0.72.0, and moving the check to parse time must
+    // not have swept any of them up.
+    let dir = fixture();
+    for line in [
+        "rustc --version 2>&1",
+        "rustc --version | rustc --print sysroot 2>&1",
+        "rustc --version | rustc --print sysroot 2>&1 > out/merged.txt",
+    ] {
+        let (store, result) = run_line(&dir, Policy::permissive(), line).await;
+        let d = decision(&store, result.run_id);
+        assert!(!d.contains("refused"), "`{line}` is still legal: {d:?}");
+        assert!(d.contains("exit 0"), "`{line}` still runs: {d:?}");
+    }
+    // And the redirecting one really did write, so "not refused" is not standing
+    // in for "never spawned".
+    let wrote = std::fs::read_to_string(dir.path().join("out/merged.txt")).unwrap();
+    assert!(
+        !wrote.trim().is_empty(),
+        "the last stage's stdout reached the file: {wrote:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_cd_stage_merging_before_a_pipe_is_not_newly_refused() {
+    // A `cd` stage inside a pipeline is skipped before its redirects are ever
+    // applied, so the parse-time check skips it too — otherwise this line, which
+    // runs today, would start being refused.
+    let dir = fixture();
+    let (store, result) =
+        run_line(&dir, Policy::permissive(), "cd src 2>&1 | rustc --version").await;
+    let d = decision(&store, result.run_id);
+    assert!(
+        !d.contains("refused"),
+        "`cd x 2>&1 | y` is not newly refused: {d:?}"
+    );
+    let obs = observation(&store, result.run_id);
+    assert!(
+        obs.contains("rustc"),
+        "and the surviving stage still ran: {obs}"
+    );
+}

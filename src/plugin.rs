@@ -7,6 +7,12 @@
 //! five places by hand, and once they are in place nothing records that any of
 //! them came from somewhere other than the operator.
 //!
+//! A seventh kind has no discovery path at all and is why 0.73.0 added one. A
+//! bundle that ships an executable contributed it to nothing: `which ultraship`
+//! found nothing, and a model could not tell "not installed" from "installed
+//! somewhere I am not allowed to look". A `[[bin]]` entry names one, and
+//! [`Plugin::bin`] hands back its absolute path.
+//!
 //! A **plugin** is a directory with a [`PLUGIN_FILE`] at its root declaring what
 //! it contributes. A `[[plugin]]` entry in any configuration scope names one by
 //! path, [`Config::plugins`](crate::Config::plugins) loads every declared one,
@@ -28,6 +34,10 @@
 //! model = "cheap-model"
 //! deny_write = true
 //!
+//! [[bin]]
+//! name = "review"
+//! path = "bin/review.mjs"
+//!
 //! [policy]
 //! layers = [{ name = "no-secrets", rules = [
 //!     { act = "write", effect = "deny", pattern = "secrets/**" },
@@ -39,13 +49,17 @@
 //! **A bundle is a stranger's directory.** It arrives under the rule 0.28.0 wrote
 //! for `[[hook]]`: a plugin declared in the committed, cloned `io.toml` may
 //! contribute skills, templates, agents and deny rules, and may not contribute a
-//! `[[hook]]` or an `[[mcp]]` — both name a program this machine will run. The
-//! same plugin declared in `io.local.toml` or the user-scope file contributes all
-//! six. A `${env:}`, `${file:}` or `${cmd:}` substitution is refused inside a
+//! `[[hook]]`, an `[[mcp]]` or a `[[bin]]` (0.73.0) — each names a program this
+//! machine will run. The same plugin declared in `io.local.toml` or the
+//! user-scope file contributes all seven.
+//! A `${env:}`, `${file:}` or `${cmd:}` substitution is refused inside a
 //! manifest in *every* scope (0.71.0), because a manifest is a third party's file
 //! wherever it was named from: the first two read this machine's environment and
 //! files, the third runs a program on it, and a downloaded directory gets none of
-//! the three.
+//! the three. For the same reason a `[[bin]]`'s `path` is refused if it is
+//! absolute or climbs out of the bundle with `..` (0.73.0): a bundle contributes
+//! an executable it ships, not one it points at somewhere else on this machine.
+//! The check is lexical and nothing on disk is read — see [`Plugin::bin`].
 //!
 //! **A bundle may take capability away and may never hand it out.** A `[policy]`
 //! block may carry layers of [`Effect::Deny`](crate::Effect) rules and nothing
@@ -58,7 +72,10 @@
 //! [`PolicyEvent::layer`](crate::PolicyEvent), a call names `<plugin>__<server>`
 //! in [`McpEvent::server`](crate::McpEvent), and a spawned child's tokens are
 //! billed under `<plugin>__<agent>`. Nothing was added to the store to make that
-//! true.
+//! true. A `[[hook]]` and a `[[bin]]` are the two exceptions and for one reason:
+//! neither contributes a name for an id to prefix — a hook names events, a path
+//! and an argv, and a `[[bin]]`'s `name` is the program an operator or a model
+//! invokes, which `rust-review__review` is not.
 //!
 //! # Switched off is not absent
 //!
@@ -67,7 +84,7 @@
 //! meant. An entry written `enabled = false` is still read, validated and held
 //! to the same trust rule — switching a bundle on is a one-character edit, so a
 //! manifest may not smuggle a `[[hook]]` past the project-scope refusal by
-//! shipping it switched off — and then contributes nothing to any of the six. It
+//! shipping it switched off — and then contributes nothing to any of the seven. It
 //! is listed on [`Plugins::disabled`] rather than [`Plugins::iter`], because an
 //! operator who turned a bundle off still has to be able to see that it is
 //! declared: a capability missing from every listing reads the same as one
@@ -98,7 +115,7 @@
 //! ```
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -186,8 +203,34 @@ struct Manifest {
     mcp: Vec<McpServer>,
     #[serde(default)]
     hook: Vec<Hook>,
+    /// (0.73.0) The executables this bundle ships. Read through [`Plugin::bin`].
+    #[serde(default)]
+    bin: Vec<Bin>,
     #[serde(default)]
     policy: Option<PluginPolicy>,
+}
+
+/// One executable a bundle ships (0.73.0).
+///
+/// `name` is what an operator or a model asks for and `path` is where the bundle
+/// keeps it, relative to the plugin root — the two halves nothing could supply
+/// for a directory that was never on `PATH`.
+///
+/// Private, where [`AgentDef`] and [`Hook`] are public: [`Plugin::bin`] hands
+/// back `(&str, PathBuf)` pairs, so no caller ever names this type. Making it
+/// public would publish its `Serialize`/`Deserialize` derives as API for nothing
+/// — the `[[bin]]` table is already committed by the module docs above, which is
+/// the argument [`Hook`] makes for the opposite conclusion only because
+/// [`Plugin::hooks`] returns the type itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Bin {
+    /// The program's name, as it would be invoked. Not namespaced — see
+    /// [`Plugin::bin`].
+    name: String,
+    /// Where the bundle keeps it, relative to the plugin root. Never absolute
+    /// and never climbing out with `..`; see `check_bins`.
+    path: PathBuf,
 }
 
 /// A manifest's `[policy]`: layers, and deliberately no defaults.
@@ -298,6 +341,33 @@ impl Plugin {
         &self.manifest.hook
     }
 
+    /// The executables it contributes (0.73.0): each entry's `name`, with its
+    /// `path` joined onto the plugin root and absolute.
+    ///
+    /// Nothing on disk is read, here or at load. An executable a bundle ships is
+    /// ordinarily produced by the bundle's own build, so a manifest that checked
+    /// out would be valid or not depending on whether that build had run — a
+    /// property no other key here has. What comes back is what the manifest
+    /// declared, resolved; what a missing file means is the caller's to decide.
+    /// The path is still guaranteed to be *inside* [`Plugin::root`], because a
+    /// `[[bin]]` that was absolute or climbed out with `..` was refused at load.
+    ///
+    /// Not namespaced, for the reason [`Plugin::hooks`] is not: the name is the
+    /// program an operator or a model invokes, and `rust-review__review` is not a
+    /// name anyone types.
+    ///
+    /// Empty unless the `[[plugin]]` entry was declared in a scope that may
+    /// contribute one; a manifest carrying a `[[bin]]` and declared in the
+    /// committed `io.toml` is refused whole rather than shortened here. See the
+    /// module docs.
+    pub fn bin(&self) -> Vec<(&str, PathBuf)> {
+        self.manifest
+            .bin
+            .iter()
+            .map(|b| (b.name.as_str(), self.root.join(&b.path)))
+            .collect()
+    }
+
     /// The policy layers it contributes, namespaced. Deny rules only.
     pub fn policy_layers(&self) -> &[Layer] {
         self.manifest
@@ -318,6 +388,10 @@ impl Plugin {
             ("agents", !m.agent.is_empty()),
             ("mcp", !m.mcp.is_empty()),
             ("hooks", !m.hook.is_empty()),
+            // (0.73.0) After `hooks` and before `policy`, because `policy` reads
+            // last: it is a constraint on what a run may do rather than
+            // something the run is handed.
+            ("bin", !m.bin.is_empty()),
             ("policy", !self.policy_layers().is_empty()),
         ];
         present
@@ -558,15 +632,6 @@ impl Plugins {
         Ok(out)
     }
 
-    /// The absolute skills directories every loaded plugin contributes, with the
-    /// id each one's names are namespaced by.
-    pub(crate) fn skill_dirs(&self) -> Vec<(String, PathBuf)> {
-        self.loaded
-            .iter()
-            .filter_map(|p| p.skills_dir().map(|d| (p.id.clone(), d)))
-            .collect()
-    }
-
     /// Read and validate one bundle directory without declaring it (0.71.0).
     ///
     /// The same loader [`Config::plugins`](crate::Config::plugins) runs, reached
@@ -574,6 +639,7 @@ impl Plugins {
     /// downloaded directory contributes, and *whether it would load at all*,
     /// before writing a line into an operator's configuration. Every check runs:
     /// the id grammar, the trust rule for `scope`, the narrowing rule, the
+    /// `[[bin]]` containment rule, the
     /// `[[hook]]` validator, and every `${...}` substitution refused in a manifest
     /// wherever it came from. The error is the string that would have appeared on
     /// [`Plugins::dropped`], so a preflight and a load cannot disagree.
@@ -594,8 +660,8 @@ impl Plugins {
     /// semantics of the module's first rule, not a quirk of the loader:
     ///
     /// - [`Scope::User`] and [`Scope::Local`] are the operator's own files, so a
-    ///   manifest's `[[hook]]` and `[[mcp]]` are returned like any other
-    ///   contribution.
+    ///   manifest's `[[hook]]`, `[[mcp]]` and `[[bin]]` are returned like any
+    ///   other contribution.
     /// - [`Scope::Project`] is the committed `io.toml` that arrives with a
     ///   `git clone`, so the same manifest is **refused whole** — not shortened.
     ///   A bundle that would only load from one of the two is exactly what an
@@ -732,6 +798,7 @@ fn load_one(scope: Scope, dir: &Path) -> Result<Plugin> {
         refuse_executing_contributions(&manifest, &file)?;
     }
     check_narrowing(&manifest, &file)?;
+    check_bins(&manifest, &file)?;
     Hooks::check(&manifest.hook, &file)?;
 
     let id = manifest.name.clone();
@@ -837,8 +904,9 @@ fn check_id(id: &str, at: &Path) -> Result<()> {
 ///
 /// The 0.28.0 argument applied to a new declaration site: `io.toml` is the file a
 /// `git clone` delivers, a `[[hook]]` runs an argv or writes to a path the file
-/// chose, and an `[[mcp]]` names a command this process spawns. The refusal is
-/// whole — a manifest that declares one contributes none of its other five kinds
+/// chose, an `[[mcp]]` names a command this process spawns, and a `[[bin]]`
+/// (0.73.0) names a program for something to find and run. The refusal is
+/// whole — a manifest that declares one contributes none of its other six kinds
 /// either, because a half-applied stranger's manifest is the failure this rule
 /// exists to prevent.
 fn refuse_executing_contributions(manifest: &Manifest, at: &Path) -> Result<()> {
@@ -846,6 +914,11 @@ fn refuse_executing_contributions(manifest: &Manifest, at: &Path) -> Result<()> 
         "hook"
     } else if !manifest.mcp.is_empty() {
         "mcp"
+    } else if !manifest.bin.is_empty() {
+        // 0.73.0. A `[[bin]]` names a program on this machine and exists so that
+        // something will go looking for it, which is the whole of the 0.28.0
+        // argument with a third key attached.
+        "bin"
     } else {
         return Ok(());
     };
@@ -856,6 +929,44 @@ fn refuse_executing_contributions(manifest: &Manifest, at: &Path) -> Result<()> 
          instead, or remove the `[[{offending}]]` from its manifest.",
         at.display()
     )))
+}
+
+/// A `[[bin]]` path stays inside the bundle, decided lexically (0.73.0).
+///
+/// [`Plugin::bin`] resolves an entry through `Path::join`, where an absolute
+/// argument replaces the base and a relative one climbs out with `..` — the same
+/// two moves `refuse_substitutions` names about `${file:}`. A bundle contributes
+/// an executable it *ships*, so an entry that could name `/usr/bin/env` or
+/// `../../../ssh` is refused rather than resolved.
+///
+/// Lexical, and deliberately: `load_one` performs no filesystem check of any
+/// kind, and an executable a bundle ships is ordinarily produced by the bundle's
+/// own build — a manifest whose validity depended on whether that build had run
+/// would be valid on Tuesday and dropped on Wednesday. Nothing here stats, opens
+/// or canonicalizes the declared file.
+///
+/// `Component` rather than a string test on both counts, so a Windows prefix
+/// (`C:\`), a bare root (`/bin/x`, which `is_absolute` calls relative on Windows)
+/// and a `..` buried mid-path (`bin/../../x`) are all one rule.
+fn check_bins(manifest: &Manifest, at: &Path) -> Result<()> {
+    for (index, entry) in manifest.bin.iter().enumerate() {
+        let wrong = entry.path.components().find_map(|c| match c {
+            Component::Prefix(_) | Component::RootDir => Some("is an absolute path"),
+            Component::ParentDir => Some("climbs out of the plugin root with `..`"),
+            _ => None,
+        });
+        let Some(wrong) = wrong else { continue };
+        return Err(crate::Error::Config(format!(
+            "{}: key `bin[{index}]`: `{}` declares the path {:?}, which {wrong}, and a `[[bin]]` \
+             path is resolved by joining it onto the plugin root, because a bundle contributes an \
+             executable it ships rather than one it points at somewhere else on this machine. \
+             Write the path relative to the plugin root.",
+            at.display(),
+            entry.name,
+            entry.path,
+        )));
+    }
+    Ok(())
 }
 
 /// Plugin-supplied policy may only narrow.

@@ -47,7 +47,7 @@
 //! Always write the down-migration first...
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, Result};
 
@@ -89,6 +89,7 @@ const DESCRIPTION_CAP: usize = 240;
 /// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Skill {
     /// How the agent refers to it: the frontmatter `name`, else the file stem,
     /// else the containing directory for a `SKILL.md`.
@@ -99,6 +100,126 @@ pub struct Skill {
     /// The file the body lives in. Absolute, and what the policy decides on when
     /// the agent asks to read it.
     pub path: PathBuf,
+    /// The directory a companion file asked for by name resolves beneath, and
+    /// may not leave (0.73.0).
+    ///
+    /// A skill file is usually not the whole skill: it points at a checklist, a
+    /// worked example, a longer reference sitting beside it. This is the root
+    /// those siblings are looked up under, and the boundary the resolver behind
+    /// `read_skill` refuses to cross.
+    ///
+    /// - **Contributed by a plugin**: the *bundle's* root — the directory its
+    ///   manifest was read from, not its `skills/` directory. A bundle that
+    ///   keeps `shared/` beside `skills/` is a normal layout, so the whole
+    ///   bundle is in reach of any skill it contributes.
+    /// - **Discovered through [`TaskContract::with_skills`](crate::TaskContract::with_skills)**:
+    ///   the skill's own directory — the subdirectory holding its `SKILL.md`,
+    ///   or, for a top-level `*.md` skill, the skills directory itself, which is
+    ///   the only directory such a skill has.
+    ///
+    /// Canonical for a discovered skill, since it is [`Skill::path`]'s parent;
+    /// for a contributed one it is the bundle root as the manifest was loaded
+    /// from, which is why the resolver canonicalises both sides rather than
+    /// trusting this to already be canonical.
+    pub root: PathBuf,
+}
+
+/// What a companion path asked for by name turned out to be — the outcome of
+/// [`resolve_under`] (0.73.0).
+///
+/// Three outcomes rather than an `Option`, because a file that is not there and
+/// a file that is somewhere it may not be are different events and must read
+/// differently in the trace: one is a typo, the other is the skill reaching out
+/// of its bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SkillFile {
+    /// Inside the root. The absolute, canonical path to open.
+    Resolved(PathBuf),
+    /// Refused: absolute, or climbing out with `..`, or a symlink whose target
+    /// canonicalises outside the root. Carries what was asked for, verbatim, so
+    /// the observation can name it — never the resolved location, which is what
+    /// the refusal exists to keep from being disclosed.
+    Outside(String),
+    /// Nothing is there. Carries what was asked for. Not an escape: a skill
+    /// pointing at a file it no longer ships is a mistake, not an attack, and
+    /// saying "refused" would send the operator hunting for a breach.
+    Missing(String),
+}
+
+/// Resolve `rel` beneath `root`, refusing anything that leaves it.
+///
+/// The order matters, and each step catches what the one before it cannot:
+///
+/// 1. An absolute path is refused by its [`Component`]s, not by
+///    [`Path::is_absolute`] — on Windows `is_absolute` is false for `/etc/passwd`,
+///    which would make it a *relative* join and let it through.
+/// 2. Any `..` component is refused lexically, wherever it sits — `a/../../x`
+///    included. Refused, never clamped: clamping silently rewrites the request
+///    into something the caller did not ask for.
+/// 3. Both the joined path and the root are then **canonicalised** and compared.
+///    This is the actual defence. Steps 1 and 2 cannot see through a symlink
+///    sitting inside the bundle that points at the operator's home directory;
+///    canonicalising both sides is what does. It also keeps a symlink that stays
+///    *inside* the root legal, which a bundle is entitled to use.
+///
+/// A path that does not exist comes back [`SkillFile::Missing`], never
+/// [`SkillFile::Outside`] — `canonicalize` fails on both, and collapsing them
+/// would make every typo look like an attempted escape.
+pub(crate) fn resolve_under(root: &Path, rel: &str) -> SkillFile {
+    let mut joined = root.to_path_buf();
+    for component in Path::new(rel).components() {
+        match component {
+            // Absolute, or climbing out. Both are refused before any filesystem
+            // call, so a refused path is never even stat'ed.
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return SkillFile::Outside(rel.to_string());
+            }
+            Component::CurDir => {}
+            Component::Normal(part) => joined.push(part),
+        }
+    }
+
+    // The root has to be canonical too, or a root reached through a symlink
+    // (`/tmp` on macOS, a bind-mounted checkout) would make every legal file
+    // look like an escape.
+    let (Ok(root), Ok(resolved)) = (root.canonicalize(), joined.canonicalize()) else {
+        return SkillFile::Missing(rel.to_string());
+    };
+    if resolved.starts_with(&root) {
+        SkillFile::Resolved(resolved)
+    } else {
+        SkillFile::Outside(rel.to_string())
+    }
+}
+
+/// Resolve a companion path for one skill, trying the skill's own directory
+/// before its root (0.73.0).
+///
+/// Both conventions are in use and a bundle usually carries both at once:
+/// per-skill prose in a `references/` directory beside the skill's own
+/// `SKILL.md`, and bundle-wide prose in a `shared/` directory beside the whole
+/// `skills/` tree. A skill saying *read `references/tools.md`* means the one
+/// next to itself; a skill saying *read `shared/state-model.md`* means the
+/// bundle's. Resolving under a single root can serve one of those and not the
+/// other, so both are tried, nearest first.
+///
+/// **The boundary does not widen.** Each candidate goes through
+/// [`resolve_under`], and a skill's own directory is inside its root — for a
+/// contributed skill the bundle root, for a standalone one the skill's own
+/// directory, where the two candidates coincide and the second try is skipped.
+/// So every outcome is still a path inside the root, and an absolute path, a
+/// `..` or an escaping symlink is refused by whichever candidate answers.
+///
+/// Nearest-first also means a skill cannot be shadowed by a bundle-level file of
+/// the same name: its own copy wins.
+pub(crate) fn resolve_companion(skill: &Skill, rel: &str) -> SkillFile {
+    let own = skill.path.parent().unwrap_or(skill.root.as_path());
+    if own != skill.root {
+        if let found @ SkillFile::Resolved(_) = resolve_under(own, rel) {
+            return found;
+        }
+    }
+    resolve_under(&skill.root, rel)
 }
 
 /// The skills discovered for one run.
@@ -236,12 +357,19 @@ impl Skills {
                 .or_else(|| first_prose_line(body))
                 .unwrap_or_else(|| "(no description)".to_string());
 
+            // Absolute so the path in the trace and the path the policy decides
+            // on do not depend on the process's working directory.
+            let path = std::fs::canonicalize(&file).unwrap_or(file);
             skills.push(Skill {
                 name,
                 description: clamp(&description, DESCRIPTION_CAP),
-                // Absolute so the path in the trace and the path the policy
-                // decides on do not depend on the process's working directory.
-                path: std::fs::canonicalize(&file).unwrap_or(file),
+                // A standalone skill reaches beneath its own directory: the one
+                // holding its `SKILL.md`, or — for a top-level `*.md` skill —
+                // the skills directory, the only directory it has. A plugin's
+                // skills get this overwritten with the bundle root by
+                // `namespaced`.
+                root: path.parent().unwrap_or(&path).to_path_buf(),
+                path,
             });
 
             if skills.len() > MAX_SKILLS {
@@ -269,15 +397,23 @@ impl Skills {
         Ok(Self { skills })
     }
 
-    /// Every name prefixed with the plugin that contributed it (0.35.0).
+    /// Every name prefixed with the plugin that contributed it, and every root
+    /// widened to the bundle's (0.35.0, root 0.73.0).
     ///
     /// Applied once, as a bundle loads, so a contributed skill cannot occupy a
     /// name the operator already uses and the catalogue the model reads says
     /// which bundle each skill came from.
+    ///
+    /// `root` is the bundle's own directory rather than its `skills/` — this is
+    /// the one place that knows a set of skills came from a plugin *and* knows
+    /// which, so it is where the widening belongs. A bundle that keeps `shared/`
+    /// beside `skills/` is a normal layout, and a skill that cannot reach it
+    /// could only point at files it duplicates. See [`Skill::root`].
     #[must_use]
-    pub(crate) fn namespaced(mut self, plugin: &str) -> Self {
+    pub(crate) fn namespaced(mut self, plugin: &str, root: &Path) -> Self {
         for skill in &mut self.skills {
             skill.name = crate::plugin::namespaced(plugin, &skill.name);
+            skill.root = root.to_path_buf();
         }
         self
     }
@@ -566,6 +702,201 @@ mod tests {
         let clamped = clamp(&long, DESCRIPTION_CAP);
         assert!(clamped.ends_with('…'));
         assert!(clamped.len() <= DESCRIPTION_CAP + 4);
+    }
+
+    /// A bundle-shaped root: a skill file, a `shared/` beside it, and a
+    /// `references/` under it. Every resolver test resolves against this.
+    fn bundle() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::create_dir_all(root.join("references")).unwrap();
+        std::fs::write(root.join("notes.md"), "notes").unwrap();
+        std::fs::write(root.join("shared/state-model.md"), "model").unwrap();
+        std::fs::write(root.join("references/codex-tools.md"), "tools").unwrap();
+        dir
+    }
+
+    fn canon(p: impl AsRef<Path>) -> PathBuf {
+        p.as_ref().canonicalize().expect("canonicalize")
+    }
+
+    #[test]
+    fn a_plain_relative_file_resolves() {
+        let dir = bundle();
+        assert_eq!(
+            resolve_under(dir.path(), "notes.md"),
+            SkillFile::Resolved(canon(dir.path().join("notes.md")))
+        );
+    }
+
+    #[test]
+    fn a_nested_file_resolves() {
+        let dir = bundle();
+        assert_eq!(
+            resolve_under(dir.path(), "shared/state-model.md"),
+            SkillFile::Resolved(canon(dir.path().join("shared/state-model.md")))
+        );
+    }
+
+    #[test]
+    fn a_file_in_the_skills_own_references_directory_resolves() {
+        let dir = bundle();
+        assert_eq!(
+            resolve_under(dir.path(), "references/codex-tools.md"),
+            SkillFile::Resolved(canon(dir.path().join("references/codex-tools.md")))
+        );
+    }
+
+    /// The two conventions coexist in one bundle, so both have to resolve for
+    /// the same skill: `references/` beside the skill itself, `shared/` beside
+    /// the whole `skills/` tree. Resolving under a single root serves one and
+    /// not the other, which is what `resolve_companion` exists to fix.
+    #[test]
+    fn a_companion_resolves_beside_the_skill_and_beside_the_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("skills/codex/references")).unwrap();
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::write(root.join("skills/codex/SKILL.md"), "body").unwrap();
+        std::fs::write(root.join("skills/codex/references/tools.md"), "OWN").unwrap();
+        std::fs::write(root.join("shared/state-model.md"), "SHARED").unwrap();
+        // Same name in both places: the skill's own copy must win, so a
+        // bundle-level file can never shadow one a skill ships beside itself.
+        std::fs::write(root.join("skills/codex/dup.md"), "OWN DUP").unwrap();
+        std::fs::write(root.join("dup.md"), "BUNDLE DUP").unwrap();
+
+        let skill = Skill {
+            name: "codex".into(),
+            description: "d".into(),
+            path: canon(root.join("skills/codex/SKILL.md")),
+            root: canon(root),
+        };
+
+        assert_eq!(
+            resolve_companion(&skill, "references/tools.md"),
+            SkillFile::Resolved(canon(root.join("skills/codex/references/tools.md"))),
+            "a reference beside the skill resolves"
+        );
+        assert_eq!(
+            resolve_companion(&skill, "shared/state-model.md"),
+            SkillFile::Resolved(canon(root.join("shared/state-model.md"))),
+            "and so does bundle-wide prose beside the skills tree"
+        );
+        assert_eq!(
+            resolve_companion(&skill, "dup.md"),
+            SkillFile::Resolved(canon(root.join("skills/codex/dup.md"))),
+            "nearest wins: the skill's own copy, not the bundle's"
+        );
+        assert_eq!(
+            resolve_companion(&skill, "../secrets"),
+            SkillFile::Outside("../secrets".into()),
+            "and the boundary does not widen by trying two candidates"
+        );
+        assert_eq!(
+            resolve_companion(&skill, "nope.md"),
+            SkillFile::Missing("nope.md".into()),
+            "absent from both is missing, not refused"
+        );
+    }
+
+    #[test]
+    fn an_absolute_path_is_refused() {
+        let dir = bundle();
+        assert_eq!(
+            resolve_under(dir.path(), "/etc/passwd"),
+            SkillFile::Outside("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn a_parent_path_is_refused() {
+        let dir = bundle();
+        assert_eq!(
+            resolve_under(dir.path(), "../../secrets"),
+            SkillFile::Outside("../../secrets".into())
+        );
+    }
+
+    #[test]
+    fn a_parent_buried_mid_path_is_refused() {
+        let dir = bundle();
+        // Lands back inside the root only by arithmetic; refused anyway, because
+        // clamping a `..` is how `a/../../x` becomes a surprise.
+        assert_eq!(
+            resolve_under(dir.path(), "shared/../../x"),
+            SkillFile::Outside("shared/../../x".into())
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_missing_not_an_escape() {
+        let dir = bundle();
+        assert_eq!(
+            resolve_under(dir.path(), "shared/gone.md"),
+            SkillFile::Missing("shared/gone.md".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_that_stays_inside_the_root_resolves() {
+        let dir = bundle();
+        let link = dir.path().join("link.md");
+        std::os::unix::fs::symlink(dir.path().join("notes.md"), &link).unwrap();
+        assert_eq!(
+            resolve_under(dir.path(), "link.md"),
+            SkillFile::Resolved(canon(dir.path().join("notes.md")))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_pointing_outside_the_root_is_refused() {
+        let dir = bundle();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let secret = elsewhere.path().join("secret.md");
+        std::fs::write(&secret, "ssh-key").unwrap();
+        // Nothing lexical sees this: the asked-for path is one plain component
+        // inside the root. Canonicalising both sides is the whole defence.
+        std::os::unix::fs::symlink(&secret, dir.path().join("escape.md")).unwrap();
+        assert_eq!(
+            resolve_under(dir.path(), "escape.md"),
+            SkillFile::Outside("escape.md".into())
+        );
+    }
+
+    #[test]
+    fn discovery_roots_a_standalone_skill_at_its_own_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("migrations.md"), "how to migrate\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("api-style")).unwrap();
+        std::fs::write(dir.path().join("api-style/SKILL.md"), "snake_case\n").unwrap();
+
+        let skills = Skills::discover(dir.path()).expect("discover");
+        // A `SKILL.md` skill owns its subdirectory; a top-level `*.md` skill has
+        // no directory of its own but the skills directory.
+        assert_eq!(
+            skills.get("api-style").unwrap().root,
+            canon(dir.path().join("api-style"))
+        );
+        assert_eq!(skills.get("migrations").unwrap().root, canon(dir.path()));
+    }
+
+    #[test]
+    fn namespacing_rewrites_the_root_to_the_bundle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle_root = dir.path();
+        std::fs::create_dir_all(bundle_root.join("skills")).unwrap();
+        std::fs::write(bundle_root.join("skills/migrations.md"), "how to migrate\n").unwrap();
+
+        let skills = Skills::discover(bundle_root.join("skills"))
+            .expect("discover")
+            .namespaced("acme", bundle_root);
+        let skill = skills.iter().next().expect("one skill");
+        assert_eq!(skill.name, "acme__migrations");
+        // The bundle root, not `skills/` — so `shared/` beside it is reachable.
+        assert_eq!(skill.root, bundle_root.to_path_buf());
     }
 
     #[test]

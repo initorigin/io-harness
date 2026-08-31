@@ -85,7 +85,8 @@ Refused, each by name and with a reason the model can act on: command
 substitution `$( )` and backticks, parameter expansion `$VAR` and `${VAR}`,
 arithmetic `$(( ))`, process substitution `<( )`, subshells `( )`, brace groups
 `{ }`, here-documents `<<`, background `&`, the `if`/`for`/`while`/`case`
-keywords, and the glob characters `*` `?` `[` `]` outside quotes.
+keywords, a stream merge on a piped stage, and the glob characters `*` `?` `[`
+`]` outside quotes.
 
 The refusals are not a list of known-bad constructs. The lexer permits an
 enumerated set of characters and refuses everything else, so a construct nobody
@@ -100,6 +101,24 @@ ran could differ by anything created in between. Passing it through unexpanded
 would hand the model a `*` that a real shell would have expanded, which silently
 means something else. Refusing is the only one of the three that cannot be
 wrong — use `find` or `list_dir` to choose paths and then name them.
+
+`2>&1` earns a sentence too, because it is the one refusal that names a redirect
+the admitted list above still admits. What is refused is the redirect on a
+**non-last** stage — `ls 2>&1 | head -50` — because merging stderr into a pipe
+needs a descriptor duplication this crate does not perform. The refusal says
+that and says the fix: put the redirect on the last stage of the pipeline.
+
+**On the last stage it is legal and always was.** `ls 2>&1`,
+`ls | head -50 2>&1` and `ls | head -50 2>&1 > out.txt` all run, merging stderr
+into the captured output. A `cd` stage is exempt as well: a `cd` inside a
+pipeline never has its redirects applied at run time, so `cd x 2>&1 | y` runs.
+
+Since 0.73.0 that is a refusal like every other one on this page — raised in the
+parse, named as `a stream merge on a piped stage`, returned as a decision
+beginning `shell refused:`, and the run carries on so the model can write
+something else. Up to 0.72.0 it was an `Error::Config` raised at spawn time,
+which propagated out and ended the run: one ordinary shell idiom cost a whole
+session.
 
 The other half of the same discipline is that the model supplies the **whole**
 argv here, which is the opposite of how the git built-ins work — those construct
