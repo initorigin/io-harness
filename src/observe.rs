@@ -794,7 +794,7 @@ pub enum EventKind {
         /// The plugin's id, which namespaces every name it contributed.
         plugin: String,
         /// Which kinds it declared — `skills`, `templates`, `agents`, `mcp`,
-        /// `hooks`, `policy` — in that order.
+        /// `hooks`, `bin` (0.73.0), `policy` — in that order.
         contributions: Vec<String>,
     },
     /// A configured language server finished starting and is answering (0.52.0).
