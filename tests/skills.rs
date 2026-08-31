@@ -1067,12 +1067,20 @@ async fn an_empty_path_lists_the_skills_own_root() {
     )
     .await;
 
-    for entry in ["plugin.toml", "shared/", "skills/"] {
+    // Nearest first, exactly as a named path resolves: an empty path is the
+    // skill's OWN directory, not the bundle root. Anything else would make the
+    // one path that names no file follow a different rule from every path that
+    // does.
+    for entry in ["SKILL.md", "references/"] {
         assert!(
             obs.contains(entry),
-            "the bundle root's listing must name {entry}, got: {obs}"
+            "the skill's own directory must be listed, naming {entry}, got: {obs}"
         );
     }
+    assert!(
+        !obs.contains("plugin.toml"),
+        "and it is the skill's directory, not the bundle root, got: {obs}"
+    );
     let decision = store.steps(result.run_id).unwrap()[0].decision.clone();
     assert!(
         decision.contains("kit__codex ."),
