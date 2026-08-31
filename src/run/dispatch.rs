@@ -37,6 +37,38 @@ pub(super) fn record_sandbox_step(
     ));
 }
 
+/// One `read_skill` target as text: a file's contents, or a directory's entries
+/// one per line (0.73.0).
+///
+/// Listing a directory rather than erroring on it is the deliberate half. A skill
+/// that says "see `references/`" would otherwise cost the model a turn guessing a
+/// filename, and every name handed back is a file that same skill may already
+/// read — the gate has already decided this path, and each entry is checked again
+/// on the call that opens it. Sorted, so two runs over one bundle read alike, and
+/// the count leads so a listing cut by `cap_result` still says how much was there.
+///
+/// `metadata` follows links, which is correct here: a symlink to a directory that
+/// `resolve_under` already proved stays inside the root should list like the
+/// directory it is.
+fn skill_target(path: &std::path::Path) -> std::io::Result<String> {
+    if !std::fs::metadata(path)?.is_dir() {
+        return std::fs::read_to_string(path);
+    }
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let mut name = entry.file_name().to_string_lossy().into_owned();
+        // A trailing slash so the model can tell what it may list next without
+        // spending a call to find out.
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            name.push('/');
+        }
+        names.push(name);
+    }
+    names.sort();
+    Ok(format!("{} entries\n{}", names.len(), names.join("\n")))
+}
+
 /// observations the agent can recover from rather than failing the run — only
 /// the model can decide what to do about them.
 #[allow(clippy::too_many_arguments)]
@@ -2275,7 +2307,62 @@ pub(super) async fn dispatch(
                     ),
                 ));
             };
-            let path = skill.path.display().to_string();
+            // 0.73.0 — an optional `path` reads a companion file, or lists a
+            // directory, from inside the skill's own root instead of reading the
+            // skill body. Resolution is `skills::resolve_companion`'s and nothing
+            // here second-guesses it: it tries the skill's own directory before
+            // the bundle root, so `references/tools.md` beside the skill and
+            // `shared/state-model.md` beside the whole `skills/` tree both
+            // resolve; an absolute path, a `..`, or a symlink whose target
+            // canonicalises out of the root never reaches the filesystem; and a
+            // path that is merely *not there* is told apart from one that is out
+            // of bounds — a skill pointing at a file it no longer ships is a
+            // typo, and reporting it as a refusal would send the operator
+            // hunting for a breach.
+            let asked = s("path");
+            let path = match asked {
+                None => skill.path.display().to_string(),
+                Some(rel) => match crate::skills::resolve_companion(skill, rel) {
+                    crate::skills::SkillFile::Resolved(abs) => abs.display().to_string(),
+                    // What was asked for, never where it resolved to: naming the
+                    // resolved location would disclose the very thing the refusal
+                    // exists to withhold. No gate call, because nothing is read.
+                    crate::skills::SkillFile::Outside(rel) => {
+                        return Ok(Dispatched::go(
+                            format!("skill {name} path {rel} refused"),
+                            format!(
+                                "\n[skill {name} refused] {rel} — that path leaves the skill's own \
+                                 directory; ask for a path inside it\n"
+                            ),
+                        ));
+                    }
+                    crate::skills::SkillFile::Missing(rel) => {
+                        return Ok(Dispatched::go(
+                            format!("skill {name} has no {rel}"),
+                            format!(
+                                "\n[skill {name} not found] {rel} — the skill's directory has no \
+                                 such file. Ask for the skill without a path to re-read what it \
+                                 points at\n"
+                            ),
+                        ));
+                    }
+                },
+            };
+            // The observation's header, the trace's decision and the target a
+            // later observation supersedes are all this one string. With no
+            // `path` it is the skill's name and nothing else, which is what keeps
+            // a body read byte for byte what it was before 0.73.0; with one it
+            // carries the companion path, so two files from one skill are two
+            // observations rather than one replacing the other.
+            //
+            // An empty `path` resolves to the root itself and so lists it, which
+            // is the right answer to "what is in this bundle?" — written `.` here
+            // so the trace cannot mistake that listing for the body read.
+            let label = match asked {
+                Some("") => format!("{name} ."),
+                Some(rel) => format!("{name} {rel}"),
+                None => name.to_string(),
+            };
             match gate(
                 ws,
                 approver,
@@ -2295,24 +2382,34 @@ pub(super) async fn dispatch(
                 Gated::Paused { request_id } => Dispatched::Pause { request_id },
                 Gated::Go {
                     target, remember, ..
-                } => match std::fs::read_to_string(&target) {
+                // The gate's target, not the path that went in: an approver may
+                // rewrite it, and whether it is a file or a directory is a
+                // question about what will actually be opened.
+                } => match skill_target(std::path::Path::new(&target)) {
                     Ok(body) => {
                         // Capped where it enters the context, like every other
                         // tool result, under the same budget-derived cap.
                         let (body, truncated) = crate::tools::cap_result(body, cap);
-                        info!(run_id, step, skill = name, truncated, "skill read");
+                        info!(
+                            run_id,
+                            step,
+                            skill = name,
+                            path = asked.unwrap_or_default(),
+                            truncated,
+                            "skill read"
+                        );
                         Dispatched::Continue {
-                            decision: format!("read skill {name}"),
-                            obs: format!("\n[skill {name}]\n{body}\n"),
+                            decision: format!("read skill {label}"),
+                            obs: format!("\n[skill {label}]\n{body}\n"),
                             kind: ObsKind::Skill,
-                            target: Some(name.to_string()),
+                            target: Some(label),
                             changed: false,
                             remember,
                         }
                     }
                     Err(e) => Dispatched::go(
-                        format!("skill {name} read error"),
-                        format!("\n[skill {name} error] {e}\n"),
+                        format!("skill {label} read error"),
+                        format!("\n[skill {label} error] {e}\n"),
                     ),
                 },
             }

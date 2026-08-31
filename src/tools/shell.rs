@@ -871,6 +871,34 @@ impl Parser {
                     "`|` must be followed by a command.",
                 ));
             }
+            // The stage just closed now has a pipe on its stdout, so a `2>&1` on
+            // it would have to merge stderr into that pipe — a descriptor
+            // duplication this crate does not perform. Refused here, at parse
+            // time, so the model is told which stage offended and gets another
+            // turn; until 0.73.0 it was an `Error::Config` raised at spawn time,
+            // which ended the whole run over one ordinary shell idiom.
+            //
+            // `cd` is exempt: a `cd` stage inside a pipeline is skipped before
+            // its redirects are ever applied, so refusing it here would newly
+            // reject a line that runs perfectly well today.
+            let prev = stages.last().expect("a pipeline always has a stage");
+            if prev.argv[0] != CD
+                && prev
+                    .redirects
+                    .iter()
+                    .any(|r| r.kind == RedirectKind::StderrToStdout)
+            {
+                return Err(Refusal::new(
+                    "a stream merge on a piped stage",
+                    at,
+                    format!(
+                        "`{}` sends its stdout down the pipe, and merging stderr into a pipe \
+                         needs a descriptor duplication this crate does not perform. Put the \
+                         redirect on the last stage of the pipeline.",
+                        prev.argv[0]
+                    ),
+                ));
+            }
             stages.push(self.command()?);
         }
         Ok(Pipeline { stages })
@@ -1282,6 +1310,12 @@ impl Shell {
         for (i, stage) in pipeline.stages.iter().enumerate() {
             let planned = &plan[base + i];
             if stage.argv[0] == CD {
+                // 0.73.0 — `parse` exempts a `cd` stage from the piped-`2>&1`
+                // refusal *because* of this `continue`: its redirects are never
+                // applied, so there is nothing to refuse. The two sites have to
+                // agree. If this skip ever goes away, the exemption in
+                // `Parser::pipeline` has to go with it, or a piped `cd 2>&1`
+                // reaches `apply_redirects` and hits the `unreachable!`.
                 err.push_str(
                     "[shell] `cd` inside a pipeline changes nothing and was skipped; run it as \
                      its own stage.\n",
@@ -1430,7 +1464,7 @@ impl Shell {
             // After the capture defaults on purpose: an explicit redirect in the
             // line is the model's own instruction and outranks the capture, the
             // same way it outranks the pipe in the foreground case.
-            apply_redirects(&mut cmd, planned, i != last)?;
+            apply_redirects(&mut cmd, planned)?;
 
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
@@ -1511,22 +1545,16 @@ enum Stage {
 /// [`Act::Write`](crate::Act::Write) or [`Act::Read`](crate::Act::Read) before
 /// this ran. Opening happens here rather than in the caller because a file has to
 /// be opened at spawn time to be a redirect at all.
-fn apply_redirects(cmd: &mut TokioCommand, planned: &Planned, piped_out: bool) -> Result<()> {
+///
+/// `2>&1` names no file and so opens nothing here. On a final stage the merge
+/// happens in the captured output, which is where the model reads it from anyway;
+/// on a stage whose stdout is piped it would need a descriptor duplication this
+/// crate does not perform, and [`parse`] refuses that line before anything spawns,
+/// so no such stage reaches this function.
+fn apply_redirects(cmd: &mut TokioCommand, planned: &Planned) -> Result<()> {
     for (kind, target) in &planned.redirects {
         let Some(path) = target else {
-            // `2>&1`, which names no file. Merging the two streams into a *pipe*
-            // needs a descriptor duplication this crate does not perform, so it is
-            // refused on a stage whose stdout is piped rather than silently
-            // dropped. On a final stage the merge happens in the captured output,
-            // which is where the model reads it from anyway.
-            if piped_out {
-                return Err(Error::Config(
-                    "`2>&1` on a stage whose stdout is piped is not supported by this tool: \
-                     merging the two streams into a pipe needs a descriptor duplication this \
-                     crate does not perform. Put the redirect on the last stage of the pipeline."
-                        .into(),
-                ));
-            }
+            // `2>&1` — see the note above; there is nothing to open.
             continue;
         };
         match kind {
@@ -1783,12 +1811,81 @@ mod tests {
             ("ls |", "a dangling pipe"),
             ("ls &&", "a dangling operator"),
             ("ls > ", "a redirect with no target"),
+            ("ls 2>&1 | head -50", "a stream merge on a piped stage"),
             ("", "an empty command line"),
         ];
         for (src, construct) in cases {
             let r = refused(src);
             assert_eq!(&r.construct, construct, "wrong construct for `{src}`: {r}");
         }
+    }
+
+    #[test]
+    fn a_stream_merge_before_a_pipe_names_the_offending_stage_and_the_fix() {
+        // The line that ended a live session in 0.72.0.
+        let r = refused("ls 2>&1 | head -50");
+        assert_eq!(r.construct, "a stream merge on a piped stage");
+        assert!(r.reason.contains("`ls`"), "the stage is named: {r}");
+        assert!(
+            r.reason
+                .contains("Put the redirect on the last stage of the pipeline."),
+            "and the fix is spelled out: {r}"
+        );
+        assert_eq!(r.at, 8, "the offset points at the pipe");
+    }
+
+    #[test]
+    fn a_stream_merge_refuses_on_the_first_offending_stage_only() {
+        // One line carrying both an offending stage (`a`, piped) and an innocent
+        // one (`d`, last of its pipeline). The refusal must name the first.
+        let r = refused("a 2>&1 | b && c | d 2>&1");
+        assert_eq!(r.construct, "a stream merge on a piped stage");
+        assert!(r.reason.contains("`a`"), "the first offender is named: {r}");
+        assert!(
+            !r.reason.contains("`d`"),
+            "and the innocent last stage is not: {r}"
+        );
+        assert_eq!(r.at, 7, "the offset is the first pipe, not the second");
+        // The control: with the offending merge removed, the same line's
+        // second list keeps its perfectly legal last-stage merge.
+        let line = ok("a | b && c | d 2>&1");
+        let last = line.commands().last().expect("four commands");
+        assert_eq!(last.argv, vec!["d".to_string()]);
+        assert_eq!(last.redirects[0].kind, RedirectKind::StderrToStdout);
+    }
+
+    #[test]
+    fn a_stream_merge_on_a_last_stage_is_still_legal() {
+        // The anti-widening gate. Every one of these is a redirect on its
+        // pipeline's last stage, every one was legal before the check moved, and
+        // every one must stay legal after it.
+        for src in [
+            "ls 2>&1",
+            "ls | head -50 2>&1",
+            "ls | head -50 2>&1 > out.txt",
+        ] {
+            let line = ok(src);
+            let last = line.commands().last().expect("at least one command");
+            assert!(
+                last.redirects
+                    .iter()
+                    .any(|r| r.kind == RedirectKind::StderrToStdout),
+                "`{src}` keeps its last-stage merge"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cd_stage_may_still_merge_before_a_pipe() {
+        // `cd` inside a pipeline never reaches redirect application at runtime, so
+        // the parse-time check skips it rather than newly refusing a line that
+        // runs today.
+        let line = ok("cd x 2>&1 | y");
+        assert_eq!(line.seq[0].first.stages.len(), 2);
+        assert_eq!(
+            line.seq[0].first.stages[0].redirects[0].kind,
+            RedirectKind::StderrToStdout
+        );
     }
 
     #[test]

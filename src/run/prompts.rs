@@ -556,12 +556,14 @@ pub(super) fn skill_tool(skills: &Skills) -> Option<ToolSpec> {
         name: READ_SKILL_TOOL.to_string(),
         description: "Load one skill's full instructions into your observations, by the name it \
                       is listed under. Read a skill when its description says it covers what you \
-                      are about to do."
+                      are about to do. Add `path` to read a file the skill points at, or to list \
+                      a directory, from inside that skill's own bundle."
             .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "The skill's name, as listed in the system prompt." }
+                "name": { "type": "string", "description": "The skill's name, as listed in the system prompt." },
+                "path": { "type": "string", "description": "Optional. A file or directory inside that skill's OWN bundle — a reference, checklist or example its instructions point at — named relative to the skill's root, e.g. \"references/tools.md\" or \"shared/\". A directory comes back as its entries, one per line. Omit it to read the skill's own instructions. A path that leaves the skill's root — an absolute path, or one using `..` — is refused." }
             },
             "required": ["name"]
         }),
@@ -1458,14 +1460,15 @@ pub(super) fn workspace_tools() -> Vec<ToolSpec> {
                           and every redirect target against the file policy BEFORE anything \
                           runs, so if one stage is denied then no stage runs. Supported: single \
                           and double quotes, backslash escapes, `|`, `;`, `&&`, `||`, and the \
-                          redirects `>` `>>` `<` `2>` `2>>` `2>&1`. `cd` works and applies to \
-                          the rest of the line. REFUSED, each with a reason: `$(...)` and \
-                          backticks, `$VAR` and `${VAR}`, `$((...))`, `<(...)`, subshells `(...)`, \
-                          `{...}`, heredocs `<<`, background `&`, `if`/`for`/`while`/`case`, and \
-                          the glob characters `*` `?` `[` `]` outside quotes — quote a character \
-                          to pass it literally, and use `find` or `list_dir` to choose paths \
-                          rather than globbing. A line that runs too long is killed and reported \
-                          as a timeout."
+                          redirects `>` `>>` `<` `2>` `2>>` `2>&1` — though `2>&1` is refused on \
+                          a stage whose stdout is piped, so put it on the pipeline's last stage. \
+                          `cd` works and applies to the rest of the line. REFUSED, each with a \
+                          reason: `$(...)` and backticks, `$VAR` and `${VAR}`, `$((...))`, \
+                          `<(...)`, subshells `(...)`, `{...}`, heredocs `<<`, background `&`, \
+                          `if`/`for`/`while`/`case`, and the glob characters `*` `?` `[` `]` \
+                          outside quotes — quote a character to pass it literally, and use \
+                          `find` or `list_dir` to choose paths rather than globbing. A line that \
+                          runs too long is killed and reported as a timeout."
                 .to_string(),
             parameters: json!({
                 "type": "object",
