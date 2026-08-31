@@ -149,8 +149,8 @@ layer.
 | **Context and memory** | Per-turn assembly to a stated budget share, compaction, invalidation, and durable memory kept by evidence | [context and memory](docs/guide/context-and-memory.md) |
 | **Sessions** | Durable, branchable conversations with token streaming, mid-turn steering and interruption | [sessions](docs/guide/sessions.md) |
 | **Configuration** | One `io.toml` over four scopes, projected onto the typed API, where a project file may narrow and never widen | [configuration](docs/guide/configuration.md) |
-| **Hooks and bundles** | An audit log, notification, formatter or blocking check from config; a directory that contributes skills, agents, servers and deny rules at once | [hooks](docs/guide/hooks.md), [bundles](docs/guide/plugins.md) |
-| **Extensibility** | The `Tool` trait in-process, MCP over stdio and streamable HTTP, and markdown skills | [tools and skills](docs/guide/tools-and-skills.md) |
+| **Hooks and bundles** | An audit log, notification, formatter or blocking check from config; a directory that contributes skills, agents, servers, the executables it ships and deny rules at once | [hooks](docs/guide/hooks.md), [bundles](docs/guide/plugins.md) |
+| **Extensibility** | The `Tool` trait in-process, MCP over stdio and streamable HTTP, and markdown skills that can open the references beside them and never anything outside | [tools and skills](docs/guide/tools-and-skills.md) |
 | **Accounting** | Input, output, cache-read, cache-write and reasoning tokens per call, with latency and TTFT; cost derived on read from a price table you own | [accounting](docs/guide/accounting.md) |
 | **Observability** | An observer called as the run happens, and a recorded provider that replays a case identically | [observability](docs/guide/observability.md) |
 | **Retention** | What the store holds, deleting a session whole, sweeping to a date, archiving the words while keeping the numbers | [retention](docs/guide/retention.md) |
@@ -529,13 +529,16 @@ other, so no run loop changed — and the whole array is refused in the committe
 project file, for the same reason `${cmd:...}` is.
 
 A **capability bundle** is a directory with a `plugin.toml` that contributes skills,
-prompt templates, an agent roster, MCP servers, hooks and deny-only policy at once,
+prompt templates, an agent roster, MCP servers, hooks, the executables it ships and
+deny-only policy at once,
 named by a `[[plugin]]` entry in any scope. Every contributed name is namespaced
 `<plugin>__<name>` as it loads, so a refusal, a tool call and a child's spend already
 say which bundle introduced them — with no new table. A bundle declared in the
-committed project file may not contribute a hook or an MCP server, because both name
-a program this machine would run, and a bundle that fails to load is dropped and
-reported rather than taking the run with it.
+committed project file may not contribute a hook, an MCP server or a `[[bin]]`, because
+all three name a program this machine would run, and a bundle that fails to load is
+dropped and reported rather than taking the run with it. A `[[bin]]` is a declaration
+and not a grant: the harness says what a bundle ships, and where a host puts it — and
+whether the policy lets the agent invoke it — stays the host's decision.
 
 ### Reach: browser, LSP, web, documents, git
 

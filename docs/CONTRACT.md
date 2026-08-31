@@ -517,6 +517,15 @@ paths. And `2>&1` on a stage whose stdout is piped is refused, because merging
 the two streams into a pipe needs a descriptor duplication this crate does not
 perform; on a final stage it merges in the captured output.
 
+**That is a parse refusal and not an error, as of 0.73.0.** It is raised where
+every other construct on this list is raised, named `a stream merge on a piped
+stage`, and `run::dispatch` returns a decision beginning `shell refused:` so the
+step is refused and the run continues. Up to 0.72.0 it was an `Error::Config`
+raised by `apply_redirects` at spawn time, which propagated out of the run loop
+and ended the run — one ordinary shell idiom cost a whole session. A `cd` stage
+is exempt, because a `cd` inside a pipeline never has its redirects applied at
+run time, so `cd x 2>&1 | y` still runs.
+
 `cd` is applied when the line is planned, not when it runs, so in
 `cd nope && ls > out.txt` the redirect resolves under `nope/` even though a real
 shell would have failed the `cd` and written in the original directory. Both
@@ -849,7 +858,7 @@ counter.
 A **plugin** is a directory with a `plugin.toml` at its root, named by a
 `[[plugin]]` entry in a configuration scope and loaded by `Config::plugins()`. It
 contributes skills, prompt templates, agent definitions, MCP servers, lifecycle
-hooks and policy layers — no more.
+hooks, declared executables (0.73.0) and policy layers — no more.
 
 **A plugin contributes data, never code.** There is no dynamic loading, and there
 will not be. A `Tool` is an in-process trait implementation the application
@@ -862,9 +871,11 @@ no checksum, no provenance. Nothing fetches, installs or updates a bundle either
 distribution is the application's. What *is* bounded is what an untrusted bundle
 may contribute, which is a different and achievable claim.
 
-**A project-scoped declaration may not contribute a hook or an MCP server.** Both
-name a program this machine would run, and `io.toml` is the file a `git clone`
-delivers — the 0.28.0 rule for `[[hook]]`, applied to a new declaration site. The
+**A project-scoped declaration may not contribute a hook, an MCP server or an
+executable.** All three name a program this machine would run, and `io.toml` is
+the file a `git clone`
+delivers — the 0.28.0 rule for `[[hook]]`, applied to a new declaration site and
+extended to `[[bin]]` in 0.73.0. The
 refusal is whole: a project-scoped bundle whose manifest declares one contributes
 none of its other kinds either, because a half-applied stranger's manifest is the
 failure the rule exists to prevent. **A manifest is not substituted at all**:
@@ -3576,3 +3587,82 @@ Two things are deliberately *not* promised. The `Debug` rendering of a `Hook` is
 not a format — nothing may parse it — and the order `Hooks::declarations()`
 returns is declaration order within a scope, not a stable global ordering across
 scopes.
+
+## What a `[[bin]]` declares, and what it does not (0.73.0)
+
+A `plugin.toml` may carry an array of `[[bin]]` tables, each with a `name` and a
+`path` relative to the plugin root — the shape `[[agent]]`, `[[mcp]]` and
+`[[hook]]` already have. `Plugin::bin()` returns each entry's name beside its
+path joined onto the plugin root, absolute, in declaration order.
+
+**Declaring an executable is not permission to run it.** This crate says what a
+bundle contributes; it does not install a program, put one on a `PATH`, or hand
+one to `exec`. Where a host places a contributed binary, and whether the policy
+lets the agent invoke it, are the host's decisions and are governed by
+`Act::Exec` like any other program.
+
+**Only a trusted scope may contribute one.** `[[bin]]` joins `[[hook]]` and
+`[[mcp]]` as a contribution a project-scoped `io.toml` may not make, for the
+same reason: it names a program this machine would run and `io.toml` arrives
+with a `git clone`. A manifest declaring one from that scope is refused **whole**
+and the bundle lands on `Plugins::dropped()` — none of its other kinds are
+applied either.
+
+**The path is validated lexically, and nothing is stat'd at load.** An absolute
+`path`, or one climbing out of the plugin root with `..`, is refused at load. A
+path that merely does not exist is not: an executable a bundle ships is
+ordinarily produced by the bundle's own build, and a manifest that was valid on
+Tuesday and dropped on Wednesday because a `target/` directory was cleaned is a
+worse contract than one that reports what was declared. What a missing file
+means is the caller's to decide.
+
+**The name is not namespaced.** Every other contributed id — skills, templates,
+agents, policy layers, MCP servers — becomes `<plugin>__<name>` as it loads. A
+`bin` name does not, because it is the program a human or a model actually
+invokes, and `rust-review__review` is not a name anyone types.
+
+**`[[bin]]` is additive forward only, and this is the one break in the format's
+history.** A `plugin.toml` written before 0.73.0 loads on 0.73.0 exactly as it
+always did. The other direction does not hold: `Manifest` carries
+`#[serde(deny_unknown_fields)]`, so a manifest declaring `[[bin]]` is refused by
+io-harness 0.72.0 and earlier as an unknown field, and the bundle is dropped
+**whole** — every skill, template, agent, hook, MCP server and deny layer in it,
+not merely the `[[bin]]`. A bundle that must load on both ships two manifests or
+requires `io-harness >= 0.73.0`.
+
+`Plugin::contributions()` gained `"bin"` as its seventh name, ordered after
+`"hooks"` and before `"policy"`. That vector is also
+`EventKind::PluginLoaded`'s `contributions` field, so a consumer matching on it
+sees a name it has not seen before.
+
+## What `read_skill` reaches with a `path` (0.73.0)
+
+`read_skill` takes an optional `path` beside its required `name`. Without one,
+the tool behaves byte for byte as it did in 0.72.0: it reads the skill's own
+body. With one, it reads a companion file the skill points at — a checklist, a
+worked example, a longer reference — or lists a directory.
+
+**The path resolves under the skill's root and may not leave it.** For a
+plugin-contributed skill that root is the *bundle's* root, not its `skills/`
+directory, so a bundle keeping `shared/` beside `skills/` is in reach of every
+skill it contributes. For a standalone skill discovered through
+`TaskContract::with_skills` it is the skill's own directory. `Skill::root`
+carries it.
+
+**Escape is refused, never resolved.** An absolute path, any `..` component, and
+a symlink whose target canonicalises outside the root are each refused with an
+observation rather than an error, and no read happens. The refusal names what
+was asked for and never where it resolved to.
+
+**The resolved path goes through the same `Act::Read` gate the body passes.** A
+policy that denies the bundle's directory denies the companion file too; there
+is no second door.
+
+**A directory comes back as a listing.** Its entries, sorted, one per line, under
+the same result cap a body is subject to. This is deliberate: it saves the model
+the turn it would otherwise spend guessing a filename.
+
+**A path that is not there is reported as not there**, distinctly from a refusal,
+and does not enumerate the directory. A skill pointing at a file it no longer
+ships is a typo, and reporting it as a refusal would send an operator hunting for
+a breach that did not happen.

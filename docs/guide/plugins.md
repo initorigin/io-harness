@@ -3,8 +3,8 @@
 *A directory is a bundle of capabilities, and everything it contributes says so.*
 
 Since 0.35.0 a directory holding a `plugin.toml` can contribute skills, prompt
-templates, agent definitions, MCP servers, lifecycle hooks and deny-only policy
-in one piece. Before it, each of those had a discovery path of its own — a
+templates, agent definitions, MCP servers, lifecycle hooks, executables it ships
+(0.73.0) and deny-only policy in one piece. Before it, each of those had a discovery path of its own — a
 `with_skills` directory here, a `Templates::discover` there, three arrays in
 `io.toml`, and a policy stack the application assembled — so handing a coherent
 set of them to somebody else meant six manual steps and no record afterwards
@@ -34,6 +34,10 @@ command = "docs-mcp-server"
 [[hook]]
 on = ["refused"]
 append = "audit.jsonl"
+
+[[bin]]
+name = "rust-review"                 # what a human or a model invokes
+path = "bin/rust-review"             # relative to this file's directory
 
 [policy]
 layers = [{ name = "no-secrets", rules = [
@@ -83,14 +87,14 @@ makes that call the identity.
 refuses `[[hook]]` there outright. A bundle is a stranger's directory one step
 further out, so the same rule governs it:
 
-| Declared in | skills, templates, agents, deny policy | `[[hook]]`, `[[mcp]]` |
+| Declared in | skills, templates, agents, deny policy | `[[hook]]`, `[[mcp]]`, `[[bin]]` |
 | --- | --- | --- |
 | `io.toml` (project) | yes | **no** |
 | `io.local.toml` (local) | yes | yes |
 | user-scope file | yes | yes |
 
 The refusal is **whole**. A project-scoped bundle whose manifest declares a hook
-contributes none of its other five kinds either — a half-applied stranger's
+contributes none of its other six kinds either — a half-applied stranger's
 manifest is the failure the rule exists to prevent.
 
 Two rules apply in every scope. **A manifest is not substituted at all** —
@@ -121,7 +125,8 @@ println!("{} contributes {:?}", plugin.id(), plugin.contributions());
 
 No declaration file is written and `Config::discover` is never called. Every
 check a load runs, runs here: the id grammar, the trust rule for `scope`, the
-narrowing rule on `[policy]`, the `[[hook]]` validator, and every substitution
+narrowing rule on `[policy]`, the `[[bin]]` containment rule, the `[[hook]]`
+validator, and every substitution
 refused in a manifest wherever it came from. The error is the string that would have
 appeared on `Plugins::dropped()`, so a preflight and a load cannot disagree.
 
@@ -135,7 +140,7 @@ It is the scope the caller intends to *declare* the bundle from, and the result
 differs by it — this is the table above as an API rather than a quirk of the
 loader:
 
-| `scope` | A manifest carrying `[[hook]]` or `[[mcp]]` |
+| `scope` | A manifest carrying `[[hook]]`, `[[mcp]]` or `[[bin]]` |
 | --- | --- |
 | `Scope::User`, `Scope::Local` | returned like any other contribution — these are the operator's own files |
 | `Scope::Project` | **refused whole**, not shortened — `io.toml` arrives with a `git clone` |
@@ -149,8 +154,10 @@ scope buys one.
 
 What comes back is the same `Plugin` a load produces, with an accessor per
 contribution kind — `skills_dir`, `templates_dir`, `agents`, `mcp_servers`,
-`hooks`, `policy_layers` — beside `id`, `description`, `version` and
-`contributions`. `hooks()` is 0.71.0's: `contributions()` has advertised
+`hooks`, `bin`, `policy_layers` — beside `id`, `description`, `version` and
+`contributions`. `bin()` is 0.73.0's, and returns each `[[bin]]` entry's name
+beside its `path` joined onto the plugin root, absolute, in declaration order.
+`hooks()` is 0.71.0's: `contributions()` has advertised
 `"hooks"` since 0.35.0 and there was no way to read the tables behind it, so an
 installer could say a bundle contributes hooks and not say what they do. The
 same accessors are on `Hook` itself; see [Hooks](hooks.md#reading-the-hooks-that-are-installed-0710).
@@ -158,6 +165,53 @@ same accessors are on `Hook` itself; see [Hooks](hooks.md#reading-the-hooks-that
 A bundle's hooks are not namespaced, and nothing was left out: a `[[hook]]`
 contributes no name for an id to prefix — it names events, a path and an argv,
 and all three belong to the operator's tree rather than to the bundle's.
+
+## `[[bin]]`: an executable the bundle ships (0.73.0)
+
+```toml
+[[bin]]
+name = "rust-review"
+path = "bin/rust-review"
+```
+
+An array of tables like `[[agent]]`, `[[mcp]]` and `[[hook]]`, with `path`
+relative to the plugin root. `Plugin::bin()` hands back each entry's name beside
+its resolved absolute path, in declaration order, and `contributions()` gained
+`"bin"` as its seventh name — after `"hooks"` and before `"policy"`.
+
+**Declaring one is not permission to run it.** The harness says what a bundle
+contributes. It does not install the program, put it on a `PATH`, or hand it to
+`exec`. Where a host places a contributed binary is the host's decision, and
+whether the agent may invoke it is `Act::Exec`'s, exactly as for any other
+program on the machine.
+
+**Trusted scopes only.** `[[bin]]` joins `[[hook]]` and `[[mcp]]` in the table
+above, and for the same reason: it names a program this machine would run, and
+`io.toml` arrives with a `git clone`. A manifest declaring one from the project
+scope is refused whole.
+
+**Validated lexically, and nothing is stat'd.** An absolute `path`, or one
+climbing out of the plugin root with `..`, is refused at load and the bundle is
+dropped. A path that simply does not exist yet is *not* refused: an executable a
+bundle ships is ordinarily produced by the bundle's own build, and a manifest
+that is valid on Tuesday and dropped on Wednesday because somebody cleaned a
+build directory is a worse contract than one that reports what was declared.
+What a missing file means is the caller's to decide.
+
+**The name is not namespaced**, unlike every skill, template, agent, policy layer
+and MCP server id a bundle contributes. Those are names a model matches against
+prose the operator wrote, so a collision matters; a `bin` name is the program a
+human or a model actually invokes, and `rust-review__review` is not a name
+anyone types.
+
+> **A manifest using `[[bin]]` does not load on an older harness.** `[[bin]]` is
+> additive **forward only**. A `plugin.toml` written before 0.73.0 loads on
+> 0.73.0 exactly as it always did. The other direction does not hold: `Manifest`
+> carries `#[serde(deny_unknown_fields)]`, so a manifest declaring `[[bin]]` is
+> refused by io-harness 0.72.0 and earlier as an unknown field, and the bundle is
+> dropped **whole** — every skill, template, agent, hook, MCP server and deny
+> layer in it, not just the `[[bin]]`. A bundle that must load on both ships two
+> manifests, or requires `io-harness >= 0.73.0`.
 
 ## Attribution
 
@@ -216,6 +270,12 @@ of a directory.
 **A hook or MCP server contributed from a trusted scope runs a program with this
 process's privileges.** Being introduced by a bundle neither sandboxes it nor
 changes the policy that governs it.
+
+**A `[[bin]]` is a declaration and nothing more.** Nothing is installed, placed
+on a `PATH` or executed by this crate, and nothing on disk is checked at load —
+a declared path may name a file that is not there. What a host does with the
+list, and whether the agent may run what it names, are the host's and the
+policy's.
 
 **Namespacing changes the names a model sees.** A prompt or a skill that referred
 to another skill by its bare name stops matching once that skill moves into a

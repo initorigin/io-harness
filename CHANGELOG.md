@@ -26,6 +26,139 @@ notes are produced from it.
 
 ### Security
 
+## [0.73.0] - 2026-08-31
+
+A skill can open the file it points at, a bundle can say which program it ships,
+and one ordinary shell idiom no longer costs a whole session. A skill was one
+markdown file and nothing else: `read_skill` returned its body, so a skill whose
+instructions said "the full checklist is in `references/review.md`" was naming a
+file the model had no way to open, and the author's choice was to inline
+everything or to be ignored. A bundle could contribute six kinds of thing and not
+the one an operator most often wants from it — the executable it built. And
+`ls 2>&1 | head -50`, which every shell on the planet accepts, was an
+`Error::Config` raised at spawn time that propagated out and ended the run, where
+every other construct this parser does not admit is a refused step the model
+simply writes around.
+
+### Breaking changes
+
+- **BREAKING (source)** — `Skill` gained a `pub root: PathBuf` field and is now
+  `#[non_exhaustive]`, so it can no longer be built with a struct literal from
+  outside this crate.
+
+  *Migration:* a caller that only **reads** a `Skill` needs no change at all —
+  `name`, `description` and `path` are the fields they always were, and `root` is
+  one more beside them. A caller that **built** one with a struct literal cannot,
+  and there is deliberately no constructor to move to: a `Skill` is what
+  `Skills::discover` found on disk, and a hand-built one describes a skill that is
+  not there.
+
+  ```rust,ignore
+  // before — a struct literal, typically in a test or a fake toolbox
+  let skill = Skill { name, description, path };
+  // after — discover the directory the skill actually lives in
+  let skills = Skills::discover(&dir)?;
+  let skill = skills.get("review").expect("review");
+  ```
+
+  `#[non_exhaustive]` goes on in the same edit on purpose. The break is being
+  taken once, for the field; adding the attribute in a later release would be a
+  second break bought for nothing.
+
+- **BREAKING (behaviour)** — `Plugin::contributions()` returns a **seventh** name,
+  `"bin"`, ordered after `"hooks"` and before `"policy"`. The same vector is
+  `EventKind::PluginLoaded`'s `contributions` field, so an observer, an installer
+  or a snapshot test matching on it sees a name it has not seen before.
+
+  *Migration:* nothing to write for a consumer that renders the vector or asks it
+  `contains("hooks")`. A consumer that matches it **exhaustively** — comparing
+  against a fixed slice, or switching on its length — adds the `"bin"` case:
+
+  ```rust,ignore
+  // before
+  assert_eq!(plugin.contributions(), ["skills", "hooks", "policy"]);
+  // after — a bundle with a [[bin]] now reports it, between the two
+  assert_eq!(plugin.contributions(), ["skills", "hooks", "bin", "policy"]);
+  ```
+
+  A manifest with no `[[bin]]` returns exactly what it returned before, so only
+  bundles that declare one change shape.
+
+- **BREAKING (format)** — a `plugin.toml` declaring `[[bin]]` does **not** load on
+  an older harness. `[[bin]]` is additive **forward only**: a manifest written
+  before 0.73.0 loads on 0.73.0 exactly as it always did. The other direction does
+  not hold. `Manifest` carries `#[serde(deny_unknown_fields)]`, so a manifest
+  declaring `[[bin]]` is refused by io-harness 0.72.0 and earlier as an unknown
+  field, and the bundle is dropped **whole** — every skill, template, agent, hook,
+  MCP server and deny layer in it, not just the `[[bin]]`.
+
+  *Migration:* a bundle that only ever loads on 0.73.0 or later needs nothing. A
+  bundle that must load on both ships **two manifests** — one bundle directory per
+  harness range — or requires `io-harness >= 0.73.0` and says so where the people
+  installing it will read it. There is no forward-compatible spelling of the key
+  to write instead: `deny_unknown_fields` is what makes an unknown key an error
+  rather than a shrug in every other manifest, and that is the property being
+  relied on here.
+
+### Added
+
+- **`read_skill` takes an optional `path`** — a file the skill's own instructions
+  point at, named relative to the skill's root. `name` is unchanged and still the
+  only required property, and a call with no `path` behaves byte for byte as it
+  did in 0.72.0. For a **plugin-contributed** skill the root is the *bundle's*
+  root rather than its `skills/` directory, so a bundle keeping `shared/` beside
+  `skills/` is in reach; for a standalone skill discovered through `with_skills`
+  it is the skill's own directory.
+- **A `path` naming a directory returns a sorted listing** of its entries, one per
+  line, under the same result cap a body is subject to. Deliberate: it saves the
+  model the turn it would otherwise spend guessing a filename.
+- **`Skill::root`** — the directory a companion path resolves beneath, and the
+  boundary the resolver refuses to cross.
+- **`plugin.toml` `[[bin]]`** — an array of tables, each a `name` and a `path`
+  relative to the plugin root, matching the shape of `[[agent]]`, `[[mcp]]` and
+  `[[hook]]`. It joins `[[hook]]` and `[[mcp]]` as a contribution a **project**
+  `io.toml` may not make — it names a program this machine would run, and
+  `io.toml` arrives with a `git clone` — so a manifest declaring one from that
+  scope is refused whole and the bundle lands on `Plugins::dropped()`. Declaring a
+  `[[bin]]` is **not** permission to execute it: the harness says what a bundle
+  contributes, and where a host places it, and whether the policy lets the agent
+  invoke it, stay the host's decisions.
+- **`Plugin::bin()`** — each declared entry's name beside its path joined onto the
+  plugin root, absolute, in declaration order. The path is validated **lexically
+  only**: absolute, or climbing out with `..`, is refused at load, and nothing is
+  ever stat'd — an executable a bundle ships is ordinarily produced by the
+  bundle's own build, and a manifest must not be valid on Tuesday and dropped on
+  Wednesday because somebody cleaned a build directory. The `bin` name is **not**
+  namespaced, unlike every skill, template, agent, layer and MCP id, because it is
+  the program a human or a model actually invokes.
+
+### Changed
+
+- A companion read goes through the **same `Act::Read` gate** the skill body
+  already passes, against the resolved absolute path. A policy that denies the
+  bundle's directory denies the companion file too; there is no second door.
+  Escape is refused and never resolved — an absolute path, any `..` component, and
+  a symlink whose target canonicalises outside the root are each refused with an
+  observation rather than an error, and no read happens. A path that simply does
+  not exist is reported as **not there**, distinctly from a refusal, and does not
+  enumerate the directory: a skill pointing at a file it no longer ships is a typo,
+  and calling it a refusal would send an operator hunting for a breach.
+
+### Fixed
+
+- `2>&1` on a stage whose stdout is piped is now refused in `parse`, by name, as
+  the construct **`a stream merge on a piped stage`**, and the run continues —
+  `run::dispatch` returns a decision beginning `shell refused:` and the model
+  writes something else, exactly like every other construct this tool does not
+  admit. Up to 0.72.0 it was an `Error::Config` from `apply_redirects` at spawn
+  time, which propagated out and ended the run: a malformed redirect cost a whole
+  session instead of one refused step. The refusal keeps the sentence that explains
+  the fix — put the redirect on the last stage of the pipeline. **A redirect on the
+  last stage is still legal and always was**: `ls 2>&1`, `ls | head -50 2>&1` and
+  `ls | head -50 2>&1 > out.txt` all run. A `cd` stage inside a pipeline is exempt,
+  because its redirects are never applied at run time, so `cd x 2>&1 | y` still
+  runs.
+
 ## [0.72.0] - 2026-08-30
 
 An agent can ask everything it needs in one breath, and each offer can explain
