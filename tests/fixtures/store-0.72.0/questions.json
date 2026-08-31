@@ -1,0 +1,85 @@
+{
+  "batch_id": 4,
+  "described_id": 1,
+  "goal": "port the parser",
+  "last_step": 0,
+  "outcome": null,
+  "read_back": [
+    {
+      "answer": null,
+      "answered_by": null,
+      "answers": [],
+      "batch_questions": [],
+      "choices": [
+        {
+          "description": "committed, and inherited by the team",
+          "label": "io.toml"
+        },
+        {
+          "label": "io.local.toml",
+          "preview": "io.local.toml is gitignored"
+        },
+        "neither, and \"stop\", please"
+      ],
+      "context": "There is a committed io.toml and a gitignored io.local.toml.",
+      "id": 1,
+      "question": "Which config should I edit?",
+      "resolved": false,
+      "run_id": 1,
+      "step": 2
+    },
+    {
+      "answer": "keep it",
+      "answered_by": "human",
+      "answers": [],
+      "batch_questions": [],
+      "choices": [
+        "drop it",
+        "keep it"
+      ],
+      "context": null,
+      "id": 2,
+      "question": "Should the old column be dropped or kept?",
+      "resolved": true,
+      "run_id": 1,
+      "step": 5
+    },
+    {
+      "answer": "a lexer bug",
+      "answered_by": "responder",
+      "answers": [],
+      "batch_questions": [],
+      "choices": [],
+      "context": "Nothing in the diff explains it.",
+      "id": 3,
+      "question": "Why did the parser change?",
+      "resolved": true,
+      "run_id": 1,
+      "step": 7
+    },
+    {
+      "answer": null,
+      "answered_by": null,
+      "answers": [],
+      "batch_questions": [
+        "which port?",
+        "which host?"
+      ],
+      "choices": [],
+      "context": null,
+      "id": 4,
+      "question": "1. which port?\n2. which host?",
+      "resolved": false,
+      "run_id": 1,
+      "step": 9
+    }
+  ],
+  "run_id": 1,
+  "status": "running",
+  "unanswered_ids": [
+    1,
+    4
+  ],
+  "workspace": "fixture-workspace",
+  "writer": "io-harness 0.72.0"
+}
