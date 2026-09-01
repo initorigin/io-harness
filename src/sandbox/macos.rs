@@ -6,24 +6,36 @@
 //! by the shared `run_capped` rlimits; memory by its RSS monitor, since macOS
 //! does not enforce address-space rlimits. This is the one native backend the
 //! build host can live-run.
+//!
+//! A path the profile cannot name is a refusal. Every path is rendered into an
+//! SBPL string literal, and a path that can end that literal goes on to append
+//! rules of its own — which the last-matching-rule-wins evaluation then honours,
+//! under a backend still reporting that it confined the run. So the backend
+//! returns [`Error::Sandbox`] rather than run a command whose boundary it could
+//! not write down.
 
 use std::path::{Path, PathBuf};
 
 use super::{run_capped, Backend, ExecMode, RunSpec, Sandbox, SandboxOutcome};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// The macOS `sandbox-exec` backend.
 pub struct MacosSandbox;
 
 impl Sandbox for MacosSandbox {
     async fn run(&self, spec: RunSpec<'_>) -> Result<SandboxOutcome> {
-        let profile = profile_for(
+        // A path this profile cannot name is a refusal, not a degradation: the
+        // error comes back before anything is spawned, so a run whose
+        // confinement could not be written down does not run at all rather than
+        // running with a boundary nobody can vouch for.
+        let profile = try_profile_for(
             spec.workdir,
             spec.allow_network,
             spec.mode,
             spec.writable_roots,
             spec.proxy,
-        );
+        )
+        .map_err(|reason| Error::Sandbox { reason })?;
         // Wrap the command in sandbox-exec with an inline profile.
         let mut wrapped: Vec<String> = vec!["sandbox-exec".into(), "-p".into(), profile];
         wrapped.extend(spec.argv.iter().cloned());
@@ -58,6 +70,14 @@ impl Sandbox for MacosSandbox {
 /// [`ExecMode::ReadOnly`] grants the temp directory and the dev nodes and nothing
 /// else — and `writable_roots` are the extra grants the run resolved, which on
 /// this platform is one `(allow file-write* (subpath …))` line each.
+///
+/// Every path is rendered by `sbpl_literal`, and a path it refuses collapses the
+/// whole profile to `REFUSED_PROFILE` — a profile that grants nothing, so the
+/// command cannot run. This signature cannot say why, because `wrap_argv` builds
+/// an argv rather than a `Result`; `try_profile_for` is the same profile with the
+/// reason kept, and the backend's own `run` takes that path so a refusal reaches
+/// the caller as [`Error::Sandbox`] instead of as a command that mysteriously
+/// could not read its own files.
 pub(crate) fn profile_for(
     workdir: &Path,
     allow_network: bool,
@@ -65,6 +85,74 @@ pub(crate) fn profile_for(
     writable_roots: &[PathBuf],
     proxy: Option<std::net::SocketAddr>,
 ) -> String {
+    try_profile_for(workdir, allow_network, mode, writable_roots, proxy).unwrap_or_else(|reason| {
+        tracing::warn!(
+            %reason,
+            "sandbox profile refused; the command gets a profile that grants nothing"
+        );
+        REFUSED_PROFILE.to_string()
+    })
+}
+
+/// The profile a run gets when one of its paths cannot be named: nothing is
+/// allowed, so `sandbox-exec` cannot even exec the program it was handed.
+///
+/// Fail closed means *this* rather than a profile with a line missing. A missing
+/// `(allow file-write* …)` line still runs the command, under a boundary that no
+/// longer matches what the run was told it had; a profile that grants nothing
+/// fails where it can be seen.
+const REFUSED_PROFILE: &str = "(version 1)\n(deny default)\n";
+
+/// Render `path` as an SBPL string literal, or say why it cannot be one.
+///
+/// Every path in the profile sits inside a double-quoted literal and SBPL's last
+/// matching rule wins, so a path that can close its own literal can append rules
+/// after it — `(allow file-write* (subpath "/"))` among them — while the backend
+/// goes on reporting `MacosSandboxExec` and a confinement that is no longer in
+/// force. The rendering is therefore verbatim and the check is on the input:
+/// `"`, `\` and every control character are **refused rather than escaped**,
+/// because SBPL's escape rules are not something this crate can pin down from
+/// the platform's documentation, and a guess about them would be a guess about
+/// where the boundary is. `(` and `)` pass through unchanged: inside a literal
+/// they are characters and not structure, and `Project (old)` is an ordinary
+/// directory name that has to keep working.
+fn sbpl_literal(path: &Path) -> std::result::Result<String, String> {
+    let text = path.to_str().ok_or_else(|| {
+        format!(
+            "the path {} is not valid UTF-8, so it cannot be named in a sandbox profile; \
+             run from a directory whose name is UTF-8",
+            path.display()
+        )
+    })?;
+    if let Some(bad) = text
+        .chars()
+        .find(|&c| matches!(c, '"' | '\\') || c.is_control())
+    {
+        let what = match bad {
+            '"' => "a double quote".to_string(),
+            '\\' => "a backslash".to_string(),
+            '\n' => "a newline".to_string(),
+            c => format!("the control character U+{:04X}", c as u32),
+        };
+        return Err(format!(
+            "the path {text} holds {what}, which cannot be written into a sandbox profile: \
+             it would end the profile's own string literal and whatever followed would \
+             become rules. This backend refuses rather than run a command it may not have \
+             confined. Rename or move the directory so its name holds no quote, backslash \
+             or control character."
+        ));
+    }
+    Ok(format!("\"{text}\""))
+}
+
+/// [`profile_for`] with the refusal kept, for the caller that can report one.
+fn try_profile_for(
+    workdir: &Path,
+    allow_network: bool,
+    mode: ExecMode,
+    writable_roots: &[PathBuf],
+    proxy: Option<std::net::SocketAddr>,
+) -> std::result::Result<String, String> {
     // 0.48.0 — when the run owns a proxy, everything is denied and that one
     // loopback address is allowed back. SBPL can name an address and a port
     // exactly, so on this platform "the proxy is the only route out" is a kernel
@@ -85,17 +173,17 @@ pub(crate) fn profile_for(
     let mut allows = String::new();
     if mode != ExecMode::ReadOnly {
         allows.push_str(&format!(
-            "(allow file-write* (subpath \"{}\"))\n",
-            workdir.display()
+            "(allow file-write* (subpath {}))\n",
+            sbpl_literal(workdir)?
         ));
     }
     for root in writable_roots {
         allows.push_str(&format!(
-            "(allow file-write* (subpath \"{}\"))\n",
-            root.display()
+            "(allow file-write* (subpath {}))\n",
+            sbpl_literal(root)?
         ));
     }
-    format!(
+    Ok(format!(
         "(version 1)\n\
          (allow default)\n\
          {net}\n\
@@ -103,7 +191,7 @@ pub(crate) fn profile_for(
          {allows}\
          (allow file-write* (literal \"/dev/null\") (literal \"/dev/dtracehelper\"))\n\
          (allow file-write* (subpath \"/private/var/folders\"))\n"
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -174,6 +262,107 @@ mod tests {
             assert!(
                 p.find(&line).unwrap() > deny_at,
                 "an allow must follow the deny-all"
+            );
+        }
+    }
+
+    /// The injection fixture from the private audit of 2026-08-29 (C1): a
+    /// directory name which, interpolated raw, closes the `subpath` literal and
+    /// appends two grants of its own. SBPL's last matching rule wins, so up to
+    /// 0.73.0 those grants were the ones in force — on `/`, for writes and for
+    /// the network — while the backend went on reporting `MacosSandboxExec` and
+    /// a confinement it no longer had.
+    const HOSTILE_DIR: &str = "p\")) (allow network*) (allow file-write* (subpath \"/";
+
+    /// C1 — a workdir that can close the profile's string literal is refused,
+    /// and the refusal is a profile that grants nothing rather than one with a
+    /// line missing.
+    #[test]
+    fn c1_a_workdir_that_closes_the_profiles_string_literal_is_refused() {
+        let workdir = PathBuf::from("/tmp").join(HOSTILE_DIR);
+        let p = profile_for(&workdir, false, ExecMode::WorkspaceWrite, &[], None);
+
+        assert_eq!(p, REFUSED_PROFILE, "the profile grants nothing");
+        assert!(!p.contains("(allow network*)"), "{p}");
+        assert!(
+            !p.contains("(allow file-write* (subpath \"/\"))"),
+            "no write grant on /: {p}"
+        );
+        assert!(
+            !p.contains(HOSTILE_DIR),
+            "nothing of the path is rendered: {p}"
+        );
+    }
+
+    /// C1 — the same guard on the other interpolation site. `writable_roots` is
+    /// env-derived rather than model-chosen, which makes it less reachable, not
+    /// safe: the rendering is the same rendering.
+    #[test]
+    fn c1_a_writable_root_that_closes_the_profiles_string_literal_is_refused_too() {
+        let roots = vec![PathBuf::from("/tmp").join(HOSTILE_DIR)];
+        let p = profile(ExecMode::WorkspaceWrite, &roots);
+
+        assert_eq!(p, REFUSED_PROFILE, "the profile grants nothing");
+        assert!(!p.contains("(allow network*)"), "{p}");
+        assert!(!p.contains(HOSTILE_DIR), "{p}");
+    }
+
+    /// C1 — every character that could end the literal refuses, and the refusal
+    /// names the path, the reason and what to do instead.
+    #[test]
+    fn c1_a_path_that_cannot_be_quoted_refuses_with_a_reason_that_teaches() {
+        fn refusal(path: &str) -> String {
+            try_profile_for(Path::new(path), false, ExecMode::WorkspaceWrite, &[], None)
+                .expect_err("a path that can end the literal is refused")
+        }
+        for bad in [
+            "/tmp/a\"b",
+            "/tmp/a\\b",
+            "/tmp/a\nb",
+            "/tmp/a\rb",
+            "/tmp/a\u{0}b",
+        ] {
+            let reason = refusal(bad);
+            assert!(reason.contains(bad), "names the path: {reason}");
+            assert!(
+                reason.contains("Rename or move the directory"),
+                "says what to do instead: {reason}"
+            );
+        }
+    }
+
+    /// C1 — the companion. An ordinary macOS directory name still gets its
+    /// grant, and gets exactly the profile a plain path gets with the path
+    /// substituted: no rule appears, disappears or moves. Parentheses are in
+    /// this list on purpose — inside a string literal they are characters, not
+    /// structure, so they need no escaping and refusing them would break
+    /// directories people really have.
+    #[test]
+    fn c1_ordinary_directory_names_still_get_their_allow_line() {
+        let baseline = profile(ExecMode::WorkspaceWrite, &[]);
+        for ordinary in [
+            "/tmp/my project",
+            "/tmp/my-project",
+            "/tmp/my.project",
+            "/tmp/проект",
+            "/tmp/josé's notes",
+            "/tmp/Project (old)",
+        ] {
+            let p = profile_for(
+                Path::new(ordinary),
+                false,
+                ExecMode::WorkspaceWrite,
+                &[],
+                None,
+            );
+            assert!(
+                p.contains(&format!("(allow file-write* (subpath \"{ordinary}\"))")),
+                "{p}"
+            );
+            assert_eq!(
+                p,
+                baseline.replace("/tmp/sbx", ordinary),
+                "only the path itself differs from a plain profile"
             );
         }
     }
