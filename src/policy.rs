@@ -62,7 +62,9 @@ pub enum Act {
     /// Spawn a binary (the verification layer's compile/test commands).
     Exec,
     /// Open an outbound connection. The target is a host, normally in
-    /// `host:port` form — see [`Policy::check`] for how a rule matches one.
+    /// `host:port` form, and rule and target are both lowercased and stripped of
+    /// one trailing root dot before they are compared — see [`Policy::check`]
+    /// for how a rule matches one.
     Net,
 }
 
@@ -152,8 +154,14 @@ impl Effect {
 /// One rule: an effect applied to an action whose target matches `pattern`.
 ///
 /// `pattern` is a glob (`*` any run including `/`, `?` one character) matched
-/// against the target's full relative path *or* its basename, the same way the
-/// `find` tool matches. That is what lets `.env` deny `config/.env`.
+/// against the target's full relative path, and — for an [`Effect::Deny`] rule
+/// only — against its basename as well, the same way the `find` tool matches.
+/// That is what lets `.env` deny `config/.env`.
+///
+/// The basename retry widens what a pattern covers, so 0.74.0 confines it to
+/// denies. Widening a deny can only refuse more; widening an allow hands out
+/// reach nobody wrote down — `allow_exec("cargo")` used to permit
+/// `./target/debug/cargo` as well, a binary the agent had just built itself.
 ///
 /// The basename half is why a bare filename is a *recursive* deny, and it is the
 /// reason to construct a `Rule` deliberately rather than reaching for the
@@ -337,6 +345,30 @@ pub struct Verdict {
 /// legitimately does rewrites a private key.
 const SECRET_PATTERNS: &[&str] = &[".env", "*.pem", "id_rsa", "id_ed25519", "*.key"];
 
+/// Paths that decide what a *later* command does, denied to [`Act::Write`] by
+/// [`Policy::default`] (0.74.0). Writing one of these is not editing a file, it
+/// is editing the machinery that runs the next one.
+///
+/// Two shapes, one class. Git reads its own repo-local `.git/config` back on
+/// every invocation, and no environment variable neutralises that one, so a
+/// `diff.<d>.textconv` or `filter.<d>.clean` written there turns the next
+/// `git_diff` or `git_add` into arbitrary execution; `.git/hooks/*` is the same
+/// route with fewer steps. `io.toml` and `io.local.toml` are read back by
+/// [`Config::discover`](crate::Config::discover), which is where a run's hooks,
+/// MCP servers and toolchain argv come from — a run that writes its own config
+/// has written its own next command line, outside every gate this policy is.
+///
+/// Denied for **writes only**, and the `.git` directory itself is deliberately
+/// not named: `git_add`, `git_commit` and `git_branch` are each an
+/// [`Act::Write`] on `.git` and stay allowed, so every legitimate reason to
+/// change a repository survives. Reads are untouched too — the agent that needs
+/// to know what a config says can still look.
+///
+/// `*/.git/*` is the second form for one reason: a submodule or nested checkout
+/// puts `.git` below the root, and an absolute target is graded as the absolute
+/// string it is. Neither is caught by the leading-`.git/` form.
+const CONFIG_PATTERNS: &[&str] = &[".git/*", "*/.git/*", "io.toml", "io.local.toml"];
+
 /// A permission policy: a stack of layers plus per-action defaults.
 ///
 /// The reason it is a *stack* rather than one rule list is that the rules
@@ -376,7 +408,8 @@ const SECRET_PATTERNS: &[&str] = &[".env", "*.pem", "id_rsa", "id_ed25519", "*.k
 ///
 /// * [`Policy::default`] — reads allowed, writes and execs [`Effect::Ask`], the
 ///   secret paths (`.env`, `*.pem`, `id_rsa`, `id_ed25519`, `*.key`) denied
-///   outright, egress denied. The tiered starting point for an interactive run.
+///   outright, writes to `.git/*`, `io.toml` and `io.local.toml` denied,
+///   egress denied. The tiered starting point for an interactive run.
 /// * [`Policy::permissive`] — enforces nothing, and is what
 ///   [`run`](crate::run) applies when the caller passes no policy at all. Start
 ///   here when you intend to write the whole boundary yourself.
@@ -396,7 +429,8 @@ pub struct Policy {
 impl Default for Policy {
     /// The tiered default a caller gets when they construct a policy without
     /// specifying tiers — reads allowed, writes and execs gated on approval,
-    /// and the secret paths denied outright.
+    /// the secret paths denied outright, and the config a later command reads
+    /// back (`.git/*`, `io.toml`, `io.local.toml`) denied for writing.
     ///
     /// This is *not* what applies when a caller passes no policy at all; that
     /// is [`Policy::permissive`], which enforces nothing.
@@ -425,12 +459,29 @@ impl Default for Policy {
                 })
                 .collect(),
         };
+        // 0.74.0 — its own layer rather than more rows in `builtin-secrets`,
+        // because these are not secrets and are not denied for reading. They are
+        // the files something *else* reads back, so a refusal here is answered
+        // by a different sentence than "that is a private key", and the trace
+        // has to be able to tell the two apart.
+        let config = Layer {
+            name: "builtin-config".into(),
+            rules: CONFIG_PATTERNS
+                .iter()
+                .map(|p| Rule {
+                    act: Act::Write,
+                    effect: Effect::Deny,
+                    pattern: (*p).to_string(),
+                })
+                .collect(),
+        };
         Self {
             layers: vec![
                 Layer {
                     name: "builtin-secrets".into(),
                     rules,
                 },
+                config,
                 exec,
             ],
             defaults: Defaults {
@@ -601,6 +652,13 @@ impl Policy {
     /// Deny-first across all layers, then ask, then allow, then the tier
     /// default. Specificity does not matter — a broad deny beats a narrow
     /// allow, matching Claude Code's precedence.
+    ///
+    /// Two things about how one target is compared to one pattern are visible
+    /// from outside: an [`Effect::Deny`] rule is matched more
+    /// loosely than an allow (basename as well as full text, and case-folded for
+    /// [`Act::Exec`]) and that an [`Act::Net`] host is folded to one spelling —
+    /// lowercased, one trailing root dot off — on both sides before either is
+    /// compared.
     pub fn explain(&self, act: Act, target: &str) -> Verdict {
         // A network target arrives as `host:port`; a rule may name either form.
         // Trying both is what lets `allow_net("api.example.com")` cover whatever
@@ -621,7 +679,7 @@ impl Policy {
                 for rule in &layer.rules {
                     if rule.act == act
                         && rule.effect == effect
-                        && forms.iter().any(|t| matches(act, &rule.pattern, t))
+                        && forms.iter().any(|t| matches(act, effect, &rule.pattern, t))
                     {
                         return Verdict {
                             effect,
@@ -644,9 +702,6 @@ impl Policy {
         }
     }
 
-    /// Evaluate `act` against `target`. This *is* [`Policy::explain`] — the
-    /// enforcement path and the explanation path are one function, so they
-    /// cannot drift apart.
     /// Would this policy permit an outbound connection to anything at all?
     ///
     /// 0.40.0, and the one place in the crate where the per-host egress model is
@@ -694,6 +749,10 @@ impl Policy {
             .any(|rule| rule.act == Act::Net)
     }
 
+    /// Evaluate `act` against `target`. This *is* [`Policy::explain`] — the
+    /// enforcement path and the explanation path are one function, so they
+    /// cannot drift apart. [`Policy::explain`] is also where how a rule matches
+    /// a target — a path, a binary name, a host — is written down.
     pub fn check(&self, act: Act, target: &str) -> Verdict {
         self.explain(act, target)
     }
@@ -736,30 +795,85 @@ fn normalise_path(s: &str) -> Cow<'_, str> {
     Cow::Borrowed(s)
 }
 
+/// Fold a host-valued pattern or target into the one form both sides are
+/// compared in: ASCII-lowercased, with one trailing root dot taken off the host.
+///
+/// A host name is not case-sensitive and its root dot is optional — `EVIL.example`,
+/// `evil.example.` and `evil.example` are one name, all three resolve, and a URL
+/// may spell any of them. Comparing them literally meant `deny_net("evil.example")`
+/// missed two of the three, which is a permission rule failing *open*. This runs
+/// inside [`matches`] rather than at the callers, so the egress proxy, the browser
+/// and a direct [`Policy::check`] cannot end up disagreeing about what a host is.
+///
+/// The dot comes off the host, not off the string, because a rule may name a port:
+/// `evil.example.:443` is the same target as `evil.example:443` and
+/// `deny_net("evil.example:443")` has to catch both. A port is digits and nothing
+/// else, which is what keeps the colons inside an IPv6 literal out of it.
+///
+/// Not applied to [`Act::Exec`]: a binary name is a filesystem path, where case
+/// folding is a property of the volume rather than of the protocol. See
+/// [`matches`] for what is done there instead.
+fn normalise_host(s: &str) -> Cow<'_, str> {
+    let lowered: Cow<'_, str> = match s.bytes().any(|b| b.is_ascii_uppercase()) {
+        true => Cow::Owned(s.to_ascii_lowercase()),
+        false => Cow::Borrowed(s),
+    };
+    let host_end = match lowered.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            host.len()
+        }
+        _ => lowered.len(),
+    };
+    if !lowered[..host_end].ends_with('.') {
+        return lowered;
+    }
+    let mut out = lowered.into_owned();
+    // ASCII `.`, so this byte index is a char boundary.
+    out.remove(host_end - 1);
+    Cow::Owned(out)
+}
+
 /// Compiled globs, keyed by the whole (normalised) pattern text.
 ///
 /// The key is whatever text [`matches`] hands over — already run through
-/// [`normalise_path`] for a path act — so the key is always exactly the string
-/// that was compiled. Two raw patterns that normalise to one form share an
-/// entry, which is correct: they denote the same location.
+/// [`normalise_path`] for a path act, [`normalise_host`] for a host — so the key
+/// is always exactly the string that was compiled. Two raw patterns that
+/// normalise to one form share an entry, which is correct: they denote the same
+/// location, or the same host.
 ///
 /// Safe as a process-wide cache because compilation is a pure function of that
-/// text and nothing else: no act, no effect, no layer, no target enters
-/// [`glob_to_regex`], and the cache stores the regex, never a verdict. So a hit
-/// can only ever hand back the regex that same pattern would have compiled to,
-/// and a pattern appearing in two layers — or in a parent and the child that
-/// [`Policy::contain`] narrows — still decides through its own rule's act,
-/// effect, and layer position. A failed compile is cached as `None`, keeping a
-/// malformed glob matching nothing exactly as before.
+/// text within this map: no layer and no target enters [`glob_to_regex`], the
+/// one other input it takes chooses *which* map ([`GLOBS_CI`]) rather than
+/// changing what this one holds, and the cache stores the regex, never a
+/// verdict. So a hit can only ever hand back the regex that same pattern would
+/// have compiled to, and a pattern appearing in two layers — or in a parent and
+/// the child that [`Policy::contain`] narrows — still decides through its own
+/// rule's act, effect, and layer position. A failed compile is cached as `None`,
+/// keeping a malformed glob matching nothing exactly as before.
 // ponytail: unbounded — one entry per distinct pattern text ever checked.
 // Patterns come from policy configs, not from the model, so the set is small and
 // fixed; bound it (LRU, or a per-Policy cache) only if a caller ever generates
 // pattern text at runtime.
 static GLOBS: OnceLock<RwLock<HashMap<String, Option<regex::Regex>>>> = OnceLock::new();
 
+/// The same cache for the case-folded compile [`matches`] uses on an
+/// [`Act::Exec`] deny.
+///
+/// A second map rather than a flag folded into the key, because the key is the
+/// soundness argument: it stays exactly the text that was compiled, so a hit can
+/// still only ever hand back the regex that text would have produced. Folding
+/// the flag in would mean a key that is no longer the pattern, and a pattern
+/// whose own text happened to spell the flag's prefix would answer the other
+/// map's question.
+static GLOBS_CI: OnceLock<RwLock<HashMap<String, Option<regex::Regex>>>> = OnceLock::new();
+
 /// [`glob_to_regex`] memoised on the pattern text. `None` is a malformed glob.
-fn compiled(pattern: &str) -> Option<regex::Regex> {
-    let cache = GLOBS.get_or_init(Default::default);
+fn compiled(pattern: &str, fold_case: bool) -> Option<regex::Regex> {
+    let cache = match fold_case {
+        true => &GLOBS_CI,
+        false => &GLOBS,
+    }
+    .get_or_init(Default::default);
     if let Some(hit) = cache
         .read()
         .unwrap_or_else(PoisonError::into_inner)
@@ -769,7 +883,7 @@ fn compiled(pattern: &str) -> Option<regex::Regex> {
     }
     // The error is dropped here as it always was — a bad glob is silent and
     // matches nothing; surfacing it would be a behaviour change, not a fix.
-    let re = glob_to_regex(pattern).ok();
+    let re = glob_to_regex(pattern, fold_case).ok();
     cache
         .write()
         .unwrap_or_else(PoisonError::into_inner)
@@ -777,35 +891,75 @@ fn compiled(pattern: &str) -> Option<regex::Regex> {
     re
 }
 
-/// Does `pattern` match `target`, by full relative path or by basename?
+/// Does `pattern` match `target`, by full text or — for a deny — by basename?
 ///
-/// Basename matching is what lets a bare `.env` deny `config/.env`, and mirrors
-/// how the `find` tool already matches globs.
+/// `act` decides what the two sides *are*, and whichever fold applies is applied
+/// to pattern and target alike so there is one definition of sameness rather than
+/// two. [`Act::Read`] and [`Act::Write`] are paths (see [`normalise_path`]);
+/// [`Act::Net`] is a host (see [`normalise_host`]); [`Act::Exec`] is a binary
+/// name, left exactly as written because `\` is not a separator in a name and
+/// rewriting it would change what a rule means.
 ///
-/// `act` decides whether the two sides are paths. [`Act::Read`] and
-/// [`Act::Write`] target paths and are normalised (see [`normalise_path`]);
-/// [`Act::Exec`] targets a binary *name* and [`Act::Net`] a host, where `\` is
-/// not a separator and rewriting it would change what a rule means.
-fn matches(act: Act, pattern: &str, target: &str) -> bool {
+/// `effect` decides how *loosely*. Three relaxations belong to [`Effect::Deny`]
+/// rules and to nothing else, because each of them makes a pattern cover more
+/// than its text says and that is only ever safe in the refusing direction:
+///
+/// * the basename retry, which lets a bare `.env` deny `config/.env` the way the
+///   `find` tool matches — and which let `allow_exec("cargo")` reach
+///   `./target/debug/cargo`, a binary the agent built for itself, until 0.74.0;
+/// * the case-folded compile for [`Act::Exec`], because a binary name is a path
+///   and half the volumes this crate runs on will spawn `RM` for `rm`. It is a
+///   deny's alone rather than a property of the host filesystem: nothing in this
+///   crate can tell whether the volume a given argv resolves on folds case, and
+///   the reading that fails closed is to let a deny catch both spellings while an
+///   allow keeps granting exactly the one it names. An `allow_exec("rustc")` that
+///   therefore misses `RUSTC` falls to the exec default, which asks or refuses;
+/// * the host fold for [`Act::Net`], for exactly the same reason. DNS is
+///   case-insensitive and one trailing root dot names the same server, so
+///   `deny_net("evil.example")` has to catch `EVIL.example:443` and
+///   `evil.example.` or it is not a boundary. Folding an *allow* would be a
+///   widening — `allow_net("api.example.com")` would begin permitting
+///   `API.Example.com`, which 0.73.0 refused — and 0.74.0 narrows only. An allow
+///   that misses a spelling falls to the net default, which asks or refuses.
+///
+/// The basename retry also splits an [`Act::Exec`] target on `\`, so
+/// `deny_exec("kubectl.exe")` covers the Windows path a resolved argv carries.
+/// The pattern side is untouched: `\` in a *rule* stays the literal a rule
+/// writer meant.
+fn matches(act: Act, effect: Effect, pattern: &str, target: &str) -> bool {
+    let deny = effect == Effect::Deny;
     let (pattern, target) = match act {
         Act::Read | Act::Write => (normalise_path(pattern), normalise_path(target)),
-        Act::Exec | Act::Net => (Cow::Borrowed(pattern), Cow::Borrowed(target)),
+        Act::Net if deny => (normalise_host(pattern), normalise_host(target)),
+        Act::Net => (Cow::Borrowed(pattern), Cow::Borrowed(target)),
+        Act::Exec => (Cow::Borrowed(pattern), Cow::Borrowed(target)),
     };
-    let Some(re) = compiled(&pattern) else {
+    let Some(re) = compiled(&pattern, deny && act == Act::Exec) else {
         return false; // a malformed glob matches nothing rather than everything
     };
     if re.is_match(&target) {
         return true;
     }
-    match target.rsplit('/').next() {
+    if !deny {
+        return false;
+    }
+    let separators: &[char] = match act {
+        Act::Exec => &['/', '\\'],
+        _ => &['/'],
+    };
+    match target.rsplit(separators).next() {
         Some(base) if base != target => re.is_match(base),
         _ => false,
     }
 }
 
 /// Compile a glob (`*` any run including `/`, `?` one char) to an anchored regex.
-fn glob_to_regex(glob: &str) -> Result<regex::Regex> {
-    let mut re = String::from("(?s)^");
+/// `fold_case` compiles it case-insensitively; see [`matches`] for who asks.
+fn glob_to_regex(glob: &str, fold_case: bool) -> Result<regex::Regex> {
+    let mut re = String::from(match fold_case {
+        true => "(?is)^",
+        false => "(?s)^",
+    });
     for ch in glob.chars() {
         match ch {
             '*' => re.push_str(".*"),
