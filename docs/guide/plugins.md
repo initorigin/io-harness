@@ -52,7 +52,8 @@ unknown key is refused by name the same way and for the same reason.
 ## Declaring one
 
 ```toml
-# io.local.toml
+# Any of the three scopes may declare one; which scope it was declared from
+# decides what its manifest may contribute.
 [[plugin]]
 path = "bundles/rust-review"
 ```
@@ -62,6 +63,18 @@ path = "bundles/rust-review"
 are both wanted. A relative `path` resolves against the discovery root — the
 project the harness was pointed at, not the directory the declaring file happens
 to live in.
+
+**And it stays under that root (0.74.0).** `path` was taken as written, so an
+absolute one replaced the discovery root outright and a relative one climbed out
+with `..`: a workspace file could point a bundle at any directory on the host, and
+a manifest sitting there contributed its `skills`, whose every `*.md` frontmatter
+is composed into the model's system prompt on the next turn. Read-only, and still
+content from outside the workspace entering the context unasked. A `path` that
+resolves outside the root — absolute, `..`, or through a symbolic link — makes the
+declaration one of the `dropped()`, with the reason. The check is
+`contain_under_root` rather than the lexical rule a `[[bin]]` gets, because this
+directory has to exist for there to be a manifest at all, so a link is a live
+route here in a way it is not for an executable a bundle has not built yet.
 
 ## Installing what it contributed
 
@@ -90,14 +103,33 @@ further out, so the same rule governs it:
 | Declared in | skills, templates, agents, deny policy | `[[hook]]`, `[[mcp]]`, `[[bin]]` |
 | --- | --- | --- |
 | `io.toml` (project) | yes | **no** |
-| `io.local.toml` (local) | yes | yes |
+| `io.local.toml` (local) | yes | **no** (0.74.0) |
 | user-scope file | yes | yes |
 
-The refusal is **whole**. A project-scoped bundle whose manifest declares a hook
-contributes none of its other six kinds either — a half-applied stranger's
-manifest is the failure the rule exists to prevent.
+**`io.local.toml` moved to the refusing side in 0.74.0**, and audit finding H2 is
+why: it sits at the workspace root, which is a path the run's own agent can write
+and a clone can ship. `[[plugin]]` is deliberately not a refused section, so a
+workspace file may still *declare* a bundle — the agent wrote `io.local.toml`
+naming one, wrote that bundle's own `plugin.toml` carrying a `[[hook]]`, and the
+next `discover().plugins()` carried it: two ordinary writes and no refusal anywhere
+on the path. The refusal is therefore on what the **manifest** contributes rather
+than on the declaration, because a bundle contributing only skills or templates is
+the ordinary case.
 
-Two rules apply in every scope. **A manifest is not substituted at all** —
+The refusal is **whole**. A workspace-declared bundle whose manifest declares a
+hook contributes none of its other six kinds either — a half-applied stranger's
+manifest is the failure the rule exists to prevent. It applies to a bundle written
+`enabled = false` as well: switching one on is a one-character edit.
+
+Three rules apply in every scope. **A bundle points only at itself**: `skills`,
+`templates` and a `[[bin]]`'s `path` are each resolved by joining onto the plugin
+root, where an absolute value replaces it and a `..` climbs out, and all three are
+refused lexically at load. The cost is highest for the first two — a `[[bin]]` is
+a path handed back for a caller to decide about, while a skills directory is
+*read* at run start and the frontmatter of every `*.md` under it reaches the
+model's system prompt on every turn, so `skills = "/home/you/notes"` put a
+directory nobody agreed to into the context of every request. **A manifest is not
+substituted at all** —
 `${env:}`, `${file:}` and `${cmd:}` are each refused wherever the declaring file
 lives, because a bundle is a third party's file however it was named. Resolving
 one would read this machine's environment or its files, or run a program on it,
@@ -285,12 +317,12 @@ bundle. This crate cannot rewrite prose.
 does not stop the run, so an operator who watches neither can run for a week
 without deny rules they believe are installed.
 
-**The standing `[[mcp]]` gap in `io.toml` itself is unchanged.** A project-scoped
-`io.toml` may still name an MCP command directly, and an unknown key inside an
-`[[mcp]]` table is still accepted because serde refuses `flatten` beside
-`deny_unknown_fields`. A *plugin's* `[[mcp]]` is refused at project scope, so the
-new surface is stricter than the old one — deliberately: new surface starts
-closed.
+**The `[[mcp]]` gap in `io.toml` itself closed in 0.74.0.** A workspace file could
+name an MCP command directly while a *plugin's* `[[mcp]]` was refused there — new
+surface started closed and the existing one was left alone. Both are refused now,
+so the same declaration is refused with a bundle around it and without one. An
+unknown key inside an `[[mcp]]` table is still accepted, because serde refuses
+`flatten` beside `deny_unknown_fields`.
 
 **`version` in a manifest is documentation.** Nothing resolves it, compares it,
 or checks it against the crate.

@@ -80,7 +80,8 @@ const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 /// **What this environment does not reach: the repository's own `.git/config`.**
 /// `GIT_CONFIG_NOSYSTEM` and `GIT_CONFIG_GLOBAL` cover the system and global
 /// files. There is no equivalent for the repo-local one, and git always reads
-/// it. That file is why `.git/**` is a write deny in [`Policy::default`] as of
+/// it. That file is why `.git/*` and `*/.git/*` are write denies in
+/// [`Policy::default`]'s `builtin-config` layer as of
 /// 0.74.0 — the agent must not be able to author it — but a repository that
 /// arrives with one already present is a separate problem from a repository the
 /// agent edits.
@@ -646,9 +647,11 @@ impl<'a> Git<'a> {
 
     /// Use a `git` that is not on `PATH` under that name.
     ///
-    /// The policy check targets this exact string; `Act::Exec` patterns match by
-    /// full text or by basename, so a rule naming `git` still covers
-    /// `/usr/bin/git`.
+    /// The policy check targets this exact string. An `Act::Exec` **deny** also
+    /// matches by basename, and case-insensitively, so `deny_exec("git")` still
+    /// covers `/usr/bin/git`; since 0.74.0 an **allow** matches the full text
+    /// only, so `allow_exec("git")` does not cover a path spelling. An allow that
+    /// misses falls to the exec tier default, which asks or refuses.
     // Only the tests need this today: production always runs the `git` on PATH,
     // and a caller-configurable git binary is a capability nobody has asked for.
     #[cfg(test)]

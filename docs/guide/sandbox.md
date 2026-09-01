@@ -82,8 +82,14 @@ section tells it so rather than claiming the per-host rules it cannot enforce.
 
 The access half is an AppContainer, and 0.26.0 built it: `io_harness::sandbox::appcontainer`
 creates a container profile, derives its SID, grants a path to it with an explicit
-ACE, and spawns a process into it through `CreateProcessW` with a
-`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute list. It is proven on the
+ACE, and spawns a process into it through `CreateProcessW` with a process-thread
+attribute list carrying two attributes —
+`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, which puts the child in the
+container, and `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (0.74.0), which decides what
+crosses into it. The second is not decoration: without it `bInheritHandles` is a
+blanket grant of every inheritable handle this process holds, carrying the access
+each was opened with, and no ACL sees it, because a handle does not go back
+through an access check. It is proven on the
 Windows CI runner, and each claim carries a negative control — the identical
 payload outside the container, which must succeed at the thing the container is
 refused:

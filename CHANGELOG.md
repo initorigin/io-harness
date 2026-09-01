@@ -60,8 +60,12 @@ half a fix.
   A workspace file may still **narrow** the boundary, which is what the project
   scope is for.
 
-- **BREAKING (behaviour)** — `.git/**`, `io.toml` and `io.local.toml` are
-  deny-by-default to `write_file`, `edit_file` and `patch_file`.
+- **BREAKING (behaviour)** — `.git/*`, `*/.git/*`, `io.toml` and `io.local.toml`
+  are deny-by-default to `write_file`, `edit_file` and `patch_file`. They live in
+  a layer of their own, `builtin-config`, rather than among the secret patterns:
+  these are not secrets and are not denied for reading, they are the files
+  something *else* reads back, so a refusal names a different reason and a trace
+  can tell the two apart.
 
   *Migration:* none for ordinary work. `git_add`, `git_commit` and `git_branch`
   cover every legitimate reason to write inside `.git`, and configuration is not
@@ -114,6 +118,93 @@ half a fix.
   rewrite applied — the original argv ran and the trace recorded the rewrite.
   Approve or deny instead. Rewrites of reads and writes are unaffected.
 
+- **BREAKING (behaviour)** — `sandbox::copy_back` refuses a path that leaves
+  either root rather than following it. Every entry must be relative and made of
+  ordinary components: a `..`, a root, a Windows prefix, or a symbolic link at
+  the source is `Error::Refused`, and the resolved destination is re-checked
+  against `dest_root` before anything is written.
+
+  *Migration:* pass workspace-relative paths, which is what a sandbox outcome
+  already hands you. There is no opt-out, and the reason is that the predicate
+  is given the *relative* path: a caller consulting a write policy was being
+  asked about `../../etc/authorized_keys` and answering about a file somewhere
+  else entirely, and a symlinked source copied the contents of whatever it
+  pointed at. A listed file the sandbox never produced is still **skipped**, as
+  before; only a path that cannot be under the root is an error.
+
+### Added
+
+- **The containment a run reports is now measured rather than declared.**
+  `BoundaryProbe` attempts a write and a dial outside the boundary before the
+  first step, and `confines_writes()`, `denies_egress()` and the boundary
+  sentence the agent is given all answer from what happened rather than from the
+  backend's own claim. Three findings in this release were a backend reporting a
+  containment it had not applied; this is the guard that makes the fourth one
+  loud.
+
+- Every arm of the probe fails closed. One **control** child runs outside the
+  boundary first, so a host that could never have performed an arm reports it
+  unmeasured rather than refused, and an attempt that could not be made claims
+  nothing. A run on a host that cannot measure is told the boundary could not be
+  established — not that there is none.
+
+- The probe is measured **once per boundary**: once per run for a flat run, and
+  once per **tree**, before the root agent runs, for a tree. So a child agent's
+  run carries no probe row of its own, which is worth knowing before reading a
+  child's trace; an agent whose contract asks for a different `SandboxConfig`
+  measures that one. A run that asked for no containment is not probed and
+  records nothing — it makes no claim, and a row naming the backend that *would*
+  have been chosen is the same misattribution the probe exists to catch. What is
+  recorded is one `sandbox_events` row of kind `boundary_probe`, at step 0, and
+  it is announced on the event stream like every other row in that table.
+
+### Changed
+
+- `deny_net` matches a host case-insensitively and ignores one trailing root
+  dot, so `deny_net("evil.example")` covers `EVIL.example:443` and
+  `evil.example.`. The fold applies to denies only: folding an allow would
+  widen it, and this release adds no widening.
+
+- An `Act::Exec` deny matches its target case-insensitively and splits a
+  Windows path on `\`. The basename fallback now applies to denies only —
+  `allow_exec("cargo")` previously also granted `./target/debug/cargo`, a binary
+  the agent had built for itself.
+
+- The egress proxy resolves a permitted host **once** and dials exactly the
+  addresses that resolution produced, closing the window in which the answer that
+  was checked and the answer that was dialled did not have to be the same one. A
+  resolution that fails is therefore reported as a refusal attributed to the
+  local-address floor — a 403 naming the reason, and a dial row marked not
+  allowed — where it used to surface as a 502 from the connect. A command whose
+  dependency fetch fails can still tell "this host is not permitted" from "the
+  network is down": both say which.
+
+- On Windows a run killed hard leaves its AppContainer profile and the ACEs that
+  named it behind, and what that costs is now written down. They are **inert for
+  access** — the SID names a container that no longer exists, so nothing can
+  enter it — but not for DACL capacity: each orphaned run leaves one ACE per
+  granted path plus a traverse ACE per ancestor, and a DACL has 64 KB of room,
+  past which every later grant on that object fails. It fails loudly rather than
+  silently, and an ordinary teardown revokes every ACE naming the SID.
+
+### Fixed
+
+- `spawn_agent` is refused while a proposed plan is unapproved, and a child that
+  does spawn inherits the policy its parent is running under rather than the
+  contract's. A plan gate could previously be stepped around by emitting
+  `spawn_agent` instead of `propose_plan`.
+
+- `before_tool` hooks fire for `spawn_agent`, `send_message` and
+  `read_messages`. An operator's hook on those three loaded, validated,
+  installed and never ran.
+
+- A remembered approval survives the tree loop, so "approve and stop asking" is
+  no longer re-asked at every step inside `run_tree`.
+
+- On Windows, teardown no longer revokes grants that failed. On a host where the
+  harness is not an administrator, every run ended with a security-descriptor
+  tree walk of `%SystemRoot%` to remove an ACE it had never written.
+
 ### Security
 
 - **The gate is on the post-edit path.** The reflex that runs a project's own
@@ -124,6 +215,82 @@ half a fix.
   `Act::Write` prompts and nothing else. The same fix closed a second spawn
   found beside it: the model-callable `check` tool gated its checker and then
   ran it outside the run's sandbox.
+
+- **An address-level floor sits under every network decision.** Until this
+  release every net decision in the crate was a hostname glob, so
+  `Policy::permissive()` handed the model cloud metadata, localhost admin ports
+  and the internal network. Loopback, link-local, cloud metadata, unique-local
+  and RFC 1918 addresses are refused whatever the policy says, and the check is
+  made **after resolution**, against the addresses that will actually be dialled.
+  `IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1` lifts it for the local-model case — an
+  environment variable and not an `io.toml` key, because a key that widens is one
+  a cloned repository could set, and the environment of a process that has
+  already started is the one thing a hostile repository cannot write. The
+  metadata hostnames and `169.254.169.254` stay refused even then. A refusal
+  names the floor as its layer, so a trace tells "your rules refused this" apart
+  from "the floor underneath your rules refused this".
+
+- **A browser navigation that reaches no host is decided by its scheme**, before
+  the navigation is issued. Only `http`, `https`, `ws` and `wss` reduce to a
+  `host:port`, so nothing else was ever decided: `browser_navigate` to a `file:`
+  URL read a local file past `Act::Read` and past every secret deny, and recorded
+  nothing. `about:blank` is permitted and every other scheme is refused —
+  an allowlist, so a scheme nobody has considered is refused too. Each decision
+  is a `BrowserNavigated` event whose `host` is the **scheme**: a `data:` URL is
+  its own payload and a `javascript:` URL is a program, and neither belongs in
+  the trace.
+
+- **A language server is told nothing about a path the policy has not cleared.**
+  The `path` a navigation names is an `Act::Read` check taken before anything
+  reads it, and it is `Workspace::check_path`, so an absolute path and a `..`
+  that climbs out are refused as they are everywhere else — until now the
+  argument was joined onto the root, read from disk and shipped to the server, so
+  `lsp_hover {"path": "../../../../etc/shadow"}` crossed the boundary
+  `read_file` would have refused and left no row. A refusal is written through
+  the same gate every other refusal is, which has a consequence worth stating: a
+  policy whose read tier is `Ask` now **prompts** on a navigation where it passed
+  silently. `Policy::default()` allows reads, so the common configuration is
+  unchanged.
+
+- **`lsp_rename` renders a file only if the policy allows reading it outright.**
+  A `WorkspaceEdit` names files the *server* chose, and rendering one puts every
+  removed line in the model's context, so each path is resolved under the
+  workspace root and must be an outright allow. An `Ask` no longer passes: there
+  is no approver on that path, and an unanswered question is not permission. The
+  cost is stated rather than hidden — under such a policy a rename renders no
+  patch and says so, and a run that wants one grants `allow_read` over the tree
+  it is renaming in.
+
+- **A shell redirect is contained the way a write is.** `shell::resolve` was
+  purely lexical, so `echo x > docs/ext/.bashrc` through a checked-in
+  `docs/ext -> $HOME` symlink created a file in the home directory. Every
+  redirect target now takes the same containment check `write_file` takes. In the
+  same pass, a `cd` target may not carry a double quote, a backslash or a control
+  character: that directory becomes the workdir a later stage is contained in,
+  and on macOS it is interpolated into an SBPL profile. `cd 'My Project'` is
+  still ordinary and still allowed.
+
+- **A workspace file cannot aim the system prompt at a directory outside the
+  workspace.** `run.skills`, `run.templates` and a `[[plugin]]`'s own `path` were
+  each resolved by joining onto the discovery root, where an absolute value
+  replaces that root and a `..` climbs out of it — and the frontmatter of every
+  `*.md` under a skills or templates directory is composed into the model's
+  system prompt on every turn, read-only, unasked, before any `Policy` exists to
+  have an opinion about the read. The two `run` keys are refused in `io.toml` and
+  `io.local.toml`; a `[[plugin]]` path that resolves outside the root — absolute,
+  `..`, or through a symbolic link — is dropped with its reason; and a bundle's
+  own `skills` and `templates` are held to the rule `[[bin]]` already had, in
+  every scope. The user scope still points wherever the operator wants, which is
+  what keeps a shared skills directory outside the project working.
+
+- **`git_worktree` cannot create a checkout outside the workspace.** It is the
+  one git built-in that creates the path the model names, and the gate routes an
+  *absolute* read or write target to the policy alone — a relaxation that exists
+  so `read_skill` can reach a bundle outside the root. `{"path":"/tmp/escaped"}`
+  therefore wrote a full checkout outside the workspace with an allow-shaped
+  trace row to match. The path is now asked of `Workspace::check_path` directly,
+  so an absolute spelling and a `..` that climbs out are the same refusal, with
+  the same row, as every other path in this crate.
 
 - **A path can no longer rewrite the macOS sandbox profile.** `workdir` and the
   writable roots were interpolated into the `sandbox-exec` profile with no
@@ -152,6 +319,16 @@ half a fix.
   override, and `GIT_ATTR_NOSYSTEM` stops the system attributes file selecting a
   driver. What `-c` cannot reach is refused outright.
 
+- **A credential file other accounts on the host can reach is named.** On unix,
+  `io.local.toml`, the user-scope file and every `${file:}` target are warned
+  about through `tracing` when any group or other permission bit is set, naming
+  the file, its mode and the `chmod 600` that fixes it. A warning rather than
+  `ssh`'s refusal, deliberately: this is a library inside somebody else's binary
+  and `0644` is what a `umask 022` host produces, so refusing would turn an
+  upgrade into a startup failure for the common case. The committed `io.toml` is
+  not checked — it is world-readable by design, and a warning on every run is one
+  an operator learns to ignore.
+
 - **The store is created readable only by the user that created it** on unix,
   and an existing store is tightened on open. The trace holds whatever the run
   saw — a step that read a credentials file puts those credentials in
@@ -161,36 +338,6 @@ half a fix.
 - **A column name read from a store's own schema is quoted** before it reaches a
   statement. A database with an unusual or foreign column name could previously
   not be sized, archived or swept.
-
-### Fixed
-
-- `spawn_agent` is refused while a proposed plan is unapproved, and a child that
-  does spawn inherits the policy its parent is running under rather than the
-  contract's. A plan gate could previously be stepped around by emitting
-  `spawn_agent` instead of `propose_plan`.
-
-- `before_tool` hooks fire for `spawn_agent`, `send_message` and
-  `read_messages`. An operator's hook on those three loaded, validated,
-  installed and never ran.
-
-- A remembered approval survives the tree loop, so "approve and stop asking" is
-  no longer re-asked at every step inside `run_tree`.
-
-- On Windows, teardown no longer revokes grants that failed. On a host where the
-  harness is not an administrator, every run ended with a security-descriptor
-  tree walk of `%SystemRoot%` to remove an ACE it had never written.
-
-### Changed
-
-- `deny_net` matches a host case-insensitively and ignores one trailing root
-  dot, so `deny_net("evil.example")` covers `EVIL.example:443` and
-  `evil.example.`. The fold applies to denies only: folding an allow would
-  widen it, and this release adds no widening.
-
-- An `Act::Exec` deny matches its target case-insensitively and splits a
-  Windows path on `\`. The basename fallback now applies to denies only —
-  `allow_exec("cargo")` previously also granted `./target/debug/cargo`, a binary
-  the agent had built for itself.
 
 ## [0.73.0] - 2026-08-31
 

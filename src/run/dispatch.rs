@@ -2178,6 +2178,14 @@ pub(super) async fn dispatch(
             // check on the program could not tell those two apart, which is the
             // weakness the git built-ins were built to route around and the reason
             // they still exist.
+            //
+            // The argv check is a way of narrowing an allowlist and not a
+            // blocklist: a joined argv has more spellings than a pattern can
+            // enumerate — `git -c x push`, `env rm`, `busybox rm` — so a
+            // `deny_exec` over a permissive `defaults.exec` is a boundary with an
+            // unbounded number of ways around it. Documented on `EXEC_TOOL` and in
+            // `docs/CONTRACT.md` rather than fixed, because the fix is the shape of
+            // the policy a caller writes, not another pattern here.
             let joined = argv.join(" ");
             let mut remembered: Vec<Rule> = Vec::new();
             let mut targets = vec![program.clone()];

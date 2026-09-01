@@ -163,28 +163,28 @@ fn c3_a_file_substitution_is_refused_in_the_project_scope() {
     for (err, what) in [(&from_file, "file"), (&from_cmd, "cmd")] {
         assert!(err.contains("key `app.cli.token`"), "names the key: {err}");
         assert!(
-            err.contains(&format!("`${{{what}:}}` is refused in the project scope")),
+            err.contains(&format!(
+                "`${{{what}:}}` is refused in a file inside the workspace"
+            )),
             "names the substitution and the scope: {err}"
         );
         assert!(err.contains("the user-scope file"), "{err}");
     }
 
-    // The control. It is the *scope* that refuses these two, not substitution:
-    // `${env:}` still resolves in a project file, and both still resolve in the
-    // scopes a workspace cannot write.
-    std::fs::write(project.path().join("secret"), "s3cret\n").unwrap();
+    // The control. It is the *scope* that refuses these two, not substitution
+    // itself: `${env:}` still resolves in a workspace file, because reading this
+    // process's own environment runs nothing and reaches no path the file chose.
+    //
+    // `${file:}` is deliberately NOT exercised at local scope here any more.
+    // 0.74.0 holds `io.local.toml` to the same rule (audit H2) — it sits at the
+    // workspace root, so the agent can write it — and the control for that side
+    // is `h2_companion_the_user_scope_still_resolves_a_command_and_a_file`.
     write(
         project.path(),
         "io.toml",
         "[app.cli]\nfrom_env = \"${env:IO_CONFIG_HOME}\"\n",
     );
-    write(
-        project.path(),
-        "io.local.toml",
-        "[app.cli]\nfrom_file = \"${file:secret}\"\n",
-    );
-    Config::discover(project.path())
-        .expect("`${env:}` at project scope and `${file:}` at local scope still resolve");
+    Config::discover(project.path()).expect("`${env:}` in a workspace file still resolves");
 }
 
 // ---------------------------------------------------------------------------
@@ -397,4 +397,73 @@ fn a_narrowing_project_file_still_loads() {
     assert_eq!(agents.names(), vec!["searcher"]);
     assert!(config.policy().is_some());
     assert!(config.sandbox().is_some());
+}
+
+/// H2 by the shortest route there is, and the one the finding does not describe.
+///
+/// The finding is written about `[[hook]]` and `[[mcp]]` — an agent writes
+/// `io.local.toml`, and the next `Config::discover` spawns the argv it named. The
+/// widening allowlist closed that. It did not close this: `${cmd:}` **runs a
+/// program during parsing**, before any `Policy` or sandbox exists, and it was
+/// refused for `io.toml` alone. So the same attack needed no `[[hook]]` at all —
+/// any key in any table, and `[app]` accepts arbitrary ones.
+///
+/// Worse than the section route in two ways. It runs at *load* rather than at a
+/// lifecycle event, so it does not wait for the run to reach anything; and
+/// expansion happens before the widening check, so even a section that is about
+/// to be refused has already run its substitution.
+///
+/// `${file:}` is the read-only half of the same door: the argument is joined onto
+/// the declaring file's directory and an absolute one names any path on the host,
+/// resolved before `Act::Read` exists.
+#[test]
+fn h2_a_workspace_file_may_not_run_a_program_or_read_a_path_while_it_is_parsed() {
+    for file in ["io.toml", "io.local.toml"] {
+        for (subst, needle) in [("cmd", "${cmd:}"), ("file", "${file:}")] {
+            let user = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let _guard = env(user.path());
+
+            // `[app]` on purpose: it takes arbitrary keys, so this needs none of
+            // the tables the allowlist refuses. A fix that only covered the
+            // refused sections would pass a test written against one of them.
+            write(
+                root.path(),
+                file,
+                &format!("[app]\nanything = \"${{{subst}:/usr/bin/whoami}}\"\n"),
+            );
+
+            let err = refusal(root.path());
+            assert!(
+                err.contains(needle),
+                "{file} must refuse {needle} while it is parsed: {err}"
+            );
+            teaches(&err, "app.anything");
+        }
+    }
+}
+
+/// The control: the user scope still runs both, which is what they are for.
+///
+/// Without this the test above is satisfied by a build that refused every
+/// substitution everywhere and took the feature away.
+#[test]
+fn h2_companion_the_user_scope_still_resolves_a_command_and_a_file() {
+    let user = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let _guard = env(user.path());
+
+    std::fs::write(user.path().join("secret.txt"), "from-a-file\n").unwrap();
+    write(
+        user.path(),
+        "io.toml",
+        "[app]\nfrom_file = \"${file:secret.txt}\"\n",
+    );
+
+    let config = Config::discover(root.path()).expect("the user scope may still substitute");
+    let keys: Vec<&str> = config.origins().map(|(k, _)| k).collect();
+    assert!(
+        keys.iter().any(|k| k.contains("from_file")),
+        "the value was read rather than skipped: {keys:?}"
+    );
 }

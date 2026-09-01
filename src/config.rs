@@ -94,6 +94,16 @@
 //! naming the key — because an empty string in a boundary rule is a rule that
 //! matches nothing.
 //!
+//! **A credential file readable by other accounts is named, not refused**
+//! (0.74.0). On unix, `io.local.toml`, the user-scope `io.toml` and every
+//! `${file:}` target are warned about through `tracing` when any group or other
+//! permission bit is set — the file, its mode, and the `chmod 600` that fixes it.
+//! It is a warning rather than `ssh`'s refusal because this is a library inside
+//! somebody else's binary and `0644` is what a `umask 022` host produces by
+//! default: refusing would turn an upgrade into a startup failure for the common
+//! case. The committed `io.toml` is not checked at all — it is world-readable by
+//! design, and a warning on every run is one an operator learns to ignore.
+//!
 //! **A file inside a workspace may narrow the boundary and may never widen it**
 //! (0.27.0; extended from the project scope to `io.local.toml` in 0.74.0).
 //! `io.toml` arrives with a `git clone`, and `io.local.toml` sits in the workspace
@@ -104,7 +114,13 @@
 //! `sandbox.force_floor = false` and `sandbox.mode = "full-access"`. So are
 //! `[[hook]]`, `[browser]`, `[[provider]]`, `[[mcp]]` and `[[lsp]]` whole, each
 //! because it names a program to run or an endpoint a credential is sent to. So
-//! are `${cmd:}` and `${file:}` anywhere in a project-scoped file.
+//! are `${cmd:}` and `${file:}` anywhere in a file inside the workspace — the
+//! first runs a program while the file is being parsed, which is the same door
+//! reached without any of the tables above. And `run.skills`
+//! and `run.templates` may not leave the workspace root there (0.74.0): both are
+//! joined onto the discovery root, where an absolute value replaces it and a `..`
+//! climbs out, and every `*.md` under whatever they name is composed into the
+//! model's system prompt on every turn.
 //!
 //! The **user scope** is where all of them are written instead. It is the one file
 //! nothing in a workspace can reach, which is the whole of why it is the one still
@@ -2073,11 +2089,62 @@ fn env_dir(var: &str) -> Option<PathBuf> {
 // Parse, substitute, validate, merge
 // ---------------------------------------------------------------------------
 
+/// Name a credential file that other accounts on this host can reach (0.74.0).
+///
+/// `io.local.toml`, the user-scope `io.toml` and every `${file:}` target hold the
+/// one thing in this format worth stealing — an `api_key`, a bearer token, a
+/// header. They were read with `read_to_string` and their mode was never looked
+/// at, so a file left at `0644` by an editor's umask handed every account on a
+/// shared host a working credential, and nothing anywhere said so.
+///
+/// **A warning, not a refusal**, and the difference is the whole decision. `ssh`
+/// refuses because it is an interactive client that can say why and be re-run a
+/// second later; this is a library inside somebody else's binary, where the same
+/// rule turns an upgrade into a startup failure for every operator whose config
+/// arrived at `0644` — which is the default outcome of a `umask 022` host and so
+/// is the *common* case, not the exceptional one. Refusing would break far more
+/// working setups than the finding is worth, and an operator who reads the
+/// warning fixes it with one `chmod`.
+///
+/// `Scope::Project` is deliberately not checked. `io.toml` is committed and
+/// arrives from a `git clone` world-readable by design; warning on it every time
+/// is what teaches an operator to ignore the warning that matters.
+///
+/// Unix only. Windows expresses this with ACLs, which have no mode to compare and
+/// no `chmod` to recommend, so there is nothing here that would be true there.
+#[cfg(unix)]
+fn warn_if_exposed(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    // The same mask `ssh` uses: any group or other bit at all, not the read bits
+    // alone. A file another account may *write* is a file whose credential that
+    // account chooses next time.
+    if mode & 0o077 != 0 {
+        tracing::warn!(
+            "{}: mode {mode:04o} — this file is accessible to accounts other than its owner, \
+             and a credential in it is readable by every one of them. Run `chmod 600 {}`.",
+            path.display(),
+            path.display()
+        );
+    }
+}
+
+/// Windows has no mode to compare: see the unix half.
+#[cfg(not(unix))]
+fn warn_if_exposed(_path: &Path) {}
+
 /// Read one scope: parse it, substitute against its own directory, and validate
 /// it on its own so an error can name the file it came from.
 fn read_scope(scope: Scope, path: &Path) -> Result<toml::value::Table> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+    if scope != Scope::Project {
+        warn_if_exposed(path);
+    }
     let table = parse(scope, &text, path)?;
     // 0.74.0 — `Scope::Local` is held to this too. `io.local.toml` is the
     // operator's own file in intent; in fact it is a path in the workspace root,
@@ -2127,8 +2194,10 @@ fn declared_plugins(
 /// `scope` reaches all the way down to [`expand`] because two substitutions —
 /// `${cmd:...}`, which runs a program, and `${file:...}` (0.74.0), whose argument
 /// is joined onto the file's directory and so names any path when written absolute
-/// — are refused in the project scope, and the project scope is the one a
-/// `git clone` delivers.
+/// — are refused in every file inside the workspace. `io.toml` arrives with a
+/// `git clone`; `io.local.toml` is a path the run's own agent can write. Both are
+/// therefore somewhere a program to run may not be named, and `${cmd:}` runs its
+/// one here, during parsing, before any `Policy` or sandbox exists.
 pub(crate) fn parse(scope: Scope, text: &str, path: &Path) -> Result<toml::value::Table> {
     let mut table: toml::value::Table = toml::from_str(text)
         .map_err(|e| Error::Config(format!("{}: {}", path.display(), e.message())))?;
@@ -2279,9 +2348,12 @@ fn check_providers(providers: &[ProviderSpec]) -> Result<()> {
 
 /// A file inside a workspace may narrow the boundary and may never widen it.
 ///
-/// Two rules, and [`REFUSED_SECTIONS`] states the first of them as a sentence: no
-/// section that names a program to run or an endpoint a credential is sent to, and
-/// no [`PROJECT_WIDENING`] key set to its widening value.
+/// Three rules, and [`REFUSED_SECTIONS`] states the first of them as a sentence:
+/// no section that names a program to run or an endpoint a credential is sent to,
+/// no [`PROJECT_WIDENING`] key set to its widening value, and no `run.skills` or
+/// `run.templates` naming a directory outside the workspace root (0.74.0) — that
+/// third one is a *read* rather than an act, and it is here because the directory
+/// it names is composed into the model's system prompt on every turn.
 ///
 /// Held against the project scope since 0.27.0 and against `io.local.toml` since
 /// 0.74.0. `io.toml` arrives with a `git clone`; `io.local.toml` is the operator's
@@ -2328,6 +2400,50 @@ fn refuse_widening(scope: Scope, table: &toml::value::Table, path: &Path) -> Res
                  never widen it, because {because}. Write it in {USER_SCOPE} instead.",
                 path.display(),
                 keys.join(".")
+            )));
+        }
+    }
+    // 0.74.0, audit L13. `run.skills` and `run.templates` name directories whose
+    // `*.md` frontmatter is composed into the system prompt of every turn, and
+    // both are resolved by joining onto the discovery root — where an absolute
+    // value replaces that root outright and a relative one climbs out of it with
+    // `..`. A cloned `io.toml` saying `skills = "/home/you/.ssh"` therefore put
+    // this host's files into the model's context on the first turn, read-only and
+    // unasked, before any `Policy` existed to have an opinion about the read.
+    //
+    // Refused only in the scopes a workspace can supply. The user scope still
+    // points wherever the operator wants, which is what keeps a shared skills
+    // directory kept outside the project working.
+    //
+    // Lexical, like `plugin.rs`'s `[[bin]]` rule and for the same reason: nothing
+    // on this path touches the filesystem, and a directory that has not been
+    // checked out yet is not a config error. `Component` rather than a string
+    // test, so a Windows prefix (`C:\`), a bare root (`/etc`, which
+    // `Path::is_absolute` calls relative on Windows) and a `..` buried mid-path
+    // are one rule.
+    for key in ["skills", "templates"] {
+        let Some(written) = table
+            .get("run")
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get(key))
+            .and_then(toml::Value::as_str)
+        else {
+            continue;
+        };
+        let wrong = Path::new(written).components().find_map(|c| match c {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                Some("is an absolute path")
+            }
+            std::path::Component::ParentDir => Some("climbs out of the workspace root with `..`"),
+            _ => None,
+        });
+        if let Some(wrong) = wrong {
+            return Err(Error::Config(format!(
+                "{}: key `run.{key}`: `{written}` {wrong}, and {who} may narrow the boundary and \
+                 never widen it, because {because}. Every `*.md` under that directory reaches the \
+                 model's system prompt. Write it relative to the workspace root, or name it from \
+                 {USER_SCOPE} instead.",
+                path.display()
             )));
         }
     }
@@ -2488,19 +2604,28 @@ fn expand(scope: Scope, raw: &str, dir: &Path, key: &[String], path: &Path) -> R
             // and then sent wherever the file's other keys point. The read happens
             // before any `Policy` exists, so `Act::Read` never sees it.
             "file" => {
-                if scope == Scope::Project {
+                // 0.74.0, audit H2 — every scope inside the workspace, not just
+                // the committed one. `io.local.toml` sits at the workspace root,
+                // which is a path the run's own agent can write, so refusing this
+                // for `io.toml` alone left the same arbitrary read one file over.
+                if scope != Scope::User {
                     return Err(bad_key(
                         path,
                         key,
                         format!(
-                            "`${{file:}}` is refused in the project scope, because `{PROJECT_FILE}` \
-                             travels with a clone and the argument is joined onto its directory — \
-                             an absolute one names any path on this machine. Write it in \
-                             {USER_SCOPE} instead."
+                            "`${{file:}}` is refused in a file inside the workspace, because \
+                             `{PROJECT_FILE}` travels with a clone, `{LOCAL_FILE}` is a path this \
+                             run's own agent can write, and the argument is joined onto the file's \
+                             directory — an absolute one names any path on this machine. Write it \
+                             in {USER_SCOPE} instead."
                         ),
                     ));
                 }
                 let at = dir.join(arg);
+                // A `${file:}` target is a credential by construction — the
+                // feature exists to keep one out of a committed file — so this
+                // one is checked in every scope that reaches it.
+                warn_if_exposed(&at);
                 std::fs::read_to_string(&at)
                     .map_err(|e| {
                         bad_key(path, key, format!("cannot read `{}`: {e}", at.display()))
@@ -2512,13 +2637,24 @@ fn expand(scope: Scope, raw: &str, dir: &Path, key: &[String], path: &Path) -> R
             // file a `git clone` delivers — so the one scope that cannot use this is
             // the one an operator did not write.
             "cmd" => {
-                if scope == Scope::Project {
+                // 0.74.0, audit H2 — and this one is the sharpest edge of that
+                // finding rather than a tidy-up beside it. `${cmd:}` runs a
+                // program at load: outside the `Policy`, outside the sandbox,
+                // before the run has a first step. Refusing it for `io.toml`
+                // alone left the whole of H2 open by a shorter route than the one
+                // the finding describes — the agent writes `io.local.toml` with
+                // any key at all carrying a `${cmd:}`, and the next
+                // `Config::discover` runs it. No `[[hook]]` needed, and `[app]`
+                // takes arbitrary keys.
+                if scope != Scope::User {
                     return Err(bad_key(
                         path,
                         key,
                         format!(
-                            "`${{cmd:}}` is refused in the project scope, because `{PROJECT_FILE}` \
-                             travels with a clone. Write it in {USER_SCOPE} instead."
+                            "`${{cmd:}}` is refused in a file inside the workspace: it runs a \
+                             program at load, before any policy or sandbox exists. `{PROJECT_FILE}` \
+                             travels with a clone and `{LOCAL_FILE}` is a path this run's own agent \
+                             can write. Write it in {USER_SCOPE} instead."
                         ),
                     ));
                 }
@@ -2718,7 +2854,12 @@ mod tests {
 
         let key = ["run".to_string()];
         let path = Path::new("io.toml");
-        let at = Scope::Local;
+        // The user scope, because since 0.74.0 it is the only one `${file:}`
+        // resolves in at all. The claim here is about what a substitution turns
+        // into — a value, or an error naming the key, and never an empty string —
+        // not about which file may carry one, so it is asserted in the scope where
+        // every form still runs.
+        let at = Scope::User;
         assert_eq!(
             expand(at, "${env:IO_HARNESS_TEST_SET}", dir.path(), &key, path).unwrap(),
             "from-the-environment"
@@ -2749,8 +2890,15 @@ mod tests {
         );
     }
 
+    /// 0.74.0, audit H2 — the boundary is the workspace, not the committed file.
+    ///
+    /// `io.local.toml` sits at the workspace root, which is a path the run's own
+    /// agent writes to, so a rule that refused `${cmd:}` in `io.toml` alone left the
+    /// same load-time execution one file over. Both workspace scopes are asserted
+    /// here, and `${file:}` beside `${cmd:}`, because they are one rule with two
+    /// arms and an arm with no assertion is an arm nothing holds.
     #[test]
-    fn a_command_substitution_runs_outside_the_project_scope_and_never_inside_it() {
+    fn a_command_substitution_runs_in_the_user_scope_and_never_in_a_workspace_file() {
         // Each platform's own spelling of "print this", "succeed silently" and
         // "fail". Named rather than skipped: `${cmd:}` is a real feature on Windows
         // and a test that ran on two platforms out of three would prove it there.
@@ -2760,13 +2908,15 @@ mod tests {
         let (echo, quiet, fail) = ("printf s3cret", "true", "false");
 
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("token"), "s3cret\n").unwrap();
         let key = ["mcp".to_string()];
-        let path = Path::new("io.local.toml");
+        // The user-scope file, which is the only one either of these runs in now.
+        let path = Path::new("io.toml");
 
         // A trailing newline is trimmed, and the value composes inside a larger string.
         assert_eq!(
             expand(
-                Scope::Local,
+                Scope::User,
                 &format!("Bearer ${{cmd:{echo}}}"),
                 dir.path(),
                 &key,
@@ -2786,37 +2936,50 @@ mod tests {
             (format!("${{cmd:{quiet}}}"), "resolved to nothing"),
         ] {
             let input = input.as_str();
-            let err = expand(Scope::Local, input, dir.path(), &key, path)
+            let err = expand(Scope::User, input, dir.path(), &key, path)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(expect), "{input}: {err}");
         }
 
-        // The project scope refuses it outright, before running anything.
-        let err = expand(
-            Scope::Project,
-            &format!("${{cmd:{echo}}}"),
-            dir.path(),
-            &key,
-            Path::new(PROJECT_FILE),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("refused in the project scope"), "{err}");
-        // The negative control: it is `cmd:` that is refused there, not substitution.
-        // A rule that disarmed `${env:}` in the project scope would be a much worse
-        // feature that this test would otherwise pass.
-        std::env::set_var("IO_HARNESS_TEST_SET", "from-the-environment");
-        assert_eq!(
-            expand(
-                Scope::Project,
-                "${env:IO_HARNESS_TEST_SET}",
-                dir.path(),
-                &key,
-                Path::new(PROJECT_FILE),
-            )
-            .unwrap(),
-            "from-the-environment"
-        );
+        // Both files inside the workspace refuse both substitutions outright, before
+        // running or reading anything. The success above is what proves the refusal
+        // is the scope and not a `${cmd:}` that stopped working.
+        for (scope, file) in [(Scope::Project, PROJECT_FILE), (Scope::Local, LOCAL_FILE)] {
+            for (input, needle) in [
+                (format!("${{cmd:{echo}}}"), "`${cmd:}`"),
+                ("${file:token}".to_string(), "`${file:}`"),
+            ] {
+                let err = expand(scope, &input, dir.path(), &key, Path::new(file))
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains(&format!(
+                        "{needle} is refused in a file inside the workspace"
+                    )),
+                    "{file}: {err}"
+                );
+                assert!(
+                    err.contains(USER_SCOPE),
+                    "the error says where to write it instead: {err}"
+                );
+            }
+
+            // The negative control: it is `cmd:` and `file:` that a workspace file
+            // refuses, not substitution. A rule that disarmed `${env:}` there would
+            // be a much worse feature that this test would otherwise pass.
+            std::env::set_var("IO_HARNESS_TEST_SET", "from-the-environment");
+            assert_eq!(
+                expand(
+                    scope,
+                    "${env:IO_HARNESS_TEST_SET}",
+                    dir.path(),
+                    &key,
+                    Path::new(file),
+                )
+                .unwrap(),
+                "from-the-environment"
+            );
+        }
     }
 }

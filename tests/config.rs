@@ -186,9 +186,9 @@ fn f5_an_unknown_key_fails_the_load_naming_the_key_and_the_file() {
 
 /// The user scope throughout, and not incidentally: `[[mcp]]` may be declared
 /// nowhere else since 0.74.0, and `${file:}` — like `${cmd:}` before it — is
-/// refused in the project scope, so a file named there would be refused for the
-/// scope rather than read and reported on. The claim under test is about
-/// substitution, so it is asserted in the scope where substitution still runs.
+/// refused in every file inside the workspace, so a file named there would be
+/// refused for the scope rather than read and reported on. The claim under test is
+/// about substitution, so it is asserted in the scope where substitution still runs.
 #[test]
 fn f6_substitution_reaches_the_field_or_names_the_key_that_failed() {
     let user_dir = tempfile::tempdir().unwrap();
@@ -310,9 +310,12 @@ fn origin_of_a_substituted_value_is_the_file_it_was_written_in() {
     let _guard = env(user_dir.path());
     std::env::set_var("IO_HARNESS_ORIGIN_TEST_SKILLS", "skills");
 
-    // `${cmd:}` is refused in the project scope, so both substituted forms are
-    // written in the local one — where the question "which file said this" is
-    // exactly as live.
+    // `${cmd:}` — and `${file:}` with it since 0.74.0 — is refused in every file
+    // inside the workspace, so both substituted forms are written in the user
+    // scope, the one scope where they still run. The question this test asks,
+    // "which file said this", is exactly as live there: a substituted value is
+    // still the one form whose origin an implementation could report as the
+    // mechanism instead of the file.
     let cases = [
         (
             "${env:IO_HARNESS_ORIGIN_TEST_SKILLS}",
@@ -328,15 +331,15 @@ fn origin_of_a_substituted_value_is_the_file_it_was_written_in() {
     let mut answers = Vec::new();
     for (value, what) in cases {
         write(
-            project.path(),
-            "io.local.toml",
+            user_dir.path(),
+            "io.toml",
             &format!("[run]\nskills = \"{value}\"\n"),
         );
         let config = Config::discover(project.path()).unwrap();
         let at = config.origin("run.skills");
         assert_eq!(at.len(), 1, "{what}");
-        assert_eq!(at[0].scope, Scope::Local, "{what}");
-        assert_eq!(at[0].path, project.path().join("io.local.toml"), "{what}");
+        assert_eq!(at[0].scope, Scope::User, "{what}");
+        assert_eq!(at[0].path, user_dir.path().join("io.toml"), "{what}");
         answers.push(at[0].clone());
     }
     assert!(
@@ -1733,15 +1736,21 @@ fn the_app_table_takes_keys_this_crate_has_never_heard_of() {
 /// F4 — through real files, since the scope is what decides and a scope only
 /// exists on disk.
 ///
-/// **Carried on `[app]` since 0.74.0, and the claim is unchanged.** `${cmd:}` is
-/// refused in the project scope and runs in every other, exactly as before; what
-/// moved is the table it used to be demonstrated through. `[[mcp]]` is now a
-/// user-scope section, so a project file carrying one is refused for the *section*
-/// before a substitution is ever expanded, and the assertion below would be
-/// measuring the wrong rule. `[app]` is a section a workspace file may still write,
-/// which is what keeps this a test about the substitution.
+/// **Carried on `[app]` since 0.74.0, and the boundary moved with it.** `${cmd:}`
+/// runs a program while a file is being parsed, so 0.74.0's audit finding H2 holds
+/// `io.local.toml` to the same refusal as `io.toml`: it sits at the workspace root,
+/// which is a path the run's own agent writes to, and `[app]` takes arbitrary keys —
+/// so leaving it trusted left load-time execution reachable by one `write_file` and
+/// no `[[hook]]` at all. The user scope is the one that still runs it, and is the
+/// only scope outside every workspace.
+///
+/// `[app]` rather than `[[mcp]]`: `[[mcp]]` is a user-scope section now, so a
+/// workspace file carrying one is refused for the *section* before a substitution is
+/// ever expanded, and this would be measuring the wrong rule. `[app]` is a section a
+/// workspace file may still write, which is what keeps this a test about the
+/// substitution.
 #[test]
-fn a_command_substitution_is_refused_in_the_project_scope_and_runs_in_the_local_one() {
+fn a_command_substitution_is_refused_in_every_workspace_file_and_runs_in_the_user_scope() {
     #[cfg(windows)]
     let echo = "cmd /c echo s3cret";
     #[cfg(not(windows))]
@@ -1760,14 +1769,22 @@ fn a_command_substitution_is_refused_in_the_project_scope_and_runs_in_the_local_
             .clone()
     };
 
-    write(project.path(), "io.toml", &app(&format!("${{cmd:{echo}}}")));
-    let err = Config::discover(project.path()).unwrap_err().to_string();
-    assert!(err.contains("refused in the project scope"), "{err}");
-    assert!(err.contains("io.toml"), "the error names the file: {err}");
+    // Both files inside the workspace, each on its own so a fix that covered the
+    // committed one alone fails here rather than passing on the other's back.
+    for file in ["io.toml", "io.local.toml"] {
+        write(project.path(), file, &app(&format!("${{cmd:{echo}}}")));
+        let err = Config::discover(project.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("`${cmd:}` is refused in a file inside the workspace"),
+            "{file}: {err}"
+        );
+        assert!(err.contains(file), "the error names the file: {err}");
+        std::fs::remove_file(project.path().join(file)).unwrap();
+    }
 
-    // The negative control: it is `cmd:` that the project scope refuses, not
+    // The negative control: it is `cmd:` that a workspace file refuses, not
     // substitution. Without this a rule that disarmed `${env:}` there — a much worse
-    // feature — would pass the assertion above.
+    // feature — would pass the assertions above.
     std::env::set_var("IO_HARNESS_CONFIG_TEST_CMD", "from-the-environment");
     write(
         project.path(),
@@ -1778,14 +1795,14 @@ fn a_command_substitution_is_refused_in_the_project_scope_and_runs_in_the_local_
         token(&Config::discover(project.path()).unwrap()),
         "from-the-environment"
     );
+    std::fs::remove_file(project.path().join("io.toml")).unwrap();
 
-    // And the local scope, which the operator wrote, may use it. 0.74.0 stopped
-    // trusting `io.local.toml` to declare a *program* — a hook, an MCP server, a
-    // provider — and deliberately left this alone: a substitution is refused in the
-    // one scope a `git clone` delivers, and in no other.
+    // And the user scope, which no run root contains and no agent can write, runs
+    // it — the half without which every refusal above is satisfied by a build that
+    // took the feature away.
     write(
-        project.path(),
-        "io.local.toml",
+        user_dir.path(),
+        "io.toml",
         &app(&format!("${{cmd:{echo}}}")),
     );
     assert_eq!(token(&Config::discover(project.path()).unwrap()), "s3cret");

@@ -181,6 +181,10 @@ The operator's own file names the variable instead, and has been able to since
 0.19.0:
 
 ```toml
+# The user-scope file. `[[provider]]` is refused in `io.toml` and in
+# `io.local.toml` since 0.74.0: `base_url` redirects every completion of the run
+# and `api_key` decides which of this host's secrets is sent with it, and the
+# endpoint is contacted before the run's first step.
 [[provider]]
 kind = "compatible"
 preset = "groq"                     # or base_url = "http://10.0.0.4:8000/v1", never both

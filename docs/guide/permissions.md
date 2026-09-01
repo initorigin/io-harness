@@ -62,7 +62,7 @@ want a boundary.
 | Action | Default | Note |
 | --- | --- | --- |
 | Read | allow | `.env`, `*.pem`, `id_rsa`, `id_ed25519`, `*.key` denied outright |
-| Write | **ask** | including overwriting a file the path rules already allow |
+| Write | **ask** | including overwriting a file the path rules already allow; `.git/*`, `*/.git/*`, `io.toml` and `io.local.toml` denied outright |
 | Exec | ask | `rustc` and `<test-binary>` allowed, so verification works |
 | Net | **deny** | an outbound host is not something a human can meaningfully approve on sight mid-run; name your hosts with `allow_net` — your configured provider is allowed for you |
 
@@ -70,6 +70,17 @@ The secret patterns are denied for **both** read and write: nothing an agent
 legitimately does rewrites a private key. They live in a layer named
 `builtin-secrets`, and the two exec allows in one named `builtin-exec`, so a
 refusal that comes from the built-ins is attributable to them in the trace.
+
+The write denies on `.git/*`, `*/.git/*`, `io.toml` and `io.local.toml` are a
+third layer, `builtin-config` (0.74.0), and it is its own layer rather than four
+more rows in `builtin-secrets` because these are not secrets and are not denied
+for reading. They are the files something *else* reads back: a repository's own
+git config selects the filter and diff drivers `git` then runs, and a
+configuration file is read by the next `Config::discover`. So a refusal here is
+answered by a different sentence than "that is a private key", and the trace has
+to be able to tell the two apart. The pattern is `.git/*` and not `.git*`, so
+`.gitignore`, `.gitmodules` and `.gitattributes` are untouched, and the git
+built-ins still cover every legitimate reason to write inside `.git`.
 
 A **denied** action never reaches the approver — it is refused and reported to
 the model as a tool result it can adapt to, and the refusal consumes a step, so
@@ -113,14 +124,37 @@ exists; it is in
 ### How a rule matches
 
 A rule's `pattern` is a glob — `*` matches any run of characters including `/`,
-`?` matches one — tested against the target's full relative path *or* its
-basename, the same way the `find` tool matches. That is what lets `.env` deny
-`config/.env`. For `Act::Exec` the target is the binary name. Specificity does
-not matter: a broad deny beats a narrow allow.
+`?` matches one — tested against the target's full relative path. For `Act::Exec`
+the target is the binary name. Specificity does not matter: a broad deny beats a
+narrow allow.
+
+**A deny is matched more loosely than an allow, and only a deny (0.74.0).** Three
+relaxations belong to `Effect::Deny` rules and to nothing else, because each makes
+a pattern cover more than its text says and that is only ever safe in the refusing
+direction:
+
+- the **basename retry**, which is what lets `.env` deny `config/.env`, the same
+  way the `find` tool matches — and which, applied to allows, let
+  `allow_exec("cargo")` also grant `./target/debug/cargo`, a binary the agent had
+  built for itself. For `Act::Exec` the retry splits on `\` as well as `/`, so
+  `deny_exec("kubectl.exe")` covers the Windows path a resolved argv carries;
+- a **case-folded compile for `Act::Exec`**, because half the volumes this crate
+  runs on will spawn `RM` for `rm` and nothing here can tell whether the volume a
+  given argv resolves on folds case;
+- the **host fold for `Act::Net`** below.
+
+An allow keeps granting exactly what it names. One that misses a spelling —
+`allow_exec("rustc")` against `RUSTC` — falls to the tier default, which asks or
+refuses.
 
 A network target arrives as `host:port`, and both forms are tried, so
 `allow_net("api.example.com")` covers whatever port the URL resolved to while
-`allow_net("api.example.com:443")` still means that port and no other.
+`allow_net("api.example.com:443")` still means that port and no other. For a
+**deny**, rule and target are folded to one spelling first — lowercased, with one
+trailing root dot removed — because DNS is case-insensitive and `evil.example.`
+names the same server, so `deny_net("evil.example")` has to catch
+`EVIL.example:443` and `evil.example.` or it is not a boundary. Folding an allow
+would widen it, so an allow is compared as written.
 
 On Windows, patterns and targets are folded to one form before comparison — a
 `\\?\` verbatim prefix is stripped and `\` becomes `/` — because a deny built
@@ -172,6 +206,19 @@ also carry a rewritten action (`modified`) or rules to `remember` for the rest
 of the run. Both are re-checked against the policy: **an approval cannot move an
 action across a deny, and a remembered allow cannot override one.**
 Remembered rules come back on `RunResult::remembered` for you to persist.
+
+**A `modified` request on an `Act::Exec` action is refused rather than applied
+(0.74.0).** Nothing runs, and the refusal names both the argv that was asked about
+and the one that came back. Every consumer of an exec approval — `exec`, `shell`,
+the git built-ins, a registered tool, an MCP tool — dispatches the argv it parsed
+*before* the gate was consulted and reads only `remember`, so the rewrite had no
+consumer: a human approved one command while another ran, and the trace recorded
+the one that did not. In the direction that matters more, an approver *narrowing*
+an argv was overruled without ever being told. Approve the action as asked, deny
+it, or narrow it with an exec rule. Rewrites of a read or a write are unaffected —
+those two paths read the rewritten target and content back off the gate — and the
+same refusal applies to a `modified` on a pending `exec` or `net` handed to
+`resume_with_decision`.
 
 Built-ins: `ApproveAll`, `DenyAll`, `StdinApprover`. `DenyAll` is the safe
 default for an unattended run that must never take a sensitive action;

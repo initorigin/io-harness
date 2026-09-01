@@ -837,9 +837,19 @@ pub enum EventKind {
     /// the model never typed**: a click on a link, a redirect, a script assigning
     /// `location`. This is the row that makes the boundary auditable, because it
     /// records every place the browser went and every place it was stopped from
-    /// going, rather than only the URLs a tool was handed.
+    /// going, rather than only the URLs a tool was handed. Since 0.74.0 a URL
+    /// that reaches no host emits one too, decided by its scheme before the
+    /// navigation is issued; before that it was permitted and recorded nowhere.
     BrowserNavigated {
-        /// The `host:port` the policy decided about.
+        /// The `host:port` the policy decided about — or, for a URL that reaches
+        /// no host, the **scheme** it was refused by (0.74.0): `file:`, `data:`,
+        /// `javascript:`, or `(no scheme)` for a string that carries none.
+        ///
+        /// The scheme rather than the URL, deliberately. A `data:` URL *is* its
+        /// payload and a `javascript:` URL is a program, so recording either
+        /// would copy the thing that was refused into the trace and into the
+        /// model's observation, which are two of the places it was refused from
+        /// reaching.
         host: String,
         /// Whether the navigation was allowed to proceed.
         permitted: bool,

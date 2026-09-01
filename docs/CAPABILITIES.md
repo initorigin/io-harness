@@ -35,9 +35,9 @@ the limits that capability actually has.
 | [Accounting](guide/accounting.md) | One row per provider call, the cache and reasoning breakdown, latency and TTFT, and cost derived from a price table you own |
 | [Documents](guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut, with the reasoning |
 | [Images and git](guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
-| [Hooks](guide/hooks.md) | Reacting to a run from `io.toml`: an audit log, a notification, a formatter, a check that stops the run — and why the whole array is refused in the project scope |
+| [Hooks](guide/hooks.md) | Reacting to a run from `io.toml`: an audit log, a notification, a formatter, a check that stops the run — and why the whole array is refused in every file inside the workspace |
 | [Providers](guide/providers.md) | One `Compatible` provider over any OpenAI-shaped endpoint, the 21 vendor presets, the local runtimes, what `Provider::models()` reports, the routing rules that change which model answers mid-run, and the optional method that reports a finished tool call while the completion is still streaming |
-| [Capability bundles](guide/plugins.md) | A directory that contributes skills, templates, agents, MCP servers, hooks and deny-only policy at once; what a project-scoped declaration may not hand you; how a contribution names the bundle it came from; and why a broken bundle is dropped rather than fatal |
+| [Capability bundles](guide/plugins.md) | A directory that contributes skills, templates, agents, MCP servers, hooks and deny-only policy at once; what a declaration from inside the workspace may not hand you; how a contribution names the bundle it came from; and why a broken bundle is dropped rather than fatal |
 | [Retention](guide/retention.md) | What a session and a store are holding, removing a session whole, sweeping to a date and what that refuses, keeping every row while emptying every word, and returning the freed pages to the filesystem |
 | [The mailbox](guide/mailbox.md) | Giving each agent in a tree an address, sending a finding to a named sibling, reading an inbox oldest-first exactly once, and a bounded wait that returns on the message or on the sender finishing |
 
@@ -193,10 +193,11 @@ into it.
   click, a redirect and a script assigning `location` are gated by the same code
   as the URL the model typed
 - **LSP navigation** — definition, references, symbols, hover and rename answered
-  by a language server named in `io.toml` or on the contract, offered only to a
-  run that configured one; `lsp_rename` returns a patch you apply yourself, so
-  every byte reaching the workspace still passes an `Act::Write` check on where
-  it lands
+  by a language server named on the contract or in the user-scope `io.toml`,
+  offered only to a run that configured one; the path a question names is an
+  `Act::Read` check taken before the server is told anything, and `lsp_rename`
+  returns a patch you apply yourself, so every byte reaching the workspace still
+  passes an `Act::Write` check on where it lands
 - **Documents** — spreadsheets, Word, PowerPoint text, PDF and barcode decoding,
   each behind its own cargo feature, all off by default
 - **Images** — passthrough to any provider whose model accepts one, with BMP,
@@ -209,8 +210,9 @@ into it.
 - **Hooks** — `[[hook]]` tables in `io.toml` turn an audit log, a notification, a
   formatter and a local policy check that can stop the run into a path or an
   argv instead of Rust, reaching the run through the `Observer` the crate already
-  had; the whole array is refused in the project scope, because a committed file
-  that runs a command on a teammate's machine is not something to inherit
+  had; the whole array is refused in every file inside the workspace, because
+  neither a committed file that runs a command on a teammate's machine nor one the
+  run's own agent can write is something to inherit
 - **Retention** — the store answers what it and each session are holding, removes
   a session whole or every session older than a date, and empties a session of
   words while keeping every row an audit rests on; nothing expires on its own,

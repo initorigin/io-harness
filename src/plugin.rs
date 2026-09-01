@@ -68,6 +68,16 @@
 //! an executable it ships, not one it points at somewhere else on this machine.
 //! The check is lexical and nothing on disk is read — see [`Plugin::bin`].
 //!
+//! **A bundle points only at itself, and a declaration only inside the workspace**
+//! (0.74.0, audit L13). `skills` and `templates` are held to the `[[bin]]` rule
+//! above, and a `[[plugin]]`'s own `path` is resolved under the discovery root
+//! rather than taken as written — an absolute one, a `..`, or a symbolic link out
+//! of the workspace drops the declaration. Both keys name directories that are
+//! *read*: the frontmatter of every `*.md` under a skills directory is composed
+//! into the model's system prompt on every turn, so a value that escaped put a
+//! directory nobody agreed to into the context of every request. Read-only, and
+//! still content from outside the workspace arriving unasked.
+//!
 //! **A bundle may take capability away and may never hand it out.** A `[policy]`
 //! block may carry layers of [`Effect::Deny`](crate::Effect) rules and nothing
 //! else. An `allow` rule, an `ask` rule or a `defaults` block drops the plugin.
@@ -315,11 +325,18 @@ impl Plugin {
     }
 
     /// The absolute skills directory this plugin contributes, if any.
+    ///
+    /// Guaranteed to be inside [`Plugin::root`] (0.74.0): a `skills` value that
+    /// was absolute or climbed out with `..` was refused at load, for the reason
+    /// a `[[bin]]`'s `path` is — with the frontmatter of every `*.md` under this
+    /// directory reaching the model's system prompt as the added weight.
     pub fn skills_dir(&self) -> Option<PathBuf> {
         self.manifest.skills.as_ref().map(|d| self.root.join(d))
     }
 
     /// The absolute templates directory this plugin contributes, if any.
+    ///
+    /// Inside [`Plugin::root`] on the same rule as [`Plugin::skills_dir`].
     pub fn templates_dir(&self) -> Option<PathBuf> {
         self.manifest.templates.as_ref().map(|d| self.root.join(d))
     }
@@ -712,7 +729,9 @@ impl Plugins {
     /// `root` is the discovery root a relative `path` resolves against — the
     /// project the harness was pointed at, not the directory the declaring file
     /// happens to live in, which is the rule a `[[hook]]`'s `append` already
-    /// follows.
+    /// follows. Since 0.74.0 it is also the boundary: a `path` that resolves
+    /// outside it — absolute, `..`, or through a symbolic link — is dropped
+    /// rather than loaded.
     ///
     /// A declaration switched off is loaded and validated like any other and
     /// then routed to [`Plugins::disabled`], because what an operator wants to
@@ -730,6 +749,33 @@ impl Plugins {
             let fallback = dir
                 .file_name()
                 .map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into());
+            // 0.74.0, audit L13. `path` was taken as written: an absolute one
+            // replaced the discovery root outright and a relative one climbed out
+            // of it with `..`, so a workspace file could point a bundle at any
+            // directory on this host and a manifest sitting there contributed its
+            // `skills`, whose every `*.md` frontmatter is composed into the
+            // model's system prompt on the next turn. Read-only, and still
+            // content from outside the workspace entering the context unasked.
+            //
+            // `contain_under_root` rather than the lexical rule `check_bins`
+            // uses, because the directory this names is one that exists — it has
+            // to, or there is no manifest to read — so a symbolic link inside the
+            // workspace pointing out of it is a live route here in a way it is
+            // not for an executable a bundle has not built yet.
+            //
+            // What is *checked* is canonical; what becomes `Plugin::root` is the
+            // path as written. The two name the same directory once the check has
+            // passed, and `Plugin::root` is a value operators read and strip
+            // prefixes off — canonicalising it would rename every plugin path on
+            // any host whose temporary or checkout directory is itself a link.
+            if let Err(error) = crate::tools::workspace::contain_under_root(root, &decl.path) {
+                out.dropped.push(Dropped {
+                    id: fallback,
+                    path: dir,
+                    error: error.to_string(),
+                });
+                continue;
+            }
             match load_one(*scope, &dir) {
                 Ok(plugin) => {
                     // A switched-off bundle claims no id, and the ordering here
@@ -818,6 +864,7 @@ fn load_one(scope: Scope, dir: &Path) -> Result<Plugin> {
         refuse_executing_contributions(&manifest, &file)?;
     }
     check_narrowing(&manifest, &file)?;
+    check_dirs(&manifest, &file)?;
     check_bins(&manifest, &file)?;
     Hooks::check(&manifest.hook, &file)?;
 
@@ -949,6 +996,49 @@ fn refuse_executing_contributions(manifest: &Manifest, at: &Path) -> Result<()> 
          user-scope file instead, or remove the `[[{offending}]]` from its manifest.",
         at.display()
     )))
+}
+
+/// `skills` and `templates` stay inside the bundle, decided lexically (0.74.0,
+/// audit L13).
+///
+/// [`Plugin::skills_dir`] and [`Plugin::templates_dir`] resolve their key through
+/// `Path::join`, where an absolute value replaces the plugin root outright and a
+/// relative one climbs out of it with `..` — the same two moves `check_bins`
+/// refuses for a `[[bin]]`. The consequence is larger here than there: a
+/// `[[bin]]` is a path handed back for a caller to decide about, while a skills
+/// directory is *read* at run start and the frontmatter of every `*.md` under it
+/// is composed into the model's system prompt on every turn. So `skills =
+/// "/home/you/notes"` in a manifest put a directory nobody agreed to into the
+/// context of every request, read-only and unannounced.
+///
+/// `skills::resolve_under` already confines each file to the skills directory.
+/// What it cannot do is decide where that directory is, which is this.
+///
+/// Lexical, and for `check_bins`' reason: `load_one` performs no filesystem check
+/// of any kind, and a manifest whose validity depended on whether a directory had
+/// been checked out yet would be valid on Tuesday and dropped on Wednesday.
+fn check_dirs(manifest: &Manifest, at: &Path) -> Result<()> {
+    for (key, declared) in [
+        ("skills", manifest.skills.as_ref()),
+        ("templates", manifest.templates.as_ref()),
+    ] {
+        let Some(declared) = declared else { continue };
+        let wrong = declared.components().find_map(|c| match c {
+            Component::Prefix(_) | Component::RootDir => Some("is an absolute path"),
+            Component::ParentDir => Some("climbs out of the plugin root with `..`"),
+            _ => None,
+        });
+        let Some(wrong) = wrong else { continue };
+        return Err(crate::Error::Config(format!(
+            "{}: key `{key}`: {:?} {wrong}, and `{key}` is resolved by joining it onto the plugin \
+             root, because a bundle contributes a directory it ships rather than one it points at \
+             somewhere else on this machine — and every `*.md` under it reaches the model's system \
+             prompt. Write the path relative to the plugin root.",
+            at.display(),
+            declared,
+        )));
+    }
+    Ok(())
 }
 
 /// A `[[bin]]` path stays inside the bundle, decided lexically (0.73.0).

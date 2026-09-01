@@ -144,11 +144,31 @@ use crate::verify::{ExecGuard, Verification};
 /// Only [`run_tree`] offers it. [`run`] and [`run_with`] never put it in the
 /// tool list, so a contract cannot opt into sub-agents by accident.
 ///
-/// It is deliberately *not* governed by the exec policy the way a registered
-/// tool's name is — a spawn is intercepted by the tree loop before dispatch, and
-/// its ceilings are [`Containment`]'s: total agents, concurrency, depth, and the
-/// shared token ledger. To forbid composition, use [`run_with`]; to bound it,
-/// lower those caps.
+/// It is *not* governed by the exec policy the way a registered tool's name is:
+/// a spawn is intercepted by the tree loop before dispatch, so it never reaches
+/// [`Policy::explain`](crate::Policy::explain) and no `Act::Exec` rule names it.
+/// Three things bound it instead.
+///
+/// [`Containment`]'s ceilings — total agents, concurrency, depth, and the shared
+/// token ledger. To forbid composition, use [`run_with`]; to bound it, lower
+/// those caps.
+///
+/// A `before_tool` `[[hook]]` naming `spawn_agent` (0.74.0). The three tools the
+/// tree loop handles itself — this one, `send_message` and `read_messages` — are
+/// put to the operator's checks in that loop rather than in `dispatch`, ahead of
+/// everything below, so a hook attached to a spawn fires instead of loading,
+/// validating, installing and then silently approving.
+///
+/// **A spawn is refused while a proposed plan is unapproved** (0.74.0). A child
+/// started before a human saw the plan inherits this run's whole boundary and
+/// does the work outside the gate, which is not one act slipping past the phase
+/// but the phase not existing. The refusal had to be written here because the
+/// `plan-gate` layer cannot cover a call that never resolves through the policy.
+///
+/// And the child's own boundary is its parent's: a spawned agent inherits the
+/// policy the parent is running under and may only narrow it — a definition's
+/// `deny_write`/`deny_net`, or the call's own, go on through
+/// [`Policy::contain`](crate::Policy::contain), and no path there adds an allow.
 pub const SPAWN_TOOL: &str = "spawn_agent";
 
 /// What the loop writes into an observation when the model called no tool.

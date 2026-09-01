@@ -11,7 +11,8 @@ you want, name a path to append them to or an argv to run, and the audit log, th
 notification, the formatter and the local policy check stop being code.
 
 ```toml
-# io.local.toml — gitignored, and yours. A project file may not declare a hook.
+# The user-scope file — outside every workspace, and the only place a hook lives.
+# ~/.config/io/io.toml on unix, %APPDATA%\io\io.toml on Windows.
 [[hook]]
 append = "audit.jsonl"
 ```
@@ -311,15 +312,24 @@ can contribute hooks too, and `Plugin::hooks()` is the bundle half; after
 One `Hooks` covers a whole [tree](composition.md): a child's events reach it with
 the child's own `run_id` and a non-zero `depth`, like any other observer's.
 
-## A project file may not declare a hook
+## No file inside the workspace may declare a hook
 
-**`[[hook]]` is refused in the project scope**, and the whole array is refused
-rather than its executing half:
+**`[[hook]]` is refused in `io.toml` and, since 0.74.0, in `io.local.toml`**, and
+the whole array is refused rather than its executing half:
 
 ```
-io.toml: key `hook`: a project-scoped file may not declare hooks, because a hook
-runs or writes on this machine and `io.toml` arrives with a `git clone`. Write it
-in `io.local.toml` or the user-scope file instead.
+io.toml: key `hook`: a project-scoped file may not declare hooks — a hook runs an
+argv on this machine, or appends to a path the file itself chose, on an event the
+file itself picks — and `io.toml` arrives with a `git clone`. Write it in the
+user-scope file (`$IO_CONFIG`, else `$IO_CONFIG_HOME/io.toml`, else
+`$XDG_CONFIG_HOME/io/io.toml` or `~/.config/io/io.toml`) instead.
+```
+
+```
+io.local.toml: key `hook`: a workspace-root `io.local.toml` may not declare hooks
+— a hook runs an argv on this machine, or appends to a path the file itself chose,
+on an event the file itself picks — and it sits in the workspace root a run's own
+agent can write to. Write it in the user-scope file (…) instead.
 ```
 
 0.27.0 refused `${cmd:}` in `io.toml` because parsing a file must not be able to
@@ -329,13 +339,19 @@ write to a path a stranger chose, which is the same hazard by a shorter route �
 refusing the executing half and allowing the writing half would be a rule a reader
 has to hold two halves of.
 
-`io.local.toml` and your user-scope file take hooks unchanged. `Config::from_toml`
-is the project scope too, and refuses them for the same reason. A `[[hook]]` hidden
-inside a `[profile.<name>]` body of a project file is refused as well; a profile is
-applied later, and a check that only looked at the base would let it reach the same
-place by a different path.
+**`io.local.toml` was the documented home for a hook until 0.74.0, and audit
+finding H2 is why it is not any more.** It is the operator's own file in intent;
+in fact it is a path in the workspace root, which is a path the run's own agent
+writes and a path a clone can ship. One `write_file` of an unremarkable name
+declared a hook the next `Config::discover` would run — outside the `Policy` and
+outside the sandbox, and nothing about that write looked like an escalation. The
+user scope is the one file no workspace can reach, so it is the one that still
+takes hooks, and every refusal names it. `Config::from_toml` is the project scope
+too, and refuses them for the same reason. A `[[hook]]` hidden inside a
+`[profile.<name>]` body is refused as well; a profile is applied later, and a check
+that only looked at the base would let it reach the same place by a different path.
 
-This is the [configuration guide's](configuration.md#a-project-file-may-narrow-and-may-never-widen-0270)
+This is the [configuration guide's](configuration.md#a-file-inside-the-workspace-may-narrow-and-may-never-widen-0270)
 narrow-never-widen rule applied to a new key rather than a new rule, and it comes
 with the same sentence it is not.
 
@@ -377,17 +393,19 @@ run had moved on could not refuse anything. It also means hooking `token` with a
 `run` action is a decision to spawn a process per streamed token, and the run will
 be exactly as slow as that sounds.
 
-**A hook is refused in the project scope, whole — and that does not make a cloned
-repository safe.** `[[mcp]]` still names a command, `[toolchain]` still names an
-argv, and a `[[policy.layers]]` entry can still allow what the defaults did not.
-This is a specific narrowing of a specific hazard, and the boundary against the
-agent is still the `Policy` the caller loaded.
+**A hook is refused in every file inside the workspace, whole — and that does not
+make a cloned repository safe.** `[toolchain]` still names an argv, a
+`[[policy.layers]]` entry can still allow what the defaults did not, and `${cmd:}`
+is refused in `io.toml` and not in `io.local.toml`. This is a specific narrowing of
+a specific hazard, and the boundary against the agent is still the `Policy` the
+caller loaded.
 
 **A hook is not accumulated across scopes.** Unlike `[[policy.layers]]` and
-`[[agent]]`, a later scope **replaces** the array whole — so one `[[hook]]` in
-`io.local.toml` silently replaces every hook in the user-scope file. The hooks that
-run are the hooks of one file, never a pile assembled from three. `Config::sources()`
-says which file won.
+`[[agent]]`, a later scope **replaces** the array whole. Since 0.74.0 only the user
+scope may declare it, so there is no second file left to lose to that rule: the
+hooks that run are that file's, plus whatever a user-scope bundle contributed,
+which `Plugins::apply_to_hooks` appends. `Config::sources()` says which file was
+read.
 
 **An `append` hook opens its file once per event rather than holding a handle**,
 and appends are serialised by a lock. Within this process that is enough: a
