@@ -254,7 +254,12 @@ async fn h7_a_dot_dot_path_out_of_the_root_is_refused_before_the_server_is_told_
         "a file outside the root reached the model: {transcript}"
     );
     assert!(
-        transcript.contains("refused by policy") && transcript.contains("../secret.txt"),
+        // The refusal now comes from the gate rather than from `navigate`'s own
+        // floor, so it is the crate's standard `[read refused]` observation and,
+        // more to the point, a `policy_events` row — which is the half of H7 the
+        // floor alone could not close. The floor is still there underneath for a
+        // caller that reaches the session without the run loop.
+        transcript.contains("[read refused]") && transcript.contains("../secret.txt"),
         "and the refusal names the act and the path it refused: {transcript}"
     );
 }
@@ -340,7 +345,9 @@ async fn h7_a_denied_in_root_path_is_refused_as_the_question_not_just_in_the_ans
         "a denied path was read and echoed back: {transcript}"
     );
     assert!(
-        transcript.contains("refused by policy") && transcript.contains("secret/*"),
+        // Gate wording, as above — and the rule still names itself, which is what
+        // this assertion is really about.
+        transcript.contains("[read refused]") && transcript.contains("secret/*"),
         "and the rule that refused it is attributed: {transcript}"
     );
 }

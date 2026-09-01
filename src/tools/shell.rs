@@ -1056,7 +1056,15 @@ pub(crate) fn plan(line: &Line, root: &Path) -> Result<Vec<Planned>> {
         let cd_target = if cmd.argv[0] == CD {
             Some(match cmd.argv.get(1) {
                 None => root.to_path_buf(),
-                Some(t) => resolve(&here, t, root)?,
+                Some(t) => {
+                    // The word, not the resolved path: what is checked here is
+                    // the name the *model* chose, and the root it is joined onto
+                    // was chosen by whoever configured the run. A root that
+                    // cannot be named in a profile is the sandbox backend's
+                    // refusal to make, and it makes it.
+                    check_workdir_word(t)?;
+                    resolve(&here, t, root)?
+                }
             })
         } else {
             None
@@ -1630,12 +1638,32 @@ fn open_for_write(path: &Path, append: bool) -> Result<std::fs::File> {
 
 /// Join `rel` onto `base` and refuse anything that leaves `root`.
 ///
-/// Lexical rather than `canonicalize`, and deliberately: `canonicalize` requires
-/// the path to exist, and a redirect target usually does not — it is about to be
-/// created. So `..` is resolved by walking components, and a walk that would rise
-/// above the root is refused rather than clamped. Clamping would silently
-/// redirect `> ../../etc/passwd` into the workspace, which is a surprise in the
-/// one direction that matters.
+/// Two checks, because one of them is not enough.
+///
+/// The first is lexical, and deliberately so: `canonicalize` requires the path to
+/// exist, and a redirect target usually does not — it is about to be created. So
+/// `..` is resolved by walking components, and a walk that would rise above the
+/// root is refused rather than clamped. Clamping would silently redirect
+/// `> ../../etc/passwd` into the workspace, which is a surprise in the one
+/// direction that matters.
+///
+/// The second is [`contain_under_root`](super::workspace::contain_under_root),
+/// added in 0.74.0 for audit H4. A lexical answer says nothing about symbolic
+/// links, and the escape it missed is the *parent*, not the leaf: with
+/// `docs/ext -> /home/user` checked into the repository, `> docs/ext/.bashrc` is
+/// lexically inside the root, and `open_for_write` follows the link and creates a
+/// file in the home directory. The helper resolves the deepest existing ancestor,
+/// requires *that* under the canonical root, and so refuses the redirect before
+/// anything is opened. `write_file` takes the same helper, which is what makes
+/// the two doors answer the same way about the same path.
+///
+/// The helper's answer is checked and discarded rather than returned. What comes
+/// back is the path as written, still under `root` component for component,
+/// because the caller derives the policy target from it by stripping `root` — and
+/// on a host whose temporary directory is itself a link, the canonical form does
+/// not start with `root` and would be graded as an absolute path from outside.
+/// The two forms name the same file: containment is what the helper decides, and
+/// naming is what this returns.
 ///
 /// This is a second line rather than the first: `dispatch` checks each of these
 /// paths against the policy through `Workspace::check_path`. It is here because
@@ -1662,7 +1690,68 @@ fn resolve(base: &Path, rel: &str, root: &Path) -> Result<PathBuf> {
     if !out.starts_with(root) {
         return Err(Error::Config(format!("`{rel}` leaves the workspace root")));
     }
+    super::workspace::contain_under_root(root, &out)?;
     Ok(out)
+}
+
+/// Refuse a `cd` target word whose *name* could become structure in a sandbox
+/// profile (0.74.0, audit C1).
+///
+/// A `cd` is the one place a model chooses a directory name that this crate then
+/// interpolates into something it did not write. `planned.cwd` is handed to
+/// `wrap_argv` and `contain_command` as the stage's workdir, and on macOS the
+/// seatbelt backend renders that workdir into an SBPL string literal. SBPL's last
+/// matching rule wins, so a directory named
+/// `p")) (allow network*) (allow file-write* (subpath "/` appended its own rules
+/// to the profile while the backend went on reporting a confining rung.
+///
+/// `sbpl_literal` already refuses those characters at the profile, and that is
+/// the fix that closes the hole. This is the second line, taken at the door
+/// rather than at the wall: it removes the *class* — a model-chosen name that
+/// carries syntax into a generated artefact — instead of one instance of it, it
+/// applies on every platform rather than only where a profile is generated, and
+/// it refuses while the model can still read a reason, rather than after the run
+/// has silently collapsed to a profile that grants nothing.
+///
+/// ## What the set admits, and why it is not narrower
+///
+/// Admitted: every character that is not refused below. That is spaces, hyphens,
+/// dots, underscores, apostrophes, parentheses, and every non-ASCII character —
+/// `My Project`, `my-project`, `my.project`, `Project (old)`, `josé's notes` and
+/// `проект` are all ordinary directory names on the platforms this runs on, and
+/// none of them is significant inside a quoted profile literal. A restriction to
+/// a literal bare word — letters, digits, `-`, `_`, `.` — was considered and
+/// rejected: it would refuse `cd "My Project"`, which is a real thing to do in a
+/// real workspace, and it would buy nothing, because a space cannot end a string
+/// literal.
+///
+/// Refused: `"` and `\`, which are the two characters that can end an SBPL string
+/// literal or change what the next one means, and every control character,
+/// newline included, which can end a line in generated text of almost any shape.
+/// A directory whose name holds one of those is refused rather than escaped, for
+/// the reason `sbpl_literal` gives: the escape rules are not something this crate
+/// can pin down from the platform's documentation, and a guess about them is a
+/// guess about where the boundary is.
+fn check_workdir_word(word: &str) -> Result<()> {
+    let Some(bad) = word
+        .chars()
+        .find(|&c| matches!(c, '"' | '\\') || c.is_control())
+    else {
+        return Ok(());
+    };
+    let what = match bad {
+        '"' => "a double quote".to_string(),
+        '\\' => "a backslash".to_string(),
+        '\n' => "a newline".to_string(),
+        c => format!("the control character U+{:04X}", c as u32),
+    };
+    Err(Error::Config(format!(
+        "`cd {word}` names a directory whose name holds {what}. This directory becomes the \
+         working directory of every later stage, and that path is written into the sandbox \
+         profile that confines them, where such a character can end the profile's own string \
+         literal and whatever followed would become rules. Run the command from a directory \
+         whose name holds no quote, backslash or control character."
+    )))
 }
 
 #[cfg(test)]
@@ -2244,6 +2333,57 @@ mod tests {
         ];
         for (src, want) in cases {
             assert_eq!(ok(src).commands().count(), want, "for `{src}`");
+        }
+    }
+
+    /// C1 — the whole refused set, and the reason it is not larger.
+    ///
+    /// A `cd` target becomes the workdir every later stage runs in, and that path
+    /// is written into the sandbox profile confining them. The three shapes here
+    /// are the ones that can end a generated line or a generated string literal;
+    /// everything else is a directory name somebody really has.
+    #[test]
+    fn c1_a_cd_target_that_could_carry_syntax_into_a_profile_is_refused() {
+        for hostile in [
+            r#"p")) (allow network*) (allow file-write* (subpath "/"#,
+            "back\\slash",
+            "two\nlines",
+            "bell\u{7}",
+            "nul\0byte",
+        ] {
+            assert!(
+                check_workdir_word(hostile).is_err(),
+                "`cd {hostile:?}` must be refused"
+            );
+        }
+    }
+
+    /// The companion, and the argument against a literal bare-word set.
+    ///
+    /// A space cannot end a string literal, and neither can a hyphen, a dot, an
+    /// underscore, a parenthesis, an apostrophe or a non-ASCII letter. Refusing
+    /// them would break workspaces people really have and close nothing —
+    /// `Project (old)` is in the list because parentheses are structure in SBPL
+    /// *outside* a literal and characters inside one, which is exactly where this
+    /// boundary is drawn.
+    #[test]
+    fn c1_an_ordinary_directory_name_is_still_a_valid_cd_target() {
+        for ordinary in [
+            "src",
+            "My Project",
+            "my-project",
+            "my.project",
+            "my_project",
+            "Project (old)",
+            "josé's notes",
+            "проект",
+            "../sibling",
+        ] {
+            assert!(
+                check_workdir_word(ordinary).is_ok(),
+                "`cd {ordinary}` must still be allowed here — containment is \
+                 `resolve`'s question, not this one"
+            );
         }
     }
 }
