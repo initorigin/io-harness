@@ -14,7 +14,36 @@ impl Store {
     /// WAL is a persistent property of the database file, not of this
     /// connection: a store opened once by 0.12.0 stays in WAL mode afterwards.
     /// That is why it is documented as a migration.
+    ///
+    /// **On unix the file is created readable only by the user that creates
+    /// it**, and an existing store is tightened to the same on open. The trace
+    /// holds whatever the run saw — see [`Store::record`](crate::state::Store::record)
+    /// — so the default umask's world-readable file would outlive the run
+    /// holding every secret it touched. A host without file modes gives the
+    /// file whatever the containing directory grants.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        // The trace holds whatever the run saw — every prompt, tool call and
+        // result verbatim — and the file outlives the run, so it is made the
+        // user's own rather than left at whatever the umask grants (0.74.0).
+        // Created here rather than chmod'd after `Connection::open` returns:
+        // a chmod after the fact leaves a window in which another local account
+        // can open the file, and a later chmod does not revoke a descriptor
+        // already open. SQLite leaves an existing file's mode alone and gives
+        // the `-wal` and `-shm` files the mode of the main file, so creating it
+        // first covers all three. An existing store is tightened too, so one
+        // written by an earlier release stops being world-readable the first
+        // time this one opens it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(path)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // `query_row` rather than `execute`: this pragma returns the resulting
