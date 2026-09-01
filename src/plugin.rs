@@ -47,11 +47,18 @@
 //! # Three rules, and each is the reason the format is usable at all
 //!
 //! **A bundle is a stranger's directory.** It arrives under the rule 0.28.0 wrote
-//! for `[[hook]]`: a plugin declared in the committed, cloned `io.toml` may
+//! for `[[hook]]`: a plugin declared in a file *inside the workspace* may
 //! contribute skills, templates, agents and deny rules, and may not contribute a
 //! `[[hook]]`, an `[[mcp]]` or a `[[bin]]` (0.73.0) — each names a program this
-//! machine will run. The same plugin declared in `io.local.toml` or the
-//! user-scope file contributes all seven.
+//! machine will run. Only a plugin declared in the **user-scope** file
+//! contributes all seven.
+//!
+//! `io.local.toml` was on the trusted side of that line until 0.74.0, and audit
+//! finding H2 is why it is not any more: it sits at the workspace root, which is
+//! a path the run's own agent can write and a clone can ship. Declaring a bundle
+//! is still permitted from either workspace file — a bundle contributing only
+//! skills or templates is the ordinary case — so the refusal is on what the
+//! *manifest* contributes, not on the declaration.
 //! A `${env:}`, `${file:}` or `${cmd:}` substitution is refused inside a
 //! manifest in *every* scope (0.71.0), because a manifest is a third party's file
 //! wherever it was named from: the first two read this machine's environment and
@@ -83,7 +90,7 @@
 //! so every file written before the key existed means exactly what it already
 //! meant. An entry written `enabled = false` is still read, validated and held
 //! to the same trust rule — switching a bundle on is a one-character edit, so a
-//! manifest may not smuggle a `[[hook]]` past the project-scope refusal by
+//! manifest may not smuggle a `[[hook]]` past the workspace-scope refusal by
 //! shipping it switched off — and then contributes nothing to any of the seven. It
 //! is listed on [`Plugins::disabled`] rather than [`Plugins::iter`], because an
 //! operator who turned a bundle off still has to be able to see that it is
@@ -659,11 +666,14 @@ impl Plugins {
     /// result differs by it on purpose — this is the marketplace-install
     /// semantics of the module's first rule, not a quirk of the loader:
     ///
-    /// - [`Scope::User`] and [`Scope::Local`] are the operator's own files, so a
-    ///   manifest's `[[hook]]`, `[[mcp]]` and `[[bin]]` are returned like any
+    /// - [`Scope::User`] is the operator's own file, outside every workspace, so
+    ///   a manifest's `[[hook]]`, `[[mcp]]` and `[[bin]]` are returned like any
     ///   other contribution.
     /// - [`Scope::Project`] is the committed `io.toml` that arrives with a
-    ///   `git clone`, so the same manifest is **refused whole** — not shortened.
+    ///   `git clone`, and as of 0.74.0 [`Scope::Local`] is held to the same rule
+    ///   — `io.local.toml` sits at the workspace root, so the agent can write it
+    ///   (audit H2). From either, the same manifest is **refused whole** — not
+    ///   shortened.
     ///   A bundle that would only load from one of the two is exactly what an
     ///   installer has to tell an operator before it writes anything.
     ///
@@ -909,8 +919,8 @@ fn check_id(id: &str, at: &Path) -> Result<()> {
     )))
 }
 
-/// A plugin declared in the project scope contributes nothing that runs a
-/// program.
+/// A plugin declared in any file inside the workspace contributes nothing that
+/// runs a program.
 ///
 /// The 0.28.0 argument applied to a new declaration site: `io.toml` is the file a
 /// `git clone` delivers, a `[[hook]]` runs an argv or writes to a path the file
