@@ -23,14 +23,19 @@
 //! a string to a shell, so a hook has no metacharacter surface beyond its own
 //! arguments.
 //!
-//! ## Refused in the project scope, whole
+//! ## Refused inside the workspace, whole
 //!
 //! 0.27.0 refused `${cmd:}` in `io.toml` because parsing a file must not be able to
 //! run a command, and `io.toml` is the file a `git clone` delivers. A hook that runs
 //! an argv is that primitive arriving one release later. A hook that *appends* is a
 //! write to a path a stranger chose, which is the same hazard by a shorter route —
-//! so the whole array is refused there, not its executing half, and `io.local.toml`
-//! or the user-scope file is the stated alternative.
+//! so the whole array is refused there, not its executing half.
+//!
+//! 0.74.0 extends that to `io.local.toml`. It is the operator's own file in intent,
+//! and in fact it is a path in the workspace root a run's own agent writes to, so one
+//! `write_file` of it declared an argv the next `Config::discover` would run. The
+//! user-scope file is the only stated alternative, and it is the one file no
+//! workspace can reach.
 //!
 //! ## A hook runs inside the run loop
 //!
@@ -92,13 +97,15 @@ const POLL: Duration = Duration::from_millis(5);
 /// use io_harness::Config;
 ///
 /// # fn demo() -> io_harness::Result<()> {
-/// let dir = tempfile::tempdir()?;
+/// let home = tempfile::tempdir()?;
+/// std::env::set_var("IO_CONFIG_HOME", home.path());
 /// std::fs::write(
-///     dir.path().join("io.local.toml"),
+///     home.path().join("io.toml"),
 ///     "[[hook]]\non = [\"finished\"]\nrun = [\"notify\"]\n\n\
 ///      [[hook]]\nat = \"before_tool\"\nrun = [\"gate\"]\n",
 /// )?;
 ///
+/// let dir = tempfile::tempdir()?;
 /// let hooks = Config::discover(dir.path())?.hooks();
 ///
 /// // Neither table wrote an `on_failure`, and the two do not get the same
@@ -162,12 +169,14 @@ pub enum OnFailure {
 /// use io_harness::Config;
 ///
 /// # fn demo() -> io_harness::Result<()> {
-/// let dir = tempfile::tempdir()?;
+/// let home = tempfile::tempdir()?;
+/// std::env::set_var("IO_CONFIG_HOME", home.path());
 /// std::fs::write(
-///     dir.path().join("io.local.toml"),
+///     home.path().join("io.toml"),
 ///     "[[hook]]\nat = \"before_tool\"\ntools = [\"write_file\"]\nrun = [\"gate\"]\n",
 /// )?;
 ///
+/// let dir = tempfile::tempdir()?;
 /// let hooks = Config::discover(dir.path())?.hooks();
 /// let hook = &hooks.declarations()[0];
 ///
@@ -560,13 +569,17 @@ fn wait_bounded(child: &mut Child, limit: Duration) -> Option<std::process::Exit
 /// use io_harness::{Config, EventKind, Flow, Observer, RunEvent};
 ///
 /// # fn demo() -> io_harness::Result<()> {
-/// let dir = tempfile::tempdir()?;
-/// // A hook table is refused in `io.toml`, which is the file a clone delivers.
+/// // The user scope: a hook table is refused in every file inside the workspace.
+/// let home = tempfile::tempdir()?;
+/// std::env::set_var("IO_CONFIG_HOME", home.path());
 /// std::fs::write(
-///     dir.path().join("io.local.toml"),
+///     home.path().join("io.toml"),
 ///     "[[hook]]\non = [\"refused\"]\nappend = \"audit.jsonl\"\n",
 /// )?;
 ///
+/// // `append` resolves against the discovery root, so the log lands beside the
+/// // project being watched rather than beside the file that declared it.
+/// let dir = tempfile::tempdir()?;
 /// let hooks = Config::discover(dir.path())?.hooks();
 /// hooks.event(&RunEvent::new(1, 1, EventKind::Refused {
 ///     act: "write".into(),
@@ -651,13 +664,15 @@ impl Hooks {
     /// use io_harness::Config;
     ///
     /// # fn demo() -> io_harness::Result<()> {
-    /// let dir = tempfile::tempdir()?;
-    /// // `io.local.toml`: a `[[hook]]` is refused in the committed `io.toml`.
+    /// // The user scope: a `[[hook]]` is refused in every file inside the workspace.
+    /// let home = tempfile::tempdir()?;
+    /// std::env::set_var("IO_CONFIG_HOME", home.path());
     /// std::fs::write(
-    ///     dir.path().join("io.local.toml"),
+    ///     home.path().join("io.toml"),
     ///     "[[hook]]\non = [\"finished\"]\nrun = [\"notify\"]\ntimeout_ms = 250\n",
     /// )?;
     ///
+    /// let dir = tempfile::tempdir()?;
     /// let hooks = Config::discover(dir.path())?.hooks();
     /// let table = &hooks.declarations()[0];
     /// assert_eq!(table.on().to_vec(), ["finished"]);

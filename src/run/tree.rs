@@ -502,7 +502,19 @@ where
         // committed: a step left uncommitted is replayed, and replaying it
         // re-adopts its children through the ordinary spawn path — doing both
         // would adopt one child twice.
-        readopt_children(tree, run_id, depth, policy, start_step, inflight).await?;
+        // 0.74.0 — `ws.policy()`, not `policy`: while the plan phase is on that is
+        // `policy` narrowed by `plan_lock`, and a child re-adopted from a previous
+        // process must come back under the boundary this agent is actually running
+        // inside rather than the one its contract asked for. See the fan-out below,
+        // which passes the same thing for the same reason.
+        readopt_children(tree, run_id, depth, ws.policy(), start_step, inflight).await?;
+
+        // 0.74.0 — the rules an approver asked to stop being asked about, kept for
+        // the rest of this agent's run as the flat loop keeps them. Until now the
+        // tree dropped them at the end of every step, so "approve and stop asking"
+        // meant "approve again next step" inside a `run_tree` and meant what it said
+        // in a flat run.
+        let mut remembered: Vec<Rule> = Vec::new();
 
         for step in start_step..=contract.max_steps {
             // 0.48.0 — the same per-step refresh and drain the flat loop does. A
@@ -602,7 +614,11 @@ where
                     &global_notes,
                     Assembly {
                         ws: Some(&ws),
-                        policy,
+                        // 0.74.0 — the policy this agent is running under, which is
+                        // what the flat loop passes. A stale read refreshed against
+                        // the contract's own policy would re-read through a deny the
+                        // plan phase or an approver had since put in the way.
+                        policy: ws.policy(),
                         store: tree.store,
                         run_id,
                         step,
@@ -792,6 +808,11 @@ where
             let mut decisions: Vec<String> = Vec::new();
             let mut calls_json: Vec<String> = Vec::new();
             let mut step_changed = false;
+            // What an approver asked to remember during THIS step, applied once at
+            // the end of it. Per-step rather than per-call for the reason the flat
+            // loop gives: a policy rebuilt mid-step would decide two calls of one
+            // completion under two different boundaries.
+            let mut new_rules: Vec<Rule> = Vec::new();
             // The same note as the flat loop: a broken provider-executed search is
             // an observation the child can act on, not silence.
             if let Some(note) = web_failure_note(&response) {
@@ -856,7 +877,74 @@ where
             let mut spawn_calls: Vec<&ToolCall> = Vec::new();
             for call in &response.tool_calls {
                 calls_json.push(format!("{}:{}", call.name, call.arguments));
+                // 0.74.0 — the three tools this loop handles itself never reach
+                // `dispatch`, which is where every other call is put to the
+                // operator's `before_tool` checks. They are asked here instead,
+                // ahead of the short-circuits below, so a `[[hook]]` naming
+                // `spawn_agent`, `send_message` or `read_messages` fires rather than
+                // loading, validating, installing and then silently approving —
+                // which is the one failure a check attached to a tool cannot afford,
+                // and looks identical to a check that said yes. Everything past this
+                // point reaches `dispatch` and is gated there, so no call is asked
+                // about twice.
+                if call.name == SPAWN_TOOL
+                    || call.name == SEND_MESSAGE_TOOL
+                    || call.name == READ_MESSAGES_TOOL
+                {
+                    if let Some(refused) = tool_gate(
+                        contract.tool_hooks.as_deref(),
+                        call,
+                        tree.watch,
+                        run_id,
+                        step,
+                        depth,
+                    ) {
+                        // A hook can only refuse, and `tool_gate` renders that as a
+                        // `Continue` carrying the sentence the model reads. The
+                        // `continue` is outside the destructuring on purpose: any
+                        // other shape is still a refusal, and a call that fell
+                        // through to run would be this gate failing open.
+                        if let Dispatched::Continue {
+                            decision,
+                            obs,
+                            kind,
+                            target,
+                            ..
+                        } = refused
+                        {
+                            ledger.push(Observation::new(step, kind, target, obs));
+                            decisions.push(decision);
+                        }
+                        continue;
+                    }
+                }
                 if call.name == SPAWN_TOOL {
+                    // 0.74.0 — refused while the plan is unreviewed, for the reason
+                    // `remember` and `forget` are refused in `dispatch`: a spawn is
+                    // intercepted here and never resolves through `Policy::explain`,
+                    // so the `plan-gate` layer cannot cover it. A child started
+                    // before a human saw the plan inherits this run's whole boundary
+                    // and does the work outside the gate, which is not one act
+                    // slipping past the phase but the phase not existing.
+                    if planning {
+                        ledger.push(Observation::new(
+                            step,
+                            ObsKind::Error,
+                            None,
+                            bound(
+                                &format!(
+                                    "\n[{SPAWN_TOOL} refused] the plan has not been approved \
+                                     yet, so no sub-agent is being started — a child would \
+                                     inherit this run's permissions and work outside the \
+                                     phase. Call `{PROPOSE_PLAN_TOOL}` first.\n"
+                                ),
+                                entry_cap,
+                                ObsKind::Error,
+                            ),
+                        ));
+                        decisions.push(format!("{SPAWN_TOOL} refused (planning)"));
+                        continue;
+                    }
                     spawn_calls.push(call);
                     continue;
                 }
@@ -944,11 +1032,12 @@ where
                         kind,
                         target,
                         changed,
-                        ..
+                        remember,
                     } => {
                         step_changed |= changed;
                         ledger.push(Observation::new(step, kind, target, obs));
                         decisions.push(decision);
+                        new_rules.extend(remember);
                     }
                     Dispatched::Pause { request_id } => {
                         decisions.push(format!("awaiting approval (request {request_id})"));
@@ -980,10 +1069,22 @@ where
             }
             // The phase ends here, and the spawn calls below are the reason it must:
             // an approved plan names the agents it hands work to, and until it is
-            // approved a spawn is an `Act::Exec` the `plan-gate` layer refuses.
+            // approved a spawn is refused at the top of the loop above. 0.74.0
+            // corrected the sentence that used to stand here — it said the
+            // `plan-gate` layer refused a spawn as an `Act::Exec`, and it does not:
+            // a spawn is intercepted before `dispatch` and never reaches
+            // `Policy::explain` at all, which is why the refusal had to be written.
             if plan_approved {
                 planning = false;
-                ws = Workspace::with_policy(&tree.root, policy.clone());
+                // Rebuilt from the base rather than edited, so the `plan-gate` layer
+                // goes and every rule an approver remembered stays: an approval ends
+                // the phase, it does not undo a decision a human already made. The
+                // flat loop states the same argument at its own rebuild.
+                let mut unlocked = policy.clone();
+                if !remembered.is_empty() {
+                    unlocked = unlocked.merge(remembered_layer(&remembered));
+                }
+                ws = Workspace::with_policy(&tree.root, unlocked);
                 tools.retain(|t| t.name != PROPOSE_PLAN_TOOL);
                 system = base_system.clone();
                 if let Some(approved) = tree.store.approved_plan(run_id)? {
@@ -1038,7 +1139,15 @@ where
                 let results: Vec<Result<SpawnOutcome>> = stream::iter(
                     spawn_calls
                         .into_iter()
-                        .map(|c| spawn_child(tree, c, run_id, depth, policy, step)),
+                        // 0.74.0 — `ws.policy()`, not `policy`. A child may only
+                        // narrow what it is handed, so handing it the contract's own
+                        // policy while this agent is running under a narrowed one
+                        // gives the child MORE than its parent has: through the plan
+                        // phase that is `plan_lock`'s `deny_write("*")` and
+                        // `deny_exec("*")`, and after an approver has narrowed the
+                        // run it is that decision. What the parent is actually
+                        // running under is `ws`.
+                        .map(|c| spawn_child(tree, c, run_id, depth, ws.policy(), step)),
                 )
                 .buffered(width)
                 .collect()
@@ -1229,6 +1338,20 @@ where
                     request_id,
                     steps: step,
                 });
+            }
+
+            // 0.74.0 — rules an approver asked to remember apply as a top layer for
+            // the rest of this agent's run, exactly as they do in the flat loop.
+            // Until now the tree read them off `Dispatched::Continue` and threw them
+            // away, so an operator who said "allow this and stop asking" was asked
+            // again on the next step of the same run — and one who said "and never
+            // this other path" had that decision forgotten. Merging rather than
+            // editing is what keeps a remembered allow from defeating a deny
+            // beneath it.
+            if !new_rules.is_empty() {
+                let merged = ws.policy().clone().merge(remembered_layer(&new_rules));
+                ws = Workspace::with_policy(agent_root, merged);
+                remembered.extend(new_rules);
             }
 
             // Draw this step's tokens against the tree. The draw is recorded even
