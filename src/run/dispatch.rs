@@ -1034,6 +1034,7 @@ pub(super) async fn dispatch(
                                 lsp,
                                 run_id,
                                 watch,
+                                exec_sandbox,
                             )
                             .await;
                             Dispatched::Continue {
@@ -1153,6 +1154,7 @@ pub(super) async fn dispatch(
                                 lsp,
                                 run_id,
                                 watch,
+                                exec_sandbox,
                             )
                             .await;
                             Dispatched::Continue {
@@ -1251,6 +1253,7 @@ pub(super) async fn dispatch(
                                 lsp,
                                 run_id,
                                 watch,
+                                exec_sandbox,
                             )
                             .await;
                             Dispatched::Continue {
@@ -1338,7 +1341,17 @@ pub(super) async fn dispatch(
                     Gated::Go { remember, .. } => remembered.extend(remember),
                 }
             }
-            let obs = match checker.run(ws.root(), exec_timeout, cap).await {
+            // 0.74.0 — the `check` tool gated its checker and then spawned it
+            // outside the run's containment, so a policy allowing `cargo` handed
+            // the host the workspace's own `build.rs`, its proc macros and any
+            // `rustc-wrapper`, while `exec cargo check` on the same run was
+            // contained. Found while closing C2; the same spawn, the same fix.
+            let contained = exec_sandbox
+                .map(|c| std::sync::Arc::new(c.with_egress(ws.policy().permits_any_egress())));
+            let obs = match checker
+                .run(ws.root(), exec_timeout, cap, contained.as_ref())
+                .await
+            {
                 crate::tools::diagnostics::Outcome::Clean => {
                     "\n[check] the project's own check found nothing\n".to_string()
                 }
@@ -3088,6 +3101,7 @@ pub(super) enum Gated {
 /// write into a failed one, and it does not return an error. An information
 /// feature that can take down the tool it informs on is a worse trade than not
 /// having it.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn diagnostics_after_write(
     ws: &Workspace,
     toolchain: Option<&crate::toolchain::Toolchain>,
@@ -3096,6 +3110,10 @@ pub(super) async fn diagnostics_after_write(
     lsp: &LspSession,
     run_id: i64,
     watch: &Watch<'_>,
+    // 0.74.0 — the containment this call was granted. The check after a write
+    // spawns the project's compiler, which runs the workspace's own build
+    // script; before this release it did so ungated and uncontained (audit C2).
+    exec_sandbox: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
 ) -> String {
     let root = ws.root();
     // 0.52.0 — what a configured server sees, appended to what the compiler said
@@ -3103,7 +3121,16 @@ pub(super) async fn diagnostics_after_write(
     // edit about a server that cannot answer is noise the model pays for on every
     // write. `check` reports all four states, because there somebody did ask.
     let served = lsp_diagnostics_text(&lsp.diagnose(ws, None, run_id, watch).await, false);
-    match crate::tools::diagnostics::after_edit(root, toolchain, timeout, cap).await {
+    match crate::tools::diagnostics::after_edit(
+        root,
+        toolchain,
+        timeout,
+        cap,
+        ws.policy(),
+        exec_sandbox,
+    )
+    .await
+    {
         crate::tools::diagnostics::Outcome::Found(text) => format!("{text}{served}"),
         crate::tools::diagnostics::Outcome::Clean => served,
         // A skip is silent. There is no ecosystem here, so there is nothing the
