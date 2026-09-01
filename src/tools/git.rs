@@ -70,13 +70,28 @@ const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 /// * `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL` — `/etc/gitconfig` and
 ///   `~/.gitconfig` can define aliases and `core.*` settings that change what a
 ///   subcommand does. Nothing in this crate's permission model covers them.
-const FIXED_ENV: [(&str, &str); 6] = [
+/// * `GIT_ATTR_NOSYSTEM` — the system `gitattributes` file assigns attributes
+///   like `filter=` and `diff=` to paths, and those attributes are what select
+///   the config entries that name a program to run (0.74.0, audit H1). The
+///   repository's own in-tree `.gitattributes` is *not* covered by this and
+///   cannot be disabled by any environment variable; see [`GitCmd::argv`] for
+///   `--no-textconv`, and `docs/CONTRACT.md` for what remains.
+///
+/// **What this environment does not reach: the repository's own `.git/config`.**
+/// `GIT_CONFIG_NOSYSTEM` and `GIT_CONFIG_GLOBAL` cover the system and global
+/// files. There is no equivalent for the repo-local one, and git always reads
+/// it. That file is why `.git/**` is a write deny in [`Policy::default`] as of
+/// 0.74.0 — the agent must not be able to author it — but a repository that
+/// arrives with one already present is a separate problem from a repository the
+/// agent edits.
+const FIXED_ENV: [(&str, &str); 7] = [
     ("GIT_PAGER", "cat"),
     ("PAGER", "cat"),
     ("LC_ALL", "C"),
     ("LANG", "C"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_CONFIG_GLOBAL", NULL_DEVICE),
+    ("GIT_ATTR_NOSYSTEM", "1"),
 ];
 
 /// Repository hooks, disabled by pointing `core.hooksPath` at a path that cannot
@@ -90,6 +105,98 @@ const FIXED_ENV: [(&str, &str); 6] = [
 /// tree left in its hooks directory. `-c` is the reliable way to suppress it,
 /// because it wins over every config file, including the repository's own.
 const NO_HOOKS: &str = "core.hooksPath";
+
+/// Refuse to run `git` at all in a repository whose own config names a program
+/// to run that no override can take away (0.74.0, audit H1).
+///
+/// Everything else this module does to `.git/config` is a neutralisation: `-c`
+/// beats every config file, so [`NO_HOOKS`] and [`NO_FSMONITOR`] are settled by
+/// setting them, and `--no-ext-diff`/`--no-textconv` settle the diff drivers.
+/// **A `filter` or `merge` driver cannot be settled that way**, because it is
+/// keyed by a name the repository chooses: there is no wildcard `-c` and no
+/// switch that disables filters as a class. `git add` runs `filter.<name>.clean`
+/// over a path whose `.gitattributes` line assigns it, and both halves ship
+/// inside the repository — so a clone the agent never wrote to is enough.
+///
+/// Refusing the whole call is the fail-closed answer and the honest one: the
+/// alternative is to run git and hope the particular subcommand does not reach
+/// the driver. The refusal names the section and the key, so an operator who
+/// meets it knows which line in which file to look at.
+///
+/// A repository without such a driver — every ordinary one — is unaffected, and
+/// a missing or unreadable `.git/config` is not an error here. This reads the
+/// file rather than asking `git config`, because asking git means spawning git,
+/// which is the thing being decided about.
+fn refuse_executing_repo_config(workdir: &std::path::Path, program: &str) -> Result<()> {
+    // A worktree's `.git` is a file naming the real directory. One hop is
+    // enough: git does not chain them.
+    let dot_git = workdir.join(".git");
+    let config = match std::fs::read_to_string(&dot_git) {
+        Ok(pointer) => match pointer.strip_prefix("gitdir:").map(str::trim) {
+            Some(dir) => std::path::PathBuf::from(dir).join("config"),
+            None => return Ok(()),
+        },
+        Err(_) => dot_git.join("config"),
+    };
+    let Ok(text) = std::fs::read_to_string(&config) else {
+        return Ok(()); // no repository, or none we can read: nothing to refuse
+    };
+    let mut section = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix('[') {
+            section = rest
+                .split(']')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            continue;
+        }
+        let kind = if section.starts_with("filter ") {
+            "filter"
+        } else if section.starts_with("merge ") {
+            "merge"
+        } else {
+            continue;
+        };
+        let key = line
+            .split('=')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let names_a_program = match kind {
+            "filter" => matches!(key.as_str(), "clean" | "smudge" | "process"),
+            _ => key == "driver",
+        };
+        if names_a_program {
+            // `Error::Refused` rather than `Error::Config`: this has to reach the
+            // agent as a refusal it can read and work around, not as an error
+            // that ends the run. A run killed by a hostile repository is a denial
+            // of service the repository chose, which is the wrong answer to a
+            // finding about the repository having too much say.
+            return Err(Error::Refused {
+                act: "exec".into(),
+                target: program.to_string(),
+                rule: Some(format!(
+                    "<the repository's own .git/config defines [{section}] {key}, which names a \
+                     program git would run during an ordinary command>"
+                )),
+                layer: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The filesystem monitor, disabled by setting it to nothing.
+///
+/// `core.fsmonitor` names a program, and `git status` runs it to find out which
+/// paths changed. It is the second of the two keys a checked-out repository can
+/// carry that turn a read-only-looking git call into a spawn — `.git/hooks/*` is
+/// the first — and unlike the hooks path it costs nothing to clear, because the
+/// monitor is an optimisation and git falls back to scanning without it.
+const NO_FSMONITOR: &str = "core.fsmonitor";
 
 /// One git invocation, as a closed set of shapes.
 ///
@@ -109,7 +216,7 @@ pub(crate) enum GitCmd {
         /// Model-supplied paths to limit the report to. Data, never options.
         paths: Vec<String>,
     },
-    /// `git diff --no-color --no-ext-diff [--cached] -- <paths>`
+    /// `git diff --no-color --no-ext-diff --no-textconv [--cached] -- <paths>`
     Diff {
         /// Diff the index rather than the working tree (`--cached`).
         staged: bool,
@@ -351,6 +458,13 @@ impl GitCmd {
                 v.push("diff".into());
                 v.push("--no-color".into());
                 v.push("--no-ext-diff".into());
+                // 0.74.0, audit H1. `--no-ext-diff` covers `diff.external`, and
+                // covers only that. `diff.<driver>.textconv` names a program git
+                // runs over each blob before diffing it, selected by a `diff=`
+                // attribute in the repository's own `.gitattributes` — so a
+                // checked-out tree that already carries both needs no write from
+                // the agent to get a program spawned by an ordinary `git_diff`.
+                v.push("--no-textconv".into());
                 if *staged {
                     v.push("--cached".into());
                 }
@@ -551,6 +665,7 @@ impl<'a> Git<'a> {
     /// precede every model-supplied byte.
     pub(crate) fn argv(&self, cmd: &GitCmd) -> Result<Vec<String>> {
         cmd.check()?;
+        refuse_executing_repo_config(&self.workdir, &self.program)?;
         let mut argv = vec![self.program.clone(), "--no-pager".into()];
         // 0.48.0 — a reader declares `ReadOnly`, and `git status` refreshing a
         // stale index would take `.git/index.lock` under exactly that mode. This
@@ -563,6 +678,15 @@ impl<'a> Git<'a> {
         }
         argv.push("-c".into());
         argv.push(format!("{NO_HOOKS}={NULL_DEVICE}"));
+        // 0.74.0, audit H1. `core.fsmonitor` names a program git runs to learn
+        // which files changed, and an ordinary `git_status` is enough to invoke
+        // it. It can be set by the repository's own `.git/config`, which no
+        // environment variable disables — but `-c` beats every config file,
+        // including that one, so clearing it here is sufficient and needs no
+        // inspection of the file. An empty value is git's own way of switching
+        // the monitor off.
+        argv.push("-c".into());
+        argv.push(format!("{NO_FSMONITOR}="));
         argv.extend(cmd.config()?);
         argv.extend(cmd.options());
         argv.push("--".into());
