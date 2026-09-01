@@ -313,7 +313,7 @@ pub(crate) fn grants(
     toolchain_roots: &[PathBuf],
     program_dir: Option<&Path>,
     system_root: Option<&Path>,
-    tmp: &Path,
+    run_tmp: &Path,
 ) -> Vec<GrantedPath> {
     let mut out: Vec<GrantedPath> = Vec::new();
 
@@ -339,22 +339,34 @@ pub(crate) fn grants(
             });
         }
     }
-    // The temporary directory in every mode: a toolchain that cannot open a
+    // A temporary directory in every mode: a toolchain that cannot open a
     // temporary file cannot run at all. The same allowance every other backend
     // makes.
     //
-    // **`DirectoryOnly`, and it is a boundary decision before it is a cost.**
-    // What a toolchain needs here is the ability to *create* a temporary file,
-    // and a new file inherits the ACE from the directory. What it does not need
-    // — and what a default-deny container has no business handing over — is
-    // every temporary file every other program on the machine has already
-    // written. `%TEMP%` is shared, it is large, and it is being written to by
-    // other processes while this runs, which made re-propagating it the one
-    // grant in this set that was both expensive and racy: a payload whose ACE
-    // this crate's own test could read a moment earlier was refused, because a
-    // concurrent run's propagation had recomputed that file's DACL in between.
+    // **`run_tmp` is the run's own directory under `%TEMP%`, and never `%TEMP%`
+    // itself (0.74.0).** The grant this crate writes for `Full` is inheritable,
+    // because a directory whose contents did not carry the ACE would be a grant
+    // that looks applied and does nothing. On `%TEMP%` that is a shared object:
+    // every temporary file *anything* on the machine created afterwards — a
+    // concurrent run's, another tool's — materialised the container's
+    // `FILE_ALL_ACCESS` ACE at creation, and Windows inheritance is static, so
+    // withdrawing the ACE later does not take those files back. One run's
+    // container was reaching another's temporary files, and no teardown could
+    // undo it.
+    //
+    // A per-run directory answers all of it at once and costs one `mkdir`: it is
+    // empty when it is granted, nothing else writes into it, and the caller
+    // deletes it whole at teardown rather than trying to revoke an inheritance
+    // that has already happened. `%TEMP%` itself is left with the traverse the
+    // ancestor pass below gives it, which is enough to reach this directory by
+    // name and not enough to enumerate what is beside it. The child is pointed at
+    // it by `TMP`/`TEMP` in the environment the container spawn builds — a grant
+    // the payload cannot find is not a grant.
+    //
+    // `DirectoryOnly`, because the directory is new: there is nothing already
+    // inside it for a tree walk to reach, and what it comes to hold inherits.
     out.push(GrantedPath {
-        path: tmp.to_path_buf(),
+        path: run_tmp.to_path_buf(),
         grant: Grant::Full,
         reach: Reach::DirectoryOnly,
     });
@@ -480,6 +492,109 @@ pub(crate) fn command_line(argv: &[String]) -> String {
     out
 }
 
+/// Whether this backend's confinement is applied **only** by
+/// [`Sandbox::run`](super::Sandbox::run).
+///
+/// A caller that owns its own `Child` reaches containment through
+/// `super::wrap_argv` and `super::contain_command`, and through nothing else.
+/// Both answer for the macOS profile and for the Linux rungs; neither has a
+/// Windows branch, and neither can have one — an AppContainer is entered at
+/// `CreateProcessW` through a process-thread attribute list, so there is no argv
+/// to prepend and no `pre_exec` on this platform. `wrap_argv` hands such a caller
+/// the argv back unchanged and `contain_command` hands it `None`.
+///
+/// So a backend named here confines what `Sandbox::run` spawns and **nothing** a
+/// caller spawns itself. The `shell` tool, whose stages are piped into one
+/// another, and the git built-ins, whose child is theirs, are those callers, and
+/// they must refuse rather than spawn: a child that ran completely unwrapped
+/// while the run wrote `windows-appcontainer` into its `SandboxEvent` rows and
+/// told the agent it had a filesystem and a network boundary is the "names an
+/// isolation it did not apply" failure this crate says it will not ship.
+///
+/// Pure, and compiled on every host, so the decision is asserted on the build
+/// machine rather than only on the one runner that can execute it.
+// The callers are `crate::tools::shell::Shell::run_line` and
+// `crate::tools::git::Git::run`, on every platform. Both are wired up as of
+// 0.74.0, so there is no `allow(dead_code)` here: the attribute would hide the
+// next removal, and this function going uncalled is precisely the regression
+// that reopens H11.
+pub(crate) fn applied_only_by_sandbox_run(backend: Backend) -> bool {
+    matches!(backend, Backend::WindowsAppContainer)
+}
+
+/// The AppContainer profile name for one run.
+///
+/// **Unique per run, and unguessable, and both halves are the boundary.**
+///
+/// A profile's SID is `DeriveAppContainerSidFromAppContainerName(name)` — a pure
+/// function of the name — so a name is a SID and a fixed name is a fixed SID.
+/// Every contained run on the machine shared one until 0.74.0, and the grants
+/// this crate writes are merged into a DACL and were never removed, so two
+/// separate things followed from it. A `WorkspaceWrite` run left an inheritable
+/// `FILE_ALL_ACCESS` ACE on the workspace, and the next run over the same tree
+/// under [`ExecMode::ReadOnly`] was handed that ACE back under the identical SID
+/// — a mode that enforced nothing, silently, and only after a prior run. And the
+/// name was a constant in this file, so any process on the machine could derive
+/// the SID and spawn itself into the same container to inherit everything that
+/// had accumulated there.
+///
+/// The `unique` half is therefore drawn from the OS rather than counted: a
+/// process id and a sequence number are both readable by the very local process
+/// this is keeping out. Sixty-four bits, hex, one profile per run.
+///
+/// The capability set stays in the name because an operator cleaning up after a
+/// crashed run should be able to read what they are deleting, and because
+/// `io-harness-` is the prefix that identifies one. Thirty-one characters, well
+/// under the sixty-four a profile name may have.
+#[allow(dead_code)]
+pub(crate) fn run_profile_name(allow_network: bool, unique: u64) -> String {
+    let caps = if allow_network { "net" } else { "iso" };
+    format!("io-harness-{caps}-{unique:016x}")
+}
+
+/// A value for [`run_profile_name`]'s `unique` that a local adversary cannot
+/// predict.
+///
+/// `RandomState` is keyed from the operating system's randomness once per
+/// process and advances per construction, which is the only unpredictable number
+/// `std` offers without a dependency — and this release adds none. The process id
+/// and the counter are mixed in so two runs in one process, and two processes
+/// that somehow share a seed, still differ.
+#[allow(dead_code)]
+pub(crate) fn fresh_profile_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    h.write_u32(std::process::id());
+    h.finish()
+}
+
+/// Every handle a contained spawn may let cross into the container: the file the
+/// child's standard streams are redirected to, and the descriptors the caller
+/// asked for by name. **Nothing else.**
+///
+/// `CreateProcessW` is called with `bInheritHandles` true, because the redirect
+/// and the C-runtime descriptor table both need it. Without a
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` that is a blanket grant: *every* handle
+/// this process holds that is marked inheritable crosses into a default-deny
+/// container carrying the access it was opened with, so one leaked inheritable
+/// handle is a hole straight through the ACL boundary the container exists to be.
+/// This is the list that closes it, and it is built here — portable, as data —
+/// so what the child may inherit is asserted on the build host rather than only
+/// on the runner that can spawn one.
+///
+/// Order is the capture file first, then the caller's slice, matching the
+/// descriptor table `Spawned::start_with` writes.
+#[allow(dead_code)]
+pub(crate) fn inheritable_handles<H: Copy>(capture: H, inherited: &[H]) -> Vec<H> {
+    let mut out = Vec::with_capacity(1 + inherited.len());
+    out.push(capture);
+    out.extend_from_slice(inherited);
+    out
+}
+
 /// The Win32 half. Compiled only on Windows; everything above this line builds
 /// on every host so the mapping and its test do too.
 ///
@@ -555,28 +670,35 @@ pub(crate) mod job {
     /// Deliberately a process-global last-one-wins rather than a channel: it
     /// exists so a failure has something to print, and a decline is rare enough
     /// that the most recent one is the interesting one.
-    /// The profile every contained run on this machine shares.
+    /// The profile for one contained run, created fresh and deleted at teardown.
     ///
-    /// Deterministic on purpose: the SID derives from the name, so one name means
-    /// one SID means every process writes the identical ACE onto the paths they
-    /// share. Two processes with two SIDs racing a read-modify-write over one
-    /// DACL lose each other's entry, and the symptom is a container that cannot
-    /// read the toolchain home. It is not deleted on drop — see `Profile`.
+    /// **Not shared, and not deterministic, since 0.74.0.** The argument for
+    /// sharing one machine-wide name was that a profile's SID derives from its
+    /// name, so one name meant one SID meant every process wrote the identical
+    /// ACE onto the paths they share, and two SIDs racing a read-modify-write
+    /// over one DACL lost each other's entry. What that argument left out is that
+    /// this crate's grants are only ever *added*: the shared ACE outlived the run
+    /// that wrote it, so a `WorkspaceWrite` run left the workspace writable to
+    /// the same SID the next `ExecMode::ReadOnly` run would enter under, and a
+    /// constant name is a constant SID that any process on the machine can derive
+    /// and spawn itself into. See `super::run_profile_name`, which carries the
+    /// whole argument, and the revoke pass in `run_contained`, which is the half
+    /// that makes a per-run name affordable rather than merely correct.
     ///
-    /// **The name encodes the capability set**, so there are two of them rather
-    /// than one. A profile registers its capabilities when it is *created*, and a
-    /// shared profile is created once and re-entered forever after; if one name
-    /// served both answers, whichever run created it would decide what every
-    /// later run's profile was registered with. The token's array is what an
-    /// access check reads, but registration and token disagreeing is a state
-    /// nothing here has measured, and this release does not ship a boundary whose
-    /// correctness rests on an untested equivalence.
-    pub(crate) fn shared_profile(allow_network: bool) -> &'static str {
-        if allow_network {
-            "io-harness-sandbox-net"
-        } else {
-            "io-harness-sandbox"
-        }
+    /// **The DACL race the shared name answered is not gone, and what changed is
+    /// which paths can lose one.** Two runs granting the same object still
+    /// read-modify-write one DACL, and one can still drop the other's ACE. Under
+    /// one shared SID the two entries were identical and a loss was invisible;
+    /// under two they are different entries and a loss is real. The paths where
+    /// two runs collide are the machine-wide ones — the toolchain homes,
+    /// `%SystemRoot%`, the program's directory, and the traverse ancestors — and
+    /// every one of those is in the set `run_contained` treats as non-fatal
+    /// because it is belt-and-braces over an `ALL APPLICATION PACKAGES` ACE the
+    /// path already carries. A run that loses one fails to start its payload,
+    /// visibly. The writable grants, which are the ones a lost ACE would make
+    /// *quiet*, are on the workspace and the run's own directories.
+    fn run_profile(allow_network: bool) -> String {
+        super::run_profile_name(allow_network, super::fresh_profile_id())
     }
 
     /// A throwaway profile name, **per process**, for the availability probe.
@@ -612,10 +734,102 @@ pub(crate) mod job {
         }
     }
 
+    /// What one contained run leaves the machine, undone.
+    ///
+    /// **A grant that is never withdrawn is the finding, not the tidiness.** The
+    /// ACEs this crate writes are merged into DACLs and were removed by nothing
+    /// before 0.74.0, so `ExecMode::ReadOnly` was not enforced on any tree a
+    /// `WorkspaceWrite` run had touched: the inheritable `FILE_ALL_ACCESS` ACE was
+    /// still there and still named a SID the next run entered under. A per-run
+    /// profile answers the *identity* half of that and would, on its own, replace
+    /// one permanent ACE with one permanent ACE per run — a workspace DACL that
+    /// grows until the 64 KB an ACL may be is used up and every later grant fails.
+    /// So the two halves ship together: a name nothing else holds, and a
+    /// withdrawal that runs whatever the run did.
+    ///
+    /// **Best-effort, and it has to be.** Revoking is a DACL write, and the same
+    /// reasons a grant can fail — no `WRITE_DAC` on `%SystemRoot%`, a locked
+    /// descendant, a directory the run itself deleted — apply here, on a path
+    /// where there is nothing left to return to the caller. Each failure is
+    /// logged and the rest still run. What survives a failed revoke is an ACE
+    /// naming a container profile that no longer exists, which grants nothing to
+    /// anyone: the SID has 64 bits of unpredictable name behind it and is never
+    /// entered again.
+    ///
+    /// **What a killed run leaves.** `Drop` covers a return, an error and a
+    /// panic; it does not cover the process being killed or the machine losing
+    /// power. That run leaves its profile registered, its directory under
+    /// `%LOCALAPPDATA%\Packages`, its own temporary directory, and its ACEs — all
+    /// named `io-harness-`, all inert, and all reclaimed by nothing. This is
+    /// stated rather than solved: sweeping profiles by prefix at start-up would
+    /// delete the profile a concurrently running agent is spawning into, which is
+    /// a failure this module has already paid for once.
+    struct Teardown<'a> {
+        profile: &'a crate::sandbox::appcontainer::win::Profile,
+        /// The entries whose grant actually landed, pushed as the loop below
+        /// applies them.
+        ///
+        /// **Not the whole grant set, and the difference is a tree walk over
+        /// `%SystemRoot%`.** A read-execute or traverse grant that fails is
+        /// non-fatal — the path already carries an `ALL APPLICATION PACKAGES`
+        /// ACE, and the run goes on — and this process wrote no ACE there to take
+        /// back. Withdrawing one anyway is a `TreeSetNamedSecurityInfoW` over
+        /// `C:\Windows` in exchange for nothing, at the end of every run on every
+        /// host where the harness is not an administrator, which is most of them.
+        /// `revoke_for` asks for the successful entries in those words.
+        applied: Vec<super::GrantedPath>,
+        run_tmp: &'a std::path::Path,
+    }
+
+    impl Drop for Teardown<'_> {
+        fn drop(&mut self) {
+            for g in &self.applied {
+                if let Err(e) = crate::sandbox::appcontainer::win::revoke_for(
+                    &g.path,
+                    self.profile.sid(),
+                    g.reach,
+                ) {
+                    tracing::debug!(
+                        path = %g.path.display(),
+                        "sandbox: could not withdraw the container's grant ({e}); it names a \
+                         profile that is about to stop existing"
+                    );
+                }
+            }
+            // Removed whole, and not merely revoked above: the container's ACE on
+            // this directory is inheritable, so the files under it materialised it
+            // when they were created, and withdrawing it from the directory does
+            // not reach them. Deleting the directory does.
+            if let Err(e) = std::fs::remove_dir_all(self.run_tmp) {
+                tracing::debug!(
+                    path = %self.run_tmp.display(),
+                    "sandbox: could not remove the container's temporary directory ({e})"
+                );
+            }
+        }
+    }
+
     pub(super) async fn run_contained(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
         use crate::sandbox::appcontainer::win::{grant_for, Profile, Spawned};
 
         let tmp = std::env::temp_dir();
+        // **The run's own temporary directory, not the machine's.** The container
+        // is granted this and never `%TEMP%` itself; `super::grants` carries the
+        // argument. Created before the grant set is derived because a grant on a
+        // path that is not there fails, and a failed writable grant declines the
+        // whole container.
+        let run_tmp = tmp.join(format!(
+            "io-harness-run-{}-{:016x}",
+            std::process::id(),
+            super::fresh_profile_id()
+        ));
+        if let Err(e) = std::fs::create_dir_all(&run_tmp) {
+            tracing::warn!("sandbox: could not create the container's temporary directory ({e})");
+            note_decline(&format!(
+                "could not create the container's temporary directory: {e}"
+            ));
+            return None;
+        }
         // The **resolved** program's directory, not `argv[0]`'s. A command is
         // named the way every command is named — `cargo`, `rustc`, `npm` — and
         // the parent of a bare filename is the empty path, so the one directory
@@ -632,16 +846,15 @@ pub(crate) mod job {
             &toolchain_roots,
             program_dir.as_deref(),
             system_root.as_deref(),
-            &tmp,
+            &run_tmp,
         );
 
-        // A deterministic name, so a profile stranded by a crashed run is
-        // re-entered rather than becoming a permanent failure — the module's own
-        // `ERROR_ALREADY_EXISTS` path. Bounded well under the 64-character limit.
-        let profile = match Profile::shared(shared_profile(spec.allow_network), spec.allow_network)
-        {
+        // A name unique to this run, deleted when the `Profile` drops. See
+        // `run_profile`.
+        let profile = match Profile::create(&run_profile(spec.allow_network), spec.allow_network) {
             Ok(p) => p,
             Err(e) => {
+                let _ = std::fs::remove_dir_all(&run_tmp);
                 tracing::warn!(
                     "sandbox: could not create an AppContainer profile ({e}); \
                      falling back to the job object, which contains resources and not access"
@@ -650,8 +863,20 @@ pub(crate) mod job {
                 return None;
             }
         };
+        // **Declared after the profile it borrows, so it runs before the profile
+        // is freed**, and before the temporary directory it removes could be
+        // needed. Every exit below — a declined grant, a failed spawn, an error, a
+        // panic unwinding through here — leaves the run's ACEs withdrawn and its
+        // directory gone, because the withdrawal is a `Drop` and not a step at the
+        // end that a `return` can skip. The same argument the job handle makes.
+        let mut teardown = Teardown {
+            profile: &profile,
+            applied: Vec::with_capacity(granted.len()),
+            run_tmp: &run_tmp,
+        };
         for g in &granted {
             let Err(e) = grant_for(&g.path, profile.sid(), g.grant, g.reach) else {
+                teardown.applied.push(g.clone());
                 continue;
             };
             // **A read-execute grant that fails is not fatal, and this is not a
@@ -721,6 +946,12 @@ pub(crate) mod job {
         // batch — would otherwise share one capture file and read each other's
         // output. The process id keeps two processes on the same machine apart;
         // the counter keeps two runs inside one process apart.
+        //
+        // **In the machine's `%TEMP%`, deliberately, and not in `run_tmp`.** The
+        // child reaches this file through the inherited handle its standard
+        // streams are, and needs no path to it. Leaving it where the container is
+        // granted nothing but traverse means the payload cannot find, truncate or
+        // rewrite the record of what it did.
         static CAPTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let out_path = tmp.join(format!(
             "io-harness-{}-{}.out",
@@ -736,7 +967,8 @@ pub(crate) mod job {
             }
         };
         let cmdline = super::command_line(spec.argv);
-        let mut child = match Spawned::start(&cmdline, spec.workdir, &profile, &file) {
+        let spawned = Spawned::start(&cmdline, spec.workdir, &profile, &file, Some(&run_tmp));
+        let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("sandbox: could not spawn into the AppContainer ({e})");
@@ -1739,10 +1971,10 @@ mod tests {
         assert_eq!(find(&g, r"C:\cache\npm").unwrap().grant, Grant::Full);
         assert_eq!(find(&g, r"C:\Temp").unwrap().grant, Grant::Full);
 
-        // A path the run named reaches what is already inside it; the shared
-        // temporary directory is granted for what the run will *create* there,
-        // and re-propagating it is the one grant in this set that was both
-        // expensive and racy.
+        // A path the run named reaches what is already inside it; the run's own
+        // temporary directory is granted for what it will *create* there, and it
+        // is empty at the moment it is granted, so there is nothing under it for
+        // a tree walk to find.
         assert_eq!(find(&g, r"C:\work").unwrap().reach, Reach::Tree);
         assert_eq!(find(&g, r"C:\cache\cargo").unwrap().reach, Reach::Tree);
         assert_eq!(
@@ -1879,6 +2111,158 @@ mod tests {
             2,
             "the workspace and the temp directory, and that is all"
         );
+    }
+
+    /// H11 — which backends confine only what `Sandbox::run` spawns.
+    ///
+    /// The decision is a pure function of the backend so that it is asserted on
+    /// every build host and not only on the one runner that can enter a
+    /// container. It is what the `shell` tool and the git built-ins consult
+    /// before spawning a `Child` of their own: every other rung reaches them
+    /// through `wrap_argv` or `contain_command`, and the AppContainer reaches
+    /// them through neither.
+    #[test]
+    fn h11_only_the_windows_container_is_applied_by_sandbox_run_alone() {
+        assert!(
+            applied_only_by_sandbox_run(Backend::WindowsAppContainer),
+            "the container is entered at `CreateProcessW` through a process-thread attribute \
+             list, so a caller that owns its own `Child` cannot be inside one"
+        );
+        for b in [
+            Backend::MacosSandboxExec,
+            Backend::LinuxLandlock,
+            Backend::LinuxBubblewrap,
+            Backend::LinuxNamespaces,
+            Backend::WindowsJobObject,
+            Backend::PortableFloor,
+        ] {
+            assert!(
+                !applied_only_by_sandbox_run(b),
+                "{} is reachable from `wrap_argv` or `contain_command`, so refusing a caller's \
+                 own spawn under it would refuse a command this crate can confine",
+                b.as_str()
+            );
+        }
+    }
+
+    /// M8 — a run's profile name is its own, and unguessable.
+    ///
+    /// A profile's SID is `DeriveAppContainerSidFromAppContainerName` of its
+    /// name, so the name *is* the identity. Until 0.74.0 it was one of two
+    /// constants in this file, which meant every run on the machine shared a SID
+    /// any process could derive: the grants one run left behind were the next
+    /// one's, and `ExecMode::ReadOnly` enforced nothing on a tree a
+    /// `WorkspaceWrite` run had touched.
+    #[test]
+    fn m8_a_runs_container_profile_name_is_unique_and_unguessable() {
+        // The two names 0.73.0 shipped. Naming them here is what makes this test
+        // fail against that behaviour rather than merely describe this one.
+        for constant in ["io-harness-sandbox", "io-harness-sandbox-net"] {
+            for net in [false, true] {
+                assert_ne!(
+                    run_profile_name(net, fresh_profile_id()),
+                    constant,
+                    "a profile name a second process can write down is a container it can \
+                     spawn itself into"
+                );
+            }
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            assert!(
+                seen.insert(fresh_profile_id()),
+                "two runs drew the same profile id, so two runs share one container SID"
+            );
+        }
+
+        for net in [false, true] {
+            let caps = if net { "net" } else { "iso" };
+            let name = run_profile_name(net, 0x0123_4567_89ab_cdef);
+            assert_eq!(name, format!("io-harness-{caps}-0123456789abcdef"));
+            // Sixty-four is the documented ceiling for a profile name, and the
+            // prefix is what an operator cleaning up after a crashed run reads.
+            assert!(
+                name.len() <= 64 && name.starts_with("io-harness-"),
+                "{name}"
+            );
+        }
+        // The capability set stays in the name: a profile registers its
+        // capabilities when it is created, so the two answers must never be one
+        // name.
+        assert_ne!(
+            run_profile_name(true, 7),
+            run_profile_name(false, 7),
+            "a network-permitting container and an isolated one must not be the same profile"
+        );
+    }
+
+    /// M8's other half — the machine's `%TEMP%` is never handed to a container.
+    ///
+    /// The grant this crate writes for `Grant::Full` is inheritable, and Windows
+    /// inheritance is static: every temporary file *anything* on the machine
+    /// created after such a grant materialised the container's `FILE_ALL_ACCESS`
+    /// ACE at creation, and withdrawing the ACE later does not take those files
+    /// back. What the run gets is its own empty directory underneath, and
+    /// `%TEMP%` keeps the traverse that makes it reachable by name.
+    ///
+    /// Portable: `grants` is a pure derivation, and on a unix build host the
+    /// paths below are real unix paths with real ancestors.
+    #[test]
+    fn m8_the_machines_temporary_directory_is_never_granted_to_a_container() {
+        let tmp = std::env::temp_dir();
+        let run_tmp = tmp.join("io-harness-run-1-0123456789abcdef");
+        for mode in [ExecMode::ReadOnly, ExecMode::WorkspaceWrite] {
+            let g = grants(mode, &tmp.join("work"), &[], &[], None, None, &run_tmp);
+            let own = g.iter().find(|e| e.path == run_tmp);
+            let shared: Vec<&GrantedPath> = g.iter().filter(|e| e.path == tmp).collect();
+            assert_eq!(
+                own.map(|e| e.grant),
+                Some(Grant::Full),
+                "the run's own temporary directory is what a toolchain is given: {g:?}"
+            );
+            assert_eq!(
+                own.map(|e| e.reach),
+                Some(Reach::DirectoryOnly),
+                "the directory is new, so there is nothing already inside it to walk: {g:?}"
+            );
+            assert!(
+                shared.iter().all(|e| e.grant == Grant::Traverse),
+                "`%TEMP%` is shared with every other process on the machine, and an \
+                 inheritable grant on it reaches every temporary file created afterwards, \
+                 including another run's: {g:?}"
+            );
+            // The negative control. `%TEMP%` is the parent of the directory the
+            // run was granted, so it is always in the set — an assertion that it
+            // is never granted *more* than traverse would otherwise pass on a
+            // derivation that had stopped naming it at all.
+            assert!(
+                !shared.is_empty(),
+                "`%TEMP%` must still be walked through, or the directory under it cannot be \
+                 reached by name: {g:?}"
+            );
+        }
+    }
+
+    /// M9 — what may cross into a container, as data.
+    ///
+    /// `CreateProcessW` is called with `bInheritHandles` true, so without a
+    /// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` every inheritable handle this process
+    /// holds is duplicated into a default-deny container carrying the access it
+    /// was opened with — past a token whose whole job is to answer no to what it
+    /// was not granted by name. This is the list that closes it, built out here
+    /// so its contents are asserted on the build host.
+    #[test]
+    fn m9_only_the_capture_file_and_the_named_handles_cross_into_a_container() {
+        assert_eq!(
+            inheritable_handles(7u32, &[]),
+            vec![7u32],
+            "a contained spawn has one handle to inherit: the file both its standard streams \
+             are redirected to"
+        );
+        // Order is the capture file first, then the caller's slice, because that
+        // is the order `Spawned::start_with` writes the descriptor table in.
+        assert_eq!(inheritable_handles(7u32, &[8, 9]), vec![7u32, 8, 9]);
     }
 
     #[test]

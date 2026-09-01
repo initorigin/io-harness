@@ -1226,6 +1226,30 @@ impl Shell {
     }
 
     async fn run_line(&self, line: &Line, plan: &[Planned]) -> Result<ShellOutcome> {
+        // **H11 (0.74.0) — the same refusal the git built-ins make, and for the
+        // same reason.** A line's stages are piped into one another, so this tool
+        // owns every `Child` and reaches containment only through `wrap_argv` and
+        // `contain_command`. Neither has a Windows branch and neither can have
+        // one: an AppContainer is entered at `CreateProcessW` through a
+        // process-thread attribute list, so there is no argv to prepend and no
+        // `pre_exec` to install. Every stage of every line — `shell` and
+        // `shell_start` alike, which both arrive here — spawned completely
+        // unwrapped while the run reported `windows-appcontainer`.
+        if let Some(sb) = &self.sandbox {
+            let backend = sb.containment.backend();
+            if crate::sandbox::windows::applied_only_by_sandbox_run(backend) {
+                return Err(Error::Sandbox {
+                    reason: format!(
+                        "this run asked for access confinement and the `{}` backend is applied \
+                         only by the sandbox's own runner, which a shell line's stages do not \
+                         go through. Nothing was started — a stage spawned here would have had \
+                         no filesystem and no network boundary while the run reported that it \
+                         had both",
+                        backend.as_str()
+                    ),
+                });
+            }
+        }
         let mut out = String::new();
         let mut err = String::new();
         let mut code = Some(0);

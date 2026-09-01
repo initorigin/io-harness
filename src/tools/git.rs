@@ -722,6 +722,31 @@ impl<'a> Git<'a> {
                 layer: verdict.layer,
             });
         }
+        // **H11 (0.74.0) — a backend only `Sandbox::run` can apply is refused
+        // here, never spawned.** This built-in owns its own `Child`, so the
+        // containment it gets is whatever `wrap_argv` and `contain_command` can
+        // express and nothing else. The Windows AppContainer is entered at
+        // `CreateProcessW` through a process-thread attribute list, so it is
+        // expressible in neither, and spawning anyway ran git with no filesystem
+        // and no network boundary while the run wrote `windows-appcontainer`
+        // into its `SandboxEvent` rows and into the agent's own boundary prompt.
+        // Naming an isolation that was never applied is the one failure this
+        // crate says it will not ship, so this refuses instead.
+        if let Some(c) = &self.sandbox {
+            let backend = c.backend();
+            if crate::sandbox::windows::applied_only_by_sandbox_run(backend) {
+                return Err(Error::Sandbox {
+                    reason: format!(
+                        "this run asked for access confinement and the `{}` backend is applied \
+                         only by the sandbox's own runner, which a git built-in does not go \
+                         through. Nothing was started — a child spawned here would have had no \
+                         filesystem and no network boundary while the run reported that it had \
+                         both",
+                        backend.as_str()
+                    ),
+                });
+            }
+        }
         // 0.48.0 — the same two halves every other spawn site in this crate uses:
         // what the argv becomes under a wrapping backend, and the restriction that
         // is installed in the child instead of expressed as an argv. Both, or a
