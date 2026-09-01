@@ -26,6 +26,172 @@ notes are produced from it.
 
 ### Security
 
+## [0.74.0] - 2026-09-01
+
+**The boundary this crate is built to be is now actually on the path, and it
+proves itself rather than declaring itself.** An internal audit read the whole
+crate under the threat model that matters — an LLM-driven agent following
+prompt-injected instructions from a hostile repository, a hostile PR branch, or
+a config the agent wrote itself — and returned 51 findings. Two of them were
+this product's own thesis failing rather than a bug beside it: the gate the
+design rests on was not on the post-edit path at all, and three separate
+backends reported a containment that was not in force.
+
+Every change here removes permission or adds a check. Nothing in this release
+grants an act that 0.73.0 refused. Several of the narrowings are visible, and
+each one below names what to do instead — a refusal that does not teach is
+half a fix.
+
+### Breaking changes
+
+- **BREAKING (behaviour)** — a file inside the workspace may no longer declare
+  anything that names a program to run or an endpoint a credential is sent to.
+  `[[provider]]`, `[[mcp]]`, `[[lsp]]`, `[[hook]]` and `[browser]` are refused
+  in both `io.toml` and `io.local.toml`, and a plugin bundle named by either may
+  not contribute them either.
+
+  *Migration:* move the table to the **user-scope** file — `$IO_CONFIG`, else
+  `$IO_CONFIG_HOME/io.toml`, else `$XDG_CONFIG_HOME/io/io.toml` or
+  `~/.config/io/io.toml`; on Windows `%IO_CONFIG%`, else
+  `%IO_CONFIG_HOME%\io.toml`, else `%APPDATA%\io\io.toml`. Every refusal names
+  that path. `io.local.toml` was the documented home for per-project hooks and
+  is no longer an option for them: it sits at the workspace root, which is a
+  path the agent can write and a clone can ship, and that is the whole finding.
+  A workspace file may still **narrow** the boundary, which is what the project
+  scope is for.
+
+- **BREAKING (behaviour)** — `.git/**`, `io.toml` and `io.local.toml` are
+  deny-by-default to `write_file`, `edit_file` and `patch_file`.
+
+  *Migration:* none for ordinary work. `git_add`, `git_commit` and `git_branch`
+  cover every legitimate reason to write inside `.git`, and configuration is not
+  agent-writable by design. `.gitignore`, `.gitmodules` and `.gitattributes` are
+  unaffected — the pattern is `.git/*`, not `.git*`.
+
+- **BREAKING (behaviour)** — `git` refuses to run at all in a repository whose
+  own `.git/config` defines a `filter` or `merge` driver.
+
+  *Migration:* remove the driver from that repository's config. There is no
+  narrower answer available: a driver is keyed by a name the repository chooses,
+  so there is no wildcard `-c` to neutralise it and no environment variable that
+  suppresses a repo-local config file at all. The refusal names the section, the
+  key and the file.
+
+- **BREAKING (behaviour)** — under a policy whose `exec` tier is not `allow`,
+  the automatic post-edit check no longer runs. `Policy::default()` has
+  `exec: Ask`, so this is the default.
+
+  *Migration:* `allow_exec` the checker for the projects you want checked. The
+  write itself is unaffected and still cannot fail; the diagnostics are simply
+  absent. Before this release that reflex spawned the project's compiler with no
+  `Act::Exec` gate and no containment, which for a cargo project means running
+  the workspace's own `build.rs`.
+
+- **BREAKING (behaviour)** — on Windows, `shell`, `shell_start` and the `git`
+  built-ins refuse to spawn when the run selected the AppContainer backend.
+
+  *Migration:* run those tools without `access_confinement`, or use the `exec`
+  tool, which is contained. An AppContainer is entered at `CreateProcessW`
+  through a process-thread attribute list, so it cannot be expressed as an argv
+  wrapper — which is why these tools were previously spawning completely
+  unwrapped while the run reported `windows-appcontainer`.
+
+- **BREAKING (behaviour)** — a path that escapes the workspace root is now
+  denied rather than graded on its collapsed spelling, a write no longer follows
+  a symlink at the leaf out of the root, and `Workspace::read_bytes` refuses a
+  file over 64 MiB.
+
+  *Migration:* none for a path that stays inside the root, including one that
+  uses `..` to get there and one that goes through a symlink pointing inside.
+  A caller that relied on `check_path` allowing `../../x` was relying on a bug:
+  it graded that path as `x`.
+
+- **BREAKING (behaviour)** — the gate refuses an approver's `modified` request
+  on an `Act::Exec` action instead of discarding it, and a resumed approval
+  whose persisted act cannot be replayed is refused instead of performed.
+
+  *Migration:* an approver that rewrote an exec action was never having its
+  rewrite applied — the original argv ran and the trace recorded the rewrite.
+  Approve or deny instead. Rewrites of reads and writes are unaffected.
+
+### Security
+
+- **The gate is on the post-edit path.** The reflex that runs a project's own
+  checker after every successful write called `Exec::new` directly, with no
+  `gate(Act::Exec)` and no containment. `CHECKERS` maps `Cargo.toml` to
+  `cargo check`, which compiles and runs `build.rs`, so a repository the agent
+  can write reached arbitrary host execution while the approver saw two
+  `Act::Write` prompts and nothing else. The same fix closed a second spawn
+  found beside it: the model-callable `check` tool gated its checker and then
+  ran it outside the run's sandbox.
+
+- **A path can no longer rewrite the macOS sandbox profile.** `workdir` and the
+  writable roots were interpolated into the `sandbox-exec` profile with no
+  escaping, and SBPL is last-matching-rule-wins, so a directory whose name
+  closed the profile's own string literal appended rules to it — regranting
+  write and network on `/` while the backend still answered
+  `confines_writes() = true`. Paths carrying a quote, a backslash or a control
+  character are refused; a profile that cannot be built grants nothing rather
+  than silently losing one line.
+
+- **Windows stops naming a containment it never applied**, the AppContainer
+  profile is per-run with an unguessable SID and is revoked at teardown, and the
+  spawn's handle list names only the capture file and the handles it was given.
+  A fixed profile name meant `ExecMode::ReadOnly` was not enforced after any
+  earlier writable run on the same tree.
+
+- **A cloned repository can no longer redirect the provider endpoint** or name
+  an MCP or LSP server to spawn at run start. This is the same door
+  `plugin.rs` already refused for a project-scoped plugin; it is now one
+  allowlist in one place, and the rule is written down rather than enumerated:
+  anything that names a program to run, or names an endpoint a credential is
+  sent to, is refused outside the user scope, without exception.
+
+- **A repository's own git config is neutralised or refused.** `--no-textconv`
+  joins `--no-ext-diff`, `core.fsmonitor` joins `core.hooksPath` as a `-c`
+  override, and `GIT_ATTR_NOSYSTEM` stops the system attributes file selecting a
+  driver. What `-c` cannot reach is refused outright.
+
+- **The store is created readable only by the user that created it** on unix,
+  and an existing store is tightened on open. The trace holds whatever the run
+  saw — a step that read a credentials file puts those credentials in
+  `steps.result` — and that is now stated in the crate's own documentation
+  rather than left to be discovered.
+
+- **A column name read from a store's own schema is quoted** before it reaches a
+  statement. A database with an unusual or foreign column name could previously
+  not be sized, archived or swept.
+
+### Fixed
+
+- `spawn_agent` is refused while a proposed plan is unapproved, and a child that
+  does spawn inherits the policy its parent is running under rather than the
+  contract's. A plan gate could previously be stepped around by emitting
+  `spawn_agent` instead of `propose_plan`.
+
+- `before_tool` hooks fire for `spawn_agent`, `send_message` and
+  `read_messages`. An operator's hook on those three loaded, validated,
+  installed and never ran.
+
+- A remembered approval survives the tree loop, so "approve and stop asking" is
+  no longer re-asked at every step inside `run_tree`.
+
+- On Windows, teardown no longer revokes grants that failed. On a host where the
+  harness is not an administrator, every run ended with a security-descriptor
+  tree walk of `%SystemRoot%` to remove an ACE it had never written.
+
+### Changed
+
+- `deny_net` matches a host case-insensitively and ignores one trailing root
+  dot, so `deny_net("evil.example")` covers `EVIL.example:443` and
+  `evil.example.`. The fold applies to denies only: folding an allow would
+  widen it, and this release adds no widening.
+
+- An `Act::Exec` deny matches its target case-insensitively and splits a
+  Windows path on `\`. The basename fallback now applies to denies only —
+  `allow_exec("cargo")` previously also granted `./target/debug/cargo`, a binary
+  the agent had built for itself.
+
 ## [0.73.0] - 2026-08-31
 
 A skill can open the file it points at, a bundle can say which program it ships,
