@@ -59,14 +59,58 @@ fn unwritable(rel: &str, e: impl std::fmt::Display) -> Error {
     Error::Config(format!("cannot build the PDF for {rel}: {e}"))
 }
 
+/// The message a caught panic carried, or a stand-in when it carried none.
+///
+/// A payload is a `&str` for a literal `panic!("...")` and a `String` for a
+/// formatted one; anything else is legal and has nothing to print.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "the parser panicked without a message".to_string())
+}
+
 /// Parse a document out of the workspace, in memory.
 ///
 /// The single read entry point for the `lopdf` side of this module: bytes from
 /// [`Workspace::read_bytes`], parsed with [`Document::load_mem`]. A truncated or
 /// non-PDF file comes back as an [`Err`] here rather than as a panic deeper in.
+///
+/// # Why the panic guard is here
+///
+/// `lopdf` reports most malformed input as an error and panics on some of it —
+/// it decodes object streams in parallel behind a mutex, and a worker that
+/// panics leaves that mutex poisoned, so every `lock().unwrap()` after it panics
+/// too and one bad object becomes a cascade. The guard is on this function
+/// rather than on a caller because every `lopdf` path in this module comes
+/// through here: [`watermark`] and [`fill_form`] get the same protection
+/// [`read_text`] has always had, and a fourth caller added later gets it without
+/// having to know about it. Parsing is a pure function of a byte slice, so
+/// catching the unwind is sound — nothing is left half-mutated, only a
+/// [`Document`] that was never built.
+///
+/// Two things it does not cover, and both are honest limits rather than gaps to
+/// be worded around:
+///
+/// - An object graph nested deeply enough recurses until the thread's stack runs
+///   out. That is a `SIGSEGV`, not a panic; no [`catch_unwind`](std::panic::catch_unwind)
+///   catches it, and the process is gone.
+/// - Under a `panic = "abort"` profile there is no unwinding to catch. The
+///   binary's profile decides that and a library cannot override it.
+///
+/// The panic message is also still printed by the default hook before this turns
+/// it into an [`Error::Config`].
 fn open(ws: &Workspace, rel: &str) -> Result<Document> {
     let bytes = ws.read_bytes(rel)?;
-    Document::load_mem(&bytes).map_err(|e| unreadable(rel, e))
+    match std::panic::catch_unwind(|| Document::load_mem(&bytes)) {
+        Ok(Ok(doc)) => Ok(doc),
+        Ok(Err(e)) => Err(unreadable(rel, e)),
+        Err(panic) => Err(unreadable(
+            rel,
+            format!("parsing failed: {}", panic_text(&panic)),
+        )),
+    }
 }
 
 /// Serialise a document and hand the bytes to the workspace.
@@ -295,22 +339,22 @@ pub fn write_new(ws: &Workspace, rel: &str, pages: &[String]) -> Result<Wrote> {
 /// pure function of a byte slice, so catching the unwind is safe: there is no
 /// half-mutated state left behind, only a `String` that was never produced.
 ///
-/// The guard depends on unwinding, so it does nothing under a `panic = "abort"`
-/// profile; the panic message is also still printed by the default hook before
-/// this converts it into an [`Error::Config`].
+/// This is the second of the two guards, not a copy of one: it wraps
+/// `pdf-extract`, and the `lopdf` side is wrapped in `open`. Both carry the same
+/// two residuals — the guard depends on unwinding, so it does nothing under a
+/// `panic = "abort"` profile, and an input that recurses until the stack runs out
+/// takes the process down with a `SIGSEGV` that no guard catches. The panic
+/// message is also still printed by the default hook before this converts it into
+/// an [`Error::Config`].
 pub fn read_text(ws: &Workspace, rel: &str) -> Result<String> {
     let bytes = ws.read_bytes(rel)?;
     match std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes)) {
         Ok(Ok(text)) => Ok(text),
         Ok(Err(e)) => Err(unreadable(rel, e)),
-        Err(panic) => {
-            let what = panic
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "the extractor panicked".to_string());
-            Err(unreadable(rel, format!("text extraction failed: {what}")))
-        }
+        Err(panic) => Err(unreadable(
+            rel,
+            format!("text extraction failed: {}", panic_text(&panic)),
+        )),
     }
 }
 

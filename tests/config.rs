@@ -1208,11 +1208,9 @@ async fn a_substituted_secret_reaches_the_field_and_not_the_trace() {
         write(
             user_dir.path(),
             "io.toml",
-            &format!(
-                "[[mcp]]\nid = \"svc\"\ntransport = \"http\"\n\
-                 url = \"https://example.test\"\n[mcp.headers]\n\
-                 Authorization = \"Bearer ${{env:IO_HARNESS_CONFIG_TEST_SECRET}}\"\n"
-            ),
+            "[[mcp]]\nid = \"svc\"\ntransport = \"http\"\n\
+             url = \"https://example.test\"\n[mcp.headers]\n\
+             Authorization = \"Bearer ${env:IO_HARNESS_CONFIG_TEST_SECRET}\"\n",
         );
         let config = Config::discover(project.path()).unwrap();
         // It did reach the typed field — the point of substitution.

@@ -19,10 +19,31 @@
 
 use std::io::Cursor;
 
-use calamine::{Reader, Xlsx};
+use calamine::{DataType, Reader, Xlsx, XlsxError};
 
 use crate::error::{Error, Result};
 use crate::tools::workspace::{Workspace, Wrote};
+
+/// The largest used range [`read_sheet`] will materialise, in cells.
+///
+/// `calamine` renders a sheet by densifying its used range: `Range::from_sparse`
+/// allocates one value per cell of the bounding box between the outermost cells
+/// that hold anything, whatever fraction of that box is empty. So the cost of a
+/// read is the *span*, not the count. Two cells the format itself allows, `A1`
+/// and `XFD1048576`, span 16,384 columns by 1,048,576 rows — 1.7e10 values at
+/// about 32 bytes each, a ~550 GB allocation asked for by a file a couple of
+/// kilobytes long. That is an out-of-memory kill under Linux overcommit or an
+/// `handle_alloc_error` abort, and an abort is not something a caller can catch.
+///
+/// Five million is picked against both ends of that. Under it the densified
+/// buffer is ~160 MB: large, survivable, and already past the size whose text
+/// projection is worth handing a model — five million cells is a hundred columns
+/// by fifty thousand rows and renders as something on the order of ten megabytes
+/// of text. Over it, what is refused was unreadable as text either way. The cap
+/// is 0.03% of the format's own grid, so the crafted case misses it by more than
+/// three orders of magnitude while a full-height single column (1,048,576 cells)
+/// still reads.
+const MAX_CELLS: u64 = 5_000_000;
 
 /// A workbook the caller pointed at could not be parsed.
 ///
@@ -42,11 +63,92 @@ fn unwritable(rel: &str, e: impl std::fmt::Display) -> Error {
 /// Parse a workbook out of the workspace, in memory.
 ///
 /// The single read entry point for this module: bytes from
-/// [`Workspace::read_bytes`], parsed from a [`Cursor`]. A corrupt or non-xlsx
-/// file comes back as an [`Err`] here rather than as a panic deeper in.
+/// [`Workspace::read_bytes`], parsed from a [`Cursor`]. A file that is not a zip,
+/// or is a zip that is not a workbook, comes back as an [`Err`] here rather than
+/// as a panic deeper in.
+///
+/// Only the package is read at this point — the workbook part, the shared strings
+/// and the sheet list. A sheet's own XML is not parsed until `worksheet_range`
+/// asks for it, so a sheet that is corrupt, or whose used range is too large to
+/// materialise, is *not* caught here; [`read_sheet`] is where both of those are
+/// turned into an error, and [`MAX_CELLS`] is the second one.
 fn open(ws: &Workspace, rel: &str) -> Result<Xlsx<Cursor<Vec<u8>>>> {
     let bytes = ws.read_bytes(rel)?;
     Xlsx::new(Cursor::new(bytes)).map_err(|e| unreadable(rel, e))
+}
+
+/// Refuse a sheet whose used range would densify past [`MAX_CELLS`].
+///
+/// Streams the sheet's cells and keeps only the outermost non-empty position in
+/// each direction — the same bounding box `Range::from_sparse` is about to
+/// allocate — so the question the allocation asks is answered before it is asked,
+/// in constant memory. Empty cells are skipped because `worksheet_range` drops
+/// them before it computes that box, and a check that counted them would refuse a
+/// sheet the reader would have handled.
+///
+/// The sheet XML is therefore parsed twice, once here and once by
+/// `worksheet_range`.
+// ponytail: two passes over the sheet XML rather than one. Build the `Range` from
+// this stream instead if a legitimate sheet near the cap ever makes the second
+// pass matter.
+fn check_used_range(book: &mut Xlsx<Cursor<Vec<u8>>>, rel: &str, name: &str) -> Result<()> {
+    let mut cells = match book.worksheet_cells_reader(name) {
+        Ok(cells) => cells,
+        // The one error `worksheet_range` answers with an empty range instead of
+        // an error: a chartsheet or dialog sheet holds no cells and densifies
+        // nothing, so it is not this function's to refuse.
+        Err(XlsxError::NotAWorksheet(_)) => return Ok(()),
+        Err(e) => return Err(unreadable(rel, e)),
+    };
+
+    let (mut rows, mut cols) = ((u32::MAX, 0u32), (u32::MAX, 0u32));
+    let mut any = false;
+    while let Some(cell) = cells.next_cell().map_err(|e| unreadable(rel, e))? {
+        if cell.get_value().is_empty() {
+            continue;
+        }
+        let (row, col) = cell.get_position();
+        any = true;
+        rows = (rows.0.min(row), rows.1.max(row));
+        cols = (cols.0.min(col), cols.1.max(col));
+    }
+    if !any {
+        return Ok(());
+    }
+
+    let height = u64::from(rows.1 - rows.0) + 1;
+    let width = u64::from(cols.1 - cols.0) + 1;
+    let span = height * width;
+    if span > MAX_CELLS {
+        return Err(unreadable(
+            rel,
+            format!(
+                "sheet {name:?} spans {span} cells ({height} rows by {width} columns), \
+                 past the {MAX_CELLS}-cell limit this reader will lay out in memory. \
+                 The span between the outermost cells is what costs, not how many \
+                 of them hold a value, so one far-out cell is enough to reach it"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The A1 letters for a zero-based column index, or `?` where there are none.
+///
+/// `rust_xlsxwriter`'s helper takes a `u16` and adds one to it internally, so
+/// 65,535 overflows *inside* it — a panic in a debug build, a wrap to column `A`
+/// in a release one — and a column above `u16` never reaches it at all. Neither
+/// is hypothetical: a used range is built from the cell references a file
+/// carries, and those are not held to the format's own grid, so a sheet can put a
+/// cell past column `XFD` as easily as inside it. A column with no name the
+/// helper can spell is labelled `?` rather than labelled wrongly, because a
+/// header that reads `FOS` over column 70,000 is a lie the model would then build
+/// an A1 reference out of.
+fn column_label(col: u32) -> String {
+    match u16::try_from(col) {
+        Ok(c) if c < u16::MAX => rust_xlsxwriter::utility::column_number_to_name(c),
+        _ => "?".to_string(),
+    }
 }
 
 /// Whether `cell` is an A1-style reference this module will pass to the library.
@@ -56,8 +158,15 @@ fn open(ws: &Workspace, rel: &str) -> Result<Xlsx<Cursor<Vec<u8>>>> {
 /// `"sheet!A1"` — panics *inside* the dependency. The check is here so a bad
 /// reference from a model becomes a message it can correct instead of a crashed
 /// run. `$` anchors are accepted because the library understands them.
+///
+/// Both halves of the reference are bounded, and for the same reason. Four
+/// letters index past the end of the library's column table, and a row of more
+/// than seven digits does not fit the `u32` it parses the row into — `"A5000000000"`
+/// is a reference every other rule here accepts, and it is the `None` that
+/// unwrap turns into a dead run. Seven digits reaches 9,999,999, which is past
+/// the format's own last row (1,048,576) and nowhere near `u32`'s ceiling.
 fn is_a1(cell: &str) -> bool {
-    regex::Regex::new(r"^\$?[A-Za-z]{1,3}\$?[1-9][0-9]*$").is_ok_and(|re| re.is_match(cell))
+    regex::Regex::new(r"^\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6}$").is_ok_and(|re| re.is_match(cell))
 }
 
 /// The names of every sheet in the workbook, in workbook order.
@@ -92,6 +201,16 @@ pub fn sheet_names(ws: &Workspace, rel: &str) -> Result<Vec<String>> {
 /// and colours are not shown — a text projection cannot carry them, and pretending
 /// otherwise would cost tokens on a lie. [`set_cell`] preserves all of it on the
 /// way back regardless, because it never round-trips through this rendering.
+///
+/// # The one refusal
+///
+/// A sheet is laid out densely before it is rendered — one value per cell of the
+/// box between its outermost cells, empty or not — so a sheet whose used range
+/// spans more than five million of them is refused instead of read, and the error
+/// names the sheet, the span and the limit. The span is what costs: two cells at
+/// opposite corners of the format's grid are a couple of kilobytes on disk and
+/// hundreds of gigabytes laid out. A column the header has no name for is
+/// labelled `?`.
 pub fn read_sheet(ws: &Workspace, rel: &str, sheet: Option<&str>) -> Result<String> {
     let mut book = open(ws, rel)?;
     let names = book.sheet_names();
@@ -109,6 +228,7 @@ pub fn read_sheet(ws: &Workspace, rel: &str, sheet: Option<&str>) -> Result<Stri
             .ok_or_else(|| Error::Config(format!("{rel} contains no sheets")))?,
     };
 
+    check_used_range(&mut book, rel, &name)?;
     let range = book
         .worksheet_range(&name)
         .map_err(|e| unreadable(rel, e))?;
@@ -118,15 +238,20 @@ pub fn read_sheet(ws: &Workspace, rel: &str, sheet: Option<&str>) -> Result<Stri
 
     let mut out = String::new();
     // The gutter column has no letter, so the header starts with the separator.
+    //
+    // Saturating, both here and on the row below: the first row and column come
+    // out of the file's own cell references, so a crafted sheet can start a used
+    // range close enough to `u32`'s ceiling that walking it overflows the
+    // addition — a panic in a debug build, a wrapped-around coordinate in a
+    // release one. Saturating pins the label instead of moving it.
     for c in 0..range.width() {
         out.push('\t');
-        out.push_str(&rust_xlsxwriter::utility::column_number_to_name(
-            (first_col + c as u32) as u16,
-        ));
+        out.push_str(&column_label(first_col.saturating_add(c as u32)));
     }
     out.push('\n');
     for (i, row) in range.rows().enumerate() {
-        out.push_str(&(first_row + i as u32 + 1).to_string());
+        let number = first_row.saturating_add(i as u32).saturating_add(1);
+        out.push_str(&number.to_string());
         for cell in row {
             out.push('\t');
             out.push_str(&cell.to_string().replace(['\t', '\n', '\r'], " "));
@@ -469,15 +594,19 @@ mod tests {
         let ws = Workspace::new(d.path());
         two_sheet_fixture(&ws, "book.xlsx");
 
-        for bad in ["", "A", "1", "A0", "Data!A1", "AAAA1", "B 2"] {
+        // `"A5000000000"` is the M14 case: every other rule accepts it, and the
+        // row does not fit the `u32` the library parses it into, so the guard is
+        // the only thing between it and an unwrap on `None`.
+        for bad in ["", "A", "1", "A0", "Data!A1", "AAAA1", "B 2", "A5000000000"] {
             let e = set_cell(&ws, "book.xlsx", "Data", bad, "x").unwrap_err();
             assert!(
                 e.to_string().contains("A1-style"),
                 "{bad:?} should be refused as a reference, got {e}"
             );
         }
-        // And the control: the well-formed forms are accepted.
-        for good in ["B2", "b2", "$B$2", "AA100"] {
+        // And the control: the well-formed forms are accepted, including the
+        // format's own last row, which the digit bound has to leave room for.
+        for good in ["B2", "b2", "$B$2", "AA100", "A1048576"] {
             assert!(
                 set_cell(&ws, "book.xlsx", "Data", good, "x").is_ok(),
                 "{good:?} is a valid reference"

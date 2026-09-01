@@ -197,7 +197,10 @@ async fn m1_a_resumed_approval_whose_act_has_no_replay_refuses_instead_of_writin
         .await
         .unwrap();
     let RunOutcome::AwaitingApproval { request_id, .. } = paused.outcome else {
-        panic!("expected the write to park on a human, got {:?}", paused.outcome)
+        panic!(
+            "expected the write to park on a human, got {:?}",
+            paused.outcome
+        )
     };
     let real = store.pending(request_id).unwrap().unwrap();
 
@@ -296,13 +299,19 @@ async fn m1_a_deferred_read_still_resumes_and_truncates_nothing() {
     let policy = Policy::default()
         .layer("app")
         .rule(Act::Read, Effect::Ask, "*");
-    let script = Script::new(vec![vec![call("read_file", json!({ "path": "README.md" }))]]);
+    let script = Script::new(vec![vec![call(
+        "read_file",
+        json!({ "path": "README.md" }),
+    )]]);
 
     let paused = run_with(&contract(dir.path(), 3), &script, &store, &policy, &Defer)
         .await
         .unwrap();
     let RunOutcome::AwaitingApproval { request_id, .. } = paused.outcome else {
-        panic!("expected the read to park on a human, got {:?}", paused.outcome)
+        panic!(
+            "expected the read to park on a human, got {:?}",
+            paused.outcome
+        )
     };
     assert_eq!(store.pending(request_id).unwrap().unwrap().act, "read");
 
@@ -357,10 +366,16 @@ async fn m1_a_resumed_exec_approval_refuses_an_approver_rewrite() {
         .await
         .unwrap();
     let RunOutcome::AwaitingApproval { request_id, .. } = paused.outcome else {
-        panic!("expected the tool call to park on a human, got {:?}", paused.outcome)
+        panic!(
+            "expected the tool call to park on a human, got {:?}",
+            paused.outcome
+        )
     };
     let pending = store.pending(request_id).unwrap().unwrap();
-    assert_eq!((pending.act.as_str(), pending.target.as_str()), ("exec", "recorder"));
+    assert_eq!(
+        (pending.act.as_str(), pending.target.as_str()),
+        ("exec", "recorder")
+    );
 
     let err = resume_with_decision(
         &contract,
@@ -424,7 +439,10 @@ async fn m1_a_tree_resume_whose_act_has_no_replay_refuses_instead_of_writing_the
     .await
     .unwrap();
     let RunOutcome::AwaitingApproval { request_id, .. } = paused.outcome else {
-        panic!("expected the tree to park on a human, got {:?}", paused.outcome)
+        panic!(
+            "expected the tree to park on a human, got {:?}",
+            paused.outcome
+        )
     };
     let real = store.pending(request_id).unwrap().unwrap();
 
@@ -511,11 +529,9 @@ async fn m4_the_gate_refuses_an_exec_rewrite_instead_of_running_the_original() {
         "the trace records both forms, so a reader can see which one was asked for"
     );
     assert!(
-        !events
-            .iter()
-            .any(|e| e.kind == "decision"
-                && e.target == "recorder"
-                && e.decision.as_deref() == Some("approve")),
+        !events.iter().any(|e| e.kind == "decision"
+            && e.target == "recorder"
+            && e.decision.as_deref() == Some("approve")),
         "0.73.0 recorded an approval here while dispatching the original, got \
          {events:?}"
     );
@@ -533,9 +549,15 @@ async fn m4_an_approver_may_still_redirect_a_write() {
     });
     let script = Script::new(vec![vec![write_call("NOTES.md", "original\n")]]);
 
-    run_with(&contract(dir.path(), 2), &script, &store, &asking(), &approver)
-        .await
-        .unwrap();
+    run_with(
+        &contract(dir.path(), 2),
+        &script,
+        &store,
+        &asking(),
+        &approver,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         std::fs::read_to_string(dir.path().join("REDIRECTED.md")).unwrap(),

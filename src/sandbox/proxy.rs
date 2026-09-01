@@ -497,6 +497,15 @@ mod tests {
     /// On 0.73.0 this same policy tunnelled the connection with a 200: the
     /// proxy's whole decision was `Policy::check` on the string `127.0.0.1:port`,
     /// so a run permitted one host had the machine's own admin ports with it.
+    // The guard is held across the awaits below on purpose, which is what the
+    // lint names. It serialises a *process-wide* environment variable against
+    // every other test in this binary, so releasing it at the first await would
+    // be releasing it before the thing it protects has happened. There is no
+    // deadlock available: nothing inside these awaits takes the same lock, and
+    // under nextest each test is its own process anyway. An async mutex would
+    // silence the lint by making the guard `Send`, which is not the property in
+    // question.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn m10_the_floor_refuses_a_loopback_upstream_the_policy_allows() {
         let _floored = floored();

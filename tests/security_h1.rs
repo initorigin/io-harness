@@ -218,7 +218,10 @@ async fn h1_a_textconv_driver_in_the_repository_is_not_run_by_git_diff() {
     // Appended, not replaced: the repository has to stay a valid one, or git
     // refuses for a reason that has nothing to do with this test.
     let mut cfg = std::fs::read_to_string(p.join(".git/config")).unwrap();
-    cfg.push_str(&format!("[diff \"evil\"]\n\ttextconv = {}\n", script.display()));
+    cfg.push_str(&format!(
+        "[diff \"evil\"]\n\ttextconv = {}\n",
+        script.display()
+    ));
     std::fs::write(p.join(".git/config"), cfg).unwrap();
     std::fs::write(p.join("README.md"), "hello, changed\n").unwrap();
 

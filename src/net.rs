@@ -498,9 +498,7 @@ fn is_metadata_name(host: &str) -> bool {
 /// Whether `host` is a name reserved to this machine or this link.
 fn is_local_name(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    LOCAL_HOSTS.contains(&host.as_str())
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
+    LOCAL_HOSTS.contains(&host.as_str()) || host.ends_with(".localhost") || host.ends_with(".local")
 }
 
 /// The floor's verdict on one address: `Some(why)` refuses.
@@ -1204,29 +1202,59 @@ mod tests {
             ("127.0.0.1", "loopback, 127.0.0.0/8"),
             ("127.9.9.9", "loopback, 127.0.0.0/8"),
             ("0.0.0.0", "this-network, 0.0.0.0/8"),
-            ("169.254.169.254", "the cloud instance-metadata address 169.254.169.254"),
+            (
+                "169.254.169.254",
+                "the cloud instance-metadata address 169.254.169.254",
+            ),
             ("169.254.1.1", "link-local, 169.254.0.0/16"),
-            ("10.0.0.1", "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)"),
-            ("172.16.0.1", "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)"),
-            ("172.31.255.255", "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)"),
-            ("192.168.1.1", "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)"),
+            (
+                "10.0.0.1",
+                "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)",
+            ),
+            (
+                "172.16.0.1",
+                "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)",
+            ),
+            (
+                "172.31.255.255",
+                "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)",
+            ),
+            (
+                "192.168.1.1",
+                "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)",
+            ),
             ("::1", "loopback, ::1"),
             ("::", "the unspecified address, ::"),
             ("fe80::1", "link-local, fe80::/10"),
             ("febf::1", "link-local, fe80::/10"),
-            ("fd00::1", "a unique-local address, fc00::/7 (of which fd00::/8)"),
-            ("fc00::1", "a unique-local address, fc00::/7 (of which fd00::/8)"),
+            (
+                "fd00::1",
+                "a unique-local address, fc00::/7 (of which fd00::/8)",
+            ),
+            (
+                "fc00::1",
+                "a unique-local address, fc00::/7 (of which fd00::/8)",
+            ),
             // Both IPv6 spellings of a v4 address land on the v4 rules. A floor
             // that graded only the v4 form is one `::ffff:127.0.0.1` walks
             // through.
             ("::ffff:127.0.0.1", "loopback, 127.0.0.0/8"),
-            ("::ffff:169.254.169.254", "the cloud instance-metadata address 169.254.169.254"),
-            ("::ffff:10.1.2.3", "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)"),
+            (
+                "::ffff:169.254.169.254",
+                "the cloud instance-metadata address 169.254.169.254",
+            ),
+            (
+                "::ffff:10.1.2.3",
+                "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)",
+            ),
             // `::0.0.0.5`, not `::0.0.0.1`: the latter *is* `::1`, so it is
             // loopback before it is anything else and says so.
             ("::0.0.0.5", "this-network, 0.0.0.0/8"),
             ("::0.0.0.1", "loopback, ::1"),
-            ("::10.1.2.3", "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)"),
+            (
+                "::10.1.2.3",
+                "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)",
+            ),
         ] {
             let ip: IpAddr = addr.parse().unwrap();
             assert_eq!(floor_reason(ip), Some(expect), "{addr}");
@@ -1304,10 +1332,17 @@ mod tests {
                 "a refusal names the key that restores it: {rule:?}"
             );
             // And the widening is what it is for: the local-model endpoint.
-            assert!(floor_by_name(host, 11434, LocalNet::Allowed).is_ok(), "{host}");
+            assert!(
+                floor_by_name(host, 11434, LocalNet::Allowed).is_ok(),
+                "{host}"
+            );
         }
 
-        for meta in ["metadata.google.internal", "METADATA.GOOG", "metadata.goog."] {
+        for meta in [
+            "metadata.google.internal",
+            "METADATA.GOOG",
+            "metadata.goog.",
+        ] {
             assert!(floor_by_name(meta, 80, LocalNet::Denied).is_err(), "{meta}");
             assert!(
                 floor_by_name(meta, 80, LocalNet::Allowed).is_err(),
@@ -1330,7 +1365,10 @@ mod tests {
     #[test]
     fn m10_dialable_returns_the_addresses_it_graded() {
         let got = dialable("93.184.216.34", 443, LocalNet::Denied).unwrap();
-        assert_eq!(got, vec!["93.184.216.34:443".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(
+            got,
+            vec!["93.184.216.34:443".parse::<SocketAddr>().unwrap()]
+        );
         let got = dialable("[::1]", 8080, LocalNet::Allowed).unwrap();
         assert_eq!(got, vec!["[::1]:8080".parse::<SocketAddr>().unwrap()]);
         assert!(dialable("127.0.0.1", 8080, LocalNet::Denied).is_err());

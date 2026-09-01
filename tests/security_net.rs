@@ -17,6 +17,16 @@
 //! graded against a supplied address list in `src/net.rs`'s unit tests, where the
 //! function is reachable without a socket.
 
+// Every test that touches the widening holds `WIDENING` across its awaits, which
+// is what this lint names. That is the point of the guard rather than an
+// oversight: the widening is a process-wide environment variable, so releasing
+// the lock at the first await would release it before the thing it protects has
+// happened. No deadlock is available — nothing inside these awaits takes the
+// same lock — and under nextest each test is its own process. An async mutex
+// would silence the lint by making the guard `Send`, which is not the property
+// in question.
+#![allow(clippy::await_holding_lock)]
+
 use std::net::TcpListener as StdListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -245,7 +255,10 @@ async fn m10_a_loopback_endpoint_is_refused_under_a_policy_that_allows_every_hos
     .unwrap_err();
 
     let Error::Refused {
-        target, rule, layer, ..
+        target,
+        rule,
+        layer,
+        ..
     } = &err
     else {
         panic!("expected a net refusal, got {err:?}");
@@ -343,9 +356,15 @@ async fn m10_an_http_mcp_server_on_a_local_address_is_refused() {
         let store = Store::memory().unwrap();
         let contract = contract(dir.path()).with_mcp([McpServer::http("web", url.clone())]);
 
-        let err = run_with(&contract, &Silent, &store, &Policy::permissive(), &ApproveAll)
-            .await
-            .unwrap_err();
+        let err = run_with(
+            &contract,
+            &Silent,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(&err, Error::Refused { act, layer, .. }
