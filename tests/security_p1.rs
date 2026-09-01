@@ -247,9 +247,57 @@ fn c4_a_project_scoped_mcp_or_lsp_server_is_refused_at_load() {
         assert!(err.contains("key `mcp`"), "names the key: {err}");
         assert!(err.contains("may not"), "is a refusal: {err}");
         assert!(
-            err.contains("`io.toml` arrives with a `git clone`"),
+            err.contains("arrives with a `git clone`"),
             "gives the same reason: {err}"
         );
+    }
+}
+
+/// The same door, one level down — and it was still open after the first fix.
+///
+/// `plugin` is deliberately *not* a refused section: a workspace file may still
+/// name a bundle, because a bundle that contributes only skills or templates is
+/// the ordinary case and refusing it would take a feature away for nothing. What
+/// closed C4 was `plugin.rs` refusing a *manifest* that names a program — and
+/// that check read `scope == Scope::Project`, so it never fired for the local
+/// scope that 0.74.0 had just brought under the same rule.
+///
+/// The cost of the gap was one extra `write_file`: name a bundle from
+/// `io.local.toml`, put the `[[hook]]` in the bundle's own manifest, and the
+/// next `discover().plugins()` carried it with no refusal anywhere on the path.
+/// Asserted for both scopes together, because a fix that moves the boundary
+/// rather than widening it is the only one that closes this.
+#[test]
+fn h2_a_bundle_named_by_any_file_inside_the_workspace_may_not_name_a_program() {
+    let bundle = tempfile::tempdir().unwrap();
+    write(
+        bundle.path(),
+        "plugin.toml",
+        "name = \"tools\"\n\n[[hook]]\non = [\"started\"]\nrun = [\"sh\", \"-c\", \"true\"]\n",
+    );
+
+    for scope in [Scope::Project, Scope::Local] {
+        let err = Plugins::inspect(scope, bundle.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("key `hook`"), "{scope:?} names the key: {err}");
+        assert!(
+            err.contains("the user-scope file"),
+            "{scope:?} sends the operator somewhere that still works: {err}"
+        );
+        assert!(
+            !err.contains("io.local.toml"),
+            "{scope:?} must not name a file that refuses the same table: {err}"
+        );
+    }
+
+    // The control. A bundle contributing nothing that runs is still loadable
+    // from inside the workspace, or this fix would have cost the feature.
+    let harmless = tempfile::tempdir().unwrap();
+    write(harmless.path(), "plugin.toml", "name = \"docs\"\n");
+    for scope in [Scope::Project, Scope::Local] {
+        Plugins::inspect(scope, harmless.path())
+            .unwrap_or_else(|e| panic!("{scope:?} refused a bundle that names no program: {e}"));
     }
 }
 

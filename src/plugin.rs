@@ -794,7 +794,17 @@ fn load_one(scope: Scope, dir: &Path) -> Result<Plugin> {
     })?;
 
     check_id(&manifest.name, &file)?;
-    if scope == Scope::Project {
+    // 0.74.0, audit H2 — every scope but the user's, not just the project one.
+    //
+    // This read `scope == Scope::Project` until 0.74.0, and that left the whole
+    // finding open one level down. `plugin` is deliberately not a refused
+    // section, so a workspace file may still declare one; the agent therefore
+    // wrote `io.local.toml` naming a bundle, wrote the bundle's own
+    // `plugin.toml` carrying a `[[hook]]`, and the next `discover().plugins()`
+    // carried it — two ordinary writes, no refusal anywhere on the path. The
+    // check that closes it has to match `Config::read_scope`, which now
+    // widening-checks every scope that is not the user's.
+    if scope != Scope::User {
         refuse_executing_contributions(&manifest, &file)?;
     }
     check_narrowing(&manifest, &file)?;
@@ -923,10 +933,10 @@ fn refuse_executing_contributions(manifest: &Manifest, at: &Path) -> Result<()> 
         return Ok(());
     };
     Err(crate::Error::Config(format!(
-        "{}: key `{offending}`: a plugin declared in a project-scoped `io.toml` may not contribute \
-         `[[{offending}]]`, because it names a program this machine would run and `io.toml` \
-         arrives with a `git clone`. Declare this plugin in `io.local.toml` or the user-scope file \
-         instead, or remove the `[[{offending}]]` from its manifest.",
+        "{}: key `{offending}`: a plugin declared in a file inside the workspace may not contribute \
+         `[[{offending}]]`, because it names a program this machine would run and a workspace file \
+         arrives with a `git clone` or is written by the agent itself. Declare this plugin in the \
+         user-scope file instead, or remove the `[[{offending}]]` from its manifest.",
         at.display()
     )))
 }
