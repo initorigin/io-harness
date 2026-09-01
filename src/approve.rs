@@ -148,7 +148,7 @@ pub enum Decision {
         /// re-evaluated against the policy before it runs, so an approver
         /// cannot rewrite an action across a deny.
         ///
-        /// **A rewrite of an [`Act::Exec`](crate::Act::Exec) action is refused
+        /// **A rewrite of an [`Act::Exec`] action is refused
         /// rather than applied** (0.74.0), and nothing runs. Every consumer of
         /// an exec approval — `exec`, `shell`, the git built-ins, a registered
         /// tool, an MCP tool — dispatches the argv it parsed *before* the gate

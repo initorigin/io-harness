@@ -8,11 +8,11 @@
 //! changes the `/` mount and leaves every separately-mounted filesystem — `/run`
 //! on every systemd host, `/dev/shm`, a separate `/home` or `/var` — exactly as
 //! writable as it was, while the child is uid 0 in its user namespace mapped to
-//! the caller's own uid and writes them with the caller's rights. [`MOUNT_SETUP`]
+//! the caller's own uid and writes them with the caller's rights. `MOUNT_SETUP`
 //! now walks `/proc/self/mountinfo` and remounts *each* mount read-only, and
 //! mounts a fresh `procfs` belonging to the run's own pid namespace, which is
 //! what stops a payload reading `/proc/<harness-pid>/environ` and taking every
-//! provider key the harness process holds. Both are the effect [`bwrap_argv`]'s
+//! provider key the harness process holds. Both are the effect `bwrap_argv`'s
 //! `--ro-bind / /` and `--proc /proc` already had, said in the one place the
 //! namespace rung says anything.
 //!

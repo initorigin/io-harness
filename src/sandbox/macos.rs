@@ -78,6 +78,8 @@ impl Sandbox for MacosSandbox {
 /// reason kept, and the backend's own `run` takes that path so a refusal reaches
 /// the caller as [`Error::Sandbox`] instead of as a command that mysteriously
 /// could not read its own files.
+// Live only on macOS; see the note on `REFUSED_PROFILE`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn profile_for(
     workdir: &Path,
     allow_network: bool,
@@ -101,6 +103,13 @@ pub(crate) fn profile_for(
 /// `(allow file-write* …)` line still runs the command, under a boundary that no
 /// longer matches what the run was told it had; a profile that grants nothing
 /// fails where it can be seen.
+// This module is compiled on every platform so its tests run on every platform —
+// the profile is a pure string rendering and the C1 assertions are worth having on
+// the Linux and Windows legs too. Its one production caller, `sandbox::wrap_argv`,
+// is behind `cfg(target_os = "macos")`, so off macOS the lib build has no caller
+// and `-D warnings` reads that as dead code. The `cfg_attr` is scoped to exactly
+// that: on macOS the item is live and an unused one would still fail the build.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const REFUSED_PROFILE: &str = "(version 1)\n(deny default)\n";
 
 /// Render `path` as an SBPL string literal, or say why it cannot be one.
