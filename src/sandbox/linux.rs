@@ -3,6 +3,19 @@
 //! — a process in an empty net namespace has no route out — which is stronger
 //! than the floor's best-effort env strip.
 //!
+//! **Read-only means every mount, and `/proc` is the namespace's own (0.74.0).**
+//! A mount namespace is a set of mounts, not one tree: `remount,bind,ro /`
+//! changes the `/` mount and leaves every separately-mounted filesystem — `/run`
+//! on every systemd host, `/dev/shm`, a separate `/home` or `/var` — exactly as
+//! writable as it was, while the child is uid 0 in its user namespace mapped to
+//! the caller's own uid and writes them with the caller's rights. [`MOUNT_SETUP`]
+//! now walks `/proc/self/mountinfo` and remounts *each* mount read-only, and
+//! mounts a fresh `procfs` belonging to the run's own pid namespace, which is
+//! what stops a payload reading `/proc/<harness-pid>/environ` and taking every
+//! provider key the harness process holds. Both are the effect [`bwrap_argv`]'s
+//! `--ro-bind / /` and `--proc /proc` already had, said in the one place the
+//! namespace rung says anything.
+//!
 //! cfg-gated to `target_os = "linux"`; the argv construction is unit-tested on
 //! the macOS build host under its cfg. Seccomp tightening is layered by the
 //! kernel default under the unprivileged user namespace.
@@ -58,6 +71,16 @@ pub(crate) struct Rungs {
 ///
 /// Strength order, and it is the roadmap's: Landlock, bubblewrap, namespaces,
 /// floor. The floor is not a rung anyone probes for — it is what is left.
+///
+/// **A rung placed above another must confine at least as much as it.** That is
+/// what "strength order" has to mean for the order to be worth anything, and
+/// until 0.74.0 the bubblewrap rung broke it: it sat above the namespace rung
+/// while [`bwrap_argv`] created no pid namespace at all, so a payload on the
+/// *stronger* rung could see and signal the harness and every sibling agent's
+/// processes, which the *weaker* one's `--pid --fork` already prevented. The
+/// flags in [`bwrap_argv`] are what make this ordering honest rather than
+/// nominal; a namespace added to [`unshare_argv`] and not to `bwrap_argv` puts
+/// it back into the state this comment exists to record.
 ///
 /// **The one rule that can send a host below its strongest available primitive**
 /// is the egress requirement. A run that denies egress may not be given a rung
@@ -208,13 +231,67 @@ fn bwrap_works() -> bool {
     })
 }
 
+/// The one directory a contained command may use for temporary files, and the
+/// value its `TMPDIR` is set to.
+///
+/// **Not the system temporary directory (0.74.0).** Both mount rungs used to
+/// bind the whole of it writable, and [`crate::sandbox::workdir`] puts every
+/// run's ephemeral workspace *inside* it — so each run could read and rewrite
+/// every concurrent run's workspace from inside its own sandbox, and a workspace
+/// located there was confined by nothing at all.
+///
+/// The replacement is [`super::macos`]'s shape, which has pointed `TMPDIR` at the
+/// workdir since 0.6.0: under a mode that grants the workdir, the workdir *is*
+/// the writable temporary directory, so there is no second directory to create,
+/// to grant or to clean up. [`ExecMode::ReadOnly`] is the case macOS leaves to
+/// the system directory and this does not — there the workdir is precisely what
+/// may not be written — so it gets a directory of its own beneath the system
+/// temporary directory. A toolchain that cannot open a temporary file cannot run
+/// at all, which is why the grant is narrowed rather than withdrawn.
+///
+/// The directory is created here rather than by the mount script or by `bwrap`,
+/// because both need it to exist on the host already: `bwrap --bind` fails on a
+/// source that is not there, and the script's `rw` runs after every mount has
+/// been made read-only.
+fn tmp_target(workdir: &Path, mode: ExecMode) -> PathBuf {
+    if mode != ExecMode::ReadOnly {
+        return workdir.to_path_buf();
+    }
+    // Named for the process, not for the run: this rung is handed a workdir and
+    // a mode and no run identity, and a per-command directory would be a
+    // per-command leak — nothing here outlives the process to remove it. Two
+    // concurrent `ReadOnly` runs of one embedder therefore share a scratch
+    // directory, which is a far smaller surface than the system temporary
+    // directory and, under `ReadOnly`, holds nothing either run produced on
+    // purpose.
+    let dir = std::env::temp_dir().join(format!("io-harness-tmp-{}", std::process::id()));
+    // A directory this process cannot create is one the payload cannot write
+    // either: the mount setup's `[ -d ]` guard leaves it ungranted and the
+    // command fails on its first temporary file, which is the honest outcome
+    // rather than a silent grant of somewhere else.
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// The `bwrap` argv this rung builds, factored out so it is unit-testable
 /// without spawning anything — the same treatment [`unshare_argv`] gets.
 ///
 /// The tree is bound read-only, then each writable root is bound back over it,
-/// which is the identical statement the mount setup makes with `remount,bind,ro`
-/// and its `rw` loop. `/proc` and `/dev` are populated because a mount namespace
-/// with neither is a namespace most toolchains cannot start in.
+/// which is the identical statement the mount setup makes with its
+/// `remount,bind,ro` walk and its `rw` loop. `--ro-bind` is recursive, so this
+/// rung has always covered every mount rather than only `/`. `/proc` and `/dev`
+/// are populated because a mount namespace with neither is a namespace most
+/// toolchains cannot start in.
+///
+/// **The namespaces are what make this rung's place in [`rung`] honest
+/// (0.74.0).** It is ranked above the namespace rung, so it has to confine at
+/// least as much, and it did not: `--unshare-pid`, `--unshare-ipc`,
+/// `--unshare-uts` and `--new-session` were all absent while `unshare_argv`'s
+/// `--pid --fork` was not. The pid namespace is also the half that gives
+/// `--proc /proc` its meaning — a `procfs` instance belongs to the pid namespace
+/// of whoever mounted it, so without the unshare the "new" `/proc` still listed
+/// every process on the host and `/proc/<harness-pid>/environ` still handed a
+/// payload every provider key the harness holds.
 ///
 /// **The payload is the trailing arguments after `--`**, never interpolated, so
 /// a metacharacter in an argument stays an ordinary byte — the property
@@ -232,12 +309,29 @@ pub(crate) fn bwrap_argv(
         "--ro-bind".into(),
         "/".into(),
         "/".into(),
+        // Every namespace the rung below this one takes, and the two it does not.
+        // A pid namespace is the difference between a payload that can read and
+        // signal the harness and one that cannot see it at all; `--proc /proc`
+        // below is only a fresh view of the *host's* process table without it.
+        "--unshare-pid".into(),
+        "--unshare-ipc".into(),
+        "--unshare-uts".into(),
+        // bubblewrap's documented terminal-injection guard: a payload sharing the
+        // caller's controlling terminal can push characters into it with
+        // `TIOCSTI` and have the caller's shell run them. Every contained command
+        // is spawned with a null stdin and piped output, so nothing here has a
+        // terminal to keep — the flag closes the case where a future caller
+        // passes one through.
+        "--new-session".into(),
         "--proc".into(),
         "/proc".into(),
         "--dev".into(),
         "/dev".into(),
         // A child of a run that ends must not outlive it. The shared runner
-        // kills the tree, and this is the kernel saying the same thing.
+        // kills the tree, and this is the kernel saying the same thing —
+        // `--die-with-parent` is a `PDEATHSIG` on `bwrap` alone, and it reaches
+        // the payload's own descendants only because `--unshare-pid` above makes
+        // them a pid namespace the kernel tears down with its init.
         "--die-with-parent".into(),
     ];
 
@@ -248,13 +342,24 @@ pub(crate) fn bwrap_argv(
         writable.push(workdir);
     }
     writable.extend(writable_roots.iter().map(|p| p.as_path()));
-    let tmp = std::env::temp_dir();
-    writable.push(&tmp);
+    // One temporary directory that belongs to this run, never the whole system
+    // temporary directory — see [`tmp_target`]. Under a mode that grants the
+    // workdir it *is* the workdir, already bound just above.
+    let tmp = tmp_target(workdir, mode);
+    if tmp.as_path() != workdir {
+        writable.push(&tmp);
+    }
     for root in writable {
         v.push("--bind".into());
         v.push(root.display().to_string());
         v.push(root.display().to_string());
     }
+    // And the payload is told where it is, so a toolchain reaching for a
+    // temporary file reaches the one place this run may write rather than a
+    // read-only `/tmp`.
+    v.push("--setenv".into());
+    v.push("TMPDIR".into());
+    v.push(tmp.display().to_string());
 
     if !allow_network {
         v.push("--unshare-net".into());
@@ -334,6 +439,13 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
         }
     };
     let fd: RawFd = ruleset.raw();
+    // The rule set's own answer, and the seccomp filter's. Landlock's network
+    // rights are TCP only, so the run whose outbound TCP the rule set takes
+    // control of is the run whose datagram sockets the filter beside it has to
+    // refuse — one hole with two halves, and a constant here would install the
+    // half that does nothing. Read from the plan, exactly as
+    // `crate::sandbox::contain_command` reads it on the other spawn path.
+    let net_restricted = plan.restricts_network();
 
     let wspec = RunSpec::new(spec.argv, spec.workdir, spec.limits)
         .with_network(spec.allow_network)
@@ -356,7 +468,7 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
                 // requires, so the rule set goes on first and the deny-list
                 // second. Neither allocates.
                 super::landlock::restrict_self(fd)?;
-                super::seccomp::install()
+                super::seccomp::install(net_restricted)
             });
         }
     })
@@ -433,26 +545,58 @@ fn wrapper_failure(outcome: &SandboxOutcome) -> Option<String> {
 /// does the same through mount and network namespaces" as macOS. Only `--net`
 /// was doing real work.
 ///
-/// The script remounts the whole tree read-only and then binds back the places a
+/// The script remounts every mount read-only and then binds back the places a
 /// command legitimately writes: the run's own workdir (unless the
 /// [`ExecMode`](crate::ExecMode) withholds it), the writable roots the run
-/// resolved — a toolchain's own caches, since 0.46.0 — and the system temporary
-/// directory. The last is not a convenience: it is the same allowance the macOS
-/// profile already makes for `/private/var/folders`, and without it most
-/// toolchains fail on their first temporary file. All three are stated in
-/// `docs/CONTRACT.md`.
+/// resolved — a toolchain's own caches, since 0.46.0 — and [`tmp_target`], which
+/// the payload's `TMPDIR` is pointed at. The last is not a convenience: without
+/// somewhere to open a temporary file most toolchains fail immediately.
 ///
-/// **`/` is remounted read-only directly, and is deliberately not bound to
-/// itself first.** The first version of this script did `mount --bind / /`
-/// before the remount, on the assumption that a bind was needed to own the
-/// mount. On a GitHub `ubuntu-latest` runner that bind fails with
-/// `wrong fs type, bad option, bad superblock on /` and takes the whole setup
-/// with it, so the probe reported failure and every contained run on Linux
-/// silently took the portable floor — the confinement this module documents was
-/// applied nowhere, and the matrix is what caught it. Measured on the runner:
-/// with the bind removed, the remount alone leaves the tree genuinely
-/// read-only — asserted by *attempting a write and having it refused*, not by
-/// the mount's exit status — and the workdir rebinds writable over it.
+/// **"Read-only" is a walk over `/proc/self/mountinfo`, not one remount
+/// (0.74.0).** A mount namespace is a set of mounts and `remount,bind,ro /`
+/// changes exactly one of them. Until 0.74.0 that was the whole of this rung's
+/// filesystem confinement, so every separately-mounted filesystem stayed
+/// writable — `/run`, which is a tmpfs on every systemd host, `/dev/shm`, and a
+/// separate `/home` or `/var` — and the child, uid 0 in its user namespace
+/// mapped to the caller's own uid, wrote them with the caller's rights while
+/// [`Backend::confines_writes`](crate::Backend::confines_writes) answered
+/// `true`. Each mount is now remounted read-only in turn.
+///
+/// Two mounts are passed over and neither is a hole. A mount the sixth
+/// `mountinfo` field already reports as `ro` — a `squashfs` snap, a
+/// `/run/credentials` drop — is read-only before the walk reaches it, and
+/// remounting it would be one more kernel call to be refused by a host for no
+/// gain. `/dev/pts` is skipped because a `devpts` instance holds pty nodes the
+/// kernel creates and nothing a payload can put there, while a read-only one
+/// stops a payload opening a terminal at all.
+///
+/// **A mount that cannot be confined fails the setup, and nothing then claims it
+/// was confined.** The walk has no partial success: a remount the kernel refuses
+/// exits 125 with the `unshare:` prefix, so [`wrapper_failure`] turns it into
+/// [`crate::Error::Sandbox`] and the payload never runs, and the same script run
+/// by [`unshare_works`] answers `false`, which takes this host to a lower rung
+/// that reports itself. There is no path on which the recursion fails and
+/// `LinuxNamespaces` is still the backend recorded.
+///
+/// **`/proc` is remounted, and it is the run's own.** `--pid --fork` puts the
+/// payload in a new pid namespace but leaves the host's `procfs` mounted over
+/// it, so `/proc/<harness-pid>/environ` handed a payload every provider key the
+/// harness process holds. A `procfs` instance belongs to the pid namespace of
+/// whoever mounted it, and this one is mounted by the script running as init of
+/// the run's namespace, so the harness is not in it to be read.
+///
+/// **No mount is bound to itself before its remount.** The first version of this
+/// script did `mount --bind / /` before the remount, on the assumption that a
+/// bind was needed to own the mount. On a GitHub `ubuntu-latest` runner that
+/// bind fails with `wrong fs type, bad option, bad superblock on /` and takes
+/// the whole setup with it, so the probe reported failure and every contained
+/// run on Linux silently took the portable floor — the confinement this module
+/// documents was applied nowhere, and the matrix is what caught it. Measured on
+/// the runner: with the bind removed, the remount alone leaves the tree
+/// genuinely read-only — asserted by *attempting a write and having it refused*,
+/// not by the mount's exit status — and the workdir rebinds writable over it.
+/// The mount points are read out of `mountinfo` in one pass before any of them
+/// is touched, because the file is a live view of the very set being changed.
 ///
 /// **`sh` here is not a shell for the payload.** The command arrives as
 /// positional parameters and leaves through `exec "$@"`, so nothing re-parses
@@ -465,15 +609,24 @@ fn wrapper_failure(outcome: &SandboxOutcome) -> Option<String> {
 /// payload's own non-zero exit. A wrapper failure reported as a failed command
 /// is the exact confusion that made the original Linux breakage need a CI log.
 /// **The writable set is a counted argument list, not a fixed pair (0.46.0).**
-/// `$1` is the workdir to enter, `$2` is how many writable roots follow, and the
-/// payload begins after them — so the same script serves a run with no extra
-/// grants and one whose toolchain writes to three caches, without the count ever
-/// being inferred from the argv's shape. The workdir is in that list only when
-/// the [`ExecMode`](crate::ExecMode) grants it, which is what makes `read-only`
-/// a mode here rather than a label: the process still `cd`s into the workspace
-/// and still cannot write to it.
+/// `$1` is the workdir to enter, `$2` is the temporary directory the run owns,
+/// `$3` is how many writable roots follow, and the payload begins after them —
+/// so the same script serves a run with no extra grants and one whose toolchain
+/// writes to three caches, without the count ever being inferred from the argv's
+/// shape. The workdir is in that list only when the
+/// [`ExecMode`](crate::ExecMode) grants it, which is what makes `read-only` a
+/// mode here rather than a label: the process still `cd`s into the workspace and
+/// still cannot write to it.
+///
+/// `set -f` matters: the mount points read out of `mountinfo` are re-split by
+/// the shell, and a directory named with a `*` in it would otherwise be expanded
+/// into whatever happened to be beside it. The kernel escapes space, tab,
+/// newline and backslash in that file as `\0ddd`, which is exactly the form
+/// `printf %b` decodes, so a mount point containing any of them survives the
+/// round trip instead of being silently skipped — and a mount silently skipped
+/// is a mount left writable.
 const MOUNT_SETUP: &str = "\
-set -e
+set -ef
 fail() { echo \"unshare: sandbox mount setup failed: $1\" >&2; exit 125; }
 rw() {
   [ -d \"$1\" ] || return 0
@@ -481,11 +634,23 @@ rw() {
   mount -o remount,bind,rw \"$1\" 2>/dev/null || fail \"could not make $1 writable\"
 }
 mount --make-rprivate / 2>/dev/null || fail 'could not make / private'
-mount -o remount,bind,ro / 2>/dev/null || fail 'could not remount / read-only'
+[ -r /proc/self/mountinfo ] || fail 'could not read /proc/self/mountinfo'
+points=
+while read -r _ _ _ _ point opts _; do
+  case \"$opts\" in ro|ro,*) continue ;; esac
+  points=\"$points $point\"
+done < /proc/self/mountinfo
+for esc in $points; do
+  point=$(printf '%b' \"$esc\")
+  case \"$point\" in /dev/pts) continue ;; esac
+  mount -o remount,bind,ro \"$point\" 2>/dev/null || fail \"could not remount $point read-only\"
+done
+mount -t proc -o nosuid,nodev,noexec proc /proc 2>/dev/null || fail 'could not mount /proc'
 wd=\"$1\"; shift
+TMPDIR=\"$1\"; export TMPDIR; shift
 n=\"$1\"; shift
 while [ \"$n\" -gt 0 ]; do rw \"$1\"; shift; n=$((n-1)); done
-rw \"${TMPDIR:-/tmp}\"
+[ \"$TMPDIR\" = \"$wd\" ] || rw \"$TMPDIR\"
 cd \"$wd\" || fail 'could not enter the workdir'
 exec \"$@\"
 ";
@@ -511,14 +676,16 @@ pub(crate) fn unshare_argv(
         v.push("--net".into());
     }
     v.push("--".into());
-    // `sh -c <script> sh <workdir> <n> <root>... <argv...>`: `$0` is `sh`, `$1` is
-    // the workdir the script enters, `$2` is how many writable roots follow, and
-    // the payload is what remains after them.
+    // `sh -c <script> sh <workdir> <tmpdir> <n> <root>... <argv...>`: `$0` is `sh`,
+    // `$1` is the workdir the script enters, `$2` is the one temporary directory
+    // this run may write to and the value it exports as `TMPDIR`, `$3` is how
+    // many writable roots follow, and the payload is what remains after them.
     v.push("sh".into());
     v.push("-c".into());
     v.push(MOUNT_SETUP.into());
     v.push("sh".into());
     v.push(workdir.display().to_string());
+    v.push(tmp_target(workdir, mode).display().to_string());
 
     let mut writable: Vec<String> = Vec::new();
     if mode != ExecMode::ReadOnly {
@@ -1042,11 +1209,21 @@ mod tests {
             !argv.windows(3).any(|w| w == ["--bind", "/w", "/w"]),
             "read-only must not bind the workspace writable"
         );
-        let tmp = std::env::temp_dir().display().to_string();
+        // A temporary directory is writable under every mode — but it is this
+        // run's own, not the system one. 0.74.0 replaced the second with the
+        // first; see `tmp_target`.
+        let tmp = tmp_target(Path::new("/w"), ExecMode::ReadOnly)
+            .display()
+            .to_string();
         assert!(
             argv.windows(3)
                 .any(|w| w[0] == "--bind" && w[1] == tmp && w[2] == tmp),
-            "the temp directory is writable under every mode"
+            "a temp directory is writable under every mode"
+        );
+        assert!(
+            argv.windows(3)
+                .any(|w| w == ["--setenv", "TMPDIR", tmp.as_str()]),
+            "and the payload is told where it is"
         );
         assert!(
             !argv.contains(&"--unshare-net".to_string()),
@@ -1068,6 +1245,286 @@ mod tests {
             stderr: "bwrap: Creating new namespace failed: Operation not permitted\n".into(),
         };
         assert!(wrapper_failure(&fail).is_some());
+    }
+
+    // --- 0.74.0, the audited holes in the two mount rungs --------------------
+    //
+    // Every one of these reads the argv or the setup script the rung *builds*,
+    // and none of them needs a namespace to exist. That is deliberate: the build
+    // host is macOS, the CI runner's kernel refuses unprivileged user namespaces
+    // (see this module's header), so a live assertion about either mount rung
+    // runs on no machine anyone watches — while a missing flag is exactly the
+    // defect these findings are. `tests/security_linux.rs` holds the live arms,
+    // `cfg(target_os = "linux")` and skipping when the host's chain selects a
+    // rung other than these two; it is the second line, not the first.
+
+    /// The setup script this rung builds.
+    fn setup_script(mode: ExecMode) -> String {
+        unshare_argv(&["true".into()], Path::new("/w"), false, mode, &[])
+            .into_iter()
+            .find(|a| a.contains("mount --bind"))
+            .expect("the mount setup is one of the arguments")
+    }
+
+    /// H8 — a mount namespace is a *set* of mounts, and `remount,bind,ro /`
+    /// changes one of them.
+    ///
+    /// Fails on 0.73.0's script, whose entire filesystem confinement was that one
+    /// line: `/run` (a tmpfs on every systemd host), `/dev/shm` and a separately
+    /// mounted `/home` or `/var` stayed writable, and the child — uid 0 in its
+    /// user namespace, mapped to the caller's own uid — wrote them with the
+    /// caller's rights while the rung reported that it confined writes.
+    #[test]
+    fn h8_the_setup_remounts_every_mount_read_only_and_not_only_the_root_one() {
+        let script = setup_script(ExecMode::WorkspaceWrite);
+        assert!(
+            script.starts_with("set -ef"),
+            "the mount points are re-split by the shell, so globbing is off or a \
+             directory named with a `*` in it expands into its neighbours"
+        );
+        assert!(
+            script.contains("/proc/self/mountinfo"),
+            "the set of mounts has to be enumerated before any of it can be confined"
+        );
+        assert!(
+            script.contains("mount -o remount,bind,ro \"$point\""),
+            "and every mount in it remounted read-only in turn"
+        );
+        assert!(
+            !script.contains("mount -o remount,bind,ro / "),
+            "0.73.0's single remount of `/` is not the confinement any more — if it \
+             is still here, it is still all that runs"
+        );
+    }
+
+    /// H8's fail-closed half: the walk has no partial success.
+    ///
+    /// A rung that cannot apply the confinement it promises must not report that
+    /// it did. There is no branch on which a refused remount leaves the payload
+    /// running and `LinuxNamespaces` recorded: the script exits 125 with the
+    /// `unshare:` prefix, [`wrapper_failure`] turns that into
+    /// [`crate::Error::Sandbox`], and the same script run by [`unshare_works`]
+    /// answers `false`, which takes the host to a rung that reports itself.
+    #[test]
+    fn h8_a_mount_that_cannot_be_confined_fails_the_setup_closed() {
+        let script = setup_script(ExecMode::WorkspaceWrite);
+        assert!(
+            script.contains("|| fail \"could not remount $point read-only\""),
+            "a refused remount must fail the setup, not be skipped"
+        );
+        assert!(
+            script.contains("[ -r /proc/self/mountinfo ] || fail"),
+            "and a mountinfo that cannot be read is a failure too, or the walk \
+             would confine nothing and say nothing"
+        );
+        assert!(script.contains("exit 125"));
+
+        let refused = SandboxOutcome {
+            backend: Backend::LinuxNamespaces,
+            argv: vec!["unshare".into()],
+            exit_code: Some(125),
+            cap_hit: None,
+            stdout: String::new(),
+            stderr: "unshare: sandbox mount setup failed: could not remount /run read-only\n"
+                .into(),
+        };
+        assert!(
+            wrapper_failure(&refused).is_some(),
+            "the run must end as a sandbox error and not as the payload's own verdict"
+        );
+    }
+
+    /// H10 — `/proc` belongs to the run's pid namespace, so the harness is not in
+    /// it to be read.
+    ///
+    /// Fails on 0.73.0's script, which mounted no `procfs` at all: `--pid --fork`
+    /// made a pid namespace and left the *host's* `/proc` mounted over it, so
+    /// `/proc/<harness-pid>/environ` handed a payload every provider key the
+    /// harness process holds.
+    #[test]
+    fn h10_the_setup_replaces_proc_with_the_pid_namespaces_own() {
+        let argv = unshare_argv(
+            &["true".into()],
+            Path::new("/w"),
+            false,
+            ExecMode::WorkspaceWrite,
+            &[],
+        );
+        assert!(
+            argv.contains(&"--pid".to_string()) && argv.contains(&"--fork".to_string()),
+            "the pid namespace the procfs instance will belong to"
+        );
+        let script = setup_script(ExecMode::WorkspaceWrite);
+        assert!(
+            script.contains("mount -t proc"),
+            "a procfs instance belongs to the pid namespace of whoever mounted it, \
+             so the namespace is worth nothing until one is mounted inside it"
+        );
+        assert!(
+            script.contains("|| fail 'could not mount /proc'"),
+            "and a /proc that could not be replaced fails the setup rather than \
+             running the payload against the host's"
+        );
+    }
+
+    /// H10's bubblewrap half. Fails on 0.73.0's argv, which had `--proc /proc`
+    /// and no pid namespace for it to belong to — a fresh mount of the same host
+    /// process table.
+    #[test]
+    fn h10_the_bwrap_argv_unshares_the_pid_namespace_its_proc_belongs_to() {
+        let argv = bwrap_argv(
+            &["true".into()],
+            Path::new("/w"),
+            false,
+            ExecMode::WorkspaceWrite,
+            &[],
+        );
+        assert!(argv.contains(&"--unshare-pid".to_string()));
+        assert!(argv.windows(2).any(|w| w == ["--proc", "/proc"]));
+    }
+
+    /// H12 — a rung ranked above another must confine at least as much as it.
+    ///
+    /// The premise is asserted first, because the requirement only exists while
+    /// the ranking does. Fails on 0.73.0, where bubblewrap sat above the
+    /// namespace rung with no pid namespace at all: a payload on the *stronger*
+    /// rung could see and signal the harness and every sibling agent's processes,
+    /// which the weaker rung's `--pid --fork` already prevented — and
+    /// `--die-with-parent`, a `PDEATHSIG` on `bwrap` alone, reached none of the
+    /// payload's own descendants.
+    #[test]
+    fn h12_the_bwrap_rung_confines_every_namespace_the_rung_below_it_confines() {
+        assert_eq!(
+            rung(
+                Rungs {
+                    landlock_abi: None,
+                    bubblewrap: true,
+                    unshare: true,
+                },
+                true,
+                false
+            ),
+            Backend::LinuxBubblewrap,
+            "the premise: bubblewrap is ranked above the namespace rung"
+        );
+
+        let bwrap = bwrap_argv(
+            &["true".into()],
+            Path::new("/w"),
+            false,
+            ExecMode::WorkspaceWrite,
+            &[],
+        );
+        let unshare = unshare_argv(
+            &["true".into()],
+            Path::new("/w"),
+            false,
+            ExecMode::WorkspaceWrite,
+            &[],
+        );
+
+        // `unshare`'s spelling on the left, bubblewrap's on the right. The user
+        // and mount namespaces are not in the table because `bwrap` takes both
+        // implicitly — it cannot build its root without them — and a row that
+        // named a flag never passed would assert nothing.
+        for (below, above) in [("--pid", "--unshare-pid"), ("--net", "--unshare-net")] {
+            assert!(
+                unshare.contains(&below.to_string()),
+                "the premise: the namespace rung takes {below}"
+            );
+            assert!(
+                bwrap.contains(&above.to_string()),
+                "the bubblewrap rung is ranked above the namespace rung and takes \
+                 {below}'s equivalent {above} nowhere, so it confines less than the \
+                 rung it outranks"
+            );
+        }
+        for extra in ["--unshare-ipc", "--unshare-uts", "--new-session"] {
+            assert!(
+                bwrap.contains(&extra.to_string()),
+                "{extra} is this rung's alone, and it is part of what its place in \
+                 the order is claiming"
+            );
+        }
+    }
+
+    /// L11 — no rung grants the whole system temporary directory.
+    ///
+    /// Fails on 0.73.0, where both mount rungs bound it writable and
+    /// [`crate::sandbox::workdir`] puts every run's ephemeral workspace inside
+    /// it: each run could read and rewrite every concurrent run's workspace from
+    /// inside its own sandbox, and a workspace located there was confined by
+    /// nothing at all.
+    #[test]
+    fn l11_no_mount_rung_grants_the_whole_system_temporary_directory() {
+        let system = std::env::temp_dir().display().to_string();
+        for mode in [
+            ExecMode::ReadOnly,
+            ExecMode::WorkspaceWrite,
+            ExecMode::FullAccess,
+        ] {
+            let bwrap = bwrap_argv(&["true".into()], Path::new("/w"), true, mode, &[]);
+            assert!(
+                !bwrap
+                    .windows(3)
+                    .any(|w| w[0] == "--bind" && w[1] == system && w[2] == system),
+                "{mode:?}: bubblewrap bound the whole of {system} writable"
+            );
+            let unshare = unshare_argv(&["true".into()], Path::new("/w"), true, mode, &[]);
+            assert!(
+                !unshare.contains(&system),
+                "{mode:?}: the namespace rung passed {system} to its setup script"
+            );
+        }
+        assert!(
+            !MOUNT_SETUP.contains("TMPDIR:-/tmp"),
+            "and the script no longer reaches for `/tmp` on its own behalf"
+        );
+    }
+
+    /// L11's other half — the one directory that *is* granted is the one the
+    /// payload's `TMPDIR` names, so a toolchain reaching for a temporary file
+    /// reaches somewhere it may write.
+    #[test]
+    fn l11_the_temporary_grant_is_exactly_what_tmpdir_points_at() {
+        for mode in [ExecMode::ReadOnly, ExecMode::WorkspaceWrite] {
+            let target = tmp_target(Path::new("/w"), mode).display().to_string();
+
+            let bwrap = bwrap_argv(&["true".into()], Path::new("/w"), true, mode, &[]);
+            assert!(
+                bwrap
+                    .windows(3)
+                    .any(|w| w == ["--setenv", "TMPDIR", target.as_str()]),
+                "{mode:?}: TMPDIR must name the directory this run owns"
+            );
+            assert!(
+                bwrap
+                    .windows(3)
+                    .any(|w| w[0] == "--bind" && w[1] == target && w[2] == target),
+                "{mode:?}: and that directory must be bound writable"
+            );
+
+            let unshare = unshare_argv(&["true".into()], Path::new("/w"), true, mode, &[]);
+            let head = unshare
+                .iter()
+                .position(|a| a.contains("mount --bind"))
+                .unwrap();
+            assert_eq!(
+                unshare[head + 3],
+                target,
+                "{mode:?}: and reaches the script as its second positional"
+            );
+        }
+        assert!(
+            MOUNT_SETUP.contains("TMPDIR=\"$1\"; export TMPDIR"),
+            "which the script exports, or the payload never learns where it is"
+        );
+        assert_eq!(
+            tmp_target(Path::new("/w"), ExecMode::WorkspaceWrite),
+            Path::new("/w"),
+            "under a mode that grants the workdir there is no second directory to \
+             create or clean up — the shape `super::macos` has used since 0.6.0"
+        );
     }
 
     #[test]
@@ -1133,7 +1590,7 @@ mod tests {
             &[],
         );
         let script = argv.iter().find(|a| a.contains("mount --bind")).unwrap();
-        assert!(script.contains("remount,bind,ro /"));
+        assert!(script.contains("remount,bind,ro"));
         assert!(script.contains("remount,bind,rw"));
         assert!(
             argv.contains(&"/w".to_string()),
@@ -1158,13 +1615,22 @@ mod tests {
             &roots,
         );
 
-        // `sh -c <script> sh <workdir> <n> <root>... <payload...>`
-        let wd_at = argv.iter().position(|a| a == "/w").unwrap();
-        assert_eq!(argv[wd_at + 1], "3", "workdir plus two roots");
-        assert_eq!(argv[wd_at + 2], "/w", "the workdir leads the writable list");
-        assert_eq!(argv[wd_at + 3], "/home/u/.cargo");
-        assert_eq!(argv[wd_at + 4], "/home/u/.npm");
-        assert_eq!(&argv[wd_at + 5..], &["echo".to_string(), "hi".to_string()]);
+        // `sh -c <script> sh <workdir> <tmpdir> <n> <root>... <payload...>`.
+        // Anchored on the script rather than on the first `/w`, because the
+        // workdir now appears three times over — as the directory to enter, as
+        // this run's `TMPDIR`, and as the head of the writable list.
+        let head = argv
+            .iter()
+            .position(|a| a.contains("mount --bind"))
+            .unwrap();
+        assert_eq!(argv[head + 1], "sh", "$0");
+        assert_eq!(argv[head + 2], "/w", "the workdir to enter");
+        assert_eq!(argv[head + 3], "/w", "and the temporary directory it owns");
+        assert_eq!(argv[head + 4], "3", "workdir plus two roots");
+        assert_eq!(argv[head + 5], "/w", "the workdir leads the writable list");
+        assert_eq!(argv[head + 6], "/home/u/.cargo");
+        assert_eq!(argv[head + 7], "/home/u/.npm");
+        assert_eq!(&argv[head + 8..], &["echo".to_string(), "hi".to_string()]);
     }
 
     /// F3 — under `ReadOnly` the workdir is entered and not bound writable, so
@@ -1178,9 +1644,20 @@ mod tests {
             ExecMode::ReadOnly,
             &[],
         );
-        let wd_at = argv.iter().position(|a| a == "/w").unwrap();
-        assert_eq!(argv[wd_at + 1], "0", "nothing is writable but the temp dir");
-        assert_eq!(&argv[wd_at + 2..], &["true".to_string()]);
+        let head = argv
+            .iter()
+            .position(|a| a.contains("mount --bind"))
+            .unwrap();
+        assert_eq!(argv[head + 2], "/w", "the workdir is still entered");
+        assert_eq!(
+            argv[head + 3],
+            tmp_target(Path::new("/w"), ExecMode::ReadOnly)
+                .display()
+                .to_string(),
+            "and the temporary directory is not the workdir under this mode"
+        );
+        assert_eq!(argv[head + 4], "0", "nothing is writable but the temp dir");
+        assert_eq!(&argv[head + 5..], &["true".to_string()]);
     }
 
     #[test]
