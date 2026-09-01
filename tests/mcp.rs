@@ -26,6 +26,24 @@ use serde_json::json;
 #[path = "../examples/mcp_fixture_server.rs"]
 mod fixture_server;
 
+/// Reach a listener this test process put on loopback.
+///
+/// The local-address floor (0.74.0) refuses `127.0.0.0/8` whatever the policy
+/// says, so the HTTP-transport tests here have to opt into the widening the
+/// local-model case is documented under. That is the floor working: the policy is
+/// still what decides which host is reachable — `an_unlisted_mcp_host_is_refused`
+/// below is unaffected because its refusal is the policy's — and the floor's own
+/// refusals are asserted in `tests/security_net.rs`.
+///
+/// Set once for the whole binary and never unset, because the widening is
+/// process-wide and `cargo test` runs a binary's tests as threads: a per-test
+/// set/unset pair would be read by whatever else happened to be deciding at that
+/// moment.
+fn widen_for_loopback() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("IO_HARNESS_ALLOW_LOCAL_ADDRESSES", "1"));
+}
+
 /// Serve the fixture over streamable HTTP on an ephemeral port, returning its
 /// URL.
 async fn serve_http() -> String {
@@ -48,6 +66,7 @@ async fn serve<S: rmcp::handler::server::ServerHandler + Clone>(handler: S) -> S
         std::sync::Arc::new(LocalSessionManager::default()),
         Default::default(),
     );
+    widen_for_loopback();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -844,6 +863,9 @@ async fn a_server_declared_without_the_enabled_key_offers_the_same_roster() {
 
 /// A URL nothing is listening on: bound to learn a free port, then dropped.
 fn closed_port() -> String {
+    // Unreachable is the answer this asks for, and a floor refusal is a different
+    // answer: the probe has to get as far as the socket to tell them apart.
+    widen_for_loopback();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);

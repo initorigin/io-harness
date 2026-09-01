@@ -36,7 +36,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::error::{Error, Result};
-use crate::policy::{Act, Effect, Policy};
+use crate::net::{self, LocalNet};
+use crate::policy::{Act, Effect, Policy, Verdict};
 
 /// The largest request head this will read before refusing.
 ///
@@ -51,9 +52,10 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// One outbound connection this proxy decided about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Dial {
-    /// The host as the client asked for it, never resolved to an address: the
-    /// policy's patterns are written against names, and resolving first would
-    /// decide against something the operator never wrote.
+    /// The host as the client asked for it. The policy's patterns are written
+    /// against names, so the name is what the trace records and what a refusal
+    /// quotes back — the addresses it resolved to are graded by the floor
+    /// (0.74.0) but are not what the operator wrote.
     pub(crate) host: String,
     pub(crate) port: u16,
     /// The step the run was on when the dial happened, stamped at decision time
@@ -171,12 +173,44 @@ async fn serve(
     };
 
     let target = format!("{host}:{port}");
-    let verdict = {
+    let mut verdict = {
         let guard = policy
             .read()
             .map_err(|_| Error::Config("policy lock".into()))?;
         guard.check(Act::Net, &target)
     };
+
+    // Resolve once, grade what came back, and dial exactly those addresses.
+    //
+    // Until 0.74.0 the verdict above was computed on the string and the name was
+    // resolved a second time by `TcpStream::connect(&target)` below — two
+    // resolutions with a decision in between, which is the DNS-rebinding window:
+    // the answer that was checked and the answer that was dialled did not have to
+    // be the same one. There is one resolution now and the dial takes the set it
+    // produced, so the two cannot differ.
+    let mut addrs = Vec::new();
+    if verdict.effect == Effect::Allow {
+        match net::dialable_async(&host, port, LocalNet::configured()).await {
+            Ok(a) => addrs = a,
+            // A floor refusal is a denial like any other here: it goes down the
+            // same channel, into the same trace row, and out as the same 403 with
+            // the reason and the key that restores it in the body.
+            Err(Error::Refused { rule, layer, .. }) => {
+                verdict = Verdict {
+                    effect: Effect::Deny,
+                    rule,
+                    layer,
+                };
+            }
+            Err(e) => {
+                verdict = Verdict {
+                    effect: Effect::Deny,
+                    rule: Some(e.to_string()),
+                    layer: Some(net::FLOOR_LAYER.into()),
+                };
+            }
+        }
+    }
     let allowed = verdict.effect == Effect::Allow;
     let _ = dials.send(Dial {
         host: host.clone(),
@@ -200,7 +234,10 @@ async fn serve(
         return Ok(());
     }
 
-    let upstream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&target)).await {
+    // `&addrs[..]`, never `&target`: the set graded above is the set dialled, and
+    // naming the host again here is what reopened the window.
+    let upstream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addrs[..])).await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             respond(&mut client, 502, &format!("{target}: {e}")).await;
@@ -367,6 +404,44 @@ mod tests {
         (addr, task)
     }
 
+    /// Serialises the tests that need the operator widening against the tests
+    /// that need the floor.
+    ///
+    /// Every test below dials a listener it put on `127.0.0.1` itself, which the
+    /// local-address floor refuses by default — so those tests run under
+    /// `IO_HARNESS_ALLOW_LOCAL_ADDRESSES`, which is process-wide. `cargo test` runs one
+    /// binary's tests as threads of one process, so a bare `set_var` would be read
+    /// by whatever else happened to be deciding at that moment; the lock is what
+    /// makes the two kinds of test not overlap. Under nextest each test is its own
+    /// process and the lock costs nothing.
+    static WIDENING: Mutex<()> = Mutex::new(());
+
+    /// Hold the widening on for as long as the returned value lives.
+    struct Widened(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Widened {
+        fn on() -> Self {
+            // A poisoned lock is a test that panicked while holding it, not a
+            // reason to fail every test after it.
+            let held = WIDENING.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var(crate::net::ALLOW_LOCAL_ENV, "1");
+            Self(held)
+        }
+    }
+
+    impl Drop for Widened {
+        fn drop(&mut self) {
+            std::env::remove_var(crate::net::ALLOW_LOCAL_ENV);
+        }
+    }
+
+    /// The other side of the same lock: the floor is in place and stays there.
+    fn floored() -> std::sync::MutexGuard<'static, ()> {
+        let held = WIDENING.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(crate::net::ALLOW_LOCAL_ENV);
+        held
+    }
+
     async fn proxy_for(policy: Policy) -> EgressProxy {
         EgressProxy::start(Arc::new(RwLock::new(policy)), Arc::new(AtomicU32::new(7)))
             .await
@@ -386,6 +461,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_permitted_host_is_tunnelled_and_a_denied_one_is_refused_by_name() {
+        // The listener is on loopback, which the floor refuses by default.
+        let _widened = Widened::on();
         let (upstream, _server) = echo_listener("pong").await;
         // The policy names the loopback host the listener is on, and nothing else.
         let policy = Policy::default().layer("test").allow_net("127.0.0.1");
@@ -412,6 +489,36 @@ mod tests {
         assert!(dials.iter().all(|d| d.step == 7));
         // And a drain takes them: a dial is reported once, not once per step.
         assert!(proxy.drain().is_empty());
+    }
+
+    /// M10 — the floor is under the policy here too: a rule that names the
+    /// loopback host is not enough to reach it, and the 403 says what to set.
+    ///
+    /// On 0.73.0 this same policy tunnelled the connection with a 200: the
+    /// proxy's whole decision was `Policy::check` on the string `127.0.0.1:port`,
+    /// so a run permitted one host had the machine's own admin ports with it.
+    #[tokio::test]
+    async fn m10_the_floor_refuses_a_loopback_upstream_the_policy_allows() {
+        let _floored = floored();
+        let (upstream, _server) = echo_listener("pong").await;
+        let policy = Policy::default().layer("test").allow_net("127.0.0.1");
+        let proxy = proxy_for(policy).await;
+
+        let answer = connect_through(&proxy, &upstream.to_string()).await;
+        assert!(
+            answer.starts_with("HTTP/1.1 403"),
+            "the floor refuses a loopback upstream: {answer}"
+        );
+
+        let dials = proxy.drain();
+        assert_eq!(dials.len(), 1, "{dials:?}");
+        assert!(!dials[0].allowed);
+        assert_eq!(dials[0].layer.as_deref(), Some(crate::net::FLOOR_LAYER));
+        let rule = dials[0].rule.as_deref().unwrap();
+        assert!(
+            rule.contains("127.0.0.1") && rule.contains(crate::net::ALLOW_LOCAL_KEY),
+            "a refusal names the address and the key that restores it: {rule}"
+        );
     }
 
     /// O3 — the proxy ends with the run that owns it. A listener that outlived
@@ -444,6 +551,7 @@ mod tests {
     #[ignore = "measurement, not an assertion: run with --ignored --nocapture"]
     async fn n5_per_dial_overhead() {
         const N: u32 = 30;
+        let _widened = Widened::on();
         let (upstream, _server) = echo_listener("pong").await;
         let target = upstream.to_string();
         let proxy = proxy_for(Policy::default().layer("m").allow_net("127.0.0.1")).await;
@@ -481,6 +589,7 @@ mod tests {
     /// would go on permitting what the run had stopped permitting.
     #[tokio::test]
     async fn narrowing_the_policy_mid_run_reaches_the_proxy() {
+        let _widened = Widened::on();
         let (upstream, _server) = echo_listener("pong").await;
         let shared = Arc::new(RwLock::new(
             Policy::default().layer("test").allow_net("127.0.0.1"),

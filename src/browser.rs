@@ -410,7 +410,17 @@ impl NavGate {
             return true;
         };
         let verdict = self.policy.check(Act::Net, &target);
-        let permitted = verdict.effect == Effect::Allow;
+        // 0.74.0, audit M10 — the floor applies here too, and it did not.
+        //
+        // This is the one net decision in the crate that never went through
+        // `NetGuard`: it asks the policy directly, so the address-level floor
+        // that `net.rs` and the proxy gained was simply absent, and
+        // `browser_navigate` to `http://169.254.169.254/` under `allow_net("*")`
+        // still reached cloud metadata. `browser_navigate` is one of the three
+        // sites the finding names, so a fix that closed the other two and left
+        // this one would have closed the finding on paper only.
+        let permitted = verdict.effect == Effect::Allow
+            && crate::net::floor_target(&target, crate::net::LocalNet::configured()).is_ok();
         self.decisions
             .lock()
             .expect("navigation decisions are not poisoned")

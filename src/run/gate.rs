@@ -23,13 +23,20 @@ pub(super) enum ProviderAccess {
 /// with the same answer — and asking a human it repeatedly would train them to
 /// wave it through.
 ///
-/// The provider layer is merged *before* the check, not consulted after it. That
-/// ordering is what makes a network-deny base usable: the `net` default denies,
-/// the provider layer's allow rule beats a default, and a caller's explicit
-/// `deny_net` still beats the allow because deny is absolute across layers. So
-/// "deny everything but the model" needs no host list from the caller, while
-/// "deny even the model" remains expressible — and fails fast as a refusal
-/// rather than hanging on a call that is never made.
+/// The provider layer is merged *before* the check for an endpoint of a trusted
+/// origin, and only for one (0.74.0, audit finding C3). That ordering is what
+/// makes a network-deny base usable: the `net` default denies, the provider
+/// layer's allow rule beats a default, and a caller's explicit `deny_net` still
+/// beats the allow because deny is absolute across layers. So "deny everything
+/// but the model" needs no host list from the caller, while "deny even the model"
+/// remains expressible — and fails fast as a refusal rather than hanging on a
+/// call that is never made.
+///
+/// An endpoint of an untrusted origin is put to the caller's own policy first,
+/// where a deny answers before the overlay can widen anything. The two origins
+/// that stay exempt are the user-scope `io.toml` and a provider the embedder
+/// built in its own Rust — see [`net::ProviderOrigin`] for how the distinction
+/// travels, and why an unmarked policy means the second of those.
 pub(super) async fn authorize_provider<P: Provider>(
     provider: &P,
     policy: &Policy,
@@ -62,6 +69,29 @@ pub(super) async fn authorize_provider<P: Provider>(
                 layer: None,
             });
         };
+        // C3 — the overlay below is an *allow* for this host. Until 0.74.0 it was
+        // merged before the host was checked, so a caller whose `net` default is
+        // Deny was never asked about its own provider's endpoint. It is asked
+        // first now, unless the endpoint came from an origin the operator owns.
+        //
+        // Against `policy`, never `effective`: `effective` already carries the
+        // overlay of every endpoint checked before this one, and a fallback
+        // chain's first host must not authorize its second.
+        //
+        // Only a Deny is intercepted. An `Ask` is still the overlay's to answer
+        // below, so this narrows the ordering and cannot turn an allowance into a
+        // question the caller never asked for.
+        if net::provider_origin(policy, &target) == net::ProviderOrigin::Untrusted
+            && policy.check(Act::Net, &target).effect == Effect::Deny
+        {
+            // Through the guard rather than as a bare `Error::Refused`, so the
+            // refusal is recorded and announced the way every other one is. It
+            // re-reads the same policy and reaches the same Deny.
+            NetGuard::new(policy)
+                .tracing(store, run_id, 0)
+                .watching(watch, 0)
+                .check_target(&target)?;
+        }
         effective = effective.merge(net::provider_layer(&target));
         // Step 0: the authorization happens before the run's first step.
         let verdict = NetGuard::new(&effective)
