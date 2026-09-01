@@ -1,0 +1,93 @@
+{
+  "awkward_prompt": "Rename the \"order\" column — it's a keyword — and check C:\\repo\\io.toml",
+  "goal": "port the parser",
+  "parked_run": 2,
+  "runs": [
+    {
+      "canonical_trace": "step 1 | tokens 512 | decision read the schema | tool_call  | prompt what does the schema hold? | result seven tables name a run\nstep 2 | tokens 768 | decision wrote io.toml | tool_call {\"name\":\"write_file\",\"input\":{\"path\":\"io.toml\"}} | prompt apply the rename | result written\n",
+      "id": 1,
+      "last_step": 2,
+      "outcome": "success",
+      "resumable": true,
+      "status": "completed",
+      "steps": [
+        {
+          "decision": "read the schema",
+          "prompt": "what does the schema hold?",
+          "result": "seven tables name a run",
+          "step": 1,
+          "tokens": 512,
+          "tool_call": ""
+        },
+        {
+          "decision": "wrote io.toml",
+          "prompt": "apply the rename",
+          "result": "written",
+          "step": 2,
+          "tokens": 768,
+          "tool_call": "{\"name\":\"write_file\",\"input\":{\"path\":\"io.toml\"}}"
+        }
+      ]
+    },
+    {
+      "canonical_trace": "step 1 | tokens 256 | decision read the trace | tool_call  | prompt check the mode | result the file is world-readable\n",
+      "id": 2,
+      "last_step": 1,
+      "outcome": null,
+      "resumable": true,
+      "status": "running",
+      "steps": [
+        {
+          "decision": "read the trace",
+          "prompt": "check the mode",
+          "result": "the file is world-readable",
+          "step": 1,
+          "tokens": 256,
+          "tool_call": ""
+        }
+      ]
+    }
+  ],
+  "session_created_at": "2026-09-01T17:18:02.505Z",
+  "session_head": 2,
+  "session_id": 1,
+  "session_root": "fixture-workspace",
+  "session_size": {
+    "bytes": 598,
+    "rows": 9,
+    "runs": 2,
+    "session_id": 1,
+    "turns": 2
+  },
+  "sweep": {
+    "refused": [
+      1
+    ],
+    "sessions": 0
+  },
+  "sweep_cutoff": "2999-01-01T00:00:00.000Z",
+  "turns": [
+    {
+      "created_at": "2026-09-01T17:18:02.505Z",
+      "id": 1,
+      "outcome": "success",
+      "parent_turn_id": null,
+      "prompt": "Rename the \"order\" column — it's a keyword — and check C:\\repo\\io.toml",
+      "reply": "Renamed it, and the keyword is quoted.",
+      "run_id": 1,
+      "session_id": 1
+    },
+    {
+      "created_at": "2026-09-01T17:18:02.506Z",
+      "id": 2,
+      "outcome": null,
+      "parent_turn_id": 1,
+      "prompt": "And the trace file's mode?",
+      "reply": null,
+      "run_id": 2,
+      "session_id": 1
+    }
+  ],
+  "workspace": "fixture-workspace",
+  "writer": "io-harness 0.73.0"
+}

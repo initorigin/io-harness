@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.73.0"
+version = "0.74.0"
 edition = "2021"
 # `libsqlite3-sys` 0.38.1 sets the floor from 0.23.0 on: its build script — and
 # `rusqlite` 0.40's own source — call the std `cfg_select!` macro, stabilised in
@@ -41,15 +41,16 @@ categories = ["asynchronous", "api-bindings"]
 # guide pages, and a package that ships the links without the pages is worse
 # than one that ships neither.
 #
-# The six crates under `tests/fixtures/` are excluded because each is a
+# The seven crates under `tests/fixtures/` are excluded because each is a
 # separate cargo package with its own manifest, and one of them deliberately
 # fails to resolve. They exist to be run from a git checkout by CI, never from
 # the published package. The fixtures they *produce* — the 0.22.0- and
 # 0.29.0-written databases under `tests/fixtures/store-0.22.0/` and
 # `tests/fixtures/store-0.29.0/` — are NOT excluded, because the two
 # cross-version test files read them and `cargo package` verifies the tests
-# compile. `tests/fixtures/store-0.71.0/` joins them in 0.72.0 and
-# `tests/fixtures/store-0.72.0/` in 0.73.0, for the same reason.
+# compile. `tests/fixtures/store-0.71.0/` joins them in 0.72.0,
+# `tests/fixtures/store-0.72.0/` in 0.73.0 and `tests/fixtures/store-0.73.0/`
+# in 0.74.0, for the same reason.
 exclude = [
     ".ultraship",
     ".env",
@@ -58,6 +59,7 @@ exclude = [
     "tests/fixtures/gen-0.29.0",
     "tests/fixtures/gen-0.71.0",
     "tests/fixtures/gen-0.72.0",
+    "tests/fixtures/gen-0.73.0",
     "tests/fixtures/links-consumer",
     "tests/fixtures/throughput-0.22.0",
 ]
