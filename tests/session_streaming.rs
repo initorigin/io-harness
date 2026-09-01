@@ -243,16 +243,21 @@ async fn a_one_shot_run_emits_no_deltas_and_a_session_turn_does() {
         "a one-shot run asked the provider to stream"
     );
     // The event sequence a 0.19.0 consumer would have seen, plus 0.45.0's
-    // `PromptComposed` and 0.46.0's `Contained` — both of which arrive before the
-    // first step, because both are resolved once at run start, and which are the
-    // two "other"s below. The expectation was changed deliberately, twice now: an
-    // additive variant on a `#[non_exhaustive]` enum is exactly what this crate has
-    // told observers to expect since 0.24.0, and the claim this assertion is really
-    // making — that streaming adds no `Token` events to a one-shot run — is the two
-    // assertions above it.
+    // `PromptComposed`, 0.46.0's `Contained` and 0.74.0's `boundary_probe` — all
+    // three of which arrive before the first step, because all three are resolved
+    // once at run start, and which are the three "other"s below. The expectation
+    // was changed deliberately, three times now: an additive variant on a
+    // `#[non_exhaustive]` enum is exactly what this crate has told observers to
+    // expect since 0.24.0, and the claim this assertion is really making — that
+    // streaming adds no `Token` events to a one-shot run — is the two assertions
+    // above it.
+    //
+    // 0.74.0's row is announced rather than only recorded, because
+    // `sandbox_events` and the event stream are held to each other row for row —
+    // see `observe::the_verify_gates_sandbox_is_announced_as_sandbox_events_records_it`.
     assert_eq!(
         *quiet.kinds.lock().unwrap(),
-        vec!["started", "other", "other", "step", "finished"]
+        vec!["started", "other", "other", "other", "step", "finished"]
     );
 
     // The control: the same provider, through a session turn.

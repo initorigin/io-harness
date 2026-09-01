@@ -48,6 +48,23 @@
 //!
 //! A configurable network egress *allow-list* is out of scope for 0.6.0 (network
 //! is deny-by-default only); it lands in 0.8.0 with MCP/plugins.
+//!
+//! ## The list above is a claim; the run measures it
+//!
+//! Every line of it was true of the code and still wrong on a host — three of
+//! 0.74.0's findings were one failure on three platforms, a backend reporting a
+//! containment it did not apply. So a run does not take the list on trust:
+//! [`BoundaryProbe::measure`] attempts a write and a dial *outside* the boundary
+//! at start — once per run in the flat loop, once per tree in the tree loop,
+//! where every agent runs under one containment — and
+//! [`BoundaryProbe::confines_writes`] /
+//! [`BoundaryProbe::denies_egress`] answer from what happened rather than from
+//! what the backend declares. An attempt that could not be made claims nothing.
+//!
+//! "Nothing it spawned outlives it" is likewise something the foreground path
+//! only started doing in 0.74.0: until then the teardown walked `ppid` links,
+//! which a payload that forks twice steps out of. Every spawn here now leads its
+//! own process group and every kill signals that group first.
 
 use std::path::{Path, PathBuf};
 
@@ -137,6 +154,16 @@ impl Backend {
     /// Does a run under this backend have its writes confined to what the mode
     /// granted?
     ///
+    /// **This is the design claim, not the measurement.** It says what the
+    /// backend is built to apply; it cannot say what this host's kernel, this
+    /// host's `sandbox-exec` binary or this run's own paths actually delivered.
+    /// Three of 0.74.0's findings were that gap wearing three hats — a backend
+    /// reporting a containment it did not apply, on each of the three platforms —
+    /// so the answer a *run* should trust is [`BoundaryProbe::confines_writes`],
+    /// which attempts a write outside the boundary at run start and reports what
+    /// happened. Read this one to know what a backend is *for*; read the probe to
+    /// know what it did.
+    ///
     /// **One exhaustive `match`, and that is the entire point of it.** Before
     /// 0.47.0 this question was answered by `matches!(backend, MacosSandboxExec |
     /// LinuxNamespaces)` written out in four places across the test suite. When
@@ -174,6 +201,10 @@ impl Backend {
 
     /// Does this backend enforce the run's egress answer with a real boundary,
     /// rather than approximating it by stripping proxy variables?
+    ///
+    /// **The design claim again, and the same caveat.** What this run's commands
+    /// were actually refused is [`BoundaryProbe::denies_egress`], measured at run
+    /// start against a listener the harness owns on loopback.
     ///
     /// Same exhaustive shape and the same reason. Note that a backend reported by
     /// [`Sandbox::backend`] for a run that denies egress already satisfies the
@@ -214,23 +245,21 @@ impl Backend {
     /// ignore, which is what [`denies_egress`](Backend::denies_egress) answers.
     /// This one is narrower and comes first: can the connection be made at all.
     ///
-    /// **[`WindowsAppContainer`](Backend::WindowsAppContainer) cannot**, and no
-    /// capability changes it — measured on `windows-latest` with none, with
-    /// `internetClient`, with `privateNetworkClientServer` and with both, while
-    /// the same request succeeds outside the container and an outbound request to
-    /// a real host succeeds inside it. So egress there is the capability itself:
-    /// all of the network, or none of it. A run that would have been proxied is
-    /// given no proxy on that backend rather than one it cannot reach, and the
-    /// agent's own boundary section says which of the two it has.
-    ///
     /// **Only [`WindowsAppContainer`](Backend::WindowsAppContainer) cannot**, and
     /// no capability changes it — measured on `windows-latest` with none, with
     /// `internetClient`, with `privateNetworkClientServer` and with both, while
     /// the same request succeeds outside the container and an outbound request to
-    /// a real host succeeds inside it. A run that would have been proxied is given
-    /// no proxy on that backend rather than one it cannot reach, because a
-    /// command pointed at an unreachable proxy waits out its own clock on every
-    /// request instead of being scoped.
+    /// a real host succeeds inside it. So egress there is the capability itself:
+    /// all of the network, or none of it. A run that would have been proxied is
+    /// given no proxy on that backend rather than one it cannot reach — a command
+    /// pointed at an unreachable proxy waits out its own clock on every request
+    /// instead of being scoped — and the agent's own boundary section says which
+    /// of the two it has.
+    ///
+    /// It is also the one backend [`BoundaryProbe`] leaves the dial arm
+    /// unmeasured on: the refusal a loopback listener would see there is the
+    /// loopback boundary rather than the egress answer, and reporting it as
+    /// egress would be the misattribution the probe exists to catch.
     ///
     /// Third exhaustive `match` beside the two above, and for the same reason: the
     /// next backend added is a compile error here rather than a claim it quietly
@@ -1165,28 +1194,380 @@ impl Sandbox for FloorSandbox {
     }
 }
 
-/// Run `argv` in `workdir` under `limits`, capturing output and enforcing caps
-/// that *kill*. `configure` is a backend hook to further restrict the command
-/// (e.g. wrap it in `sandbox-exec`) before it is spawned; the floor passes a
-/// no-op. Shared by the floor and the native unix backends so caps and teardown
-/// live in one place.
+/// What a run's own startup probe **measured** about the boundary it is about to
+/// run under (0.74.0).
 ///
-/// Caps:
-/// - **CPU** via `RLIMIT_CPU` (unix `pre_exec`) → SIGXCPU → [`Cap::Cpu`]. *Unix
-///   only here* — on Windows the CPU cap is the Job Object's per-job time limit,
-///   applied by [`windows`], not by this function.
-/// - **Memory** via an RSS poll-and-kill monitor → [`Cap::Memory`] (macOS does
-///   not enforce address-space rlimits, so a monitor is the portable mechanism).
-///   *Unix only here* — the monitor reads the process table with `ps`, which does
-///   not exist on Windows; the Windows memory bound is the job's commit limit.
-/// - **Wall** via a tokio timeout → [`Cap::Wall`]. The one cap that applies on
-///   **every** platform and under **every** backend, and therefore the backstop
-///   that fires when nothing else can.
+/// [`Backend::confines_writes`] and [`Backend::denies_egress`] are declarations:
+/// they say what a backend is designed to apply. Three of this release's findings
+/// were one failure wearing three hats — a backend reporting a containment it did
+/// not apply, on macOS, on Windows and on Linux. Fixing three instances leaves the
+/// fourth one silent. This type is what makes the next one loud: before a run
+/// trusts its boundary, it attempts a write and a dial *outside* that boundary and
+/// records what happened, so the claim is something the machine checks rather than
+/// something a human asserted once.
 ///
-/// A cap the platform cannot apply is never *claimed*: [`SandboxOutcome::cap_hit`]
-/// only ever names a cap that really fired, and a run whose backend has no
-/// CPU/memory mechanism warns once rather than letting a caller believe the
-/// limits it configured are in force.
+/// **Measured once per boundary, never cached.** A flat run has one containment
+/// and measures it once at run start. A tree has one containment for every agent
+/// in it — a child shares its parent's workspace and its containment — so it is
+/// measured once before the root runs and read by each agent, and an agent whose
+/// contract asks for a different [`SandboxConfig`] measures its own. What is
+/// forbidden is a value kept *past the thing it measured*: a host's Landlock ABI,
+/// its `sandbox-exec` binary, its writable roots and its own kernel settings can
+/// all change between two runs of one process, and a cached "yes" is the same
+/// unverified claim in a faster wrapper.
+///
+/// **Every arm fails closed.** Each is an `Option<bool>` and each accessor answers
+/// `true` only for `Some(true)`. A probe that could not run — no probe tool on the
+/// host, no directory outside the boundary to aim at, a backend a loopback
+/// listener cannot measure — answers `false` to everything, because an unproven
+/// claim must not read as a proven one.
+///
+/// ```
+/// use io_harness::sandbox::{BoundaryProbe, SandboxConfig};
+///
+/// # async fn demo() {
+/// let probe = BoundaryProbe::measure(&SandboxConfig::new(), &[]).await;
+/// if probe.contradicts_claim() {
+///     // The backend named an isolation this host did not deliver. The run is
+///     // told what was measured, not what was advertised.
+///     eprintln!("boundary claim not met: {}", probe.trace_label());
+/// }
+/// // And the value a run should act on is the measurement, never the backend's
+/// // own answer.
+/// let _ = probe.confines_writes();
+/// # }
+/// # let _ = demo;
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundaryProbe {
+    /// The backend the probe ran under — what [`select`] chose for this config.
+    pub backend: Backend,
+    /// Was a write to a path outside the boundary refused?
+    ///
+    /// `Some(true)` — attempted, and the file was not there afterwards.
+    /// `Some(false)` — attempted, and it landed. `None` — the attempt could not
+    /// be made, which is not evidence of anything and never reads as `true`.
+    pub write_refused: Option<bool>,
+    /// Was a connection to an address outside the boundary refused? Same three
+    /// meanings as [`write_refused`](BoundaryProbe::write_refused).
+    ///
+    /// The address is a listener the harness itself owns on `127.0.0.1`, so the
+    /// arm never makes a real network call. That also bounds what it can see: on
+    /// a backend that cannot reach loopback at all
+    /// ([`Backend::reaches_loopback_proxy`] is false for
+    /// [`WindowsAppContainer`](Backend::WindowsAppContainer)) a refusal would say
+    /// nothing about egress, so the arm is left unmeasured rather than answered.
+    pub dial_refused: Option<bool>,
+}
+
+/// The program the probe runs.
+///
+/// A system utility rather than a dependency — the same argument `ps` and
+/// `taskkill` already carry in this file — and the one present out of the box on
+/// all three targets that can both write a file to a named path and open a TCP
+/// connection. Every path reaches it as its own argv word, so nothing the probe
+/// builds is ever re-parsed by a shell: C1 in this release was a path that became
+/// syntax, and a guard against that class must not open a new instance of it.
+///
+/// **`_PROGRAM`, never `_TOOL`.** In this crate a *tool* is something the model
+/// may call, and `tests/custom_tools.rs` enforces that by scanning `src/` for
+/// `const <NAME>_TOOL: &str = "..."` and requiring every value it finds to be a
+/// reserved tool name. A const naming a program the crate *spawns* is not that,
+/// so it must not wear the suffix — the alternative is reserving a tool name the
+/// harness does not answer, which is a defect of its own.
+///
+// ponytail: one program, no fallback chain. A host without it gets an unmeasured
+// probe and therefore no claim, which is the correct direction; add `bash`'s
+// `/dev/tcp` and `cp` as a second rung only if a real host turns up without curl.
+const PROBE_PROGRAM: &str = "curl";
+
+/// What the write arm copies. A file present on every host of its platform, read
+/// through `file://` so the arm needs no network at all — the two arms have to
+/// fail independently or a backend that denied egress would read as one that
+/// confined writes.
+#[cfg(unix)]
+const PROBE_SOURCE: &str = "file:///etc/hosts";
+#[cfg(windows)]
+const PROBE_SOURCE: &str = "file:///C:/Windows/win.ini";
+#[cfg(not(any(unix, windows)))]
+const PROBE_SOURCE: &str = "";
+
+impl BoundaryProbe {
+    /// A probe that has not run: both arms unknown, so both claims are `false`.
+    ///
+    /// What a caller records when it deliberately skips the measurement. It is a
+    /// constructor rather than a `Default` because a boundary with no evidence
+    /// behind it is not a default anyone should fall into.
+    pub fn unmeasured(backend: Backend) -> Self {
+        Self {
+            backend,
+            write_refused: None,
+            dial_refused: None,
+        }
+    }
+
+    /// Attempt a write and a dial outside the boundary this config selects, and
+    /// report what happened.
+    ///
+    /// `writable_roots` are the roots the run grants besides the workdir, so the
+    /// probe measures the boundary the run will actually have rather than a
+    /// different one.
+    ///
+    /// Three short-lived child processes at most: one **control** run outside the
+    /// boundary, which is what separates "the boundary refused it" from "this host
+    /// could never have done it" — a distinction the whole guard rests on, because
+    /// a tool that cannot run answers every question with a refusal — and then one
+    /// contained run per arm. An arm whose control failed stays `None`.
+    ///
+    /// Nothing here asserts a duration. The caps on the contained runs exist so a
+    /// wedged child cannot outlive the probe; a run they killed is reported as
+    /// unmeasured rather than as a refusal.
+    pub async fn measure(config: &SandboxConfig, writable_roots: &[PathBuf]) -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let backend = select(config).backend();
+        // `FullAccess` reaches no backend at all — the command is not wrapped —
+        // so there is nothing to attempt and nothing is confined. Measured by not
+        // needing to be, rather than left unknown.
+        if !config.mode.is_contained() {
+            return Self {
+                backend,
+                write_refused: Some(false),
+                dial_refused: Some(false),
+            };
+        }
+        let mut probe = Self::unmeasured(backend);
+
+        let found = resolve_program(PROBE_PROGRAM);
+        let Some(tool) = found.as_deref().and_then(Path::to_str) else {
+            return probe;
+        };
+        let Some(outside) = probe_outside_dir() else {
+            return probe;
+        };
+        let Ok(dir) = workdir() else {
+            return probe;
+        };
+        let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await else {
+            return probe;
+        };
+        let Ok(addr) = listener.local_addr() else {
+            return probe;
+        };
+
+        // The listener answers, so a permitted dial completes instead of waiting
+        // out a clock, and it counts. The count is incremented before the reply is
+        // written, so a child that has exited is a child whose connection is
+        // already counted — the arm needs no sleep to be sure it looked late
+        // enough.
+        let dialled = Arc::new(AtomicUsize::new(0));
+        let acceptor = tokio::spawn({
+            let dialled = Arc::clone(&dialled);
+            async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    dialled.fetch_add(1, Ordering::SeqCst);
+                    use tokio::io::AsyncWriteExt;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    let _ = sock.shutdown().await;
+                }
+            }
+        });
+
+        // The control: the same two attempts, outside the boundary, in one child.
+        let control_target = outside.join(probe_name("control"));
+        let control_argv = probe_argv(
+            tool,
+            &control_target,
+            PROBE_SOURCE,
+            Some(&dir.path().join("probe-control-sink")),
+            Some(addr),
+        );
+        let mut control = tokio::process::Command::new(&control_argv[0]);
+        control
+            .args(&control_argv[1..])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let _ = control.status().await;
+        let write_arm_runs = control_target.is_file();
+        let dial_arm_runs = dialled.load(Ordering::SeqCst) > 0;
+        let _ = std::fs::remove_file(&control_target);
+
+        let limits = probe_limits();
+        if write_arm_runs {
+            let target = outside.join(probe_name("write"));
+            let argv = probe_argv(tool, &target, PROBE_SOURCE, None, None);
+            let spec = RunSpec::new(&argv, dir.path(), &limits)
+                .with_network(config.allow_network)
+                .with_mode(config.mode)
+                .with_writable_roots(writable_roots);
+            // A run the caps killed measured nothing: `cap_hit` is the difference
+            // between "the boundary refused it" and "it never got that far".
+            if let Ok(outcome) = select(config).run(spec).await {
+                probe.write_refused = outcome.cap_hit.is_none().then(|| !target.is_file());
+            }
+            let _ = std::fs::remove_file(&target);
+        }
+        // A backend the proxy itself cannot be reached from is one a loopback
+        // listener cannot measure: the refusal would be the loopback boundary
+        // rather than the egress answer, and reporting it as egress would be the
+        // same misattribution this type exists to catch.
+        if dial_arm_runs && backend.reaches_loopback_proxy() {
+            let before = dialled.load(Ordering::SeqCst);
+            let sink = dir.path().join("probe-dial-sink");
+            let argv = probe_argv(tool, &sink, "", Some(&sink), Some(addr));
+            let spec = RunSpec::new(&argv, dir.path(), &limits)
+                .with_network(config.allow_network)
+                .with_mode(config.mode)
+                .with_writable_roots(writable_roots);
+            if let Ok(outcome) = select(config).run(spec).await {
+                probe.dial_refused = outcome
+                    .cap_hit
+                    .is_none()
+                    .then(|| dialled.load(Ordering::SeqCst) == before);
+            }
+        }
+        acceptor.abort();
+
+        if probe.contradicts_claim() {
+            tracing::warn!(
+                backend = backend.as_str(),
+                measured = %probe.trace_label(),
+                "the sandbox backend named a containment this host did not apply; the run is \
+                 told what was measured, not what was advertised"
+            );
+        }
+        probe
+    }
+
+    /// Were this run's writes confined, as measured?
+    ///
+    /// `true` only for an attempt that was made and refused. This is the answer a
+    /// run should act on; [`Backend::confines_writes`] is what the backend was
+    /// designed to do.
+    pub fn confines_writes(&self) -> bool {
+        self.write_refused == Some(true)
+    }
+
+    /// Was this run's egress denied, as measured? Same rule, same reason.
+    pub fn denies_egress(&self) -> bool {
+        self.dial_refused == Some(true)
+    }
+
+    /// Did the backend claim a containment the probe watched fail?
+    ///
+    /// An arm that could not run is not a contradiction — it is an absence of
+    /// evidence, and it already costs the claim through
+    /// [`confines_writes`](BoundaryProbe::confines_writes) and
+    /// [`denies_egress`](BoundaryProbe::denies_egress). This is narrower: the
+    /// attempt was made and it succeeded, under a backend that said it would not.
+    pub fn contradicts_claim(&self) -> bool {
+        (self.backend.confines_writes() && self.write_refused == Some(false))
+            || (self.backend.denies_egress() && self.dial_refused == Some(false))
+    }
+
+    /// The probe as one stable line for the trace and the agent's own prompt.
+    pub fn trace_label(&self) -> String {
+        fn arm(v: Option<bool>) -> &'static str {
+            match v {
+                Some(true) => "refused",
+                Some(false) => "landed",
+                None => "unmeasured",
+            }
+        }
+        format!(
+            "{} write-outside={} dial-outside={}",
+            self.backend.as_str(),
+            arm(self.write_refused),
+            arm(self.dial_refused)
+        )
+    }
+}
+
+/// The probe's argv: at most one file to write and one address to dial, each as
+/// its own word.
+///
+/// `curl` pairs every `-o` with the URL that follows it and runs the pairs in
+/// order, so one child can carry both attempts — but the arms are given separate
+/// children anyway, because a first transfer that fails is a first transfer whose
+/// effect on the second is curl's business rather than this crate's, and an arm
+/// that answers for the other arm is worse than an arm that costs a spawn.
+///
+/// The timeouts are a wedge guard, never evidence: whatever they stop is reported
+/// as unmeasured.
+fn probe_argv(
+    tool: &str,
+    target: &Path,
+    source: &str,
+    dial_sink: Option<&Path>,
+    dial: Option<std::net::SocketAddr>,
+) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        tool.to_string(),
+        "-s".into(),
+        "--connect-timeout".into(),
+        "2".into(),
+        "--max-time".into(),
+        "5".into(),
+    ];
+    if !source.is_empty() {
+        argv.push("-o".into());
+        argv.push(target.display().to_string());
+        argv.push(source.to_string());
+    }
+    if let (Some(sink), Some(addr)) = (dial_sink, dial) {
+        argv.push("-o".into());
+        argv.push(sink.display().to_string());
+        argv.push(format!("http://{addr}/"));
+    }
+    argv
+}
+
+/// A name no other probe on this host is using.
+fn probe_name(arm: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!(".io-harness-probe-{}-{nanos}-{arm}", std::process::id())
+}
+
+/// A directory that is genuinely **outside** what a contained run is granted.
+///
+/// Not the system temporary directory, which every backend grants writable by
+/// design — `/private/var/folders` in the macOS profile, `${TMPDIR:-/tmp}` in the
+/// Linux mount setup — and which `tempfile` puts its directories inside. A probe
+/// aimed there would watch a granted write land and report the boundary broken on
+/// every host. The Landlock rung's own tests learned this the same way, from a
+/// matrix round the development host could not reproduce.
+///
+/// The home directory is the one location present on all three platforms that a
+/// contained run is not granted and the harness itself can write. Absent or
+/// unusable, the probe does not run — and therefore claims nothing.
+fn probe_outside_dir() -> Option<PathBuf> {
+    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let dir = PathBuf::from(std::env::var_os(key)?);
+    if !dir.is_absolute() || !dir.is_dir() || dir.starts_with(std::env::temp_dir()) {
+        return None;
+    }
+    Some(dir)
+}
+
+/// Caps for a probe child: enough for a local copy and a loopback request, and a
+/// wall clock so a wedged one cannot outlive the probe. Deliberately not the
+/// run's own caps — a run configured with none would leave the probe unbounded.
+fn probe_limits() -> SandboxLimits {
+    SandboxLimits {
+        max_cpu_secs: Some(10),
+        max_wall_secs: Some(20),
+        ..SandboxLimits::default()
+    }
+}
+
 /// Apply the unix resource caps a sandboxed spawn gets, to a command the caller
 /// owns and will spawn itself.
 ///
@@ -1530,6 +1911,15 @@ pub(crate) fn contain_command(
         );
         let ruleset = landlock::Ruleset::build(&plan).ok()?;
         let fd = ruleset.raw();
+        // 0.74.0, audit H9 — read from the plan, never written as a constant
+        // here. Landlock can restrict TCP and nothing else, so a run that denied
+        // egress still reached `sendto` over UDP, and DNS is a channel that needs
+        // nothing installed. The socket filter is what closes that, and whether
+        // this spawn needs it is the same question the plan already answered.
+        // This spawn path and `linux::landlock_run` must agree: two paths that
+        // both report `LinuxLandlock` while installing different filters is the
+        // failure this release exists to stop.
+        let net_restricted = plan.restricts_network();
         // SAFETY: the closure runs in the forked child before `exec`, allocates
         // nothing and calls only `prctl`, `landlock_restrict_self` and one
         // `seccomp` install. `fd` belongs to the returned guard, which the caller
@@ -1537,7 +1927,7 @@ pub(crate) fn contain_command(
         unsafe {
             cmd.pre_exec(move || {
                 landlock::restrict_self(fd)?;
-                seccomp::install()
+                seccomp::install(net_restricted)
             });
         }
         Some(Contained { _ruleset: ruleset })
@@ -1552,6 +1942,28 @@ pub(crate) struct Contained {
     _ruleset: landlock::Ruleset,
 }
 
+/// Run `argv` in `workdir` under `limits`, capturing output and enforcing caps
+/// that *kill*. `configure` is a backend hook to further restrict the command
+/// (e.g. wrap it in `sandbox-exec`) before it is spawned; the floor passes a
+/// no-op. Shared by the floor and the native unix backends so caps and teardown
+/// live in one place.
+///
+/// Caps:
+/// - **CPU** via `RLIMIT_CPU` (unix `pre_exec`) → SIGXCPU → [`Cap::Cpu`]. *Unix
+///   only here* — on Windows the CPU cap is the Job Object's per-job time limit,
+///   applied by [`windows`], not by this function.
+/// - **Memory** via an RSS poll-and-kill monitor → [`Cap::Memory`] (macOS does
+///   not enforce address-space rlimits, so a monitor is the portable mechanism).
+///   *Unix only here* — the monitor reads the process table with `ps`, which does
+///   not exist on Windows; the Windows memory bound is the job's commit limit.
+/// - **Wall** via a tokio timeout → [`Cap::Wall`]. The one cap that applies on
+///   **every** platform and under **every** backend, and therefore the backstop
+///   that fires when nothing else can.
+///
+/// A cap the platform cannot apply is never *claimed*: [`SandboxOutcome::cap_hit`]
+/// only ever names a cap that really fired, and a run whose backend has no
+/// CPU/memory mechanism warns once rather than letting a caller believe the
+/// limits it configured are in force.
 async fn run_capped(
     backend: Backend,
     spec: RunSpec<'_>,
@@ -1623,6 +2035,20 @@ async fn run_capped_hooked(
     // Unix: apply rlimits in the child before exec. CPU is the reliable kill.
     apply_rlimits(&mut cmd, spec.limits);
 
+    // 0.74.0 — and put the child in a process group of its own, so the kills
+    // below can reach what the parent/child links cannot. The kill set was built
+    // by walking `ppid` from `ps`, and a payload that forks twice
+    // (`( sh -c work & ) &`) leaves a grandchild reparented to pid 1: invisible to
+    // the wall-clock kill and to the RSS monitor, and alive after the run it
+    // belonged to. `own_process_group` and `kill_tree_and_group` already closed
+    // exactly that gap for a detached handle; the foreground path — every
+    // verification, every `exec`, every contained command — never called them,
+    // which made this module's own "nothing outlives it" false where it is read
+    // most. Unconditional rather than conditional on a cap: the group is what
+    // makes the teardown reach, and a run with no cap set still tears down.
+    #[cfg(unix)]
+    own_process_group(&mut cmd);
+
     configure(&mut cmd);
 
     let child = cmd.spawn().map_err(|e| crate::error::Error::Sandbox {
@@ -1639,7 +2065,7 @@ async fn run_capped_hooked(
         // continue: a child that is still suspended would otherwise sit there
         // until the wall clock, and one that is running uncontained would be
         // running under a backend name that no longer describes it.
-        kill_tree(pid);
+        kill_tree_and_group(pid);
         return Err(e);
     }
 
@@ -1692,11 +2118,12 @@ async fn run_capped_hooked(
                     }
                     if tree.iter().map(|(_, rss)| rss).sum::<u64>() > max {
                         flag.store(MEM, Ordering::SeqCst);
-                        // Descendants first: killing the root alone would only
-                        // reparent the hog and leave it running.
-                        for (p, _) in tree.iter().rev() {
-                            unsafe { libc::kill(*p as libc::pid_t, libc::SIGKILL) };
-                        }
+                        // The group first and the tree after, descendants before
+                        // their parents — killing the root alone would only
+                        // reparent the hog, and walking the tree alone misses the
+                        // double-forked grandchild whose RSS this monitor could
+                        // not see either.
+                        kill_tree_and_group(Some(pid));
                         return;
                     }
                 }
@@ -1730,7 +2157,10 @@ async fn run_capped_hooked(
                     flag.store(WALL, Ordering::SeqCst);
                     // Dropping the JoinHandle detaches the wait, it does not
                     // cancel it — the child is still running and still killable.
-                    kill_tree(pid);
+                    // The group is signalled first: it is the only thing that
+                    // reaches a grandchild whose parent has already exited, which
+                    // is what a payload does deliberately to outlive its cap.
+                    kill_tree_and_group(pid);
                     if let Some(m) = mem_monitor {
                         m.abort();
                     }
@@ -2042,6 +2472,18 @@ pub fn workdir() -> Result<tempfile::TempDir> {
 /// A listed file that the sandbox never produced is skipped rather than an
 /// error: a command that failed part way leaves a partial set, and the caller
 /// already has the failure from [`SandboxOutcome`].
+///
+/// **A path that leaves either root is refused, not skipped** (0.74.0). Every
+/// entry must be relative and made of ordinary components: a `..`, a root, a
+/// Windows prefix, or a symbolic link in the source is [`Error::Refused`], and the
+/// resolved destination is re-checked against `dest_root` before anything is
+/// written. The predicate is handed the *relative* path, so without this a caller
+/// consulting a write policy would be asked about `../../etc/authorized_keys` and
+/// answering about a file somewhere else entirely — and a symlinked source would
+/// copy the contents of whatever it pointed at. A skip would have hidden that;
+/// a refusal is a caller's bug reported where the caller can see it.
+///
+/// [`Error::Refused`]: crate::Error::Refused
 pub async fn copy_back(
     workdir: &Path,
     dest_root: &Path,
@@ -2050,21 +2492,84 @@ pub async fn copy_back(
 ) -> Result<Vec<PathBuf>> {
     let mut copied = Vec::new();
     for rel in files {
+        refuse_escaping_path(rel)?;
         if !allowed(rel) {
             continue;
         }
         let src = workdir.join(rel);
-        if !src.exists() {
-            continue;
+        // `symlink_metadata` and not `exists`: `exists` follows the link and
+        // `tokio::fs::copy` would then copy what it points at, which is how a
+        // file the sandbox never produced gets written into the workspace under
+        // the name of one it did.
+        match tokio::fs::symlink_metadata(&src).await {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(refused(
+                    rel,
+                    "it is a symbolic link out of the sandbox workdir",
+                ))
+            }
+            Ok(md) if md.is_file() => {}
+            // Not there, or a directory: the same skip as before.
+            _ => continue,
         }
         let dest = dest_root.join(rel);
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
+            // The components were checked, but a *symlinked* directory already in
+            // the destination tree is a path that leaves the root without ever
+            // spelling `..`. Resolve what was actually created and re-check it.
+            let (Ok(root), Ok(under)) = (
+                tokio::fs::canonicalize(dest_root).await,
+                tokio::fs::canonicalize(parent).await,
+            ) else {
+                return Err(refused(
+                    rel,
+                    "its destination directory could not be resolved",
+                ));
+            };
+            if !under.starts_with(&root) {
+                return Err(refused(
+                    rel,
+                    "its destination resolves outside the destination root",
+                ));
+            }
         }
         tokio::fs::copy(&src, &dest).await?;
         copied.push(rel.clone());
     }
     Ok(copied)
+}
+
+/// Refuse a capture path that does not stay under both roots.
+///
+/// Only [`Component::Normal`](std::path::Component::Normal) passes, which rejects
+/// `..`, an absolute path, a Windows drive prefix and a bare `.` in one rule
+/// rather than four. Matching the shape rather than the characters is deliberate:
+/// the platform's own parser decides what a component *is*, so nothing here has to
+/// know that `C:` and `\\?\` and `/` are all the same problem.
+fn refuse_escaping_path(rel: &Path) -> Result<()> {
+    if rel.as_os_str().is_empty() {
+        return Err(refused(rel, "it names nothing"));
+    }
+    for c in rel.components() {
+        if !matches!(c, std::path::Component::Normal(_)) {
+            return Err(refused(
+                rel,
+                "it is not a plain relative path (a `..`, a root or a drive prefix would leave \
+                 the sandbox workdir and the destination root)",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn refused(rel: &Path, why: &str) -> crate::error::Error {
+    crate::error::Error::Refused {
+        act: "write".into(),
+        target: rel.display().to_string(),
+        rule: Some(format!("copy_back refuses this path: {why}")),
+        layer: None,
+    }
 }
 
 // All three backend modules are always compiled — their logic (profile/argv

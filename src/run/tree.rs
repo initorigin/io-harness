@@ -321,12 +321,80 @@ where
         // while the phase is on. `policy` here is this agent's own — a child's is its
         // parent's narrowed by `Policy::contain` — so a child is told its boundary and
         // not the root's.
-        let after_planning =
-            boundary_section(policy, &contract.exec_sandbox, will_proxy(policy, contract));
+        // Children share their parent's workspace, so they share its detection too.
+        let toolchain = crate::toolchain::detect(&tree.root);
+        // Children share their parent's workspace, so they share its containment.
+        let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
+        // 0.48.0 — the same rule as the flat loop. A contained tree run whose
+        // policy names hosts must not silently take the boolean while the flat
+        // loop scopes its egress.
+        let egress = start_egress_proxy(policy, containment.as_ref()).await;
+        let containment = match (&containment, &egress) {
+            (Some(c), Some((proxy, _, _))) => {
+                #[cfg(feature = "browser")]
+                tree.browser.route_through(proxy.addr());
+                Some(std::sync::Arc::new(c.with_proxy(Some(proxy.addr()))))
+            }
+            _ => containment,
+        };
+        report_containment(
+            tree.watch,
+            run_id,
+            depth,
+            &contract.exec_sandbox,
+            containment.as_deref(),
+        );
+        // 0.74.0 — the tree's measurement, taken once before the root ran, rather
+        // than one probe per agent.
+        //
+        // **Why one is the honest number, not the cheap one.** A few lines up,
+        // this loop says children share their parent's workspace and share its
+        // containment, and that is the argument: the boundary a child runs under
+        // *is* the one the tree resolved. Measuring it once per agent asks one
+        // question N times and can only produce N answers to it — a twenty-agent
+        // tree that disagrees with itself about its own boundary is worse evidence
+        // than one number, quite apart from the sixty short-lived child processes
+        // it spends before any agent's first prompt is composed.
+        //
+        // **This is not the cache the release refused.** A cache is a value kept
+        // past the thing it was measured on — reused for a later run, for another
+        // process, or for a different configuration — and it is refused because a
+        // host's Landlock ABI, its `sandbox-exec` binary and its writable roots
+        // can all move underneath it. None of that applies here. It is one
+        // measurement of one containment, held for exactly the lifetime of the
+        // `Tree` that has that containment and dropped with it: no `static`, no
+        // `OnceLock`, nothing that outlives one tree.
+        //
+        // And it is never read for a boundary it did not measure. A spawned
+        // child's contract carries its own `exec_sandbox`, and a contract that
+        // asks for a different one is a different boundary — so that agent
+        // measures its own rather than being told what another configuration
+        // produced. That is the line between reusing a measurement and inventing
+        // one.
+        let probe = if contract.exec_sandbox == tree.probed {
+            tree.probe.clone()
+        } else {
+            probe_boundary(
+                tree.store,
+                tree.watch,
+                depth,
+                run_id,
+                &contract.exec_sandbox,
+                containment.as_deref(),
+            )
+            .await
+        };
+        let after_planning = boundary_section(
+            policy,
+            &contract.exec_sandbox,
+            will_proxy(policy, contract),
+            &probe,
+        );
         let while_planning = boundary_section(
             &effective,
             &contract.exec_sandbox,
             will_proxy(&effective, contract),
+            &probe,
         );
         let agent_root = contract.root.as_deref().unwrap_or(&tree.root);
         let mut ws = Workspace::with_policy(agent_root, effective);
@@ -468,29 +536,6 @@ where
             }
         }
         let handles = &handles;
-        // Children share their parent's workspace, so they share its detection too.
-        let toolchain = crate::toolchain::detect(&tree.root);
-        // Children share their parent's workspace, so they share its containment.
-        let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
-        // 0.48.0 — the same rule as the flat loop. A contained tree run whose
-        // policy names hosts must not silently take the boolean while the flat
-        // loop scopes its egress.
-        let egress = start_egress_proxy(policy, containment.as_ref()).await;
-        let containment = match (&containment, &egress) {
-            (Some(c), Some((proxy, _, _))) => {
-                #[cfg(feature = "browser")]
-                tree.browser.route_through(proxy.addr());
-                Some(std::sync::Arc::new(c.with_proxy(Some(proxy.addr()))))
-            }
-            _ => containment,
-        };
-        report_containment(
-            tree.watch,
-            run_id,
-            depth,
-            &contract.exec_sandbox,
-            containment.as_deref(),
-        );
         // Children share their parent's workspace, so they share its memory: one
         // note store per workspace, every entry attributed to the run that wrote it.
         let mem_key = memory_key(&tree.root);

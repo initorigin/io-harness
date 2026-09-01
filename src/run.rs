@@ -3342,6 +3342,9 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let lsp = lsp_for(contract, &effective, store, run_id, watch).await?;
             let browser = browser_for(contract, &effective);
+            // Once for the whole tree, before the root agent runs. See `Tree::probe`.
+            let probe =
+                probe_tree_boundary(store, watch, run_id, &contract.exec_sandbox, &root).await;
             let tree = Tree {
                 mcp: &mcp,
                 lsp: &lsp,
@@ -3356,6 +3359,8 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 watch,
                 ledger,
                 containment,
+                probe,
+                probed: contract.exec_sandbox.clone(),
                 turn: None,
                 root,
                 root_run_id: run_id,
@@ -3448,6 +3453,9 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let lsp = lsp_for(contract, &effective, store, run_id, watch).await?;
             let browser = browser_for(contract, &effective);
+            // Once for the whole tree, before the root agent runs. See `Tree::probe`.
+            let probe =
+                probe_tree_boundary(store, watch, run_id, &contract.exec_sandbox, &root).await;
             let tree = Tree {
                 mcp: &mcp,
                 lsp: &lsp,
@@ -3462,6 +3470,8 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 watch,
                 ledger,
                 containment,
+                probe,
+                probed: contract.exec_sandbox.clone(),
                 turn: None,
                 root,
                 root_run_id: run_id,
@@ -3718,6 +3728,24 @@ struct Tree<'a, P: Provider> {
     watch: &'a Watch<'a>,
     ledger: Arc<Ledger>,
     containment: &'a Containment,
+    /// What this tree **measured** about the boundary its agents run under, taken
+    /// once before the root agent starts (0.74.0).
+    ///
+    /// One containment, one measurement. Every agent in a tree shares its
+    /// parent's workspace and its containment, so probing per agent would ask one
+    /// question N times and pay N times the child processes to get N answers to
+    /// it. Held here beside the ledger and the MCP session for the same reason
+    /// those are — it belongs to the tree — and, like them, it dies with the tree:
+    /// nothing static, nothing that survives into a second tree or a second run.
+    probe: crate::sandbox::BoundaryProbe,
+    /// The config `probe` was measured under, so it is never read for a boundary
+    /// it did not measure.
+    ///
+    /// A spawned child's contract carries its own `exec_sandbox`. Where it is the
+    /// root's, it is the same boundary and the same measurement; where it differs,
+    /// that agent measures its own. This field is what makes the difference a
+    /// comparison rather than an assumption.
+    probed: SandboxConfig,
     /// What a session turn adds to this tree's ROOT, and nothing else (0.39.0).
     ///
     /// `None` for every `run_tree`/`resume_tree` entry point, which is what keeps
@@ -4139,6 +4167,8 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
     let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
     let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
     let browser = browser_for(contract, policy);
+    // Once for the whole tree, before the root agent runs. See `Tree::probe`.
+    let probe = probe_tree_boundary(store, watch, run_id, &contract.exec_sandbox, &root).await;
     let tree = Tree {
         mcp: &mcp,
         lsp: &lsp,
@@ -4153,6 +4183,8 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
         watch,
         ledger,
         containment,
+        probe,
+        probed: contract.exec_sandbox.clone(),
         turn: Some(extras),
         root,
         root_run_id: run_id,
@@ -4367,6 +4399,8 @@ pub async fn resume_tree_observed<P: Provider>(
     let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
     let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
     let browser = browser_for(contract, policy);
+    // Once for the whole tree, before the root agent runs. See `Tree::probe`.
+    let probe = probe_tree_boundary(store, watch, run_id, &contract.exec_sandbox, &root).await;
     let tree = Tree {
         mcp: &mcp,
         lsp: &lsp,
@@ -4381,6 +4415,8 @@ pub async fn resume_tree_observed<P: Provider>(
         watch,
         ledger,
         containment,
+        probe,
+        probed: contract.exec_sandbox.clone(),
         turn: None,
         root,
         root_run_id: run_id,

@@ -659,6 +659,47 @@ pub(super) async fn run_workspace_from<P: Provider>(
         extra.extend(crate::tools::browser::browser_tools());
     }
     extra.extend(skill_tool(skills));
+    // Detected once, before the first turn. The marker files do not change under
+    // a run often enough to be worth a filesystem walk every step, and a run that
+    // creates its own `package.json` is creating a project rather than working in
+    // one.
+    let toolchain = crate::toolchain::detect(root);
+    // 0.46.0 — resolved once per run, beside the detection it reads. The writable
+    // roots depend on the toolchain, and `select` probes the host, so neither
+    // belongs on a per-call path.
+    let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
+    // 0.48.0 — the run owns its proxy, and the containment carries the address so
+    // every spawn site scopes the sandbox to it without asking a second question.
+    let egress = start_egress_proxy(policy, containment.as_ref()).await;
+    let containment = match (&containment, &egress) {
+        (Some(c), Some((proxy, _, _))) => {
+            #[cfg(feature = "browser")]
+            browser.route_through(proxy.addr());
+            Some(std::sync::Arc::new(c.with_proxy(Some(proxy.addr()))))
+        }
+        _ => containment,
+    };
+    report_containment(
+        watch,
+        run_id,
+        0,
+        &contract.exec_sandbox,
+        containment.as_deref(),
+    );
+    // 0.74.0 — and the boundary is measured rather than declared: one probe per
+    // run, recorded in the trace, and the only thing the boundary section below
+    // is allowed to answer from. This whole block moved up from below the prompt
+    // for exactly this reason — the section was composed 200 lines before the
+    // containment it describes was resolved.
+    let probe = probe_boundary(
+        store,
+        watch,
+        0,
+        run_id,
+        &contract.exec_sandbox,
+        containment.as_deref(),
+    )
+    .await;
     // 0.45.0 — composed once, here, and reused on every step. A system prompt that
     // varied between steps would move 0.38.0's cache breakpoint every turn and bill
     // a cache write per step on both wires that honour it.
@@ -667,8 +708,12 @@ pub(super) async fn run_workspace_from<P: Provider>(
     // the prompt the loop falls back to when it ends is a different string already.
     // An approver's remembered rule is not reflected: it widens the boundary mid-run,
     // and a prompt composed once cannot follow it (`docs/CONTRACT.md`).
-    let after_planning =
-        boundary_section(policy, &contract.exec_sandbox, will_proxy(policy, contract));
+    let after_planning = boundary_section(
+        policy,
+        &contract.exec_sandbox,
+        will_proxy(policy, contract),
+        &probe,
+    );
     // 0.60.3 — a binding rather than an argument built inline, matching the shape the
     // tree loop has had since 0.45.0, because two blocks of one turn now read it: the
     // `system` block's planning arm and the classifying opening below.
@@ -676,6 +721,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
         &effective,
         &contract.exec_sandbox,
         will_proxy(&effective, contract),
+        &probe,
     );
     let base_system = compose(PromptSpec {
         base: WORKSPACE_PROMPT,
@@ -859,33 +905,6 @@ pub(super) async fn run_workspace_from<P: Provider>(
         }
     }
     let handles = &handles;
-    // Detected once, before the first turn. The marker files do not change under
-    // a run often enough to be worth a filesystem walk every step, and a run that
-    // creates its own `package.json` is creating a project rather than working in
-    // one.
-    let toolchain = crate::toolchain::detect(root);
-    // 0.46.0 — resolved once per run, beside the detection it reads. The writable
-    // roots depend on the toolchain, and `select` probes the host, so neither
-    // belongs on a per-call path.
-    let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
-    // 0.48.0 — the run owns its proxy, and the containment carries the address so
-    // every spawn site scopes the sandbox to it without asking a second question.
-    let egress = start_egress_proxy(policy, containment.as_ref()).await;
-    let containment = match (&containment, &egress) {
-        (Some(c), Some((proxy, _, _))) => {
-            #[cfg(feature = "browser")]
-            browser.route_through(proxy.addr());
-            Some(std::sync::Arc::new(c.with_proxy(Some(proxy.addr()))))
-        }
-        _ => containment,
-    };
-    report_containment(
-        watch,
-        run_id,
-        0,
-        &contract.exec_sandbox,
-        containment.as_deref(),
-    );
     let mem_key = memory_key(root);
     // Images the agent looked at last step, carried into this one's request and
     // dropped once shown. A viewed image is a tool result, not a permanent part
