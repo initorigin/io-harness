@@ -21,6 +21,19 @@ use crate::policy::{Act, Effect, Policy, Verdict};
 // searching real build trees (open question in the 0.3.0 contract).
 const IGNORE_DIRS: &[&str] = &[".git", "target", "node_modules"];
 
+/// The largest file [`Workspace::read_bytes`] will pull into memory (0.74.0).
+///
+/// `read_bytes` is the one entry every document parser starts at — pdf, docx,
+/// xlsx, pptx, barcode all begin with the whole file as a `Vec<u8>` — and it had
+/// no ceiling, so a single oversized file in the workspace exhausted memory
+/// before any parser saw a byte, and an archive bomb got its input side for
+/// free. 64 MiB is the number because it is an order of magnitude above the
+/// largest office document a coding agent legitimately opens and an order of
+/// magnitude below what a host can lose to one allocation. A caller that
+/// genuinely needs more is not reading a document: it wants a shell command that
+/// streams.
+pub const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// A workspace rooted at one directory. All operations stay under `root`, and
 /// every path is additionally checked against a [`Policy`] before it is read or
 /// written — in this layer, not in the system prompt, so a model that ignores
@@ -421,31 +434,45 @@ impl Workspace {
     /// A symlink is checked by its own path *and* by its resolved target, so a
     /// link sitting inside an allowed directory but pointing at a denied file is
     /// refused — the target fails even though the link's own path passes.
+    ///
+    /// **A path that leaves the root is denied outright, whether or not it exists
+    /// yet (0.74.0).** Two holes made that untrue before. The escape test sat
+    /// inside `if let Ok(canon) = abs.canonicalize()`, which fails unless every
+    /// component already exists, so a file about to be *created* skipped the test
+    /// entirely — and the leaf of a write is exactly what usually does not exist.
+    /// Separately, a path [`Workspace::resolve`] refused fell through to grading
+    /// the lexical form alone, and that form collapsed a `..` instead of refusing
+    /// it, so `../../outside` graded as `outside` and came back
+    /// [`Effect::Allow`]. Containment is now decided by `contain_under_root`,
+    /// which resolves the deepest component that *does* exist; either escape is
+    /// [`Effect::Deny`] with no layer attributed, because no layer can permit it.
     pub fn check_path(&self, act: Act, rel: &str) -> Verdict {
-        let mut worst = self.policy.check(act, &normalize(rel));
+        // Anything `resolve` refuses is refused here too. Grading the lexical
+        // form of an escaping path grades a path that is not the one that would
+        // be opened, and the answer to a path with no in-workspace meaning is a
+        // refusal, not the verdict for some other path.
+        let (Ok(abs), Some(lexical)) = (self.resolve(rel), normalize(rel)) else {
+            return denied("<path escapes workspace root>");
+        };
+        let mut worst = self.policy.check(act, &lexical);
 
-        // The canonical form, when it differs and still lands inside the root.
-        if let Ok(abs) = self.resolve(rel) {
-            if let Ok(canon) = abs.canonicalize() {
-                let root_canon = self
-                    .root
-                    .canonicalize()
-                    .unwrap_or_else(|_| self.root.clone());
-                if let Ok(rel_canon) = canon.strip_prefix(&root_canon) {
-                    let rel_canon = rel_canon.to_string_lossy().replace('\\', "/");
-                    let v = self.policy.check(act, &rel_canon);
-                    if v.effect > worst.effect {
-                        worst = v;
-                    }
-                } else {
-                    // Resolves outside the root: a symlink escape, refused
-                    // regardless of what the policy says about the link itself.
-                    return Verdict {
-                        effect: Effect::Deny,
-                        rule: Some("<resolves outside workspace root>".into()),
-                        layer: None,
-                    };
-                }
+        // The contained form: the deepest existing ancestor canonicalized, with
+        // whatever does not exist yet joined back on. Grading it too is what
+        // judges a symlink by where it lands as well as by its own name, and it
+        // can only ever make the verdict stricter.
+        let (Ok(contained), Ok(root_real)) = (
+            contain_under_root(&self.root, &abs),
+            deepest_existing(&self.root),
+        ) else {
+            // Resolves outside the root: a symlink escape, refused regardless of
+            // what the policy says about the link itself.
+            return denied("<resolves outside workspace root>");
+        };
+        if let Ok(rel_canon) = contained.strip_prefix(&root_real) {
+            let rel_canon = rel_canon.to_string_lossy().replace('\\', "/");
+            let v = self.policy.check(act, &rel_canon);
+            if v.effect > worst.effect {
+                worst = v;
             }
         }
         worst
@@ -758,15 +785,82 @@ impl Workspace {
     /// The write happens in every case, [`Wrote::Unchanged`] included: this
     /// reports, it does not skip work, so nothing about the file's state depends
     /// on the comparison.
+    ///
+    /// The bytes go through one opener that on unix refuses to follow a symbolic
+    /// link at the final component, so the path the gate graded is the path that
+    /// receives the bytes.
     pub fn write_file(&self, rel: &str, content: &str) -> Result<Wrote> {
         let abs = self.resolve(rel)?;
         self.enforce(Act::Write, rel)?;
         let did = Wrote::classify(std::fs::read(&abs), content.as_bytes());
+        self.write_leaf(&abs, content.as_bytes())?;
+        Ok(did)
+    }
+
+    /// Write `content` to `abs`, refusing to follow a symlink at the leaf
+    /// (0.74.0).
+    ///
+    /// The gate canonicalizes to decide and the write used to open the
+    /// un-canonicalized path, which leaves a window: a live `shell_start` handle
+    /// looping on `ln -sfn /etc/cron.d/x src/a.rs` can replace a gated-allowed
+    /// file with a link to anywhere between the check and the write, and turn
+    /// write-inside-the-workspace into write-anywhere. Opening the leaf with
+    /// `O_NOFOLLOW` closes it: the descriptor written through is either the file
+    /// that was checked or nothing at all.
+    ///
+    /// A link that stays *inside* the root is still writable, because that is a
+    /// capability 0.73.0 had and nothing here is meant to remove: the open is
+    /// retried once against where the link points, and that destination goes
+    /// through [`contain_under_root`] before it is opened. So following a link
+    /// can only ever land where an ordinary write to its destination would have.
+    ///
+    /// **Windows** has no `O_NOFOLLOW` and no `OpenOptions` equivalent, so the
+    /// write there is an ordinary one and containment rests on
+    /// [`contain_under_root`] alone. The race this closes needs the attacker to
+    /// create a symbolic link, which on Windows needs
+    /// `SeCreateSymbolicLinkPrivilege` or developer mode — not something an
+    /// unprivileged agent has.
+    fn write_leaf(&self, abs: &Path, content: &[u8]) -> Result<()> {
         if let Some(parent) = abs.parent() {
+            // ponytail: the parent chain is checked, not held open. A directory
+            // swapped for a link between `contain_under_root` and here is still
+            // followed; closing that needs an `openat` walk from a root
+            // descriptor, which is the upgrade path if it ever matters.
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(abs, content)?;
-        Ok(did)
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            let open = |p: &Path| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(p)
+            };
+            let mut file = match open(abs) {
+                Ok(f) => f,
+                // `ELOOP` here means the leaf is a symlink and nothing else: the
+                // flag is the only reason this open can report it.
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                    let dest = std::fs::read_link(abs).map_err(Error::Io)?;
+                    let dest = match abs.parent() {
+                        Some(parent) if dest.is_relative() => parent.join(dest),
+                        _ => dest,
+                    };
+                    open(&contain_under_root(&self.root, &dest)?).map_err(Error::Io)?
+                }
+                Err(e) => return Err(Error::Io(e)),
+            };
+            file.write_all(content).map_err(Error::Io)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(abs, content).map_err(Error::Io)
+        }
     }
 
     /// Replace one exact occurrence of `search` with `replace` in a file under
@@ -837,7 +931,7 @@ impl Workspace {
         }
         let updated = current.replacen(search, replace, 1);
         let did = Wrote::classify(std::fs::read(&abs), updated.as_bytes());
-        std::fs::write(abs, updated)?;
+        self.write_leaf(&abs, updated.as_bytes())?;
         Ok(did)
     }
 
@@ -876,7 +970,7 @@ impl Workspace {
         let hunks = crate::diff::parse(patch)?;
         let updated = crate::diff::apply(&current, &hunks)?;
         let did = Wrote::classify(std::fs::read(&abs), updated.as_bytes());
-        std::fs::write(abs, updated)?;
+        self.write_leaf(&abs, updated.as_bytes())?;
         Ok(did)
     }
 
@@ -892,30 +986,52 @@ impl Workspace {
     /// is about to write; a byte read is always "parse this document", and
     /// handing a parser zero bytes turns "there is no such file" into "this file
     /// is corrupt", which is the wrong thing to tell the model.
+    ///
+    /// **A file over [`MAX_DOCUMENT_BYTES`] is refused rather than read
+    /// (0.74.0).** The size is asked for before any byte is, so a file far too
+    /// large costs one `stat` and not an allocation; the read is then capped as
+    /// well, because a path whose reported size is zero can still stream without
+    /// end — a character device or a `/proc` entry inside the root does exactly
+    /// that. Both limbs are the same limit, and refusing is the whole answer:
+    /// truncating a document and handing the front of it to a parser produces a
+    /// confident wrong reading of a file the model believes it has seen.
     pub fn read_bytes(&self, rel: &str) -> Result<Vec<u8>> {
+        use std::io::Read as _;
+
         let abs = self.resolve(rel)?;
         self.enforce(Act::Read, rel)?;
-        std::fs::read(abs).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => Error::Config(format!("no such file: {rel}")),
-            _ => Error::Io(e),
-        })
+        let len = std::fs::metadata(&abs)
+            .map_err(|e| read_error(rel, e))?
+            .len();
+        if len > MAX_DOCUMENT_BYTES {
+            return Err(too_large(rel, &format!("{len} bytes")));
+        }
+        let mut bytes = Vec::new();
+        std::fs::File::open(&abs)
+            .map_err(|e| read_error(rel, e))?
+            // One byte past the limit, so a file that reports one size and
+            // streams another is caught by the length of what actually arrived.
+            .take(MAX_DOCUMENT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| read_error(rel, e))?;
+        if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+            return Err(too_large(rel, "longer than the size it reports"));
+        }
+        Ok(bytes)
     }
 
     /// Write a file under the root as bytes, creating parent directories and
     /// reporting whether it changed anything.
     ///
     /// The byte twin of [`Workspace::write_file`], through the same policy gate
-    /// and with the same semantics: the write happens in every case,
-    /// [`Wrote::Unchanged`] included, so nothing about the file's state depends
-    /// on the comparison.
+    /// and the same symlink-refusing opener, with the same semantics: the write
+    /// happens in every case, [`Wrote::Unchanged`] included, so nothing about the
+    /// file's state depends on the comparison.
     pub fn write_bytes(&self, rel: &str, content: &[u8]) -> Result<Wrote> {
         let abs = self.resolve(rel)?;
         self.enforce(Act::Write, rel)?;
         let did = Wrote::classify(std::fs::read(&abs), content);
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(abs, content)?;
+        self.write_leaf(&abs, content)?;
         Ok(did)
     }
 
@@ -953,21 +1069,145 @@ fn escape(rel: &str) -> Error {
     Error::Config(format!("path escapes workspace: {rel}"))
 }
 
+/// The refusal a path that leaves the root gets: what it was, why, and the one
+/// thing that would work instead.
+fn outside_root(path: &Path, root: &Path) -> Error {
+    Error::Config(format!(
+        "{} is outside the workspace root {}, so nothing was opened — a `..` or a symbolic link \
+         in that path leaves the workspace root. Name a path inside it instead",
+        path.display(),
+        root.display()
+    ))
+}
+
+/// The refusal for a document read over [`MAX_DOCUMENT_BYTES`].
+fn too_large(rel: &str, size: &str) -> Error {
+    Error::Config(format!(
+        "{rel} is {size}, over the {MAX_DOCUMENT_BYTES}-byte limit on one document read, so \
+         nothing was read. Read the part you need with a command that streams, or point this at \
+         a smaller file"
+    ))
+}
+
+/// A byte read's io failure, with a missing file named as such rather than as an
+/// operating-system error the model has to decode.
+fn read_error(rel: &str, e: std::io::Error) -> Error {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => Error::Config(format!("no such file: {rel}")),
+        _ => Error::Io(e),
+    }
+}
+
+/// A refusal no layer wrote and no layer can override: the path is not a path in
+/// this workspace at all.
+fn denied(rule: &str) -> Verdict {
+    Verdict {
+        effect: Effect::Deny,
+        rule: Some(rule.into()),
+        layer: None,
+    }
+}
+
+/// Resolve `path` under `root` so the result cannot name a file outside the
+/// canonical root — whether or not that file exists yet (0.74.0).
+///
+/// `canonicalize` alone cannot decide this. It fails unless every component
+/// already exists, so a path whose leaf is about to be *created* skipped the
+/// check entirely, and the leaf of a write is exactly what usually does not
+/// exist: `~/.bashrc`, `authorized_keys`, `.config/autostart/*` and
+/// `.git/hooks/*` are all absent until something writes them. This resolves the
+/// deepest component that *does* exist, canonicalizes that, requires it under
+/// the canonical root, and joins back the components that do not exist yet.
+///
+/// `path` is joined onto the root when it is relative and taken as given when it
+/// is absolute; an absolute path outside the root is refused like any other
+/// escape. A `..` is resolved by canonicalizing the existing prefix, so it
+/// cannot climb out; a `..` among the components that do not exist is refused
+/// rather than collapsed, because there is nothing on disk to resolve it against
+/// and collapsing it lexically is the bug this exists to remove.
+///
+/// What a caller may rely on:
+/// - the returned path starts with the canonical root, component by component;
+/// - no symbolic link is followed *out* of the root at any depth, because the
+///   whole existing prefix is canonical;
+/// - a link that stays inside the root still resolves and is still usable;
+/// - a root that does not exist yet is resolved the same way, so a workspace
+///   whose directory is about to be created behaves as it did before this check.
+///
+/// What it does not promise: that the returned path contains no symbolic link at
+/// all. The leaf may still be one pointing inside the root, and a component
+/// created after this returns is outside its knowledge. A writer that needs the
+/// checked path to be the written path opens the leaf with `O_NOFOLLOW` — see
+/// [`Workspace::write_leaf`].
+///
+/// The error is an [`Error::Config`] naming the path, the root, and what to
+/// write instead.
+pub(crate) fn contain_under_root(root: &Path, path: &Path) -> Result<PathBuf> {
+    let root_real = deepest_existing(root).map_err(|_| outside_root(path, root))?;
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root_real.join(path)
+    };
+    let target = deepest_existing(&joined).map_err(|_| outside_root(path, root))?;
+    if !target.starts_with(&root_real) {
+        return Err(outside_root(path, root));
+    }
+    Ok(target)
+}
+
+/// The deepest ancestor of `path` that exists, canonicalized, with the
+/// components that do not exist joined back on.
+///
+/// Only a "not found" stops the walk. Any other failure — a component that is a
+/// file rather than a directory, a link that loops, a directory that cannot be
+/// searched — is refused rather than walked past, because a component this
+/// cannot read is a component whose target it cannot vouch for.
+fn deepest_existing(path: &Path) -> Result<PathBuf> {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut at = path;
+    loop {
+        match at.canonicalize() {
+            Ok(canon) => {
+                let mut out = canon;
+                out.extend(tail.iter().rev().copied());
+                return Ok(out);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(escape(&path.to_string_lossy())),
+        }
+        // `file_name` is `None` for `..`, for `.` and for a bare root. None of
+        // those can be resolved without a directory on disk to resolve them
+        // against, and guessing is what let `../../outside` through.
+        let (Some(name), Some(parent)) = (at.file_name(), at.parent()) else {
+            return Err(escape(&path.to_string_lossy()));
+        };
+        tail.push(name);
+        at = parent;
+    }
+}
+
 /// A model-supplied path in the `/`-separated, `.`-free form policy globs match
 /// against, so `./src/a.rs` and `src/a.rs` are the same target to a rule.
-fn normalize(rel: &str) -> String {
+///
+/// `None` when the path climbs above its own start. That used to be a silent
+/// `Vec::pop` on an empty vector — a no-op — so `../../outside` normalized to
+/// `outside` and was graded as though it named a file in the workspace. A path
+/// with no in-workspace form has no verdict to give, and the caller's only
+/// correct answer to one is a refusal.
+fn normalize(rel: &str) -> Option<String> {
     let s = rel.replace('\\', "/");
     let mut out: Vec<&str> = Vec::new();
     for part in s.split('/') {
         match part {
             "" | "." => {}
             ".." => {
-                out.pop();
+                out.pop()?;
             }
             p => out.push(p),
         }
     }
-    out.join("/")
+    Some(out.join("/"))
 }
 
 /// Compile a glob (`*` any run including `/`, `?` one char) to a regex.
