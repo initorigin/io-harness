@@ -2614,6 +2614,95 @@ pub async fn resume_with_recovery_observed<P: Provider>(
     .await
 }
 
+/// The act a resumed approval replays, or `None` for a pending row this path
+/// cannot replay (0.74.0).
+///
+/// The words are the ones `run::gate` persisted, asked for through `act_word`
+/// rather than re-spelled here, so the writer and the reader of the column
+/// cannot drift apart. Only the two filesystem acts have an effect to
+/// replay: `exec` and `net` are claimed by the arm above this one's caller, which
+/// grants what was approved and lets the model re-issue the call.
+///
+/// Before this, the column was read as "`read`, or else write". Everything that
+/// was not the word `read` became [`Act::Write`] on a target that may be a
+/// program name or a host — checked against the *path* policy, so `deny_exec` was
+/// never consulted, and then created as a file at that name while the command
+/// itself never ran. [`Store::put_pending`](crate::Store::put_pending) is public,
+/// so the column can hold a word this crate never wrote, and a fifth [`Act`]
+/// would have inherited the same arm. Refusing is the fail-closed answer: an
+/// approval that cannot be replayed is not an approval to perform something else.
+fn replayable_act(kind: &str) -> Option<Act> {
+    let act = [Act::Read, Act::Write, Act::Exec, Act::Net]
+        .into_iter()
+        .find(|act| act_word(*act) == kind)?;
+    // Total over `Act`, so a fifth one has to be answered for here rather than
+    // inheriting the write.
+    match act {
+        Act::Read | Act::Write => Some(act),
+        // Reaching this means the guard arm above the caller was removed, and a
+        // file named after a program or a host is exactly what it prevents.
+        Act::Exec | Act::Net => None,
+    }
+}
+
+/// Refuse a resume whose persisted act this path cannot replay, recording it
+/// (0.74.0).
+///
+/// A refusal row rather than a decision row, and the pending is deliberately left
+/// unresolved: nothing was performed, so nothing was decided, and a row this
+/// crate did not write is not one to spend a caller's approval on. The message
+/// names the target, why it could not be replayed, and what to do instead.
+fn unreplayable(
+    store: &Store,
+    watch: &Watch<'_>,
+    run_id: i64,
+    event_run_id: i64,
+    step: u32,
+    pending: &crate::state::Pending,
+) -> Error {
+    let ev = PolicyEvent::refusal(step, &pending.act, &pending.target);
+    if let Err(e) = store.record_event(event_run_id, &ev) {
+        return e;
+    }
+    refused(watch, run_id, 0, &ev);
+    Error::Refused {
+        act: pending.act.clone(),
+        target: format!(
+            "{} — the approval was persisted as the act \"{}\", which a resume has no \
+             way to replay, so nothing was performed. Deny the request and let the run \
+             re-issue the action.",
+            pending.target, pending.act
+        ),
+        rule: None,
+        layer: None,
+    }
+}
+
+/// Refuse a resumed `exec` or `net` approval that carries a rewrite (0.74.0).
+///
+/// That arm grants what was *persisted* and the model re-issues the call itself,
+/// so a rewritten target has nowhere to take effect. Applying it would grant one
+/// program and run another; dropping it silently would overrule an approver that
+/// meant to narrow the grant without ever telling it. Neither is honest, so the
+/// resume refuses and the pending stays open for a decision that can be carried
+/// out.
+fn unreplayable_rewrite(pending: &crate::state::Pending, rewrite: &Request) -> Error {
+    Error::Refused {
+        act: pending.act.clone(),
+        target: format!(
+            "{} — the approval rewrote it to {} ({}), and a resumed {} approval grants \
+             exactly what was persisted, so nothing was performed. Approve it as asked, \
+             or deny it and let the run re-issue the action.",
+            pending.target,
+            rewrite.target,
+            act_word(rewrite.act),
+            pending.act
+        ),
+        rule: None,
+        layer: None,
+    }
+}
+
 /// Continue a run that stopped at [`RunOutcome::AwaitingApproval`], once a
 /// human has decided about the pending action.
 ///
@@ -2622,6 +2711,22 @@ pub async fn resume_with_recovery_observed<P: Provider>(
 /// its original `run_id`. The decision is re-checked against the policy first,
 /// so a deny that landed after the pause still holds. A denial closes the run
 /// without performing the action.
+///
+/// *Exactly* is the whole claim, so a resume that cannot honour it refuses
+/// instead of approximating it (0.74.0), leaving the request pending and
+/// performing nothing:
+///
+/// - A pending row whose `act` is not one of the four this crate writes — the
+///   column is reachable through the public
+///   [`Store::put_pending`](crate::Store::put_pending) — is
+///   [`Error::Refused`](crate::Error::Refused). It is not replayed as a write at
+///   the target's name.
+/// - A `modified` request on a pending `exec` or `net` is
+///   [`Error::Refused`](crate::Error::Refused) too. Those two are resumed by
+///   *granting* what was approved and letting the model re-issue the call, so a
+///   rewritten target has nowhere to take effect; an approver is told rather than
+///   left believing a narrowing applied. Rewriting a pending `read` or `write`
+///   works as before.
 ///
 /// Preserves the policy — it is an argument — and, since 0.13.0, the run's
 /// observation ledger. It is for a run that *paused*, though: a run that crashed
@@ -2820,7 +2925,18 @@ pub async fn resume_with_decision_observed<P: Provider>(
         // The grant matters for the same reason it does for a host: without it
         // the model re-issues the call and the approver is asked a second time
         // for what they have just allowed.
-        Decision::Approve { ref remember, .. } if pending.act == "net" || pending.act == "exec" => {
+        Decision::Approve {
+            ref modified,
+            ref remember,
+        } if pending.act == "net" || pending.act == "exec" => {
+            // 0.74.0 — a rewrite has no consumer on this path. See
+            // `unreplayable_rewrite`.
+            if let Some(rewrite) = modified
+                .as_ref()
+                .filter(|m| m.target != pending.target || act_word(m.act) != pending.act)
+            {
+                return Err(unreplayable_rewrite(&pending, rewrite));
+            }
             let granted = if pending.act == "net" {
                 net::provider_layer(&pending.target)
             } else {
@@ -2889,11 +3005,12 @@ pub async fn resume_with_decision_observed<P: Provider>(
             }
             let ws = Workspace::with_policy(&root, effective.clone());
 
-            // The pause does not grant immunity: the policy still decides.
-            let act = if pending.act == "read" {
-                Act::Read
-            } else {
-                Act::Write
+            // The pause does not grant immunity: the policy still decides — and
+            // what it decides about is the act that was persisted, not whatever a
+            // filesystem check happens to accept. An act with no replay here is
+            // refused before anything is claimed or written.
+            let Some(act) = replayable_act(&pending.act) else {
+                return Err(unreplayable(store, watch, run_id, run_id, step, &pending));
             };
             let recheck = ws.check_path(act, &target);
             if recheck.effect == Effect::Deny {
@@ -2970,6 +3087,11 @@ pub async fn resume_with_decision_observed<P: Provider>(
 /// [`resume_tree`] does: the root replays its (deliberately uncommitted) pause
 /// step, re-adopts the paused child, and the child continues past the
 /// now-applied action. A denial stops the tree.
+///
+/// It refuses the same two resumes [`resume_with_decision`] refuses — a pending
+/// act with no replay, and a `modified` request on a pending `exec` or `net` —
+/// for the same reasons and with the same effect: nothing performed, the request
+/// still pending, [`Error::Refused`](crate::Error::Refused) returned.
 ///
 /// The trap this exists to avoid: the `run_id` you pass is the tree's **root**,
 /// while `pending.run_id` is whichever agent actually asked — often three levels
@@ -3173,7 +3295,18 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
         // there. `exec` joined `net` in 0.70.0 and for the same reason: a spawn
         // or a git built-in paused for approval must not come back as an empty
         // file named after the program.
-        Decision::Approve { ref remember, .. } if pending.act == "net" || pending.act == "exec" => {
+        Decision::Approve {
+            ref modified,
+            ref remember,
+        } if pending.act == "net" || pending.act == "exec" => {
+            // 0.74.0 — as in `resume_with_decision`: a rewrite has no consumer on
+            // this path. See `unreplayable_rewrite`.
+            if let Some(rewrite) = modified
+                .as_ref()
+                .filter(|m| m.target != pending.target || act_word(m.act) != pending.act)
+            {
+                return Err(unreplayable_rewrite(&pending, rewrite));
+            }
             let granted = if pending.act == "net" {
                 net::provider_layer(&pending.target)
             } else {
@@ -3252,10 +3385,17 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             // this one performed action. Tighten if child-specific deny of an
             // approved action becomes a requirement.
             let ws = Workspace::with_policy(&root, policy.clone());
-            let act = if pending.act == "read" {
-                Act::Read
-            } else {
-                Act::Write
+            // 0.74.0 — the same total read of the persisted act the flat form
+            // takes; a fix in one form and not the other is no fix.
+            let Some(act) = replayable_act(&pending.act) else {
+                return Err(unreplayable(
+                    store,
+                    watch,
+                    run_id,
+                    pending.run_id,
+                    step,
+                    &pending,
+                ));
             };
             if ws.check_path(act, &target).effect == Effect::Deny {
                 store.resolve_pending(request_id, "deny")?;
