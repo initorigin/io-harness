@@ -124,6 +124,18 @@ turn — which is why `memory.max_entries` was a knob nobody could raise.
   `memory.max_entries` is now a number an operator can raise. See
   `docs/MEASUREMENTS.md` for the before and after.
 
+### Fixed
+
+- The containment probe added in 0.74.0 no longer re-measures a boundary this
+  process has already proven for the same configuration, and can no longer
+  *un*-prove one. Its arms spawn short-lived children, and under load an arm that
+  fails left the run reporting that it could not establish confinement — which
+  changes a sentence in the system prompt, and the system prompt is the cached
+  prefix. A host that failed one probe therefore paid a cache *write* on every
+  turn after it, invisibly. The result is now kept per backend, config, writable
+  roots and proxy; a configuration that differs anywhere is measured for itself,
+  and a probe that reached no conclusion is retried rather than remembered.
+
 ### Security
 
 - `[routing]` is refused in a file inside the workspace, `io.toml` and

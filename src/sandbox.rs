@@ -1355,6 +1355,68 @@ impl BoundaryProbe {
         writable_roots: &[PathBuf],
         proxy: Option<std::net::SocketAddr>,
     ) -> Self {
+        let backend = select(config).backend();
+        // (0.75.0) A boundary this process has already proven for this exact
+        // configuration is not re-proven, and — the reason this exists — cannot be
+        // *un*-proven by a transient failure.
+        //
+        // 0.74.0 left this as its own open question and said a result keyed on the
+        // backend and its configuration "may be defensible". What settled it is
+        // that the probe's outcome reaches the model: the boundary section of the
+        // system prompt says either that commands are contained or that this run
+        // could not establish it, and those two sentences differ by about 130
+        // characters. So a probe that flaps rewrites the system block — which is
+        // the crate's own cached prefix (0.38.0). A host that fails one probe
+        // under load therefore pays a cache *write* on every subsequent turn, and
+        // 0.75.0's whole subject is making that cost visible. It was found by the
+        // determinism tests, which diverged on exactly that 130-character
+        // difference.
+        //
+        // The key is the whole configuration, not just the backend, because a
+        // cached result that outlives a configuration change is the thing 0.74.0
+        // ruled out. `writable_roots` and `proxy` are in it for the same reason
+        // they are arguments: both change the rung a backend picks.
+        let key = format!("{backend:?}|{config:?}|{writable_roots:?}|{proxy:?}");
+        if let Some(proven) = Self::proven()
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&key).cloned())
+        {
+            return proven;
+        }
+        // An arm that could not run is an absence of evidence, and this release
+        // learned what that absence costs: it is reported to the model as "this
+        // run could not establish that a write outside the boundary is refused",
+        // a sentence 130 characters longer than the one it replaces, in the block
+        // this crate caches. A spawn that lost a race under load is not a finding
+        // about the host, so it is attempted once more before it becomes one.
+        //
+        // Bounded at two on purpose. A host where the probe genuinely cannot run —
+        // no `curl`, a backend that refuses — must still reach an answer quickly
+        // and honestly, and retrying forever would turn an unmeasurable boundary
+        // into a hang.
+        let mut probe = Self::measure_once(config, writable_roots, proxy).await;
+        if probe.write_refused.is_none() || probe.dial_refused.is_none() {
+            probe = Self::measure_once(config, writable_roots, proxy).await;
+        }
+        // Only a probe that reached a conclusion on both arms is kept. Caching an
+        // absence would freeze a boundary as unproven for the life of the process
+        // on the strength of one bad moment — the opposite of the fix.
+        if probe.write_refused.is_some() && probe.dial_refused.is_some() {
+            if let Ok(mut proven) = Self::proven().lock() {
+                proven.insert(key, probe.clone());
+            }
+        }
+        probe
+    }
+
+    /// One attempt at the measurement [`measure`](BoundaryProbe::measure) caches
+    /// and retries. Everything in the doc above describes this.
+    async fn measure_once(
+        config: &SandboxConfig,
+        writable_roots: &[PathBuf],
+        proxy: Option<std::net::SocketAddr>,
+    ) -> Self {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
@@ -1504,6 +1566,19 @@ impl BoundaryProbe {
             );
         }
         probe
+    }
+
+    /// Probe results this process has already established, keyed by the whole
+    /// configuration they were measured under (0.75.0).
+    ///
+    /// A `Mutex` rather than an `RwLock` because it is touched once per run at
+    /// most, and unbounded because the key space is the set of distinct sandbox
+    /// configurations a process uses — a handful, not a function of the workload.
+    fn proven() -> &'static std::sync::Mutex<std::collections::HashMap<String, BoundaryProbe>> {
+        static PROVEN: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, BoundaryProbe>>,
+        > = std::sync::OnceLock::new();
+        PROVEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
     }
 
     /// Were this run's writes confined, as measured?
@@ -3071,5 +3146,97 @@ mod tests {
             !dst.path().join("secret.txt").exists(),
             "denied file must not be copied back"
         );
+    }
+
+    /// 0.75.0 — a boundary this process has proven is not re-probed, and cannot be
+    /// un-proven by a later failure.
+    ///
+    /// Asserted structurally rather than on a clock: a sentinel result is placed
+    /// under the key `measure` computes, and `measure` must hand that sentinel
+    /// back. A real probe could never produce it, so getting it is proof the read
+    /// path was taken. `Backend::PortableFloor` with `write_refused: Some(true)`
+    /// is the sentinel precisely because no real probe of a contained config
+    /// yields that pair on this host.
+    ///
+    /// The property this protects is not speed. The probe's outcome reaches the
+    /// model — the boundary section of the system prompt says either that commands
+    /// are contained or that this run could not establish it — so a probe that
+    /// flaps rewrites the system block, which is the crate's own cached prefix.
+    #[tokio::test]
+    async fn a_proven_boundary_is_not_re_probed() {
+        let config = SandboxConfig {
+            mode: ExecMode::WorkspaceWrite,
+            ..SandboxConfig::new()
+        };
+        let roots: Vec<PathBuf> = Vec::new();
+        let backend = select(&config).backend();
+        let key = format!(
+            "{backend:?}|{config:?}|{roots:?}|{:?}",
+            None::<std::net::SocketAddr>
+        );
+
+        let sentinel = BoundaryProbe {
+            backend: Backend::PortableFloor,
+            write_refused: Some(true),
+            dial_refused: Some(true),
+            claimed_confinement: true,
+            claimed_egress_denial: true,
+        };
+        BoundaryProbe::proven()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), sentinel.clone());
+
+        let measured = BoundaryProbe::measure(&config, &roots, None).await;
+        assert_eq!(
+            measured, sentinel,
+            "a configuration already proven must be answered from what was proven, \
+             not measured again"
+        );
+
+        // Leave no sentinel behind for another test in this process.
+        BoundaryProbe::proven().lock().unwrap().remove(&key);
+    }
+
+    /// 0.75.0 — and the key is the whole configuration, so a different one is not
+    /// served another's answer. `docs/CONTRACT.md` for 0.74.0 ruled out "a cached
+    /// result that outlives a configuration change"; this is that rule.
+    #[tokio::test]
+    async fn a_different_configuration_is_not_served_a_proven_answer() {
+        let proven_for = SandboxConfig {
+            mode: ExecMode::WorkspaceWrite,
+            allow_network: false,
+            ..SandboxConfig::new()
+        };
+        let asked_about = SandboxConfig {
+            allow_network: true,
+            ..proven_for.clone()
+        };
+        let roots: Vec<PathBuf> = Vec::new();
+        let backend = select(&proven_for).backend();
+        let key = format!(
+            "{backend:?}|{proven_for:?}|{roots:?}|{:?}",
+            None::<std::net::SocketAddr>
+        );
+
+        let sentinel = BoundaryProbe {
+            backend: Backend::PortableFloor,
+            write_refused: Some(true),
+            dial_refused: Some(true),
+            claimed_confinement: true,
+            claimed_egress_denial: true,
+        };
+        BoundaryProbe::proven()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), sentinel.clone());
+
+        let measured = BoundaryProbe::measure(&asked_about, &roots, None).await;
+        assert_ne!(
+            measured, sentinel,
+            "a config that differs anywhere must be measured for itself"
+        );
+
+        BoundaryProbe::proven().lock().unwrap().remove(&key);
     }
 }
