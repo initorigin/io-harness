@@ -375,14 +375,41 @@ async fn dropping_a_run_mid_batch_leaves_nothing_running() {
         call("endless_2"),
     ]]);
 
-    let ran = tokio::time::timeout(
-        Duration::from_millis(100),
-        run_with(&contract, &script, &store, &open_policy(), &ApproveAll),
-    )
-    .await;
-    assert!(ran.is_err(), "the batch cannot finish, so the run cannot");
-    // The run future — and with it the `JoinSet` holding the batch — is dropped
-    // here, at the end of the `timeout`, while every call is still sleeping.
+    // Drive the run until the batch has actually entered, then stop driving it.
+    //
+    // This used to be `timeout(100ms)`, which guessed that 100 ms was enough for
+    // a run to compose its prompt, answer, and reach a tool. On a loaded runner it
+    // is not, and the failure was `entered == 0` below — the test proving nothing
+    // and saying so. The clock was never the property under test: it only existed
+    // to interrupt the run mid-batch. So wait for the event itself, which cannot
+    // be too slow, and keep a bound so a genuine hang still fails rather than
+    // hanging the suite.
+    //
+    // The drop must still land inside `Endless`'s own 400 ms sleep, which a 5 ms
+    // poll comfortably does.
+    // `Box::pin` rather than `tokio::pin!`: the latter yields a `Pin<&mut _>`, and
+    // dropping that drops the borrow rather than the future — the `JoinSet` would
+    // outlive it and the test would prove nothing.
+    let policy = open_policy();
+    let mut running = Box::pin(run_with(&contract, &script, &store, &policy, &ApproveAll));
+    let mut ticks = 0;
+    loop {
+        tokio::select! {
+            finished = &mut running => {
+                panic!("the batch cannot finish, so the run cannot: {finished:?}");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                if entered.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                ticks += 1;
+                assert!(ticks < 2_000, "the batch never entered a tool at all");
+            }
+        }
+    }
+    // The run future — and with it the `JoinSet` holding the batch — goes away
+    // here, while every call is still sleeping.
+    drop(running);
     let steps_at_drop = store
         .last_run()
         .unwrap()
@@ -845,4 +872,220 @@ fn a_tool_that_says_nothing_is_mutating() {
         }
     }
     assert_eq!(Quiet.effect(), ToolEffect::Mutating);
+}
+
+// ---------------------------------------------------------------- F12 (0.75.0)
+
+/// Whether this machine can run the git half of this file at all.
+fn have_git() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+fn call_with(name: &str, arguments: serde_json::Value) -> ToolCall {
+    ToolCall {
+        name: name.into(),
+        arguments,
+    }
+}
+
+/// A workspace that is also a repository: one commit, one tracked file, and
+/// `b.txt` left untracked so `git status` has something to say.
+fn git_ws() -> tempfile::TempDir {
+    let dir = ws();
+    std::fs::write(dir.path().join("a.txt"), "ALPHA").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "BRAVO").unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git is on PATH");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "--initial-branch=main"]);
+    git(&["config", "user.email", "t@example.invalid"]);
+    git(&["config", "user.name", "test"]);
+    git(&["add", "a.txt"]);
+    git(&["commit", "-m", "first"]);
+    dir
+}
+
+/// F12 — `list_dir` and a git reader are batched beside the reads that were
+/// already batched, and every result still lands under its own call.
+///
+/// The completion mixes a call that has been in the overlappable set since
+/// 0.41.0 with the two that join it in 0.75.0, and the same completion is served
+/// twice. Both halves are deliberate: a widening defect shows up where the two
+/// kinds meet, and a batched result that outlives the step it was prepared in
+/// shows up on the second call rather than the first.
+///
+/// The order assertion is the one that matters. Three calls that run at the same
+/// time have no order of their own, and what the run records is the order the
+/// model asked for them — a claim only a completion whose calls finish out of
+/// order has anything to be wrong about.
+#[tokio::test]
+async fn f12_a_list_dir_and_a_git_reader_are_batched_beside_a_read_and_land_in_call_order() {
+    if !have_git() {
+        return;
+    }
+    let dir = git_ws();
+    let store = Store::memory().unwrap();
+    let round = || {
+        vec![
+            call_with("read_file", json!({ "path": "a.txt" })),
+            call_with("list_dir", json!({ "path": "" })),
+            call_with("git_status", json!({})),
+        ]
+    };
+    let script = MockScript::new(vec![round(), round()]);
+
+    tokio::time::timeout(
+        MUST_FINISH,
+        run_with(
+            &never_passes(dir.path(), 2),
+            &script,
+            &store,
+            &open_policy(),
+            &ApproveAll,
+        ),
+    )
+    .await
+    .expect("a batch holding a read, a listing and a git reader must complete")
+    .expect("the run itself must not error");
+
+    let run_id = store.last_run().unwrap().unwrap();
+    let landed: Vec<&str> = store
+        .observations(run_id)
+        .unwrap()
+        .iter()
+        .filter_map(|o| {
+            [
+                ("[read a.txt]", "read"),
+                ("[list_dir ]", "list"),
+                ("[git_status]", "git"),
+            ]
+            .into_iter()
+            .find(|(marker, _)| o.text.contains(marker))
+            .map(|(_, tag)| tag)
+        })
+        .collect();
+    assert_eq!(
+        landed,
+        vec!["read", "list", "git", "read", "list", "git"],
+        "every call in both batches must land, under its own call and in the order the model \
+         asked; got {landed:?}"
+    );
+
+    let git_obs: Vec<String> = store
+        .observations(run_id)
+        .unwrap()
+        .into_iter()
+        .map(|o| o.text)
+        .filter(|t| t.contains("[git_status"))
+        .collect();
+    assert_eq!(git_obs.len(), 2, "both git readers must land: {git_obs:?}");
+    for text in &git_obs {
+        assert!(
+            text.contains("b.txt") && !text.contains("failed"),
+            "the git reader really ran and saw the untracked file: {text}"
+        );
+    }
+}
+
+/// F12 — a widened tool answers identically whether it ran alone or in a batch.
+///
+/// This is not a restatement of
+/// `a_batched_run_and_a_serial_run_leave_identical_traces_every_time`: that case
+/// contains only the three tools that were already read-only, and the two paths
+/// share their code for those. `list_dir` and the git readers are the ones where
+/// they do **not** — `dispatch` still carries its own body for a lone call, and
+/// `ReadWork` carries the one the batch and the speculative paths run. Two copies
+/// of an observation string drift, and nothing else in the suite would notice.
+///
+/// A cap of 1 is `dispatch`'s copy and a cap of 10 is `ReadWork`'s, which is what
+/// makes this a comparison of the two implementations rather than of two runs.
+#[tokio::test]
+async fn f12_a_widened_tool_answers_the_same_alone_as_it_does_in_a_batch() {
+    if !have_git() {
+        eprintln!("skipped: git is not on PATH");
+        return;
+    }
+    let dir = git_ws();
+    let path = dir.path().join("recording.json");
+
+    let calls = vec![
+        call_with("read_file", json!({ "path": "a.txt" })),
+        call_with("list_dir", json!({ "path": "." })),
+        call_with("git_status", json!({})),
+        call_with("git_diff", json!({})),
+    ];
+
+    let recorder = io_harness::provider::Record::new(MockScript::new(vec![calls]));
+    run_with(
+        &never_passes(dir.path(), 1),
+        &recorder,
+        &Store::memory().unwrap(),
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .expect("the recording run must succeed");
+    recorder.save(&path).unwrap();
+
+    let batched = drive_in(
+        dir.path(),
+        &io_harness::provider::Replay::load(&path).unwrap(),
+        10,
+    )
+    .await;
+    let serial = drive_in(
+        dir.path(),
+        &io_harness::provider::Replay::load(&path).unwrap(),
+        1,
+    )
+    .await;
+
+    assert_eq!(
+        batched.2, serial.2,
+        "a `list_dir` and a git reader must leave the same observations whether \
+         they ran alone through `dispatch` or together through `ReadWork`"
+    );
+    assert_eq!(batched.0, serial.0);
+    assert_eq!(batched.1, serial.1);
+
+    // And the observations must actually contain the widened tools' output, or
+    // the comparison above is between two empty vectors.
+    let text: String = batched.2.iter().map(|o| o.text.clone()).collect();
+    assert!(
+        text.contains("a.txt") && text.contains("b.txt"),
+        "the case must really have listed and reported: {text}"
+    );
+}
+
+/// [`drive`] without the seeding, for a workspace whose contents are the case.
+///
+/// `drive` writes `READS` into the root on every call, which is right for the
+/// mixed case it was written for and wrong for a git repository: the recording
+/// would be made against one tree and replayed against another, and `Replay`
+/// keys on the request's content, so the replay would fail rather than diverge
+/// quietly.
+async fn drive_in(root: &std::path::Path, provider: &impl Provider, cap: usize) -> Trace {
+    let contract = never_passes(root, 1).with_max_parallel_reads(cap);
+    let store = Store::memory().unwrap();
+    let result = run_with(&contract, provider, &store, &open_policy(), &ApproveAll)
+        .await
+        .expect("the recorded case must replay");
+    let id = result.run_id;
+    (
+        result.outcome,
+        store.steps(id).unwrap(),
+        store.observations(id).unwrap(),
+        store.edits(id).unwrap(),
+        store.spent_tokens(id).unwrap(),
+    )
 }

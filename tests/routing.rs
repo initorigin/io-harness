@@ -324,3 +324,290 @@ async fn a_provider_that_never_overrides_reachable_behaves_as_it_did_in_0_33_0()
         "the defaulted `reachable` is `Ok(true)`, so the run starts"
     );
 }
+
+// -------------------------------------------------- the mechanical call (0.75.0)
+
+/// `Routing::mechanical` — the one completion this crate makes on its own behalf.
+///
+/// The fold's summary is issued with no model at all, so it lands on whatever the
+/// provider was constructed with: the model chosen to do the work, paid the work
+/// rate to compress a transcript. `apply_routing` never reaches it — it is called
+/// once, from the flat workspace loop, against the *step's* request.
+///
+/// Every assertion here is against the model the summarising request carried,
+/// identified by its own system prompt. Asserting on the event would not
+/// discriminate: a rule that announces a route and sends the old model is exactly
+/// the failure this file was written to catch.
+///
+/// **One call, not three.** The other two "mechanical calls" the roadmap named do
+/// not exist as completions — the plan classification reads the turn's own first
+/// response and the duplicate-memory check is local token overlap — so there is
+/// nothing to route and no test that could assert one.
+mod mechanical {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
+    use io_harness::{
+        ApproveAll, Compaction, ContextBudget, Policy, Provider, Routing, Session, Store,
+        TaskContract, Verification,
+    };
+    use serde_json::json;
+
+    /// The phrase the summarising system prompt carries and no other request does.
+    const SUMMARISER: &str = "compacting an agent's own working notes";
+
+    /// `(was it the summariser, what model did it carry)` per request. Named
+    /// because written out it trips `clippy::type_complexity` under `-D warnings`.
+    type Seen = Arc<Mutex<Vec<(bool, Option<String>)>>>;
+
+    /// Records `(is_summarising, model)` for every outbound request.
+    struct Recorder {
+        steps: Vec<Vec<ToolCall>>,
+        at: AtomicUsize,
+        seen: Seen,
+    }
+
+    impl Recorder {
+        fn new(steps: Vec<Vec<ToolCall>>) -> Self {
+            Self {
+                steps,
+                at: AtomicUsize::new(0),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// The model each summarising request carried, in order.
+        fn summarising(&self) -> Vec<Option<String>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(summarising, _)| *summarising)
+                .map(|(_, model)| model.clone())
+                .collect()
+        }
+
+        /// The model each ordinary working request carried, in order.
+        fn working(&self) -> Vec<Option<String>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(summarising, _)| !summarising)
+                .map(|(_, model)| model.clone())
+                .collect()
+        }
+    }
+
+    impl Provider for Recorder {
+        async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+            let summarising = req.system.contains(SUMMARISER);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((summarising, req.model.clone()));
+            let usage = Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+                ..Default::default()
+            });
+            if summarising {
+                return Ok(CompletionResponse {
+                    text: Some("the thread so far was about the parser.".into()),
+                    usage,
+                    ..Default::default()
+                });
+            }
+            let i = self.at.fetch_add(1, Ordering::SeqCst);
+            match self.steps.get(i) {
+                Some(calls) => Ok(CompletionResponse {
+                    tool_calls: calls.clone(),
+                    usage,
+                    ..Default::default()
+                }),
+                None => Ok(CompletionResponse {
+                    text: Some("nothing further".into()),
+                    usage,
+                    ..Default::default()
+                }),
+            }
+        }
+    }
+
+    fn open_policy() -> Policy {
+        Policy::default()
+            .layer("test")
+            .allow_read("*")
+            .allow_write("*")
+    }
+
+    fn workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "one short line\n").unwrap();
+        dir
+    }
+
+    /// Six conversational turns, so the measured turn's seed is deep enough that
+    /// a requested fold has something to fold.
+    async fn converse(session: &mut Session, store: &Store, policy: &Policy) {
+        for i in 0..6 {
+            let recorder = Recorder::new(Vec::new());
+            session
+                .turn(
+                    &format!("and then what happened at stage {i}?"),
+                    &recorder,
+                    store,
+                    policy,
+                    &ApproveAll,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The measured turn. `fold_now` forces exactly one summary; the threshold is
+    /// left far out of reach so any fold here is one that was asked for.
+    fn measured(root: &std::path::Path, routing: Option<Routing>) -> TaskContract {
+        let contract = TaskContract::workspace("summarise and continue", root)
+            .with_verification(Verification::WorkspaceFileContains {
+                file: "unreachable.txt".into(),
+                needle: "never".into(),
+            })
+            .with_max_steps(1)
+            .with_context_budget(ContextBudget::default())
+            .with_compaction(Compaction {
+                at_share: 0.8,
+                keep_recent: 2,
+            })
+            .with_fold_now(true);
+        match routing {
+            Some(routing) => contract.with_routing(routing),
+            None => contract,
+        }
+    }
+
+    fn read(path: &str) -> ToolCall {
+        ToolCall {
+            name: "read_file".into(),
+            arguments: json!({ "path": path }),
+        }
+    }
+
+    /// F15 — the summary is answered by the named model, and the work is not.
+    ///
+    /// Both halves are the assertion. "The summary was routed" alone is satisfied
+    /// by a rule that routed everything, which would send the whole run to a small
+    /// model and is the opposite of the feature.
+    #[tokio::test]
+    async fn f15_the_fold_summary_asks_the_mechanical_model_and_the_work_does_not() {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let mut session = Session::open(&store, dir.path()).unwrap();
+        converse(&mut session, &store, &policy).await;
+
+        let recorder = Recorder::new(vec![vec![read("notes.txt")]]);
+        session
+            .turn_bounded(
+                &measured(dir.path(), Some(Routing::new().mechanical("tiny-model"))),
+                &recorder,
+                &store,
+                &policy,
+                &ApproveAll,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recorder.summarising(),
+            vec![Some("tiny-model".to_string())],
+            "the fold's own completion carries the mechanical model"
+        );
+        assert!(
+            recorder.working().iter().all(|m| m.is_none()),
+            "and the working requests carry no model at all, exactly as they did \
+             in 0.74.0: {:?}",
+            recorder.working()
+        );
+    }
+
+    /// F15, the control — with the knob unset the summarising request is
+    /// byte-identical to 0.74.0's, which is to say it names no model.
+    ///
+    /// Without this arm the test above would pass over an implementation that
+    /// routed the summary unconditionally to something.
+    #[tokio::test]
+    async fn f15_without_the_knob_the_fold_summary_names_no_model() {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let mut session = Session::open(&store, dir.path()).unwrap();
+        converse(&mut session, &store, &policy).await;
+
+        let recorder = Recorder::new(vec![vec![read("notes.txt")]]);
+        session
+            .turn_bounded(
+                &measured(dir.path(), None),
+                &recorder,
+                &store,
+                &policy,
+                &ApproveAll,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recorder.summarising(),
+            vec![None],
+            "an unset knob changes nothing about the request the crate builds"
+        );
+    }
+
+    /// F15 — an escalation does not reach the fold, and the mechanical model does
+    /// not reach the work.
+    ///
+    /// The two rules travel on the same struct and must not leak into each other:
+    /// `apply_routing` decides the step's model from what the run has done, and
+    /// the mechanical model is decided by which call it is. A run carrying both
+    /// keeps them apart.
+    #[tokio::test]
+    async fn f15_the_mechanical_model_and_the_step_rules_do_not_reach_each_other() {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let policy = open_policy();
+        let mut session = Session::open(&store, dir.path()).unwrap();
+        converse(&mut session, &store, &policy).await;
+
+        // `downshift_under` fires immediately: the run has written nothing.
+        let routing = Routing::new()
+            .downshift_under(2_048, "small-model")
+            .mechanical("tiny-model");
+        let recorder = Recorder::new(vec![vec![read("notes.txt")]]);
+        session
+            .turn_bounded(
+                &measured(dir.path(), Some(routing)),
+                &recorder,
+                &store,
+                &policy,
+                &ApproveAll,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recorder.summarising(),
+            vec![Some("tiny-model".to_string())],
+            "the fold takes the mechanical model, not the downshift's"
+        );
+        assert!(
+            recorder
+                .working()
+                .iter()
+                .all(|m| m.as_deref() == Some("small-model")),
+            "and the work takes the downshift's, not the mechanical one: {:?}",
+            recorder.working()
+        );
+    }
+}

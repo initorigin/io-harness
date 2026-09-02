@@ -4640,6 +4640,7 @@ impl<'a> Speculation<'a> {
             run_id,
             step,
             started: Vec::new(),
+            spawned: std::collections::HashMap::new(),
             set: tokio::task::JoinSet::new(),
             closed: false,
             done: std::collections::HashMap::new(),
@@ -4657,6 +4658,7 @@ impl<'a> Speculation<'a> {
     fn reset(&mut self) {
         self.set = tokio::task::JoinSet::new();
         self.started.clear();
+        self.spawned.clear();
         self.done.clear();
         self.closed = false;
     }
@@ -4688,12 +4690,22 @@ impl<'a> Speculation<'a> {
             self.closed = true;
             return;
         }
-        let Some(work) = speculable(&self.ws, call, self.tools) else {
+        // (0.75.0) The run's containment, because a git reader spawns a process
+        // and `Workspace` carries no way to reach it. A speculated spawn that ran
+        // uncontained would be the one widening this release forbids itself.
+        let Some(work) = speculable(&self.ws, call, self.tools, self.sandbox.as_ref()) else {
             self.closed = true;
             return;
         };
         let ws = self.ws.clone();
         let (cap, max_read, run_id, step) = (self.cap, self.max_read, self.run_id, self.step);
+        // Asked before the work moves into the task, because after that it is
+        // gone. The batch path writes the sandbox rows around its spawn; this
+        // path cannot — no store crosses into a speculative task — so the loop
+        // writes them when it collects the call, and this is how it knows to.
+        if let Some(contained) = work.contained() {
+            self.spawned.insert(at, std::sync::Arc::clone(contained));
+        }
         self.set
             .spawn(async move { (at, work.run(&ws, cap, max_read, run_id, step).await) });
         self.started.push((at, call.clone()));
@@ -4754,6 +4766,15 @@ impl<'a> Speculation<'a> {
     /// The result already computed for the call at `at`, if there is one.
     fn take(&mut self, at: usize) -> Option<Dispatched> {
         self.done.remove(&at)
+    }
+
+    /// (0.75.0) The containment the call at `at` spawned under, if it spawned.
+    ///
+    /// Answered from what was actually started rather than from the call's name,
+    /// so a git reader the policy refused — which never spawned — does not claim
+    /// a containment it never had.
+    fn spawned(&self, at: usize) -> Option<&std::sync::Arc<crate::sandbox::ExecContainment>> {
+        self.spawned.get(&at)
     }
 
     /// Started, used, discarded — across every attempt of this step.

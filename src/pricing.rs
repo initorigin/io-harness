@@ -318,10 +318,15 @@ impl PriceTable {
     /// existed.
     pub fn cost_micros(&self, model: &str, usage: &Usage) -> Option<u64> {
         let p = self.rate(model, usage.prompt_tokens)?;
+        // (0.75.0) An unreported cache write bills as fresh input, which is what
+        // it was before the counter became `Option` and what the invoice from an
+        // OpenAI-shaped endpoint actually says: that wire writes the cache
+        // implicitly and charges a normal prompt token for it.
+        let cache_write = usage.cache_write_tokens.unwrap_or(0);
         let fresh_input = usage
             .prompt_tokens
             .saturating_sub(usage.cache_read_tokens)
-            .saturating_sub(usage.cache_write_tokens);
+            .saturating_sub(cache_write);
         // Summed exactly in u128 and rounded once at the end. Rounding each line
         // and adding would drift by up to a half-unit per dimension per call,
         // which over a long trace is a figure that matches no invoice.
@@ -329,7 +334,7 @@ impl PriceTable {
         let mtok = per_million(fresh_input, p.input)
             + per_million(usage.completion_tokens, p.output)
             + per_million(usage.cache_read_tokens, p.cache_read)
-            + per_million(usage.cache_write_tokens, p.cache_write);
+            + per_million(cache_write, p.cache_write);
         let requests = usage.server_tool_requests as u128 * p.per_server_tool_request as u128;
         let micros = (mtok + 500_000) / 1_000_000 + requests;
         Some(micros.min(u64::MAX as u128) as u64)
@@ -355,6 +360,35 @@ pub struct Spend {
     /// entered for it. A group with calls here is reporting a floor, not a
     /// total, and a renderer that hides this number is lying by omission.
     pub unpriced_calls: u64,
+    /// (0.75.0) How many calls in this group came off a wire that reports no
+    /// cache-write counter. Their write cost is unknown, not zero, so a group
+    /// with calls here is a floor on the cache write exactly as
+    /// [`Spend::unpriced_calls`] makes it a floor on the money — and for the
+    /// same reason it is a field rather than a silence.
+    pub unreported_cache_writes: u64,
+}
+
+impl Spend {
+    /// (0.75.0) The share of this group's prompt tokens that were served from
+    /// the provider's cache, or `None` for a group that summed no usage at all.
+    ///
+    /// A group whose calls all reported zero cached tokens answers `Some(0.0)`:
+    /// a cache that never hit is a measurement, and an absent measurement is
+    /// not. `None` means the group summed no prompt tokens at all — an empty
+    /// group, or one whose every call reported no usage.
+    ///
+    /// **Pricing does not enter into it.** Usage is summed before a price is
+    /// looked for, so a group whose every call is unpriced still rates; with no
+    /// vendor prices shipped, that is the ordinary case for a partial
+    /// [`PriceTable`]. [`Spend::unpriced_calls`] is what says the money is a
+    /// floor.
+    ///
+    /// Read it beside [`Spend::unreported_cache_writes`]: a high rate over a
+    /// group of calls whose writes were never reported is a read rate, not a
+    /// complete accounting.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        self.usage.cache_hit_rate()
+    }
 }
 
 /// Sum `calls` into one group under `key`, pricing what can be priced.
@@ -376,7 +410,17 @@ pub(crate) fn group(key: impl Into<String>, calls: &[&ProviderCall], prices: &Pr
         spend.usage.completion_tokens += usage.completion_tokens;
         spend.usage.total_tokens += usage.total_tokens;
         spend.usage.cache_read_tokens += usage.cache_read_tokens;
-        spend.usage.cache_write_tokens += usage.cache_write_tokens;
+        // (0.75.0) A group sums the writes it was told about and counts the
+        // calls it was not. `None` survives only while NO call in the group
+        // reported one, so a mixed group reports the reported half and says how
+        // many calls are missing from it rather than quietly rounding them to
+        // zero.
+        match usage.cache_write_tokens {
+            Some(n) => {
+                *spend.usage.cache_write_tokens.get_or_insert(0) += n;
+            }
+            None => spend.unreported_cache_writes += 1,
+        }
         spend.usage.reasoning_tokens += usage.reasoning_tokens;
         spend.usage.server_tool_requests += usage.server_tool_requests;
         match call
@@ -415,7 +459,7 @@ mod tests {
             completion_tokens: 1_000_000,
             total_tokens: 2_000_000,
             cache_read_tokens: 500_000,
-            cache_write_tokens: 100_000,
+            cache_write_tokens: Some(100_000),
             reasoning_tokens: 200_000,
             server_tool_requests: 3,
         };
@@ -586,7 +630,7 @@ mod tests {
             completion_tokens: 1_000_000,
             total_tokens: 2_000_000,
             cache_read_tokens: 500_000,
-            cache_write_tokens: 100_000,
+            cache_write_tokens: Some(100_000),
             reasoning_tokens: 200_000,
             server_tool_requests: 3,
         };

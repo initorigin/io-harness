@@ -69,6 +69,15 @@ impl Store {
                  kind  = COALESCE(excluded.kind, memory.kind)",
             (workspace, key, value, run_id, step, kind),
         )?;
+        // 0.75.0 — the token cache is rewritten here rather than left for
+        // `created_at` to invalidate, because this is the one statement in the
+        // crate that changes a value **without moving the write clock**: the
+        // `ON CONFLICT` half above leaves `created_at` alone, deliberately, so a
+        // rewind does not reorder the memory block. An entry rewound from a note
+        // about the sandbox back to a note about the parser would otherwise go on
+        // being ranked by the words it no longer holds, and the ranking would be
+        // wrong for the rest of the store's life rather than for one turn.
+        self.memory_tokens_store(workspace, key, &memory_token_lines_of(key, value))?;
         Ok(())
     }
 
@@ -447,6 +456,17 @@ impl Store {
                 evicted: Vec::new(),
             });
         }
+        // 0.75.0 — the token sets this entry will be ranked and compared by,
+        // written in the same call as the value they describe. This is the whole
+        // of the trade: a `remember` happens once and pays one tokenising pass,
+        // where a turn ranked every entry in the store twice per step and paid
+        // for all of them again each time.
+        //
+        // After the refusal branch above, so a write a pin turned away leaves the
+        // cache holding the value that is actually stored. Before the caps, so an
+        // eviction that fires on this write takes the evicted entry's cache row
+        // with it rather than leaving one behind for a key that no longer exists.
+        self.memory_tokens_store(workspace, key, &memory_token_lines_of(key, &value))?;
         Ok(MemoryWrite {
             refused: false,
             evicted: self.enforce_memory_caps(workspace, key, limits)?,
@@ -515,12 +535,23 @@ impl Store {
         if tokens.is_empty() {
             return Ok(None);
         }
+        let entries = self.memory_list(workspace)?;
+        // 0.75.0 — the stored side of every comparison comes out of the token
+        // cache, so a `remember` no longer re-tokenises every value in the
+        // workspace to find out whether one of them says the same thing. The
+        // list stays: this is a `pub` method taking a workspace and a value, and
+        // the entries are not in the caller's hand to pass in.
+        let lines = self.memory_token_lines(workspace, &entries)?;
         let mut best: Option<(usize, MemoryEntry)> = None;
-        for entry in self.memory_list(workspace)? {
+        for (entry, (_, value_line)) in entries.into_iter().zip(lines) {
             if entry.key == key {
                 continue;
             }
-            let other = memory_tokens(&entry.value);
+            // Rebuilt into the set the predicate takes rather than compared as a
+            // line: this runs once per write where the ranking runs once per
+            // entry per step, and one definition of "similar" is worth more here
+            // than the allocations a second one would save.
+            let other = memory_token_set(&value_line);
             if !memory_is_similar(&tokens, &other) {
                 continue;
             }
@@ -740,6 +771,7 @@ impl Store {
                 "DELETE FROM memory WHERE workspace = ?1 AND key = ?2",
                 (workspace, key),
             )?;
+            self.memory_tokens_drop(workspace, key)?;
             count -= 1;
             chars -= (*n).max(0) as u128;
             evicted.push(key.clone());
@@ -856,6 +888,7 @@ impl Store {
             "DELETE FROM memory_recalls WHERE workspace = ?1 AND key = ?2",
             (workspace, key),
         )?;
+        self.memory_tokens_drop(workspace, key)?;
         Ok(MemoryForget::Removed)
     }
 
@@ -865,16 +898,213 @@ impl Store {
             "DELETE FROM memory WHERE workspace = ?1 AND key = ?2",
             (workspace, key),
         )?;
+        self.memory_tokens_drop(workspace, key)?;
         Ok(n > 0)
     }
 
     /// Removes every entry for `workspace`; returns how many. Other workspaces
     /// keep theirs.
     pub fn memory_clear(&self, workspace: &str) -> Result<usize> {
-        Ok(self
+        let n = self
             .conn
-            .execute("DELETE FROM memory WHERE workspace = ?1", [workspace])?)
+            .execute("DELETE FROM memory WHERE workspace = ?1", [workspace])?;
+        self.conn.execute(
+            "DELETE FROM memory_token_cache WHERE workspace = ?1",
+            [workspace],
+        )?;
+        Ok(n)
     }
+
+    /// One workspace's cached token sets (0.75.0).
+    ///
+    /// Extracted to a `const` and executed as written so the query-plan test can
+    /// `EXPLAIN` the statement the crate actually runs, for the reason
+    /// [`Self::MEMORY_SNAPSHOTS_SQL`] gives: SQL re-typed in a test goes on
+    /// passing after somebody tidies the real one.
+    pub(crate) const MEMORY_TOKEN_CACHE_SQL: &'static str =
+        "SELECT key, created_at, entry_tokens, value_tokens FROM memory_token_cache
+          WHERE workspace = ?1";
+
+    /// The token lines for `entries`, in the same order: `(entry, value)` per
+    /// entry, where `entry` covers the key and the value together and `value`
+    /// covers the value alone (0.75.0).
+    ///
+    /// The two readers ask different questions of the same entry. The recall
+    /// ranking scores an entry on everything it says, its key included — a note
+    /// keyed `parser-quirk` is about the parser whatever its prose does — where
+    /// [`Self::memory_similar`] compares values only, because rewriting a key is
+    /// an intentional replacement and not a restatement. One shared line would
+    /// make one of the two recompute, so both are stored.
+    ///
+    /// **A miss recomputes.** A store written before this release holds no cache
+    /// rows at all, an entry evicted and later restored may hold none, and a row
+    /// whose `created_at` no longer matches the entry's is one some other writer
+    /// moved. Every one of those returns the same lines a cold pass would, so
+    /// the cache changes what a ranking *costs* and never what it *is*.
+    ///
+    /// The recomputed lines are written back, and a failure to write them is
+    /// dropped: this is the read path, a store opened read-only cannot take the
+    /// backfill, and an optimisation that turns a recall into an error costs more
+    /// than it saves.
+    pub(crate) fn memory_token_lines(
+        &self,
+        workspace: &str,
+        entries: &[MemoryEntry],
+    ) -> Result<Vec<(String, String)>> {
+        let mut cached: std::collections::BTreeMap<String, (String, String, String)> = {
+            let mut stmt = self.conn.prepare(Self::MEMORY_TOKEN_CACHE_SQL)?;
+            let rows = stmt.query_map([workspace], |r| {
+                Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match cached.remove(&entry.key) {
+                // `created_at` is the second half of the key, and it catches an
+                // overwrite: `memory_write_with` refreshes it on every write. It
+                // does NOT catch a rewind, which leaves it standing — see
+                // [`Self::memory_restore`], which writes the cache itself for
+                // exactly that reason.
+                Some((at, entry_tokens, value_tokens)) if at == entry.created_at => {
+                    out.push((entry_tokens, value_tokens))
+                }
+                _ => {
+                    let lines = memory_token_lines_of(&entry.key, &entry.value);
+                    let _ = self.memory_tokens_store(workspace, &entry.key, &lines);
+                    out.push(lines);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Write one entry's token lines, stamped with the `created_at` the entry
+    /// itself carries (0.75.0).
+    ///
+    /// The stamp is read back out of the `memory` row rather than taken from a
+    /// clock here, because the row's own `created_at` is written by SQLite's
+    /// `strftime` and a second reading of the clock would not be the same string.
+    /// The `SELECT` is also the guard: there is no row to stamp for a key the
+    /// store does not hold, and this writes nothing rather than caching tokens
+    /// for an entry that does not exist.
+    fn memory_tokens_store(
+        &self,
+        workspace: &str,
+        key: &str,
+        lines: &(String, String),
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO memory_token_cache
+                 (workspace, key, created_at, entry_tokens, value_tokens)
+             SELECT ?1, ?2, m.created_at, ?3, ?4
+               FROM memory m WHERE m.workspace = ?1 AND m.key = ?2
+             ON CONFLICT(workspace, key) DO UPDATE SET
+                 created_at   = excluded.created_at,
+                 entry_tokens = excluded.entry_tokens,
+                 value_tokens = excluded.value_tokens",
+            (workspace, key, &lines.0, &lines.1),
+        )?;
+        Ok(())
+    }
+
+    /// Take one entry's cached token lines away, in the same call as the entry
+    /// (0.75.0).
+    ///
+    /// Hygiene rather than correctness: a row left behind for a key the store no
+    /// longer holds is never read, because [`Self::memory_token_lines`] looks up
+    /// only the entries it was handed, and a key written again refreshes the row
+    /// before anything reads it. Deleted anyway, because the cache would
+    /// otherwise grow by one dead row per eviction for the life of a store, and
+    /// eviction is the thing a capped workspace does on every write.
+    fn memory_tokens_drop(&self, workspace: &str, key: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM memory_token_cache WHERE workspace = ?1 AND key = ?2",
+            (workspace, key),
+        )?;
+        Ok(())
+    }
+
+    /// How many of `signals` a token line holds (0.75.0).
+    ///
+    /// A merge walk over two already-sorted sequences rather than
+    /// `signals.intersection(&memory_token_set(line))`, because this runs once
+    /// per entry per scope per step and rebuilding the set allocates a `String`
+    /// per token to answer a question that is only a count. Both sides are in
+    /// byte order — a [`BTreeSet`](std::collections::BTreeSet) iterates in it and
+    /// [`memory_token_line`] writes it — so one pass is the whole intersection.
+    ///
+    /// The empty-token filter is for the empty line: `"".split(' ')` yields one
+    /// empty piece, and [`memory_tokens`] never produces a token that short.
+    ///
+    /// Hung off `Store` rather than left a free function because `state::memory`
+    /// is a private module and the recall ranking lives in `run::memory`; an
+    /// inherent associated item is reachable through the type wherever the type
+    /// is, which is how [`Self::MEMORY_DRAWS_SQL`] already crosses the same line.
+    pub(crate) fn memory_token_line_shared(
+        signals: &std::collections::BTreeSet<String>,
+        line: &str,
+    ) -> usize {
+        let mut shared = 0;
+        let mut left = signals.iter().map(String::as_str).peekable();
+        let mut right = line.split(' ').filter(|t| !t.is_empty()).peekable();
+        while let (Some(a), Some(b)) = (left.peek(), right.peek()) {
+            match a.cmp(b) {
+                std::cmp::Ordering::Less => {
+                    left.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    right.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    shared += 1;
+                    left.next();
+                    right.next();
+                }
+            }
+        }
+        shared
+    }
+}
+
+/// A normalised token set as one row holds it: the tokens, in order, separated
+/// by single spaces (0.75.0).
+///
+/// The cheapest form to write and to parse, and it needs no escaping — every
+/// token comes out of [`memory_tokens`], which splits on every character that is
+/// not alphanumeric, so a space cannot occur inside one. Nothing is encoded, so
+/// nothing can be mis-decoded.
+///
+/// A [`BTreeSet`](std::collections::BTreeSet) iterates in byte order, so the
+/// line is sorted and deduplicated by construction. That is the property
+/// [`Store::memory_token_line_shared`] rests on: two sorted sequences intersect
+/// in one walk, with no set rebuilt and nothing allocated.
+fn memory_token_line(tokens: &std::collections::BTreeSet<String>) -> String {
+    tokens
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Both lines one entry is stored with: the key and value together, then the
+/// value alone (0.75.0).
+fn memory_token_lines_of(key: &str, value: &str) -> (String, String) {
+    (
+        memory_token_line(&memory_tokens(&format!("{key} {value}"))),
+        memory_token_line(&memory_tokens(value)),
+    )
+}
+
+/// The tokens of one line, back as the set they were (0.75.0).
+///
+/// The inverse of [`memory_token_line`] and exact: the line holds the set's own
+/// elements, so the set that comes back is the set that went in.
+fn memory_token_set(line: &str) -> std::collections::BTreeSet<String> {
+    line.split(' ')
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1178,6 +1408,411 @@ mod tests {
         assert!(
             !control.contains("memory_recalls_entry"),
             "a column in no index must not be servable from one, got {control}"
+        );
+    }
+
+    /// One entry's cache row, or nothing.
+    ///
+    /// Read with SQL of its own rather than through [`Store::memory_token_lines`]:
+    /// these tests are about what is on disk, and a reader that recomputes a miss
+    /// answers the same either way.
+    fn cached(store: &Store, workspace: &str, key: &str) -> Option<(String, String, String)> {
+        store
+            .conn
+            .query_row(
+                "SELECT created_at, entry_tokens, value_tokens FROM memory_token_cache
+                  WHERE workspace = ?1 AND key = ?2",
+                (workspace, key),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok()
+    }
+
+    /// 0.75.0 F8. A write leaves the tokens behind it, stamped with the entry's
+    /// own write clock.
+    #[test]
+    fn f8_a_written_entry_carries_the_token_sets_it_will_be_ranked_by() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "/repo").unwrap();
+        let value = "the parser reports the column it stopped at";
+        store
+            .memory_put("/ws", "parser-quirk", value, run, 1)
+            .unwrap();
+
+        let entry = store.memory_get("/ws", "parser-quirk").unwrap().unwrap();
+        let (at, entry_tokens, value_tokens) =
+            cached(&store, "/ws", "parser-quirk").expect("the write cached its tokens");
+        assert_eq!(at, entry.created_at, "the stamp is the entry's own clock");
+        assert_eq!(
+            (entry_tokens, value_tokens),
+            memory_token_lines_of("parser-quirk", value),
+            "the stored lines are what a cold pass over the same entry computes"
+        );
+        // The key is in the ranking's line and out of the duplicate check's,
+        // which is the whole reason there are two of them.
+        let (ranked, compared) = memory_token_lines_of("parser-quirk", value);
+        assert!(ranked.contains("parser"));
+        assert!(ranked.contains("quirk"));
+        assert!(
+            !compared.contains("quirk"),
+            "the value says nothing about a quirk, and the duplicate check reads only it"
+        );
+    }
+
+    /// 0.75.0 F8, the negative control. The readers must actually read the
+    /// cache: an implementation that kept tokenising the value would pass every
+    /// equivalence test in this file, because a cache nobody reads is never
+    /// wrong.
+    ///
+    /// The row is poisoned without touching the entry, so the stamp still
+    /// matches and the read is a hit. [`Store::memory_similar`] is the public
+    /// half of the pair and answers from `value_tokens`.
+    #[test]
+    fn f8_the_duplicate_check_answers_from_the_cache_and_not_from_the_value() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "/repo").unwrap();
+        store
+            .memory_put("/ws", "held", "the maintainer reviews on Tuesdays", run, 1)
+            .unwrap();
+        let asked = "the parser rejects a trailing comma";
+        assert!(
+            store
+                .memory_similar("/ws", "fresh", asked)
+                .unwrap()
+                .is_none(),
+            "nothing stored says anything about a parser"
+        );
+
+        let poisoned = memory_token_line(&memory_tokens(asked));
+        store
+            .conn
+            .execute(
+                "UPDATE memory_token_cache SET value_tokens = ?1
+                  WHERE workspace = '/ws' AND key = 'held'",
+                [&poisoned],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .memory_similar("/ws", "fresh", asked)
+                .unwrap()
+                .map(|e| e.key)
+                .as_deref(),
+            Some("held"),
+            "the duplicate check reads the cached line, so poisoning it moves the answer"
+        );
+    }
+
+    /// 0.75.0 F9, first arm. An overwrite is ranked by what the entry now says.
+    #[test]
+    fn f9_an_overwritten_entry_is_ranked_by_the_value_that_replaced_the_old_one() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "/repo").unwrap();
+        store
+            .memory_put("/ws", "n1", "the parser rejects a trailing comma", run, 1)
+            .unwrap();
+        store
+            .memory_put(
+                "/ws",
+                "n1",
+                "the sandbox binds every root it is given",
+                run,
+                2,
+            )
+            .unwrap();
+
+        let entry = store.memory_get("/ws", "n1").unwrap().unwrap();
+        assert_eq!(
+            store
+                .memory_token_lines("/ws", std::slice::from_ref(&entry))
+                .unwrap()[0],
+            memory_token_lines_of("n1", &entry.value),
+            "the second read must not be the first read's answer"
+        );
+    }
+
+    /// 0.75.0 F9, the arm the invalidation key gets wrong.
+    ///
+    /// `memory_write_with` refreshes `created_at` on an overwrite, which is why
+    /// the contract proposed it as the key's second component. **`memory_restore`
+    /// does not** — it leaves the write clock standing on purpose, so a rewind
+    /// does not reorder the memory block — so a cache keyed on
+    /// `(workspace, key, created_at)` alone hits on a rewound entry and hands
+    /// back the tokens of a value the store no longer holds. The equality
+    /// asserted on `created_at` here is what makes the rest of the test mean
+    /// something.
+    #[test]
+    fn f9_a_rewound_entry_is_ranked_by_what_the_rewind_put_back() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "/repo").unwrap();
+        store
+            .memory_put("/ws", "n1", "the parser rejects a trailing comma", run, 1)
+            .unwrap();
+        let before = store.memory_get("/ws", "n1").unwrap().unwrap();
+
+        let restored = "the sandbox binds every root it is given";
+        store
+            .memory_restore("/ws", "n1", restored, None, run, 2)
+            .unwrap();
+        let after = store.memory_get("/ws", "n1").unwrap().unwrap();
+        assert_eq!(
+            after.created_at, before.created_at,
+            "a rewind leaves the write clock alone, which is what makes the key insufficient"
+        );
+        assert_eq!(after.value, restored);
+
+        assert_eq!(
+            store
+                .memory_token_lines("/ws", std::slice::from_ref(&after))
+                .unwrap()[0],
+            memory_token_lines_of("n1", restored),
+            "a rewound entry must not go on being ranked by the words it no longer holds"
+        );
+    }
+
+    /// 0.75.0 F9, second arm. Pinning changes no value, and a write a pin turned
+    /// away changed no value either — so the cache must go on describing what is
+    /// stored rather than what was refused.
+    #[test]
+    fn f9_a_write_a_pin_refused_leaves_the_cache_describing_the_stored_value() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "/repo").unwrap();
+        let kept = "the parser rejects a trailing comma";
+        store.memory_put("/ws", "n1", kept, run, 1).unwrap();
+        assert!(store.memory_pin("/ws", "n1", true).unwrap());
+
+        let cold = memory_token_lines_of("n1", kept);
+        assert_eq!(
+            cached(&store, "/ws", "n1").map(|c| (c.1, c.2)),
+            Some(cold.clone())
+        );
+
+        let refused = store
+            .memory_write(
+                "/ws",
+                "n1",
+                "the sandbox binds every root",
+                run,
+                2,
+                MemoryKind::Fact,
+            )
+            .unwrap();
+        assert!(
+            refused.refused,
+            "a pinned entry is not a run's to overwrite"
+        );
+        assert_eq!(
+            cached(&store, "/ws", "n1").map(|c| (c.1, c.2)),
+            Some(cold.clone()),
+            "a refused write must not cache tokens for a value that was never stored"
+        );
+
+        assert!(store.memory_pin("/ws", "n1", false).unwrap());
+        let entry = store.memory_get("/ws", "n1").unwrap().unwrap();
+        assert_eq!(
+            store.memory_token_lines("/ws", &[entry]).unwrap()[0],
+            cold,
+            "unpinning changes no value, so it changes no token set"
+        );
+    }
+
+    /// 0.75.0 F9, third arm. Every way an entry leaves takes its cache row with
+    /// it, so the cache cannot grow a dead row per removal for the life of a
+    /// store.
+    #[test]
+    fn f9_an_entry_that_leaves_takes_its_cached_tokens_with_it() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "/repo").unwrap();
+        for key in ["gone", "dropped", "kept"] {
+            store
+                .memory_put("/ws", key, "a note about the parser", run, 1)
+                .unwrap();
+        }
+        assert_eq!(
+            store.memory_forget("/ws", "gone", run, 2).unwrap(),
+            MemoryForget::Removed
+        );
+        assert!(store.memory_delete("/ws", "dropped").unwrap());
+        assert!(cached(&store, "/ws", "gone").is_none());
+        assert!(cached(&store, "/ws", "dropped").is_none());
+        assert!(cached(&store, "/ws", "kept").is_some());
+
+        // Eviction, which is the one that happens on every write once a
+        // workspace is at its cap.
+        let limits = MemoryLimits {
+            max_entries: 2,
+            max_chars: usize::MAX,
+            ..MemoryLimits::default()
+        };
+        let write = |key: &str, step: u32| {
+            store
+                .memory_write_with("/ws", key, "a note", run, step, MemoryKind::Fact, limits)
+                .unwrap()
+        };
+        assert!(write("newer", 3).evicted.is_empty(), "two entries fit two");
+        assert_eq!(
+            write("newest", 4).evicted,
+            vec!["kept"],
+            "the cap evicts the least proven entry"
+        );
+        assert!(cached(&store, "/ws", "kept").is_none());
+
+        // And clearing a workspace clears its cache, without touching another's.
+        store
+            .memory_put("/other", "elsewhere", "a note about the parser", run, 5)
+            .unwrap();
+        assert_eq!(store.memory_clear("/ws").unwrap(), 2);
+        assert!(cached(&store, "/ws", "newer").is_none());
+        assert!(cached(&store, "/ws", "newest").is_none());
+        assert!(cached(&store, "/other", "elsewhere").is_some());
+    }
+
+    /// 0.75.0 F10. The cache is an optimisation, so an empty one answers what a
+    /// full one does — byte for byte, at the seam both readers share.
+    ///
+    /// The store this exercises is also every store written before this release:
+    /// the table is added empty, and nothing rewrites the entries that were
+    /// already in it.
+    #[test]
+    fn f10_an_empty_cache_answers_exactly_what_a_full_one_answers() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "/repo").unwrap();
+        for i in 0..8 {
+            let value = format!("note {i} about the parser and the column it stopped at");
+            store
+                .memory_put("/ws", &format!("k{i}"), &value, run, 1)
+                .unwrap();
+        }
+        let entries = store.memory_list("/ws").unwrap();
+        let warm = store.memory_token_lines("/ws", &entries).unwrap();
+
+        store
+            .conn
+            .execute("DELETE FROM memory_token_cache", [])
+            .unwrap();
+        let cold = store.memory_token_lines("/ws", &entries).unwrap();
+        assert_eq!(
+            cold, warm,
+            "a miss recomputes what the hit would have returned"
+        );
+
+        // And the miss filled the cache, so the store that opened without one
+        // pays for the recomputation once rather than every turn.
+        let refilled = store.memory_token_lines("/ws", &entries).unwrap();
+        assert_eq!(refilled, warm);
+        for entry in &entries {
+            let (at, ranked, compared) =
+                cached(&store, "/ws", &entry.key).expect("the read wrote back what it recomputed");
+            assert_eq!(at, entry.created_at);
+            assert_eq!(
+                (ranked, compared),
+                memory_token_lines_of(&entry.key, &entry.value)
+            );
+        }
+    }
+
+    /// The line is the set, and the walk over it counts what the set does.
+    ///
+    /// Both halves of 0.75.0's serialisation in one place: a token cannot hold a
+    /// separator because [`memory_tokens`] splits on every non-alphanumeric
+    /// character, and both sequences are in byte order, so a single merge pass is
+    /// the whole intersection.
+    #[test]
+    fn a_token_line_round_trips_its_set_and_the_merge_walk_counts_what_the_set_counts() {
+        for (goal, text) in [
+            (
+                "fix the parser column",
+                "the parser reports the column it stopped at",
+            ),
+            ("", "anything at all"),
+            ("nothing shared here", ""),
+            ("alpha bravo charlie", "charlie bravo alpha charlie"),
+            ("Alpha BRAVO", "alpha bravo"),
+            (
+                "src/state.rs",
+                "the sandbox reads src/state.rs on every run",
+            ),
+        ] {
+            let signals = memory_tokens(goal);
+            let tokens = memory_tokens(text);
+            let line = memory_token_line(&tokens);
+            assert_eq!(
+                memory_token_set(&line),
+                tokens,
+                "the line is the set it came from"
+            );
+            assert_eq!(
+                Store::memory_token_line_shared(&signals, &line),
+                signals.intersection(&tokens).count(),
+                "the merge walk and the set intersection disagree on {goal:?} / {text:?}"
+            );
+        }
+    }
+
+    /// 0.75.0 F8. The cache read is on the turn's own path — twice per step —
+    /// and the table holds a row for every entry of every workspace a store has
+    /// ever known, so a scan here would be the cost this release removed, moved.
+    #[test]
+    fn the_token_cache_seeks_one_workspace_rather_than_scanning_every_cached_entry() {
+        let store = Store::memory().unwrap();
+        // Rows written directly: this asserts a plan, and sixty-four workspaces
+        // filled through `memory_put` would measure the write path instead.
+        for ws in 0..64 {
+            for k in 0..64 {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO memory_token_cache
+                             (workspace, key, created_at, entry_tokens, value_tokens)
+                         VALUES (?1, ?2, '2026-09-02T00:00:00.000Z', 'alpha bravo', 'bravo')",
+                        (format!("ws{ws}"), format!("k{k}")),
+                    )
+                    .unwrap();
+            }
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let mut stmt = store
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                Store::MEMORY_TOKEN_CACHE_SQL
+            ))
+            .unwrap();
+        let plan = stmt
+            .query_map(["ws0"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" | ");
+        assert!(
+            plan.contains("memory_token_cache_entry"),
+            "the ranking's cache read must seek on memory_token_cache_entry, got {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN memory_token_cache"),
+            "a turn must not read every cached entry in the store, got {plan}"
+        );
+
+        // The control: `entry_tokens` is in no index, so it cannot be served from
+        // one — which is what makes the assertions above about this index rather
+        // than about a planner that never scans anything.
+        let mut stmt = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT key FROM memory_token_cache
+                  WHERE entry_tokens = ?1",
+            )
+            .unwrap();
+        let control = stmt
+            .query_map(["alpha bravo"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join(" | ");
+        assert!(
+            control.contains("SCAN memory_token_cache"),
+            "a column in no index must scan, or the assertions above prove nothing, got {control}"
         );
     }
 }

@@ -78,6 +78,28 @@ pub(super) enum ReadWork {
         /// 0.55.0 — how many lines to return from `offset`.
         limit: Option<u64>,
     },
+    /// 0.75.0 — one directory listing, at the target an approver left behind.
+    ListDir {
+        target: String,
+        remember: Vec<Rule>,
+    },
+    /// 0.75.0 — one `git` reader, already built and already contained.
+    ///
+    /// The argv is settled before this exists: [`prepare_read`] and
+    /// [`speculable`] both build the [`GitCmd`] and both resolve the
+    /// containment, because a refusal `Git::argv` would raise has a policy row
+    /// to write and this half of the batch holds no [`Store`](crate::Store) to
+    /// write one with.
+    Git {
+        name: String,
+        cmd: GitCmd,
+        remember: Vec<Rule>,
+        /// This call's own containment, narrowed by
+        /// [`resolve_call_mode`] exactly as `dispatch` narrows it, with the
+        /// run's egress answer folded in. `None` is a `FullAccess` run, which
+        /// wraps nothing.
+        contained: Option<std::sync::Arc<crate::sandbox::ExecContainment>>,
+    },
     Custom {
         name: String,
         tool: std::sync::Arc<dyn crate::tools::Tool>,
@@ -192,6 +214,39 @@ impl ReadWork {
         }
     }
 
+    /// Whether performing this work spawns a contained process (0.75.0).
+    ///
+    /// Read for the reason [`ReadWork::attempt`] is read, and by the same
+    /// caller: the containment a spawn ran under is a row, a row needs a
+    /// [`Store`](crate::Store), and the concurrent half holds none. The creation
+    /// is recorded before the work is queued and the destruction after it joins,
+    /// so a git reader that ran inside a batch leaves the rows `dispatch` leaves
+    /// for the same call rather than none.
+    pub(super) fn spawns(&self) -> bool {
+        matches!(
+            self,
+            ReadWork::Git {
+                contained: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// (0.75.0) The containment this work will actually spawn under, narrowed by
+    /// [`resolve_call_mode`] and carrying the run's egress answer.
+    ///
+    /// The speculative path needs it *before* the work moves into its task, so
+    /// the loop can record the containment that was enforced rather than the
+    /// run's own grant. Those two differ by construction and by design: a git
+    /// reader runs `read-only` inside a run granting `workspace-write`, and a row
+    /// naming the run's grant would say the opposite of what confined the spawn.
+    pub(super) fn contained(&self) -> Option<&std::sync::Arc<crate::sandbox::ExecContainment>> {
+        match self {
+            ReadWork::Git { contained, .. } => contained.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Perform it. The same code the serial path runs, so the two cannot drift:
     /// a batched read and a lone read are the same function called from two
     /// places.
@@ -301,6 +356,130 @@ impl ReadWork {
                 }
                 Err(e) => Dispatched::go("read error", format!("\n[read error] {e}\n")),
             },
+            // 0.75.0 — a listing is a filename answer about a path, like
+            // `find`'s, so it carries `find`'s [`ObsKind`]: a later listing of
+            // the same directory is the same question asked again and
+            // supersedes this one.
+            ReadWork::ListDir { target, remember } => match ws.list_dir(&target) {
+                Ok(entries) => {
+                    let shown: Vec<String> = entries
+                        .iter()
+                        .take(OBS_LIST_DIR_CAP)
+                        .map(Entry::to_string)
+                        .collect();
+                    // Said in the listing rather than only in the count the
+                    // trace keeps: the model reads the text and nothing else,
+                    // and what it does about a truncated directory is a decision
+                    // it can only make if it is told.
+                    let note = match entries.len() - shown.len() {
+                        0 => String::new(),
+                        n => format!(
+                            "\n[showing {} of {} entries; {n} not listed — list a subdirectory \
+                             or use find to narrow]",
+                            shown.len(),
+                            entries.len()
+                        ),
+                    };
+                    Dispatched::Continue {
+                        decision: format!("list_dir {target} ({} entries)", entries.len()),
+                        obs: bound(
+                            &format!("\n[list_dir {target}]\n{}{note}\n", shown.join("\n")),
+                            cap,
+                            ObsKind::Find,
+                        ),
+                        kind: ObsKind::Find,
+                        target: Some(target),
+                        changed: false,
+                        remember,
+                    }
+                }
+                Err(e) => Dispatched::go("list_dir error", format!("\n[list_dir error] {e}\n")),
+            },
+            // 0.75.0 — the spawn, and only the spawn. Every question about this
+            // call was answered before it was queued: the policy was asked about
+            // `Act::Exec` on `git` and `Act::Read` on `.git` and on each path,
+            // the argv was built, and the containment was resolved. `.gated()`
+            // because the `Act::Exec` question has already been through the run
+            // loop's approval gate — a second raw policy check inside `Git::run`
+            // would read the same `Ask` and refuse a call a human had approved.
+            ReadWork::Git {
+                name,
+                cmd,
+                remember,
+                contained,
+            } => {
+                let git = Git::new(ws.policy(), ws.root(), cap)
+                    .contained(contained)
+                    .gated();
+                match git.run(&cmd).await {
+                    Ok(GitOutcome::Unavailable { reason }) => Dispatched::go(
+                        "git unavailable",
+                        format!(
+                            "\n[git unavailable] {reason}. This workspace cannot be worked as a \
+                             git repository; carry on without it.\n"
+                        ),
+                    ),
+                    Ok(out) => {
+                        let GitOutcome::Ran {
+                            code,
+                            stdout,
+                            stderr,
+                        } = &out
+                        else {
+                            unreachable!()
+                        };
+                        let ok = out.ok();
+                        let body = if stdout.trim().is_empty() && !ok {
+                            stderr.clone()
+                        } else {
+                            stdout.clone()
+                        };
+                        // A git that ran and failed is an observation, not a run
+                        // failure — the same treatment a malformed regex gets
+                        // from `grep`. The model reads the message and adapts.
+                        Dispatched::Continue {
+                            decision: format!(
+                                "{name} {}",
+                                if ok {
+                                    "ok".to_string()
+                                } else {
+                                    format!(
+                                        "exit {}",
+                                        code.map_or("signal".into(), |c| c.to_string())
+                                    )
+                                }
+                            ),
+                            obs: format!(
+                                "\n[{name}{}]\n{}\n",
+                                if ok {
+                                    String::new()
+                                } else {
+                                    " failed".to_string()
+                                },
+                                if body.trim().is_empty() {
+                                    "(no output)"
+                                } else {
+                                    body.trim_end()
+                                }
+                            ),
+                            kind: ObsKind::Tool,
+                            target: None,
+                            changed: false,
+                            remember,
+                        }
+                    }
+                    // The spawn itself failed. `dispatch` can end the run on
+                    // this and does; the overlapping half returns a
+                    // [`Dispatched`] and nothing else, so here it is an
+                    // observation the model reads. The refusals that carry a
+                    // policy row are not among them: `Git::argv` was called on
+                    // the caller's own thread, where the row could still be
+                    // written.
+                    Err(e) => {
+                        Dispatched::go(format!("{name} failed"), format!("\n[{name} error] {e}\n"))
+                    }
+                }
+            }
             ReadWork::Custom {
                 name,
                 tool,
@@ -339,6 +518,77 @@ impl ReadWork {
     }
 }
 
+/// The paths a git call named, as data (0.75.0).
+///
+/// One definition for both halves that build a git reader's work, because this
+/// list is what the policy is asked about *and* what lands after `--` in the
+/// argv: two readings of the same argument object are two chances for the check
+/// and the command to disagree about which paths were named. `dispatch`'s git
+/// arm reads them the same way, and is the third reading this pair exists to
+/// replace.
+pub(super) fn git_paths(arguments: &serde_json::Value) -> Vec<String> {
+    arguments
+        .get("paths")
+        .and_then(|v| v.as_array())
+        .map(|v| {
+            v.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The [`GitCmd`] one of the three git readers means (0.75.0).
+///
+/// `None` for every other name, so a caller that matched a wider set than it
+/// meant to gets nothing rather than a command for the wrong subcommand.
+pub(super) fn git_read_cmd(
+    name: &str,
+    arguments: &serde_json::Value,
+    paths: Vec<String>,
+) -> Option<GitCmd> {
+    match name {
+        GIT_STATUS_TOOL => Some(GitCmd::Status { paths }),
+        GIT_DIFF_TOOL => Some(GitCmd::Diff {
+            staged: arguments.get("staged").and_then(serde_json::Value::as_bool) == Some(true),
+            paths,
+        }),
+        GIT_LOG_TOOL => Some(GitCmd::Log {
+            // Clamped rather than trusted: a model asking for the whole history
+            // of a large repository would blow the observation cap and learn
+            // nothing the first twenty commits do not say.
+            max_count: arguments
+                .get("max_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(20)
+                .clamp(1, 200) as u32,
+            paths,
+        }),
+        _ => None,
+    }
+}
+
+/// This git call's own containment, as `dispatch` resolves it (0.75.0).
+///
+/// `Refused` is not reachable for a reader — [`ExecMode::ReadOnly`] is the
+/// widest confinement there is, so every grant satisfies it — but the match is
+/// written out rather than unwrapped, because the day a reader declares
+/// something else this returns `None` and the call falls to the serial path
+/// instead of overlapping under a mode nobody checked.
+fn git_containment(
+    ws: &Workspace,
+    name: &str,
+    custom: &Toolbox,
+    sandbox: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
+) -> Option<Option<std::sync::Arc<crate::sandbox::ExecContainment>>> {
+    match resolve_call_mode(name, custom, sandbox) {
+        CallMode::Refused { .. } => None,
+        CallMode::Contained(resolved) => Some(
+            resolved.map(|c| std::sync::Arc::new(c.with_egress(ws.policy().permits_any_egress()))),
+        ),
+    }
+}
+
 /// 0.54.0 — the work a read-only call would do, if it can be started before the
 /// completion carrying it has settled.
 ///
@@ -356,7 +606,18 @@ impl ReadWork {
 /// `remember` is empty because an outright allow carries no remembered rule,
 /// which is exactly what [`gate`] returns on [`Effect::Allow`]. A call that is
 /// deferred and then approved *can* carry one, and that call is not speculated.
-pub(super) fn speculable(ws: &Workspace, call: &ToolCall, custom: &Toolbox) -> Option<ReadWork> {
+///
+/// `sandbox` is the run's own containment (0.75.0). A git reader reaches the
+/// world through a process, so what it may do has to be resolved before it is
+/// started — the same question [`Speculation::offer`] already asks to decide
+/// whether to speculate at all, asked here to get the answer rather than the
+/// verdict.
+pub(super) fn speculable(
+    ws: &Workspace,
+    call: &ToolCall,
+    custom: &Toolbox,
+    sandbox: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
+) -> Option<ReadWork> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
     let allowed = |act: Act, target: &str| policy_verdict(ws, act, target).effect == Effect::Allow;
@@ -381,6 +642,48 @@ pub(super) fn speculable(ws: &Workspace, call: &ToolCall, custom: &Toolbox) -> O
                 remember: Vec::new(),
                 offset,
                 limit,
+            })
+        }
+        // 0.75.0 — the same act, the same target, the same check a `read_file`
+        // on this path gets: enumerating a directory the operator denied reading
+        // is that read, done one level up. An empty path is the workspace root,
+        // which `resolve` turns into the root and the policy sees as such.
+        LIST_DIR_TOOL => {
+            let path = s("path").unwrap_or_default();
+            allowed(Act::Read, path).then(|| ReadWork::ListDir {
+                target: path.to_string(),
+                remember: Vec::new(),
+            })
+        }
+        // 0.75.0 — a git reader. Three questions rather than one, because
+        // `dispatch` asks three: the program, the repository, and every path the
+        // model named. Widening the overlappable set must not widen what is
+        // asked before a process starts, so an `Act::Exec` deny on `git` leaves
+        // with nothing started here and the call runs where it always did.
+        GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL => {
+            let name = call.name.as_str();
+            let paths = git_paths(a);
+            if !allowed(Act::Exec, crate::tools::git::GIT)
+                || !allowed(Act::Read, GIT_DIR)
+                || !paths.iter().all(|p| allowed(Act::Read, p))
+            {
+                return None;
+            }
+            let contained = git_containment(ws, name, custom, sandbox)?;
+            let cmd = git_read_cmd(name, a, paths)?;
+            // A refusal [`GitCmd::argv`] raises — a path `git` would read as an
+            // option, a repository whose own config names a program to run — is
+            // a policy row `dispatch` writes, and this function holds no
+            // [`Store`](crate::Store) to write one with. So a command that
+            // cannot be built is not speculated: it runs in order, through
+            // `dispatch`, and is refused there with its row. The cap is zero
+            // because building an argv captures no output.
+            Git::new(ws.policy(), ws.root(), 0).argv(&cmd).ok()?;
+            Some(ReadWork::Git {
+                name: name.to_string(),
+                cmd,
+                remember: Vec::new(),
+                contained,
             })
         }
         name => {
@@ -440,6 +743,20 @@ pub(super) struct Speculation<'a> {
     pub(super) step: u32,
     /// The calls started for this attempt, in position order.
     pub(super) started: Vec<(usize, ToolCall)>,
+    /// (0.75.0) For each position whose work spawned a contained process — a git
+    /// reader, today — the containment it spawned **under**.
+    ///
+    /// `Speculation` holds no [`Store`], deliberately: it runs off the stream and
+    /// `rusqlite::Connection` is not `Sync`. So the sandbox rows a spawn owes the
+    /// trace cannot be written where the batch path writes them, and this is what
+    /// lets the loop write them when it collects the call.
+    ///
+    /// The **narrowed** containment and not the run's, because those differ: a git
+    /// reader runs `read-only` inside a run granting `workspace-write`, and the
+    /// row has to name what confined the process rather than what the run was
+    /// allowed.
+    pub(super) spawned:
+        std::collections::HashMap<usize, std::sync::Arc<crate::sandbox::ExecContainment>>,
     pub(super) set: tokio::task::JoinSet<(usize, Dispatched)>,
     /// Set by the first call this run will not speculate, after which nothing is
     /// speculated for the rest of the completion. The rule is the completion's
@@ -486,6 +803,8 @@ pub(super) async fn prepare_read(
     watch: &Watch<'_>,
     depth: u32,
     goal: &str,
+    // 0.75.0 — the run's containment, for the one prepared call that spawns.
+    sandbox: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
 ) -> Result<Prepared> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -534,6 +853,143 @@ pub(super) async fn prepare_read(
                     })
                 }
             }
+        }
+        // 0.75.0 — the same act and the same code as a `read_file` on this path.
+        LIST_DIR_TOOL => {
+            let path = s("path").unwrap_or_default();
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                path,
+                None,
+                watch,
+                depth,
+                goal,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Prepared::Done(Dispatched::go(decision, obs)),
+                Gated::Paused { request_id } => Prepared::Stop(Dispatched::Pause { request_id }),
+                Gated::Go {
+                    target, remember, ..
+                } => Prepared::Work(ReadWork::ListDir { target, remember }),
+            }
+        }
+        // 0.75.0 — a git reader, prepared here so that everything durable about
+        // it happens on the caller's own thread, in the model's call order: the
+        // three approvals, the containment rows, and the refusal a command that
+        // cannot be built produces. What is left for the concurrent half is the
+        // spawn.
+        //
+        // The order is `dispatch`'s order, which is the coarsest question first:
+        // a run that may not spawn `git` at all is not asked about the
+        // individual files it wanted to read.
+        name @ (GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL) => {
+            let paths = git_paths(a);
+            let mut remembered: Vec<Rule> = Vec::new();
+            let mut targets: Vec<(Act, String)> = vec![
+                (Act::Exec, crate::tools::git::GIT.to_string()),
+                (Act::Read, GIT_DIR.to_string()),
+            ];
+            targets.extend(paths.iter().map(|p| (Act::Read, p.clone())));
+            let mut stopped: Option<Prepared> = None;
+            for (act, target) in targets {
+                match gate(
+                    ws, approver, store, run_id, step, act, &target, None, watch, depth, goal,
+                )
+                .await?
+                {
+                    Gated::Refused { decision, obs } => {
+                        stopped = Some(Prepared::Done(Dispatched::go(decision, obs)));
+                        break;
+                    }
+                    Gated::Paused { request_id } => {
+                        stopped = Some(Prepared::Stop(Dispatched::Pause { request_id }));
+                        break;
+                    }
+                    Gated::Go { remember, .. } => remembered.extend(remember),
+                }
+            }
+            if let Some(stopped) = stopped {
+                return Ok(stopped);
+            }
+            let cmd =
+                git_read_cmd(name, a, paths).expect("this arm matches only the three git readers");
+            let Some(contained) = git_containment(ws, name, custom, sandbox) else {
+                // Unreachable for a reader, and an observation rather than a
+                // panic if a later release makes it reachable: `dispatch` says
+                // "Nothing was started" for the same case and so does this.
+                return Ok(Prepared::Done(Dispatched::go(
+                    format!("{name} refused: needs more containment than this run grants"),
+                    format!(
+                        "\n[{name} refused] this tool needs a containment mode this run does not \
+                         grant. Nothing was started.\n"
+                    ),
+                )));
+            };
+            // Both of `Git::argv`'s refusals land here rather than inside the
+            // spawned task — a path that would be read as an option, and a
+            // repository whose own config names a program to run — because the
+            // row is written exactly as `gate` writes one and a reader cannot
+            // tell a git refusal from any other.
+            //
+            // Asked BEFORE the containment is recorded, because a refusal returns
+            // from this arm and nothing is ever spawned: recording the creation
+            // first left a sandbox announced as created, never torn down, for a
+            // process that did not exist.
+            match Git::new(ws.policy(), ws.root(), 0).argv(&cmd) {
+                Ok(_) => {}
+                Err(Error::Refused {
+                    act,
+                    target,
+                    rule,
+                    layer,
+                }) => {
+                    let mut ev = PolicyEvent::refusal(step, act.clone(), target.clone());
+                    ev.rule = rule.clone();
+                    ev.layer = layer;
+                    store.record_event(run_id, &ev)?;
+                    refused(watch, run_id, depth, &ev);
+                    let why = rule
+                        .as_deref()
+                        .map(|r| format!(" (rule {r})"))
+                        .unwrap_or_default();
+                    return Ok(Prepared::Done(Dispatched::go(
+                        format!("{name} refused"),
+                        format!(
+                            "\n[{act} refused] {target}{why} — the policy forbids this; carry on \
+                             without git\n"
+                        ),
+                    )));
+                }
+                Err(e) => return Err(e),
+            }
+            // The containment is recorded before the spawn and torn down after it
+            // joins ([`ReadWork::spawns`]), so a git reader that ran inside a
+            // batch leaves the rows it leaves when it runs alone.
+            if let Some(containment) = &contained {
+                for event in [
+                    sandbox_create(run_id, step, containment),
+                    crate::state::SandboxEvent::exec(
+                        run_id,
+                        step,
+                        containment.backend().as_str(),
+                        name,
+                    ),
+                ] {
+                    record_sandbox_step(store, watch, depth, &event);
+                }
+            }
+            Prepared::Work(ReadWork::Git {
+                name: name.to_string(),
+                cmd,
+                remember: remembered,
+                contained,
+            })
         }
         name => {
             match gate(
@@ -602,9 +1058,11 @@ pub(super) async fn read_batch(
     max_parallel: usize,
     goal: &str,
     hooks: Option<&crate::hooks::Hooks>,
+    // 0.75.0 — the run's containment, for the git readers in this batch.
+    sandbox: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
 ) -> Result<std::collections::VecDeque<Dispatched>> {
     let mut out: Vec<Option<Dispatched>> = Vec::with_capacity(calls.len());
-    let mut queued: std::collections::VecDeque<(usize, Option<i64>, ReadWork)> =
+    let mut queued: std::collections::VecDeque<(usize, Option<i64>, bool, ReadWork)> =
         std::collections::VecDeque::new();
     for call in calls {
         // Announced here rather than in the concurrent half, so a watcher sees
@@ -615,12 +1073,12 @@ pub(super) async fn read_batch(
             continue;
         }
         match prepare_read(
-            ws, call, approver, store, run_id, step, custom, watch, depth, goal,
+            ws, call, approver, store, run_id, step, custom, watch, depth, goal, sandbox,
         )
         .await?
         {
             Prepared::Work(work) => {
-                queued.push_back((out.len(), work.attempt(), work));
+                queued.push_back((out.len(), work.attempt(), work.spawns(), work));
                 out.push(None);
             }
             Prepared::Done(done) => out.push(Some(done)),
@@ -632,13 +1090,13 @@ pub(super) async fn read_batch(
     }
 
     let owned = ws.clone();
-    let mut set: tokio::task::JoinSet<(usize, Option<i64>, Dispatched)> =
+    let mut set: tokio::task::JoinSet<(usize, Option<i64>, bool, Dispatched)> =
         tokio::task::JoinSet::new();
     let fill =
-        |set: &mut tokio::task::JoinSet<(usize, Option<i64>, Dispatched)>,
-         queued: &mut std::collections::VecDeque<(usize, Option<i64>, ReadWork)>| {
+        |set: &mut tokio::task::JoinSet<(usize, Option<i64>, bool, Dispatched)>,
+         queued: &mut std::collections::VecDeque<(usize, Option<i64>, bool, ReadWork)>| {
             while set.len() < max_parallel {
-                let Some((at, attempt, work)) = queued.pop_front() else {
+                let Some((at, attempt, spawns, work)) = queued.pop_front() else {
                     break;
                 };
                 let ws = owned.clone();
@@ -646,6 +1104,7 @@ pub(super) async fn read_batch(
                     (
                         at,
                         attempt,
+                        spawns,
                         work.run(&ws, cap, max_read, run_id, step).await,
                     )
                 });
@@ -653,8 +1112,8 @@ pub(super) async fn read_batch(
         };
     fill(&mut set, &mut queued);
     while let Some(joined) = set.join_next().await {
-        let (at, attempt, done) = match joined {
-            Ok(triple) => triple,
+        let (at, attempt, spawns, done) = match joined {
+            Ok(quad) => quad,
             // A tool that panics panicked before this release too, and the run
             // died with it. Carrying the unwind on rather than turning it into an
             // observation keeps that true.
@@ -670,6 +1129,17 @@ pub(super) async fn read_batch(
         // `Store` cannot cross into a spawned task.
         if let Some(id) = attempt {
             store.close_attempt(id)?;
+        }
+        // 0.75.0 — and the containment this call spawned under is gone, for the
+        // same reason and in the same place: `run` holds no store, so the row
+        // that says the sandbox was torn down is written by whoever joined it.
+        if spawns {
+            record_sandbox_step(
+                store,
+                watch,
+                depth,
+                &crate::state::SandboxEvent::destroy(run_id, step),
+            );
         }
         out[at] = Some(done);
         fill(&mut set, &mut queued);

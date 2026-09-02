@@ -199,6 +199,46 @@ to report.
 registers none. It exists so the run has one code path rather than an
 `Option<&dyn Observer>` threaded through every call site.
 
+## Where a step spent its wall clock (0.75.0)
+
+A summary says a run took four minutes. It does not say whether those minutes went
+on the provider, in a tool, in the policy gate or in the store, and until 0.75.0
+nothing in the trace did: the `steps` row carried no timing at all, and the only
+fine-grained clock in the loop bracketed the provider call.
+
+Each committed step now records its own span and how that span divides.
+`Store::step_attributions` reads them back, with the step's time to first token
+joined from `provider_calls` beside it, so one read answers "where did this step
+go".
+
+`EventKind::StepAttributed` carries the same numbers onto the event stream, beside
+`EventKind::Step` rather than instead of it, so a slow run can be diagnosed while
+it is still running rather than after it ends.
+
+Four things about the numbers, each of which changes how they read:
+
+- **A phase that is absent did not happen; it did not take zero.** A step that
+  dispatched no tool has no tool phase. A step whose span was never closed — a
+  tree paused for a child's approval — is not attributed at all, because a `0`
+  there would be indistinguishable from a step that genuinely finished inside a
+  millisecond.
+- **The gate is part of the tool phase, not a sibling of it.** It is the policy
+  resolution for the calls that step dispatched, and it includes waiting for a
+  human when a call is one an approver must answer — which is why it can be most
+  of a step and mean nothing is slow.
+- **The store phase is the write that ended the *previous* step**, because that is
+  the only step whose row can still be open to hold it. A run's first committed
+  step therefore has none.
+- **The parts need not sum to the span.** What is left over is real — prompt
+  assembly, the fold, the loop's own bookkeeping — and it is reported by
+  subtraction rather than folded into a neighbouring phase to make the arithmetic
+  tidy.
+
+The attribution is written inside the same transaction as the step it belongs to,
+after the lease check, so a driver that lost its lease cannot write one. Nothing
+here is a gate: no test asserts any of these durations, for the reason
+`docs/MEASUREMENTS.md` gives at its top.
+
 ## What a finished run cost
 
 `Store::run_summary` returns one row per finished run: did it work, how many

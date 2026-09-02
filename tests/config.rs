@@ -591,6 +591,14 @@ run = ["io-harness-config-test-hook"]
 on_failure = "cancel"
 timeout_ms = 250
 
+[routing]
+escalate_after = 3
+escalate_to = "big-model"
+downshift_under = 2048
+downshift_to = "small-model"
+require_primary = true
+mechanical = "tiny-model"
+
 [profile.cheap]
 run = { max_steps = 5 }
 "#;
@@ -757,8 +765,20 @@ fn f7_every_key_reaches_a_typed_field() {
     assert_eq!(web.allowed_domains, ["docs.rs", "crates.io"]);
     assert_eq!(web.blocked_domains, ["evil.test"]);
 
+    // 0.75.0. The two paired rules arrive as pairs, which is the whole reason the
+    // file spells each as two keys and the loader refuses half of one.
+    let routing = applied
+        .routing
+        .clone()
+        .expect("[routing] reaches the contract");
+    assert_eq!(routing.escalate_after, Some((3, "big-model".into())));
+    assert_eq!(routing.downshift_under, Some((2048, "small-model".into())));
+    assert!(routing.require_primary);
+    assert_eq!(routing.mechanical.as_deref(), Some("tiny-model"));
+
     // Every one of those is different from the default it would otherwise hold.
     let plain = contract(project.path());
+    assert_ne!(applied.routing, plain.routing);
     assert_ne!(applied.max_steps, plain.max_steps);
     assert_ne!(applied.max_retries, plain.max_retries);
     assert_ne!(applied.retry, plain.retry);
@@ -3236,4 +3256,185 @@ fn an_unrelated_unknown_key_in_an_mcp_table_is_still_accepted() {
         Config::discover(project.path()).expect("the `[[mcp]]` exemption is narrowed, not closed");
     assert_eq!(config.mcp_servers().len(), 1);
     assert!(config.mcp_servers()[0].enabled);
+}
+
+// 0.75.0 — `[routing]`, the door `Routing` never had.
+
+/// F17 — a file inside the workspace may not choose which model answers.
+///
+/// `Config::from_toml` parses as the **project** scope, which is what makes this
+/// one line the whole test: the refusal happens before the section is ever
+/// deserialized, so there is no path by which a cloned repository's `[routing]`
+/// reaches a contract.
+#[test]
+fn f17_a_project_scoped_file_may_not_declare_routing() {
+    let err = Config::from_toml("[routing]\nmechanical = \"attacker-model\"\n")
+        .expect_err("a workspace file may not choose the model");
+    let message = err.to_string();
+    assert!(
+        message.contains("routing"),
+        "the refusal names the section: {message}"
+    );
+    assert!(
+        message.contains("which model answers"),
+        "and says why, so an operator meets a sentence rather than a silence: {message}"
+    );
+}
+
+/// F17, inside a profile — the same rule, one level down.
+///
+/// `refuse_widening` recurses into `[profile.*]` bodies, so a section refused at
+/// the top level cannot be smuggled in under a profile that a later
+/// `with_profile` would merge over the base.
+#[test]
+fn f17_the_routing_refusal_reaches_inside_a_profile() {
+    let err = Config::from_toml("[profile.cheap.routing]\nmechanical = \"attacker-model\"\n")
+        .expect_err("a profile body is checked like the top level");
+    assert!(
+        err.to_string().contains("routing"),
+        "the refusal names the section: {err}"
+    );
+}
+
+/// F16 — a routing rule is a threshold and a model, and half of one is refused
+/// rather than half-applied.
+///
+/// A file that sets `escalate_after` and forgets `escalate_to` has written a rule
+/// the type cannot hold. Ignoring the half that is present would leave the
+/// operator with an escalation they believe is in force and is not, which is the
+/// failure mode this crate refuses everywhere else it appears.
+#[test]
+fn f16_half_a_routing_rule_is_refused_naming_the_key_that_is_missing() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        user_dir.path(),
+        "io.toml",
+        "[routing]\nescalate_after = 3\n",
+    );
+
+    let err = Config::discover(project.path()).expect_err("half a rule is not a rule");
+    let message = err.to_string();
+    assert!(
+        message.contains("routing.escalate_to"),
+        "the refusal names the key that is missing: {message}"
+    );
+
+    // The other direction is refused too — a model with no threshold never fires.
+    write(
+        user_dir.path(),
+        "io.toml",
+        "[routing]\ndownshift_to = \"small-model\"\n",
+    );
+    let err =
+        Config::discover(project.path()).expect_err("a model with no threshold is not a rule");
+    assert!(
+        err.to_string().contains("routing.downshift_under"),
+        "the refusal names the missing threshold: {err}"
+    );
+
+    // And a complete rule loads, which is the control that keeps the two
+    // assertions above from passing over a file nothing would have accepted.
+    write(
+        user_dir.path(),
+        "io.toml",
+        "[routing]\ndownshift_under = 2048\ndownshift_to = \"small-model\"\n",
+    );
+    let config = Config::discover(project.path()).expect("a complete rule loads");
+    let routing = config
+        .apply_to(contract(project.path()))
+        .routing
+        .expect("the rule reaches the contract");
+    assert_eq!(routing.downshift_under, Some((2048, "small-model".into())));
+}
+
+/// F16 — half a rule is refused inside a `[profile]` body too.
+///
+/// Found by the adversarial review before the seal. A profile body is a whole
+/// `File` that `with_profile` merges over the base, so a half-rule hidden in one
+/// reached the same place by a different path and was dropped in silence — the
+/// exact "a rule the operator believes is in force and is not" the check exists
+/// to prevent. Every sibling validator in `config.rs` recurses into profile
+/// bodies; this one did not.
+#[test]
+fn f16_half_a_routing_rule_is_refused_inside_a_profile_body_too() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        user_dir.path(),
+        "io.toml",
+        "[profile.cheap]\nrouting = { escalate_after = 3 }\n",
+    );
+
+    let err = Config::discover(project.path())
+        .expect_err("a half-rule in a profile is still a half-rule");
+    assert!(
+        err.to_string().contains("routing.escalate_to"),
+        "the refusal names the missing key wherever the rule was written: {err}"
+    );
+
+    // The control: the same profile with both halves loads, so the assertion
+    // above cannot pass over a file the loader would have refused anyway.
+    write(
+        user_dir.path(),
+        "io.toml",
+        "[profile.cheap]\nrouting = { escalate_after = 3, escalate_to = \"big-model\" }\n",
+    );
+    Config::discover(project.path()).expect("a complete rule in a profile loads");
+}
+
+/// F16 — an unset `[routing]` leaves 0.74.0's behaviour exactly as it was.
+///
+/// The knob is opt-in and the release turns nothing on by default: a store, a
+/// contract and a run that never mention routing must be byte-identical to what
+/// they were before the section existed.
+#[test]
+fn f16_a_file_with_no_routing_section_leaves_the_contract_untouched() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(user_dir.path(), "io.toml", "[run]\nmax_steps = 4\n");
+
+    let applied = Config::discover(project.path())
+        .unwrap()
+        .apply_to(contract(project.path()));
+    assert_eq!(applied.max_steps, 4, "the file was read");
+    assert_eq!(
+        applied.routing,
+        contract(project.path()).routing,
+        "and routing is whatever the contract already carried, not a default the \
+         file imposed"
+    );
+}
+
+/// F16 — a file that names only the mechanical model does not clear an
+/// escalation the caller built in Rust.
+///
+/// The projection is key by key for the same reason the memory caps are: a
+/// section-wide replacement would silently reset the rules it did not mention,
+/// and a caller who set an escalation programmatically would lose it to a file
+/// that never mentioned one.
+#[test]
+fn f16_naming_one_routing_key_leaves_the_rules_the_file_did_not_mention() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        user_dir.path(),
+        "io.toml",
+        "[routing]\nmechanical = \"tiny-model\"\n",
+    );
+
+    let built = contract(project.path())
+        .with_routing(io_harness::Routing::new().escalate_after(2, "big-model"));
+    let applied = Config::discover(project.path()).unwrap().apply_to(built);
+    let routing = applied.routing.expect("routing survives");
+    assert_eq!(routing.mechanical.as_deref(), Some("tiny-model"));
+    assert_eq!(
+        routing.escalate_after,
+        Some((2, "big-model".into())),
+        "the file named one key and left the rest of the rules alone"
+    );
 }

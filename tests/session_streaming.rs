@@ -255,9 +255,14 @@ async fn a_one_shot_run_emits_no_deltas_and_a_session_turn_does() {
     // 0.74.0's row is announced rather than only recorded, because
     // `sandbox_events` and the event stream are held to each other row for row —
     // see `observe::the_verify_gates_sandbox_is_announced_as_sandbox_events_records_it`.
+    //
+    // 0.75.0 adds the fourth, and it is the one "other" that arrives *after* the
+    // step rather than before it: `StepAttributed` says where that step's wall
+    // clock went, and it is emitted beside `Step` from the same place, once the
+    // checkpoint that carries the numbers has succeeded.
     assert_eq!(
         *quiet.kinds.lock().unwrap(),
-        vec!["started", "other", "other", "other", "step", "finished"]
+        vec!["started", "other", "other", "other", "step", "other", "finished"]
     );
 
     // The control: the same provider, through a session turn.

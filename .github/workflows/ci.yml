@@ -139,7 +139,7 @@ jobs:
           key: ${{ matrix.features }}
       # nextest, installed from a prebuilt binary by a SHA-pinned action like
       # every other `uses:` in this file. Not a crate dependency.
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
         with:
           tool: cargo-nextest
       # `--tests` plus the fixture examples by name, NOT `--all-targets`.
@@ -313,7 +313,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: contained
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
         with:
           tool: cargo-nextest
       # Deliberately no `sysctl` step. Reported so a reader of the log can see
@@ -774,6 +774,72 @@ jobs:
             exit 1
           fi
           echo "still pinned to =0.73.0"
+
+  # And the same again for 0.74.0's boundary — a fifth job, for the same reason
+  # the fourth was a job rather than a step: independent pins are independent
+  # evidence, and folding them together lets one crates.io outage take out every
+  # backwards claim at once.
+  #
+  # 0.75.0 adds two things a store can see and calls both additive: a
+  # `memory_token_cache` table beside `memory`, and five nullable latency columns
+  # on `steps`. Neither bumps `CHECKPOINT_FORMAT`. Additive is a claim, and this
+  # job is the only thing in the tree that tests it — every other test that
+  # touches either surface reads rows the same tree has just written, which is
+  # exactly the shape of suite that stayed green through 0.72.0 while a
+  # serialization change made every question in a 0.72.0 store unreadable to a
+  # real 0.71.0 binary.
+  #
+  # The whole file rather than one `--exact` test, unlike the four jobs above.
+  # 0.75.0 puts the older binary in two positions, not one: reading a store this
+  # tree wrote, and then writing into it — a 0.74.0 `memory_put` leaves the new
+  # cache table without a line for the entry it just wrote, and the second test
+  # is what a 0.75.0 reader then answers. There is no forwards half and no
+  # committed `store-0.74.0/` database: a release that only adds a table and some
+  # nullable columns reads an older store by construction, and that half has
+  # passed from its first run since 0.72.0 without ever being able to fail.
+  # No dots in the job id — that is a parse-time failure of the whole workflow,
+  # which is a 0-second run and not a test failure.
+  cross-version-0-74-0:
+    name: cross-version-0.74.0 (0.74.0 reads a store this tree wrote)
+    runs-on: ubuntu-latest
+    # Compiles the previous release from crates.io with a bundled SQLite, then this
+    # tree's test binary. 20 minutes, in line with the other single-OS jobs.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # The pinned generator: `io-harness = "=0.74.0"` from crates.io, in its own
+      # workspace with its own target directory, so it never drags a second
+      # `libsqlite3-sys` into this crate's build.
+      - name: build the pinned 0.74.0 binary
+        working-directory: tests/fixtures/gen-0.74.0
+        run: cargo build
+      # `--ignored` because both tests in that file are ignored by default — they
+      # need the binary the step above just produced, and a test that silently
+      # passes when its subject is missing is worse than one that is visibly not
+      # run.
+      - name: a 0.74.0 binary reads and writes a store this tree wrote
+        run: cargo test --test cross_version_0_74_0 -- --ignored
+      # The control. The generator is supposed to be the PREVIOUS release, and the one
+      # way this job quietly stops proving anything is that pin drifting to a version
+      # that already knows about whatever the new release changed. Checked here rather
+      # than trusted, because the failure is silent by construction.
+      - name: the generator is still pinned to 0.74.0
+        run: |
+          set -uo pipefail
+          if ! grep -q '^io-harness = "=0.74.0"$' tests/fixtures/gen-0.74.0/Cargo.toml; then
+            echo "::error::tests/fixtures/gen-0.74.0 is no longer pinned to =0.74.0."
+            echo "That pin is what makes this job evidence rather than a label:"
+            echo "with it drifted, the 'older binary' is not older and the"
+            echo "backwards-compatibility claim is unproven."
+            exit 1
+          fi
+          echo "still pinned to =0.74.0"
 
   # OP1 — the docs.rs build, reproduced. This job exists because of a defect no
   # other job in this file could see.

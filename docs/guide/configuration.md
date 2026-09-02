@@ -265,6 +265,42 @@ The two rules answer different questions — a number a workspace file lowers is
 ceiling an operator still chose, where a section a workspace file declares is a
 program an operator never saw.
 
+## `[routing]` — which model answers, and when (0.75.0)
+
+```toml
+[routing]
+escalate_after = 3              # consecutive failed gate attempts
+escalate_to    = "big-model"    # ...then ask this one instead
+downshift_under = 2048          # while the run has written fewer bytes than this
+downshift_to    = "small-model" # ...ask this one
+require_primary = true          # refuse to start if the provider says it is down
+mechanical      = "tiny-model"  # the completions the crate makes on its own behalf
+```
+
+The rules have existed since 0.34.0 and were reachable only from Rust. Nothing
+about their behaviour changed in 0.75.0; this is the door.
+
+**A rule is a threshold and a model, and half of one is refused at load.** The
+pairs are one value each in Rust and two keys each here, because an array holding
+a number and a string reads as a mistake in a config file. Writing
+`escalate_after` without `escalate_to` is an error naming the missing key rather
+than a rule that silently never fires — the same answer an unset `${env:}` gets,
+and for the same reason.
+
+`mechanical` names the model for the completions this crate makes on its own
+behalf rather than the caller's. There is exactly one today: the summary written
+when a long context is folded, which otherwise runs on whatever model is doing the
+work. Its failure mode is quiet — a summary from a model too small to summarise
+degrades every later turn without failing anything — so the model that answered it
+is on the trace.
+
+**`[routing]` is refused in a file inside the workspace**, `io.toml` and
+`io.local.toml` alike, and inside a `[profile]` body. A table that decides which
+model answers, and which model reads the whole transcript when the context is
+folded, is one a cloned repository must not write. It names no program and no
+endpoint, so the 0.74.0 clauses do not catch it; it is refused on the same
+principle. Write it in the user-scope file.
+
 ## `[memory]` — what a workspace's durable notes may hold
 
 ```toml

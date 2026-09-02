@@ -88,6 +88,10 @@ pub(super) fn commit_step(
         );
         return Ok(());
     }
+    // Read before the checkpoint consumes it, and announced after the checkpoint
+    // succeeds: an event for a write that then failed would be a step an observer
+    // saw and the store never held.
+    let attribution = store.staged_attribution(run_id, record.step);
     store.checkpoint_step(run_id, &record)?;
     info!(
         run_id,
@@ -112,6 +116,24 @@ pub(super) fn commit_step(
             changed,
         },
     ));
+    // Beside the step rather than instead of it, so nothing an observer already
+    // matches on moves. A step whose span was never closed — the tree's paused
+    // path, and any commit outside the loop — announces nothing, exactly as it
+    // writes nothing.
+    if let Some((span_ms, [provider_ms, tool_ms, gate_ms, store_ms])) = attribution {
+        watch.emit(RunEvent::at_depth(
+            run_id,
+            record.step,
+            depth,
+            EventKind::StepAttributed {
+                span_ms,
+                provider_ms,
+                tool_ms,
+                gate_ms,
+                store_ms,
+            },
+        ));
+    }
     Ok(())
 }
 
@@ -948,7 +970,34 @@ pub(super) async fn run_workspace_from<P: Provider>(
     // request stays bounded by what one step actually needed.
     let pending_media = &mut PendingMedia::default();
 
+    // 0.75.0 — where each step's wall clock goes, measured across the two
+    // boundaries a step actually has.
+    //
+    // `span_from` is deliberately not the top of the iteration. A step's span runs
+    // from the moment the *previous* step's commit began, because that commit and
+    // the ledger persist behind it are the store phase this step attributes: a row
+    // cannot time the write that creates it, and writing the number afterwards
+    // would put it outside the transaction whose lease check is the whole reason
+    // the attribution is written there. Every millisecond between the loop's entry
+    // and its last commit therefore belongs to exactly one step's span, and no
+    // step's parts can exceed its own.
+    //
+    // Only this loop attributes. The sub-agent tree in `run/tree.rs` has its own
+    // loop and its own commit, and it is left unattributed rather than half
+    // attributed — a tree step whose gate was timed and whose span was not would
+    // read as a step that spent nothing, which is the one thing this must never
+    // say. Bringing it in is one `open`/`close` pair around that loop's step.
+    let mut span_from = std::time::Instant::now();
+    let mut store_tail: Option<std::time::Duration> = None;
+
     for step in start_step..=contract.max_steps {
+        // 0.75.0 — this step is the one being attributed from here on. Whatever the
+        // last step left staged is discarded: a step that never reached its commit
+        // attributes nothing.
+        store.open_step_attribution(run_id, step);
+        if let Some(tail) = store_tail.take() {
+            store.attribute_store(run_id, step, tail);
+        }
         // The store's copy of each live handle's processes, refreshed each step.
         //
         // Kept current here rather than swept at the end because this loop has
@@ -1180,7 +1229,14 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 0,
             );
 
-            match complete_with_retry(
+            // 0.75.0 — the step's provider phase, bracketed here rather than read
+            // off the per-attempt bracket `complete_with_retry` already keeps for
+            // `provider_calls.latency_ms`. A step that retried twice waited for
+            // the provider through both attempts and the backoff between them,
+            // and a phase that counted only the attempt that answered would
+            // report a step that spent its wall clock nowhere.
+            let asked_at = std::time::Instant::now();
+            let answered = complete_with_retry(
                 provider,
                 &request,
                 contract,
@@ -1193,8 +1249,9 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 !recovered && contract.compaction.enabled(),
                 spec.as_mut(),
             )
-            .await
-            {
+            .await;
+            store.attribute_provider(run_id, step, asked_at.elapsed());
+            match answered {
                 Ok(response) => break (response, assembled, user),
                 // The same condition `may_compact` was passed under, so the loop and
                 // `complete_with_retry` cannot disagree about whether this run is
@@ -1415,6 +1472,15 @@ pub(super) async fn run_workspace_from<P: Provider>(
                         .take_while(|e| **e == ToolEffect::ReadOnly)
                         .count();
                 if end - at > 1 {
+                    // 0.75.0 — the batch is the step's tool phase too. Unlike a
+                    // speculated call, whose work happened off the stream before
+                    // this arm, `read_batch` runs synchronously here, after the
+                    // completion settled and inside the step's own span. Leaving
+                    // it unbracketed made a step whose reads were batched report
+                    // no tool phase at all, which reads as "no tool ran" — and
+                    // every test of the attribution drove writes, which are
+                    // serial, so nothing caught it.
+                    let batched_at = std::time::Instant::now();
                     batched = read_batch(
                         &ws,
                         &response.tool_calls[at..end],
@@ -1430,8 +1496,12 @@ pub(super) async fn run_workspace_from<P: Provider>(
                         contract.max_parallel_reads,
                         &contract.goal,
                         contract.tool_hooks.as_deref(),
+                        // (0.75.0) The batch can now contain a call that spawns —
+                        // a git reader — so the run's containment has to reach it.
+                        containment.as_ref(),
                     )
                     .await?;
+                    store.attribute_tool(run_id, step, batched_at.elapsed());
                 }
             }
             let call = &response.tool_calls[at];
@@ -1443,14 +1513,51 @@ pub(super) async fn run_workspace_from<P: Provider>(
             // in call order, at exactly the point `read_batch` makes it, so an
             // observer sees the same events in the same order whether the read
             // started early or not.
+            // 0.75.0 — and the containment rows for a speculated call that
+            // spawned, for the same reason and in the same place. `Speculation`
+            // holds no store, so a git reader started off the stream cannot write
+            // them where `read_batch` does, around its spawn. All three land here
+            // instead, in call order: the set of rows a run leaves is the same
+            // whether the read started early or not, and their position within
+            // the step is not — which is stated in `docs/CONTRACT.md` rather than
+            // claimed away.
+            // The containment this call actually spawned under, which is the
+            // call's own narrowed one and not the run's grant: a git reader runs
+            // `read-only` inside a run granting `workspace-write`, and a row
+            // naming the run's grant would say the opposite of what confined the
+            // process.
+            let spawned = spec.as_ref().and_then(|s| s.spawned(position)).cloned();
             let speculated = spec.as_mut().and_then(|s| s.take(position));
             if speculated.is_some() {
                 announce(watch, run_id, step, 0, call);
+                if let Some(c) = &spawned {
+                    for event in [
+                        // The same helper the batch path uses, so the row carries
+                        // the same backend and the same mode detail rather than a
+                        // second spelling of them.
+                        sandbox_create(run_id, step, c),
+                        crate::state::SandboxEvent::exec(
+                            run_id,
+                            step,
+                            c.backend().as_str(),
+                            &call.name,
+                        ),
+                        crate::state::SandboxEvent::destroy(run_id, step),
+                    ] {
+                        record_sandbox_step(store, watch, 0, &event);
+                    }
+                }
             }
             let dispatched = match speculated.or_else(|| batched.pop_front()) {
                 Some(done) => done,
                 None => {
-                    dispatch(
+                    // 0.75.0 — the step's tool phase, one reading per call and
+                    // summed. A speculated or batched read is not timed here: its
+                    // work happened off the stream, before this arm, and charging
+                    // it to the call that collected it would report the step
+                    // spending time it had already spent somewhere else.
+                    let dispatched_at = std::time::Instant::now();
+                    let done = dispatch(
                         &ws,
                         call,
                         approver,
@@ -1483,7 +1590,9 @@ pub(super) async fn run_workspace_from<P: Provider>(
                         &contract.goal,
                         contract.tool_hooks.as_deref(),
                     )
-                    .await?
+                    .await;
+                    store.attribute_tool(run_id, step, dispatched_at.elapsed());
+                    done?
                 }
             };
             match dispatched {
@@ -1574,6 +1683,13 @@ pub(super) async fn run_workspace_from<P: Provider>(
         // `est_tokens`) are not lost with the loop's own `info!`: `assemble`
         // records them as the step's `"assembled"` context event, which is where a
         // reader could already find them.
+        //
+        // 0.75.0 — and the step's span ends here, at the last instant before the
+        // write, because the write is what carries it. What the commit itself
+        // costs is measured below and attributed to the next step, which is the
+        // only step whose row can hold it.
+        let commit_from = std::time::Instant::now();
+        store.close_step_attribution(run_id, step, span_from.elapsed());
         commit_step(
             store,
             watch,
@@ -1591,6 +1707,10 @@ pub(super) async fn run_workspace_from<P: Provider>(
         // durable. After the commit rather than before: a ledger that ran ahead of
         // the trace would restore observations for a step the run never took.
         written = persist_ledger(store, run_id, &ledger, written)?;
+        // Both durable writes are behind us, so this is the whole store phase, and
+        // the next step's span starts where it started.
+        store_tail = Some(commit_from.elapsed());
+        span_from = commit_from;
 
         // Did that step get anywhere? A stall needs both halves — nothing changed
         // in the workspace AND a tool call this window already saw — because a

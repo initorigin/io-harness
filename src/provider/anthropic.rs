@@ -549,7 +549,11 @@ struct Accumulator {
     /// 0.18.0 — the cache breakdown of `input_tokens`, the model that answered,
     /// why it stopped, and the provider-executed tool requests it made. All
     /// carried on events the accumulator already reads and, until now, dropped.
-    cache_write_tokens: u64,
+    /// (0.75.0) `None` until Anthropic actually reports the counter. This wire
+    /// does carry it, so an absent field means the call wrote nothing worth
+    /// reporting rather than that the wire cannot say — but the accumulator
+    /// keeps the two apart and lets the response speak for itself.
+    cache_write_tokens: Option<u64>,
     cache_read_tokens: u64,
     server_tool_requests: u64,
     model: Option<String>,
@@ -850,7 +854,7 @@ impl Accumulator {
         let Some(usage) = usage else { return };
         let get = |k: &str| usage.get(k).and_then(|v| v.as_u64());
         if let Some(n) = get("cache_creation_input_tokens") {
-            self.cache_write_tokens = n;
+            self.cache_write_tokens = Some(n);
         }
         if let Some(n) = get("cache_read_input_tokens") {
             self.cache_read_tokens = n;
@@ -913,7 +917,7 @@ impl Accumulator {
         let prompt = self
             .input_tokens
             .saturating_add(self.cache_read_tokens)
-            .saturating_add(self.cache_write_tokens);
+            .saturating_add(self.cache_write_tokens.unwrap_or(0));
         // Anthropic reports no total, so this one is summed rather than taken as
         // reported.
         let total = prompt.saturating_add(self.output_tokens);
@@ -1269,7 +1273,8 @@ mod tests {
 
         let out = acc.finish();
         let u = out.usage.unwrap();
-        assert_eq!(u.cache_write_tokens, 300);
+        assert_eq!(u.cache_write_tokens, Some(300));
+        assert!(u.cache_writes_reported());
         assert_eq!(u.cache_read_tokens, 1_200);
         assert_eq!(u.server_tool_requests, 2);
         // Anthropic reports `input_tokens` EXCLUDING the cached ones, so the
@@ -1295,7 +1300,11 @@ mod tests {
 
         let out = acc.finish();
         let u = out.usage.unwrap();
-        assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (0, 0));
+        // Anthropic reported no cache object at all on this exchange, so the
+        // write counter is absent rather than zero — the distinction 0.75.0
+        // draws, and the reason a rate taken off this call is a rate over an
+        // unknown write cost.
+        assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (0, None));
         assert_eq!(u.server_tool_requests, 0);
         assert_eq!(u.prompt_tokens, 11);
         assert_eq!(u.total_tokens, 18);

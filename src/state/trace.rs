@@ -7,6 +7,8 @@
 //! file of credentials puts those credentials in `steps.result`, and the
 //! database outlives the run that wrote it. That is why the store file is
 //! created readable only by the user that made it — see [`Store::open`].
+use std::time::Duration;
+
 use super::*;
 
 impl Store {
@@ -544,9 +546,161 @@ impl Store {
         self.turn.borrow_mut().insert(run_id, turn);
     }
 
-    /// Drop the turn staged for a run this handle no longer drives (0.64.0).
+    /// Drop what is staged for a run this handle no longer drives (0.64.0) —
+    /// the turn, and the step attribution staged beside it (0.75.0).
+    ///
+    /// Both cells are cleared here rather than one each at two call sites,
+    /// because they are staged and consumed together and a run given up releases
+    /// both at the same instant. Called from `release_lease`.
     pub(crate) fn forget_staged_turn(&self, run_id: i64) {
         self.turn.borrow_mut().remove(&run_id);
+        self.attribution.borrow_mut().remove(&run_id);
+    }
+
+    // ---- 0.75.0: where a step's wall clock went ----
+
+    /// Begin attributing `step`, discarding whatever the previous step left
+    /// staged (0.75.0).
+    ///
+    /// The run loop calls this at the top of each step. Everything measured
+    /// before it, and everything measured for a run no loop has opened a step on,
+    /// is dropped — which is what keeps a sub-agent tree's dispatch, and a direct
+    /// caller's own gate, from attributing time to a step that did not spend it.
+    pub(crate) fn open_step_attribution(&self, run_id: i64, step: u32) {
+        let staged = StagedAttribution {
+            step,
+            ..Default::default()
+        };
+        self.attribution.borrow_mut().insert(run_id, staged);
+    }
+
+    /// Close the open step with the span it took, making it eligible to be
+    /// written by the commit that ends it (0.75.0).
+    ///
+    /// A step whose span is never closed is never attributed: an open row means
+    /// the loop did not reach its commit, and a `0` there would be
+    /// indistinguishable from a step that genuinely finished inside a
+    /// millisecond.
+    pub(crate) fn close_step_attribution(&self, run_id: i64, step: u32, span: Duration) {
+        if let Some(staged) = self.attribution.borrow_mut().get_mut(&run_id) {
+            if staged.step == step {
+                staged.span_ms = Some(span.as_millis() as u64);
+            }
+        }
+    }
+
+    /// The closed attribution staged for `step`, without consuming it (0.75.0).
+    ///
+    /// So the commit can announce exactly what it is about to write, from the
+    /// same staged numbers, rather than reading the row back or keeping a second
+    /// copy in the loop. `None` while the span is still open, which is the same
+    /// condition [`Self::checkpoint_step`] uses to decide there is nothing to
+    /// write — the event and the row cannot disagree because they are filtered by
+    /// one rule.
+    pub(crate) fn staged_attribution(
+        &self,
+        run_id: i64,
+        step: u32,
+    ) -> Option<(u64, [Option<u64>; 4])> {
+        self.attribution
+            .borrow()
+            .get(&run_id)
+            .filter(|a| a.step == step)
+            .and_then(|a| {
+                a.span_ms
+                    .map(|span| (span, [a.provider_ms, a.tool_ms, a.gate_ms, a.store_ms]))
+            })
+    }
+
+    /// Add `elapsed` to the provider phase of the open step (0.75.0).
+    pub(crate) fn attribute_provider(&self, run_id: i64, step: u32, elapsed: Duration) {
+        self.attribute(run_id, step, StepPhase::Provider, elapsed);
+    }
+
+    /// Add `elapsed` to the tool-execution phase of the open step (0.75.0).
+    pub(crate) fn attribute_tool(&self, run_id: i64, step: u32, elapsed: Duration) {
+        self.attribute(run_id, step, StepPhase::Tool, elapsed);
+    }
+
+    /// Add `elapsed` to the policy-gate phase of the open step (0.75.0), which is
+    /// a part of the tool phase and not a fourth beside it.
+    pub(crate) fn attribute_gate(&self, run_id: i64, step: u32, elapsed: Duration) {
+        self.attribute(run_id, step, StepPhase::Gate, elapsed);
+    }
+
+    /// Add `elapsed` to the store phase of the open step (0.75.0) — the commit
+    /// that ended the *previous* step, for the reason [`StepAttribution`] gives.
+    pub(crate) fn attribute_store(&self, run_id: i64, step: u32, elapsed: Duration) {
+        self.attribute(run_id, step, StepPhase::Store, elapsed);
+    }
+
+    /// Accumulate one phase reading onto the open step, or drop it.
+    ///
+    /// Accumulating rather than setting, because a step dispatches many calls and
+    /// may ask the provider more than once, and each of those is one reading of
+    /// the same phase. Whole milliseconds per reading rather than nanoseconds
+    /// summed and rounded once: the phases are compared against a span rounded
+    /// the same way, and rounding each part down is what keeps the sum of the
+    /// parts from exceeding the whole.
+    ///
+    /// A reading for a step that is not the open one is dropped. It belongs to a
+    /// loop this cell is not driving, and attributing it to whatever step happens
+    /// to be open would be worse than losing it.
+    fn attribute(&self, run_id: i64, step: u32, phase: StepPhase, elapsed: Duration) {
+        if let Some(staged) = self.attribution.borrow_mut().get_mut(&run_id) {
+            if staged.step == step {
+                let slot = match phase {
+                    StepPhase::Provider => &mut staged.provider_ms,
+                    StepPhase::Tool => &mut staged.tool_ms,
+                    StepPhase::Gate => &mut staged.gate_ms,
+                    StepPhase::Store => &mut staged.store_ms,
+                };
+                *slot = Some(slot.unwrap_or(0) + elapsed.as_millis() as u64);
+            }
+        }
+    }
+
+    /// The one statement [`Self::step_attributions`] runs, named so the
+    /// query-plan assertion can `EXPLAIN` the text the crate executes rather than
+    /// a copy of it that can drift.
+    ///
+    /// `span_ms IS NOT NULL` is what makes an unattributed step absent rather
+    /// than a row of zeroes: every step committed before 0.75.0, every step of a
+    /// sub-agent tree, and every row a direct caller of `record` wrote.
+    ///
+    /// The TTFT is the step's *last* attempt, which is the one that answered: a
+    /// step that retried has a row per attempt, and the failed ones measured a
+    /// broken connection rather than a first token.
+    pub(crate) const STEP_ATTRIBUTIONS_SQL: &'static str = "SELECT step, span_ms, provider_ms, \
+         tool_ms, gate_ms, store_ms, \
+         (SELECT p.ttft_ms FROM provider_calls p \
+           WHERE p.run_id = steps.run_id AND p.step = steps.step \
+           ORDER BY p.attempt DESC LIMIT 1) \
+         FROM steps WHERE run_id = ?1 AND span_ms IS NOT NULL ORDER BY step ASC";
+
+    /// Where each of a run's steps spent its wall clock, oldest step first
+    /// (0.75.0).
+    ///
+    /// One reading answers "where did this step go": the phases the step was
+    /// measured in, what it did not account for, and — for a step that called a
+    /// provider — how long that provider took to produce its first token. See
+    /// [`StepAttribution`] for what each phase covers and what the numbers do not
+    /// claim.
+    ///
+    /// Empty for a run driven before 0.75.0 and for a run that committed no
+    /// attributed step. The two are the same to a reader, and both mean the same
+    /// thing: nothing here was measured, which is not the same as measuring zero.
+    pub fn step_attributions(&self, run_id: i64) -> Result<Vec<StepAttribution>> {
+        let mut stmt = self.conn.prepare(Self::STEP_ATTRIBUTIONS_SQL)?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(StepAttribution::new(r.get::<_, i64>(0)? as u32, r.get(1)?)
+                .with_provider_ms(r.get(2)?)
+                .with_tool_ms(r.get(3)?)
+                .with_gate_ms(r.get(4)?)
+                .with_store_ms(r.get(5)?)
+                .with_ttft_ms(r.get(6)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// The one statement [`Self::step_turns`] runs, named so the query-plan
@@ -701,9 +855,34 @@ impl Store {
                 return Err(self.conflict_for(run_id)?);
             }
         }
+        // 0.75.0 — where this step's wall clock went, on the row the step is
+        // written as and inside the transaction that writes it. Out of the
+        // staging cell rather than off the `StepRecord`, for the reasons
+        // `Store::attribution` gives, and *after* the lease check above, so a
+        // driver whose run was taken from it attributes nothing: a stolen driver's
+        // phases describe work the winner's trace never took.
+        //
+        // A step the loop never closed off — and every direct caller of this
+        // method, which stages nothing — writes five `NULL`s, which is how a
+        // reader tells an unmeasured step from one that spent nothing.
+        //
+        // Matched on the step number for the reason the turn below is: a
+        // checkpoint of some *other* step must not adopt an attribution it did
+        // not earn. A step number committed twice — a retry after a tool error
+        // writes a second `steps` row — puts the same accumulated numbers on both
+        // rows, because both rows are that step and the phases were measured
+        // across it.
+        let phases = self
+            .attribution
+            .borrow()
+            .get(&run_id)
+            .filter(|a| a.step == step.step && a.span_ms.is_some())
+            .map(|a| (a.span_ms, a.provider_ms, a.tool_ms, a.gate_ms, a.store_ms))
+            .unwrap_or_default();
         tx.execute(
-            "INSERT INTO steps (run_id, step, decision, result, prompt, tool_call, tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO steps (run_id, step, decision, result, prompt, tool_call, tokens,
+                                span_ms, provider_ms, tool_ms, gate_ms, store_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             (
                 run_id,
                 step.step,
@@ -712,6 +891,11 @@ impl Store {
                 &step.prompt,
                 &step.tool_call,
                 step.tokens,
+                phases.0,
+                phases.1,
+                phases.2,
+                phases.3,
+                phases.4,
             ),
         )?;
         tx.execute(
@@ -1684,6 +1868,69 @@ mod tests {
             "{STEPS} committed steps, median of {ROUNDS} rounds:\n  \
              steps row only          {without:?}\n  \
              steps row + turn        {with:?}"
+        );
+    }
+
+    /// 0.75.0 — what per-step latency attribution costs the step it measures.
+    ///
+    /// The instrument has to be cheap enough that the number it reports is about
+    /// the work rather than about the measurement, and that claim is worth a
+    /// number rather than an assurance. Prints; asserts nothing, because a
+    /// duration asserted on a CI runner is a flake.
+    ///
+    /// Both arms assert they wrote the same number of `steps` rows before
+    /// anything is reported, and that the attributions are present exactly when
+    /// they were staged — 0.63.0's first facade measurement was itself the defect
+    /// for want of that check.
+    ///
+    /// Run with `cargo test --release --lib what_step_attribution_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "prints a measurement; asserts nothing"]
+    fn what_step_attribution_costs_per_step() {
+        const ROUNDS: usize = 21;
+        const STEPS: u32 = 40;
+
+        let median = |mut v: Vec<std::time::Duration>| {
+            v.sort();
+            v[v.len() / 2]
+        };
+        let run = |attribute: bool| {
+            let mut times = Vec::new();
+            for _ in 0..ROUNDS {
+                let store = Store::memory().unwrap();
+                let run_id = store.start_run("goal", "/repo").unwrap();
+                let started = std::time::Instant::now();
+                for step in 1..=STEPS {
+                    if attribute {
+                        // What one step of the loop does: open the span, take a
+                        // reading per phase, close it.
+                        store.open_step_attribution(run_id, step);
+                        store.attribute_provider(run_id, step, Duration::from_millis(3));
+                        store.attribute_tool(run_id, step, Duration::from_millis(2));
+                        store.attribute_gate(run_id, step, Duration::from_micros(400));
+                        store.attribute_store(run_id, step, Duration::from_micros(900));
+                        store.close_step_attribution(run_id, step, Duration::from_millis(7));
+                    }
+                    store
+                        .checkpoint_step(run_id, &StepRecord::new(step, "read a.txt", "A"))
+                        .unwrap();
+                }
+                times.push(started.elapsed());
+                assert_eq!(store.steps(run_id).unwrap().len(), STEPS as usize);
+                assert_eq!(
+                    store.step_attributions(run_id).unwrap().len(),
+                    if attribute { STEPS as usize } else { 0 }
+                );
+            }
+            median(times)
+        };
+
+        let without = run(false);
+        let with = run(true);
+        println!(
+            "{STEPS} committed steps, median of {ROUNDS} rounds:\n  \
+             steps row only          {without:?}\n  \
+             steps row + attribution {with:?}"
         );
     }
 }

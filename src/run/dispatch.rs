@@ -6,6 +6,45 @@
 
 use super::*;
 
+/// [`gate`](super::gate::gate), timed as the step's policy phase (0.75.0).
+///
+/// Every gate this module asks for goes through here, because this item shadows
+/// the glob-imported one for the whole file: twenty call sites renamed by hand
+/// would be twenty chances for the twenty-first to be added untimed, and a phase
+/// that silently stops covering a tool is a number that reads as a tool getting
+/// faster.
+///
+/// **The wait for a human is part of it.** A call the policy sends to an approver
+/// spends the step's wall clock there, and the step's own span already contains
+/// it; leaving it out would move that time into the unattributed remainder and
+/// say the loop lost it.
+///
+/// The reading lands on the step the loop currently has open, and is dropped when
+/// there is none — a sub-agent tree's dispatch, which this release does not
+/// attribute.
+#[allow(clippy::too_many_arguments)]
+async fn gate(
+    ws: &Workspace,
+    approver: &dyn Approver,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    act: Act,
+    target: &str,
+    content: Option<&str>,
+    watch: &Watch<'_>,
+    depth: u32,
+    goal: &str,
+) -> Result<Gated> {
+    let gated_at = std::time::Instant::now();
+    let out = super::gate::gate(
+        ws, approver, store, run_id, step, act, target, content, watch, depth, goal,
+    )
+    .await;
+    store.attribute_gate(run_id, step, gated_at.elapsed());
+    out
+}
+
 /// Record one sandbox lifecycle row for a contained tool call, and tell the
 /// observer.
 ///
@@ -196,7 +235,17 @@ pub(super) async fn dispatch(
         // of them run alone is the batch of size one.
         GREP_TOOL | FIND_TOOL | READ_FILE_TOOL => {
             match prepare_read(
-                ws, call, approver, store, run_id, step, custom, watch, depth, goal,
+                ws,
+                call,
+                approver,
+                store,
+                run_id,
+                step,
+                custom,
+                watch,
+                depth,
+                goal,
+                exec_sandbox,
             )
             .await?
             {
@@ -3069,7 +3118,17 @@ pub(super) async fn dispatch(
         // beside another call or on its own.
         name if custom.owns(name) => {
             match prepare_read(
-                ws, call, approver, store, run_id, step, custom, watch, depth, goal,
+                ws,
+                call,
+                approver,
+                store,
+                run_id,
+                step,
+                custom,
+                watch,
+                depth,
+                goal,
+                exec_sandbox,
             )
             .await?
             {
