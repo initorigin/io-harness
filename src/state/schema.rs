@@ -274,6 +274,44 @@ impl Store {
                  ON memory_recalls (workspace, key);",
         )?;
 
+        // 0.75.0: each entry's normalised token sets, computed once instead of on
+        // every turn. The ranking tokenised every entry of every scope on every
+        // step and `remember`'s duplicate check tokenised them all again, which
+        // `docs/MEASUREMENTS.md` priced at 119 ms per ranking at 4,096 entries —
+        // the reason `memory.max_entries` was a knob nobody could raise.
+        //
+        // `created_at` is carried here rather than joined for, because it IS the
+        // invalidation: a `memory` row refreshes it on overwrite, so a cached line
+        // whose stamp no longer matches the entry's is stale by construction and
+        // the reader recomputes. Two lines per entry and not one: the ranking
+        // scores an entry on its key and value together, the duplicate check
+        // compares values alone, and deriving either from the other would make one
+        // of the two readers wrong.
+        //
+        // `UNIQUE(workspace, key)` is load-bearing rather than tidy — it is the
+        // conflict target the upsert names, and it mirrors `memory`'s own key so a
+        // cache row cannot outlive or double up on the entry it describes.
+        //
+        // A new table only, so a 0.74.0 database gains it and a 0.74.0 binary,
+        // which never queries it, still opens and resumes a migrated store.
+        // Deliberately NOT a `CHECKPOINT_FORMAT` bump, for the reason every
+        // additive table above records: no checkpoint layout changed, and bumping
+        // it would make [`Store::check_resumable`] refuse a store that is in fact
+        // readable.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_token_cache (
+                 id           INTEGER PRIMARY KEY,
+                 workspace    TEXT NOT NULL,
+                 key          TEXT NOT NULL,
+                 created_at   TEXT NOT NULL,
+                 entry_tokens TEXT NOT NULL,
+                 value_tokens TEXT NOT NULL,
+                 UNIQUE(workspace, key)
+             );
+             CREATE INDEX IF NOT EXISTS memory_token_cache_entry
+                 ON memory_token_cache (workspace, key);",
+        )?;
+
         // 0.10.0: what the context assembler decided each turn — one row per turn
         // plus one per re-read. New table only, so a 0.9.1 database gains it and a
         // 0.9.1 binary, which never queries it, still opens and resumes a migrated
@@ -1160,6 +1198,40 @@ impl Store {
                  ON tool_attempts (run_id) WHERE completed_at IS NULL;",
         )?;
 
+        // 0.75.0: where a committed step's wall clock went. Five columns on
+        // `steps` rather than a table of its own, because the attribution is one
+        // row per step by construction and is written by the transaction that
+        // writes the step — a second table would be a second row a reader would
+        // have to prove belongs to the first, and a second write the lease check
+        // would have to cover twice.
+        //
+        // Every column nullable with no default, deliberately: a step that made
+        // no provider call must read back differently from a step whose call
+        // returned inside a millisecond, which is the distinction
+        // `provider_calls.ttft_ms` has drawn since 0.18.0. A `steps` row written
+        // before this release therefore reads as "not attributed" rather than as
+        // a step that spent nothing anywhere.
+        //
+        // This is not `tool_attempts`' mechanism above. Those stamps are written
+        // outside every step transaction on purpose, so an attempt survives the
+        // process that died mid-step. These columns are only ever true of a step
+        // that committed, so they ride the commit and vanish with it.
+        //
+        // Additive, and deliberately NOT a `CHECKPOINT_FORMAT` bump, for the
+        // reason 0.62.0's lease, 0.64.0's turns and 0.65.0's attempts were not: no
+        // checkpoint layout changed, an older binary never names these columns,
+        // and bumping the format would make [`Store::check_resumable`] refuse a
+        // database it can in fact read.
+        for col in [
+            "span_ms INTEGER",
+            "provider_ms INTEGER",
+            "tool_ms INTEGER",
+            "gate_ms INTEGER",
+            "store_ms INTEGER",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE steps ADD COLUMN {col}"), []);
+        }
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -1175,6 +1247,7 @@ impl Store {
             owner: new_owner_id(),
             leases: std::cell::RefCell::new(std::collections::HashMap::new()),
             turn: std::cell::RefCell::new(std::collections::HashMap::new()),
+            attribution: std::cell::RefCell::new(std::collections::HashMap::new()),
         })
     }
 

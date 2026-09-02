@@ -330,6 +330,44 @@ pub enum EventKind {
         /// detection rests on, added in 0.11.0.
         changed: bool,
     },
+    /// Where a committed step spent its wall clock (0.75.0).
+    ///
+    /// Emitted beside [`EventKind::Step`], from the same place, so an observer
+    /// watching a live run learns where a slow step went without waiting for it to
+    /// end and reading the store. The numbers are the ones
+    /// [`StepAttribution`](crate::StepAttribution) records; this carries them onto
+    /// the stream rather than deriving a second account of them.
+    ///
+    /// Which step is the envelope's answer, so no `step` field appears here — a
+    /// variant field named like [`RunEvent`]'s own is `#[serde(flatten)]`ed into a
+    /// duplicate key that serialises and fails only on the way back.
+    ///
+    /// Every phase is optional and an absent one means the step did not have that
+    /// phase, never that it took no time: a step that dispatched no tool has no
+    /// tool phase, and the first committed step of a run has no store phase
+    /// because the write it would measure is the one that ended the step before.
+    ///
+    /// Time to first token is deliberately **not** here, though
+    /// [`StepAttribution`](crate::StepAttribution) carries it. It lives on
+    /// `provider_calls` and reaches that type through a join at read time;
+    /// putting it on the event would mean a query per step on the emit path of
+    /// every observed run, to carry a number the same reader can already get. An
+    /// observer that wants it reads
+    /// [`Store::step_attributions`](crate::Store::step_attributions).
+    StepAttributed {
+        /// The step's own measured span, in milliseconds. Every phase below is a
+        /// part of it.
+        span_ms: u64,
+        /// Waiting on the provider, across every attempt, backoff included.
+        provider_ms: Option<u64>,
+        /// Executing tool calls, summed over the calls the step dispatched.
+        tool_ms: Option<u64>,
+        /// Resolving the policy for those calls — a part of `tool_ms`, not a
+        /// sibling of it, and the part that includes waiting for a human.
+        gate_ms: Option<u64>,
+        /// The durable write that ended the previous step.
+        store_ms: Option<u64>,
+    },
     /// A tool was invoked, before its result is known.
     ToolCall {
         /// The tool's name.
@@ -1263,6 +1301,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "started",
     "recovery_paused",
     "step",
+    "step_attributed",
     "tool_call",
     "refused",
     "approval_requested",
@@ -1757,6 +1796,13 @@ mod tests {
                 tokens: 1,
                 changed: true,
             },
+            EventKind::StepAttributed {
+                span_ms: 40,
+                provider_ms: Some(30),
+                tool_ms: Some(5),
+                gate_ms: Some(1),
+                store_ms: None,
+            },
             EventKind::ToolCall {
                 name: "n".into(),
                 target: "t".into(),
@@ -1975,6 +2021,7 @@ mod tests {
                 EventKind::Started { .. }
                 | EventKind::RecoveryPaused { .. }
                 | EventKind::Step { .. }
+                | EventKind::StepAttributed { .. }
                 | EventKind::ToolCall { .. }
                 | EventKind::Refused { .. }
                 | EventKind::ApprovalRequested { .. }

@@ -1475,3 +1475,92 @@ mod stored_events {
         );
     }
 }
+
+// ------------------------------------------- 0.75.0: the step's own attribution
+
+/// F7 — every committed step is announced twice: what it decided, and where its
+/// wall clock went.
+///
+/// Beside the step event rather than instead of it. A consumer matching on
+/// `Step` must see exactly what it saw in 0.74.0, which is the half of this that
+/// a test asserting only the new variant would not notice breaking.
+#[tokio::test]
+async fn f7_a_committed_step_announces_where_its_wall_clock_went() {
+    let dir = ws();
+    let contract = never_passes(dir.path(), 2);
+    let provider = Mock::new(vec![
+        Turn::Calls(vec![call(
+            "write_file",
+            json!({ "path": "out.txt", "content": "one" }),
+        )]),
+        Turn::Calls(vec![call("read_file", json!({ "path": "out.txt" }))]),
+    ]);
+    let store = Store::memory().unwrap();
+    let watcher = Recorder::default();
+
+    run_with_observed(
+        &contract,
+        &provider,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+        &watcher,
+    )
+    .await
+    .unwrap();
+
+    let events = watcher.events();
+    let steps: Vec<u32> = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::Step { .. }))
+        .map(|e| e.step)
+        .collect();
+    let attributed: Vec<u32> = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::StepAttributed { .. }))
+        .map(|e| e.step)
+        .collect();
+    assert_eq!(
+        steps, attributed,
+        "one attribution per committed step, for the same steps, in the same order"
+    );
+    assert!(!steps.is_empty(), "the run committed something");
+
+    // The parts are parts of the whole. Asserted as an inequality and never as a
+    // duration: a number compared against a clock is the flake this project has
+    // paid for more than any other.
+    for event in &events {
+        let EventKind::StepAttributed {
+            span_ms,
+            provider_ms,
+            tool_ms,
+            gate_ms,
+            store_ms,
+        } = &event.kind
+        else {
+            continue;
+        };
+        let named = provider_ms.unwrap_or(0) + tool_ms.unwrap_or(0) + store_ms.unwrap_or(0);
+        assert!(
+            named <= *span_ms,
+            "step {}: the phases sum past the step they were measured in: \
+             {named} > {span_ms}",
+            event.step
+        );
+        // The gate is part of the tool phase rather than a sibling of it, so it
+        // is bounded by that phase and not by the span.
+        if let (Some(gate), Some(tool)) = (gate_ms, tool_ms) {
+            assert!(
+                gate <= tool,
+                "step {}: the gate is part of the tool phase: {gate} > {tool}",
+                event.step
+            );
+        }
+    }
+}
+
+// That the new tag is a name a `[[hook]]` may filter on is asserted in the crate,
+// by `every_event_the_crate_emits_is_a_name_a_hook_may_use` (`src/hooks.rs`) over
+// the `EVENT_NAMES` census, which is `pub(crate)` and deliberately not reachable
+// from here. Repeating it in an integration test would be a second, weaker copy
+// of a check that already fails the build.

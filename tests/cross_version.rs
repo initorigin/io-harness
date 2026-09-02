@@ -248,6 +248,15 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     // rather than asserts on paper.
     "tool_attempts",
     "tool_attempts_open",
+    // 0.75.0 — each memory entry's normalised token sets, computed once instead
+    // of on every turn, and the index the ranking's read seeks on. The index is
+    // not surplus: the read is `WHERE workspace = ?1`, and a scan there would put
+    // every other workspace's cached entries in front of the one being ranked,
+    // which is the cost this table exists to remove. Added and nothing altered: a
+    // 0.74.0 binary opens a store carrying both and never names either, which
+    // `tests/cross_version_0_74_0.rs` executes rather than asserts on paper.
+    "memory_token_cache",
+    "memory_token_cache_entry",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].
@@ -302,6 +311,23 @@ const COLUMNS_ADDED_SINCE_0_22_0: &[(&str, &[&str])] = &[
     ("edits", &["hunk TEXT"]),
     ("spawns", &["as_name TEXT NOT NULL DEFAULT ''"]),
     ("pending_questions", &["questions TEXT", "answers TEXT"]),
+    // 0.75.0 — where a committed step spent its wall clock. Five nullable
+    // columns on the busiest table in the store, added rather than put in a side
+    // table so they ride the step's own commit transaction: a row written outside
+    // it is a row a driver that lost its lease can still write. A step written
+    // before this release reads as "not attributed" rather than as one that spent
+    // nothing anywhere, which is what makes every column nullable rather than
+    // `NOT NULL DEFAULT 0`.
+    (
+        "steps",
+        &[
+            "span_ms INTEGER",
+            "provider_ms INTEGER",
+            "tool_ms INTEGER",
+            "gate_ms INTEGER",
+            "store_ms INTEGER",
+        ],
+    ),
 ];
 
 /// Whether `new` is `old` with exactly the declared columns added, and nothing
