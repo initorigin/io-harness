@@ -620,13 +620,27 @@ impl Dispatched {
 
 /// Whether a call in this completion can change anything (0.41.0).
 ///
-/// Three built-ins observe and change nothing: `grep`, `find` and `read_file`.
-/// **Everything else built in is [`ToolEffect::Mutating`]**, including tools that
-/// only read the world but reach it through a process — the git readers, `exec`,
-/// `shell` — because a spawn under a sandbox backend is not something this
-/// release makes concurrent, and including `list_dir` and `view_image`, which
-/// read the workspace but are outside the set the contract named. Widening the
-/// set is a later release's decision, taken with its own evidence.
+/// Four built-ins read the workspace and change nothing — `grep`, `find`,
+/// `read_file` and `list_dir` — and three more read the repository through a
+/// `git` this crate spawns: `git_log`, `git_status` and `git_diff` (0.75.0).
+/// **Everything else built in is [`ToolEffect::Mutating`]**, including `exec`,
+/// `shell` and `shell_start`, whose argv is the model's rather than this
+/// crate's.
+///
+/// **A git reader reaches the world through a process, and that is the whole of
+/// what had to be settled** before it could join the set. Three things settle
+/// it: the argv is built by [`GitCmd::argv`](crate::tools::git::GitCmd), so the
+/// set of commands that can be emitted is finite and enumerated; the three
+/// readers declare [`ExecMode::ReadOnly`](crate::ExecMode) in [`tool_mode`] and
+/// their argv carries `--no-optional-locks`, so two of them overlapping take no
+/// `.git/index.lock` and write nothing; and the overlapping path asks the policy
+/// about `Act::Exec` on `git` and about `Act::Read` on `.git` before it starts
+/// one, on exactly the terms `dispatch` asks them ([`speculable`],
+/// [`prepare_read`]).
+///
+/// `view_image` stays `Mutating` although it only reads a file: it appends to
+/// the turn's `PendingMedia`, which is the one piece of per-turn state a tool
+/// arm mutates, and it is not shared with a spawned task.
 ///
 /// A registered tool answers for itself through [`Tool::effect`](crate::Tool),
 /// which is defaulted to `Mutating`, so a toolbox assembled before 0.41.0 keeps
@@ -635,7 +649,8 @@ impl Dispatched {
 /// question about the client rather than about this loop.
 pub(super) fn tool_effect(name: &str, custom: &Toolbox) -> ToolEffect {
     match name {
-        GREP_TOOL | FIND_TOOL | READ_FILE_TOOL => ToolEffect::ReadOnly,
+        GREP_TOOL | FIND_TOOL | READ_FILE_TOOL | LIST_DIR_TOOL => ToolEffect::ReadOnly,
+        GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL => ToolEffect::ReadOnly,
         _ => custom
             .get(name)
             .map_or(ToolEffect::Mutating, |tool| tool.effect()),
@@ -656,10 +671,13 @@ pub(super) fn tool_effect(name: &str, custom: &Toolbox) -> ToolEffect {
 /// about which of them writes is a fact in two files waiting to disagree. The
 /// modes here are that table read as grants.
 ///
-/// The three read-only built-ins declare `ReadOnly` and it is **inert**: they
+/// The four read-only built-ins declare `ReadOnly` and it is **inert**: they
 /// spawn nothing, so no backend ever wraps them and no mode is ever applied. It
 /// is written down anyway because the alternative is a reader of this function
-/// wondering whether their absence meant "needs everything".
+/// wondering whether their absence meant "needs everything" — and because
+/// [`tool_effect`] calls the same four read-only, so a mode saying otherwise
+/// would be one table contradicting the other. `list_dir` joins them in 0.75.0
+/// for that reason and for no behaviour of its own.
 ///
 /// A registered tool answers for itself through
 /// [`Tool::exec_mode`](crate::tools::Tool), defaulted to `None`, so a toolbox
@@ -668,7 +686,7 @@ pub(super) fn tool_effect(name: &str, custom: &Toolbox) -> ToolEffect {
 pub(super) fn tool_mode(name: &str, custom: &Toolbox) -> Option<crate::sandbox::ExecMode> {
     use crate::sandbox::ExecMode;
     match name {
-        GREP_TOOL | FIND_TOOL | READ_FILE_TOOL => Some(ExecMode::ReadOnly),
+        GREP_TOOL | FIND_TOOL | READ_FILE_TOOL | LIST_DIR_TOOL => Some(ExecMode::ReadOnly),
         GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL => Some(ExecMode::ReadOnly),
         GIT_ADD_TOOL | GIT_COMMIT_TOOL | GIT_BRANCH_TOOL | GIT_WORKTREE_TOOL => {
             Some(ExecMode::WorkspaceWrite)
