@@ -1230,14 +1230,18 @@ impl TaskContract {
     /// use io_harness::{Config, TaskContract};
     ///
     /// # fn demo() -> io_harness::Result<()> {
-    /// let dir = tempfile::tempdir()?;
     /// // A check an operator writes instead of compiling: nothing is published
-    /// // from this repository by an agent, whatever it decides.
+    /// // from this repository by an agent, whatever it decides. It goes in the
+    /// // user scope, because since 0.74.0 no file inside the workspace — not
+    /// // `io.toml`, not `io.local.toml` — may declare a `[[hook]]`.
+    /// let home = tempfile::tempdir()?;
+    /// std::env::set_var("IO_CONFIG_HOME", home.path());
     /// std::fs::write(
-    ///     dir.path().join("io.local.toml"),
+    ///     home.path().join("io.toml"),
     ///     "[[hook]]\nat = \"before_tool\"\ntools = [\"exec\"]\nrun = [\"./no-publish\"]\n",
     /// )?;
     ///
+    /// let dir = tempfile::tempdir()?;
     /// let hooks = Config::discover(dir.path())?.hooks();
     /// let contract = TaskContract::workspace("cut the release", dir.path())
     ///     .with_tool_hooks(Arc::new(hooks));

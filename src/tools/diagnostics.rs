@@ -71,10 +71,42 @@
 //! a successful edit into a failed one, and no path here returns `Err`: the edit
 //! already happened, and reporting it as a failure because a checker was not
 //! installed would be a lie about what the harness did to the workspace.
+//!
+//! ## The reflex is an `Act::Exec` like any other (0.74.0)
+//!
+//! `cargo check` compiles, and compiling runs `build.rs` and every procedural
+//! macro in the tree: arbitrary code chosen by whoever wrote the files in the
+//! workspace, which under this crate's threat model is not the operator. Until
+//! 0.74.0 this module spawned that on the host, uncontained, without asking the
+//! policy — so a run that wrote a `Cargo.toml` naming a build script and then
+//! wrote the build script reached host execution through two calls an approver
+//! saw as writes.
+//!
+//! [`after_edit`] now asks the policy about the checker before spawning it, and
+//! asks about the same two targets `exec` and the `check` tool do: the program
+//! alone, which is what `deny_exec("cargo")` names, and the whole argv, which is
+//! what `deny_exec("cargo check*")` names. What it runs, it runs inside the run's
+//! containment.
+//!
+//! Only [`Effect::Allow`](crate::Effect::Allow) runs the checker, and an
+//! [`Effect::Ask`](crate::Effect::Ask) is a skip rather than a question. This
+//! path has no approver to route one to and could not wait for an answer if it
+//! had: the section above is a promise that a write cannot be turned into
+//! something else by what happens after it, and a write that pauses on an
+//! approval prompt is exactly that. A run that wants the reflex under an asking
+//! policy allows the checker by name.
+//!
+//! The skip is silent for the reason every other [`Outcome::Skipped`] is silent:
+//! nobody asked. The model called `write_file`, not `check`, and a refusal it
+//! cannot act on is a line of context spent on a decision that was not its own.
+//! The `check` tool is where a model that wants an answer gets one, refusal
+//! included.
 
 use std::path::Path;
 use std::time::Duration;
 
+use crate::policy::{Act, Effect, Policy};
+use crate::sandbox::ExecContainment;
 use crate::toolchain::Toolchain;
 
 use super::exec::{head_and_tail, Exec, ExecOutcome};
@@ -94,9 +126,10 @@ pub(crate) enum Outcome {
     /// The checker ran and reported nothing. The edit compiles, as far as this
     /// project's own checker is concerned.
     Clean,
-    /// No checker ran, and none was going to: the root has no marker file, or its
-    /// ecosystem has no check command cheap enough to run after every edit. Not a
-    /// problem, and not worth telling the model about.
+    /// No checker ran, and none was going to: the root has no marker file, its
+    /// ecosystem has no check command cheap enough to run after every edit, or
+    /// (0.74.0) the policy does not allow running the one it has. Not a problem,
+    /// and not worth telling the model about.
     Skipped(String),
     /// A checker was chosen and could not produce an answer — not installed, killed
     /// by the timeout, or exited non-zero while saying nothing. The reason is short
@@ -171,20 +204,45 @@ const CHECKERS: &[(&str, &[&str], Format)] = &[
 /// the caller's, so a check obeys the same limits as every other tool result rather
 /// than limits of its own.
 ///
+/// `policy` and `sandbox` are the run's, and they are what makes this a spawn the
+/// boundary can see (0.74.0): the policy decides whether the resolved argv may run
+/// at all, and the containment is the one every other spawn in the run is held to.
+/// A run that granted [`ExecMode::FullAccess`](crate::ExecMode::FullAccess) passes
+/// `None` and the check runs on the host, which is what that mode means everywhere
+/// else too.
+///
 /// **This never returns `Err` and never fails an edit.** Every way a checker can
 /// disappoint — absent, wedged, broken — arrives as [`Outcome::Failed`] carrying a
 /// sentence, because the write already happened and the model needs to know only
-/// whether it was checked.
+/// whether it was checked. A check the policy refuses is quieter still: it is an
+/// [`Outcome::Skipped`], which the caller renders as nothing at all.
 pub(crate) async fn after_edit(
     root: &Path,
     tc: Option<&Toolchain>,
     timeout: Duration,
     cap: usize,
+    policy: &Policy,
+    sandbox: Option<&std::sync::Arc<ExecContainment>>,
 ) -> Outcome {
-    match checker(tc) {
-        Ok(checker) => checker.run(root, timeout, cap).await,
-        Err(why) => Outcome::Skipped(why),
+    let checker = match checker(tc) {
+        Ok(checker) => checker,
+        Err(why) => return Outcome::Skipped(why),
+    };
+    if let Some(why) = checker.refused_by(policy) {
+        // The one place this refusal is visible. It is deliberately not in the
+        // observation — see the module header — so an operator wondering where
+        // their diagnostics went has the log and the policy, and the model has
+        // its edit.
+        tracing::debug!(%why, "post-edit check skipped by the policy");
+        return Outcome::Skipped(why);
     }
+    // Egress on a contained check follows the run's policy, exactly as it does for
+    // `exec`: a checker that may not reach the network is a checker that cannot
+    // fetch a dependency, and that is the run's statement to make rather than this
+    // module's.
+    let contained =
+        sandbox.map(|c| std::sync::Arc::new(c.with_egress(policy.permits_any_egress())));
+    checker.run(root, timeout, cap, contained.as_ref()).await
 }
 
 /// The checker this project would run, resolved without running it (0.51.0).
@@ -193,8 +251,9 @@ pub(crate) async fn after_edit(
 /// is about to spawn before it spawns it: a model-callable path to the project's
 /// build command must be an [`Act::Exec`](crate::Act::Exec) check on that
 /// command, and a policy cannot be asked about an argv nobody has resolved yet.
-/// The automatic post-edit path needs no such split — it is the crate's own
-/// reflex after a write the policy already allowed, and it stays ungated.
+/// Since 0.74.0 the post-edit path resolves for the same reason and asks the same
+/// question; what differs is only what the two do with a refusal, which is an
+/// observation for the tool and silence for the reflex.
 ///
 /// `Err` carries the reason there is no checker, which is a [`Outcome::Skipped`]
 /// to `after_edit` and an observation to the tool.
@@ -223,9 +282,56 @@ pub(crate) struct Checker {
 }
 
 impl Checker {
-    /// Run it. Never `Err`, for the reason [`after_edit`] never is.
-    pub(crate) async fn run(&self, root: &Path, timeout: Duration, cap: usize) -> Outcome {
-        run(root, &self.argv, self.format, timeout, cap).await
+    /// Run it, inside `sandbox` (0.74.0). Never `Err`, for the reason
+    /// [`after_edit`] never is.
+    ///
+    /// The containment is the caller's, already narrowed to what this call was
+    /// granted, because a checker is a compiler and a compiler runs the
+    /// workspace's own code — `build.rs`, a proc macro, a `rustc-wrapper` named
+    /// in `.cargo/config.toml`. `None` is a run that granted
+    /// [`ExecMode::FullAccess`](crate::ExecMode::FullAccess).
+    pub(crate) async fn run(
+        &self,
+        root: &Path,
+        timeout: Duration,
+        cap: usize,
+        sandbox: Option<&std::sync::Arc<ExecContainment>>,
+    ) -> Outcome {
+        run(root, &self.argv, self.format, timeout, cap, sandbox).await
+    }
+
+    /// Why the policy will not let this checker run, or `None` if it may.
+    ///
+    /// Two targets and not one, the pair every `Act::Exec` in this crate is asked
+    /// about: the program alone is what `deny_exec("cargo")` names, and the joined
+    /// argv is what `deny_exec("cargo check*")` names. Asking about only one of
+    /// them would make the other spelling a rule that silently does nothing here
+    /// while working everywhere else.
+    ///
+    /// Anything but [`Effect::Allow`] refuses. `Ask` included: see the module
+    /// header for why this path cannot ask. `super::git` writes the same rule for
+    /// a caller that sometimes can, and its `gated` field is why the two differ.
+    fn refused_by(&self, policy: &Policy) -> Option<String> {
+        let program = &self.argv[0];
+        let joined = self.argv.join(" ");
+        for target in [program.as_str(), joined.as_str()] {
+            let verdict = policy.check(Act::Exec, target);
+            if verdict.effect == Effect::Allow {
+                continue;
+            }
+            let by = match (&verdict.rule, &verdict.layer) {
+                (Some(rule), Some(layer)) => format!(" (rule {rule} in layer {layer})"),
+                (Some(rule), None) => format!(" (rule {rule})"),
+                _ => format!(" (the policy's default for exec is {:?})", verdict.effect),
+            };
+            return Some(format!(
+                "this edit is unchecked: the policy does not allow running `{target}`{by}, and \
+                 the check after an edit is not a question this path can put to an approver. \
+                 Allow it with `allow_exec(\"{program}\")` to have it run again, or call the \
+                 `check` tool, which does ask."
+            ));
+        }
+        None
     }
 }
 
@@ -241,6 +347,7 @@ async fn run(
     format: Format,
     timeout: Duration,
     cap: usize,
+    sandbox: Option<&std::sync::Arc<ExecContainment>>,
 ) -> Outcome {
     // `usize::MAX` and not `cap`: [`Exec`] would otherwise cut the *raw* stream, and
     // for `CargoJson` that means cutting NDJSON in half — the surviving text would be
@@ -252,7 +359,10 @@ async fn run(
     // `Exec` also owns the wall-clock ceiling — it is a `tokio::time::timeout` around
     // a `kill_on_drop` child — so this module does not wrap a second one around it.
     // Two timeouts over one child is two answers to the question of what killed it.
-    let outcome = Exec::new(root, timeout, usize::MAX).run(argv).await;
+    let outcome = Exec::new(root, timeout, usize::MAX)
+        .contained(sandbox.map(std::sync::Arc::clone))
+        .run(argv)
+        .await;
 
     let (code, stdout, stderr) = match outcome {
         Ok(ExecOutcome::Ran {
@@ -268,10 +378,11 @@ async fn run(
                 after.as_secs()
             ));
         }
-        // Unreachable today: diagnostics build their own uncontained `Exec`, so no
-        // backend is selected and no cap can be reported. Handled rather than
-        // `unreachable!()` so that pointing this path at a sandbox later is a
-        // compile-time decision instead of a panic in someone's run.
+        // Reachable since 0.74.0, which is when this path was pointed at the run's
+        // sandbox: a backend with a memory or CPU cap kills the compiler like any
+        // other child, and the edit that preceded it is unchecked rather than
+        // clean. Written before it was reachable, on the argument that a sandbox
+        // would arrive one day; it did.
         Ok(ExecOutcome::Capped { cap, .. }) => {
             return Outcome::Failed(format!(
                 "`{}` was killed by the {} cap, so this edit is unchecked",
@@ -412,19 +523,94 @@ mod tests {
     async fn an_unknown_ecosystem_is_a_skip_and_spawns_nothing() {
         let dir = tempfile::tempdir().unwrap();
 
-        let none = after_edit(dir.path(), None, Duration::ZERO, CAP).await;
+        let none = after_edit(
+            dir.path(),
+            None,
+            Duration::ZERO,
+            CAP,
+            &Policy::permissive(),
+            None,
+        )
+        .await;
         assert!(
             matches!(none, Outcome::Skipped(_)),
             "a root with no marker has nothing to check: {none:?}"
         );
 
         for eco in ["make", "maven", "gradle", "dotnet", "swift", "ruby"] {
-            let out = after_edit(dir.path(), Some(&toolchain(eco)), Duration::ZERO, CAP).await;
+            let out = after_edit(
+                dir.path(),
+                Some(&toolchain(eco)),
+                Duration::ZERO,
+                CAP,
+                &Policy::permissive(),
+                None,
+            )
+            .await;
             assert!(
                 matches!(out, Outcome::Skipped(_)),
                 "{eco} has no cheap checker, which is a skip and not a failure: {out:?}"
             );
         }
+    }
+
+    /// US-IO-HARNESS-0.74.0-C2: the reflex asks the policy before it spawns, and a
+    /// verdict that is not `Allow` is a skip.
+    ///
+    /// The zero timeout is what makes each arm about spawning rather than about a
+    /// return value, exactly as in the test above: anything that reached [`Exec`]
+    /// would be killed on its first poll and come back `Failed`, so a `Skipped`
+    /// proves no child was started. The last arm is the control — the same call
+    /// under a policy that allows the checker *does* reach the spawn — without
+    /// which this test would pass against an implementation that had simply
+    /// stopped checking anything.
+    #[tokio::test]
+    async fn c2_a_check_the_policy_does_not_allow_is_skipped_rather_than_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = toolchain("cargo");
+
+        for policy in [
+            // The program alone, which is the spelling `exec` refuses `cargo` with.
+            Policy::permissive().deny_exec("cargo"),
+            // The whole argv, which is the other spelling and reaches the same
+            // command. A gate that asked about only the program would run this one.
+            Policy::permissive().deny_exec("cargo check*"),
+            // `Ask` is not `Allow`, and this path has no approver to ask. The
+            // tiered default is where most embedders start, so this arm is also
+            // the statement that a default-policy run no longer compiles the
+            // workspace by reflex.
+            Policy::default(),
+        ] {
+            let out =
+                after_edit(dir.path(), Some(&cargo), Duration::ZERO, CAP, &policy, None).await;
+            let Outcome::Skipped(why) = &out else {
+                panic!("a checker the policy does not allow must not be spawned: {out:?}");
+            };
+            assert!(
+                why.contains("cargo"),
+                "the reason names the target that was refused: {why}"
+            );
+            assert!(
+                why.contains("allow_exec"),
+                "and what to do about it, or the operator has a feature that went \
+                 quiet with nothing to act on: {why}"
+            );
+        }
+
+        let allowed = after_edit(
+            dir.path(),
+            Some(&cargo),
+            Duration::ZERO,
+            CAP,
+            &Policy::permissive(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(allowed, Outcome::Failed(_)),
+            "the control: a policy that allows the checker still reaches the spawn, \
+             which the zero timeout turns into a failure rather than a skip: {allowed:?}"
+        );
     }
 
     /// F8/NF4: a checker that is not installed must not fail the edit, must not be an
@@ -439,6 +625,7 @@ mod tests {
             Format::Rendered,
             Duration::from_secs(30),
             CAP,
+            None,
         )
         .await;
 
@@ -466,6 +653,7 @@ mod tests {
             Format::CargoJson,
             Duration::from_secs(60),
             CAP,
+            None,
         )
         .await;
         assert_eq!(
@@ -547,6 +735,7 @@ mod tests {
             Format::Rendered,
             Duration::from_secs(60),
             20,
+            None,
         )
         .await;
 
@@ -565,6 +754,7 @@ mod tests {
             Format::Rendered,
             Duration::from_secs(60),
             CAP,
+            None,
         )
         .await;
         let Outcome::Found(text) = &whole else {
@@ -592,6 +782,7 @@ mod tests {
             Format::CargoJson,
             Duration::from_secs(60),
             CAP,
+            None,
         )
         .await;
         assert!(matches!(out, Outcome::Failed(_)), "{out:?}");

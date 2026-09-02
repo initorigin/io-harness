@@ -19,7 +19,7 @@
 //! a path, and nothing here writes at all — so a deck is governed by exactly the
 //! policy that governs a source file.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -32,6 +32,20 @@ use crate::tools::workspace::Workspace;
 /// are deliberately not read: boilerplate placeholder text and private notes are
 /// not what "the text of this deck" means.
 const SLIDES: &str = "ppt/slides/slide";
+
+/// The most of one slide part this will read, uncompressed.
+///
+/// `zip` bounds the compressed side of an entry and nothing bounds the other one:
+/// deflate reaches about a thousand to one on a run of a single byte, so ten
+/// megabytes of slide part inflate to something on the order of ten gigabytes,
+/// once per slide part in the archive. The read is what has to be bounded, since
+/// by the time a length could be checked the bytes are already in memory — and
+/// the length an entry declares for itself is written by whoever wrote the file.
+///
+/// Sixteen megabytes is far past any real slide part, which run under one, and
+/// small enough that a deck full of them stays an amount of memory a process can
+/// spare.
+const MAX_SLIDE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// A deck the caller pointed at could not be parsed.
 ///
@@ -123,6 +137,15 @@ fn slide_text(xml: &[u8]) -> std::result::Result<String, quick_xml::Error> {
 /// is an error naming the file rather than an empty string, for the same reason
 /// the spreadsheet reader refuses a workbook with no sheets: silence reads as
 /// "this deck is blank", which is a different and wrong thing to tell the model.
+///
+/// # The one refusal
+///
+/// Each slide part is read under a sixteen-megabyte ceiling, because a zip bounds
+/// what an entry costs compressed and not what it costs expanded. A part that
+/// runs past it fails the whole extraction rather than contributing the prefix
+/// that fit: a partial slide is indistinguishable from a short one once it is
+/// text, and a deck quietly reported as shorter than it is would be worse than a
+/// deck reported as unreadable.
 pub fn read_text(ws: &Workspace, rel: &str) -> Result<String> {
     let bytes = ws.read_bytes(rel)?;
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| unreadable(rel, e))?;
@@ -145,12 +168,27 @@ pub fn read_text(ws: &Workspace, rel: &str) -> Result<String> {
 
     let mut out = String::new();
     for (number, index) in slides {
+        let entry = archive.by_index(index).map_err(|e| unreadable(rel, e))?;
         let mut xml = Vec::new();
-        std::io::copy(
-            &mut archive.by_index(index).map_err(|e| unreadable(rel, e))?,
-            &mut xml,
-        )
-        .map_err(|e| unreadable(rel, e))?;
+        // One byte past the limit, deliberately. Reading exactly the limit leaves
+        // "the part ended" and "the read stopped" as the same observation, and the
+        // difference between them is the whole point: a slide the reader saw only
+        // the first sixteen megabytes of extracts as a short slide, and nothing in
+        // the output would tell a model that from a slide that is short. Asking
+        // for one more byte than may be kept makes the overrun a fact rather than
+        // an inference, and it is refused.
+        std::io::copy(&mut entry.take(MAX_SLIDE_BYTES + 1), &mut xml)
+            .map_err(|e| unreadable(rel, e))?;
+        if xml.len() as u64 > MAX_SLIDE_BYTES {
+            return Err(unreadable(
+                rel,
+                format!(
+                    "slide {number} expands past the {MAX_SLIDE_BYTES}-byte limit this reads a \
+                     slide part as. A part that large is a compression bomb rather than a slide, \
+                     and reading what fits would report the deck as shorter than it is"
+                ),
+            ));
+        }
         let text = slide_text(&xml).map_err(|e| unreadable(rel, e))?;
 
         if !out.is_empty() {

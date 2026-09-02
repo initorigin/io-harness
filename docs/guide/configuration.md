@@ -49,7 +49,7 @@ Later wins, key by key:
 | # | Scope | Where | Meant to be |
 | --- | --- | --- | --- |
 | 1 | defaults | whatever the typed API produces with no file | — |
-| 2 | `user` | `$IO_CONFIG_HOME/io.toml`, else `$XDG_CONFIG_HOME/io/io.toml` or `~/.config/io/io.toml`; `%APPDATA%\io\io.toml` on Windows | one person's own machine |
+| 2 | `user` | `$IO_CONFIG` outright, else `$IO_CONFIG_HOME/io.toml`, else `$XDG_CONFIG_HOME/io/io.toml` or `~/.config/io/io.toml`; on Windows `%IO_CONFIG%`, else `%IO_CONFIG_HOME%\io.toml`, else `%APPDATA%\io\io.toml` | one person's own machine |
 | 3 | `project` | `io.toml` in the workspace root | **committed** |
 | 4 | `local` | `io.local.toml` in the workspace root | **gitignored** |
 
@@ -57,6 +57,15 @@ That split is the point of the feature: a project sets a boundary its
 collaborators inherit, and an individual overrides one key of it without editing
 a shared file. **Commit `io.toml`. Never commit `io.local.toml`** — the crate's
 own `.gitignore` carries it, and yours should too.
+
+**Both workspace files are held to the same trust rule since 0.74.0**, and the
+line the rule is drawn on is *where the file sits*, not who is supposed to own it.
+`io.local.toml` is the operator's own file in intent; in fact it is a path in the
+workspace root, and a run's own agent writes paths in the workspace root. So the
+keys and sections listed under
+[A file inside the workspace may narrow, and may never widen](#a-file-inside-the-workspace-may-narrow-and-may-never-widen-0270)
+are refused in both, and the **user scope** — outside every workspace — is the one
+that can still widen.
 
 Discovery reads the root it is given and does **not** walk upward out of it. A
 run's configuration comes from the directory the caller named, never from
@@ -244,11 +253,17 @@ makes it a number that does not move, which is what a refusal a run's behaviour
 turns on has to be. Both ceilings apply to every read, and the refusal names the
 one that bit.
 
-It is one of four keys a project-scoped `io.toml` may only **lower** — the other
-three are the `[memory]` caps below. The keys a cloned repository may not widen
-are otherwise refused by their widening value (`exec = "allow"`); a number has no
-such value, so the smaller of the two wins instead. `io.local.toml` and the
-user-scope file set them outright.
+It is one of five keys a project-scoped `io.toml` may only **lower** — the others
+are `run.max_wait_secs` and the three `[memory]` caps below. The keys a cloned
+repository may not widen are otherwise refused by their widening value
+(`exec = "allow"`); a number has no such value, so the smaller of the two wins
+instead. `io.local.toml` and the user-scope file set them outright — and that is
+the asymmetry to know about, because 0.74.0 went the other way for the refusals:
+`io.local.toml` is held to every refused key and every refused section, and is
+*not* held to this lower-only rule. A number written there still overrides yours.
+The two rules answer different questions — a number a workspace file lowers is a
+ceiling an operator still chose, where a section a workspace file declares is a
+program an operator never saw.
 
 ## `[memory]` — what a workspace's durable notes may hold
 
@@ -332,6 +347,8 @@ file omits is an explicit zero.
 ### `[[provider]]` → `ProviderSpec`, via `Config::provider_spec` (0.27.0)
 
 ```toml
+# The user-scope file. `[[provider]]` is refused in `io.toml` and in
+# `io.local.toml` since 0.74.0 — see the trust rule below.
 [[provider]]                              # the first entry is the provider
 kind = "openrouter"                       # "openrouter" | "anthropic" | "openai" | "compatible"
 model = "anthropic/claude-sonnet-4"
@@ -362,6 +379,13 @@ file named in three lines of their own code.
 
 `ProviderSpec` is `#[non_exhaustive]`: match it with a `_ =>` arm, because a later
 release adds a variant.
+
+**The array is refused in both workspace files (0.74.0).** `base_url` redirects
+every completion of the run and `api_key` decides which of this host's secrets is
+sent as the `Authorization` header of that redirected request, and the endpoint is
+contacted before the run's first step — so nothing the policy does later stands in
+front of it. The refusal is on the whole table rather than on those two keys, for
+the reason every other refused section is whole.
 
 **Printing a spec does not print the key (0.71.0).** `Debug` is hand-written:
 every field is verbatim except `api_key`, which renders as `<redacted>` when the
@@ -540,9 +564,10 @@ argv with that JSON on the child's stdin, and exactly one of the two is required
 Both resolve against the discovery root, which is also the child's working
 directory. There is no shell: the argv is an array and reaches the process unsplit.
 
-**`[[hook]]` is refused in the project scope**, whole, for the reasons in
-[A project file may narrow, and may never widen](#a-project-file-may-narrow-and-may-never-widen-0270)
-below. The full page is [Hooks](hooks.md).
+**`[[hook]]` is refused in `io.toml` and in `io.local.toml`**, whole, for the
+reasons in
+[A file inside the workspace may narrow, and may never widen](#a-file-inside-the-workspace-may-narrow-and-may-never-widen-0270)
+below. It goes in the user-scope file. The full page is [Hooks](hooks.md).
 
 ### `[[mcp]]` → [`McpServer`](mcp-and-network.md)
 
@@ -566,6 +591,14 @@ Declaring a server does not start it. Its binary is still an `Act::Exec` check
 and its host still an `Act::Net` check, so without a policy rule naming them the
 run refuses before the server process exists.
 
+**`[[mcp]]` is refused in `io.toml` and in `io.local.toml` (0.74.0)**, and belongs
+in the user-scope file. A server is a command, an argv and an environment this
+process spawns at run start, and the spawn gate is an `Act::Exec` check on the
+binary name alone — so `command = "node"` in a repository that legitimately allows
+`node` is arbitrary execution with the argument doing the work. `plugin.rs` had
+refused exactly this for a project-scoped *plugin* since 0.35.0; this is the same
+declaration reached without a bundle around it.
+
 ### `[web]` → `WebAccess`, via `Config::apply_to`
 
 ```toml
@@ -577,9 +610,14 @@ allowed_domains = ["docs.rs"]          # empty means the vendor's default: anywh
 blocked_domains = ["evil.test"]        # empty means no block-list
 ```
 
-The table lands on the same `WebAccess` the programmatic builder produces, and it
-merges key by key like any other table: a local scope writing `search = false`
-switches it off without dropping the project's `max_uses` or domain lists.
+**The table is refused in both workspace files since 0.74.0**, so the only file
+that may carry it is the user-scope one — see
+[the trust rule](#a-file-inside-the-workspace-may-narrow-and-may-never-widen-0270).
+That takes the merge with it in practice: there is one scope left to write the
+table, so it lands on the same `WebAccess` the programmatic builder produces
+rather than being assembled key by key from two files. A caller that wants
+per-project web access sets it on the `TaskContract` in Rust, which is where the
+decision is the application's rather than the repository's.
 
 Nothing here is on by default, and writing the table is not the same as switching
 it on — a file that carries `[web]` with `search = false` has stated a decision,
@@ -606,7 +644,7 @@ X-Key = "${file:./secrets/mcp-key}"
 `${cmd:...}` runs a credential helper and takes its trimmed stdout:
 
 ```toml
-# io.local.toml — gitignored, and yours.
+# The user-scope file: `[[mcp]]` is refused in both workspace files since 0.74.0.
 [[mcp]]
 id = "search"
 transport = "http"
@@ -620,11 +658,38 @@ program, so a `;`, a `|` or a backtick in it is an argument rather than a second
 command. A non-zero exit is a failure, because a helper that failed did not produce
 a credential.
 
-**`${cmd:...}` is refused in the project scope.** `io.toml` is committed and arrives
-with a `git clone`, and a run-this primitive in that file would run on the first
-`Config::discover` of a repository you have not read. Write it in `io.local.toml`
-or in your user-scope file. `Config::from_toml` is the project scope too, and
-refuses it for the same reason.
+**`${cmd:...}` and `${file:...}` are refused in every file inside the workspace**
+(0.74.0). `io.toml` is committed and arrives with a `git clone`: a run-this
+primitive in that file would run on the first `Config::discover` of a repository
+you have not read, and `${file:...}` is one step short of it — its argument is
+joined onto the file's own directory, and `Path::join` lets an absolute argument
+replace that directory outright, so `api_key = "${file:/home/you/.ssh/id_rsa}"` is
+an arbitrary read of this host resolved at load and then sent wherever the file's
+other keys point. `Config::from_toml` is the project scope too, and refuses both
+for the same reason.
+
+`io.local.toml` is held to the same rule, and it is worth saying why rather than
+leaving it as symmetry. That file sits at the workspace root, which is a path the
+run's own agent can write — and `${cmd:}` runs its program *during parsing*,
+before any `Policy` or sandbox exists. So refusing the tables that name a program
+while still expanding these two would have left the whole of that boundary
+reachable by a shorter route than the tables: any key in any table, including the
+`[app]` block that takes arbitrary ones. The substitutions are the run-this and
+read-this primitives, and they are reached without a `[[hook]]` at all.
+
+Write them in the user-scope file, which is the one scope no workspace can
+reach.
+
+**A credential file other accounts can read is named, not refused (0.74.0).** On
+unix, `io.local.toml`, the user-scope file and every `${file:}` target are warned
+about through `tracing` when any group or other permission bit is set — the file,
+its mode, and the `chmod 600` that fixes it. A warning rather than `ssh`'s
+refusal, because this is a library inside somebody else's binary and `0644` is
+what a `umask 022` host produces by default: refusing would turn an upgrade into a
+startup failure for the common case. The committed `io.toml` is not checked at all
+— it is world-readable by design, and a warning on every run is one an operator
+learns to ignore. Windows expresses this with ACLs, which have no mode to compare
+and no `chmod` to recommend.
 
 `${file:...}` resolves against the directory of the file that wrote it, and its
 contents are trimmed. All three forms **resolve or fail**: an unset variable, an
@@ -666,39 +731,169 @@ The shape is still there — an operator debugging a config wants to know that
 this is a narrower print rather than a blank one. And it is `Debug` alone:
 `Serialize` writes what the operator typed, for the reason given above.
 
-## A project file may narrow, and may never widen (0.27.0)
+## A file inside the workspace may narrow, and may never widen (0.27.0)
 
 `io.toml` is committed. It travels with a `git clone`, and until 0.27.0 a cloned
 repository's file could switch off the parts of the boundary that stop it mattering.
-Four keys are therefore refused in the **project** scope, and only when the value
-written is the one that widens:
+Twelve keys are therefore refused, and only when the value written is one that
+widens:
 
-| Key | Refused in `io.toml` when it says | Still legal there |
-| --- | --- | --- |
-| `policy.defaults.exec` | `"allow"` | `"ask"`, `"deny"` |
-| `policy.defaults.net` | `"allow"` | `"ask"`, `"deny"` |
-| `sandbox.allow_network` | `true` | `false` |
-| `sandbox.force_floor` | `false` | `true` |
-
-Plus `${cmd:...}` anywhere in the file, and — since 0.28.0 — the whole `[[hook]]`
-array. Not the executing half of it: a hook that runs an argv is the `${cmd:...}`
-primitive arriving one release later, and a hook that appends is a write to a path
-a cloned repository chose, which is the same hazard by a shorter route. The refusal
-names the key, the file, and where to write it instead — `io.local.toml` or your
-user-scope file, where all of them are accepted unchanged. A widening key or a hook
-hidden inside `[profile.<name>]` is refused too; the profile is applied later, and a
-check that only looked at the base would let it reach the same place by a different
-path.
+| Key | Refused when it says | Still legal | Since |
+| --- | --- | --- | --- |
+| `policy.defaults.read` | `"allow"` | `"ask"`, `"deny"` | 0.74.0 |
+| `policy.defaults.write` | `"allow"` | `"ask"`, `"deny"` | 0.74.0 |
+| `policy.defaults.exec` | `"allow"` | `"ask"`, `"deny"` | 0.27.0 |
+| `policy.defaults.net` | `"allow"` | `"ask"`, `"deny"` | 0.27.0 |
+| `sandbox.allow_network` | `true` | `false` | 0.27.0 |
+| `sandbox.force_floor` | `false` | `true` | 0.27.0 |
+| `sandbox.mode` | `"full-access"`, `"workspace-write"` | `"read-only"` | 0.46.0, `"workspace-write"` 0.74.0 |
+| `sandbox.limits.max_cpu_secs` | `0` | any other number | 0.74.0 |
+| `sandbox.limits.max_wall_secs` | `0` | any other number | 0.74.0 |
+| `sandbox.limits.max_memory_bytes` | `0` | any other number | 0.74.0 |
+| `sandbox.limits.max_processes` | `0` | any other number | 0.74.0 |
+| `sandbox.limits.max_open_files` | `0` | any other number | 0.74.0 |
 
 Value-dependent rather than key-dependent, deliberately: a project file *denying*
-`exec` is exactly what the project scope is for, and a rule that refused the key
-outright would forbid the good half to stop the bad one.
+`exec` is exactly what the scope is for, and a rule that refused the key outright
+would forbid the good half to stop the bad one.
 
-**What this does not claim.** Not that a cloned repository is safe. `[[mcp]]` still
-names a command, `[toolchain]` still names an argv, and a `[[policy.layers]]` entry
-can still allow what the defaults did not. This is a specific narrowing of a
-specific hazard — four keys, one substitution and one array, no more — and it is the
-file half of a boundary whose enforcing half is still the `Policy` you loaded.
+The five keys 0.74.0 added to the top of that table, and the two values it added
+beside them, were each a hole rather than an oversight, and each is worth reading
+once:
+
+- **`read` and `write` were missing.** The shipped defaults are `read = "allow"`
+  and `write = "ask"`, a later scope *overrides* an earlier one, and the project
+  scope outranks the user scope in the merge — so a cloned `io.toml` writing
+  `write = "allow"` turned every unmatched write from a question the approver
+  answers into a silent grant, whatever the operator had written in their own file.
+- **`sandbox.mode = "workspace-write"` is refused as well as `"full-access"`.**
+  The merge lets a project file *replace* the user scope's value, so
+  `workspace-write` written in a workspace file raised an operator's own
+  `read-only` back to the crate's own default. `read-only` is the one value that
+  narrows in every direction, and it is the one that stays legal — which is all the
+  scope needs, since `workspace-write` is what a file saying nothing already gets.
+- **`0` in a `[sandbox.limits]` key means *no cap*.** Each of the five written as
+  zero in a cloned file removes a wall the operator put up. Only the categorical
+  value is refused: a merely large finite cap is still a cap, and refusing one
+  would need the user scope's number, which a check that reads one file at a time
+  does not have.
+
+**Six whole sections are refused as well**, and they implement one sentence rather
+than a list: *anything that names a program to run, names an endpoint a credential
+is sent to, or opens a route out of the boundary the `Policy` does not gate, may
+not be declared by a file inside the workspace.*
+
+| Section | Since | Why it is on the list |
+| --- | --- | --- |
+| `[[hook]]` | 0.28.0 | runs an argv, or appends to a path the file chose, on an event the file picks |
+| `[browser]` | 0.53.0 | names a program the run then drives against whatever a page contains |
+| `[[provider]]` | 0.74.0 | names the endpoint this run's credential is sent to, contacted before the first step |
+| `[[mcp]]` | 0.74.0 | a command, an argv and an environment this process spawns at run start |
+| `[[lsp]]` | 0.74.0 | the same, by another name |
+| `[web]` | 0.74.0 | a provider-executed search or fetch is dialled by the provider, so `Act::Net` never sees it and no sandbox is on the path |
+
+`[web]` is the entry the sentence does not read out word for word, and it is the
+third clause's reason for existing. The provider dials the URL, so the run's egress
+proxy is not on the path and the domain lists beside it are a filter this crate
+*states* rather than enforces — a workspace file writing `[web] search = true` is
+therefore switching on an egress surface no rung of this crate mediates, and
+`fetch = true` beside it lets the model be pointed at a URL, which is a repository
+choosing where the run's context may be sent. `sandbox.allow_network = true` is a
+refused *key* for re-opening egress inside the sandbox; this opens one outside it
+entirely. The cost is stated rather than hidden: `[web] search = false` is a
+narrowing sentence and a workspace file can no longer write it either. The feature
+is off unless the user scope turns it on, so there is nothing for that narrowing to
+narrow that the operator did not choose from outside the workspace.
+
+A section is refused **whole** rather than by its hazardous key — the 0.28.0
+argument about `[[hook]]`'s `run`/`append` pair, generalised. A rule that permits
+half a table is a rule a reader has to hold two halves of, and the next key added
+to that table lands on the permitted side by default. A table added to the file
+format later belongs on this list because the sentence covers it, not because
+somebody thought of it in time. What names neither a program nor a credentialled
+endpoint stays legal, which is what keeps the scope worth having: `[policy]`,
+`[[agent]]`, `[run]`, `[[plugin]]` and the rest still let a repository narrow a
+boundary from its own committed file.
+
+**A `[[policy.layers]]` in a workspace file may carry `deny` rules and nothing
+else (0.74.0).** `[policy]` is not a refused section — a repository narrowing its
+own boundary from its own committed file is what the scope is for — but a layer
+reached the widening keys' destination by a different door. Layers are appended to
+the shipped defaults with no effect filter, `Policy::explain` resolves deny → ask →
+allow across the whole stack, and the default contributes no `Act::Exec` or
+`Act::Net` deny for an allow to lose to. So
+
+```toml
+# Refused in `io.toml` and in `io.local.toml` since 0.74.0.
+[[policy.layers]]
+name = "ci-tools"
+rules = [{ act = "exec", effect = "allow", pattern = "*" }]
+```
+
+was `policy.defaults.exec = "allow"` written five lines away from where that is
+refused — and the `net` spelling of it also switched the sandbox's own
+`allow_network` back on, because every spawn site resolves that flag from the
+policy rather than from `[sandbox]`. The key on the list was not the key that
+decided.
+
+An **`ask` rule is refused too**, not only an `allow`: an ask hands capability out
+as well, since it converts an act the operator's own default *denied* into one an
+approver is asked to wave through. A rule whose `effect` is missing or is not a
+string is refused on the same reading — the question is "is this the word `deny`",
+and the answer for anything else is no. The refusal names the layer, the effect,
+the act and the pattern. This is the rule a `plugin.toml` has been held to since
+0.35.0, and that file is the *more* trusted of the two; an `io.toml` arriving with
+a clone getting the looser treatment was the asymmetry 0.74.0 removed. Write an
+allow layer in the user-scope file.
+
+**`run.skills` and `run.templates` may not leave the workspace root** in either
+workspace file (0.74.0). Both are resolved by joining onto the discovery root,
+where an absolute value replaces that root outright and a relative one climbs out
+of it with `..`, and the frontmatter of every `*.md` under whatever they name is
+composed into the model's system prompt on every turn — so a cloned `io.toml`
+saying `skills = "/home/you/.ssh"` put this host's files into the context of every
+request, read-only, unasked, and before any `Policy` existed to have an opinion
+about the read. The check is lexical: an absolute path, a bare root, a Windows
+prefix or a `..` anywhere in the value is refused, nothing on disk is touched, and
+a directory that has not been checked out yet is not a config error. The user
+scope still points wherever the operator wants, which is what keeps a shared
+skills directory outside the project working. A `[[plugin]]`'s own `path` is held
+to the same boundary — see [Capability bundles](plugins.md).
+
+Plus `${cmd:...}` anywhere in `io.toml`, and since 0.74.0 `${file:...}` there too:
+its argument is joined onto the file's own directory, and an absolute one replaces
+that directory outright, so `${file:/home/you/.ssh/id_rsa}` in a cloned file is an
+arbitrary read of this host resolved before any `Policy` exists.
+
+**`io.local.toml` is held to the keys and the sections since 0.74.0.** It was on
+the trusted side of this line for eleven releases, and it is a path in the
+workspace root: one `write_file` of an unremarkable name declared a `[[hook]]`, an
+`[[mcp]]` command or a `[[provider]]` endpoint that the next `Config::discover`
+would act on, outside the `Policy` and outside the sandbox. Every refusal names the
+key, the file, and the **user-scope** file to write it in instead — `$IO_CONFIG`,
+else `$IO_CONFIG_HOME/io.toml`, else `$XDG_CONFIG_HOME/io/io.toml` or
+`~/.config/io/io.toml`; on Windows `%IO_CONFIG%`, else `%IO_CONFIG_HOME%\io.toml`,
+else `%APPDATA%\io\io.toml`. That is the one file no workspace can reach, which is
+the whole reason the scope exists. A widening key or a refused section hidden inside
+`[profile.<name>]` is caught too; the profile is applied later, and a check that
+only looked at the base would let it reach the same place by a different path.
+
+**What this does not claim.** Not that a cloned repository is safe. `[toolchain]`
+still names an argv the embedding application may act on, `[instructions]` still
+puts the repository's own prose in front of the model, and a workspace file may
+still declare a `[[plugin]]` — what a bundle it names may *contribute* is bounded
+(see [Capability bundles](plugins.md)), not the naming. This is a specific
+narrowing of specific hazards, and it is the file half of a boundary whose
+enforcing half is still the `Policy` you loaded.
+
+**And it does not claim there is a key for everything.** The address floor under
+every network decision (0.74.0) is lifted by the environment variable
+`IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1` and by nothing in this file, deliberately: a
+config key that widens is one a cloned repository could set, and the environment of
+a process that has already started is the one thing a workspace cannot write. If
+you are looking for `net.allow_local_addresses`, it does not exist and is not
+coming — see
+[the local-address floor](mcp-and-network.md#the-local-address-floor-0740).
 
 ## An unknown key is an error
 
@@ -768,8 +963,9 @@ ending, so it cannot be the last word. Treat a workspace whose instructions file
 you have not read the way you would treat any other text a stranger wrote into
 your prompt.
 
-**A project file may narrow and never widen, and that is all it does.** See the
-section above for the four keys, and for the sentence it is not.
+**A file inside the workspace may narrow and never widen, and that is all it
+does.** See the section above for the twelve keys, the six sections, the
+deny-only rule on a `[[policy.layers]]`, and for the sentence it is not.
 
 **An origin reports the merge and does not take part in it.** `Config::origin`
 changed what a caller can *see* about a resolution in 0.30.0 and changed no
@@ -785,8 +981,9 @@ many events you point one at. See [Hooks](hooks.md) for the rest.
 
 **Hooks do not accumulate across scopes.** `[[hook]]` is not in the appending set
 that `[[policy.layers]]` and `[[agent]]` are in, so a later scope replaces the array
-whole: one hook in `io.local.toml` discards every hook your user-scope file
-declared.
+whole. Since 0.74.0 only the user scope may declare one at all, so the hooks that
+run are that file's — plus whatever a user-scope bundle contributed, which
+`Plugins::apply_to_hooks` appends to them.
 
 **A `preset`'s base URL is a default this crate ships, not a fact about the
 vendor.** It was right on the day the release was cut and the vendor is under no
@@ -837,11 +1034,14 @@ list answers for every file, and where two servers claim one suffix the first in
 declaration order wins. `timeout_secs` bounds every request to it, and it is also
 what bounds how long the run will wait for a slow start-up.
 
-Allowed in a project-scoped `io.toml`, for the reason `[[mcp]]` is: starting the
-server is an `Act::Exec` check on `command`, so the boundary is the policy the
-caller loaded rather than the scope of the file that named the binary. Unlike
-`[[mcp]]`, a misspelled key here **is** rejected by name — there is no
-`#[serde(flatten)]` in this table to forbid it.
+**Refused in `io.toml` and in `io.local.toml` (0.74.0)**, for the reason `[[mcp]]`
+is and by the same rule: a language server is a command, an argv and an environment
+this process spawns at run start, and the spawn gate is an `Act::Exec` check on the
+binary name alone. Through 0.73.0 both were allowed in a workspace file on the
+argument that the policy the caller loaded was the boundary; that argument left the
+argument vector — where the work actually happens — to whoever wrote the file.
+Write it in the user-scope file. Unlike `[[mcp]]`, a misspelled key here **is**
+rejected by name — there is no `#[serde(flatten)]` in this table to forbid it.
 
 A narrower scope replaces the whole set rather than appending to it, the way
 `[[hook]]` and `[[provider]]` do: the servers that run are the servers of one file.

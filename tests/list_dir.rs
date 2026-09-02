@@ -254,10 +254,27 @@ async fn through_the_loop_an_escaping_path_is_an_error_the_agent_can_act_on() {
     .unwrap();
 
     let next = observation(&store, result.run_id, 1);
+    // 0.74.0 (audit H3) moved where this is caught, not whether it is. `../..`
+    // used to reach `ws.list_dir` and come back as a tool-level error, because
+    // `check_path` graded the collapsed spelling — `normalize` popped the `..`
+    // off an empty vector and handed the gate `""`. It is now denied at the gate
+    // instead, and the gate names the act rather than the tool, so the line reads
+    // `[read refused] ../.. (rule <path escapes workspace root>)`. The claim this
+    // test makes is unchanged: the agent is told why, and is not handed a listing
+    // of the machine.
     assert!(
-        next.contains("[list_dir error]") && next.contains("escapes workspace"),
-        "the agent is told why, not handed a listing of the machine: {next}"
+        next.contains("refused") || next.contains("error"),
+        "an escaping path must come back as a refusal or an error, never a listing: {next}"
     );
+    assert!(
+        next.contains("escapes workspace"),
+        "the agent is told why: {next}"
+    );
+    // Not asserted: that the line omits `../..`. The refusal deliberately echoes
+    // the path it refused — an agent that cannot see which of its calls was
+    // turned down cannot act on the answer, which is the whole point of the
+    // observation. What must never appear is a listing, and the first assertion
+    // is what covers that.
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,54 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What proving the boundary costs a run (0.74.0)
+
+**What is being measured.** 0.74.0 stops taking a backend's word for its own
+containment: before the first step, `BoundaryProbe::measure` attempts a write and
+a dial outside the boundary and the run's claims are answered from what happened.
+That is process spawns at run start, so the question a reader will have is what a
+run pays for the evidence.
+
+**The shape to expect, stated before it was measured.** A fixed cost per
+*boundary*, paid once and never per step. At most three short-lived children: one
+uncontained control, which is what separates "the boundary refused it" from "this
+host could never have done it", and then one contained child per arm. Nothing
+grows with the length of the run, the number of steps or the size of the
+workspace. A flat run measures once; a tree measures once before its root agent
+runs and every agent under it reads that measurement, so a twenty-agent tree pays
+this once rather than twenty times. A run that asked for no containment pays
+nothing — it is not probed at all.
+
+**Method.** `n5_the_startup_probe_cost` in `tests/security_probe.rs`, `#[ignore]`d
+because it prints rather than asserts. It times one whole
+`BoundaryProbe::measure` against a default `SandboxConfig` — the control child and
+both contained arms — and prints the elapsed time, the probe's trace label and the
+backend it ran under. Seven runs, median reported. Run it with:
+
+```text
+cargo nextest run --run-ignored ignored-only --success-output immediate -E 'test(n5_)'
+```
+
+**Machine.** Apple M1, 8 cores, macOS 26.5.2, `curl` 8.7.1 — the probe spawns the
+host's own `curl` rather than carrying a dependency — otherwise idle, `cargo test`
+dev profile.
+
+**Numbers.** Median of 7 runs:
+
+| What | Median |
+| --- | --- |
+| one `BoundaryProbe::measure`, `macos-sandbox-exec` | 63 ms |
+
+Once per run against a run whose first provider call is measured in hundreds of
+milliseconds and whose whole life is measured in minutes. The number is recorded,
+not asserted: no test gates on it, and a duration asserted on a CI runner is a
+flake.
+
+**What it does not measure.** The cost on Linux or Windows, where the rungs and
+the spawn are different; a host with no `curl`, which is an unmeasured probe and
+therefore no spawns at all; and the second and later agents of a tree, which reuse
+the measurement and pay nothing.
+
 ## What the durable assistant turn costs (0.64.0)
 
 **What is being measured.** 0.64.0 writes one extra row per committed step — the

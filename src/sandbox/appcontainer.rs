@@ -84,9 +84,9 @@ pub(crate) mod win {
         HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, SetEntriesInAclW, TreeSetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-        GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID,
-        TRUSTEE_W,
+        GetNamedSecurityInfoW, SetEntriesInAclW, TreeSetNamedSecurityInfoW, ACCESS_MODE,
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT,
+        TRUSTEE_IS_GROUP, TRUSTEE_IS_SID, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -103,8 +103,9 @@ pub(crate) mod win {
         InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
         UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
         CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
-        PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES,
-        STARTUPINFOEXW, STARTUPINFOW,
+        PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        STARTUPINFOW,
     };
 
     /// A NUL-terminated UTF-16 string, kept alive by the caller.
@@ -219,40 +220,55 @@ pub(crate) mod win {
         grant(path, sid, access, reach)
     }
 
+    /// Undo one entry of the grant set, at the end of the run that applied it
+    /// (0.74.0).
+    ///
+    /// `grant_for` in the other direction, and it takes no `Grant` because
+    /// `revoke` withdraws every ACE naming the SID rather than subtracting a
+    /// mask: what a path was given does not have to be remembered in order to be
+    /// given back.
+    ///
+    /// The caller passes only the entries whose grant actually succeeded. A
+    /// revoke is a DACL read-modify-write over `reach`, so calling it for a path
+    /// this run never wrote to is a tree rewrite of `%SystemRoot%` in exchange
+    /// for nothing.
+    pub(crate) fn revoke_for(
+        path: &Path,
+        sid: PSID,
+        r: crate::sandbox::windows::Reach,
+    ) -> io::Result<()> {
+        let reach = match r {
+            crate::sandbox::windows::Reach::Tree => Reach::Tree,
+            crate::sandbox::windows::Reach::DirectoryOnly => Reach::DirectoryOnly,
+        };
+        revoke(path, sid, reach)
+    }
+
     /// An AppContainer profile, and the SID it is addressed by.
     ///
     /// The profile is a registry-backed, named object with a lifetime longer than
     /// this process, which is why `Drop` deletes it: a run that leaves one behind
     /// leaves state on the operator's machine, and a thousand runs leave a
-    /// thousand. Creation tolerates `ERROR_ALREADY_EXISTS` and falls back to
-    /// deriving the SID from the name, so a profile stranded by a crashed run is
-    /// reused rather than turned into a permanent failure.
+    /// thousand. Creation still tolerates `ERROR_ALREADY_EXISTS` and falls back
+    /// to deriving the SID from the name, which since 0.74.0 is a safety net and
+    /// no longer a design: a run's name carries sixty-four bits nothing else can
+    /// predict, so the only names that can collide are the per-process probe's
+    /// and one a caller repeated on purpose.
+    ///
+    /// **`Drop` deletes it unconditionally, since 0.74.0.** Between 0.59.0 and
+    /// then, the profile every contained run shared opted out of the deletion —
+    /// one machine-wide name, so whichever process finished first would otherwise
+    /// have destroyed the container the others were still spawning into. What that
+    /// left behind was a container addressed by a name written into this file,
+    /// whose SID is `DeriveAppContainerSidFromAppContainerName` of it and
+    /// therefore computable by any process on the machine, holding every grant
+    /// every run had ever accumulated. The name is now the run's own and
+    /// unpredictable — `super::super::windows::run_profile_name` carries the
+    /// argument — which removes the race the opt-out existed for, and the deletion
+    /// comes back with it.
     pub(crate) struct Profile {
         name: Vec<u16>,
         sid: PSID,
-        /// Whether dropping this deletes the profile behind it.
-        ///
-        /// **False for the one every contained run shares, and that is two races
-        /// answered at once.** A profile is a registry-backed object named by a
-        /// string, so a deterministic name is shared between every process on the
-        /// machine — and deleting it on drop meant whichever process finished
-        /// first destroyed the container the others were still spawning into.
-        ///
-        /// Giving each process its own name fixes that and creates a worse one:
-        /// the SID derives from the name, soeach process then writes a *different*
-        /// ACE onto the same shared paths — the toolchain home, the temporary
-        /// directory — and two read-modify-write passes over one DACL lose each
-        /// other's entry. The symptom is a container that cannot read the
-        /// toolchain home and a launcher that reports it "could not create home
-        /// directory ... Cannot create a file when that file already exists".
-        ///
-        /// Sharing the name is therefore the *correct* half: every process writes
-        /// the identical ACE for the identical SID, so concurrent grants converge
-        /// instead of clobbering. What had to go is the deletion. The cost is one
-        /// profile left on a machine that has ever run a contained command, which
-        /// is re-entered rather than recreated; the tests keep unique names and
-        /// keep deleting theirs.
-        delete_on_drop: bool,
         /// The `internetClient` capability SID, when this profile was created
         /// with the network permitted.
         ///
@@ -367,10 +383,18 @@ pub(crate) mod win {
             };
 
             if hr < 0 {
-                // A profile left behind by a previous run is not an error: the
-                // name is deterministic precisely so it can be re-entered.
+                // A profile left behind by a previous run is not an error.
                 // `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` is the one code that
                 // means "this exists", and anything else is a real failure.
+                //
+                // **What this is not, since 0.74.0: a way in.** Adopting a
+                // profile this run did not create — and then deleting it on
+                // `Drop` — needs the name, and a run's name is sixty-four bits
+                // drawn from the OS. What is left reachable is the per-process
+                // probe name and a caller that repeated a name deliberately,
+                // which is why the tolerance stays: the alternative on this path
+                // is a decline, and a decline is an error handed to a caller who
+                // asked for containment by name.
                 let already = hr == hresult_from_win32(ERROR_ALREADY_EXISTS);
                 if !already {
                     return Err(io::Error::from_raw_os_error(win32_from_hresult(hr)));
@@ -388,16 +412,7 @@ pub(crate) mod win {
                 name,
                 sid,
                 capability: (cap_count >= 1).then_some(cap_sid),
-                delete_on_drop: true,
             })
-        }
-
-        /// The profile every contained run on this machine shares, which outlives
-        /// the process that first created it. See `delete_on_drop`.
-        pub(crate) fn shared(name: &str, allow_network: bool) -> io::Result<Self> {
-            let mut p = Self::create(name, allow_network)?;
-            p.delete_on_drop = false;
-            Ok(p)
         }
 
         /// The container SID. Valid for as long as this `Profile` is.
@@ -424,9 +439,7 @@ pub(crate) mod win {
             // this type, and this is the only free. `self.name` is still live.
             unsafe {
                 FreeSid(self.sid);
-                if self.delete_on_drop {
-                    DeleteAppContainerProfile(self.name.as_ptr());
-                }
+                DeleteAppContainerProfile(self.name.as_ptr());
             }
         }
     }
@@ -468,9 +481,12 @@ pub(crate) mod win {
     /// The SID is not decoration. Without it a second profile in one process
     /// asking for a path the first already granted is skipped, told it succeeded,
     /// and reads back with no ACE of its own — the same silent-inert-grant shape
-    /// this module has already paid for once. It survived because the production
-    /// profile name is deterministic and derives one stable SID, so the omission
-    /// could only be seen by a test that builds two containers, and none did.
+    /// this module has already paid for once. It survived because production used
+    /// one deterministic profile name until 0.74.0 and therefore one stable SID,
+    /// so the omission could only be seen by a test that builds two containers,
+    /// and none did. A per-run name makes the SID load-bearing in production too:
+    /// two runs in one embedding process grant the same workspace under two
+    /// different containers, which is the shape the test only simulated.
     type MemoKey = (std::path::PathBuf, Access, Reach, Vec<u8>);
 
     /// A SID's own bytes, for use as a map key.
@@ -577,9 +593,19 @@ pub(crate) mod win {
         // window twenty times over — and it is what the depth test caught,
         // reading the ACE off a file that then could not be executed.
         //
-        // The container SID is derived from a fixed profile name, so it is the
-        // same SID on every run of every process on the machine: the first run
-        // pays for the walk and no later one repeats it.
+        // **What the memo stopped saving, said plainly (0.74.0).** Its key
+        // includes the SID and the SID is now the run's own — see
+        // `super::super::windows::run_profile_name` — so a second run repeats
+        // every walk the first one paid for instead of skipping it. What it still
+        // does is what the paragraphs above are about: inside *one* run the grant
+        // set names a path and then names its ancestors, and two runs in one
+        // embedding process overlap on the workspace and the toolchain homes
+        // while both are in flight.
+        //
+        // That is the price of the fix and it is not hidden. A shared SID paid
+        // for the walk once per machine and left behind an ACE no teardown could
+        // withdraw, which is what `revoke` and the audit finding it closes are
+        // about; a per-run SID pays for the walk once per run.
         //
         // **The memo is this process's own completed grants, and reading the ACE
         // off the directory is not a substitute for it.** `SetNamedSecurityInfoW`
@@ -605,6 +631,83 @@ pub(crate) mod win {
             }
         }
 
+        // **A traverse ACE is not inheritable, and that is a cost decision as
+        // much as a scope one.**
+        //
+        // Scope first: traverse exists so a *named* directory can be reached by
+        // walking to it, and nothing below an ancestor should acquire rights
+        // because the run happened to name a path underneath it.
+        //
+        // The cost is why this is stated rather than assumed. `SetNamedSecurityInfoW`
+        // propagates *inheritable* ACEs to the objects under the path, and the
+        // flag that this function varies by `Reach` decides whether existing
+        // children are recomputed — it does not make an inheritable ACE stop
+        // being inheritable. The ancestors of a granted path include `C:\`, so an
+        // inheritable traverse ACE there is a request to walk the volume: both
+        // Windows legs of the first run with ancestors were still going at forty
+        // minutes and were cancelled by their own timeout, having failed no test.
+        // `NO_INHERITANCE` is one ACE on one directory and nothing to propagate.
+        let inheritance = match access {
+            Access::Traverse => 0,
+            // CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE.
+            _ => 3,
+        };
+        set_entry(path, sid, GRANT_ACCESS, access.mask(), inheritance, reach)?;
+        granted_here()
+            .lock()
+            .expect("the grant memo is not poisoned")
+            .insert(memo_key);
+        tracing::debug!(path = %path.display(), ?access, "sandbox: granted the AppContainer");
+        Ok(())
+    }
+
+    /// Withdraw every ACE naming `sid` on `path` (0.74.0).
+    ///
+    /// **The other half of a per-run profile.** A grant this crate writes is
+    /// merged into the object's DACL and, until this existed, was removed by
+    /// nothing: the workspace kept an inheritable `FILE_ALL_ACCESS` ACE for the
+    /// one SID every contained run on the machine entered under, so
+    /// `ExecMode::ReadOnly` enforced nothing on any tree a `WorkspaceWrite` run
+    /// had already touched. Naming the container per run fixes whose SID it is;
+    /// this is what stops one permanent ACE becoming one per run, which a DACL
+    /// only has 64 KB of room for before every later grant on that object fails.
+    ///
+    /// `REVOKE_ACCESS` removes *all* of the trustee's entries rather than
+    /// subtracting a mask, which is what a teardown wants and why this takes no
+    /// `Access`: whatever the run was given back, it is given back whole.
+    ///
+    /// The caller is `super::super::windows::job`'s teardown, which treats a
+    /// failure as a fact to log. There is nothing to hand a caller by then, and an
+    /// ACE that outlives its profile names a container that no longer exists.
+    pub(crate) fn revoke(path: &Path, sid: PSID, reach: Reach) -> io::Result<()> {
+        // The memo records what this process has granted so a repeat can be
+        // skipped. A path whose ACE has just been taken away has not been
+        // granted, and a long-lived embedder that ran a thousand contained
+        // commands would otherwise hold a thousand runs' worth of dead keys.
+        let key = sid_key(sid);
+        granted_here()
+            .lock()
+            .expect("the grant memo is not poisoned")
+            .retain(|(p, _, _, s)| p.as_path() != path || *s != key);
+        // The mask and the inheritance are ignored for a revoke; the SDK
+        // documents both as unread when the mode is `REVOKE_ACCESS`.
+        set_entry(path, sid, REVOKE_ACCESS, 0, 0, reach)
+    }
+
+    /// Apply one `EXPLICIT_ACCESS_W` to `path`'s DACL, as far as `reach` says.
+    ///
+    /// The shared middle of `grant` and `revoke`, which differ only in the access
+    /// mode and in what a successful write looks like afterwards. Written once
+    /// because the propagation rules below are the part that was wrong twice, and
+    /// a second copy is a second place for them to be wrong again.
+    fn set_entry(
+        path: &Path,
+        sid: PSID,
+        mode: ACCESS_MODE,
+        mask: u32,
+        inheritance: u32,
+        reach: Reach,
+    ) -> io::Result<()> {
         let wpath = wide(path);
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut sd = std::ptr::null_mut();
@@ -631,30 +734,9 @@ pub(crate) mod win {
         // has to outlive `SetEntriesInAclW` and be freed exactly once afterwards.
         let _sd = LocalGuard(sd);
 
-        // **A traverse ACE is not inheritable, and that is a cost decision as
-        // much as a scope one.**
-        //
-        // Scope first: traverse exists so a *named* directory can be reached by
-        // walking to it, and nothing below an ancestor should acquire rights
-        // because the run happened to name a path underneath it.
-        //
-        // The cost is why this is stated rather than assumed. `SetNamedSecurityInfoW`
-        // propagates *inheritable* ACEs to the objects under the path, and the
-        // flag that this function varies by `Reach` decides whether existing
-        // children are recomputed — it does not make an inheritable ACE stop
-        // being inheritable. The ancestors of a granted path include `C:\`, so an
-        // inheritable traverse ACE there is a request to walk the volume: both
-        // Windows legs of the first run with ancestors were still going at forty
-        // minutes and were cancelled by their own timeout, having failed no test.
-        // `NO_INHERITANCE` is one ACE on one directory and nothing to propagate.
-        let inheritance = match access {
-            Access::Traverse => 0,
-            // CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE.
-            _ => 3,
-        };
         let ea = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: access.mask(),
-            grfAccessMode: GRANT_ACCESS,
+            grfAccessPermissions: mask,
+            grfAccessMode: mode,
             grfInheritance: inheritance,
             Trustee: TRUSTEE_W {
                 pMultipleTrustee: std::ptr::null_mut(),
@@ -692,11 +774,14 @@ pub(crate) mod win {
         // `windows-latest`, one flag.
         //
         // The cost is real and is not hidden: propagation walks the granted tree,
-        // so the *first* grant of a large directory is O(entries in it). It is
-        // paid once per machine rather than once per run — the check at the head
-        // of this function returns early on every later run — and `Reach` is what
-        // decides whether a path is worth walking at all. That is what N5
-        // measures on this backend.
+        // so a grant of a large directory is O(entries in it), and since 0.74.0
+        // it is paid **once per run**. The memo at the head of `grant` is keyed by
+        // the container SID and a run's SID is its own, so it now skips a repeat
+        // inside one run — the grant set names a path and then names its
+        // ancestors — and never a second run. `revoke` walks the same tree again
+        // at teardown, which is what the audit finding this closes costs. `Reach`
+        // is what decides whether a path is worth walking at all, and that is what
+        // N5 measures on this backend.
         //
         // SAFETY: `wpath` is live, `merged` is the ACL just built and still
         // owned by `_merged`, and the owner, group and SACL arguments are null,
@@ -745,27 +830,27 @@ pub(crate) mod win {
                 //
                 // So the *root* is what decides. If it carries the ACE the grant
                 // stands, with the failure logged; if it does not, nothing under
-                // it can have been set either and the error is real.
+                // it can have been set either and the error is real. A revoke
+                // reads the same fact from the other side: it succeeded at the
+                // root when the root no longer names the SID at all.
                 if rc != ERROR_SUCCESS {
-                    let want = access.mask();
-                    let root_has = granted_mask(path, sid).is_some_and(|have| have & want == want);
-                    if !root_has {
+                    let root_done = if mode == GRANT_ACCESS {
+                        granted_mask(path, sid).is_some_and(|have| have & mask == mask)
+                    } else {
+                        granted_mask(path, sid).is_none()
+                    };
+                    if !root_done {
                         return Err(io::Error::from_raw_os_error(rc as i32));
                     }
                     tracing::warn!(
                         path = %path.display(),
-                        "sandbox: the container's grant reached this directory but not every \
+                        "sandbox: the container's ACE reached this directory but not every \
                          object under it (os error {rc}); something else holds one of them"
                     );
                 }
             }
             Reach::DirectoryOnly => set_dacl_on_this_object_alone(path, merged)?,
         }
-        granted_here()
-            .lock()
-            .expect("the grant memo is not poisoned")
-            .insert(memo_key);
-        tracing::debug!(path = %path.display(), ?access, "sandbox: granted the AppContainer");
         Ok(())
     }
 
@@ -849,6 +934,55 @@ pub(crate) mod win {
         }
     }
 
+    /// This process's environment with `TMP` and `TEMP` pointed at `temp`, as the
+    /// UTF-16 block `CreateProcessW` reads (0.74.0).
+    ///
+    /// **A grant the payload cannot find is not a grant.** The container is
+    /// granted the run's own directory under `%TEMP%` and only traverse on
+    /// `%TEMP%` itself — see `super::super::windows::grants` for why the shared
+    /// one cannot be handed over — and a child that inherited this process's
+    /// `TMP` would go looking in the directory it may walk through and not write
+    /// to. Every toolchain opens a temporary file, so that is not a corner.
+    ///
+    /// Nothing else is filtered. What the harness's own environment exposes to a
+    /// contained child is the same question on every platform and is not this
+    /// function's to answer differently.
+    ///
+    /// The block is `NAME=VALUE\0` repeated and terminated by one more `\0`.
+    /// Sorted case-insensitively by name, which is the order the documentation
+    /// asks for; a name is stored under its uppercase form as a sort key only,
+    /// and written out as it was read.
+    fn temp_env_block(temp: &Path) -> Vec<u16> {
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+
+        let mut vars: BTreeMap<String, (OsString, OsString)> = std::env::vars_os()
+            .map(|(k, v)| (k.to_string_lossy().to_uppercase(), (k, v)))
+            .collect();
+        for name in ["TMP", "TEMP"] {
+            vars.insert(
+                name.to_string(),
+                (OsString::from(name), temp.as_os_str().to_os_string()),
+            );
+        }
+
+        let mut block: Vec<u16> = Vec::new();
+        for (_, (name, value)) in vars {
+            // A name that is empty, or the `=C:`-style drive variables the shell
+            // keeps, would produce an entry the child's parser reads as the end
+            // of the block.
+            if name.is_empty() || name.to_string_lossy().starts_with('=') {
+                continue;
+            }
+            block.extend(name.encode_wide());
+            block.push(u16::from(b'='));
+            block.extend(value.encode_wide());
+            block.push(0);
+        }
+        block.push(0);
+        block
+    }
+
     /// A process running inside an AppContainer.
     ///
     /// Holds the process handle, so [`Drop`] can be the kill-on-drop the shared
@@ -894,19 +1028,30 @@ pub(crate) mod win {
         /// here produces a process that starts, runs and writes nothing, which is
         /// the worst available failure — it looks like a quiet payload rather
         /// than a broken redirect.
+        ///
+        /// `temp` is the directory the child must use for temporary files
+        /// (0.74.0). The container is granted the run's own directory and not
+        /// `%TEMP%` — see `super::super::windows::grants` — and the child would
+        /// otherwise inherit this process's `TMP`/`TEMP`, which now point
+        /// somewhere it may traverse and not write. A grant the payload cannot
+        /// find is not a grant.
         pub(crate) fn start(
             cmdline: &str,
             cwd: &Path,
             profile: &Profile,
             out: &std::fs::File,
+            temp: Option<&Path>,
         ) -> io::Result<Self> {
-            Self::start_with(Plan {
-                cmdline,
-                cwd,
-                profile: Some(profile),
-                out,
-                inherited: &[],
-            })
+            Self::start_in(
+                Plan {
+                    cmdline,
+                    cwd,
+                    profile: Some(profile),
+                    out,
+                    inherited: &[],
+                },
+                temp,
+            )
         }
 
         /// Start `plan.cmdline`, optionally inside a container, optionally with
@@ -920,6 +1065,16 @@ pub(crate) mod win {
         /// and the failure is silent in both — a process that starts and never
         /// speaks.
         pub(crate) fn start_with(plan: Plan<'_>) -> io::Result<Self> {
+            Self::start_in(plan, None)
+        }
+
+        /// [`start_with`](Self::start_with), plus the temporary directory the
+        /// child is pointed at.
+        ///
+        /// Separate from `Plan` so that adding it did not reach the one caller
+        /// that has no container and therefore no per-run temporary directory to
+        /// be pointed at — the browser.
+        fn start_in(plan: Plan<'_>, temp: Option<&Path>) -> io::Result<Self> {
             let Plan {
                 cmdline,
                 cwd,
@@ -942,19 +1097,35 @@ pub(crate) mod win {
             // checked and `size` is what is read instead.
             // The attribute list exists only for a container. An ordinary spawn
             // — the browser outside containment — needs no attribute at all, and
-            // asking for a list of one and filling none is a structure the kernel
+            // asking for a list of two and filling none is a structure the kernel
             // reads differently from a plain `STARTUPINFO`.
+            //
+            // **Two attributes since 0.74.0**: the security capabilities that put
+            // the child in the container, and the handle list that decides what
+            // crosses into it. The count here and the number of
+            // `UpdateProcThreadAttribute` calls below must agree — a list sized
+            // for one and given two fails the second update, and a list sized for
+            // two and given one is read as far as it was filled.
+            const ATTRIBUTES: u32 = 2;
             let mut buf: Vec<usize>;
             let mut list: LPPROC_THREAD_ATTRIBUTE_LIST = std::ptr::null_mut();
             let mut _attrs: Option<AttrGuard> = None;
             let mut granted: [SID_AND_ATTRIBUTES; 1] = unsafe { std::mem::zeroed() };
             let caps;
+            let crossing;
 
             if let Some(profile) = profile {
                 let mut size: usize = 0;
                 // SAFETY: a null list with a live `size` out-parameter is the
                 // documented way to ask how large the list must be.
-                unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+                unsafe {
+                    InitializeProcThreadAttributeList(
+                        std::ptr::null_mut(),
+                        ATTRIBUTES,
+                        0,
+                        &mut size,
+                    )
+                };
                 if size == 0 {
                     return Err(io::Error::other(
                         "the process attribute list reported a size of zero",
@@ -966,9 +1137,10 @@ pub(crate) mod win {
                 list = buf.as_mut_ptr().cast::<core::ffi::c_void>() as LPPROC_THREAD_ATTRIBUTE_LIST;
 
                 // SAFETY: `list` points at `buf`, which is at least `size` bytes
-                // and outlives every use below; the count matches the one
-                // attribute set immediately after.
-                if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
+                // and outlives every use below; the count matches the attributes
+                // set immediately after.
+                if unsafe { InitializeProcThreadAttributeList(list, ATTRIBUTES, 0, &mut size) } == 0
+                {
                     return Err(io::Error::last_os_error());
                 }
                 _attrs = Some(AttrGuard(list));
@@ -1008,6 +1180,47 @@ pub(crate) mod win {
                         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
                         std::ptr::from_ref(&caps).cast(),
                         size_of_val(&caps),
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+
+                // **What may cross into the container, named (0.74.0).**
+                //
+                // `bInheritHandles` below is true, because the redirect and the
+                // C-runtime descriptor table both need it, and on its own that is
+                // a blanket grant: *every* handle this process holds that is
+                // marked inheritable is duplicated into the child, carrying the
+                // access it was opened with, past a token that was supposed to
+                // answer no to everything it had not been granted by name. One
+                // leaked inheritable handle — a store file, a socket, a log — is a
+                // hole straight through the boundary this module exists to be, and
+                // nothing in the container's ACL sees it, because a handle does
+                // not go back through an access check.
+                //
+                // `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` turns that blanket into a
+                // list. The list is the capture file the two standard streams are
+                // redirected to, plus whatever the caller asked for by name, and
+                // nothing else — see `super::super::windows::inheritable_handles`,
+                // which builds it as portable data so what may cross is asserted
+                // on the build host too. Every handle in it must already be
+                // inheritable, which `handle` is made above and which `Plan`
+                // requires of `inherited`.
+                crossing = crate::sandbox::windows::inheritable_handles(handle, inherited);
+                // SAFETY: `list` is initialised for two attributes and this is the
+                // second; the value is a live array of `HANDLE` owned by
+                // `crossing`, which lives until after the spawn below, and the
+                // size passed is that array's own byte length.
+                if unsafe {
+                    UpdateProcThreadAttribute(
+                        list,
+                        0,
+                        PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                        crossing.as_ptr().cast(),
+                        size_of_val(crossing.as_slice()),
                         std::ptr::null_mut(),
                         std::ptr::null(),
                     )
@@ -1074,12 +1287,24 @@ pub(crate) mod win {
             // mutable one of its own rather than a shared literal.
             let mut cmd = wide(cmdline);
             let wcwd = wide(cwd);
+            // A null environment block means "inherit this process's", which is
+            // what every spawn here did and what an ordinary one still does. A
+            // contained spawn needs `TMP`/`TEMP` pointed at the only temporary
+            // directory it has been granted; see `temp_env_block`.
+            let env = temp.map(temp_env_block);
+            let env_ptr = match &env {
+                Some(block) => block.as_ptr().cast::<core::ffi::c_void>(),
+                None => std::ptr::null(),
+            };
 
-            // SAFETY: `cmd`, `wcwd` and `si` are all live for the call. Handle
-            // inheritance is on, which is required for the redirect above to
-            // reach the child. `EXTENDED_STARTUPINFO_PRESENT` is what makes the
-            // kernel read `si` as a `STARTUPINFOEXW` and consult its attribute
-            // list, and without it the container SID would be silently ignored.
+            // SAFETY: `cmd`, `wcwd`, `si` and the block `env_ptr` addresses are
+            // all live for the call. Handle inheritance is on, which is required
+            // for the redirect above to reach the child — and since 0.74.0 the
+            // attribute list bounds what that inherits to the handles named in
+            // `crossing`, which is live for the call too.
+            // `EXTENDED_STARTUPINFO_PRESENT` is what makes the kernel read `si`
+            // as a `STARTUPINFOEXW` and consult its attribute list, and without
+            // it the container SID would be silently ignored.
             let ok = unsafe {
                 CreateProcessW(
                     std::ptr::null(),
@@ -1100,7 +1325,7 @@ pub(crate) mod win {
                     } else {
                         EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED
                     },
-                    std::ptr::null(),
+                    env_ptr,
                     wcwd.as_ptr(),
                     std::ptr::from_mut(&mut si).cast::<STARTUPINFOW>(),
                     &mut pi,
@@ -1244,7 +1469,7 @@ mod tests {
 
         let out_path = cwd.join("io-harness-out.txt");
         let file = std::fs::File::create(&out_path).expect("create the capture file");
-        let mut child = Spawned::start(cmdline, cwd, &profile, &file)
+        let mut child = Spawned::start(cmdline, cwd, &profile, &file, None)
             .unwrap_or_else(|e| panic!("F1: CreateProcessW into the AppContainer failed: {e}"));
         // 0.47.0 spawns suspended so the backend can put the process in its
         // job object before it runs an instruction. A caller that only starts
@@ -1398,9 +1623,14 @@ mod tests {
             .unwrap_or_else(|e| panic!("could not grant the workspace: {e}"));
         let out_path = work.path().join("net-allowed.txt");
         let file = std::fs::File::create(&out_path).expect("capture file");
-        let mut child =
-            Spawned::start(&format!("cmd.exe /c {probe}"), work.path(), &profile, &file)
-                .expect("spawn into a network-permitting container");
+        let mut child = Spawned::start(
+            &format!("cmd.exe /c {probe}"),
+            work.path(),
+            &profile,
+            &file,
+            None,
+        )
+        .expect("spawn into a network-permitting container");
         child.resume().expect("resume");
         drop(file);
         let permitted = child.wait(60_000).expect("wait");
@@ -1446,6 +1676,7 @@ mod tests {
             work.path(),
             &keep,
             &file,
+            None,
         )
         .expect("the surviving container must still be spawnable");
         child.resume().expect("resume");
@@ -1469,8 +1700,11 @@ mod tests {
     /// alone, so the second container was told its grant was already done and
     /// got nothing — success reported, DACL unchanged, which is the same silent
     /// inert grant this module has already paid for once. It survived because
-    /// production uses one deterministic profile name and therefore one stable
-    /// SID, so only a test that builds two containers could ever see it.
+    /// production used one deterministic profile name until 0.74.0 and therefore
+    /// one stable SID, so only a test that builds two containers could ever see
+    /// it. Since the name is the run's own, this is production's shape as well:
+    /// two runs in one embedding process grant the same workspace under two
+    /// containers.
     #[test]
     fn a_grant_to_one_container_is_not_a_grant_to_another() {
         let work = tempfile::tempdir().expect("tempdir");
@@ -1532,7 +1766,7 @@ mod tests {
             exe.display()
         );
         let mut child =
-            Spawned::start(&line, work.path(), &profile, &file).expect("spawn the payload");
+            Spawned::start(&line, work.path(), &profile, &file, None).expect("spawn the payload");
         child.resume().expect("resume the contained process");
         let code = child.wait(60_000).expect("wait");
 
@@ -1611,7 +1845,8 @@ mod tests {
             let out_path = root.path().join(format!("o{level}.txt"));
             let file = std::fs::File::create(&out_path).expect("capture");
             let line = "cmd.exe /c depth.bat".to_string();
-            let mut child = Spawned::start(&line, dir, &profile, &file).expect("spawn the payload");
+            let mut child =
+                Spawned::start(&line, dir, &profile, &file, None).expect("spawn the payload");
             child.resume().expect("resume");
             let code = child.wait(30_000).expect("wait");
             drop(file);
@@ -1655,6 +1890,7 @@ mod tests {
             dir.path(),
             &profile,
             &file,
+            None,
         )
         .expect("spawn the slow payload");
         slow.resume().expect("resume the contained process");
@@ -1665,7 +1901,7 @@ mod tests {
         );
 
         let mut quick =
-            Spawned::start("cmd.exe /c exit 7", dir.path(), &profile, &file).expect("spawn");
+            Spawned::start("cmd.exe /c exit 7", dir.path(), &profile, &file, None).expect("spawn");
         quick.resume().expect("resume the contained process");
         assert_eq!(
             quick.wait(30_000).expect("wait"),

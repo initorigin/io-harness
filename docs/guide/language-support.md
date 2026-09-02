@@ -94,13 +94,26 @@ the workspace on demand, so "is this tree already broken, and where" is a questi
 before a write rather than a note after one. It takes no arguments: what runs is
 the detected command in the table below and not the model's guess at it.
 
-The two differ in exactly two ways, both deliberate. `check` is an `Act::Exec`
-check on the resolved command — the program *and* the whole argv, as `exec` is —
-because a model-callable path to the project's build command must be refusable by
-the policy that refuses `exec`; the automatic post-edit check is not gated, being
-the crate's own reflex after a write the policy already allowed. And when this
-ecosystem has no checker, `check` says so where the automatic path stays silent —
-an empty answer to a direct question reads as "your project is clean".
+Both are gated the same way, and since 0.74.0 both run inside the run's own
+containment. Each is an `Act::Exec` check on the resolved command — the program
+*and* the whole argv, as `exec` is — because `cargo check` compiles, and compiling
+runs the workspace's `build.rs`, its proc macros and any `rustc-wrapper` named in
+`.cargo/config.toml`: code chosen by whoever wrote the files in the tree, which is
+not necessarily the operator. Until 0.74.0 the automatic one was ungated and
+uncontained on the argument that it was the crate's own reflex after a write the
+policy had already allowed.
+
+They differ in what they do with a refusal. `check` reports one, because somebody
+asked; the reflex is silent, because the model called `write_file` and a refusal
+it cannot act on is context spent on a decision that was not its own. And only
+`Effect::Allow` runs the reflex — an `Effect::Ask` is a skip rather than a
+question, since this path has no approver and a write that paused on an approval
+prompt would be a write turned into something else by what happens after it.
+**`Policy::default()` sets `exec: Ask`, so under it nothing is checked after an
+edit.** Name the checker with `allow_exec` for the projects you want checked; the
+write is unaffected either way and still cannot fail. And when this ecosystem has
+no checker, `check` says so where the automatic path stays silent — an empty
+answer to a direct question reads as "your project is clean".
 
 What that buys is when the error arrives, not that it arrives. Until now an agent
 learned that its edit did not compile only by deciding to find out — call `exec`,
@@ -257,7 +270,10 @@ tooling asks.
 defined", "who calls it", "what is this", and it answers them from a resolution
 rather than from a match. 0.52.0 gives the agent the second kind of question.
 
-Name a server in `io.toml`:
+Name a server in the user-scope `io.toml` — since 0.74.0 `[[lsp]]` is refused in
+both workspace files, because a language server is a command, an argv and an
+environment this process spawns at run start, and the spawn gate is an `Act::Exec`
+check on the binary name alone:
 
 ```toml
 [[lsp]]
@@ -294,6 +310,15 @@ The server starts once per run, in the background, so a cold index is paid once
 rather than inside a tool call. Starting it is an `Act::Exec` check on the binary
 named — without `allow_exec` for it the run refuses before the process exists.
 
+The `path` a question names is an `Act::Read` check of its own, taken before the
+server is told anything (0.74.0). The file is about to be read from disk and sent
+to a third-party process, and until this release the path was only joined onto the
+workspace root — which an absolute argument discards and a `../..` climbs out of —
+so `lsp_hover {"path": "../../../../etc/shadow"}` crossed the boundary
+`read_file` would have refused and left no row. A read tier of `Ask` now prompts
+here, exactly as it does for `read_file`; `Policy::default()` allows reads, so the
+common configuration is unchanged.
+
 Measured over one question ("where is this defined and which call sites use it")
 against the same repository: **three provider calls and 6,052 prompt bytes**
 through the server, against **six calls and 11,901 bytes** through
@@ -307,6 +332,15 @@ call. That keeps every byte reaching the workspace behind an `Act::Write` check 
 the path it lands in, and keeps the all-or-nothing guarantee `patch_file` already
 gives.
 
+**A file is rendered only if the policy allows reading it outright** (0.74.0). The
+server decides which files a `WorkspaceEdit` names, not the model, and rendering
+one is not naming it — every removed line lands in the model's context. So each
+path is resolved under the workspace root and must be `Effect::Allow`: an `Ask` is
+not permission, because there is no approver on this path to answer it. A file
+that does not clear the bar is omitted, with a count and the reason, rather than
+dropped silently. A run that wants the patch grants `allow_read` over the tree it
+is renaming in — the grant applying that patch already needs.
+
 ### Diagnostics
 
 Where a configured server answers diagnostic requests, its findings are appended
@@ -318,9 +352,11 @@ a model writes.
 ### Stated plainly
 
 - A server indexes the whole root, including files a `deny_read` rule covers. Every
-  location handed back is checked against the same `Act::Read` rule `read_file` is,
-  and an omission is counted in the answer — but the server process has still read
-  those files.
+  location handed back is checked against `Act::Read` and an omission is counted in
+  the answer — but the server process has still read those files. The bar depends on
+  what is being handed back: a path that is only *printed* is omitted on an outright
+  `Deny`, since naming a path is not reading it, while a file whose *contents* this
+  crate is about to render — `lsp_rename`'s patch — needs an `Allow`.
 - The server runs at the harness's own privilege, like an MCP stdio server. It is
   not inside the execution sandbox.
 - A server still indexing answers `[]` rather than an error. This crate waits for

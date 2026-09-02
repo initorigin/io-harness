@@ -97,10 +97,17 @@ const TOOLCHAIN_VAR: &str = "IO_HARNESS_SECRETS_TEST_TOOLCHAIN";
 const AGENT_VAR: &str = "IO_HARNESS_SECRETS_TEST_AGENT";
 const BROWSER_VAR: &str = "IO_HARNESS_SECRETS_TEST_BROWSER";
 
-/// Hold the environment, and point the user scope at somewhere empty so a config
-/// file on the developer's own machine cannot change what this measures.
+/// Hold the environment, and point the user scope at `user_dir` so a config file on
+/// the developer's own machine cannot change what this measures.
+///
+/// `IO_CONFIG` is removed rather than left alone: it names the user-scope *file*
+/// outright and wins over `IO_CONFIG_HOME`, so a developer who has one exported
+/// would otherwise be running a different test. That matters more since 0.74.0,
+/// because the fixture below now writes its tables into that scope rather than into
+/// the workspace.
 fn env<'a>(user_dir: &Path) -> MutexGuard<'a, ()> {
     let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("IO_CONFIG");
     std::env::set_var("IO_CONFIG_HOME", user_dir);
     for (var, value) in [
         (KEY_VAR, KEY),
@@ -148,17 +155,25 @@ fn hides_secrets_shows<T: std::fmt::Debug>(value: &T, expected: &[&str]) {
 /// `File`'s own impl refuses to print.
 ///
 /// Discovered rather than parsed, so `sources`, `origins` and the merged `raw`
-/// table are all populated — the fields a derived `Debug` would have printed. The
-/// hooks go in `io.local.toml` because a project-scoped file may not declare
-/// them: a hook runs a program and `io.toml` arrives with a `git clone`.
+/// table are all populated — the fields a derived `Debug` would have printed.
+///
+/// Every table goes in the **user** scope, because since 0.74.0 that is the only
+/// scope any of them may be declared in: `[[provider]]`, `[[mcp]]`, `[[lsp]]` and
+/// `[[hook]]` each name a program to run or an endpoint a credential is sent to,
+/// and neither `io.toml`, which arrives with a `git clone`, nor `io.local.toml`,
+/// which sits in the workspace root a run's own agent writes to, may carry one.
+/// Which is also why this fixture is still worth having: the user scope is exactly
+/// where the resolved secrets now live.
 ///
 /// The `Cargo.toml` is not configuration — it is the marker
 /// [`io_harness::toolchain::detect`] needs, because `Config::toolchain` overlays
 /// a `[toolchain.<ecosystem>]` table onto a detection rather than producing one.
-fn loaded(project: &Path) -> Config {
+/// It stays in the project, as does the `append` path a hook writes: both are
+/// resolved against the discovery root rather than against the declaring file.
+fn loaded(user: &Path, project: &Path) -> Config {
     std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
     std::fs::write(
-        project.join("io.toml"),
+        user.join("io.toml"),
         format!(
             "[[provider]]\nkind = \"anthropic\"\nmodel = \"claude-sonnet-4\"\n\
              api_key = \"${{env:{KEY_VAR}}}\"\n\n\
@@ -176,14 +191,8 @@ fn loaded(project: &Path) -> Config {
              deny_write = true\n\n\
              [toolchain.cargo]\n\
              test = [\"sentinel-runner\", \"--token=${{env:{TOOLCHAIN_VAR}}}\"]\n\
-             lint = []\n"
-        ),
-    )
-    .unwrap();
-    std::fs::write(
-        project.join("io.local.toml"),
-        format!(
-            "[[hook]]\non = [\"refused\"]\n\
+             lint = []\n\n\
+             [[hook]]\non = [\"refused\"]\n\
              run = [\"sentinel-gate\", \"--token=${{env:{HOOK_VAR}}}\"]\n\n\
              [[hook]]\non = [\"refused\"]\nappend = \"sentinel-audit.jsonl\"\n"
         ),
@@ -202,11 +211,11 @@ fn a_loaded_config_does_not_print_the_secrets_it_resolved() {
     let project = tempfile::tempdir().unwrap();
     let _guard = env(user_dir.path());
 
-    let config = loaded(project.path());
+    let config = loaded(user_dir.path(), project.path());
 
     // The substitution really happened — otherwise everything below is asserting
     // that a config with no secrets in it prints no secrets.
-    assert_eq!(config.sources()[0].0, Scope::Project);
+    assert_eq!(config.sources()[0].0, Scope::User);
     let Some(ProviderSpec::Anthropic { model, api_key }) = config.provider_spec() else {
         panic!("the file named an anthropic provider");
     };
@@ -263,7 +272,7 @@ fn the_accessors_that_hand_back_those_arrays_do_not_print_them_either() {
     let project = tempfile::tempdir().unwrap();
     let _guard = env(user_dir.path());
 
-    let config = loaded(project.path());
+    let config = loaded(user_dir.path(), project.path());
 
     // Positive controls first: each secret reached the field it is asserted
     // absent from below. Without these, every assertion here would pass on a
@@ -361,7 +370,7 @@ fn the_toolchain_overlay_and_the_agent_roster_do_not_print_them_either() {
     let project = tempfile::tempdir().unwrap();
     let _guard = env(user_dir.path());
 
-    let config = loaded(project.path());
+    let config = loaded(user_dir.path(), project.path());
 
     // `[toolchain.cargo]` — an override onto a detection, not a detection.
     let detected = io_harness::toolchain::detect(project.path()).expect("Cargo.toml is a marker");
@@ -454,10 +463,11 @@ fn a_credential_in_a_browser_argument_is_not_printed_either() {
     let project = tempfile::tempdir().unwrap();
     let _guard = env(user_dir.path());
 
-    // `io.local.toml`: a project-scoped file may not configure a browser, because
-    // `[browser]` names a program to execute and `io.toml` arrives with a clone.
+    // The user scope: no file inside the workspace may configure a browser, because
+    // `[browser]` names a program to execute — `io.toml` arrives with a clone, and
+    // `io.local.toml` is a path the run's own agent writes to (0.74.0).
     std::fs::write(
-        project.path().join("io.local.toml"),
+        user_dir.path().join("io.toml"),
         format!(
             "[browser]\nbinary = \"/usr/bin/sentinel-browser\"\n\
              args = [\"--proxy-server=https://user:${{env:{BROWSER_VAR}}}@proxy.example.test:8080\"]\n\
@@ -497,13 +507,23 @@ fn a_credential_in_a_browser_argument_is_not_printed_either() {
 /// takes a caller-written URL: an MCP endpoint behind a gateway is routinely
 /// written with the credential in it, and it is not `headers` that would have
 /// leaked it.
+///
+/// Discovered from the user scope rather than parsed from text: `Config::from_toml`
+/// is the project scope, and since 0.74.0 the project scope may not declare an
+/// `[[mcp]]` at all.
 #[test]
 fn a_credential_carried_in_an_mcp_url_is_not_printed_either() {
-    let config = Config::from_toml(
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    std::fs::write(
+        user_dir.path().join("io.toml"),
         "[[mcp]]\nid = \"gateway\"\ntransport = \"http\"\n\
          url = \"https://user:sk-SENTINEL-IN-A-URL@mcp.example.test/v1?api-key=sk-SENTINEL-IN-A-URL\"\n",
     )
     .unwrap();
+
+    let config = Config::discover(project.path()).unwrap();
     for rendered in both_forms(&config.mcp_servers()) {
         assert!(
             !rendered.contains("sk-SENTINEL-IN-A-URL"),
@@ -523,10 +543,16 @@ fn a_credential_carried_in_an_mcp_url_is_not_printed_either() {
 /// and a placeholder that could not tell them apart would hide the second one.
 #[test]
 fn an_unset_key_renders_as_none_rather_than_as_a_placeholder() {
-    let config = Config::from_toml(
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    std::fs::write(
+        user_dir.path().join("io.toml"),
         "[[provider]]\nkind = \"openrouter\"\nmodel = \"anthropic/claude-sonnet-4\"\n",
     )
     .unwrap();
+
+    let config = Config::discover(project.path()).unwrap();
     let rendered = format!("{:?}", config.provider_spec().unwrap());
     assert_eq!(
         rendered, "OpenRouter { model: \"anthropic/claude-sonnet-4\", api_key: None }",
@@ -540,12 +566,18 @@ fn an_unset_key_renders_as_none_rather_than_as_a_placeholder() {
 /// the key in a log through the field next to the one being redacted.
 #[test]
 fn a_credential_carried_in_a_base_url_is_not_printed_either() {
-    let config = Config::from_toml(
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    std::fs::write(
+        user_dir.path().join("io.toml"),
         "[[provider]]\nkind = \"compatible\"\n\
          base_url = \"https://user:sk-SENTINEL-IN-A-URL@gateway.example.test/v1\"\n\
          model = \"some-model\"\nauth = \"none\"\n",
     )
     .unwrap();
+
+    let config = Config::discover(project.path()).unwrap();
     for rendered in both_forms(config.provider_spec().unwrap()) {
         assert!(
             !rendered.contains("sk-SENTINEL-IN-A-URL"),

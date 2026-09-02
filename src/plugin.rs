@@ -44,14 +44,22 @@
 //! ] }]
 //! ```
 //!
-//! # Three rules, and each is the reason the format is usable at all
+//! # Four rules, and each is the reason the format is usable at all
 //!
 //! **A bundle is a stranger's directory.** It arrives under the rule 0.28.0 wrote
-//! for `[[hook]]`: a plugin declared in the committed, cloned `io.toml` may
+//! for `[[hook]]`: a plugin whose manifest sits *inside the workspace* may
 //! contribute skills, templates, agents and deny rules, and may not contribute a
 //! `[[hook]]`, an `[[mcp]]` or a `[[bin]]` (0.73.0) — each names a program this
-//! machine will run. The same plugin declared in `io.local.toml` or the
-//! user-scope file contributes all seven.
+//! machine will run. Only a plugin whose manifest lives outside the workspace,
+//! named from the **user-scope** file, contributes all seven.
+//!
+//! `io.local.toml` was on the trusted side of that line until 0.74.0, and audit
+//! finding H2 is why it is not any more: it sits at the workspace root, which is
+//! a path the run's own agent can write and a clone can ship. Declaring a bundle
+//! is still permitted from either workspace file — a bundle contributing only
+//! skills or templates is the ordinary case — so the refusal is on what the
+//! *manifest* contributes, not on the declaration.
+//!
 //! A `${env:}`, `${file:}` or `${cmd:}` substitution is refused inside a
 //! manifest in *every* scope (0.71.0), because a manifest is a third party's file
 //! wherever it was named from: the first two read this machine's environment and
@@ -60,6 +68,29 @@
 //! absolute or climbs out of the bundle with `..` (0.73.0): a bundle contributes
 //! an executable it ships, not one it points at somewhere else on this machine.
 //! The check is lexical and nothing on disk is read — see [`Plugin::bin`].
+//!
+//! **The question is where the manifest is, not who named it** (0.74.0). A
+//! `[[plugin]]`'s `path` is relative to the discovery root, so the operator's own
+//! `~/.config/io/io.toml` writing `path = "bundles/tools"` names a directory
+//! inside the very workspace the run is writing to — and a `plugin.toml` the
+//! agent puts there is an agent-authored file whatever scope pointed at it. So
+//! the user scope's trust is extended to the bundle only when the bundle is
+//! outside the workspace, which is where the scope's own premise holds. Moving a
+//! bundle out of the project is the migration for a declaration that stops
+//! contributing a `[[hook]]`.
+//!
+//! **A bundle points only at itself, and a workspace file's declaration only
+//! inside the workspace** (0.74.0, audit L13). `skills` and `templates` are held
+//! to the `[[bin]]` rule above, and a `[[plugin]]`'s own `path` is resolved under
+//! the discovery root rather than taken as written — an absolute one, a `..`, or
+//! a symbolic link out of the workspace drops the declaration when the file that
+//! wrote it is `io.toml` or `io.local.toml`. The user-scope file still points
+//! wherever the operator wants, the way `run.skills` does. Both keys name
+//! directories that are *read*: the frontmatter of every `*.md` under a skills
+//! directory is composed into the model's system prompt on every turn, so a value
+//! that escaped put a directory nobody agreed to into the context of every
+//! request. Read-only, and still content from outside the workspace arriving
+//! unasked.
 //!
 //! **A bundle may take capability away and may never hand it out.** A `[policy]`
 //! block may carry layers of [`Effect::Deny`](crate::Effect) rules and nothing
@@ -83,7 +114,7 @@
 //! so every file written before the key existed means exactly what it already
 //! meant. An entry written `enabled = false` is still read, validated and held
 //! to the same trust rule — switching a bundle on is a one-character edit, so a
-//! manifest may not smuggle a `[[hook]]` past the project-scope refusal by
+//! manifest may not smuggle a `[[hook]]` past the workspace-scope refusal by
 //! shipping it switched off — and then contributes nothing to any of the seven. It
 //! is listed on [`Plugins::disabled`] rather than [`Plugins::iter`], because an
 //! operator who turned a bundle off still has to be able to see that it is
@@ -308,11 +339,18 @@ impl Plugin {
     }
 
     /// The absolute skills directory this plugin contributes, if any.
+    ///
+    /// Guaranteed to be inside [`Plugin::root`] (0.74.0): a `skills` value that
+    /// was absolute or climbed out with `..` was refused at load, for the reason
+    /// a `[[bin]]`'s `path` is — with the frontmatter of every `*.md` under this
+    /// directory reaching the model's system prompt as the added weight.
     pub fn skills_dir(&self) -> Option<PathBuf> {
         self.manifest.skills.as_ref().map(|d| self.root.join(d))
     }
 
     /// The absolute templates directory this plugin contributes, if any.
+    ///
+    /// Inside [`Plugin::root`] on the same rule as [`Plugin::skills_dir`].
     pub fn templates_dir(&self) -> Option<PathBuf> {
         self.manifest.templates.as_ref().map(|d| self.root.join(d))
     }
@@ -659,11 +697,19 @@ impl Plugins {
     /// result differs by it on purpose — this is the marketplace-install
     /// semantics of the module's first rule, not a quirk of the loader:
     ///
-    /// - [`Scope::User`] and [`Scope::Local`] are the operator's own files, so a
-    ///   manifest's `[[hook]]`, `[[mcp]]` and `[[bin]]` are returned like any
-    ///   other contribution.
+    /// - [`Scope::User`] is the operator's own file, outside every workspace, so
+    ///   a manifest's `[[hook]]`, `[[mcp]]` and `[[bin]]` are returned like any
+    ///   other contribution. What that scope does *not* carry is the bundle's
+    ///   location: a user-scope `[[plugin]]` whose `path` resolves inside the
+    ///   discovery root is graded at load time as the workspace file it is, and
+    ///   the same manifest is refused there. An installer that writes a
+    ///   bundle into the project it is working on wants that answer, not this
+    ///   one.
     /// - [`Scope::Project`] is the committed `io.toml` that arrives with a
-    ///   `git clone`, so the same manifest is **refused whole** — not shortened.
+    ///   `git clone`, and as of 0.74.0 [`Scope::Local`] is held to the same rule
+    ///   — `io.local.toml` sits at the workspace root, so the agent can write it
+    ///   (audit H2). From either, the same manifest is **refused whole** — not
+    ///   shortened.
     ///   A bundle that would only load from one of the two is exactly what an
     ///   installer has to tell an operator before it writes anything.
     ///
@@ -693,7 +739,16 @@ impl Plugins {
     /// # demo().unwrap();
     /// ```
     pub fn inspect(scope: Scope, dir: impl AsRef<Path>) -> Result<Plugin> {
-        load_one(scope, dir.as_ref())
+        // No discovery root reaches here, so `Scope::User` is answered as the
+        // trusted case unconditionally. That is the honest answer for what this
+        // call is — a preflight against a directory an operator is deciding
+        // whether to declare at all — and `Plugins::load` is where the second
+        // half of the rule lives: a user-scope declaration whose path lands
+        // *inside* the workspace is graded as the workspace file it is, so a
+        // bundle inspected here as loadable can still be refused there. The
+        // directory is normally outside any workspace at install time, which is
+        // when this is called.
+        load_one(scope == Scope::User, dir.as_ref())
     }
 
     /// Load every declared plugin. Infallible by construction: see the module
@@ -702,7 +757,15 @@ impl Plugins {
     /// `root` is the discovery root a relative `path` resolves against — the
     /// project the harness was pointed at, not the directory the declaring file
     /// happens to live in, which is the rule a `[[hook]]`'s `append` already
-    /// follows.
+    /// follows. Since 0.74.0 it is also what decides trust, and it decides it two
+    /// different ways depending on which file declared the bundle:
+    ///
+    /// - declared by a file **inside the workspace** (`io.toml`, `io.local.toml`),
+    ///   a `path` that resolves outside `root` — absolute, `..`, or through a
+    ///   symbolic link — is dropped rather than loaded;
+    /// - declared by the **user-scope** file, a `path` may point anywhere, and it
+    ///   is where the manifest lands that decides what the manifest may
+    ///   contribute: inside `root` it is graded as the workspace file it is.
     ///
     /// A declaration switched off is loaded and validated like any other and
     /// then routed to [`Plugins::disabled`], because what an operator wants to
@@ -720,7 +783,63 @@ impl Plugins {
             let fallback = dir
                 .file_name()
                 .map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into());
-            match load_one(*scope, &dir) {
+            // `contain_under_root` rather than the lexical rule `check_bins`
+            // uses, because the directory this names is one that exists — it has
+            // to, or there is no manifest to read — so a symbolic link inside the
+            // workspace pointing out of it is a live route here in a way it is
+            // not for an executable a bundle has not built yet.
+            //
+            // What is *checked* is canonical; what becomes `Plugin::root` is the
+            // path as written. The two name the same directory once the check has
+            // passed, and `Plugin::root` is a value operators read and strip
+            // prefixes off — canonicalising it would rename every plugin path on
+            // any host whose temporary or checkout directory is itself a link.
+            let contained = crate::tools::workspace::contain_under_root(root, &decl.path);
+            // 0.74.0, audit L13. `path` was taken as written: an absolute one
+            // replaced the discovery root outright and a relative one climbed out
+            // of it with `..`, so a workspace file could point a bundle at any
+            // directory on this host and a manifest sitting there contributed its
+            // `skills`, whose every `*.md` frontmatter is composed into the
+            // model's system prompt on the next turn. Read-only, and still
+            // content from outside the workspace entering the context unasked.
+            //
+            // Held against the scopes a workspace can supply and not against the
+            // user scope, which is the split `refuse_widening` makes for
+            // `run.skills` and makes for the same reason: the operator's own file
+            // still points wherever the operator wants, and a shared bundle kept
+            // outside the project is the case that would otherwise stop loading.
+            if *scope != Scope::User {
+                if let Err(error) = &contained {
+                    out.dropped.push(Dropped {
+                        id: fallback,
+                        path: dir,
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            }
+            // 0.74.0. Trust follows where the manifest *is*, not which file named
+            // it, and a `[[plugin]]` is the one declaration where those two answers
+            // differ: every other section is content in the file whose scope is
+            // being graded, while this one is a pointer at a second file somewhere
+            // else. `read_scope` states the premise the user scope's exemption
+            // rests on — `$IO_CONFIG`, `$IO_CONFIG_HOME` and `~/.config/io` are
+            // outside every workspace, so a run that can write its own root cannot
+            // reach them — and that premise holds for the declaring file and does
+            // not transfer to a directory it points at. A relative `path` resolves
+            // against the discovery root, so `path = "bundles/tools"` in the
+            // operator's own file names a directory the run's agent writes to: one
+            // ordinary `write_file` of `bundles/tools/plugin.toml` carrying a
+            // `[[hook]]` was a program to run, installed with no refusal anywhere
+            // on the path.
+            //
+            // `contained.is_err()` is read as "outside", which is fail-closed
+            // where it matters: the other way `contain_under_root` fails is a
+            // component it cannot resolve, and a component this cannot resolve is
+            // one `load_one` cannot read a manifest through either, so such a
+            // declaration is dropped a few lines below rather than trusted.
+            let trusted = *scope == Scope::User && contained.is_err();
+            match load_one(trusted, &dir) {
                 Ok(plugin) => {
                     // A switched-off bundle claims no id, and the ordering here
                     // is the whole of that rule (0.70.0).
@@ -773,7 +892,7 @@ impl Plugins {
 /// Every check runs **before** any contribution is namespaced or handed back, so
 /// a refused manifest contributes nothing rather than contributing the half that
 /// was read before the refusal.
-fn load_one(scope: Scope, dir: &Path) -> Result<Plugin> {
+fn load_one(trusted: bool, dir: &Path) -> Result<Plugin> {
     let file = dir.join(PLUGIN_FILE);
     if !file.is_file() {
         return Err(crate::Error::Config(format!(
@@ -794,10 +913,27 @@ fn load_one(scope: Scope, dir: &Path) -> Result<Plugin> {
     })?;
 
     check_id(&manifest.name, &file)?;
-    if scope == Scope::Project {
+    // 0.74.0, audit H2 — every scope but the user's, not just the project one.
+    //
+    // This read `scope == Scope::Project` until 0.74.0, and that left the whole
+    // finding open one level down. `plugin` is deliberately not a refused
+    // section, so a workspace file may still declare one; the agent therefore
+    // wrote `io.local.toml` naming a bundle, wrote the bundle's own
+    // `plugin.toml` carrying a `[[hook]]`, and the next `discover().plugins()`
+    // carried it — two ordinary writes, no refusal anywhere on the path. The
+    // check that closes it has to match `Config::read_scope`, which now
+    // widening-checks every scope that is not the user's.
+    //
+    // `trusted` rather than the scope itself, because the scope answers who named
+    // the bundle and this rule is about where the manifest is — see
+    // `Plugins::load`, which is the caller that holds both answers. Here the
+    // parameter is the whole of the decision, so nothing in this function has to
+    // hold the two apart.
+    if !trusted {
         refuse_executing_contributions(&manifest, &file)?;
     }
     check_narrowing(&manifest, &file)?;
+    check_dirs(&manifest, &file)?;
     check_bins(&manifest, &file)?;
     Hooks::check(&manifest.hook, &file)?;
 
@@ -899,8 +1035,8 @@ fn check_id(id: &str, at: &Path) -> Result<()> {
     )))
 }
 
-/// A plugin declared in the project scope contributes nothing that runs a
-/// program.
+/// A plugin whose manifest sits inside the workspace contributes nothing that
+/// runs a program.
 ///
 /// The 0.28.0 argument applied to a new declaration site: `io.toml` is the file a
 /// `git clone` delivers, a `[[hook]]` runs an argv or writes to a path the file
@@ -909,6 +1045,13 @@ fn check_id(id: &str, at: &Path) -> Result<()> {
 /// whole — a manifest that declares one contributes none of its other six kinds
 /// either, because a half-applied stranger's manifest is the failure this rule
 /// exists to prevent.
+///
+/// Whether it applies is [`Plugins::load`]'s answer and not this function's: the
+/// caller is the one that knows the discovery root, and since 0.74.0 the question
+/// is where the manifest lives rather than which file named it. The message
+/// therefore states both halves of the way out — a bundle outside the workspace,
+/// declared from the user scope — because either one alone leaves the refusal
+/// standing.
 fn refuse_executing_contributions(manifest: &Manifest, at: &Path) -> Result<()> {
     let offending = if !manifest.hook.is_empty() {
         "hook"
@@ -923,12 +1066,56 @@ fn refuse_executing_contributions(manifest: &Manifest, at: &Path) -> Result<()> 
         return Ok(());
     };
     Err(crate::Error::Config(format!(
-        "{}: key `{offending}`: a plugin declared in a project-scoped `io.toml` may not contribute \
-         `[[{offending}]]`, because it names a program this machine would run and `io.toml` \
-         arrives with a `git clone`. Declare this plugin in `io.local.toml` or the user-scope file \
-         instead, or remove the `[[{offending}]]` from its manifest.",
+        "{}: key `{offending}`: a plugin whose manifest is inside the workspace may not contribute \
+         `[[{offending}]]`, because it names a program this machine would run and a file inside the \
+         workspace arrives with a `git clone` or is written by the agent itself. Keep this bundle \
+         outside the workspace and name it from the user-scope file, or remove the \
+         `[[{offending}]]` from its manifest.",
         at.display()
     )))
+}
+
+/// `skills` and `templates` stay inside the bundle, decided lexically (0.74.0,
+/// audit L13).
+///
+/// [`Plugin::skills_dir`] and [`Plugin::templates_dir`] resolve their key through
+/// `Path::join`, where an absolute value replaces the plugin root outright and a
+/// relative one climbs out of it with `..` — the same two moves `check_bins`
+/// refuses for a `[[bin]]`. The consequence is larger here than there: a
+/// `[[bin]]` is a path handed back for a caller to decide about, while a skills
+/// directory is *read* at run start and the frontmatter of every `*.md` under it
+/// is composed into the model's system prompt on every turn. So `skills =
+/// "/home/you/notes"` in a manifest put a directory nobody agreed to into the
+/// context of every request, read-only and unannounced.
+///
+/// `skills::resolve_under` already confines each file to the skills directory.
+/// What it cannot do is decide where that directory is, which is this.
+///
+/// Lexical, and for `check_bins`' reason: `load_one` performs no filesystem check
+/// of any kind, and a manifest whose validity depended on whether a directory had
+/// been checked out yet would be valid on Tuesday and dropped on Wednesday.
+fn check_dirs(manifest: &Manifest, at: &Path) -> Result<()> {
+    for (key, declared) in [
+        ("skills", manifest.skills.as_ref()),
+        ("templates", manifest.templates.as_ref()),
+    ] {
+        let Some(declared) = declared else { continue };
+        let wrong = declared.components().find_map(|c| match c {
+            Component::Prefix(_) | Component::RootDir => Some("is an absolute path"),
+            Component::ParentDir => Some("climbs out of the plugin root with `..`"),
+            _ => None,
+        });
+        let Some(wrong) = wrong else { continue };
+        return Err(crate::Error::Config(format!(
+            "{}: key `{key}`: {:?} {wrong}, and `{key}` is resolved by joining it onto the plugin \
+             root, because a bundle contributes a directory it ships rather than one it points at \
+             somewhere else on this machine — and every `*.md` under it reaches the model's system \
+             prompt. Write the path relative to the plugin root.",
+            at.display(),
+            declared,
+        )));
+    }
+    Ok(())
 }
 
 /// A `[[bin]]` path stays inside the bundle, decided lexically (0.73.0).

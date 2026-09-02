@@ -579,22 +579,39 @@ async fn containment_names_the_backend_the_host_actually_gave() {
             line.contains(backend.as_str()),
             "the line names a backend the host did not give: {line}"
         );
-        match backend.confines_writes() {
+        // 0.74.0 — the expectation comes from the PROBE, not from
+        // `backend.confines_writes()`. Deriving it from the declaration is the
+        // coupling this release exists to remove: on a host where a backend
+        // over-claims, the prompt would correctly say so and this test would go
+        // red for being right. The probe is measured here the same way the run
+        // measures it, so the two agree by construction rather than by luck.
+        let probe =
+            io_harness::sandbox::BoundaryProbe::measure(&config, &[dir.path().to_path_buf()], None)
+                .await;
+        match probe.write_refused {
             // A resource-only backend is stated as one. This is the degraded case
             // and the whole reason the line reports the selection rather than the
             // request. Asked rather than enumerated, so that a backend added to
             // the enum cannot make this test quietly assert the wrong half.
-            false => {
+            Some(false) => {
                 assert!(line.contains("resource limits only"), "{line}");
                 assert!(line.contains("no filesystem confinement"), "{line}");
             }
-            true => {
+            Some(true) => {
                 assert!(line.contains("are contained"), "{line}");
                 assert!(line.contains("confined to the workspace"), "{line}");
                 // 0.46.0 — the mode is named beside the backend, because a mode a
                 // host cannot enforce and a mode it can read identically without
                 // it.
                 assert!(line.contains("mode: workspace-write"), "{line}");
+            }
+            // The host could not attempt the write — no `curl`, or no home
+            // directory to aim at. The run is told what could not be established
+            // rather than that there is no confinement, because only the first is
+            // known to be true, and this arm asserts that distinction survives.
+            None => {
+                assert!(line.contains("could not establish"), "{line}");
+                assert!(!line.contains("are contained"), "{line}");
             }
         }
     }
@@ -1149,16 +1166,19 @@ async fn boundary_line_for(policy: &Policy, contract: &TaskContract) -> String {
 
 #[tokio::test]
 async fn a_proxied_run_says_whether_its_egress_boundary_is_enforced_or_advisory() {
-    use io_harness::sandbox::{select, Sandbox};
     let dir = workspace();
     // A policy that names a host is what makes a run proxied.
     let policy = Policy::default().layer("test").allow_net("api.example.com");
     let c = contract(dir.path()).with_contained_exec(SandboxConfig::new());
 
     let line = boundary_line_for(&policy, &c).await;
-    let backend = select(&SandboxConfig::new()).backend();
 
-    if backend.denies_egress() {
+    // 0.74.0 — measured, not declared, for the reason given in
+    // `the_containment_line_names_the_backend_the_host_actually_gave`: a test that
+    // reads the declaration re-creates the coupling the probe was built to break,
+    // and goes red on exactly the host where the fix is working.
+    let probe = io_harness::sandbox::BoundaryProbe::measure(&SandboxConfig::new(), &[], None).await;
+    if probe.denies_egress() {
         assert!(
             line.contains("proxy this run owns")
                 && line.contains("only the hosts this run's policy names"),

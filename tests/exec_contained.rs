@@ -348,6 +348,14 @@ async fn the_contracts_exec_timeout_is_not_reported_as_a_sandbox_cap() {
 /// only egress probe that can assert the *allow* arm without depending on
 /// somebody else's uptime.
 async fn loopback_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    // 0.74.0, audit M10 — the egress proxy now refuses a loopback upstream by
+    // default, and these tests route a contained `curl` through it to a listener
+    // on 127.0.0.1. The widening is the documented opt-out an operator uses for
+    // a local model; set once and never unset, because it is process-wide and
+    // `cargo test` runs a binary's tests as threads. Opting in here is the point:
+    // the floor is real, so a test that needs its own loopback has to say so.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("IO_HARNESS_ALLOW_LOCAL_ADDRESSES", "1"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {

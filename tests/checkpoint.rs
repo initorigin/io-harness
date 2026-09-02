@@ -2,9 +2,12 @@
 //! deterministic offline providers. A "crash" is modelled two ways, both honest:
 //! a REAL SIGKILL of a child process running the `crash_fixture` binary (the
 //! headline `crash_resume` test), and, for the in-process tests, dropping the
-//! run future mid-flight (`tokio::time::timeout`) and reopening the `Store` — a
-//! new connection with a fresh in-memory ledger and step counters, exactly what
-//! a restarted process sees. Nothing here touches the network.
+//! run future mid-flight and reopening the `Store` — a new connection with a
+//! fresh in-memory ledger and step counters, exactly what a restarted process
+//! sees. Where the moment of the drop matters, it is chosen by reading the
+//! store rather than by a clock (`crash_a_tree_mid_fan_out`), because a budget
+//! that fits a development machine is not one a loaded CI runner keeps.
+//! Nothing here touches the network.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -187,6 +190,118 @@ fn tree_contract(root: &std::path::Path) -> TaskContract {
 }
 fn containment() -> Containment {
     Containment::new(10, 4, 3, 1_000_000)
+}
+
+/// Drive `run` until `ready` says the store shows the state the caller is
+/// waiting for, then drop it — how every "crash" in this file that is not a real
+/// SIGKILL picks its moment.
+///
+/// `Ok(None)` is the cut-off. `Ok(Some(_))` is a run that finished first, which
+/// every caller rejects. `Err` is the bound below, and the caller turns it into
+/// a panic naming the state it actually reached.
+///
+/// **A cut-off point is a condition, not a clock.** Through 0.73.0 each of these
+/// wrapped its run in a short `timeout` and hoped the moment fell inside it —
+/// two bets at once: that the run reaches the state the test wants, and that it
+/// gets no further. The second is bought honestly, by a provider's
+/// `child_delay` holding the work inside its completion call. The first was only
+/// hope, and 0.74.0 spent it: the startup boundary probe runs up to three
+/// short-lived child processes before the root agent takes its first step, and a
+/// process spawn costs far more on a Windows or macOS runner than on a
+/// development machine. So the run is dropped when the store *shows* the state
+/// rather than when a clock says it is probably there.
+///
+/// The outer timeout is a bound, not a budget. Nothing is timed against it; it
+/// is here so a condition that never arrives fails with a number instead of
+/// hanging CI.
+///
+/// `ready` and `run` both hold the same `&Store`, and that cannot deadlock: a
+/// tree runs on one task — children are futures in a `FuturesUnordered`, never
+/// spawned tasks — [`Store`] owns its `Connection` behind no lock at all, and a
+/// `&Store` is `!Send`, so the run cannot be driven anywhere but here. There is
+/// no lock for the poll to wait on and no other thread for it to wait for.
+async fn cut_off_when<F: std::future::Future>(
+    run: F,
+    mut ready: impl FnMut() -> bool,
+) -> Result<Option<F::Output>, tokio::time::error::Elapsed> {
+    // Only decides how far past the condition the run gets before it is
+    // dropped. Anything well under the provider's delay leaves the work asleep.
+    const POLL: Duration = Duration::from_millis(5);
+    // Generous on purpose: a liveness bound, never a budget.
+    const GIVE_UP: Duration = Duration::from_secs(30);
+
+    tokio::time::timeout(GIVE_UP, async {
+        tokio::select! {
+            r = run => Some(r),
+            () = async {
+                while !ready() {
+                    tokio::time::sleep(POLL).await;
+                }
+            } => None,
+        }
+    })
+    .await
+}
+
+/// Start a tree over `dir` under `policy` and cut it off mid-fan-out — the crash
+/// every whole-tree resume test starts from. Leaves the store closed, as a
+/// killed process would, with the children spawned and none of them finished.
+///
+/// The moment is [`cut_off_when`]'s: the store showing the root plus one child,
+/// which is the number the wall-clock version asserted after the fact.
+/// `TreeProvider`'s 500ms `child_delay` keeps the other half true — no child can
+/// have finished — and stays a duration, because "nothing has happened yet" is
+/// not a state the store can be polled for. It is asserted instead.
+async fn crash_a_tree_mid_fan_out(dir: &std::path::Path, db: &std::path::Path, policy: &Policy) {
+    // Root + one child: the fan-out has happened.
+    const FANNED_OUT: u32 = 2;
+
+    let store = Store::open(db).unwrap();
+    let slow = TreeProvider {
+        child_delay: Duration::from_millis(500),
+    };
+    // Bound rather than built inline, so nothing the run borrows is a temporary
+    // of the call expression.
+    let contract = tree_contract(dir);
+    let approver = ApproveAll;
+    let bounds = containment();
+    let finished = cut_off_when(
+        run_tree(&contract, &slow, &store, policy, &approver, &bounds),
+        || store.agent_count_tree(1).unwrap() >= FANNED_OUT,
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the fan-out never reached {FANNED_OUT} agents; the tree has {}. That is a \
+             fan-out that does not spawn, not a slow machine",
+            store.agent_count_tree(1).unwrap()
+        )
+    });
+    assert!(
+        finished.is_none(),
+        "the run finished instead of being cut off mid-fan-out: {finished:?}"
+    );
+
+    let agents = store.agent_count_tree(1).unwrap();
+    assert!(
+        agents >= FANNED_OUT,
+        "children were spawned before the crash, so the resume has a tree to restore \
+         (got {agents})"
+    );
+    // The other half of "mid-fan-out", and the reason the resume has work left:
+    // every child is still inside its `child_delay`, so neither file the fan-out
+    // exists to write has been written.
+    for f in ["a.txt", "b.txt"] {
+        assert!(
+            !dir.join(f).exists(),
+            "{f} was written before the cut-off, so this is a finished child rather than a \
+             crash mid-fan-out"
+        );
+    }
+    assert!(
+        store.run_policy(1).unwrap().is_some(),
+        "the policy the tree started under is durable — that is what the resume reads"
+    );
 }
 
 /// A workspace contract over `root` satisfied by `needle` landing in `out.txt`.
@@ -505,39 +620,15 @@ async fn a_long_unattended_run_sustains_the_loop_and_checkpoints_throughout() {
 async fn a_tree_crash_resumes_every_agent_from_its_checkpoint() {
     let dir = ws();
     let db = dir.path().join("runs.db");
-    let store = Store::open(&db).unwrap();
     let contract = tree_contract(dir.path());
 
-    // Crash: drop the run mid-fan-out while children are still sleeping.
-    let slow = TreeProvider {
-        child_delay: Duration::from_millis(500),
-    };
-    let crashed = tokio::time::timeout(
-        Duration::from_millis(150),
-        run_tree(
-            &contract,
-            &slow,
-            &store,
-            &Policy::permissive(),
-            &ApproveAll,
-            &containment(),
-        ),
-    )
-    .await;
-    assert!(
-        crashed.is_err(),
-        "the run should have been cut off mid-fan-out"
-    );
-    // Children were spawned (rows + spawn records) but nothing finished.
-    let agents_before = store.agent_count_tree(1).unwrap();
-    assert!(
-        agents_before >= 2,
-        "children were spawned before the crash (got {agents_before})"
-    );
-    drop(store);
+    // Crash: drop the run at the moment the store shows the fan-out, with every
+    // child still asleep. `crash_a_tree_mid_fan_out` asserts both halves of that.
+    crash_a_tree_mid_fan_out(dir.path(), &db, &Policy::permissive()).await;
 
     // Restart: a fresh Store, fresh ledger. Resume the tree to completion.
     let store = Store::open(&db).unwrap();
+    let agents_before = store.agent_count_tree(1).unwrap();
     let fast = TreeProvider {
         child_delay: Duration::ZERO,
     };
@@ -971,39 +1062,6 @@ fn tree_refusals(db: &std::path::Path) -> Vec<(String, Option<String>, Option<St
     rows
 }
 
-/// Start a tree under `policy` and cut it off mid-fan-out — F4's crash, with the
-/// policy as a parameter. Leaves the store closed, as a killed process would.
-async fn crash_a_tree_mid_fan_out(dir: &std::path::Path, db: &std::path::Path, policy: &Policy) {
-    let store = Store::open(db).unwrap();
-    let slow = TreeProvider {
-        child_delay: Duration::from_millis(500),
-    };
-    let crashed = tokio::time::timeout(
-        Duration::from_millis(150),
-        run_tree(
-            &tree_contract(dir),
-            &slow,
-            &store,
-            policy,
-            &ApproveAll,
-            &containment(),
-        ),
-    )
-    .await;
-    assert!(
-        crashed.is_err(),
-        "the run should have been cut off mid-fan-out"
-    );
-    assert!(
-        store.agent_count_tree(1).unwrap() >= 2,
-        "children were spawned before the crash, so the resume has a tree to restore"
-    );
-    assert!(
-        store.run_policy(1).unwrap().is_some(),
-        "the policy the tree started under is durable — that is what the resume reads"
-    );
-}
-
 /// F12 — a tree started under a policy denying a path, crashed, and resumed
 /// through the new entry point *without a policy argument* still refuses that
 /// path, and the refusal is attributable to the original rule and layer.
@@ -1211,24 +1269,41 @@ async fn a_detached_child_is_readopted_after_a_restart() {
     })
     .with_max_steps(6);
 
-    // Cut the process off while the detached child is still working.
+    // Cut the process off while the detached child is still working — at the
+    // moment the store shows the coordinator's spawn step COMMITTED, not merely
+    // the moment the child row appears. The child row is written inside that
+    // step, before it commits, and a resume from an uncommitted spawn step
+    // replays the spawn call: that is the blocking-child path, not this one.
+    // What this test is about is the other case named in the comment on
+    // `AgentEvent::spawn_args` — a detached child's step does commit, so the
+    // call is gone and re-adoption is the only way back to it.
+    //
+    // 5s `child_delay` stays a duration: it is what makes "the child had not
+    // finished" true below, and no store state expresses "has not happened yet".
     let slow = DetachProvider {
         child_delay: Duration::from_secs(5),
         park_parent: true,
     };
-    let crashed = tokio::time::timeout(
-        Duration::from_millis(300),
-        run_tree(
-            &contract,
-            &slow,
-            &store,
-            &Policy::permissive(),
-            &ApproveAll,
-            &containment(),
-        ),
+    let policy = Policy::permissive();
+    let approver = ApproveAll;
+    let bounds = containment();
+    let crashed = cut_off_when(
+        run_tree(&contract, &slow, &store, &policy, &approver, &bounds),
+        || store.last_step(1).unwrap() >= 1 && !store.children(1).unwrap().is_empty(),
     )
-    .await;
-    assert!(crashed.is_err(), "the run was cut off mid-flight");
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the coordinator never committed a detaching spawn step; last step {}, children \
+             {:?}. That is a detach that does not happen, not a slow machine",
+            store.last_step(1).unwrap(),
+            store.children(1).unwrap()
+        )
+    });
+    assert!(
+        crashed.is_none(),
+        "the run finished instead of being cut off mid-flight: {crashed:?}"
+    );
     let children_before = store.children(1).unwrap();
     assert_eq!(children_before.len(), 1, "one child was detached");
     assert!(

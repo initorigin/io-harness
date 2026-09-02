@@ -1,5 +1,12 @@
 //! The durable trace: steps, checkpoints, events, edits and snapshots
 //! (0.62.0 split).
+//!
+//! **The trace holds whatever the run saw.** Nothing written here is redacted,
+//! sampled or summarised: the prompt of every step, the arguments of every tool
+//! call and the result the tool returned all go in verbatim. A step that read a
+//! file of credentials puts those credentials in `steps.result`, and the
+//! database outlives the run that wrote it. That is why the store file is
+//! created readable only by the user that made it — see [`Store::open`].
 use super::*;
 
 impl Store {
@@ -632,6 +639,16 @@ impl Store {
     }
 
     /// Record one step's full trace entry.
+    ///
+    /// **What goes in is whatever the run saw.** The prompt, the tool call and
+    /// the result are stored as they were, with nothing removed: a step that
+    /// read a `.env`, a private key or a token leaves that secret in
+    /// `steps.result`, and the database is still there after the run that wrote
+    /// it has ended. A trace is a copy of everything the run touched, and is
+    /// handled — copied, attached to a report, checked into a repository — on
+    /// those terms. On unix the store file is created private to the user that
+    /// made it (0.74.0); a host without file modes gives it whatever the
+    /// containing directory grants.
     pub fn record(&self, run_id: i64, step: &StepRecord) -> Result<()> {
         self.conn.execute(
             "INSERT INTO steps (run_id, step, decision, result, prompt, tool_call, tokens)

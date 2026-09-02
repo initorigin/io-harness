@@ -22,6 +22,23 @@ use io_harness::{
 };
 use serde_json::json;
 
+/// Reach a listener this test process put on loopback.
+///
+/// The local-address floor (0.74.0) refuses `127.0.0.0/8` whatever the policy
+/// says, so every test in this file has to opt into the widening the local-model
+/// case is documented under — the floor working, not a boundary being weakened:
+/// the policy is still what decides which loopback *host* is reachable, and
+/// `tests/security_net.rs` is where the floor's own refusals are asserted.
+///
+/// Set once for the whole binary and never unset, because the widening is
+/// process-wide and `cargo test` runs a binary's tests as threads: a per-test
+/// set/unset pair would be read by whatever else happened to be deciding at that
+/// moment. Called from [`Sink::start`], which every test here goes through.
+fn widen_for_loopback() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("IO_HARNESS_ALLOW_LOCAL_ADDRESSES", "1"));
+}
+
 /// A listener that accepts nothing and only counts connection attempts.
 ///
 /// Counting *accepts* is what makes "no connection was opened" an observation
@@ -33,6 +50,7 @@ struct Sink {
 
 impl Sink {
     fn start() -> Self {
+        widen_for_loopback();
         let listener = StdListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let seen = Arc::new(AtomicUsize::new(0));
@@ -221,6 +239,50 @@ async fn a_deny_all_base_still_reaches_its_provider_through_the_provider_layer()
         .find(|e| e.act == "net" && e.decision.as_deref() == Some("allow"))
         .expect("the allowance is recorded, not silent");
     assert_eq!(allowed.layer.as_deref(), Some("provider"));
+}
+
+/// C3 — the same base and the same provider as F8, with the endpoint marked as
+/// coming from an origin the operator does not vouch for: the caller's own
+/// deny-by-default `net` answers first, and the provider layer never gets to
+/// widen it.
+///
+/// The marker is a layer with no rules named `provider-untrusted:<host:port>` —
+/// what a configuration writes beside a `[[provider]]` whose scope it does not
+/// vouch for, and what any caller can write by hand through `Policy::layer`. It
+/// grants nothing and denies nothing; all it does is withdraw the exemption.
+///
+/// This fails against 0.73.0, where `authorize_provider` merged the allow overlay
+/// before checking the host, so nothing short of an explicit `deny_net` could
+/// refuse a provider endpoint. The contrast is the test above: same base, same
+/// endpoint, no marker — still reached, because an endpoint that never came
+/// through a configuration is the embedder's own Rust, which is a trusted origin.
+#[tokio::test]
+async fn an_untrusted_provider_endpoint_is_refused_by_a_deny_all_base() {
+    let sink = Sink::start();
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Dialer::new(sink.url());
+    let policy = Policy::default()
+        .layer("app")
+        .allow_read("*")
+        .allow_write("*")
+        .layer(format!("provider-untrusted:{}", sink.addr));
+
+    let err = run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &policy,
+        &ApproveAll,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(&err, Error::Refused { act, .. } if act == "net"),
+        "{err:?}"
+    );
+    assert_eq!(sink.connections(), 0, "refused before a socket was opened");
 }
 
 /// F8 — an explicit deny of the provider's own host still wins, and fails fast.

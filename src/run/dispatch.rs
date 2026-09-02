@@ -1034,6 +1034,7 @@ pub(super) async fn dispatch(
                                 lsp,
                                 run_id,
                                 watch,
+                                exec_sandbox,
                             )
                             .await;
                             Dispatched::Continue {
@@ -1153,6 +1154,7 @@ pub(super) async fn dispatch(
                                 lsp,
                                 run_id,
                                 watch,
+                                exec_sandbox,
                             )
                             .await;
                             Dispatched::Continue {
@@ -1251,6 +1253,7 @@ pub(super) async fn dispatch(
                                 lsp,
                                 run_id,
                                 watch,
+                                exec_sandbox,
                             )
                             .await;
                             Dispatched::Continue {
@@ -1338,7 +1341,17 @@ pub(super) async fn dispatch(
                     Gated::Go { remember, .. } => remembered.extend(remember),
                 }
             }
-            let obs = match checker.run(ws.root(), exec_timeout, cap).await {
+            // 0.74.0 — the `check` tool gated its checker and then spawned it
+            // outside the run's containment, so a policy allowing `cargo` handed
+            // the host the workspace's own `build.rs`, its proc macros and any
+            // `rustc-wrapper`, while `exec cargo check` on the same run was
+            // contained. Found while closing C2; the same spawn, the same fix.
+            let contained = exec_sandbox
+                .map(|c| std::sync::Arc::new(c.with_egress(ws.policy().permits_any_egress())));
+            let obs = match checker
+                .run(ws.root(), exec_timeout, cap, contained.as_ref())
+                .await
+            {
                 crate::tools::diagnostics::Outcome::Clean => {
                     "\n[check] the project's own check found nothing\n".to_string()
                 }
@@ -1384,7 +1397,22 @@ pub(super) async fn dispatch(
                 LSP_REFERENCES_TOOL => crate::lsp::Nav::References { path, line, column },
                 _ => crate::lsp::Nav::Hover { path, line, column },
             };
-            navigated(&call.name, lsp.navigate(ask, ws, run_id, watch).await, cap)
+            navigate_gated(
+                &call.name,
+                Some(path),
+                ask,
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                lsp,
+                watch,
+                depth,
+                goal,
+                cap,
+            )
+            .await?
         }
         LSP_RENAME_TOOL => {
             let path = s("path").unwrap_or_default();
@@ -1408,7 +1436,22 @@ pub(super) async fn dispatch(
                 column,
                 new_name,
             };
-            navigated(&call.name, lsp.navigate(ask, ws, run_id, watch).await, cap)
+            navigate_gated(
+                &call.name,
+                Some(path),
+                ask,
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                lsp,
+                watch,
+                depth,
+                goal,
+                cap,
+            )
+            .await?
         }
         LSP_SYMBOLS_TOOL => {
             let path = s("path");
@@ -1422,7 +1465,11 @@ pub(super) async fn dispatch(
                 ));
             }
             let ask = crate::lsp::Nav::Symbols { path, query };
-            navigated(&call.name, lsp.navigate(ask, ws, run_id, watch).await, cap)
+            navigate_gated(
+                &call.name, path, ask, ws, approver, store, run_id, step, lsp, watch, depth, goal,
+                cap,
+            )
+            .await?
         }
         #[cfg(feature = "browser")]
         name if crate::tools::browser::is_browser_tool(name) => {
@@ -2131,6 +2178,14 @@ pub(super) async fn dispatch(
             // check on the program could not tell those two apart, which is the
             // weakness the git built-ins were built to route around and the reason
             // they still exist.
+            //
+            // The argv check is a way of narrowing an allowlist and not a
+            // blocklist: a joined argv has more spellings than a pattern can
+            // enumerate — `git -c x push`, `env rm`, `busybox rm` — so a
+            // `deny_exec` over a permissive `defaults.exec` is a boundary with an
+            // unbounded number of ways around it. Documented on `EXEC_TOOL` and in
+            // `docs/CONTRACT.md` rather than fixed, because the fix is the shape of
+            // the policy a caller writes, not another pattern here.
             let joined = argv.join(" ");
             let mut remembered: Vec<Rule> = Vec::new();
             let mut targets = vec![program.clone()];
@@ -2692,6 +2747,43 @@ pub(super) async fn dispatch(
                     .filter(|p| !p.trim().is_empty())
                     .map(|p| vec![p.to_string()])
                     .unwrap_or_default();
+
+                // 0.74.0, audit H3 — the worktree path is asked of
+                // `Workspace::check_path` itself, not only of the gate below.
+                // `gate` grades a *relative* read or write target through
+                // `check_path`, but hands an *absolute* one to the policy
+                // directly: that relaxation exists so `read_skill` can reach a
+                // bundle outside the root, and it is exactly wrong for the one
+                // git built-in that CREATES the path the model named.
+                // `Git::argv`'s own check refuses a leading `-` and nothing
+                // else, so under a policy whose writes are broad
+                // `{"path":"/tmp/escaped"}` put a full checkout outside the
+                // workspace and wrote an *allow* row to match. Asked here, an
+                // absolute path and a `..` that climbs out are the same
+                // refusal, with the same row, as every other path in this
+                // crate.
+                if let Some(path) = paths.first() {
+                    let verdict = ws.check_path(Act::Write, path);
+                    if verdict.effect == Effect::Deny {
+                        let mut ev = PolicyEvent::refusal(step, "write", path.as_str());
+                        ev.rule.clone_from(&verdict.rule);
+                        ev.layer.clone_from(&verdict.layer);
+                        store.record_event(run_id, &ev)?;
+                        crate::run::refused(watch, run_id, depth, &ev);
+                        let why = verdict
+                            .rule
+                            .as_deref()
+                            .map(|r| format!(" (rule {r})"))
+                            .unwrap_or_default();
+                        return Ok(Dispatched::go(
+                            "write refused",
+                            format!(
+                                "\n[write refused] {path}{why} — the policy forbids this; try \
+                                 another path\n"
+                            ),
+                        ));
+                    }
+                }
             }
 
             // What the policy is asked, per tool. Reading history reads `.git`.
@@ -2727,6 +2819,18 @@ pub(super) async fn dispatch(
             // files it wanted to stage. The target is `GIT` itself, the string
             // `Git::run` checks, so the approver is asked about what actually
             // runs.
+            //
+            // **The exec target is the program and only the program** (0.74.0,
+            // audit L8). `deny_exec("git")` refuses every built-in in this arm;
+            // `deny_exec("git commit*")` refuses none of them, because no
+            // built-in ever presents a joined argv the way `exec` does. It could
+            // not: the argv these tools build carries the `-c` hardening flags
+            // between the program and the sub-command, so the string an operator
+            // would have to write is one this crate composes rather than one
+            // they chose. A sub-command is denied by naming what it touches —
+            // `deny_write(".git")` stops `git_commit` and `git_branch`, a
+            // `deny_read` on a path stops `git_add` staging it — which is the
+            // check the paths below perform.
             let mut targets: Vec<(Act, String)> = vec![
                 (Act::Exec, crate::tools::git::GIT.to_string()),
                 (repo_act, GIT_DIR.to_string()),
@@ -3010,12 +3114,14 @@ pub(super) async fn dispatch(
             {
                 Gated::Refused { decision, obs } => return Ok(Dispatched::go(decision, obs)),
                 Gated::Paused { request_id } => return Ok(Dispatched::Pause { request_id }),
-                // The rewritten form is not honoured: an approver may narrow or
+                // No rewritten form arrives here. An approver may narrow or
                 // deny, but "call a different MCP tool than the model asked for"
                 // is a substitution this arm has never made and the model's own
-                // arguments would not follow it. `gate` has already re-checked the
-                // rewrite against the policy, so nothing crosses a deny either way.
-                // The remembered rules do travel, so "allow this tool from now on"
+                // arguments would not follow it — so since 0.74.0 (audit M4)
+                // `gate` REFUSES a `modified` request on an `Act::Exec` rather
+                // than returning it for a consumer to drop. A `Gated::Go` on this
+                // path is therefore always the tool the model named. The
+                // remembered rules do travel, so "allow this tool from now on"
                 // sticks for the rest of the run exactly as it does for a write.
                 Gated::Go { remember, .. } => remember,
             };
@@ -3057,6 +3163,81 @@ pub(super) async fn dispatch(
     })
 }
 
+/// Put a navigation tool's `path` through the gate, then ask the language
+/// server.
+///
+/// 0.74.0, audit H7. [`crate::lsp::LspSession::navigate`] already refuses a path
+/// that leaves the root, but it refuses it *silently*: it has no `Store`, no
+/// `step` and no `depth`, and every persisted `policy_events` row in this crate
+/// is written by [`gate`]. A read that crossed the boundary with no row is the
+/// exact shape H7 is about, so the row is written here, where the run's identity
+/// is in scope — and writing it through `gate` rather than by hand is what keeps
+/// one spelling of "what a refusal looks like" instead of two.
+///
+/// **A policy whose reads are `Ask` now prompts on a navigation.** That is
+/// visible to an operator who had one, and it is the same treatment `read_file`
+/// gets: a question about a file the model chose is a question, not a silent
+/// pass. The floor inside `navigate` still stands underneath — it refuses a
+/// `Deny` on its own, so a caller reaching the session without this loop is no
+/// weaker than it was.
+///
+/// One function for all three arms, not three copies, for the reason `navigate`
+/// checks in one place: a boundary written three times is a boundary missing
+/// from one of them.
+#[allow(clippy::too_many_arguments)]
+async fn navigate_gated(
+    name: &str,
+    path: Option<&str>,
+    ask: crate::lsp::Nav<'_>,
+    ws: &Workspace,
+    approver: &dyn Approver,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    lsp: &LspSession,
+    watch: &Watch<'_>,
+    depth: u32,
+    goal: &str,
+    cap: usize,
+) -> Result<Dispatched> {
+    // `lsp_symbols` may name a query instead of a path, and a missing `path` on
+    // the other four is already an error the server answers. Nothing to gate.
+    let remembered = match path.filter(|p| !p.is_empty()) {
+        None => Vec::new(),
+        Some(path) => {
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                path,
+                None,
+                watch,
+                depth,
+                goal,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => return Ok(Dispatched::go(decision, obs)),
+                Gated::Paused { request_id } => return Ok(Dispatched::Pause { request_id }),
+                // The rewritten target is not read back: `Nav` was built from the
+                // model's own arguments and a redirected navigation would answer
+                // a question nobody asked. An approver narrows a navigation by
+                // denying it. The remembered rules travel, so an "always allow
+                // this" answered at a hover prompt is not asked again.
+                Gated::Go { remember, .. } => remember,
+            }
+        }
+    };
+    let mut done = navigated(name, lsp.navigate(ask, ws, run_id, watch).await, cap);
+    if let Dispatched::Continue { remember, .. } = &mut done {
+        *remember = remembered;
+    }
+    Ok(done)
+}
+
 /// What the policy and the approver together decided about one action.
 pub(super) enum Gated {
     /// Perform it, possibly in the form an approver rewrote it into.
@@ -3088,6 +3269,7 @@ pub(super) enum Gated {
 /// write into a failed one, and it does not return an error. An information
 /// feature that can take down the tool it informs on is a worse trade than not
 /// having it.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn diagnostics_after_write(
     ws: &Workspace,
     toolchain: Option<&crate::toolchain::Toolchain>,
@@ -3096,6 +3278,10 @@ pub(super) async fn diagnostics_after_write(
     lsp: &LspSession,
     run_id: i64,
     watch: &Watch<'_>,
+    // 0.74.0 — the containment this call was granted. The check after a write
+    // spawns the project's compiler, which runs the workspace's own build
+    // script; before this release it did so ungated and uncontained (audit C2).
+    exec_sandbox: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
 ) -> String {
     let root = ws.root();
     // 0.52.0 — what a configured server sees, appended to what the compiler said
@@ -3103,7 +3289,16 @@ pub(super) async fn diagnostics_after_write(
     // edit about a server that cannot answer is noise the model pays for on every
     // write. `check` reports all four states, because there somebody did ask.
     let served = lsp_diagnostics_text(&lsp.diagnose(ws, None, run_id, watch).await, false);
-    match crate::tools::diagnostics::after_edit(root, toolchain, timeout, cap).await {
+    match crate::tools::diagnostics::after_edit(
+        root,
+        toolchain,
+        timeout,
+        cap,
+        ws.policy(),
+        exec_sandbox,
+    )
+    .await
+    {
         crate::tools::diagnostics::Outcome::Found(text) => format!("{text}{served}"),
         crate::tools::diagnostics::Outcome::Clean => served,
         // A skip is silent. There is no ecosystem here, so there is nothing the

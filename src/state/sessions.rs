@@ -2,6 +2,26 @@
 //! (0.62.0 split).
 use super::*;
 
+/// One column name, quoted for interpolation into a statement this module
+/// assembles by hand.
+///
+/// The names come from `PRAGMA table_info`, which reads the schema of whatever
+/// file the store was opened over — and that file is not necessarily one this
+/// crate wrote. Interpolated raw, a column named so as to close the expression
+/// it lands in and open a statement of its own is SQL rather than a name: the
+/// sums in `Store::sum_of` stop at a syntax error and the store is unusable,
+/// and the `UPDATE` in [`Store::archive_session`] is the statement such a name
+/// is written to reach. Quoted, with every embedded quote doubled, the name is
+/// a name again whatever it says.
+///
+/// No name is refused. SQLite's own quoting is total for every name it can
+/// hand back — an embedded quote, a semicolon, a newline, even the empty name
+/// survive the round trip — so a filter over what looks like a plausible column
+/// would refuse legitimate schemas and prevent nothing.
+fn quoted(column: &str) -> String {
+    format!("\"{}\"", column.replace('"', "\"\""))
+}
+
 impl Store {
     /// The text and blob columns of one table, read from the schema this store
     /// actually has rather than from a list compiled into the binary.
@@ -10,6 +30,10 @@ impl Store {
     /// without anyone remembering to add it here — which is the same argument
     /// the deletion's own test makes by enumerating `sqlite_master` instead of
     /// checking a list.
+    ///
+    /// The names are returned as the schema spells them, because
+    /// `is_fact_column` matches on the spelling. Every one of them is untrusted
+    /// input and reaches a statement through `quoted`, never raw.
     fn text_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let cols = stmt
@@ -59,13 +83,13 @@ impl Store {
         }
         let sum = cols
             .iter()
-            .map(|c| format!("COALESCE(SUM(LENGTH({c})), 0)"))
+            .map(|c| format!("COALESCE(SUM(LENGTH({})), 0)", quoted(c)))
             .collect::<Vec<_>>()
             .join(" + ");
         let filter = if only_nonempty {
             let any = cols
                 .iter()
-                .map(|c| format!("COALESCE(LENGTH({c}), 0) > 0"))
+                .map(|c| format!("COALESCE(LENGTH({}), 0) > 0", quoted(c)))
                 .collect::<Vec<_>>()
                 .join(" OR ");
             format!(" AND ({any})")
@@ -656,7 +680,7 @@ impl Store {
             let touched = {
                 let any = cols
                     .iter()
-                    .map(|c| format!("COALESCE(LENGTH({c}), 0) > 0"))
+                    .map(|c| format!("COALESCE(LENGTH({}), 0) > 0", quoted(c)))
                     .collect::<Vec<_>>()
                     .join(" OR ");
                 self.conn.query_row(
@@ -667,7 +691,7 @@ impl Store {
             };
             let set = cols
                 .iter()
-                .map(|c| format!("{c} = ''"))
+                .map(|c| format!("{} = ''", quoted(c)))
                 .collect::<Vec<_>>()
                 .join(", ");
             tx.execute_batch(&format!("UPDATE {table} SET {set} WHERE {key} IN ({ids})"))?;

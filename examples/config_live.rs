@@ -48,16 +48,20 @@ async fn main() -> io_harness::Result<()> {
             r#"
 [policy.defaults]
 read = "allow"
-write = "deny"
+write = "ask"
 exec = "deny"
 net = "deny"
 
+# 0.74.0 — a layer in a file inside the workspace may carry `deny` rules and
+# nothing else. This file is committed, so it is the file a `git clone` hands
+# whoever runs the agent next, and a grant written here is a grant the operator
+# never made. Narrowing is what the scope is for, so the deny below is exactly
+# the shape that still belongs in it — and `write = "ask"` above is how a
+# project asks for a human on the writes it did not name.
 [[policy.layers]]
 name = "project"
 rules = [
-  {{ act = "write", effect = "allow", pattern = "src/*" }},
-  {{ act = "write", effect = "allow", pattern = "NOTES.md" }},
-  {{ act = "write", effect = "deny",  pattern = "secrets/*" }},
+  {{ act = "write", effect = "deny", pattern = "secrets/*" }},
 ]
 
 [run]

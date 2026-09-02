@@ -42,7 +42,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.73"
+io-harness = "0.74"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -148,7 +148,7 @@ layer.
 | **Providers** | OpenRouter, Anthropic and OpenAI natively, one `Compatible` provider for any OpenAI-shaped endpoint, 21 vendor presets, fallback between them | [providers](docs/guide/providers.md) |
 | **Context and memory** | Per-turn assembly to a stated budget share, compaction, invalidation, and durable memory kept by evidence | [context and memory](docs/guide/context-and-memory.md) |
 | **Sessions** | Durable, branchable conversations with token streaming, mid-turn steering and interruption | [sessions](docs/guide/sessions.md) |
-| **Configuration** | One `io.toml` over four scopes, projected onto the typed API, where a project file may narrow and never widen | [configuration](docs/guide/configuration.md) |
+| **Configuration** | One `io.toml` over four scopes, projected onto the typed API, where a file inside the workspace may narrow and never widen | [configuration](docs/guide/configuration.md) |
 | **Hooks and bundles** | An audit log, notification, formatter or blocking check from config; a directory that contributes skills, agents, servers, the executables it ships and deny rules at once | [hooks](docs/guide/hooks.md), [bundles](docs/guide/plugins.md) |
 | **Extensibility** | The `Tool` trait in-process, MCP over stdio and streamable HTTP, and markdown skills that can open the references beside them and never anything outside | [tools and skills](docs/guide/tools-and-skills.md) |
 | **Accounting** | Input, output, cache-read, cache-write and reasoning tokens per call, with latency and TTFT; cost derived on read from a price table you own | [accounting](docs/guide/accounting.md) |
@@ -296,6 +296,15 @@ the trace records what actually applied.
 A run whose policy names hosts reaches those hosts and no others, through a proxy
 the run owns. What that proxy is worth differs per backend and is stated per
 backend in [docs/CONTRACT.md](docs/CONTRACT.md) rather than discovered.
+
+Underneath every rule an operator writes there is an **address floor**:
+loopback, link-local, cloud-metadata, carrier-grade-NAT, unique-local and RFC 1918
+addresses are refused whatever the policy says, because a rule is a hostname glob
+and nobody thinks to deny their own admin ports.
+`IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1` is the only way off it, and it is an
+environment variable rather than an `io.toml` key on purpose — a key that widens is
+one a cloned repository could set. A run against a local model runtime needs it;
+see [MCP and network egress](docs/guide/mcp-and-network.md).
 
 Beside all of that, model-produced code runs in an ephemeral **execution sandbox**
 with an isolated workdir, resource caps that kill rather than throttle, and
@@ -517,24 +526,31 @@ so the programs built on it keep their own settings in the same file;
 repository's own guidance, with `files = []` as the opt-out. `${env:...}`,
 `${file:...}` and `${cmd:...}` keep a credential out of the file, an unknown key is
 an error rather than a shrug, and nothing is loaded implicitly: the caller reads the
-file, before the run, once. A **project** file may narrow the boundary and may never
-widen it — the keys that would make cloning a repository dangerous are refused in the
-one file a clone delivers.
+file, before the run, once. A file **inside the workspace** may narrow the boundary
+and may never widen it: the twelve keys that would remove containment, a
+`[[policy.layers]]` rule whose effect is anything but `deny`, and every section
+that names a program to run, names an endpoint a credential is sent to, or opens a
+route out of the boundary the policy does not gate — `[[hook]]`, `[browser]`,
+`[[provider]]`, `[[mcp]]`, `[[lsp]]`, `[web]` — are refused in the committed
+`io.toml` *and* in the gitignored `io.local.toml`, which sits at the workspace root
+where the agent can write it. The user-scope file, outside every workspace, is the
+one that can still widen, and every refusal names it.
 
 A `[[hook]]` table names the events it wants and one thing to do with them: a path to
 append the event stream to is an audit log, an argv to run is a notification or a
 formatter, and that argv with `on_failure = "cancel"` is a local policy check that
 ends the run. `Config::hooks()` returns an `Observer` the caller installs like any
-other, so no run loop changed — and the whole array is refused in the committed
-project file, for the same reason `${cmd:...}` is.
+other, so no run loop changed — and the whole array is refused in both workspace
+files, for the same reason `${cmd:...}` is refused in the committed one. It lives in
+the user-scope file.
 
 A **capability bundle** is a directory with a `plugin.toml` that contributes skills,
 prompt templates, an agent roster, MCP servers, hooks, the executables it ships and
 deny-only policy at once,
 named by a `[[plugin]]` entry in any scope. Every contributed name is namespaced
 `<plugin>__<name>` as it loads, so a refusal, a tool call and a child's spend already
-say which bundle introduced them — with no new table. A bundle declared in the
-committed project file may not contribute a hook, an MCP server or a `[[bin]]`, because
+say which bundle introduced them — with no new table. A bundle declared from any file
+inside the workspace may not contribute a hook, an MCP server or a `[[bin]]`, because
 all three name a program this machine would run, and a bundle that fails to load is
 dropped and reported rather than taking the run with it. A `[[bin]]` is a declaration
 and not a grant: the harness says what a bundle ships, and where a host puts it — and
@@ -548,19 +564,26 @@ agent is then shown — with the console output and the uncaught errors each act
 produced. **Every document navigation is an `Act::Net` check against the host,
 decided at the paused request rather than at the URL a tool was handed**, so a
 navigation caused by a click, a redirect or a script is decided by the same rule as
-one the model typed, and every decision is a row in the trace. It is driven over a
+one the model typed, and every decision is a row in the trace. A URL that reaches no
+host is decided by its scheme instead, before the navigation is issued: `about:blank`
+and nothing else, so `file:`, `data:` and `javascript:` are refused and recorded
+rather than slipping past a check that only ever saw hosts. It is driven over a
 pipe on the child's own descriptors and opens **no debugging port**, which is both
 the smaller attack surface and the reason it needs no new dependency. Nothing is ever
 downloaded: the browser is one already installed, and its absence is a refusal.
 
-**LSP navigation.** Point the harness at a language server in `io.toml` and the agent
+**LSP navigation.** Point the harness at a language server — on the contract, or in
+the user-scope `io.toml` — and the agent
 asks the questions an editor answers rather than the ones a text search answers:
 `lsp_definition`, `lsp_references`, `lsp_symbols`, `lsp_hover` and `lsp_rename`. The
 server starts once per run in the background, so its index is paid for once and not
 inside a tool call, and starting it is an `Act::Exec` check on the binary the operator
-named. `lsp_rename` **writes nothing** — it answers with a patch series you apply with
-`patch_file`, one gate check per file. Configure no server and nothing changes: the
-five schemas are absent from the catalogue entirely.
+named, while the `path` a question names is an `Act::Read` check taken before the
+server is told anything. `lsp_rename` **writes nothing** — it answers with a patch
+series you apply with `patch_file`, one gate check per file, and renders only the
+files the policy allows reading outright, because the server chooses which files a
+rename names. Configure no server and nothing changes: the five schemas are absent
+from the catalogue entirely.
 
 **Provider-executed web search and fetch.** `TaskContract::with_web` declares what the
 provider may look up on the agent's behalf — search, optionally fetch, a cap on
@@ -628,7 +651,7 @@ limits that capability actually has.
 | [Accounting](docs/guide/accounting.md) | Per-call rows, cache and reasoning tokens, latency, derived cost, and grouped outcome, gate and recovery counts |
 | [Documents](docs/guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut |
 | [Images and git](docs/guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
-| [Hooks](docs/guide/hooks.md) | An audit log, a notification, a formatter or a check that stops the run, declared in `io.toml` |
+| [Hooks](docs/guide/hooks.md) | An audit log, a notification, a formatter or a check that stops the run, declared in the user-scope `io.toml` |
 | [Providers](docs/guide/providers.md) | One compatible provider, the 21 vendor presets, running a model locally, what a model costs, and asking one to think harder |
 | [Capability bundles](docs/guide/plugins.md) | A directory that contributes skills, templates, agents, MCP servers, hooks and deny rules at once, what a cloned repository may not hand you, and how a contribution names its bundle |
 | [Retention](docs/guide/retention.md) | What a store is holding, removing a session whole, sweeping to a date and what it refuses, archiving the words while keeping the numbers, and reclaiming the space |
@@ -742,9 +765,9 @@ Deno project may carry both and `npm test` is wrong for it; `Makefile` is tried
 last, because a great many projects have one *beside* their real build system. A
 root with no marker reports nothing rather than guessing.
 
-**A write is type-checked where a cheap checker exists.** After a successful
-write, five ecosystems run their own check and attach what it found, so a mistake
-arrives with the edit rather than twenty steps later:
+**A write is type-checked where a cheap checker exists and the policy allows it.**
+After a successful write, five ecosystems run their own check and attach what it
+found, so a mistake arrives with the edit rather than twenty steps later:
 
 | Ecosystem | Check after a write |
 | --- | --- |
@@ -759,10 +782,18 @@ their build, and running a build after every single edit would make editing
 unusable. An ecosystem with no cheap checker is a fact about the ecosystem, not a
 gap in the harness: nothing runs, and nothing is said to the model.
 
+The check is an `Act::Exec` on the program and on the whole argv, like any other
+spawn, and it runs inside the run's containment — a checker is a compiler, and a
+compiler runs the workspace's own build script. Only an outright allow runs it:
+there is no approver on the path after a write, so an `ask` is a silent skip, and
+`Policy::default()` asks about exec. Name the checker with `allow_exec` for the
+projects you want checked; the write itself is unaffected either way.
+
 ### Language servers
 
-There is no built-in list of languages here either. Name a server in `io.toml` or
-on the contract — its command, and the extensions it answers for — and the agent
+There is no built-in list of languages here either. Name a server on the contract or
+in the user-scope `io.toml` — its command, and the extensions it answers for — and
+the agent
 gains five tools for that language: `lsp_definition`, `lsp_references`,
 `lsp_symbols`, `lsp_hover` and `lsp_rename`. `rust-analyzer`, `gopls`,
 `typescript-language-server`, `pyright`, `clangd` and anything else speaking LSP
@@ -810,7 +841,14 @@ The rung a host takes is the strongest that can enforce what the run asked for, 
 a run denying egress is never given one that cannot deny egress. The Linux chain's
 first rung is Landlock, which needs no namespace at all — which matters because a
 stock Ubuntu host ships `kernel.apparmor_restrict_unprivileged_userns=1` and refuses
-the unprivileged user namespace the namespace backend needs.
+the unprivileged user namespace the namespace backend needs. The namespace rung
+also needs `setpriv` (util-linux, beside `unshare`), so that the payload cannot
+inherit the capabilities that made its own read-only mounts; a host without it
+skips the rung and reports the backend it actually got.
+
+What a run reports about its boundary is **measured**: a probe attempts a write
+and a dial outside it before the first step, and an arm that could not be
+attempted reads as *not established* rather than as confined.
 
 **Windows access confinement is opt-in.** A Job Object has no filesystem facility and
 no network facility, so a contained Windows command gets the resource caps and nothing

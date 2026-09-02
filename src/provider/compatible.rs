@@ -64,6 +64,9 @@ pub use crate::net::REQUEST_TIMEOUT;
 #[non_exhaustive]
 pub enum Auth {
     /// `Authorization: Bearer <key>`, which every hosted vendor here uses.
+    ///
+    /// Refused over a plain `http://` base whose host is not this machine
+    /// (0.74.0): see [`Compatible::new`].
     Bearer,
     /// No credential header at all — a local runtime, or a proxy that
     /// authenticates some other way.
@@ -127,6 +130,30 @@ pub(crate) const PRESETS: &[(&str, &str, Auth)] = &[
     ("vllm", "http://localhost:8000/v1", Auth::None),
 ];
 
+/// Whether `base` names a host on this machine (0.74.0).
+///
+/// Built on [`crate::net::target`] rather than on a second URL parser, so the
+/// host this answers for is the same host the egress policy governs — including
+/// the awkward shapes it already handles: userinfo before the host, an IPv6
+/// literal in brackets, an implicit port. A base it cannot parse is not local,
+/// which is the fail-closed answer.
+fn is_loopback(base: &str) -> bool {
+    let Some(target) = crate::net::target(base) else {
+        return false;
+    };
+    // `target` always appends a port, so the host is everything before the last
+    // colon — except for a bracketed IPv6 literal, where it is what the brackets
+    // hold.
+    let host = match target.strip_prefix('[') {
+        Some(inside) => inside.split(']').next().unwrap_or_default(),
+        None => target.rsplit_once(':').map_or("", |(h, _)| h),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Every preset name, for an error message that lists what exists rather than
 /// only what was misspelled.
 pub(crate) fn preset_names() -> Vec<&'static str> {
@@ -154,9 +181,12 @@ pub(crate) fn preset_list() -> String {
 /// let local = Compatible::ollama("llama3.2");
 ///
 /// // Or anything else that speaks the format — a proxy, a gateway, a runtime on
-/// // a port of your own. The base is the whole prefix the vendor documents.
+/// // a port of your own. The base is the whole prefix the vendor documents, and
+/// // it is `https` because a bearer key over plain `http` to anywhere but this
+/// // machine is refused: see `Compatible::new`.
 /// use io_harness::Auth;
-/// let own = Compatible::new("http://10.0.0.4:8000/v1", Auth::None, "", "my-model")
+/// let key = std::env::var("LAB_GATEWAY_KEY").unwrap();
+/// let own = Compatible::new("https://gateway.internal:8000/v1", Auth::Bearer, key, "my-model")
 ///     .with_name("lab");
 ///
 /// let contract = TaskContract::new(
@@ -201,6 +231,21 @@ impl Compatible {
     ///
     /// `base` is the whole prefix the vendor documents — `/chat/completions` and
     /// `/models` are appended to it. Pass `""` as the key with [`Auth::None`].
+    ///
+    /// # A bearer key is never sent in cleartext (0.74.0)
+    ///
+    /// [`Auth::Bearer`] over a `http://` base whose host is not on this machine
+    /// is refused when the request is made, with [`Error::Config`] naming the
+    /// base. Nothing about the constructor changes — the refusal is at the one
+    /// place the auth style reaches the wire, so a provider built from
+    /// `[[provider]]` in `io.toml` is governed by it exactly as one built here
+    /// is.
+    ///
+    /// The alternatives it names are the two that do not put the operator's
+    /// credential on the wire in the clear: `https://` for a remote endpoint, or
+    /// [`Auth::None`] for one that authenticates some other way. Loopback —
+    /// `localhost`, `127.0.0.0/8`, `::1` — is exempt, which is what keeps the
+    /// eight local-runtime presets and a developer's own port working.
     pub fn new(
         base: impl Into<String>,
         auth: Auth,
@@ -331,6 +376,39 @@ impl Compatible {
         Self::new(base, Auth::Bearer, "test-key", "test-model").with_timeout(timeout)
     }
 
+    /// Refuse to send a bearer credential in the clear (0.74.0).
+    ///
+    /// `base` is caller-supplied — from Rust, or from `base_url` in an
+    /// operator's `io.toml` — and until this existed nothing looked at its
+    /// scheme. A `http://` base pointed anywhere but this machine puts the key
+    /// on the wire in plaintext for every hop between here and the endpoint to
+    /// read, and it did so silently: no warning, no trace entry, nothing.
+    ///
+    /// It refuses rather than warning because a warning is a thing an
+    /// unattended run emits into a log nobody reads while the key travels
+    /// anyway, and because nothing in the preset table is refused by it — every
+    /// [`Auth::Bearer`] row is `https://` and every `http://` row is a loopback
+    /// runtime with [`Auth::None`]. What it does refuse is a configuration that
+    /// was already leaking.
+    ///
+    /// An unparseable base is refused too. [`crate::net::target`] answering
+    /// `None` means the host could not be determined, and a host nobody could
+    /// name is not a host anyone proved is local.
+    fn refuse_cleartext_bearer(&self) -> Result<()> {
+        if self.auth != Auth::Bearer || !self.base.to_ascii_lowercase().starts_with("http://") {
+            return Ok(());
+        }
+        if is_loopback(&self.base) {
+            return Ok(());
+        }
+        Err(Error::Config(format!(
+            "refusing to send a bearer credential in cleartext to {}: the base is plain \
+             http:// and its host is not on this machine. Use https:// for a remote \
+             endpoint, or Auth::None for one that needs no credential",
+            super::redacted_endpoint(&self.base)
+        )))
+    }
+
     /// One completion, with each text delta handed to `on_token` as it arrives.
     /// Both trait methods are this function; `complete` passes a sink that does
     /// nothing.
@@ -343,6 +421,7 @@ impl Compatible {
         #[cfg(feature = "media")]
         super::ensure_media_accepted(self.name(), self.accepts_images(), &request)?;
         openai_wire::ensure_web_supported(self.name(), WebFlavor::OpenAi, &request)?;
+        self.refuse_cleartext_bearer()?;
         let sent = std::time::Instant::now();
         let mut req = self.client.post(self.chat_url());
         // The one place the auth style reaches the wire. `Auth::None` sends no
@@ -785,6 +864,59 @@ mod tests {
                 | "vllm" => Ok(Local),
                 _ => Err(()),
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // L5 — what counts as "this machine"
+    // -----------------------------------------------------------------------
+
+    /// The parse under the refusal, driven over the shapes that decide it.
+    ///
+    /// `tests/security_provider.rs` asserts the behaviour through `complete`;
+    /// this is the half that is easy to get subtly wrong — a host read off the
+    /// wrong side of a colon, or a `127.0.0.1` smuggled into userinfo in front
+    /// of a host that is not local at all.
+    #[test]
+    fn l5_only_a_host_on_this_machine_is_loopback() {
+        for base in [
+            "http://localhost:1234/v1",
+            "http://LOCALHOST/v1",
+            "http://127.0.0.1:11434/v1",
+            // The whole of 127.0.0.0/8, not just the one address people type.
+            "http://127.99.4.2/v1",
+            "http://[::1]:8000/v1",
+            "http://[::1]/v1",
+        ] {
+            assert!(is_loopback(base), "{base}");
+        }
+        for base in [
+            "http://10.0.0.4:8000/v1",
+            "http://example.com/v1",
+            // Userinfo that merely *looks* local in front of a host that is not.
+            "http://127.0.0.1@evil.example/v1",
+            // A name that starts with the local one but is a different host.
+            "http://localhost.evil.example/v1",
+            // Unparseable is not local: a host nobody could name is a host
+            // nobody proved was here.
+            "not a url",
+            "http://",
+        ] {
+            assert!(!is_loopback(base), "{base}");
+        }
+    }
+
+    /// The eight local-runtime presets, and the thirteen hosted ones, are on the
+    /// two sides of the refusal they were always on. A guard that moved either
+    /// would break a documented configuration rather than close a hole.
+    #[test]
+    fn l5_no_preset_is_refused_by_the_cleartext_guard() {
+        for (name, _, _) in PRESETS {
+            let built = Compatible::preset(name, "k", "m").unwrap();
+            assert!(
+                built.refuse_cleartext_bearer().is_ok(),
+                "{name} is refused by its own preset row"
+            );
         }
     }
 

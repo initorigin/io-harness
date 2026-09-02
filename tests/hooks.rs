@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use io_harness::hooks::OnFailure;
 use io_harness::observe::{Flow, Observer, RunEvent};
@@ -19,21 +19,39 @@ use io_harness::{
 };
 use serde_json::json;
 
-/// One empty directory for the whole binary, so every test in it points the user
-/// scope at the same place.
+/// Guards `IO_CONFIG_HOME`, which the process has exactly one of.
 ///
-/// `tests/config.rs` guards the same variable with a mutex because its tests set it
-/// to *different* directories and the process has one environment. Here every test
-/// wants the same answer — an empty user scope, so a config file on the developer's
-/// own machine cannot change what these tests measure — so one shared directory
-/// removes the race rather than serializing around it. Which matters: half of these
-/// tests are `async`, and a lock held across an `.await` is a lint and a deadlock
-/// waiting for a reason.
-static USER: OnceLock<tempfile::TempDir> = OnceLock::new();
+/// Until 0.74.0 every test here wanted the same answer — an empty user scope, so a
+/// config file on the developer's own machine could not change what they measure —
+/// and one shared directory removed the race without serializing around it. That is
+/// no longer available: a `[[hook]]` may now be declared only in the user scope, so
+/// each test needs a *different* one, which is the situation `tests/config.rs` has
+/// always been in.
+///
+/// The lock is therefore held across the two lines that touch the environment and
+/// the `Config::discover` that reads them, and released before the caller reaches an
+/// `.await` — a lock held across one is a lint and a deadlock waiting for a reason,
+/// and half of these tests are `async`.
+static ENV: Mutex<()> = Mutex::new(());
 
-fn empty_user_scope() {
-    let dir = USER.get_or_init(|| tempfile::tempdir().unwrap());
-    std::env::set_var("IO_CONFIG_HOME", dir.path());
+/// Discover a configuration whose `[[hook]]` tables live in the user scope — since
+/// 0.74.0 the only scope that may declare one, because `io.toml` arrives with a
+/// clone and `io.local.toml` sits in the workspace root a run's own agent writes to.
+///
+/// The tempdir is dropped on return, which is safe because discovery has already
+/// read the file into the returned value: nothing here reads configuration from disk
+/// again once the caller holds it, which is `tests/config.rs`'s NF3.
+///
+/// `IO_CONFIG` is removed rather than left alone: it names the user-scope *file*
+/// outright and wins over `IO_CONFIG_HOME`, so a developer who has one exported
+/// would otherwise be running a different test.
+fn discover_with(ws: &Path, user_toml: &str) -> io_harness::Result<Config> {
+    let user = tempfile::tempdir().unwrap();
+    std::fs::write(user.path().join("io.toml"), user_toml).unwrap();
+    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("IO_CONFIG");
+    std::env::set_var("IO_CONFIG_HOME", user.path());
+    Config::discover(ws)
 }
 
 // ---------------------------------------------------------------- scaffolding
@@ -155,11 +173,10 @@ fn logged(at: &Path) -> Vec<String> {
 
 #[tokio::test]
 async fn f1_a_hook_fires_on_the_events_it_names_and_on_no_others() {
-    empty_user_scope();
     let ws = tempfile::tempdir().unwrap();
 
-    std::fs::write(
-        ws.path().join("io.local.toml"),
+    let hooks = discover_with(
+        ws.path(),
         r#"
         [[hook]]
         on = ["refused", "finished"]
@@ -173,9 +190,8 @@ async fn f1_a_hook_fires_on_the_events_it_names_and_on_no_others() {
         append = "never.jsonl"
         "#,
     )
-    .unwrap();
-
-    let hooks = Config::discover(ws.path()).unwrap().hooks();
+    .unwrap()
+    .hooks();
     let tags = Tags::default();
     let store = Store::open(ws.path().join("s.db")).unwrap();
 
@@ -225,20 +241,17 @@ async fn f1_a_hook_fires_on_the_events_it_names_and_on_no_others() {
 
 #[test]
 fn f2_an_event_this_crate_does_not_emit_is_refused_naming_it() {
-    empty_user_scope();
     let ws = tempfile::tempdir().unwrap();
 
-    std::fs::write(
-        ws.path().join("io.local.toml"),
+    let err = discover_with(
+        ws.path(),
         "[[hook]]\non = [\"finshed\"]\nappend = \"a.jsonl\"\n",
     )
-    .unwrap();
-
-    let err = Config::discover(ws.path()).unwrap_err();
+    .unwrap_err();
     let text = err.to_string();
     assert!(text.contains("finshed"), "{text}");
     assert!(text.contains("hook[0]"), "{text}");
-    assert!(text.contains("io.local.toml"), "{text}");
+    assert!(text.contains("io.toml"), "{text}");
 
     // The control is in `src/hooks.rs`: every name the crate emits is accepted, so a
     // rule written against a hand-typed subset fails there rather than here.
@@ -310,15 +323,19 @@ fn argv(parts: &[&str]) -> String {
 }
 
 /// Run one turn under one hook table and report the outcome.
+///
+/// The table is loaded from the user scope and the turn reads a file of its own, so
+/// the run still reaches a `refused` and a `finished` without the configuration
+/// having to sit inside the workspace it is watching.
 async fn run_under(ws: &Path, hook: &str) -> io_harness::RunOutcome {
-    std::fs::write(ws.join("io.local.toml"), hook).unwrap();
-    let hooks = Config::discover(ws).unwrap().hooks();
+    std::fs::write(ws.join("read-me.txt"), "something to read\n").unwrap();
+    let hooks = discover_with(ws, hook).unwrap().hooks();
     let store = Store::open(ws.join("s.db")).unwrap();
     run_with_observed(
         &contract(ws),
         &mock(vec![vec![call(
             "read_file",
-            json!({"path": "io.local.toml"}),
+            json!({"path": "read-me.txt"}),
         )]]),
         &store,
         &read_only(),
@@ -332,7 +349,6 @@ async fn run_under(ws: &Path, hook: &str) -> io_harness::RunOutcome {
 
 #[tokio::test]
 async fn f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin() {
-    empty_user_scope();
     let ws = tempfile::tempdir().unwrap();
 
     // A generous bound, because nothing here is asserting one. This test asks what
@@ -379,8 +395,6 @@ async fn f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin() {
 /// the two criteria are asserted through one another rather than through a log line.
 #[tokio::test]
 async fn f4_a_hook_that_outlives_its_timeout_is_killed_and_reported_as_a_failure() {
-    empty_user_scope();
-
     let slow = tempfile::tempdir().unwrap();
     let outcome = run_under(
         slow.path(),
@@ -418,8 +432,6 @@ async fn f4_a_hook_that_outlives_its_timeout_is_killed_and_reported_as_a_failure
 
 #[tokio::test]
 async fn f5_a_failing_hook_stops_the_run_only_when_the_operator_asked_it_to() {
-    empty_user_scope();
-
     let asked = tempfile::tempdir().unwrap();
     let outcome = run_under(
         asked.path(),
@@ -482,11 +494,8 @@ timeout_ms = 1234
 /// and a manifest's — and a test against one proves nothing about the other.
 #[test]
 fn a_configured_hook_is_readable_key_by_key_and_not_merely_counted() {
-    empty_user_scope();
     let ws = tempfile::tempdir().unwrap();
-    std::fs::write(ws.path().join("io.local.toml"), SEVEN_KEYS).unwrap();
-
-    let hooks = Config::discover(ws.path()).unwrap().hooks();
+    let hooks = discover_with(ws.path(), SEVEN_KEYS).unwrap().hooks();
     assert!(
         !hooks.is_empty(),
         "the countable answer, which is what 0.70.0 had"

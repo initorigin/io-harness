@@ -12,7 +12,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::tools::{Tool, ToolEffect, ToolFuture, Toolbox};
@@ -145,10 +145,9 @@ fn argv(parts: &[&str]) -> String {
     format!("[{}]", items.join(", "))
 }
 
-/// One `[[hook]]` table at local scope, installed on a contract.
+/// One `[[hook]]` table in the user scope, installed on a contract.
 fn gated(dir: &Path, table: &str) -> TaskContract {
-    std::fs::write(dir.join("io.local.toml"), table).unwrap();
-    let hooks = Config::discover(dir).unwrap().hooks();
+    let hooks = user(dir, table).unwrap().hooks();
     TaskContract::workspace("write out.txt", dir).with_tool_hooks(Arc::new(hooks))
 }
 
@@ -159,16 +158,48 @@ fn spawns(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Write `io.local.toml` — local scope, where a hook is permitted — and read the
-/// configuration back.
-fn local(dir: &Path, body: &str) -> io_harness::Result<Config> {
-    std::fs::write(dir.join("io.local.toml"), body).unwrap();
+/// Guards `IO_CONFIG_HOME`, which the process has exactly one of and which every
+/// test in this file now needs a different value of.
+///
+/// Held across the two lines that touch the environment and the `Config::discover`
+/// that reads them, and released before any caller reaches an `.await` — a lock held
+/// across one is a lint and a deadlock waiting for a reason.
+static ENV: Mutex<()> = Mutex::new(());
+
+/// Write the user-scope `io.toml` — since 0.74.0 the only scope where a `[[hook]]`
+/// is permitted — and read the configuration back.
+///
+/// `IO_CONFIG` is removed rather than left alone: it names the user-scope *file*
+/// outright and wins over `IO_CONFIG_HOME`, so a developer who has one exported
+/// would otherwise be running a different test.
+fn user(dir: &Path, body: &str) -> io_harness::Result<Config> {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("io.toml"), body).unwrap();
+    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("IO_CONFIG");
+    std::env::set_var("IO_CONFIG_HOME", home.path());
     Config::discover(dir)
 }
 
-/// Write `io.toml` — project scope, the file a `git clone` delivers.
+/// Write `io.toml` in the workspace — project scope, the file a `git clone`
+/// delivers — under an empty user scope, and read the configuration back.
 fn project(dir: &Path, body: &str) -> io_harness::Result<Config> {
     std::fs::write(dir.join("io.toml"), body).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("IO_CONFIG");
+    std::env::set_var("IO_CONFIG_HOME", home.path());
+    Config::discover(dir)
+}
+
+/// Write `io.local.toml` — the gitignored workspace-root file, held to the project
+/// scope's rule since 0.74.0 because a run's own agent writes to that directory.
+fn local(dir: &Path, body: &str) -> io_harness::Result<Config> {
+    std::fs::write(dir.join("io.local.toml"), body).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("IO_CONFIG");
+    std::env::set_var("IO_CONFIG_HOME", home.path());
     Config::discover(dir)
 }
 
@@ -184,27 +215,43 @@ run = ["true"]
 /// F6 — the trust rule is extended, never weakened.
 ///
 /// A hook that can stop a tool is strictly more dangerous than one that appends a
-/// log line, so `at` inherits the project-scope refusal rather than reopening the
-/// question — including inside a `[profile]`, which is where the boundary has been
-/// widened by accident before.
+/// log line, so `at` inherits the refusal every `[[hook]]` carries rather than
+/// reopening the question — including inside a `[profile]`, which is where the
+/// boundary has been widened by accident before.
+///
+/// **The scope this test names changed in 0.74.0.** `io.local.toml` used to be the
+/// stated alternative and is now held to the identical rule: it is the operator's
+/// own file in intent, and in fact a path in the workspace root that the run's own
+/// agent writes to, so one `write_file` of it declared the very gate this test is
+/// about. Both workspace files are asserted here, and the control moved to the user
+/// scope — the one file no workspace can reach.
 #[test]
-fn a_lifecycle_hook_is_refused_in_a_project_scoped_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let err = project(dir.path(), GATE).unwrap_err();
-    assert!(err.to_string().contains("may not declare hooks"), "{err}");
+fn a_lifecycle_hook_is_refused_in_every_file_inside_the_workspace() {
+    type Writer = fn(&Path, &str) -> io_harness::Result<Config>;
+    let files: [(&str, Writer); 2] = [("io.toml", project), ("io.local.toml", local)];
 
-    // The same table, one level down, reached by a different path.
-    let dir = tempfile::tempdir().unwrap();
-    let err = project(
-        dir.path(),
-        "[profile.ci]\n[[profile.ci.hook]]\nat = \"before_tool\"\nrun = [\"true\"]\n",
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("hook"), "{err}");
+    for (label, write) in files {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write(dir.path(), GATE).unwrap_err();
+        assert!(
+            err.to_string().contains("may not declare hooks"),
+            "{label}: {err}"
+        );
 
-    // And the identical file at local scope loads.
+        // The same table, one level down, reached by a different path.
+        let dir = tempfile::tempdir().unwrap();
+        let err = write(
+            dir.path(),
+            "[profile.ci]\n[[profile.ci.hook]]\nat = \"before_tool\"\nrun = [\"true\"]\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("hook"), "{label}: {err}");
+    }
+
+    // The control, and the reason the refusals above are a boundary rather than a
+    // removal: the identical file in the user scope loads and installs.
     let dir = tempfile::tempdir().unwrap();
-    let config = local(dir.path(), GATE).expect("a local-scope lifecycle hook loads");
+    let config = user(dir.path(), GATE).expect("a user-scope lifecycle hook loads");
     assert!(!config.hooks().is_empty());
 }
 
@@ -242,7 +289,7 @@ fn a_lifecycle_table_that_cannot_fire_is_refused_at_load() {
     ];
     for (body, expect) in cases {
         let dir = tempfile::tempdir().unwrap();
-        let err = local(dir.path(), body).unwrap_err();
+        let err = user(dir.path(), body).unwrap_err();
         assert!(
             err.to_string().contains(expect),
             "`{body}` must be refused naming `{expect}`, got: {err}"

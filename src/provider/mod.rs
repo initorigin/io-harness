@@ -27,20 +27,143 @@ use futures_util::StreamExt;
 
 use crate::error::{Error, Result};
 
+// ---------------------------------------------------------------------------
+// What a response is allowed to cost (0.74.0).
+//
+// A provider response is untrusted input and an operator-supplied endpoint is
+// reachable configuration, so every buffer below grows with whatever the socket
+// chooses to send. Until 0.74.0 the only bound on any of them was the 600 s
+// request deadline, which is not a memory bound at all: a host that writes
+// steadily for ten minutes decides how much of this process's address space it
+// takes. Each constant states what it bounds and why that number cannot be
+// reached by a response anybody wants.
+// ---------------------------------------------------------------------------
+
+/// The most bytes one SSE line may reach before [`read_sse`] gives up.
+///
+/// An SSE event on either wire is one JSON delta — a text fragment, a fragment
+/// of a tool call's arguments, a usage object. A megabyte is a quarter of a
+/// million tokens in a single event, which no vendor emits and no reader wants;
+/// a stream that sends no newline at all is the shape this exists to stop.
+pub(crate) const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
+/// The most bytes one response may accumulate across its text, its reasoning
+/// and its tool-call arguments, drawn against a single per-response [`Budget`].
+///
+/// One budget rather than one cap per field, because three independently capped
+/// fields is three times the bound with none of the extra headroom being useful.
+/// Eight mebibytes is well past the output window of every model this crate can
+/// reach, so a legitimate answer never approaches it.
+pub(crate) const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most tool-call blocks one response may open.
+///
+/// A block index is chosen by the sender, so the map keyed on it grows with
+/// whatever arrives even when every block is empty and [`MAX_RESPONSE_BYTES`]
+/// never moves. Bounding the bytes without bounding the cardinality would leave
+/// the same exhaustion reachable through a cheaper door.
+pub(crate) const MAX_TOOL_CALL_BLOCKS: usize = 1024;
+
+/// What one accumulated row costs a [`Budget`] before its content is counted.
+///
+/// A citation, a server-tool call or a remembered tool id is a `Vec` element or
+/// a map entry with `String` headers inside it: tens of bytes of heap even when
+/// every field is empty. Without a floor, a response made entirely of empty rows
+/// draws nothing and the byte budget never notices it.
+pub(crate) const ROW_BYTES: usize = 64;
+
+/// The most bytes of a non-success body that reach an [`Error`] message.
+///
+/// Vendors put a sentence in an error body. This string travels into a typed
+/// error that [`Fallback`] logs and the trace stores, so it is bounded at the
+/// read rather than trimmed after the whole body is already in memory.
+pub(crate) const MAX_ERROR_DETAIL_BYTES: usize = 8 * 1024;
+
+/// One response's accumulation budget (0.74.0).
+///
+/// Every append a stream makes to a `String` the accumulators own is drawn
+/// against this. A draw that does not fit spends the whole budget rather than
+/// truncating: a response half read is a *different* response — a tool call
+/// whose arguments were cut mid-JSON either fails to parse or, worse, parses
+/// into something the model did not ask for — so the stream is refused instead.
+#[derive(Default)]
+pub(crate) struct Budget {
+    used: usize,
+    spent: bool,
+}
+
+impl Budget {
+    /// Draw `bytes`, reporting whether the budget had room. A refused draw
+    /// spends the budget for good, so a later, smaller fragment cannot be
+    /// spliced onto a response that already lost bytes.
+    pub(crate) fn take(&mut self, bytes: usize) -> bool {
+        if self.spent || self.used.saturating_add(bytes) > MAX_RESPONSE_BYTES {
+            self.spent = true;
+            return false;
+        }
+        self.used += bytes;
+        true
+    }
+
+    /// Spend the budget without drawing anything, for a bound that is counted
+    /// rather than measured in bytes.
+    pub(crate) fn exhaust(&mut self) {
+        self.spent = true;
+    }
+
+    /// Whether this response asked for more than it was allowed.
+    pub(crate) fn spent(&self) -> bool {
+        self.spent
+    }
+}
+
+/// The failure a spent [`Budget`] becomes, shared by both wire formats.
+///
+/// [`Malformed`](crate::error::ProviderErrorKind::Malformed) rather than a new
+/// kind: the response arrived and cannot be read, which is exactly what that
+/// variant means. It is retryable, and that is affordable — each attempt is
+/// bounded by the same constants, and the retry policy bounds the attempts.
+pub(crate) fn over_budget() -> Error {
+    Error::provider_malformed(format!(
+        "the response passed the {MAX_RESPONSE_BYTES}-byte bound on what one \
+         completion may accumulate, and was refused rather than truncated"
+    ))
+}
+
+/// The accumulator entry a streamed tool-call fragment belongs to, or `None`
+/// once the response has opened [`MAX_TOOL_CALL_BLOCKS`] of them (0.74.0).
+///
+/// Shared by both wire formats so the cardinality bound cannot hold on one wire
+/// and not the other.
+pub(crate) fn call_entry<'a>(
+    calls: &'a mut std::collections::BTreeMap<u64, (String, String)>,
+    index: u64,
+    budget: &mut Budget,
+) -> Option<&'a mut (String, String)> {
+    if calls.len() >= MAX_TOOL_CALL_BLOCKS && !calls.contains_key(&index) {
+        budget.exhaust();
+        return None;
+    }
+    Some(calls.entry(index).or_default())
+}
+
 /// Turn a non-success response into a typed [`Error::Provider`], preserving the
 /// status and the server's `Retry-After`.
 ///
 /// Every provider funnels through here rather than inspecting `status()` itself:
 /// the three did it identically before this existed, and one place is what stops
 /// them from drifting into disagreeing about what a 429 means.
+///
+/// The body is read through [`capped_body`] rather than `Response::text`, so a
+/// hostile or desynced endpoint cannot make its *error* path the expensive one.
 pub(crate) async fn ensure_success(resp: reqwest::Response) -> Result<reqwest::Response> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
-    // Read the header before the body: `text()` consumes the response.
+    // Read the header before the body: reading the body consumes the response.
     let retry_after = crate::net::retry_after(resp.headers());
-    let detail = resp.text().await.unwrap_or_default();
+    let detail = capped_body(resp).await;
     let detail = detail.trim();
     Err(Error::provider_status(
         status.as_u16(),
@@ -51,6 +174,27 @@ pub(crate) async fn ensure_success(resp: reqwest::Response) -> Result<reqwest::R
             detail.to_string()
         },
     ))
+}
+
+/// The first [`MAX_ERROR_DETAIL_BYTES`] of a response body, as text (0.74.0).
+///
+/// Streamed rather than `Response::text().await` because the point is the
+/// allocation and not the message: `text()` holds the whole body before anything
+/// could truncate it, which is the M13 hole on the error path. A body cut at the
+/// cap can end mid-character, so the bytes are decoded lossily — the string is a
+/// diagnostic, and a replacement character in it beats an allocation nobody
+/// bounded.
+async fn capped_body(resp: reqwest::Response) -> String {
+    let mut stream = resp.bytes_stream();
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(Ok(chunk)) = stream.next().await {
+        let room = MAX_ERROR_DETAIL_BYTES - out.len();
+        out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if out.len() >= MAX_ERROR_DETAIL_BYTES {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Reject a response that parsed to nothing at all.
@@ -109,6 +253,11 @@ pub(crate) fn ensure_parsed(response: CompletionResponse) -> Result<CompletionRe
 /// after `data:`) to `ingest`. `ingest` returns `true` to stop early on a
 /// provider's terminal event. Shared by every provider so the transport lives
 /// in one place; each provider supplies its own JSON accumulation.
+///
+/// A line that passes [`MAX_SSE_LINE_BYTES`] without a newline ends the read as
+/// [`Malformed`](crate::error::ProviderErrorKind::Malformed) (0.74.0). Before
+/// that the buffer grew for as long as the endpoint kept writing, so the only
+/// bound on it was the request deadline.
 pub(crate) async fn read_sse<F>(resp: reqwest::Response, mut ingest: F) -> Result<()>
 where
     F: FnMut(&str) -> bool,
@@ -133,6 +282,14 @@ where
             if ingest(data) {
                 return Ok(());
             }
+        }
+        // Checked after the drain, never before it: what is left here is one
+        // unterminated line, so a chunk carrying many complete events is not
+        // charged for their total.
+        if buf.len() > MAX_SSE_LINE_BYTES {
+            return Err(Error::provider_malformed(format!(
+                "an event stream line passed {MAX_SSE_LINE_BYTES} bytes without a newline"
+            )));
         }
     }
     Ok(())
@@ -2778,5 +2935,119 @@ mod media_tests {
         assert_eq!(Media::source_type_for("notes.md"), None);
         // And the wire table did not widen with it.
         assert_eq!(Media::media_type_for("scan.bmp"), None);
+    }
+}
+
+/// The transport's own bounds (0.74.0 — M13).
+///
+/// Driven over a real socket rather than by calling the functions with a
+/// hand-made buffer, because what is being asserted is that the bound holds
+/// against a *stream*: bytes arriving in whatever chunks the client happens to
+/// read them in, which is the shape a hand-made buffer cannot reproduce.
+#[cfg(test)]
+mod transport_bounds {
+    use std::time::Duration;
+
+    use super::failures::{serve, stream_response};
+    use super::*;
+    use crate::error::ProviderErrorKind as Kind;
+
+    const PATIENT: Duration = Duration::from_secs(30);
+
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+    fn request() -> CompletionRequest {
+        CompletionRequest {
+            system: "s".into(),
+            user: "u".into(),
+            ..Default::default()
+        }
+    }
+
+    fn failure(err: Error) -> (Kind, String) {
+        let Error::Provider { kind, message, .. } = err else {
+            panic!("expected a provider error, got {err:?}");
+        };
+        (kind, message)
+    }
+
+    #[tokio::test]
+    async fn m13_an_unterminated_event_stream_line_is_refused_at_the_cap() {
+        // One complete event, then a line that never ends. Through 0.73.0 the
+        // tail was buffered until the socket closed and then silently dropped,
+        // so this returned a successful completion — and the buffer had grown by
+        // however much the endpoint chose to send inside the request deadline.
+        let flood = "x".repeat(MAX_SSE_LINE_BYTES + 1);
+        let url = serve(stream_response(&format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"done\"}}}}]}}\n\ndata: {flood}"
+        )));
+
+        let err = Compatible::at(&url, PATIENT)
+            .complete(request())
+            .await
+            .unwrap_err();
+        let (kind, message) = failure(err);
+        assert_eq!(kind, Kind::Malformed);
+        assert!(message.contains("without a newline"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn m13_an_ordinary_stream_is_not_refused_by_the_line_cap() {
+        // The negative control: the same transport, the same reader, a line of a
+        // size any provider actually sends.
+        let url = serve(stream_response(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n",
+        ));
+        let out = Compatible::at(&url, PATIENT)
+            .complete(request())
+            .await
+            .unwrap();
+        assert_eq!(out.text.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn m13_an_error_body_is_bounded_before_it_becomes_an_error_message() {
+        // The error path was the unbounded one nobody looks at: `text()` read the
+        // whole body whatever its size, and the string went straight into an
+        // `Error` message that `Fallback` logs and the trace stores.
+        let body = "E".repeat(MAX_ERROR_DETAIL_BYTES * 4);
+        let url = serve(format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ));
+
+        let err = Compatible::at(&url, PATIENT)
+            .complete(request())
+            .await
+            .unwrap_err();
+        let (kind, message) = failure(err);
+        assert_eq!(kind, Kind::Request);
+        assert!(
+            message.len() <= MAX_ERROR_DETAIL_BYTES,
+            "the message is {} bytes",
+            message.len()
+        );
+        // And the control: what survived is the server's own words, not a
+        // placeholder that would satisfy the length assertion by saying nothing.
+        assert!(
+            message.starts_with("EEEE"),
+            "{}",
+            &message[..8.min(message.len())]
+        );
+    }
+
+    #[tokio::test]
+    async fn m13_a_short_error_body_still_arrives_whole() {
+        // The other control. A cap that swallowed every error body would pass the
+        // test above and make every real 4xx undiagnosable.
+        let body = "model \"zeta\" does not exist";
+        let url = serve(format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ));
+        let err = Compatible::at(&url, PATIENT)
+            .complete(request())
+            .await
+            .unwrap_err();
+        assert_eq!(failure(err).1, body);
     }
 }

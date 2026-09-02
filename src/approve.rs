@@ -147,6 +147,21 @@ pub enum Decision {
         /// A rewritten action to perform instead of the requested one. It is
         /// re-evaluated against the policy before it runs, so an approver
         /// cannot rewrite an action across a deny.
+        ///
+        /// **A rewrite of an [`Act::Exec`] action is refused
+        /// rather than applied** (0.74.0), and nothing runs. Every consumer of
+        /// an exec approval — `exec`, `shell`, the git built-ins, a registered
+        /// tool, an MCP tool — dispatches the argv it parsed *before* the gate
+        /// was consulted and reads only `remember`, so there is nowhere for a
+        /// rewritten command to take effect. Discarding it silently meant a
+        /// human approved one command while another ran and the trace recorded
+        /// the one that did not — and, in the direction that matters more, an
+        /// approver *narrowing* an argv was overruled without being told.
+        /// Approve the action as asked, deny it, or narrow it with an exec rule.
+        /// The same refusal applies to a `modified` on a pending `exec` or `net`
+        /// handed to [`resume_with_decision`](crate::resume_with_decision).
+        /// A rewritten read or write is honoured as before: those two paths take
+        /// their target and content off the gate's own answer.
         modified: Option<Request>,
         /// Rules to apply as a run-scoped top layer. A remembered allow still
         /// cannot defeat a deny beneath it.
