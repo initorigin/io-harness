@@ -432,6 +432,62 @@ pub struct Store {
     /// is written by the same transaction that writes the `steps` row or by
     /// nothing at all.
     turn: std::cell::RefCell<std::collections::HashMap<i64, AssistantTurn>>,
+    /// Where the step now being driven has spent its wall clock, per run
+    /// (0.75.0).
+    ///
+    /// The third use of the staging shape the two fields above describe, and it
+    /// is here for their reasons rather than a third one: [`StepRecord`] has
+    /// public fields and no `#[non_exhaustive]`, so a seventh is a compile break
+    /// for anyone building one with a literal, and `checkpoint_step` is `pub`, so
+    /// it cannot grow a parameter either.
+    ///
+    /// It also buys something the other two did not need. The phases are measured
+    /// in three different modules — the run loop brackets the provider call and
+    /// the dispatch, and `run/dispatch.rs` brackets the policy gate inside one —
+    /// and a cell on the handle every one of them already holds is what lets the
+    /// gate's number reach the commit without threading an out-parameter through
+    /// a dispatch that takes twenty-eight arguments already.
+    ///
+    /// Opened by the loop at the top of a step and consumed *inside*
+    /// [`Self::checkpoint_step`]'s transaction, after the lease check, so a step
+    /// that never commits and a driver that lost its run both leave no
+    /// attribution behind. A phase measured while no step is open — a sub-agent
+    /// tree's dispatch, or a direct caller's own gate — is dropped rather than
+    /// attributed to a step that did not spend it.
+    attribution: std::cell::RefCell<std::collections::HashMap<i64, StagedAttribution>>,
+}
+
+/// The attribution of the step a handle is driving, while it is still being
+/// measured (0.75.0).
+///
+/// Separate from [`StepAttribution`], the shape a reader gets back, over one
+/// field: a span that is not measured yet. A staged row with no span is a step
+/// still running, and it is what stops a commit from writing an attribution for
+/// a step whose phases were never closed off — where a `0` span would be
+/// indistinguishable from a step that really did finish in under a millisecond.
+#[derive(Debug, Default)]
+pub(crate) struct StagedAttribution {
+    /// The step these numbers belong to. A commit of any other step ignores them,
+    /// the way a staged turn is matched on its own step number.
+    pub(crate) step: u32,
+    pub(crate) span_ms: Option<u64>,
+    pub(crate) provider_ms: Option<u64>,
+    pub(crate) tool_ms: Option<u64>,
+    pub(crate) gate_ms: Option<u64>,
+    pub(crate) store_ms: Option<u64>,
+}
+
+/// Which phase of a step one clock reading belongs to (0.75.0).
+///
+/// An enum rather than a field accessor per phase, so the four staging methods
+/// on [`Store`] share one body and cannot come to disagree about what
+/// accumulating a reading means.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StepPhase {
+    Provider,
+    Tool,
+    Gate,
+    Store,
 }
 
 /// Whether the lease row in hand has lapsed, as SQL (0.62.0).
@@ -947,6 +1003,162 @@ impl AssistantTurn {
             text: text.map(Into::into),
             calls,
         }
+    }
+}
+
+/// Where one committed step's wall clock went (0.75.0).
+///
+/// Read with [`Store::step_attributions`], which answers "where did this step go"
+/// for every attributed step of a run — including the provider's TTFT for the
+/// step's own call, so the question costs one query rather than two joined by
+/// hand.
+///
+/// **A phase that did not happen is absent, not zero.** A step that called no
+/// provider reports `provider_ms: None`, which is a different fact from a call
+/// that returned inside a millisecond — the distinction
+/// [`ProviderCall::ttft_ms`] already draws, kept here for the same reason: a zero
+/// averaged into a report flatters whatever produced it.
+///
+/// **The phases are disjoint and they do not tile the span.** `provider_ms`,
+/// `tool_ms` and `store_ms` are separate stretches of the step; compaction,
+/// prompt assembly and the loop's own bookkeeping are none of them, and what they
+/// cost is [`Self::unattributed_ms`] — reported, rather than folded into whatever
+/// phase happens to be adjacent. `gate_ms` is the one nested number: a policy
+/// resolution happens *inside* a tool dispatch, so it is part of `tool_ms` the
+/// way a call's TTFT is part of its latency, and [`Self::attributed_ms`] does not
+/// count it twice.
+///
+/// **`store_ms` is the commit that ended the previous step, not this one's.** A
+/// row cannot time the write that creates it, and writing the number afterwards
+/// would put it outside the transaction whose lease check is what stops a driver
+/// that lost the run from writing at all. So a step's span runs from the moment
+/// the previous step's commit began to the moment this step's own commit begins,
+/// and the store phase inside it is that commit plus the ledger persist that
+/// followed it. The first committed step of a run reports no store phase, because
+/// the only commit it could name is its own.
+///
+/// Only the flat workspace loop attributes; a sub-agent tree's steps and every
+/// step committed before 0.75.0 record nothing and are not returned.
+///
+/// `#[non_exhaustive]`: a later release may attribute a phase this one does not
+/// separate — compaction and prompt assembly are the two candidates already in
+/// the remainder — and adding a field to a struct callers construct is the break
+/// [`StepRecord`] cannot pay. [`Self::new`] and the `with_*` builders are the
+/// door outside the crate, because the attribute forbids every struct expression
+/// there, `..Default::default()` included.
+///
+/// ```
+/// # fn main() -> io_harness::Result<()> {
+/// let store = io_harness::Store::memory()?;
+/// let run_id = store.start_run("write the notes", "gpt-5")?;
+///
+/// // Written by the run loop, in the transaction that commits each step. A run
+/// // that has taken no step has nothing to report yet.
+/// assert!(store.step_attributions(run_id)?.is_empty());
+///
+/// for a in store.step_attributions(run_id)? {
+///     println!(
+///         "step {}: {}ms of {}ms attributed, {}ms elsewhere, first token {:?}",
+///         a.step,
+///         a.attributed_ms(),
+///         a.span_ms,
+///         a.unattributed_ms(),
+///         a.ttft_ms,
+///     );
+/// }
+/// # Ok(()) }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StepAttribution {
+    /// The step these numbers belong to.
+    pub step: u32,
+    /// The step's own measured span, in milliseconds. Every phase below is a part
+    /// of it, and no sum of them may exceed it.
+    pub span_ms: u64,
+    /// Waiting on the provider, across every attempt the step made — the retries
+    /// and the backoff between them included, because a step that retried twice
+    /// spent that time on the provider and nowhere else.
+    pub provider_ms: Option<u64>,
+    /// Executing tool calls, summed over the calls the step dispatched.
+    pub tool_ms: Option<u64>,
+    /// Resolving the policy for those calls, *of which* — a part of `tool_ms`,
+    /// and the part that includes waiting for a human when a call is one an
+    /// approver must answer.
+    pub gate_ms: Option<u64>,
+    /// The durable write that ended the previous step: its commit transaction and
+    /// the ledger persist after it. `None` on a run's first committed step.
+    pub store_ms: Option<u64>,
+    /// The provider's time to first token on this step's last attempt, from
+    /// [`ProviderCall::ttft_ms`]. `None` when the step made no call and when the
+    /// call measured nothing — a provider that streamed no tokens reports no
+    /// TTFT rather than zero.
+    pub ttft_ms: Option<u64>,
+}
+
+impl StepAttribution {
+    /// A step's attribution over a measured span, with no phase attributed yet.
+    pub fn new(step: u32, span_ms: u64) -> Self {
+        Self {
+            step,
+            span_ms,
+            provider_ms: None,
+            tool_ms: None,
+            gate_ms: None,
+            store_ms: None,
+            ttft_ms: None,
+        }
+    }
+
+    /// Set the provider phase; `None` leaves it absent.
+    pub fn with_provider_ms(mut self, ms: Option<u64>) -> Self {
+        self.provider_ms = ms;
+        self
+    }
+
+    /// Set the tool-execution phase; `None` leaves it absent.
+    pub fn with_tool_ms(mut self, ms: Option<u64>) -> Self {
+        self.tool_ms = ms;
+        self
+    }
+
+    /// Set the policy-gate phase, which is part of the tool phase and not beside
+    /// it; `None` leaves it absent.
+    pub fn with_gate_ms(mut self, ms: Option<u64>) -> Self {
+        self.gate_ms = ms;
+        self
+    }
+
+    /// Set the store phase; `None` leaves it absent.
+    pub fn with_store_ms(mut self, ms: Option<u64>) -> Self {
+        self.store_ms = ms;
+        self
+    }
+
+    /// Set the step's time to first token; `None` leaves it absent.
+    pub fn with_ttft_ms(mut self, ms: Option<u64>) -> Self {
+        self.ttft_ms = ms;
+        self
+    }
+
+    /// The span this step accounted for: the provider, the tools and the store.
+    ///
+    /// `gate_ms` is not added — it is measured inside the dispatch `tool_ms`
+    /// already covers, and adding it would report a step spending longer than it
+    /// lasted.
+    pub fn attributed_ms(&self) -> u64 {
+        self.provider_ms.unwrap_or(0) + self.tool_ms.unwrap_or(0) + self.store_ms.unwrap_or(0)
+    }
+
+    /// The span this step did not account for: compaction, prompt assembly, the
+    /// loop's per-step bookkeeping, and whatever the host was doing instead.
+    ///
+    /// Saturating, so a remainder is never a wrapped enormous number: the parts
+    /// are measured with separate clock readings and rounded down to whole
+    /// milliseconds each, and a step whose phases round up to its span is a fast
+    /// step, not a corrupt row.
+    pub fn unattributed_ms(&self) -> u64 {
+        self.span_ms.saturating_sub(self.attributed_ms())
     }
 }
 

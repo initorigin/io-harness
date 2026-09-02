@@ -980,3 +980,118 @@ fn the_aggregates_over_an_empty_store_are_empty_rather_than_absent() {
     assert_eq!(store.first_try().unwrap(), io_harness::FirstTry::default());
     assert_eq!(store.recovery().unwrap(), io_harness::Recovery::default());
 }
+
+/// F3 — a session's spend is one read, and it agrees with the sum of the runs
+/// its turns were served by.
+///
+/// The same agreement `grouping_by_model_by_day_and_by_run_agree_with_each_other`
+/// asserts for the other three groupings. It is the check that catches a join
+/// that double-counts a call or drops one.
+#[tokio::test]
+async fn f3_a_sessions_spend_agrees_with_the_runs_its_turns_were_served_by() {
+    let store = Store::memory().unwrap();
+    let table = prices(3_000_000);
+
+    let session_id = store.create_session("/tmp").unwrap();
+    let mut run_ids = Vec::new();
+    for turn in 0..3 {
+        let run_id = store.start_run("goal", "NOTES.md").unwrap();
+        store
+            .record_turn(session_id, None, run_id, "prompt")
+            .unwrap();
+        store
+            .record_provider_call(
+                run_id,
+                &ProviderCall {
+                    step: 1,
+                    provider: "p".into(),
+                    model: Some("cheap-model".into()),
+                    usage: Some(Usage {
+                        prompt_tokens: 1_000,
+                        completion_tokens: 100,
+                        total_tokens: 1_100,
+                        cache_read_tokens: 250 * (turn as u64 + 1),
+                        ..Default::default()
+                    }),
+                    latency_ms: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        run_ids.push(run_id);
+    }
+
+    let by_session = store.spend_by_session(&table).unwrap();
+    assert_eq!(by_session.len(), 1, "three turns of one conversation");
+    let session = &by_session[0];
+    assert_eq!(session.key, session_id.to_string());
+    assert_eq!(session.calls, 3);
+
+    let by_run = store.spend_by_run(&table).unwrap();
+    let summed: (u64, u64, u64) = (
+        by_run.iter().map(|s| s.calls).sum(),
+        by_run.iter().map(|s| s.usage.total_tokens).sum(),
+        by_run.iter().map(|s| s.cost_micros).sum(),
+    );
+    assert_eq!(
+        (
+            session.calls,
+            session.usage.total_tokens,
+            session.cost_micros
+        ),
+        summed,
+        "the conversation costs exactly what its turns did"
+    );
+
+    // 250 + 500 + 750 read out of 3,000 prompt tokens.
+    assert_eq!(session.cache_hit_rate(), Some(0.5));
+}
+
+/// F3, the other half — a run that belongs to no session is absent from the
+/// session grouping rather than bucketed under a sentinel.
+///
+/// A one-shot `run_with` is not an unattributed conversation; it is not a
+/// conversation. Inventing a group for it would make the sessions disagree with
+/// the runs for a reason a reader could not see.
+#[tokio::test]
+async fn f3_a_run_outside_any_session_is_absent_rather_than_grouped() {
+    let store = Store::memory().unwrap();
+    let table = prices(3_000_000);
+
+    let session_id = store.create_session("/tmp").unwrap();
+    let in_session = store.start_run("goal", "NOTES.md").unwrap();
+    store
+        .record_turn(session_id, None, in_session, "prompt")
+        .unwrap();
+    let one_shot = store.start_run("goal", "NOTES.md").unwrap();
+
+    for run_id in [in_session, one_shot] {
+        store
+            .record_provider_call(
+                run_id,
+                &ProviderCall {
+                    step: 1,
+                    provider: "p".into(),
+                    model: Some("cheap-model".into()),
+                    usage: Some(Usage {
+                        prompt_tokens: 1_000,
+                        total_tokens: 1_000,
+                        ..Default::default()
+                    }),
+                    latency_ms: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    assert_eq!(store.spend_by_run(&table).unwrap().len(), 2);
+    let by_session = store.spend_by_session(&table).unwrap();
+    assert_eq!(by_session.len(), 1);
+    assert_eq!(by_session[0].calls, 1, "only the turn's own call");
+
+    // A store with no sessions at all reports nothing rather than one empty
+    // group, the same way the other aggregates report an empty vector.
+    let bare = Store::memory().unwrap();
+    assert!(bare.spend_by_session(&table).unwrap().is_empty());
+}

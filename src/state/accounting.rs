@@ -25,7 +25,11 @@ impl Store {
                 u.map(|u| u.completion_tokens),
                 u.map(|u| u.total_tokens),
                 u.map(|u| u.cache_read_tokens),
-                u.map(|u| u.cache_write_tokens),
+                // (0.75.0) `and_then`, not `map`: the column has always been
+                // nullable and now the counter is too, so a wire that reports no
+                // cache write writes SQL NULL rather than a zero the reader
+                // cannot tell from a measured one.
+                u.and_then(|u| u.cache_write_tokens),
                 u.map(|u| u.reasoning_tokens),
                 u.map(|u| u.server_tool_requests),
                 call.latency_ms,
@@ -64,7 +68,12 @@ impl Store {
                         completion_tokens: r.get::<_, Option<u64>>(5)?.unwrap_or(0),
                         total_tokens,
                         cache_read_tokens: r.get::<_, Option<u64>>(7)?.unwrap_or(0),
-                        cache_write_tokens: r.get::<_, Option<u64>>(8)?.unwrap_or(0),
+                        // (0.75.0) Read straight through rather than collapsed:
+                        // a NULL here is a wire that reports no cache write, and
+                        // every row written before this release is a NULL for a
+                        // reason nobody recorded — which is the same "unknown",
+                        // not a measured zero.
+                        cache_write_tokens: r.get::<_, Option<u64>>(8)?,
                         reasoning_tokens: r.get::<_, Option<u64>>(9)?.unwrap_or(0),
                         server_tool_requests: r.get::<_, Option<u64>>(10)?.unwrap_or(0),
                     }),
@@ -108,7 +117,8 @@ impl Store {
                             completion_tokens: r.get::<_, Option<u64>>(7)?.unwrap_or(0),
                             total_tokens,
                             cache_read_tokens: r.get::<_, Option<u64>>(9)?.unwrap_or(0),
-                            cache_write_tokens: r.get::<_, Option<u64>>(10)?.unwrap_or(0),
+                            // As above: NULL is unknown, not zero.
+                            cache_write_tokens: r.get::<_, Option<u64>>(10)?,
                             reasoning_tokens: r.get::<_, Option<u64>>(11)?.unwrap_or(0),
                             server_tool_requests: r.get::<_, Option<u64>>(12)?.unwrap_or(0),
                         }),
@@ -154,37 +164,95 @@ impl Store {
     /// ```
     pub fn spend_by_model(&self, prices: &PriceTable) -> Result<Vec<Spend>> {
         self.grouped(prices, |_, _, call| {
-            call.model.clone().unwrap_or_else(|| UNKNOWN_MODEL.into())
+            Some(call.model.clone().unwrap_or_else(|| UNKNOWN_MODEL.into()))
         })
     }
 
     /// Spend grouped by day (`YYYY-MM-DD`, UTC, from the database clock), priced
     /// by `prices` (0.18.0).
     pub fn spend_by_day(&self, prices: &PriceTable) -> Result<Vec<Spend>> {
-        self.grouped(prices, |_, day, _| day.to_string())
+        self.grouped(prices, |_, day, _| Some(day.to_string()))
     }
 
     /// Spend grouped by run id, priced by `prices` (0.18.0).
     pub fn spend_by_run(&self, prices: &PriceTable) -> Result<Vec<Spend>> {
-        self.grouped(prices, |run_id, _, _| run_id.to_string())
+        self.grouped(prices, |run_id, _, _| Some(run_id.to_string()))
     }
 
-    /// The shared body of the three groupings: read once, key by `key`, sum and
-    /// price each group. Rows come back ordered by key, which is the only
-    /// ordering promised.
+    /// Spend grouped by session id, priced by `prices` (0.75.0).
+    ///
+    /// A durable conversation is this crate's headline shape and until now its
+    /// cost was reachable only by folding [`Store::spend_by_run`] over the turns
+    /// by hand: every turn of a session is its own run, and the session tables
+    /// carry no token columns. This joins the two, so "what did this conversation
+    /// cost, and how much of it was served from cache" is one read.
+    ///
+    /// A run that belongs to no session is **absent** rather than grouped under a
+    /// sentinel. That is the difference from [`Store::spend_by_model`], where an
+    /// unknown model is still a call somebody paid for and must stay visible: a
+    /// one-shot run is not an unattributed session, it is not a session at all,
+    /// and inventing a group for it would make the sum of the sessions disagree
+    /// with the sum of the runs for a reason no reader could see.
+    ///
+    /// ```
+    /// use io_harness::pricing::{Price, PriceTable};
+    /// use io_harness::{ProviderCall, Store, Usage};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// # let store = Store::memory()?;
+    /// # let session_id = store.create_session("/tmp")?;
+    /// # let run_id = store.start_run("goal", "NOTES.md")?;
+    /// # store.record_turn(session_id, None, run_id, "hello")?;
+    /// # store.record_provider_call(run_id, &ProviderCall {
+    /// #     step: 1, provider: "anthropic".into(), model: Some("m".into()),
+    /// #     usage: Some(Usage { prompt_tokens: 1_000_000, total_tokens: 1_000_000,
+    /// #                         cache_read_tokens: 750_000, ..Default::default() }),
+    /// #     ..Default::default() })?;
+    /// let prices = PriceTable::new("2026-09-02").with("m", Price { input: 1_000_000, ..Price::ZERO });
+    ///
+    /// let spend = store.spend_by_session(&prices)?;
+    /// assert_eq!(spend[0].key, session_id.to_string());
+    /// // Three quarters of the conversation's prompt came off the cache.
+    /// assert_eq!(spend[0].cache_hit_rate(), Some(0.75));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn spend_by_session(&self, prices: &PriceTable) -> Result<Vec<Spend>> {
+        // Read the run-to-session map once rather than asking per call: a session
+        // of forty turns is forty runs, and a lookup per provider call would be a
+        // query per attempt.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT run_id, session_id FROM session_turns")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let sessions: std::collections::HashMap<i64, i64> =
+            rows.collect::<std::result::Result<_, _>>()?;
+        self.grouped(prices, |run_id, _, _| {
+            sessions.get(&run_id).map(|id| id.to_string())
+        })
+    }
+
+    /// The shared body of the groupings: read once, key by `key`, sum and price
+    /// each group. Rows come back ordered by key, which is the only ordering
+    /// promised.
+    ///
+    /// (0.75.0) `key` returns `Option`, and a `None` **drops** the call rather
+    /// than bucketing it. Only [`Store::spend_by_session`] uses that: the other
+    /// three key every call there is, and a grouping that silently omitted one
+    /// would be a floor pretending to be a total.
     fn grouped(
         &self,
         prices: &PriceTable,
-        key: impl Fn(i64, &str, &ProviderCall) -> String,
+        key: impl Fn(i64, &str, &ProviderCall) -> Option<String>,
     ) -> Result<Vec<Spend>> {
         let calls = self.all_provider_calls()?;
         let mut groups: std::collections::BTreeMap<String, Vec<&ProviderCall>> =
             std::collections::BTreeMap::new();
         for (run_id, day, call) in &calls {
-            groups
-                .entry(key(*run_id, day, call))
-                .or_default()
-                .push(call);
+            let Some(k) = key(*run_id, day, call) else {
+                continue;
+            };
+            groups.entry(k).or_default().push(call);
         }
         Ok(groups
             .into_iter()

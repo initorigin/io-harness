@@ -6,11 +6,18 @@
 //! endpoint and model reading nothing:
 //!
 //! ```text
-//! marked   call 1  prompt=7420  cache_read=0     cache_write=0  completion=5
-//! marked   call 2  prompt=7421  cache_read=7408  cache_write=0  completion=5
-//! control  call 1  prompt=7420  cache_read=0     cache_write=0  completion=5
-//! control  call 2  prompt=7421  cache_read=0     cache_write=0  completion=5
+//! marked   call 1  prompt=7420  cache_read=0     cache_write=None  completion=5
+//! marked   call 2  prompt=7421  cache_read=7408  cache_write=None  completion=5
+//! control  call 1  prompt=7420  cache_read=0     cache_write=None  completion=5
+//! control  call 2  prompt=7421  cache_read=0     cache_write=None  completion=5
 //! ```
+//!
+//! (0.75.0) The write column reads `None` rather than the `0` recorded in 2026:
+//! OpenRouter's wire carries no cache-write counter, so the zero was this crate's
+//! own placeholder and never something the provider said. Nothing about the money
+//! changes — an unreported write is still billed as fresh input — but the rate
+//! these rows produce is now readable as what it is, a read rate over an unknown
+//! write cost.
 //!
 //! Those rows go into a real [`Store`], come back out through
 //! [`Store::provider_calls`], and are priced through the shipped table — which is
@@ -44,7 +51,11 @@ fn measured() -> [Usage; 2] {
             completion_tokens: 5,
             total_tokens: 7425,
             cache_read_tokens: 0,
-            cache_write_tokens: 0,
+            // (0.75.0) `None`, not zero. These are real OpenRouter figures and
+            // that wire carries no cache-write counter at all, so what was
+            // recorded here was the crate's own placeholder rather than
+            // something the provider said.
+            cache_write_tokens: None,
             ..Default::default()
         },
         Usage {
@@ -52,7 +63,7 @@ fn measured() -> [Usage; 2] {
             completion_tokens: 5,
             total_tokens: 7426,
             cache_read_tokens: 7408,
-            cache_write_tokens: 0,
+            cache_write_tokens: None,
             ..Default::default()
         },
     ]
@@ -157,7 +168,7 @@ async fn an_unreported_cache_write_is_billed_as_fresh_input() {
 
     // What it would have charged had the write been reported, at the 1.25x premium.
     let with_write = Usage {
-        cache_write_tokens: 7408,
+        cache_write_tokens: Some(7408),
         ..as_reported
     };
     let honest = table.cost_micros(MODEL, &with_write).unwrap();
@@ -166,5 +177,146 @@ async fn an_unreported_cache_write_is_billed_as_fresh_input() {
         honest > reported,
         "a reported write costs more than the same tokens billed as fresh input: \
          {honest} against {reported}"
+    );
+}
+
+/// F1 — the rate is answered by the accounting surface, not by the caller.
+///
+/// The counters have been recorded since 0.18.0 and nothing divided one by the
+/// other, so the effect of both cache breakpoints was unobservable. These are the
+/// same measured rows: the first call read nothing and the second read 7,408 of
+/// its 7,421 prompt tokens.
+#[tokio::test]
+async fn f1_the_hit_rate_comes_off_the_usage_rather_than_the_caller() {
+    let [cold, warm] = measured();
+
+    assert_eq!(cold.cache_hit_rate(), Some(0.0));
+    let rate = warm
+        .cache_hit_rate()
+        .expect("a call with a prompt has a rate");
+    assert!(
+        (rate - 7408.0 / 7421.0).abs() < f64::EPSILON,
+        "the rate is the read over the prompt, not a rounded figure: {rate}"
+    );
+
+    // A call with no prompt has nothing to have hit, which is a different fact
+    // from having missed — the distinction the accounting layer draws everywhere
+    // else between an unrecorded run and a free one.
+    assert_eq!(Usage::default().cache_hit_rate(), None);
+}
+
+/// F1, the grouped half — a group agrees with the calls that built it, and an
+/// empty group answers nothing rather than zero.
+#[tokio::test]
+async fn f1_a_groups_rate_agrees_with_the_calls_it_summed() {
+    let store = Store::memory().expect("a store");
+    let run_id = store.start_run("rate", "NOTES.md").expect("a run");
+
+    for (attempt, usage) in measured().into_iter().enumerate() {
+        store
+            .record_provider_call(
+                run_id,
+                &ProviderCall {
+                    step: 1,
+                    attempt: attempt as u32,
+                    provider: "openrouter".into(),
+                    model: Some(MODEL.into()),
+                    usage: Some(usage),
+                    latency_ms: 10,
+                    ..Default::default()
+                },
+            )
+            .expect("the call records");
+    }
+
+    let table = PriceTable::new("2026-08-06").with(MODEL, priced(300_000));
+    let spend = store.spend_by_run(&table).expect("a grouping");
+    let group = spend.first().expect("one run, one group");
+
+    // 7,408 read out of 14,841 prompt tokens across the two calls.
+    let rate = group
+        .cache_hit_rate()
+        .expect("a group with a prompt has a rate");
+    assert!(
+        (rate - 7408.0 / 14_841.0).abs() < f64::EPSILON,
+        "the group's rate is its summed read over its summed prompt: {rate}"
+    );
+
+    // Both calls came off a wire with no cache-write counter, so the group says
+    // so rather than reporting a summed zero.
+    assert_eq!(group.unreported_cache_writes, 2);
+    assert_eq!(group.usage.cache_write_tokens, None);
+}
+
+/// F2 — two usages with identical reads are distinguishable on whether the wire
+/// reported a write at all.
+///
+/// This is the defect the release exists to prevent: a hit rate computed through
+/// OpenRouter looks like a complete accounting of a call that also paid to write
+/// the cache, because that wire has no counter for the write and the crate used
+/// to record the absence as a zero.
+#[tokio::test]
+async fn f2_an_unreported_write_is_not_a_zero_write() {
+    let anthropic_shaped = Usage {
+        prompt_tokens: 7421,
+        cache_read_tokens: 7408,
+        cache_write_tokens: Some(0),
+        ..Default::default()
+    };
+    let openai_shaped = Usage {
+        cache_write_tokens: None,
+        ..anthropic_shaped
+    };
+
+    // Identical rates, because the read and the prompt are identical.
+    assert_eq!(
+        anthropic_shaped.cache_hit_rate(),
+        openai_shaped.cache_hit_rate()
+    );
+
+    // And still distinguishable, which is the whole point.
+    assert_ne!(anthropic_shaped, openai_shaped);
+    assert!(anthropic_shaped.cache_writes_reported());
+    assert!(!openai_shaped.cache_writes_reported());
+}
+
+/// F2, through the store — the distinction survives a round trip rather than
+/// being collapsed by the column's nullability on the way back in.
+#[tokio::test]
+async fn f2_the_unreported_write_survives_the_store() {
+    let store = Store::memory().expect("a store");
+    let run_id = store.start_run("wire", "NOTES.md").expect("a run");
+
+    let call = |attempt, cache_write_tokens| ProviderCall {
+        step: 1,
+        attempt,
+        provider: "p".into(),
+        model: Some(MODEL.into()),
+        usage: Some(Usage {
+            prompt_tokens: 100,
+            total_tokens: 100,
+            cache_read_tokens: 50,
+            cache_write_tokens,
+            ..Default::default()
+        }),
+        latency_ms: 1,
+        ..Default::default()
+    };
+    store
+        .record_provider_call(run_id, &call(0, Some(0)))
+        .expect("the reported call records");
+    store
+        .record_provider_call(run_id, &call(1, None))
+        .expect("the unreported call records");
+
+    let back = store.provider_calls(run_id).expect("the calls read back");
+    let writes: Vec<_> = back
+        .iter()
+        .map(|c| c.usage.expect("usage").cache_write_tokens)
+        .collect();
+    assert_eq!(
+        writes,
+        vec![Some(0), None],
+        "a measured zero and an absent counter are different rows, not one"
     );
 }

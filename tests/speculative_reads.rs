@@ -1302,3 +1302,475 @@ async fn a_tool_needing_more_containment_than_the_run_grants_is_not_started_earl
         "the run should still carry the containment refusal it always did: {all}"
     );
 }
+
+// ------------------------------------- the widened set (0.75.0, F12 and F13)
+
+/// Whether this machine can run the git half of this file at all.
+fn have_git() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// [`workspace`] with a repository around it: one commit, one tracked file, and
+/// `b.txt` plus `src/` left untracked so `git status` has something to say.
+fn git_workspace() -> tempfile::TempDir {
+    let dir = workspace();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/deep.txt"), "DEEP").unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git is on PATH");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "--initial-branch=main"]);
+    git(&["config", "user.email", "t@example.invalid"]);
+    git(&["config", "user.name", "test"]);
+    git(&["add", "a.txt"]);
+    git(&["commit", "-m", "first"]);
+    dir
+}
+
+fn list_dir(path: &str) -> ToolCall {
+    ToolCall {
+        name: "list_dir".into(),
+        arguments: json!({ "path": path }),
+    }
+}
+
+fn git_call(name: &str) -> ToolCall {
+    ToolCall {
+        name: name.into(),
+        arguments: json!({}),
+    }
+}
+
+/// Every observation of a run, as one string per row.
+fn texts(store: &Store, run_id: i64) -> Vec<String> {
+    store
+        .observations(run_id)
+        .unwrap()
+        .into_iter()
+        .map(|o| o.text)
+        .collect()
+}
+
+/// F12 — a `list_dir` and a git reader are in the overlappable set, beside the
+/// calls that were already in it.
+///
+/// The completion is `[read_file, list_dir, git_status, peek]` and `peek` is a
+/// rendezvous with the provider's own stream. Speculation is the completion's
+/// **leading** run of read-only calls, so `peek` can only be reached early if
+/// every call before it was speculated — which is exactly the claim. A release
+/// that widened `tool_effect` for one of the two and not the other closes
+/// speculation at that position, `peek` is left for the serial path, the
+/// completion is still waiting on it, and the bounded timeout fires.
+///
+/// Mixing the newly eligible calls with an already eligible one is deliberate:
+/// a batch where the two kinds meet is the second call, and the second call is
+/// where this repository's widening defects have shown up.
+#[tokio::test]
+async fn f12_a_list_dir_and_a_git_reader_join_the_calls_that_start_before_the_completion_returns() {
+    if !have_git() {
+        return;
+    }
+    let ws = git_workspace();
+    let store = Store::memory().unwrap();
+    let gate = Arc::new(tokio::sync::Barrier::new(2));
+
+    let provider = Script::new(vec![
+        Turn::calls(vec![
+            read("a.txt"),
+            list_dir(""),
+            git_call("git_status"),
+            tool("peek"),
+        ])
+        .gated(&gate),
+        Turn::done(),
+    ]);
+    let tools = Toolbox::new().with(Rendezvous {
+        name: "peek".into(),
+        barrier: Arc::clone(&gate),
+    });
+    let listener = Listener::default();
+    let mut session = Session::open(&store, ws.path()).unwrap();
+
+    let turn = tokio::time::timeout(
+        MUST_FINISH,
+        session.turn_bounded_observed(
+            &contract(ws.path(), tools),
+            &provider,
+            &store,
+            &policy(),
+            &ApproveAll,
+            &listener,
+        ),
+    )
+    .await
+    .expect(
+        "the tool never met the stream: a call before it was not started early, so the widened \
+         set does not hold",
+    )
+    .unwrap();
+
+    assert_eq!(
+        listener.counts(),
+        Some((4, 4, 0)),
+        "all four leading calls should have been started early and used"
+    );
+
+    let all = texts(&store, turn.run_id).join("\n");
+    assert!(
+        all.contains("[list_dir ]") && all.contains("a.txt"),
+        "the listing must be the listing, not a refusal: {all}"
+    );
+    assert!(
+        all.contains("[git_status]") && all.contains("b.txt"),
+        "the git reader must have reported the untracked file: {all}"
+    );
+}
+
+/// F12 — a widened tool called twice in one run is settled to its own call each
+/// time.
+///
+/// Two completions, each `[list_dir, git_status]`, listing a different directory.
+/// The trap this exists for is a speculated result that survives the step it was
+/// started in: the second listing would then carry the first one's entries, and
+/// the observation has the shape of a successful listing either way.
+#[tokio::test]
+async fn f12_a_widened_tool_speculated_twice_carries_its_own_answer_each_time() {
+    if !have_git() {
+        return;
+    }
+    let ws = git_workspace();
+    let store = Store::memory().unwrap();
+
+    let provider = Script::new(vec![
+        Turn::calls(vec![list_dir(""), git_call("git_status")]),
+        Turn::calls(vec![list_dir("src"), git_call("git_log")]),
+        Turn::done(),
+    ]);
+    let listener = Listener::default();
+    let mut session = Session::open(&store, ws.path()).unwrap();
+
+    let turn = tokio::time::timeout(
+        MUST_FINISH,
+        session.turn_bounded_observed(
+            &contract(ws.path(), Toolbox::new()),
+            &provider,
+            &store,
+            &policy(),
+            &ApproveAll,
+            &listener,
+        ),
+    )
+    .await
+    .expect("the turn should finish")
+    .unwrap();
+
+    assert_eq!(
+        listener.speculated.lock().unwrap().clone(),
+        vec![(2, 2, 0), (2, 2, 0)],
+        "both steps should have started and used both of their calls"
+    );
+
+    let listings: Vec<String> = texts(&store, turn.run_id)
+        .into_iter()
+        .filter(|t| t.contains("[list_dir"))
+        .collect();
+    assert_eq!(listings.len(), 2, "both listings must land: {listings:?}");
+    assert!(
+        listings[0].contains("a.txt") && !listings[0].contains("deep.txt"),
+        "the first listing is the root's: {}",
+        listings[0]
+    );
+    assert!(
+        listings[1].contains("deep.txt") && !listings[1].contains("a.txt"),
+        "the second listing is src's, not the first one's answer again: {}",
+        listings[1]
+    );
+
+    let all = texts(&store, turn.run_id).join("\n");
+    assert!(
+        all.contains("[git_status]") && all.contains("[git_log]"),
+        "both git readers must land under their own call: {all}"
+    );
+}
+
+/// F13 — a git reader is started early only where the policy allows the spawn.
+///
+/// The arm this test adds to `a_denied_call_is_never_started_early`, for a
+/// newly eligible tool. A git reader reaches the world through a process, so
+/// the question the speculative path has to ask is `Act::Exec` on `git` — the
+/// same question `dispatch` asks — and a run that denies it must speculate
+/// nothing and refuse the call exactly as it did before 0.75.0.
+///
+/// Both arms run the same script against the same workspace. Without the
+/// allowing arm the test passes against a build where a git reader is never
+/// speculated at all, which is the failure mode a permission-shaped widening
+/// makes easy.
+#[tokio::test]
+async fn f13_a_git_reader_is_started_early_only_when_the_policy_allows_the_spawn() {
+    if !have_git() {
+        return;
+    }
+    async fn once(policy: &Policy) -> (Option<(usize, usize, usize)>, String) {
+        let ws = git_workspace();
+        let store = Store::memory().unwrap();
+        let provider = Script::new(vec![
+            Turn::calls(vec![git_call("git_status")]),
+            Turn::done(),
+        ]);
+        let listener = Listener::default();
+        let mut session = Session::open(&store, ws.path()).unwrap();
+        let turn = tokio::time::timeout(
+            MUST_FINISH,
+            session.turn_bounded_observed(
+                &contract(ws.path(), Toolbox::new()),
+                &provider,
+                &store,
+                policy,
+                &ApproveAll,
+                &listener,
+            ),
+        )
+        .await
+        .expect("the turn should finish")
+        .unwrap();
+        (listener.counts(), texts(&store, turn.run_id).join("\n"))
+    }
+
+    let (allowed, allowed_obs) = once(&policy()).await;
+    assert_eq!(
+        allowed,
+        Some((1, 1, 0)),
+        "a git reader the policy allows is started early: {allowed_obs}"
+    );
+    assert!(
+        allowed_obs.contains("[git_status]"),
+        "and it reported: {allowed_obs}"
+    );
+
+    let denied_policy = Policy::default()
+        .layer("speculation-test")
+        .allow_read("*")
+        .allow_write("*")
+        .deny_exec("git");
+    let (denied, denied_obs) = once(&denied_policy).await;
+    assert_eq!(
+        denied, None,
+        "a run that may not spawn git must speculate nothing: {denied_obs}"
+    );
+    assert!(
+        denied_obs.contains("exec refused"),
+        "and the call is refused where it always was, in order: {denied_obs}"
+    );
+}
+
+/// F13 — the containment check that stops a greedy tool lets a git reader
+/// through.
+///
+/// The arm this test adds to
+/// `a_tool_needing_more_containment_than_the_run_grants_is_not_started_early`,
+/// for a newly eligible tool. `git_status` declares
+/// [`ExecMode::ReadOnly`], which every grant satisfies, so it is contained
+/// rather than refused; `greedy` declares `FullAccess`, which this run does not
+/// grant, so it closes speculation and is refused with nothing started. One
+/// completion holds both, which is what makes this an assertion about the check
+/// rather than about either tool.
+#[tokio::test]
+async fn f13_the_containment_check_that_stops_a_greedy_tool_lets_a_git_reader_through() {
+    if !have_git() {
+        return;
+    }
+    let ws = git_workspace();
+    let store = Store::memory().unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let provider = Script::new(vec![
+        Turn::calls(vec![git_call("git_status"), tool("greedy")]),
+        Turn::done(),
+    ]);
+    let tools = Toolbox::new().with(Greedy {
+        runs: Arc::clone(&runs),
+    });
+    let listener = Listener::default();
+    let mut session = Session::open(&store, ws.path()).unwrap();
+
+    let turn = tokio::time::timeout(
+        MUST_FINISH,
+        session.turn_bounded_observed(
+            &contract(ws.path(), tools),
+            &provider,
+            &store,
+            &policy(),
+            &ApproveAll,
+            &listener,
+        ),
+    )
+    .await
+    .expect("the turn should finish")
+    .unwrap();
+
+    assert_eq!(
+        listener.counts(),
+        Some((1, 1, 0)),
+        "the git reader is speculated and the greedy tool closes speculation"
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "a tool the run's containment refuses was started anyway, off the stream"
+    );
+    let all = texts(&store, turn.run_id).join("\n");
+    assert!(
+        all.contains("[git_status]") && all.contains("greedy refused"),
+        "the reader ran and the greedy tool was refused, in the same completion: {all}"
+    );
+}
+
+/// F13 — a batched git reader records the containment it spawned under.
+///
+/// Two git readers in one completion go through `read_batch`, which holds the
+/// store the concurrent half does not. The rows a git reader leaves when it runs
+/// alone are the rows it leaves when it runs beside another one — a
+/// `create` naming the mode it resolved to, and a `destroy` — or the overlap
+/// bought its speed by deleting the record of what confined it.
+///
+/// `Deaf` rather than `Script`, so the batch is what runs: a provider that
+/// reports its calls would speculate both and never form one.
+#[cfg(unix)]
+#[tokio::test]
+async fn f13_a_batched_git_reader_records_the_containment_it_spawned_under() {
+    if !have_git() {
+        return;
+    }
+    let ws = git_workspace();
+    let store = Store::memory().unwrap();
+    let provider = Deaf::new(vec![
+        Turn::calls(vec![git_call("git_status"), git_call("git_log")]),
+        Turn::done(),
+    ]);
+    let listener = Listener::default();
+    let mut session = Session::open(&store, ws.path()).unwrap();
+
+    let turn = tokio::time::timeout(
+        MUST_FINISH,
+        session.turn_bounded_observed(
+            &contract(ws.path(), Toolbox::new()),
+            &provider,
+            &store,
+            &policy(),
+            &ApproveAll,
+            &listener,
+        ),
+    )
+    .await
+    .expect("the turn should finish")
+    .unwrap();
+
+    assert_eq!(
+        listener.counts(),
+        None,
+        "a provider that reports nothing speculates nothing, so this is the batch path"
+    );
+    let events = store.sandbox_events(turn.run_id).unwrap();
+    let created: Vec<String> = events
+        .iter()
+        .filter(|e| e.kind == "create")
+        .filter_map(|e| e.detail.clone())
+        .collect();
+    assert_eq!(
+        created,
+        vec![
+            ExecMode::ReadOnly.as_str().to_string(),
+            ExecMode::ReadOnly.as_str().to_string()
+        ],
+        "each batched reader records the mode it was narrowed to: {events:?}"
+    );
+    assert_eq!(
+        events.iter().filter(|e| e.kind == "destroy").count(),
+        2,
+        "and each records that its containment went away: {events:?}"
+    );
+}
+
+/// F13 — a **speculated** git reader records the containment it spawned under,
+/// and that is the call's narrowed one rather than the run's grant.
+///
+/// Found by the adversarial review before the seal. `Speculation` holds no
+/// `Store`, so the rows are written when the loop collects the call — and the
+/// first version wrote them from the run-wide `ExecContainment`, which grants
+/// `workspace-write` by default. The row would have said `workspace-write` for a
+/// process that actually ran `read-only`: a trace saying the opposite of what was
+/// enforced, which is worse than no row at all.
+///
+/// The sibling above covers the batch arm and cannot see this: a provider that
+/// reports nothing never speculates.
+#[tokio::test]
+async fn f13_a_speculated_git_reader_records_the_containment_it_spawned_under() {
+    if !have_git() {
+        return;
+    }
+    let ws = git_workspace();
+    let store = Store::memory().unwrap();
+    let gate = Arc::new(tokio::sync::Barrier::new(2));
+
+    // `Script` reports finished calls as it streams, which is what puts the git
+    // reader on the speculative path rather than the batch one.
+    let provider = Script::new(vec![
+        Turn::calls(vec![git_call("git_status"), tool("peek")]).gated(&gate),
+        Turn::done(),
+    ]);
+    let tools = Toolbox::new().with(Rendezvous {
+        name: "peek".into(),
+        barrier: Arc::clone(&gate),
+    });
+    let listener = Listener::default();
+    let mut session = Session::open(&store, ws.path()).unwrap();
+
+    let turn = tokio::time::timeout(
+        MUST_FINISH,
+        session.turn_bounded_observed(
+            &contract(ws.path(), tools),
+            &provider,
+            &store,
+            &policy(),
+            &ApproveAll,
+            &listener,
+        ),
+    )
+    .await
+    .expect("the turn should finish")
+    .unwrap();
+
+    assert_eq!(
+        listener.counts(),
+        Some((2, 2, 0)),
+        "both leading calls start early — the rendezvous tool declares itself \
+         read-only too — and if nothing started this is the batch path"
+    );
+
+    let events = store.sandbox_events(turn.run_id).unwrap();
+    let created: Vec<String> = events
+        .iter()
+        .filter(|e| e.kind == "create")
+        .filter_map(|e| e.detail.clone())
+        .collect();
+    assert_eq!(
+        created,
+        vec![ExecMode::ReadOnly.as_str().to_string()],
+        "the row must name what confined the spawn, not what the run was granted: {events:?}"
+    );
+    assert_eq!(
+        events.iter().filter(|e| e.kind == "destroy").count(),
+        1,
+        "and the containment is recorded as gone: {events:?}"
+    );
+}

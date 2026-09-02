@@ -199,7 +199,7 @@ to have charged.
 
 ## Grouped rows, and where the crate stops
 
-Three groupings, each returning the raw sums with the derived cost beside them:
+Four groupings, each returning the raw sums with the derived cost beside them:
 
 - `Store::spend_by_model` — keyed by the model that served each call. A call
   whose provider named no model groups under `UNKNOWN_MODEL` and counts as
@@ -207,10 +207,48 @@ Three groupings, each returning the raw sums with the derived cost beside them:
 - `Store::spend_by_day` — keyed `YYYY-MM-DD`, from the database clock, the same
   clock `runs.started_at` uses.
 - `Store::spend_by_run` — keyed by run id.
+- `Store::spend_by_session` (0.75.0) — keyed by session id. Every turn of a
+  session is its own run and the session tables carry no token columns, so this
+  is the join rather than a fold the caller writes.
+
+A run that belongs to no session is **absent** from the session grouping rather
+than bucketed under a sentinel. That is the opposite of `spend_by_model`'s answer
+for an unknown model, and deliberately: an unpriced call is still a call somebody
+paid for and has to stay visible, where a one-shot run is not an unattributed
+conversation — it is not a conversation. Inventing a group for it would make the
+sessions disagree with the runs for a reason no reader could see.
 
 Rows come back ordered by key, which is the only ordering promised. Streaks,
 leaderboards, heat maps, per-day charts and every other rendering are the
 consuming application's decision, not the harness's.
+
+## The cache hit rate, and the wire that cannot report half of it
+
+The cache counters have been recorded since 0.18.0 and, until 0.75.0, nothing
+divided one by the other. Two breakpoints place the cacheable prefix — the end of
+the system block (0.38.0) and inside the transcript (0.44.0) — and their effect
+was unobservable, which is a poor position for a design constraint to be in.
+
+`Usage::cache_hit_rate` and `Spend::cache_hit_rate` answer the share of the prompt
+that was served from cache. A call with no prompt has no rate, rather than a rate
+of zero: nothing to have hit and having missed are different facts.
+
+**`Usage::cache_write_tokens` is an `Option`, and the `None` is load-bearing.**
+The OpenAI wire — which fronts OpenAI, OpenRouter and every `Compatible` endpoint
+— carries no cache-write counter at all. Before 0.75.0 that absence was recorded
+as `0`, which reads exactly like a call that wrote nothing. It is not: it is a
+call whose write cost the vendor never told us. `Usage::cache_writes_reported`
+says which you are looking at.
+
+So a hit rate taken from an OpenRouter run is a **read rate over an unknown write
+cost**, and this crate's own live cache evidence is taken on that wire. Read
+`Spend::unreported_cache_writes` beside the rate: it counts the calls in the group
+whose writes were never reported, in the same "this group is a floor, not a total"
+role `unpriced_calls` has. Nothing in the crate infers a write from the prompt
+length — an invented number is worse than an absent one.
+
+Pricing is unaffected. An unreported write is billed as fresh input, exactly as it
+was before the counter became an option.
 
 ## What the runs did, not just what they cost
 

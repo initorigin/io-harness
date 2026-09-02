@@ -642,6 +642,46 @@ Escalation wins over downshifting, is one-way, and counts *consecutive* failed
 gates. A run whose gate keeps refusing is not one to save money on, and a run that
 oscillates between two models is a behaviour nobody asked for.
 
+Both rules apply to the flat workspace loop. A tree's children take their model
+from their own `AgentDef`, and `apply_routing` has never run for them.
+
+### The completions the crate makes on its own behalf (0.75.0)
+
+`Routing::mechanical` names the model for a completion the crate issues for
+itself rather than for the caller:
+
+```rust
+use io_harness::Routing;
+
+// Fold the transcript on something cheap; leave the work where it is.
+let routing = Routing::new().mechanical("small-model");
+# let _ = routing;
+```
+
+**There is exactly one such completion today**: the summary written when a long
+context is folded. It sets no model at all, so it lands on whatever the provider
+was constructed with — the model chosen to do the work, paid the work rate to
+compress a transcript.
+
+It is decided by *which call it is*, not by what the run has done, which is why it
+is read from the contract rather than through the rules above. The two do not
+reach each other: a run carrying both a downshift and a `mechanical` model sends
+the downshift's model on its steps and the mechanical one on its fold.
+
+The routed call is announced as `EventKind::Routed`, because a routed completion
+that is invisible is one an operator can only find on a bill. Unset, the request
+is byte-identical to the one 0.74.0 sent.
+
+**Two things that look like mechanical calls and are not.** The plan
+classification reads the turn's own first completion and issues no request of its
+own; the duplicate-memory check is local token overlap with no model and no
+network. Neither can be routed, because neither is a call. They are named here so
+the absence is a fact rather than something to be discovered.
+
+All six keys are also settable in `io.toml` under `[routing]`, which is refused at
+project scope — see
+[Configuration](configuration.md#routing--which-model-answers-and-when-0750).
+
 ## Reporting a tool call before the completion ends (0.54.0)
 
 `Provider` has three completion methods, and two of them are defaulted:

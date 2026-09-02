@@ -1,0 +1,52 @@
+# Pinned to io-harness 0.74.0 — the PREVIOUS release — on purpose, with an `=`
+# requirement so cargo cannot drift it forward. Never bump this. Its whole job is to
+# read a SQLite database exactly the way 0.74.0 reads one, and to write into one
+# exactly the way 0.74.0 writes, so `tests/cross_version_0_74_0.rs` can prove a real
+# 0.74.0 binary still reads a store 0.75.0 wrote. A binary built from the current tree
+# and labelled "0.74.0" would prove nothing; bumping this dependency turns the evidence
+# back into a label.
+#
+# This crate exists because of what 0.72.0 cost. 0.72.0 changed `Question::choices`
+# from `Vec<String>` to `Vec<Choice>`, and its entire green suite could not see the
+# consequence, because every test in it read rows the same tree had just written. Only
+# a real previous-release binary could. The rule 0.72.0 wrote for itself is that every
+# release after it carries the same fixture against its own predecessor, whether or
+# not that release believes it changed anything a store can see.
+#
+# 0.75.0 changes a store twice, and calls both changes additive: a `memory_token_cache`
+# table beside `memory`, and five latency columns on `steps`. Neither bumps
+# `CHECKPOINT_FORMAT`. "Additive" is exactly the claim 0.72.0 made about itself, so
+# what this crate reads is memory entries and committed steps — the two surfaces this
+# release moves — rather than the sessions and traces 0.74.0's fixture read.
+#
+# There is deliberately no committed `store-0.74.0/` database and no `write` mode to
+# produce one. The forwards direction — this tree reading a 0.74.0 store — passed from
+# the first run in 0.72.0 and proved nothing, because a release that only adds a table
+# and some nullable columns reads an older store by construction. The direction that
+# has ever caught anything is the backwards one, and that one needs a binary rather
+# than a file.
+#
+# It is listed in the root manifest's `exclude`, so it is never packaged, and it is
+# built with its own `target/` (run it from this directory) so it never drags a second
+# `libsqlite3-sys` into the main crate's build.
+[package]
+name = "gen-0-74-0"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Empty on purpose: without it cargo walks up and tries to join the io-harness package
+# as a workspace member, which fails because the root manifest excludes this directory.
+[workspace]
+
+[dependencies]
+io-harness = "=0.74.0"
+serde_json = "1"
+# No `tokio` here, unlike the four generators before this one, which each carry it and
+# none of which name it in a line of code. Nothing this binary calls is async: a
+# `Store` is a synchronous handle over a SQLite connection, and both modes below are a
+# handful of statements against one. A dependency that compiles for every run of this
+# job and is never linked against is build time spent on nothing.
+#
+# No `tempfile` either. Both modes are handed a database path by the test that spawned
+# them, so this binary never chooses a location for anything.

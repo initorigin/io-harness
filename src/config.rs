@@ -292,6 +292,14 @@ struct File {
     // every run over it, where everything in `[run]` bounds one run.
     #[serde(default)]
     memory: Option<MemorySection>,
+    // 0.75.0 — the door `Routing` never had. The rules have been able to change
+    // which model answers mid-run since 0.34.0 and were reachable only from Rust,
+    // so an operator could not use any of it from a file. In `REFUSED_SECTIONS`:
+    // a table that decides which model answers is a table a cloned repository
+    // must not write, on the same rule 0.74.0 wrote down for everything that
+    // names a program to run.
+    #[serde(default)]
+    routing: Option<RoutingSection>,
     #[serde(default)]
     toolchain: BTreeMap<String, ToolchainSection>,
     #[serde(default)]
@@ -893,6 +901,25 @@ struct MemorySection {
     max_entry_chars: Option<u64>,
 }
 
+/// The file form of [`Routing`] (0.75.0).
+///
+/// `escalate_after` and `downshift_under` are pairs in Rust — a threshold and a
+/// model — and a pair is a poor shape in TOML, where an array of two values of
+/// different types reads as a mistake. Each becomes two keys that are required
+/// together: naming one without the other is refused at load rather than
+/// silently ignored, because a threshold with no model and a model with no
+/// threshold are both a rule the operator believes is in force and is not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutingSection {
+    escalate_after: Option<u32>,
+    escalate_to: Option<String>,
+    downshift_under: Option<u64>,
+    downshift_to: Option<String>,
+    require_primary: Option<bool>,
+    mechanical: Option<String>,
+}
+
 /// An operator's override for one ecosystem, applied onto what
 /// [`crate::toolchain::detect`] found. Every command optional: a file that
 /// changes the test command should not have to restate the build one.
@@ -1104,6 +1131,7 @@ impl Config {
         refuse_nested_profiles(&file, path)?;
         crate::hooks::Hooks::check(&file.hook, path)?;
         check_providers(&file.provider)?;
+        check_routing(&file)?;
         // The same check `read_scope` makes, because this function repeats that
         // validator row rather than sharing it (0.70.0).
         crate::mcp::check_enabled_spelling(&table, path)?;
@@ -2045,6 +2073,28 @@ impl Config {
             out = out.with_memory_limits(limits);
         }
 
+        // 0.75.0 — key by key onto whatever routing the contract already carries,
+        // for the same reason the caps above are: a file that names only the
+        // mechanical model must not silently clear an escalation the caller built
+        // in Rust. The paired keys are validated at load (`check_routing`), so by
+        // the time one is present here its partner is too.
+        if let Some(routing) = &self.file.routing {
+            let mut rules = out.routing.clone().unwrap_or_default();
+            if let (Some(after), Some(model)) = (routing.escalate_after, &routing.escalate_to) {
+                rules.escalate_after = Some((after, model.clone()));
+            }
+            if let (Some(under), Some(model)) = (routing.downshift_under, &routing.downshift_to) {
+                rules.downshift_under = Some((under, model.clone()));
+            }
+            if let Some(v) = routing.require_primary {
+                rules.require_primary = v;
+            }
+            if let Some(model) = &routing.mechanical {
+                rules.mechanical = Some(model.clone());
+            }
+            out = out.with_routing(rules);
+        }
+
         let Some(run) = &self.file.run else {
             return out;
         };
@@ -2212,6 +2262,7 @@ fn read_scope(scope: Scope, path: &Path) -> Result<toml::value::Table> {
     refuse_nested_profiles(&file, path)?;
     crate::hooks::Hooks::check(&file.hook, path)?;
     check_providers(&file.provider)?;
+    check_routing(&file)?;
     // Against the raw table, not `file`: `[[mcp]]` is the one section exempt from
     // `deny_unknown_fields`, so by the time it has deserialized the misspelling
     // is already gone (0.70.0).
@@ -2341,6 +2392,19 @@ const PROJECT_WIDENING: &[(&[&str], &[&str])] = &[
 /// anything deserializes, and a boundary that moved with a feature flag would be
 /// one an operator could not state.
 const REFUSED_SECTIONS: &[(&str, &str, &str)] = &[
+    // 0.75.0. `[routing]` decides which model answers, and `mechanical` decides
+    // which model reads the whole transcript when a fold summarises it. A cloned
+    // repository choosing either one chooses where the work goes and what it
+    // costs, and — pointed at a model slug the operator's own provider resolves
+    // differently — chooses it invisibly. The table names no endpoint and no
+    // program, so it is not caught by the 0.74.0 clauses; it is refused on the
+    // same principle rather than by the same words.
+    (
+        "routing",
+        "routing rules",
+        "routing decides which model answers this run, and which model reads the \
+         whole transcript when the context is folded",
+    ),
     // 0.28.0. The whole array, not its executing half: `run` is the `${cmd:}`
     // primitive by another name, and `append` is a write to a path the file chose,
     // which is the same hazard by a shorter route. Refusing one and allowing the
@@ -2448,6 +2512,61 @@ fn untrusted(scope: Scope) -> (&'static str, &'static str) {
 fn check_providers(providers: &[ProviderSpec]) -> Result<()> {
     for (index, spec) in providers.iter().enumerate() {
         spec.validate(index)?;
+    }
+    Ok(())
+}
+
+/// A routing rule is a threshold and a model, and a file that names one without
+/// the other is refused (0.75.0).
+///
+/// [`Routing`](crate::Routing) carries each rule as a pair, so a TOML file that
+/// sets `escalate_after` and forgets `escalate_to` has written a rule that cannot
+/// be built. Ignoring the half that is there would leave an operator with a rule
+/// they believe is in force and is not, which is the failure this crate refuses
+/// everywhere else it appears — an unset `${env:}` is an error rather than an
+/// empty string for the same reason.
+/// Checked on the top level **and inside every `[profile.*]` body**, because a
+/// profile body is a whole `File` that `with_profile` merges over the base — so a
+/// half-rule hidden in one would otherwise reach the same place by a different
+/// path and be dropped just as silently. Every sibling validator in this module
+/// recurses the same way; a check that did not would be absent on the one path it
+/// does not cover.
+fn check_routing(file: &File) -> Result<()> {
+    check_routing_section(&file.routing)?;
+    for profile in file.profile.values() {
+        check_routing_section(&profile.routing)?;
+    }
+    Ok(())
+}
+
+fn check_routing_section(routing: &Option<RoutingSection>) -> Result<()> {
+    let Some(routing) = routing else {
+        return Ok(());
+    };
+    for (threshold, model, set, unset) in [
+        (
+            routing.escalate_after.is_some(),
+            routing.escalate_to.is_some(),
+            "routing.escalate_after",
+            "routing.escalate_to",
+        ),
+        (
+            routing.downshift_under.is_some(),
+            routing.downshift_to.is_some(),
+            "routing.downshift_under",
+            "routing.downshift_to",
+        ),
+    ] {
+        if threshold != model {
+            let (named, missing) = match threshold {
+                true => (set, unset),
+                false => (unset, set),
+            };
+            return Err(Error::Config(format!(
+                "{named} is set without {missing}; a routing rule is a threshold and \
+                 a model, and half of one is a rule that never fires"
+            )));
+        }
     }
     Ok(())
 }

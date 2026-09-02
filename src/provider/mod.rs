@@ -1350,7 +1350,16 @@ pub struct Usage {
     /// (0.18.0) Prompt tokens the provider wrote *into* its cache on this call.
     /// Also a breakdown of [`Usage::prompt_tokens`], and usually priced above a
     /// fresh read rather than below it.
-    pub cache_write_tokens: u64,
+    ///
+    /// (0.75.0) `None` where the wire carries no cache-write counter at all,
+    /// which is every OpenAI-shaped endpoint and therefore OpenRouter too. That
+    /// is a different fact from `Some(0)` — "this call wrote nothing into the
+    /// cache" — and collapsing the two makes a hit rate computed on that wire
+    /// read as a complete accounting of a call that also paid to write. The
+    /// distinction is the one [`CompletionResponse::ttft_ms`] already draws for
+    /// the same reason: a provider that measured nothing reports nothing rather
+    /// than zero.
+    pub cache_write_tokens: Option<u64>,
     /// (0.18.0) Tokens the model spent reasoning before answering, where the
     /// provider reports them separately. A breakdown of
     /// [`Usage::completion_tokens`].
@@ -1362,6 +1371,54 @@ pub struct Usage {
     /// Zero everywhere until the crate declares such tools (0.22.0). The counter
     /// exists first so that adding them is not a second widening of this type.
     pub server_tool_requests: u64,
+}
+
+impl Usage {
+    /// (0.75.0) The share of this call's prompt that the provider served from
+    /// its cache, between `0.0` and `1.0`, or `None` for a call with no prompt
+    /// to have hit.
+    ///
+    /// The crate has recorded [`Usage::cache_read_tokens`] since 0.18.0 and
+    /// never divided it by anything, so the effect of the two cache breakpoints
+    /// 0.38.0 and 0.44.0 place has been unobservable: a prefix nobody can
+    /// measure is not a prefix anybody can optimise. This is that division, done
+    /// once, here, rather than in every caller that wants it.
+    ///
+    /// ```
+    /// use io_harness::Usage;
+    ///
+    /// let usage = Usage {
+    ///     prompt_tokens: 4_000,
+    ///     cache_read_tokens: 3_000,
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(usage.cache_hit_rate(), Some(0.75));
+    ///
+    /// // A call with no prompt has no rate, rather than a rate of zero.
+    /// assert_eq!(Usage::default().cache_hit_rate(), None);
+    /// ```
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        // Saturating rather than asserting: the counters are a breakdown of the
+        // prompt, but they come off a vendor's wire and a vendor that reports a
+        // read larger than its own prompt total is a bug this crate reports a
+        // ceiling for rather than panics on.
+        (self.prompt_tokens > 0).then(|| {
+            self.cache_read_tokens.min(self.prompt_tokens) as f64 / self.prompt_tokens as f64
+        })
+    }
+
+    /// (0.75.0) Whether the wire that produced this usage reports a cache-write
+    /// counter at all.
+    ///
+    /// `false` means [`Usage::cache_write_tokens`] is unknown, not zero. A hit
+    /// rate read beside a `false` here is a read rate over an unknown write
+    /// cost, which is the honest reading of every OpenAI-shaped endpoint —
+    /// including OpenRouter, where this crate's own live evidence is taken.
+    /// Nothing in the crate infers the write from the prompt length; an invented
+    /// number is worse than an absent one.
+    pub fn cache_writes_reported(&self) -> bool {
+        self.cache_write_tokens.is_some()
+    }
 }
 
 /// One model completion.
