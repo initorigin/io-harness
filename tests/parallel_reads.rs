@@ -375,14 +375,41 @@ async fn dropping_a_run_mid_batch_leaves_nothing_running() {
         call("endless_2"),
     ]]);
 
-    let ran = tokio::time::timeout(
-        Duration::from_millis(100),
-        run_with(&contract, &script, &store, &open_policy(), &ApproveAll),
-    )
-    .await;
-    assert!(ran.is_err(), "the batch cannot finish, so the run cannot");
-    // The run future — and with it the `JoinSet` holding the batch — is dropped
-    // here, at the end of the `timeout`, while every call is still sleeping.
+    // Drive the run until the batch has actually entered, then stop driving it.
+    //
+    // This used to be `timeout(100ms)`, which guessed that 100 ms was enough for
+    // a run to compose its prompt, answer, and reach a tool. On a loaded runner it
+    // is not, and the failure was `entered == 0` below — the test proving nothing
+    // and saying so. The clock was never the property under test: it only existed
+    // to interrupt the run mid-batch. So wait for the event itself, which cannot
+    // be too slow, and keep a bound so a genuine hang still fails rather than
+    // hanging the suite.
+    //
+    // The drop must still land inside `Endless`'s own 400 ms sleep, which a 5 ms
+    // poll comfortably does.
+    // `Box::pin` rather than `tokio::pin!`: the latter yields a `Pin<&mut _>`, and
+    // dropping that drops the borrow rather than the future — the `JoinSet` would
+    // outlive it and the test would prove nothing.
+    let policy = open_policy();
+    let mut running = Box::pin(run_with(&contract, &script, &store, &policy, &ApproveAll));
+    let mut ticks = 0;
+    loop {
+        tokio::select! {
+            finished = &mut running => {
+                panic!("the batch cannot finish, so the run cannot: {finished:?}");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                if entered.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                ticks += 1;
+                assert!(ticks < 2_000, "the batch never entered a tool at all");
+            }
+        }
+    }
+    // The run future — and with it the `JoinSet` holding the batch — goes away
+    // here, while every call is still sleeping.
+    drop(running);
     let steps_at_drop = store
         .last_run()
         .unwrap()
