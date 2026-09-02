@@ -1843,6 +1843,31 @@ pub struct Routing {
     /// `Ok(true)`: a provider that says nothing about reachability makes this a
     /// no-op rather than a failure.
     pub require_primary: bool,
+    /// (0.75.0) Ask this model for the completions the crate makes on its own
+    /// behalf rather than on the caller's.
+    ///
+    /// There is exactly one such completion today: the summary a fold writes
+    /// when the context is compacted. It is issued with no model at all, so it
+    /// lands on whatever the provider was constructed with — the model chosen to
+    /// do the work, paying the work rate to compress a transcript. Naming a
+    /// cheaper one here changes that and nothing else.
+    ///
+    /// **One call, not three.** The roadmap this release was planned against
+    /// named three "mechanical calls". The other two are not provider calls at
+    /// all and cannot be routed: the plan classification reads the turn's own
+    /// first completion, and the duplicate-memory check is local token overlap
+    /// with no model and no network. They are named here so the absence is a
+    /// recorded fact rather than an omission a reader has to discover.
+    ///
+    /// Unset, every one of those calls behaves exactly as it did in 0.74.0, and
+    /// the request the crate builds is byte-identical. The crate names no
+    /// vendor's model itself: what is small for a provider is the operator's
+    /// knowledge, not this crate's.
+    ///
+    /// The failure mode is stated because it is quiet: a summary from a model
+    /// too small to summarise degrades every later turn of the run without
+    /// failing anything. Which model answered is on the trace for that reason.
+    pub mechanical: Option<String>,
 }
 
 impl Routing {
@@ -1870,6 +1895,16 @@ impl Routing {
     #[must_use]
     pub fn require_primary(mut self) -> Self {
         self.require_primary = true;
+        self
+    }
+
+    /// (0.75.0) Answer the crate's own mechanical completions on `model`.
+    ///
+    /// See [`Routing::mechanical`] for which calls those are — one, today — and
+    /// for why the other two the roadmap named are not routable.
+    #[must_use]
+    pub fn mechanical(mut self, model: impl Into<String>) -> Self {
+        self.mechanical = Some(model.into());
         self
     }
 
