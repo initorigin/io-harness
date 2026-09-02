@@ -40,7 +40,7 @@ everywhere — so a task isolates the same way on mac, linux, and windows:
 | Backend | Isolation |
 | --- | --- |
 | **macOS `sandbox-exec`** | a generated profile confines writes to the workdir and **denies network**; rlimits cap CPU and open files; an RSS monitor caps memory (macOS does not enforce address-space rlimits) |
-| **Linux namespaces** | user/mount/pid/**net** namespaces via `unshare` — a *hard* network boundary and a private root — plus the same rlimits and RSS monitor *(cfg-gated; compiled + unit-tested, not live-run on the macOS build host)* |
+| **Linux namespaces** | user/mount/pid/**net** namespaces via `unshare` — a *hard* network boundary and a private root — plus the same rlimits and RSS monitor. Requires `setpriv` (util-linux, beside `unshare`) since 0.74.0: the setup runs as uid 0 and the payload would otherwise inherit `CAP_SYS_ADMIN` over the mount namespace it had just made read-only. A host without it skips this rung *(cfg-gated; compiled + unit-tested, not live-run on the macOS build host)* |
 | **Windows Job Object** (the default) | a **resource** boundary and only that: caps committed memory, user-mode CPU and the active process count, and kills the whole process tree when the job handle closes. A Job Object has no path rule and no socket rule to set, so filesystem scoping is still the floor's ephemeral workdir and egress denial is still the proxy-env strip (see the note under this table) |
 | **Windows AppContainer** (0.59.0, opt-in) | the **access** boundary that job has no facility for: a low-box token that is default-deny on every securable object and reaches only the paths this run resolved, with no capability granting it a socket unless the policy permits egress. Selected by `SandboxConfig::with_access_confinement()`, and it refuses rather than degrading |
 | **Portable floor** | the guaranteed minimum on every OS: fresh subprocess, ephemeral workdir, resource caps, network env stripped. Deliberately the **weakest** backend — filesystem-scoped and resource-capped, *not* a full syscall jail |
@@ -156,6 +156,43 @@ an `Error::Sandbox`, never a failed verification.
 Use `Sandbox::backend()` on what `select` returns to see what will really run.
 `SandboxConfig::floor_only()` forces the floor everywhere, which is how the
 selection ladder is exercised in tests.
+
+**Since 0.74.0 the boundary is measured rather than declared.**
+`sandbox::BoundaryProbe` attempts a write and a dial outside the boundary before
+the run's first step, and `confines_writes()`, `denies_egress()` and the boundary
+sentence the agent is given answer from what happened rather than from what the
+backend was built to do. Three of that release's findings were a backend reporting
+a containment it had not applied, and twice before — 0.40.0 and 0.48.0 — the code
+was right about the design and wrong about the host.
+
+Every arm fails closed, and the effect on an ordinary run is worth knowing before
+it surprises you: **an arm that could not be attempted answers `false`**, so a host
+with no probe program, or none with a directory outside the boundary to aim at, is
+told the boundary could not be established even under a backend that would have
+confined it. It is worded as what this run could not establish rather than as an
+absence of confinement, because only the first is known to be true. One **control**
+child runs outside the boundary first, so a host that could never have performed an
+arm reports it unmeasured rather than refused.
+
+The probe is taken once per boundary — once per flat run, and once per tree before
+the root agent runs, since every agent in a tree shares one containment — so a
+child's trace carries no probe row of its own. A run that asked for no containment
+is not probed and records nothing: it makes no claim, and a row naming the backend
+that *would* have applied is the same misattribution the probe exists to catch.
+What lands is one `sandbox_events` row of kind `boundary_probe` at step 0, whose
+`detail` names both attempts and how each ended, announced on the event stream like
+every other row in that table.
+
+The warning that a backend named a containment this host did not apply is measured
+against **this run's** claim — `BoundaryProbe::claimed_confinement` and
+`claimed_egress_denial` — and not against the backend's unconditional properties,
+because a run that permits network is supposed to see its dial land and a
+`FullAccess` run on macOS or Linux still names a confining backend without being
+wrapped by it. A **proxied** run claims neither arm: its egress is scoped by the
+proxy rather than denied by the boundary, and a tree that will be proxied is
+recorded unmeasured, because on Linux the proxy decides which rung the chain picks.
+`BoundaryProbe::measure(config, &writable_roots, proxy)` takes that proxy address —
+`None` where there is no proxy.
 
 Sandboxing is the **default** for the verification gate and is transparent to it
 — the same code passes or fails as before — and a caller who wants direct-host

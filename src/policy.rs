@@ -154,14 +154,19 @@ impl Effect {
 /// One rule: an effect applied to an action whose target matches `pattern`.
 ///
 /// `pattern` is a glob (`*` any run including `/`, `?` one character) matched
-/// against the target's full relative path, and — for an [`Effect::Deny`] rule
-/// only — against its basename as well, the same way the `find` tool matches.
-/// That is what lets `.env` deny `config/.env`.
+/// against the target's full relative path, and — for every rule except an
+/// [`Effect::Allow`] — against its basename as well, the same way the `find`
+/// tool matches. That is what lets `.env` deny `config/.env`.
 ///
-/// The basename retry widens what a pattern covers, so 0.74.0 confines it to
-/// denies. Widening a deny can only refuse more; widening an allow hands out
-/// reach nobody wrote down — `allow_exec("cargo")` used to permit
-/// `./target/debug/cargo` as well, a binary the agent had just built itself.
+/// The basename retry widens what a pattern covers, so 0.74.0 withholds it from
+/// allows. Widening a deny can only refuse more, and widening an ask can only
+/// ask more; widening an allow hands out reach nobody wrote down —
+/// `allow_exec("cargo")` used to permit `./target/debug/cargo` as well, a binary
+/// the agent had just built itself. An [`Effect::Ask`] rule keeps the retry for
+/// the mirror-image reason: `ask_write("credentials.json")` that stopped
+/// covering `sub/credentials.json` would not narrow it to a refusal, it would
+/// drop it to the write default — which is what an operator wrote the rule to
+/// override.
 ///
 /// The basename half is why a bare filename is a *recursive* deny, and it is the
 /// reason to construct a `Rule` deliberately rather than reaching for the
@@ -654,11 +659,11 @@ impl Policy {
     /// allow, matching Claude Code's precedence.
     ///
     /// Two things about how one target is compared to one pattern are visible
-    /// from outside: an [`Effect::Deny`] rule is matched more
-    /// loosely than an allow (basename as well as full text, and case-folded for
-    /// [`Act::Exec`]) and that an [`Act::Net`] host is folded to one spelling —
-    /// lowercased, one trailing root dot off — on both sides before either is
-    /// compared.
+    /// from outside: an [`Effect::Allow`] rule is matched more *strictly* than a
+    /// deny or an ask — full text only, where those two also try the basename —
+    /// and additionally a deny alone is case-folded for [`Act::Exec`] and an
+    /// [`Act::Net`] deny's host is folded to one spelling, lowercased and with
+    /// one trailing root dot off, on both sides before either is compared.
     pub fn explain(&self, act: Act, target: &str) -> Verdict {
         // A network target arrives as `host:port`; a rule may name either form.
         // Trying both is what lets `allow_net("api.example.com")` cover whatever
@@ -891,7 +896,8 @@ fn compiled(pattern: &str, fold_case: bool) -> Option<regex::Regex> {
     re
 }
 
-/// Does `pattern` match `target`, by full text or — for a deny — by basename?
+/// Does `pattern` match `target`, by full text or — for a rule that does not
+/// grant — by basename?
 ///
 /// `act` decides what the two sides *are*, and whichever fold applies is applied
 /// to pattern and target alike so there is one definition of sameness rather than
@@ -900,13 +906,17 @@ fn compiled(pattern: &str, fold_case: bool) -> Option<regex::Regex> {
 /// name, left exactly as written because `\` is not a separator in a name and
 /// rewriting it would change what a rule means.
 ///
-/// `effect` decides how *loosely*. Three relaxations belong to [`Effect::Deny`]
-/// rules and to nothing else, because each of them makes a pattern cover more
-/// than its text says and that is only ever safe in the refusing direction:
+/// `effect` decides how *loosely*, and it does so along one axis: a relaxation
+/// makes a pattern cover more than its text says, which is safe exactly where
+/// covering more cannot grant more.
 ///
 /// * the basename retry, which lets a bare `.env` deny `config/.env` the way the
-///   `find` tool matches — and which let `allow_exec("cargo")` reach
-///   `./target/debug/cargo`, a binary the agent built for itself, until 0.74.0;
+///   `find` tool matches, is withheld from [`Effect::Allow`] alone — it let
+///   `allow_exec("cargo")` reach `./target/debug/cargo`, a binary the agent
+///   built for itself, until 0.74.0. An [`Effect::Ask`] rule keeps it: a rule
+///   that asks grants nothing, and one that stopped matching would fall through
+///   to a tier default that is *more* permissive than asking in both shipped
+///   tiers, turning "ask before writing this" into "write it";
 /// * the case-folded compile for [`Act::Exec`], because a binary name is a path
 ///   and half the volumes this crate runs on will spawn `RM` for `rm`. It is a
 ///   deny's alone rather than a property of the host filesystem: nothing in this
@@ -940,7 +950,13 @@ fn matches(act: Act, effect: Effect, pattern: &str, target: &str) -> bool {
     if re.is_match(&target) {
         return true;
     }
-    if !deny {
+    // An *allow* and nothing else. The argument the release makes is about
+    // widening reach, and only an allow hands reach out; an `Effect::Ask` rule
+    // that stopped matching would not narrow anything, it would fall through to
+    // the tier default — `Allow` for reads under `Policy::default` and for
+    // everything under `Policy::permissive` — so confining the retry to denies
+    // turned a rule that asked into one that did not.
+    if effect == Effect::Allow {
         return false;
     }
     let separators: &[char] = match act {

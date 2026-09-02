@@ -586,7 +586,8 @@ async fn containment_names_the_backend_the_host_actually_gave() {
         // red for being right. The probe is measured here the same way the run
         // measures it, so the two agree by construction rather than by luck.
         let probe =
-            io_harness::sandbox::BoundaryProbe::measure(&config, &[dir.path().to_path_buf()]).await;
+            io_harness::sandbox::BoundaryProbe::measure(&config, &[dir.path().to_path_buf()], None)
+                .await;
         match probe.write_refused {
             // A resource-only backend is stated as one. This is the degraded case
             // and the whole reason the line reports the selection rather than the
@@ -1176,7 +1177,7 @@ async fn a_proxied_run_says_whether_its_egress_boundary_is_enforced_or_advisory(
     // `the_containment_line_names_the_backend_the_host_actually_gave`: a test that
     // reads the declaration re-creates the coupling the probe was built to break,
     // and goes red on exactly the host where the fix is working.
-    let probe = io_harness::sandbox::BoundaryProbe::measure(&SandboxConfig::new(), &[]).await;
+    let probe = io_harness::sandbox::BoundaryProbe::measure(&SandboxConfig::new(), &[], None).await;
     if probe.denies_egress() {
         assert!(
             line.contains("proxy this run owns")

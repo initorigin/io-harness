@@ -148,7 +148,7 @@ layer.
 | **Providers** | OpenRouter, Anthropic and OpenAI natively, one `Compatible` provider for any OpenAI-shaped endpoint, 21 vendor presets, fallback between them | [providers](docs/guide/providers.md) |
 | **Context and memory** | Per-turn assembly to a stated budget share, compaction, invalidation, and durable memory kept by evidence | [context and memory](docs/guide/context-and-memory.md) |
 | **Sessions** | Durable, branchable conversations with token streaming, mid-turn steering and interruption | [sessions](docs/guide/sessions.md) |
-| **Configuration** | One `io.toml` over four scopes, projected onto the typed API, where a project file may narrow and never widen | [configuration](docs/guide/configuration.md) |
+| **Configuration** | One `io.toml` over four scopes, projected onto the typed API, where a file inside the workspace may narrow and never widen | [configuration](docs/guide/configuration.md) |
 | **Hooks and bundles** | An audit log, notification, formatter or blocking check from config; a directory that contributes skills, agents, servers, the executables it ships and deny rules at once | [hooks](docs/guide/hooks.md), [bundles](docs/guide/plugins.md) |
 | **Extensibility** | The `Tool` trait in-process, MCP over stdio and streamable HTTP, and markdown skills that can open the references beside them and never anything outside | [tools and skills](docs/guide/tools-and-skills.md) |
 | **Accounting** | Input, output, cache-read, cache-write and reasoning tokens per call, with latency and TTFT; cost derived on read from a price table you own | [accounting](docs/guide/accounting.md) |
@@ -296,6 +296,15 @@ the trace records what actually applied.
 A run whose policy names hosts reaches those hosts and no others, through a proxy
 the run owns. What that proxy is worth differs per backend and is stated per
 backend in [docs/CONTRACT.md](docs/CONTRACT.md) rather than discovered.
+
+Underneath every rule an operator writes there is an **address floor**:
+loopback, link-local, cloud-metadata, carrier-grade-NAT, unique-local and RFC 1918
+addresses are refused whatever the policy says, because a rule is a hostname glob
+and nobody thinks to deny their own admin ports.
+`IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1` is the only way off it, and it is an
+environment variable rather than an `io.toml` key on purpose — a key that widens is
+one a cloned repository could set. A run against a local model runtime needs it;
+see [MCP and network egress](docs/guide/mcp-and-network.md).
 
 Beside all of that, model-produced code runs in an ephemeral **execution sandbox**
 with an isolated workdir, resource caps that kill rather than throttle, and
@@ -518,9 +527,11 @@ repository's own guidance, with `files = []` as the opt-out. `${env:...}`,
 `${file:...}` and `${cmd:...}` keep a credential out of the file, an unknown key is
 an error rather than a shrug, and nothing is loaded implicitly: the caller reads the
 file, before the run, once. A file **inside the workspace** may narrow the boundary
-and may never widen it: the keys that would remove containment, and every section
-that names a program to run or an endpoint a credential is sent to — `[[hook]]`,
-`[browser]`, `[[provider]]`, `[[mcp]]`, `[[lsp]]` — are refused in the committed
+and may never widen it: the twelve keys that would remove containment, a
+`[[policy.layers]]` rule whose effect is anything but `deny`, and every section
+that names a program to run, names an endpoint a credential is sent to, or opens a
+route out of the boundary the policy does not gate — `[[hook]]`, `[browser]`,
+`[[provider]]`, `[[mcp]]`, `[[lsp]]`, `[web]` — are refused in the committed
 `io.toml` *and* in the gitignored `io.local.toml`, which sits at the workspace root
 where the agent can write it. The user-scope file, outside every workspace, is the
 one that can still widen, and every refusal names it.
@@ -830,7 +841,14 @@ The rung a host takes is the strongest that can enforce what the run asked for, 
 a run denying egress is never given one that cannot deny egress. The Linux chain's
 first rung is Landlock, which needs no namespace at all — which matters because a
 stock Ubuntu host ships `kernel.apparmor_restrict_unprivileged_userns=1` and refuses
-the unprivileged user namespace the namespace backend needs.
+the unprivileged user namespace the namespace backend needs. The namespace rung
+also needs `setpriv` (util-linux, beside `unshare`), so that the payload cannot
+inherit the capabilities that made its own read-only mounts; a host without it
+skips the rung and reports the backend it actually got.
+
+What a run reports about its boundary is **measured**: a probe attempts a write
+and a dial outside it before the first step, and an arm that could not be
+attempted reads as *not established* rather than as confined.
 
 **Windows access confinement is opt-in.** A Job Object has no filesystem facility and
 no network facility, so a contained Windows command gets the resource caps and nothing

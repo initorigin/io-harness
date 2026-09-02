@@ -618,6 +618,33 @@ fn wrapper_failure(outcome: &SandboxOutcome) -> Option<String> {
 /// mode here rather than a label: the process still `cd`s into the workspace and
 /// still cannot write to it.
 ///
+/// **The payload must not keep the capabilities that made these mounts** (0.74.0).
+/// `unshare --user --map-root-user` runs this script as uid 0 in a new user
+/// namespace with a full capability set, and `exec` hands that same process to the
+/// payload. A regular binary normally sheds capabilities on `execve` — but this
+/// process is root, and for a root process exec'ing a file with no file
+/// capabilities the kernel takes the permitted set as full. So before this release
+/// the payload arrived holding `CAP_SYS_ADMIN` **over the very mount namespace
+/// this script had just made read-only**, and one `mount -o remount,bind,rw /`
+/// undid every remount above it. `ExecMode::ReadOnly` was a label on this rung,
+/// and [`Backend::confines_writes`](crate::Backend::confines_writes) answered
+/// `true` for it.
+///
+/// `setpriv` empties the bounding set, so the exec that follows resolves to no
+/// capabilities at all and nothing on the far side can add one back;
+/// `--no-new-privs` closes the setuid route to the same place. Escaping into a
+/// *nested* user namespace does not recover the boundary: mounts propagated into a
+/// new mount namespace come in locked, and their read-only flag cannot be cleared
+/// from there.
+///
+/// **A host without `setpriv` fails the setup rather than running uncontained.**
+/// It ships in util-linux beside `unshare` itself, so its absence is unusual — and
+/// [`unshare_works`] runs this same script, so a host missing it answers `false`
+/// there, the chain skips this rung, and the run is reported under the backend it
+/// actually got. Degrading loudly to a weaker backend is this file's rule; running
+/// under a name whose guarantee was not applied is the failure the whole release
+/// is about.
+///
 /// `set -f` matters: the mount points read out of `mountinfo` are re-split by
 /// the shell, and a directory named with a `*` in it would otherwise be expanded
 /// into whatever happened to be beside it. The kernel escapes space, tab,
@@ -652,7 +679,8 @@ n=\"$1\"; shift
 while [ \"$n\" -gt 0 ]; do rw \"$1\"; shift; n=$((n-1)); done
 [ \"$TMPDIR\" = \"$wd\" ] || rw \"$TMPDIR\"
 cd \"$wd\" || fail 'could not enter the workdir'
-exec \"$@\"
+command -v setpriv >/dev/null 2>&1 || fail 'setpriv is required to drop the mount capabilities'
+exec setpriv --no-new-privs --inh-caps=-all --bounding-set=-all -- \"$@\"
 ";
 
 /// The `unshare` argv this backend builds for a run, factored out so it is
@@ -702,6 +730,155 @@ pub(crate) fn unshare_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The payload does not inherit the capabilities that built its own
+    /// boundary** (0.74.0).
+    ///
+    /// This rung runs its mount setup as uid 0 in a new user namespace, and a root
+    /// process exec'ing a file with no file capabilities keeps a full permitted
+    /// set — so without the drop below, the payload reached `exec` holding
+    /// `CAP_SYS_ADMIN` over the mount namespace whose every mount had just been
+    /// remounted read-only, and could put them all back with one `mount -o
+    /// remount,bind,rw`. `ExecMode::ReadOnly` was a label on this rung.
+    ///
+    /// Asserted on the script rather than on a host because it is a property of
+    /// what this crate *builds*: the containment CI can exercise is Linux's, and
+    /// this must not be able to regress on a macOS or Windows developer's machine
+    /// between two CI rounds. The ordering assertion is the load-bearing half — a
+    /// drop that happens anywhere but immediately before the payload is a drop the
+    /// payload runs before.
+    #[test]
+    fn the_mount_setup_drops_its_capabilities_before_it_execs_the_payload() {
+        let exec = MOUNT_SETUP
+            .lines()
+            .rev()
+            .find(|l| l.trim_start().starts_with("exec "))
+            .expect("the setup hands the payload over with `exec`");
+        assert!(
+            exec.contains("setpriv"),
+            "the payload is exec'd without dropping the mount capabilities: {exec}"
+        );
+        assert!(
+            exec.contains("--bounding-set=-all"),
+            "the bounding set survives the exec, so a capability can be added back: {exec}"
+        );
+        assert!(
+            exec.contains("--no-new-privs"),
+            "a setuid binary can still reach what the drop removed: {exec}"
+        );
+        assert!(
+            exec.trim_end().ends_with("-- \"$@\""),
+            "the payload is not the last thing on the exec line: {exec}"
+        );
+        // And the run degrades loudly rather than running uncontained under a name
+        // whose guarantee was never applied.
+        assert!(
+            MOUNT_SETUP.contains("command -v setpriv"),
+            "a host without setpriv would silently run this rung with full capabilities"
+        );
+    }
+
+    /// **The capability drop must not cost this host the rung it had** (0.74.0).
+    ///
+    /// [`unshare_works`] runs the real setup script, so a `setpriv` this host does
+    /// not have — or a flag its util-linux does not know — turns `probes.unshare`
+    /// to `false`, the chain skips this rung, and every run here quietly takes a
+    /// weaker backend. Nothing else would notice: both Linux CI legs resolve to
+    /// Landlock, so no other test on this platform exercises the namespace rung's
+    /// setup at all.
+    ///
+    /// The control is what makes it a real assertion rather than a skip: this only
+    /// demands the script work on a host where the namespaces themselves work.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_capability_drop_does_not_cost_this_host_the_namespace_rung() {
+        use std::process::{Command, Stdio};
+        let bare = Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--pid",
+                "--fork",
+                "--",
+                "true",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !bare {
+            eprintln!(
+                "skipped: this host cannot create the namespaces at all, so it has no rung to lose"
+            );
+            return;
+        }
+        assert!(
+            unshare_works(),
+            "the namespaces work on this host but the setup script does not — the capability drop \
+             cost this host its rung, and every run here silently takes a weaker backend"
+        );
+    }
+
+    /// **The payload cannot undo the read-only mounts the setup just made**
+    /// (0.74.0, F7).
+    ///
+    /// `unshare --user --map-root-user` runs the script as uid 0, and a root
+    /// process exec'ing a file with no file capabilities keeps a full permitted
+    /// set — so before the drop the payload held `CAP_SYS_ADMIN` over its own
+    /// mount namespace and one `remount,bind,rw` put back everything the walk over
+    /// `mountinfo` had just taken away. `ExecMode::ReadOnly` was a label on this
+    /// rung while `Backend::confines_writes()` answered `true` for it.
+    ///
+    /// **Driven through `unshare_argv` rather than through [`LinuxSandbox::run`]
+    /// on purpose.** `rung` picks Landlock on both Linux CI legs, so a test that
+    /// went through the sandbox would skip here and this property would go the way
+    /// of the `mountinfo` walk, which shipped in this same release without ever
+    /// having run on a machine. Spawning the argv directly is the only way this
+    /// rung is exercised on any host that has it.
+    ///
+    /// `RAN` is the control: without it a payload that failed to start for an
+    /// unrelated reason would pass as a payload that was correctly refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_payload_cannot_remount_its_own_boundary_writable() {
+        use std::process::{Command, Stdio};
+        if !unshare_works() {
+            eprintln!("skipped: this host has no namespace rung to exercise");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("io-harness-f7-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a workdir for the payload");
+        let argv = unshare_argv(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "mount -o remount,bind,rw / 2>/dev/null && echo BROKE; echo RAN".into(),
+            ],
+            &dir,
+            false,
+            ExecMode::ReadOnly,
+            &[],
+        );
+        let out = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .output()
+            .expect("the wrapper spawns");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            stdout.contains("RAN"),
+            "the payload never ran, so its refusal proves nothing: {stdout} / {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !stdout.contains("BROKE"),
+            "the payload remounted its own boundary read-write: the mode is a label, not a boundary"
+        );
+    }
 
     /// F3 — the chain's order, decided without a host.
     ///
@@ -1570,9 +1747,12 @@ mod tests {
             !script.contains("rm -rf"),
             "the argv must not reach the script text"
         );
+        // `"$@"` and nothing else: whatever the script execs into — since 0.74.0
+        // that is `setpriv`, which drops the mount capabilities first — the payload
+        // stays a list of positional parameters and never becomes script text.
         assert!(
-            script.contains("exec \"$@\""),
-            "and must leave through exec"
+            script.contains("exec ") && script.trim_end().ends_with("\"$@\""),
+            "and must leave through exec, as positional parameters"
         );
         assert_eq!(argv.last().unwrap(), &nasty);
     }

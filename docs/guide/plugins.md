@@ -52,8 +52,10 @@ unknown key is refused by name the same way and for the same reason.
 ## Declaring one
 
 ```toml
-# Any of the three scopes may declare one; which scope it was declared from
-# decides what its manifest may contribute.
+# Any of the three scopes may declare one. What its manifest may contribute is
+# decided by the scope that declared it AND by where the bundle sits: a `path`
+# is relative to the discovery root, so this one names a directory inside the
+# workspace the run is writing to.
 [[plugin]]
 path = "bundles/rust-review"
 ```
@@ -100,11 +102,23 @@ makes that call the identity.
 refuses `[[hook]]` there outright. A bundle is a stranger's directory one step
 further out, so the same rule governs it:
 
-| Declared in | skills, templates, agents, deny policy | `[[hook]]`, `[[mcp]]`, `[[bin]]` |
-| --- | --- | --- |
-| `io.toml` (project) | yes | **no** |
-| `io.local.toml` (local) | yes | **no** (0.74.0) |
-| user-scope file | yes | yes |
+| Declared in | Manifest sits | skills, templates, agents, deny policy | `[[hook]]`, `[[mcp]]`, `[[bin]]` |
+| --- | --- | --- | --- |
+| `io.toml` (project) | anywhere | yes | **no** |
+| `io.local.toml` (local) | anywhere | yes | **no** (0.74.0) |
+| user-scope file | **outside** the workspace | yes | yes |
+| user-scope file | **inside** the workspace | yes | **no** (0.74.0) |
+
+**The last row is the one to read twice.** A `[[plugin]]`'s `path` resolves
+against the discovery root, so `path = "bundles/tools"` in the operator's *own*
+file names a directory the run's agent can write to — and one ordinary
+`write_file` of `bundles/tools/plugin.toml` carrying a `[[hook]]` was a program
+to run, installed with no refusal anywhere on the path. The user scope's
+exemption rests on its file living outside every workspace; that premise holds
+for the declaring file and does not transfer to a directory it points at. So
+trust follows where the manifest *is*, not only which file named it. Keep a
+trusted bundle outside the project — `~/.config/io/bundles/rust-review`, named
+absolutely — and it contributes all seven kinds as before.
 
 **`io.local.toml` moved to the refusing side in 0.74.0**, and audit finding H2 is
 why: it sits at the workspace root, which is a path the run's own agent can write
@@ -174,8 +188,14 @@ loader:
 
 | `scope` | A manifest carrying `[[hook]]`, `[[mcp]]` or `[[bin]]` |
 | --- | --- |
-| `Scope::User`, `Scope::Local` | returned like any other contribution — these are the operator's own files |
-| `Scope::Project` | **refused whole**, not shortened — `io.toml` arrives with a `git clone` |
+| `Scope::User` | returned like any other contribution — this is the operator's own file |
+| `Scope::Local`, `Scope::Project` | **refused whole**, not shortened — both files sit at the workspace root, which a `git clone` ships and the run's own agent can write |
+
+`inspect` is a **preflight, and it answers about the scope you name rather than
+about a run.** No discovery root reaches it, so it cannot see where the bundle
+would land: a `Scope::User` answer of "loadable" can still be refused at load
+time, when the bundle turns out to sit inside the workspace. Ask it what a scope
+permits; do not read it as a promise about the next run.
 
 A bundle that would load from one file and not the other is exactly what an
 installer has to tell an operator *before* it writes anything, and marketplace

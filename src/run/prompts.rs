@@ -309,9 +309,17 @@ pub(super) async fn probe_boundary(
     let Some(containment) = containment else {
         return crate::sandbox::BoundaryProbe::unmeasured(crate::sandbox::select(config).backend());
     };
-    // The roots the run will actually grant, so the probe measures this run's
-    // boundary rather than a stricter one it will not have.
-    let probe = crate::sandbox::BoundaryProbe::measure(config, containment.roots.as_slice()).await;
+    // The roots the run will actually grant **and the proxy it will actually
+    // route through**, so the probe measures this run's boundary rather than a
+    // stricter one it will not have. The flat loop rebinds its containment with
+    // the proxy address before it gets here, which is why this call site can pass
+    // one and `probe_tree_boundary` cannot.
+    let probe = crate::sandbox::BoundaryProbe::measure(
+        config,
+        containment.roots.as_slice(),
+        containment.proxy,
+    )
+    .await;
     // Step 0, like every other run-start row: no step of this run produced it.
     let mut measured = crate::state::SandboxEvent::create(run_id, 0, probe.backend.as_str());
     measured.kind = "boundary_probe".to_string();
@@ -330,17 +338,41 @@ pub(super) async fn probe_boundary(
 /// which is what `agent_loop` computes too: children share their parent's
 /// workspace, so they share its detection and its roots.
 ///
-/// The egress proxy is not started yet and does not need to be. It reaches the
-/// containment through `ExecContainment::with_proxy`, which sets an address and
-/// leaves the roots alone, and the roots are the only part of the containment the
-/// probe reads.
+/// **A tree that will be proxied is recorded unmeasured, not measured without the
+/// proxy** (0.74.0). The proxy does not exist yet at this call site and cannot: it
+/// is started once the `Tree` is built, and this runs before that so the
+/// measurement happens once for the whole tree. An earlier draft of this release
+/// argued the absence did not matter, on the grounds that `with_proxy` "sets an
+/// address and leaves the roots alone, and the roots are the only part of the
+/// containment the probe reads". That was wrong twice over. The proxy is an input
+/// to which *rung* a backend picks, not only to the rules inside one: on Linux the
+/// namespace rungs refuse a proxied run outright, so measuring with no proxy
+/// measures `bwrap` while the tree itself takes Landlock. And it is the difference
+/// between a boundary that denies egress and one that scopes it through a listener
+/// — reporting the first for a run that has the second is exactly the
+/// misattribution `BoundaryProbe` exists to catch.
+///
+/// So the row is still written and it still says what happened: both arms
+/// `unmeasured`, which claims nothing. An absent measurement costs the boundary
+/// section its two claims, which is the correct direction — the flat loop, whose
+/// proxy is resolved before its probe, measures a proxied boundary properly.
 pub(super) async fn probe_tree_boundary(
     store: &Store,
     watch: &Watch<'_>,
     run_id: i64,
     config: &SandboxConfig,
     root: &std::path::Path,
+    will_proxy: bool,
 ) -> crate::sandbox::BoundaryProbe {
+    if will_proxy {
+        let probe =
+            crate::sandbox::BoundaryProbe::unmeasured(crate::sandbox::select(config).backend());
+        let mut measured = crate::state::SandboxEvent::create(run_id, 0, probe.backend.as_str());
+        measured.kind = "boundary_probe".to_string();
+        measured.detail = Some(probe.trace_label());
+        crate::run::dispatch::record_sandbox_step(store, watch, 0, &measured);
+        return probe;
+    }
     let toolchain = crate::toolchain::detect(root);
     let containment = exec_containment(config, toolchain.as_ref());
     // Depth 0: the tree's boundary is measured before the root agent runs, and it
@@ -1885,11 +1917,19 @@ mod boundary_sentence {
     use super::*;
     use crate::sandbox::{Backend, BoundaryProbe};
 
+    /// A probe for a run that asked its backend for **both** boundaries, so the
+    /// rows below are the case where a claim exists to be contradicted. The claims
+    /// are read off the backend because that is what a contained, egress-denying
+    /// run resolves to; a run that permits network or wraps nothing claims neither,
+    /// and that distinction is what `contradicts_claim` is tested on in
+    /// `tests/security_probe.rs`.
     fn probe(backend: Backend, write: Option<bool>, dial: Option<bool>) -> BoundaryProbe {
         BoundaryProbe {
             backend,
             write_refused: write,
             dial_refused: dial,
+            claimed_confinement: backend.confines_writes(),
+            claimed_egress_denial: backend.denies_egress(),
         }
     }
 

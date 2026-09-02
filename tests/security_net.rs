@@ -9,9 +9,14 @@
 //!
 //! These tests drive the boundary the way a caller does, so a floor that decided
 //! correctly in a unit test and was never consulted by the loop would fail here.
-//! Nothing below makes an outbound connection: every refused address is a
-//! literal or a reserved name, so no resolver is consulted, and the one test that
-//! connects connects to a listener it started itself on loopback.
+//!
+//! **Nothing below queries a resolver or reaches the network.** Every endpoint is
+//! an IP literal, a name reserved to this machine, or a short-form IPv4 spelling
+//! that `getaddrinfo` answers from `inet_aton` without a query; the only sockets
+//! opened are to a listener the test started itself on loopback. That is a
+//! constraint on the suite and not an accident of it: a permission test that has
+//! to ask the internet a question is a test that fails on an aeroplane and passes
+//! for the wrong reason on a hostile network.
 //!
 //! The floor's own decision function — which range each address falls in — is
 //! graded against a supplied address list in `src/net.rs`'s unit tests, where the
@@ -324,6 +329,21 @@ async fn m10_every_local_range_and_metadata_name_is_refused_under_a_permissive_p
         // Unique local, and "this network".
         "http://[fd00::1]/v1",
         "http://0.0.0.0:8080/v1",
+        // Carrier-grade NAT, and the metadata service that lives inside it.
+        // 100.64.0.0/10 is not RFC 1918, so `Ipv4Addr::is_private` says nothing
+        // about it and the floor did not grade it at all — which left Alibaba
+        // Cloud's instance-metadata endpoint at 100.100.100.200 reachable under
+        // the same permissive policy every other metadata address was refused by.
+        "http://100.64.0.1/v1",
+        "http://100.127.255.255/v1",
+        "http://100.100.100.200/latest/meta-data/",
+        // Authority confusion. The backslash ends the authority for every scheme
+        // reduced here, as it does in the WHATWG parser and in Chrome, so this is
+        // the loopback endpoint in front of it. Until 0.74.0's own review it was
+        // *checked* as `example.com:80` and would have been *dialled* at
+        // `127.0.0.1:11434` — the checked host and the dialled host were not the
+        // same host.
+        "http://127.0.0.1:11434\\@example.com/v1",
     ] {
         let (_, rule, layer) = refusal_for(endpoint).await;
         assert_eq!(layer.as_deref(), Some("local-address floor"), "{endpoint}");
@@ -377,6 +397,146 @@ async fn m10_an_http_mcp_server_on_a_local_address_is_refused() {
         );
     }
     assert_eq!(sink.connections(), 0, "nothing was dialled");
+}
+
+/// M10 — a host that is a literal only to the *resolver* is resolved and graded.
+///
+/// This is the half of the finding that a name-only floor cannot reach, in the
+/// one shape that can be asserted without a DNS query. `2130706433` and `127.1`
+/// are `127.0.0.1` to `inet_aton`, and `2852039166` is `169.254.169.254`; none of
+/// the three parses as an `IpAddr`, so the floor's literal arm never saw them, and
+/// none of the three matches a policy glob written against the dotted form
+/// either. `getaddrinfo` answers all of them from `inet_aton` without asking a
+/// resolver, so this test connects to nothing and looks nothing up.
+///
+/// On 0.74.0 as released, every endpoint below was authorized: `floor_by_name`
+/// answered `Ok` for anything it could not parse as an address, and nothing in
+/// the crate resolved a name before dialling it except the egress proxy.
+///
+/// Unix only, deliberately: Windows' `getaddrinfo` documents dotted-decimal, so
+/// these would reach a resolver there, and a test that emits a DNS query is not
+/// one this suite may run.
+#[cfg(unix)]
+#[tokio::test]
+async fn m10_a_host_only_the_resolver_reads_as_local_is_refused() {
+    let _floored = floored();
+    let sink = Sink::start();
+    let port = sink.addr.rsplit_once(':').unwrap().1.to_string();
+
+    // A provider endpoint pointed at this test's own listener, spelled as one
+    // decimal. The provider dials for real, so a boundary that decided correctly
+    // and connected anyway is caught by the counter rather than assumed away.
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Dialer::new(format!("http://2130706433:{port}/v1"));
+    let err = run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Refused { act, rule, layer, .. }
+            if act == "net"
+                && layer.as_deref() == Some("local-address floor")
+                // The refusal names the address that decided, not the spelling
+                // that was typed: `127.0.0.1` is what a reader has to act on.
+                && rule.as_deref().is_some_and(|r| r.contains("127.0.0.1"))),
+        "expected a floor refusal naming the resolved address, got {err:?}"
+    );
+    assert_eq!(sink.connections(), 0, "no socket may be opened");
+
+    // The same, by name, for the addresses this suite must not send a packet to.
+    for endpoint in [
+        "http://127.1:8080/v1",
+        "http://2852039166/latest/meta-data/iam/security-credentials/",
+    ] {
+        let (_, rule, layer) = refusal_for(endpoint).await;
+        assert_eq!(layer.as_deref(), Some("local-address floor"), "{endpoint}");
+        assert!(
+            rule.as_deref().unwrap().contains(ALLOW_LOCAL_KEY),
+            "{endpoint}: {rule:?}"
+        );
+    }
+
+    // And the MCP transport, the caller the audit named first.
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let contract = contract(dir.path()).with_mcp([McpServer::http(
+        "web",
+        format!("http://2130706433:{port}/mcp"),
+    )]);
+    let err = run_with(
+        &contract,
+        &Silent,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Refused { act, layer, .. }
+            if act == "net" && layer.as_deref() == Some("local-address floor")),
+        "expected a floor refusal, got {err:?}"
+    );
+    assert_eq!(sink.connections(), 0, "nothing was dialled");
+}
+
+/// M10 — the widening lifts a short-form local address and never the metadata one.
+///
+/// The companion to the test above, and the reason it is separate: it turns the
+/// widening on, which is process-wide.
+#[cfg(unix)]
+#[tokio::test]
+async fn m10_the_opt_out_reaches_a_short_form_loopback_endpoint() {
+    let held = WIDENING.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var(ALLOW_LOCAL_ENV, "1");
+
+    let sink = Sink::start();
+    let port = sink.addr.rsplit_once(':').unwrap().1.to_string();
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Dialer::new(format!("http://2130706433:{port}/v1"));
+    let result = run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .expect("the widening lets a loopback endpoint through however it is spelled");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
+    assert!(sink.connections() >= 1, "a socket, not a verdict");
+
+    // Metadata stays refused, in this spelling as in the dotted one.
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Dialer::quiet("http://2852039166/latest/meta-data/");
+    let err = run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Refused { act, layer, .. }
+            if act == "net" && layer.as_deref() == Some("local-address floor")),
+        "the widening is for local runtimes, not for metadata: {err:?}"
+    );
+
+    std::env::remove_var(ALLOW_LOCAL_ENV);
+    drop(held);
 }
 
 /// M10's negative control — the floor must not break an ordinary public host.

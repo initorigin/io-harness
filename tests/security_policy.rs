@@ -468,6 +468,71 @@ fn l7_a_deny_by_bare_name_is_still_recursive() {
     );
 }
 
+/// The same narrowing on the two path acts, which the exec example above does
+/// not cover: an allow grants the one location it names, and a target one
+/// directory down falls to the tier default.
+#[test]
+fn l7_a_path_allow_does_not_reach_the_same_name_one_directory_down() {
+    let reads = Policy::default().layer("ops").allow_read("notes.md");
+    assert_eq!(reads.check(Act::Read, "notes.md").effect, Effect::Allow);
+
+    let writes = Policy::default().layer("ops").allow_write("out.txt");
+    assert_eq!(writes.check(Act::Write, "out.txt").effect, Effect::Allow);
+    assert_eq!(
+        writes.check(Act::Write, "logs/out.txt").effect,
+        Effect::Ask,
+        "an allow grants the path it names; the tier default decides the rest"
+    );
+    // And the recursive form is still writable by hand: `*` spans `/`.
+    let recursive = Policy::default().layer("ops").allow_write("*out.txt");
+    assert_eq!(
+        recursive.check(Act::Write, "logs/out.txt").effect,
+        Effect::Allow
+    );
+}
+
+/// The retry is withheld from **allows**, not from everything that is not a
+/// deny. An `Effect::Ask` rule grants nothing, so widening what it covers hands
+/// out no reach — and withholding it does not narrow the rule, it *deletes* the
+/// rule: an ask that no longer matches falls through to the tier default, which
+/// in both shipped tiers is more permissive than asking.
+#[test]
+fn l7_an_ask_rule_keeps_the_basename_retry_because_losing_it_grants() {
+    // `Policy::default()` has `read: Allow`, so an ask-read that stops matching
+    // does not become a refusal — it becomes a silent read.
+    let reads = Policy::default()
+        .layer("ops")
+        .rule(Act::Read, Effect::Ask, "notes.md");
+    assert_eq!(
+        reads.check(Act::Read, "docs/notes.md").effect,
+        Effect::Ask,
+        "an ask that stops matching falls to `read: Allow`, which is a widening"
+    );
+
+    // `Policy::permissive()` has `write: Allow`, and this is the shape an
+    // operator writes the rule for in the first place.
+    let writes = Policy::permissive()
+        .layer("ops")
+        .ask_write("credentials.json");
+    assert_eq!(
+        writes.check(Act::Write, "sub/credentials.json").effect,
+        Effect::Ask,
+        "an ask that stops matching falls to `write: Allow`, which is a widening"
+    );
+    assert_eq!(
+        writes.check(Act::Write, "credentials.json").effect,
+        Effect::Ask,
+        "the path the rule names, unchanged"
+    );
+
+    // The control: the retry is a *retry*, not a match on anything. A different
+    // name one directory down is still the default.
+    assert_eq!(
+        writes.check(Act::Write, "sub/other.json").effect,
+        Effect::Allow
+    );
+}
+
 // ---------------------------------------------------------------------------
 // L9 — a resolved argv on Windows carries backslashes
 // ---------------------------------------------------------------------------

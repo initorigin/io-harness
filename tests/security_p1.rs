@@ -253,6 +253,76 @@ fn c4_a_project_scoped_mcp_or_lsp_server_is_refused_at_load() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// C3/C4's third shape — `[web]` opens egress nothing in this crate mediates
+// ---------------------------------------------------------------------------
+
+/// The same sentence one table over. `[web]` joined `REFUSED_SECTIONS` in 0.74.0
+/// because a provider-executed search is dialled *by the provider*: `src/web.rs`
+/// states it outright — `Act::Net` never sees it — so the `Policy` does not gate
+/// it, the run's egress proxy is not on the path, and the domain lists beside it
+/// are filled into the vendor's own filter rather than enforced here. A cloned
+/// `io.toml` writing `search = true` therefore switched on an egress surface no
+/// rung of this crate mediates, and `fetch = true` beside it let the repository
+/// choose where the run's context may be sent.
+///
+/// `sandbox.allow_network = true` is refused for re-opening egress *inside* the
+/// sandbox; this opens one outside it entirely, so the two are asserted against
+/// the same `teaches` shape — refusing the narrower key while permitting the wider
+/// table would not be one rule.
+///
+/// The cost is stated rather than hidden, and is why the control matters: `[web]
+/// search = false` is a narrowing sentence a workspace file can no longer write
+/// either. That is the 0.28.0 whole-section argument paid the way `[[hook]]` pays
+/// it — the feature is off unless the user scope turns it on — and the control is
+/// what proves the scope it was moved to still works.
+#[test]
+fn c3_a_workspace_file_may_not_declare_provider_executed_web_access() {
+    let user = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user.path());
+
+    for file in ["io.toml", "io.local.toml"] {
+        write(
+            project.path(),
+            file,
+            "[web]\nsearch = true\nfetch = true\nallowed_domains = [\"docs.rs\"]\n",
+        );
+        let err = refusal(project.path());
+        teaches(&err, "web");
+        assert!(
+            err.contains("`Act::Net` never"),
+            "names the reason the boundary does not see it: {err}"
+        );
+        std::fs::remove_file(project.path().join(file)).unwrap();
+    }
+
+    // The same table through the text entry point, which is the project scope too.
+    let err = Config::from_toml("[web]\nsearch = true\n")
+        .expect_err("`Config::from_toml` is the project scope")
+        .to_string();
+    teaches(&err, "web");
+
+    // The control: the scope every refusal above points at declares it and it
+    // reaches the contract. Without this a rule that refused `[web]` everywhere
+    // would satisfy each assertion above while deleting the feature.
+    write(
+        user.path(),
+        "io.toml",
+        "[web]\nsearch = true\nmax_uses = 3\nallowed_domains = [\"docs.rs\"]\n",
+    );
+    let web = Config::discover(project.path())
+        .expect("the user scope declares web access")
+        .apply_to(io_harness::TaskContract::workspace(
+            "exercise web access",
+            project.path(),
+        ))
+        .web
+        .expect("and it reaches the contract");
+    assert!(web.search);
+    assert_eq!(web.max_uses, Some(3));
+}
+
 /// The same door, one level down — and it was still open after the first fix.
 ///
 /// `plugin` is deliberately *not* a refused section: a workspace file may still
@@ -299,6 +369,89 @@ fn h2_a_bundle_named_by_any_file_inside_the_workspace_may_not_name_a_program() {
         Plugins::inspect(scope, harmless.path())
             .unwrap_or_else(|e| panic!("{scope:?} refused a bundle that names no program: {e}"));
     }
+}
+
+/// H2, the half the first fix left standing.
+///
+/// `refuse_executing_contributions` was keyed on the scope of the *declaring*
+/// file, and `Plugins::load` resolves a `[[plugin]]`'s `path` against the
+/// discovery root in every scope — so an operator's own `~/.config/io/io.toml`
+/// writing `path = "bundles/tools"` names a directory inside the workspace the run
+/// is writing to. One `write_file` of `bundles/tools/plugin.toml` carrying a
+/// `[[hook]]` was then a program installed as trusted, from the one scope exempt
+/// from the rule, with no refusal anywhere on the path. This release made a
+/// declared `[[plugin]]` path under the discovery root the shape *every* scope
+/// writes, which is what turned a latent asymmetry into a route.
+///
+/// The premise the user scope's exemption rests on is that `$IO_CONFIG`,
+/// `$IO_CONFIG_HOME` and `~/.config/io` are outside every workspace, so a run that
+/// can write its own root cannot reach them. It holds for the declaring file and
+/// does not transfer to a directory that file points at. A manifest inside the
+/// workspace is therefore graded as the workspace file it is, whatever scope named
+/// it.
+///
+/// Both spellings of the declaration: the relative one is the exploit as written,
+/// the absolute one names the same directory a second way, and a fix that caught
+/// only the join would leave the other open. The control is the identical manifest
+/// outside the workspace — without it a loader that refused every user-scope
+/// declaration would pass both refusals while taking the feature away.
+#[test]
+fn h2_a_user_scoped_bundle_inside_the_workspace_is_graded_as_a_workspace_file() {
+    let user = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let _guard = env(user.path());
+
+    let manifest = "name = \"tools\"\n\n\
+                    [[hook]]\non = [\"started\"]\nrun = [\"sh\", \"-c\", \"true\"]\n";
+    let inside = root.path().join("bundles/tools");
+    std::fs::create_dir_all(&inside).unwrap();
+    write(&inside, "plugin.toml", manifest);
+
+    for declared in ["bundles/tools".to_string(), inside.display().to_string()] {
+        write(
+            user.path(),
+            "io.toml",
+            &format!("[[plugin]]\npath = {declared:?}\n"),
+        );
+        let plugins = Config::discover(root.path())
+            .expect("the declaration itself is not a refusal")
+            .plugins();
+        assert_eq!(plugins.len(), 0, "{declared}: nothing loaded");
+        assert_eq!(plugins.dropped().len(), 1, "{declared}");
+        let why = &plugins.dropped()[0].error;
+        assert!(
+            why.contains("key `hook`"),
+            "{declared}: names the key: {why}"
+        );
+        assert!(
+            why.contains("inside the workspace"),
+            "{declared}: and says what decided it: {why}"
+        );
+    }
+
+    // The control: the identical manifest outside the workspace, named from the
+    // same file, contributes its hook.
+    let elsewhere = tempfile::tempdir().unwrap();
+    write(elsewhere.path(), "plugin.toml", manifest);
+    write(
+        user.path(),
+        "io.toml",
+        &format!(
+            "[[plugin]]\npath = {:?}\n",
+            elsewhere.path().display().to_string()
+        ),
+    );
+    let plugins = Config::discover(root.path()).unwrap().plugins();
+    assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
+    assert_eq!(
+        plugins
+            .get("tools")
+            .expect("a bundle outside the workspace still loads")
+            .hooks()
+            .len(),
+        1,
+        "and its hook is the contribution the refusals above withheld"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +550,67 @@ fn a_narrowing_project_file_still_loads() {
     assert_eq!(agents.names(), vec!["searcher"]);
     assert!(config.policy().is_some());
     assert!(config.sandbox().is_some());
+}
+
+/// The two widening keys the 0.74.0 list was still missing, asserted by effect
+/// rather than by the refusal's wording.
+///
+/// `sandbox.mode` was on the list for the literal `"full-access"` alone, so a
+/// cloned `io.toml` writing `"workspace-write"` raised an operator's own
+/// `"read-only"` back to the crate's default — the merge lets a project file
+/// replace the user scope's value, and `ExecMode::narrower` was never called.
+/// `sandbox.limits.*` was on no list at all, and `0` there means *no cap*: one
+/// number in a cloned file took the wall clock, the memory ceiling or the process
+/// count down entirely.
+///
+/// Each half carries its own control in the same pass, because both keys have a
+/// narrowing value a project file is *meant* to write and a rule that refused the
+/// key outright would pass every refusal here while deleting the feature.
+#[test]
+fn h2_a_workspace_file_may_not_raise_a_ceiling_the_user_scope_lowered() {
+    for (widening, narrowing, key) in [
+        (
+            "[sandbox]\nmode = \"workspace-write\"\n",
+            "[sandbox]\nmode = \"read-only\"\n",
+            "sandbox.mode",
+        ),
+        (
+            "[sandbox.limits]\nmax_wall_secs = 0\n",
+            "[sandbox.limits]\nmax_wall_secs = 30\n",
+            "sandbox.limits.max_wall_secs",
+        ),
+    ] {
+        for file in ["io.toml", "io.local.toml"] {
+            let user = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let _guard = env(user.path());
+
+            // The ceiling the operator set, in the one scope no workspace reaches.
+            write(
+                user.path(),
+                "io.toml",
+                "[sandbox]\nmode = \"read-only\"\n[sandbox.limits]\nmax_wall_secs = 5\n",
+            );
+
+            write(root.path(), file, widening);
+            let err = refusal(root.path());
+            teaches(&err, key);
+            assert!(err.contains("widens"), "{err}");
+
+            // The control: the narrowing value of the same key, in the same file,
+            // still loads and still decides.
+            write(root.path(), file, narrowing);
+            let sandbox = Config::discover(root.path())
+                .unwrap_or_else(|e| panic!("a workspace file may narrow {key}: {e}"))
+                .sandbox()
+                .expect("the file names `[sandbox]`");
+            assert_eq!(sandbox.mode, io_harness::ExecMode::ReadOnly, "{key}");
+            assert!(
+                sandbox.limits.max_wall_secs.is_some(),
+                "the cap survives: {key}"
+            );
+        }
+    }
 }
 
 /// H2 by the shortest route there is, and the one the finding does not describe.

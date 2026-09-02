@@ -28,6 +28,16 @@ const HOSTILE_DIR: &str = "p\")) (allow network*) (allow file-write* (subpath \"
 /// C1 — the backend refuses the run rather than building a profile it cannot
 /// vouch for. On 0.73.0 this spawned the command with the injected grants in the
 /// profile and returned an outcome; the refusal is the whole fix.
+// Not on Windows, and the reason is the guard working rather than failing.
+//
+// These two drive a real `tempfile::tempdir()`, so the path is absolute — and on
+// Windows an absolute path is `C:\Users\…`, where every separator is a
+// backslash, which is one of the three characters this guard refuses. So the
+// refusal fires on the path separator before it ever reaches the injected quote,
+// and the assertions below would be checking the wrong cause. The rendering
+// itself is asserted on every platform by the unit tests in `src/sandbox/macos.rs`,
+// which build relative paths and therefore say what they mean everywhere.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn c1_the_macos_backend_refuses_a_workdir_it_cannot_name_in_its_profile() {
     let workdir = std::env::temp_dir().join(HOSTILE_DIR);
@@ -61,6 +71,10 @@ async fn c1_the_macos_backend_refuses_a_workdir_it_cannot_name_in_its_profile() 
 /// everything unusual: a space, a hyphen, a dot, a unicode character, an
 /// apostrophe and a pair of parentheses are all ordinary in a macOS directory
 /// name, and none of them can end a string literal. The run must get a profile.
+// Not on Windows, for the reason given above: the temp path's own separators are
+// refused characters, so "an ordinary name still gets a profile" cannot be
+// asserted from an absolute Windows path.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn c1_an_ordinary_directory_name_is_still_given_a_profile() {
     let root = tempfile::tempdir().unwrap();

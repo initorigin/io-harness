@@ -355,11 +355,15 @@ This is the [configuration guide's](configuration.md#a-file-inside-the-workspace
 narrow-never-widen rule applied to a new key rather than a new rule, and it comes
 with the same sentence it is not.
 
-**What this does not claim.** Not that a cloned repository is safe. `[[mcp]]` still
-names a command, `[toolchain]` still names an argv, and a `[[policy.layers]]` entry
-can still allow what the defaults did not. This is a specific narrowing of a
-specific hazard — four keys, `${cmd:}` and `[[hook]]`, no more — and it is the file
-half of a boundary whose enforcing half is still the `Policy` you loaded.
+**What this does not claim.** Not that a cloned repository is safe. `[toolchain]`
+still names an argv the embedding application may act on, and `[instructions]`
+still puts the repository's own prose in front of the model. Two sentences that
+stood here are no longer true and are worth naming as changed rather than quietly
+dropped: `[[mcp]]` is a refused section since 0.74.0, and a `[[policy.layers]]`
+entry in a workspace file may carry `deny` rules and nothing else since 0.74.0.
+This is a specific narrowing of specific hazards — twelve keys, six sections,
+`${cmd:}`, `${file:}` and a layer's effect — and it is the file half of a boundary
+whose enforcing half is still the `Policy` you loaded.
 
 ## What a hook costs
 
@@ -394,11 +398,13 @@ run had moved on could not refuse anything. It also means hooking `token` with a
 be exactly as slow as that sounds.
 
 **A hook is refused in every file inside the workspace, whole — and that does not
-make a cloned repository safe.** `[toolchain]` still names an argv, a
-`[[policy.layers]]` entry can still allow what the defaults did not, and `${cmd:}`
-is refused in `io.toml` and not in `io.local.toml`. This is a specific narrowing of
-a specific hazard, and the boundary against the agent is still the `Policy` the
-caller loaded.
+make a cloned repository safe.** `[toolchain]` still names an argv the embedding
+application may act on, and `[instructions]` still puts the repository's own prose
+in front of the model. What used to be listed here beside them no longer belongs:
+a `[[policy.layers]]` entry in a workspace file may carry `deny` rules and nothing
+else since 0.74.0, and `${cmd:}` and `${file:}` are refused in `io.local.toml` as
+well as in `io.toml`. This is a specific narrowing of a specific hazard, and the
+boundary against the agent is still the `Policy` the caller loaded.
 
 **A hook is not accumulated across scopes.** Unlike `[[policy.layers]]` and
 `[[agent]]`, a later scope **replaces** the array whole. Since 0.74.0 only the user

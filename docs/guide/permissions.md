@@ -128,24 +128,35 @@ A rule's `pattern` is a glob — `*` matches any run of characters including `/`
 the target is the binary name. Specificity does not matter: a broad deny beats a
 narrow allow.
 
-**A deny is matched more loosely than an allow, and only a deny (0.74.0).** Three
-relaxations belong to `Effect::Deny` rules and to nothing else, because each makes
-a pattern cover more than its text says and that is only ever safe in the refusing
-direction:
+**A rule that grants is matched strictly, and 0.74.0 is where that started being
+true.** Three relaxations make a pattern cover more than its text says, so each is
+withheld wherever covering more would hand out more. They are not withheld from
+the same set of rules, and the difference is the part to read:
 
 - the **basename retry**, which is what lets `.env` deny `config/.env`, the same
-  way the `find` tool matches — and which, applied to allows, let
+  way the `find` tool matches, is withheld from **`Effect::Allow` and from nothing
+  else**. A deny keeps it and so does an `ask`. Applied to allows it let
   `allow_exec("cargo")` also grant `./target/debug/cargo`, a binary the agent had
-  built for itself. For `Act::Exec` the retry splits on `\` as well as `/`, so
-  `deny_exec("kubectl.exe")` covers the Windows path a resolved argv carries;
-- a **case-folded compile for `Act::Exec`**, because half the volumes this crate
-  runs on will spawn `RM` for `rm` and nothing here can tell whether the volume a
-  given argv resolves on folds case;
-- the **host fold for `Act::Net`** below.
+  built for itself. An `ask` keeps it because a rule that asks grants nothing:
+  `ask_write("credentials.json")` that stopped covering `sub/credentials.json`
+  would not narrow to a refusal, it would fall through to the write default —
+  which is what the operator wrote the rule to override, and which is more
+  permissive than asking in both shipped tiers. Withholding the retry from asks
+  as well as allows is therefore a widening dressed as a narrowing, and it is the
+  bug the pre-0.74.0 spelling of this check actually had. For `Act::Exec` the
+  retry splits on `\` as well as `/`, so `deny_exec("kubectl.exe")` covers the
+  Windows path a resolved argv carries;
+- a **case-folded compile for `Act::Exec`**, which is a **deny's alone**, because
+  half the volumes this crate runs on will spawn `RM` for `rm` and nothing here
+  can tell whether the volume a given argv resolves on folds case. An `ask` does
+  not get this one: it is applied at compile time to the pattern, where the
+  basename retry is applied to a target that already failed;
+- the **host fold for `Act::Net`** below, a **deny's alone** for the same reason.
 
 An allow keeps granting exactly what it names. One that misses a spelling —
-`allow_exec("rustc")` against `RUSTC` — falls to the tier default, which asks or
-refuses.
+`allow_exec("rustc")` against `RUSTC`, `allow_write("out.txt")` against
+`logs/out.txt` — falls to the tier default, which asks or refuses. Write the reach
+you meant: `*` spans `/`, so `allow_write("*out.txt")` is the recursive form.
 
 A network target arrives as `host:port`, and both forms are tried, so
 `allow_net("api.example.com")` covers whatever port the URL resolved to while
@@ -177,6 +188,20 @@ reading the trace sees why that one host was allowed and which layer said so.
 Because it is a merge and not a containment rule, a caller who explicitly denies
 its own provider host still wins — deny is absolute across layers — and the run
 fails fast as a refusal rather than hanging.
+
+**Underneath every net rule there is an address floor (0.74.0), and your rules
+cannot lift it.** A target the policy allows is refused anyway when it resolves
+onto a loopback, link-local, cloud-metadata, carrier-grade NAT, unique-local or
+RFC 1918 address, or names a host reserved to this machine. `Policy::permissive()`
+is a hostname glob and nothing more, so before this release it handed the model
+this host's admin ports, the private network around it and the cloud
+instance-metadata service. The refusal is attributed to the layer
+`local-address floor`, so a trace tells "your rules refused this" apart from "the
+floor underneath your rules refused this". The one way off it is the environment
+variable `IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1`, and the ranges, the metadata
+addresses that stay refused even then, and the three call sites that grade
+differently are in the
+[MCP and network egress guide](mcp-and-network.md#the-local-address-floor-0740).
 
 The rest of egress — MCP servers, the shape of a `Act::Net` refusal, and what
 the policy does *not* govern once a stdio server is running — is in the

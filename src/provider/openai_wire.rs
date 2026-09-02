@@ -465,6 +465,13 @@ fn cached_user(flavor: WebFlavor, request: &CompletionRequest) -> Option<serde_j
 /// Un-parseable `data:` lines are skipped, as a robust SSE reader should — but a
 /// stream where *every* line was skipped is a failure, not an empty answer, so
 /// the result goes through [`ensure_parsed`].
+///
+/// What the response may accumulate is drawn against one [`super::Budget`], the
+/// same one Anthropic's accumulator draws against and with the same refusal:
+/// past the bound the stream is abandoned rather than truncated. Every provider
+/// on this wire — [`OpenAI`](crate::OpenAI), [`OpenRouter`](crate::OpenRouter)
+/// and every [`Compatible`](crate::Compatible) endpoint, presets included —
+/// parses here, so this is where the bound has to be for them to have it.
 pub(crate) async fn parse_stream_with(
     resp: reqwest::Response,
     sent: std::time::Instant,
@@ -487,9 +494,14 @@ pub(crate) async fn parse_stream_with(
             // about the accumulated state rather than about this chunk.
             acc.announce(on_call);
         }
-        false
+        // 0.74.0 — a stream that has already asked for more than one response
+        // may accumulate is stopped here rather than read to its end.
+        acc.budget.spent()
     })
     .await?;
+    if acc.budget.spent() {
+        return Err(super::over_budget());
+    }
     ensure_parsed(acc.finish())
 }
 
@@ -535,6 +547,11 @@ struct Accumulator {
     vendor: String,
     citations: Vec<crate::web::Citation>,
     server_tools: Vec<crate::web::ServerToolCall>,
+    /// 0.74.0 — what this one response is allowed to accumulate. Every `String`
+    /// and every row below grows with bytes the endpoint chose, and until this
+    /// existed the only bound on any of them was the request deadline. See
+    /// [`super::MAX_RESPONSE_BYTES`].
+    budget: super::Budget,
 }
 
 impl Accumulator {
@@ -596,7 +613,9 @@ impl Accumulator {
                 .pointer(&format!("/choices/0/delta/{key}"))
                 .and_then(|v| v.as_str())
             {
-                self.reasoning.push_str(r);
+                if self.budget.take(r.len()) {
+                    self.reasoning.push_str(r);
+                }
             }
         }
 
@@ -639,11 +658,18 @@ impl Accumulator {
                         .map(str::to_string)
                 })
                 .unwrap_or_else(|| "unknown".into());
-            self.server_tools.push(crate::web::ServerToolCall::failed(
-                &self.vendor,
-                "web_search",
-                code,
-            ));
+            // 0.74.0 — one row per chunk carrying an error object, and the chunk
+            // count is the sender's, so a row is drawn for rather than free.
+            if self
+                .budget
+                .take(super::ROW_BYTES + "web_search".len() + code.len())
+            {
+                self.server_tools.push(crate::web::ServerToolCall::failed(
+                    &self.vendor,
+                    "web_search",
+                    code,
+                ));
+            }
         }
 
         let Some(delta) = value.pointer("/choices/0/delta") else {
@@ -659,21 +685,39 @@ impl Accumulator {
 
         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
             self.mark_first_token();
-            self.text.push_str(content);
+            if self.budget.take(content.len()) {
+                self.text.push_str(content);
+            }
         }
 
         if let Some(calls) = delta.get("tool_calls").and_then(|c| c.as_array()) {
             self.mark_first_token();
             for call in calls {
+                // 0.74.0 — the index is the sender's, so the map keyed on it is
+                // opened through `call_entry`, which is where the cardinality
+                // bound lives for both wire formats.
                 let index = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
-                let entry = self.tool_calls.entry(index).or_default();
-                if let Some(name) = call.pointer("/function/name").and_then(|n| n.as_str()) {
-                    if !name.is_empty() {
-                        entry.0 = name.to_string();
+                if let Some(name) = call
+                    .pointer("/function/name")
+                    .and_then(|n| n.as_str())
+                    .filter(|n| !n.is_empty())
+                {
+                    if self.budget.take(name.len()) {
+                        if let Some(entry) =
+                            super::call_entry(&mut self.tool_calls, index, &mut self.budget)
+                        {
+                            entry.0 = name.to_string();
+                        }
                     }
                 }
                 if let Some(args) = call.pointer("/function/arguments").and_then(|a| a.as_str()) {
-                    entry.1.push_str(args);
+                    if self.budget.take(args.len()) {
+                        if let Some(entry) =
+                            super::call_entry(&mut self.tool_calls, index, &mut self.budget)
+                        {
+                            entry.1.push_str(args);
+                        }
+                    }
                 }
             }
         }
@@ -711,9 +755,23 @@ impl Accumulator {
         };
         // One page is one source however many sentences cite it — and a later
         // mention still fills in a title or a quote the first one lacked.
+        // ponytail: the dedupe is a linear scan, so the list is quadratic in the
+        // citations one answer carries. Bounded now by the budget below rather
+        // than by the deadline; a set keyed on the url is the upgrade path if a
+        // real answer ever cites enough sources for it to show.
         if let Some(seen) = self.citations.iter_mut().find(|c| c.url == found.url) {
             seen.title = seen.title.take().or(found.title);
             seen.cited_text = seen.cited_text.take().or(found.cited_text);
+            return;
+        }
+        // 0.74.0 — a new source is a new row, drawn for on the same budget as
+        // the text. Only the new one: enriching the row above allocates nothing
+        // its first mention did not already pay for.
+        let cost = super::ROW_BYTES
+            + found.url.len()
+            + found.title.as_ref().map_or(0, String::len)
+            + found.cited_text.as_ref().map_or(0, String::len);
+        if !self.budget.take(cost) {
             return;
         }
         self.citations.push(found);
@@ -1726,5 +1784,163 @@ mod media_wire {
             content[2]["image_url"]["url"],
             "data:image/webp;base64,Ag=="
         );
+    }
+}
+
+/// M13 — what one response on the OpenAI wire may make this process allocate.
+///
+/// Here rather than in `tests/` for the reason the Anthropic half is: the
+/// accumulator is private and the endpoint override is crate-internal. This is
+/// the wire `OpenAI`, `OpenRouter` and every `Compatible` endpoint stream
+/// through, so it is three providers plus every vendor preset, not one.
+#[cfg(test)]
+mod bounds {
+    use super::*;
+    use crate::provider::failures::{serve, stream_response};
+    use crate::provider::{MAX_RESPONSE_BYTES, MAX_TOOL_CALL_BLOCKS};
+    use crate::{Compatible, Error, Provider};
+    use std::time::Duration;
+
+    fn request() -> CompletionRequest {
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+        CompletionRequest {
+            system: "s".into(),
+            user: "u".into(),
+            ..Default::default()
+        }
+    }
+
+    /// One content delta carrying `bytes` bytes of text.
+    ///
+    /// Half a mebibyte per event, so each line stays well under
+    /// [`crate::provider::MAX_SSE_LINE_BYTES`] and it is the *accumulation* bound
+    /// this drives rather than that one — two bounds that pass for each other
+    /// prove neither.
+    fn text_event(bytes: usize) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "delta": { "content": "x".repeat(bytes) } }] })
+        )
+    }
+
+    #[tokio::test]
+    async fn m13_a_stream_past_the_accumulation_bound_is_refused_not_truncated() {
+        const CHUNK: usize = 512 * 1024;
+        let events: String = std::iter::repeat_with(|| text_event(CHUNK))
+            .take(MAX_RESPONSE_BYTES / CHUNK + 1)
+            .collect();
+        let url = serve(stream_response(&format!("{events}data: [DONE]\n\n")));
+
+        // Through 0.74.0's first cut this was a *successful* completion carrying
+        // eight and a half mebibytes of text: the bound landed on the Anthropic
+        // accumulator and on the SSE line, and this wire — the one behind every
+        // vendor preset — never drew against it at all.
+        let err = Compatible::at(&url, Duration::from_secs(30))
+            .complete(request())
+            .await
+            .unwrap_err();
+        let Error::Provider { kind, message, .. } = &err else {
+            panic!("expected a provider error, got {err:?}");
+        };
+        assert_eq!(*kind, crate::error::ProviderErrorKind::Malformed);
+        assert!(message.contains("accumulate"), "{message}");
+    }
+
+    /// One `tool_calls` delta, wrapped in the choice/delta envelope every chunk
+    /// on this wire carries.
+    fn call_event(delta: serde_json::Value) -> String {
+        let chunk = json!({ "choices": [{ "delta": { "tool_calls": [delta] } }] });
+        format!("data: {chunk}\n\n")
+    }
+
+    /// The companion. A cap that refused everything would pass the test above
+    /// while breaking every real answer, so an ordinary streamed completion —
+    /// text, several tool calls, each one's arguments split across deltas the
+    /// way a vendor actually sends them — must still arrive whole.
+    #[tokio::test]
+    async fn m13_an_ordinary_streamed_completion_still_accumulates_every_tool_call() {
+        let mut events = String::new();
+        events.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"reading\"}}]}\n\n");
+        let calls = [
+            ("read_file", r#"{"path":"#, r#""a.rs"}"#),
+            ("read_file", r#"{"path":"#, r#""b.rs"}"#),
+            ("grep", r#"{"pattern":"#, r#""fn main"}"#),
+        ];
+        for (index, (name, head, tail)) in calls.into_iter().enumerate() {
+            // The name first, then the arguments in two fragments, each on its
+            // own event: three deltas for one call, as the wire sends it.
+            let open = json!({ "index": index, "function": { "name": name } });
+            events.push_str(&call_event(open));
+            for fragment in [head, tail] {
+                let more = json!({ "index": index, "function": { "arguments": fragment } });
+                events.push_str(&call_event(more));
+            }
+        }
+        events.push_str("data: [DONE]\n\n");
+
+        let out = Compatible::at(serve(stream_response(&events)), Duration::from_secs(30))
+            .complete(request())
+            .await
+            .unwrap();
+        assert_eq!(out.text.as_deref(), Some("reading"));
+        let calls: Vec<_> = out
+            .tool_calls
+            .iter()
+            .map(|c| (c.name.as_str(), c.arguments.clone()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("read_file", json!({"path": "a.rs"})),
+                ("read_file", json!({"path": "b.rs"})),
+                ("grep", json!({"pattern": "fn main"})),
+            ]
+        );
+    }
+
+    #[test]
+    fn m13_a_response_cannot_open_unbounded_tool_call_blocks() {
+        // The cheaper door onto the same exhaustion, and the one the byte bound
+        // above can never see: the index is the sender's `u64`, so a stream of
+        // near-empty deltas grew the map with whatever arrived while every line
+        // stayed far under the SSE cap.
+        let mut acc = Accumulator::default();
+        for index in 0..=MAX_TOOL_CALL_BLOCKS as u64 {
+            let delta = json!({ "index": index, "function": { "arguments": "" } });
+            acc.ingest(&json!({ "choices": [{ "delta": { "tool_calls": [delta] } }] }));
+        }
+        assert!(acc.budget.spent(), "the cardinality bound must be reached");
+        assert_eq!(acc.tool_calls.len(), MAX_TOOL_CALL_BLOCKS);
+    }
+
+    #[test]
+    fn m13_a_row_the_sender_repeats_is_drawn_for_rather_than_free() {
+        // The third door. A `Vec` push is not a `String` append, so a row whose
+        // fields are empty costs heap that a byte count alone scores as nothing
+        // — which is what `ROW_BYTES` is for. An `error` object inside a 200
+        // leaves one row per chunk and the chunk count is the sender's.
+        let chunk = json!({ "error": { "code": "e" } });
+        let mut acc = Accumulator::default();
+        for _ in 0..MAX_RESPONSE_BYTES / crate::provider::ROW_BYTES + 1 {
+            acc.ingest(&chunk);
+        }
+        assert!(acc.budget.spent(), "an empty row is not free");
+    }
+
+    #[test]
+    fn m13_the_rows_a_real_answer_carries_all_still_land() {
+        // The companion to the row bound: a few sources and one failed search is
+        // what a real answer looks like, and a bound that refused those would
+        // pass the test above while breaking every cited answer.
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({ "error": { "code": "search_unavailable" } }));
+        for n in 0..3 {
+            let url = format!("https://e/{n}");
+            let cite = json!({ "type": "url_citation", "url_citation": { "url": url } });
+            acc.ingest(&json!({ "choices": [{ "delta": { "annotations": [cite] } }] }));
+        }
+        assert!(!acc.budget.spent());
+        assert_eq!(acc.citations.len(), 3);
+        assert_eq!(acc.server_tools.len(), 2, "the failure, and one search");
     }
 }

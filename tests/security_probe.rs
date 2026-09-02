@@ -49,7 +49,7 @@ fn outside_dir() -> Option<PathBuf> {
 #[tokio::test]
 async fn probe_measures_this_hosts_backend_and_the_claims_follow_the_measurement() {
     let config = SandboxConfig::new();
-    let probe = BoundaryProbe::measure(&config, &[]).await;
+    let probe = BoundaryProbe::measure(&config, &[], None).await;
     eprintln!("probe: {}", probe.trace_label());
 
     assert_eq!(probe.backend, select(&config).backend());
@@ -115,10 +115,16 @@ fn probe_that_could_not_run_never_claims_a_boundary() {
         assert!(!unmeasured.contradicts_claim());
         assert!(unmeasured.trace_label().contains("unmeasured"));
 
+        // A run that asked its backend for both boundaries, so there is a claim
+        // here for the measurement to contradict. The claims are the run's, not
+        // the backend's — see the two tests below for the configurations that
+        // make no claim at all and must therefore contradict nothing.
         let failed = BoundaryProbe {
             backend,
             write_refused: Some(false),
             dial_refused: Some(false),
+            claimed_confinement: backend.confines_writes(),
+            claimed_egress_denial: backend.denies_egress(),
         };
         assert!(
             !failed.confines_writes() && !failed.denies_egress(),
@@ -155,12 +161,12 @@ async fn breaking_a_backends_confinement_makes_the_probe_fail_and_the_claim_drop
         eprintln!("skipped: no home directory to aim the probe at on this host");
         return;
     };
-    let baseline = BoundaryProbe::measure(&SandboxConfig::new(), &[]).await;
+    let baseline = BoundaryProbe::measure(&SandboxConfig::new(), &[], None).await;
 
     let mut sabotaged_config = SandboxConfig::new();
     sabotaged_config.allow_network = true;
     let roots = vec![outside];
-    let sabotaged = BoundaryProbe::measure(&sabotaged_config, &roots).await;
+    let sabotaged = BoundaryProbe::measure(&sabotaged_config, &roots, None).await;
     eprintln!(
         "baseline: {} / sabotaged: {}",
         baseline.trace_label(),
@@ -316,7 +322,7 @@ async fn l12_copy_back_refuses_a_symlinked_source() {
 #[tokio::test]
 async fn probe_reports_full_access_as_the_absence_of_a_boundary() {
     let config = SandboxConfig::new().with_mode(ExecMode::FullAccess);
-    let probe = BoundaryProbe::measure(&config, &[]).await;
+    let probe = BoundaryProbe::measure(&config, &[], None).await;
     assert_eq!(probe.write_refused, Some(false));
     assert_eq!(probe.dial_refused, Some(false));
     assert!(!probe.confines_writes() && !probe.denies_egress());
@@ -498,7 +504,7 @@ async fn a_full_access_run_makes_no_claim_so_it_records_no_probe() {
 async fn n5_the_startup_probe_cost() {
     let config = SandboxConfig::new();
     let started = std::time::Instant::now();
-    let probe = BoundaryProbe::measure(&config, &[]).await;
+    let probe = BoundaryProbe::measure(&config, &[], None).await;
     let elapsed = started.elapsed();
     eprintln!(
         "probe cost: {:?} ({}), backend {}",
@@ -509,4 +515,87 @@ async fn n5_the_startup_probe_cost() {
     // Named so the reader knows what the number covers: one uncontained control
     // child and one contained child per arm.
     eprintln!("method: one control spawn + one contained spawn per measured arm");
+}
+
+/// **A run that asked for no containment contradicts nothing** (0.74.0).
+///
+/// `select` reads the platform, not the mode: a [`FullAccess`](ExecMode::FullAccess)
+/// run on macOS still resolves to `MacosSandboxExec`, and on Linux to a native
+/// rung, each of whose `confines_writes()` is `true`. The command is then wrapped
+/// in nothing, so the probe correctly records that a write outside the boundary
+/// landed.
+///
+/// Holding that measurement against the *backend's* declaration reported every
+/// `FullAccess` run on those platforms as a host that had failed to apply an
+/// isolation nobody requested — the release's own "the backend lied" warning,
+/// firing on the one configuration that promises the least. `contradicts_claim`
+/// compares against **the run's** claim for exactly this reason.
+///
+/// The second assertion is what stops this being vacuous: on a platform whose
+/// selected backend declares confinement, the old comparison genuinely would have
+/// fired here, so the test has something to catch.
+#[tokio::test]
+async fn a_full_access_run_claims_nothing_and_so_contradicts_nothing() {
+    let mut config = SandboxConfig::new();
+    config.mode = ExecMode::FullAccess;
+    let probe = BoundaryProbe::measure(&config, &[], None).await;
+    eprintln!("full-access probe: {}", probe.trace_label());
+
+    assert!(
+        !probe.confines_writes() && !probe.denies_egress(),
+        "an unwrapped run claimed a boundary: {}",
+        probe.trace_label()
+    );
+    assert!(
+        !probe.contradicts_claim(),
+        "a run that asked for no containment was reported as a backend that lied: {}",
+        probe.trace_label()
+    );
+    assert!(
+        !probe.claimed_confinement && !probe.claimed_egress_denial,
+        "an unwrapped run recorded a claim it never made: {}",
+        probe.trace_label()
+    );
+    if select(&config).backend().confines_writes() {
+        eprintln!(
+            "non-vacuous here: {} declares confinement, so the backend-level \
+             comparison would have fired",
+            select(&config).backend().as_str()
+        );
+    }
+}
+
+/// **A run that permits network is not contradicted by a dial that lands**
+/// (0.74.0).
+///
+/// [`Backend::denies_egress`] is unconditional — it says what the backend is built
+/// to apply, and every native backend answers `true`. The dial arm runs the child
+/// with the run's own egress answer, so on a run that allows network the
+/// connection is *supposed* to succeed. Comparing the two fired the warning on
+/// every network-allowed run on macOS, on Linux and inside an AppContainer.
+///
+/// Asserted as a negative so it holds on every host: no configuration that permits
+/// egress may be reported as a boundary that failed to deny it. The arm is left
+/// unmeasured on a host with no probe tool, and `None` contradicts nothing either,
+/// so the test is honest rather than skipped.
+#[tokio::test]
+async fn a_run_that_permits_network_is_not_reported_as_a_failed_egress_denial() {
+    let mut config = SandboxConfig::new();
+    config.allow_network = true;
+    let probe = BoundaryProbe::measure(&config, &[], None).await;
+    eprintln!("network-allowed probe: {}", probe.trace_label());
+
+    assert!(
+        !probe.claimed_egress_denial,
+        "a run that permits network claimed to deny egress: {}",
+        probe.trace_label()
+    );
+    assert!(
+        !probe.contradicts_claim() || probe.write_refused == Some(false),
+        "a permitted dial was reported as a backend that failed to deny egress: {}",
+        probe.trace_label()
+    );
+    // And the measurement itself is still recorded honestly: the arm says what
+    // happened, it is only the *claim* that was never made.
+    assert_eq!(probe.denies_egress(), probe.dial_refused == Some(true));
 }

@@ -417,6 +417,34 @@ impl NavGate {
     /// `Ask` counts as **not permitted** here, following 0.40.0's rule for
     /// `Act::Net`: there is nobody to ask inside a paused request, and a
     /// navigation is not undoable once the bytes are in the page.
+    ///
+    /// # The floor here is name-only, and that is a stated limit
+    ///
+    /// Every other net decision in the crate resolves its target and grades the
+    /// addresses that came back ([`crate::net::NetGuard::check`]). This one
+    /// cannot, and saying why is worth more than a check that looks like the
+    /// others:
+    ///
+    /// - **Resolving here would not bind the dial.** Chrome resolves every URL
+    ///   itself. The addresses this gate graded and the address the browser
+    ///   connected to would be two answers to the same question, and a name whose
+    ///   owner answers differently the second time is the whole of the attack.
+    ///   Pinning the navigation to an address instead means rewriting the URL's
+    ///   host, which breaks SNI and certificate validation for every `https://`
+    ///   page — a fix that trades a real guarantee for the appearance of one.
+    /// - **What it would cost is real.** A resolver on this path refuses every
+    ///   name that does not resolve *from this process*, at the moment the request
+    ///   is paused.
+    ///
+    /// So a hostname is graded by name only, and
+    /// `browser_navigate("http://169.254.169.254.nip.io/")` reaches cloud
+    /// metadata under a policy that allows every host — `nip.io` answers
+    /// `<anything>.<ip>` with that address, so the attack needs no infrastructure.
+    /// The way to close it is to route the browser through the run's egress proxy
+    /// unconditionally: the proxy already resolves once, grades, and dials exactly
+    /// the addresses it graded, and Chrome behind `--proxy-server` does not
+    /// resolve at all. Today that proxy exists only for a *contained* run whose
+    /// policy names hosts, which `Policy::permissive()` does not.
     pub(crate) fn permits(&self, url: &str) -> bool {
         // 0.74.0, audit H6 — a URL with no host used to return `true` here and
         // record nothing, on the reasoning that a URL reaching no network is not
@@ -441,16 +469,30 @@ impl NavGate {
         // still reached cloud metadata. `browser_navigate` is one of the three
         // sites the finding names, so a fix that closed the other two and left
         // this one would have closed the finding on paper only.
-        let permitted = verdict.effect == Effect::Allow
-            && crate::net::floor_target(&target, crate::net::LocalNet::configured()).is_ok();
+        //
+        // Name-only, for the reasons this method's own docs give. Every literal
+        // spelling of a local address is refused; a *name* that resolves onto one
+        // is not, and that gap is stated rather than papered over.
+        let floored = (verdict.effect == Effect::Allow)
+            .then(|| crate::net::floor_target(&target, crate::net::LocalNet::configured()).err())
+            .flatten();
+        let permitted = verdict.effect == Effect::Allow && floored.is_none();
+        // The floor's own rule and layer when the floor decided, so a row reads
+        // "the floor underneath your rules refused this" rather than naming the
+        // glob that allowed it. Until this release a floored navigation was
+        // recorded with the *permitting* rule beside `permitted: false`.
+        let (rule, layer) = match floored {
+            Some(crate::error::Error::Refused { rule, layer, .. }) => (rule, layer),
+            _ => (verdict.rule, verdict.layer),
+        };
         self.decisions
             .lock()
             .expect("navigation decisions are not poisoned")
             .push(Decision {
                 target,
                 permitted,
-                rule: verdict.rule,
-                layer: verdict.layer,
+                rule,
+                layer,
             });
         permitted
     }
@@ -534,11 +576,19 @@ pub(crate) fn scheme_label(url: &str) -> String {
 /// Written by hand because this crate parses no URLs and adding a dependency to
 /// do it would cost more than the twenty lines. Only the authority is needed: the
 /// policy matches on host and optional port, and never on a path.
+///
+/// The authority ends at `\` as well as at `/`, `?` and `#`, because Chrome's own
+/// GURL — the parser that decides what this browser actually dials — treats a
+/// backslash as a path separator for every scheme reduced here. Reading it as
+/// part of the host made `http://127.0.0.1:11434\@example.com/` decide about
+/// `example.com:80` while the browser went to the loopback endpoint before the
+/// backslash. The same fix is in [`crate::net::target`]; the two parsers agree
+/// because they must, and `tests/security_browser.rs` says so at the gate.
 pub(crate) fn target_of(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let scheme = scheme.to_ascii_lowercase();
     let authority = rest
-        .split(['/', '?', '#'])
+        .split(['/', '?', '#', '\\'])
         .next()
         .filter(|a| !a.is_empty())?;
     // Credentials in a URL are not part of the host the policy decides about.
@@ -1762,10 +1812,56 @@ mod tests {
             target_of("http://user:pw@example.com/x"),
             Some("example.com:80".into())
         );
+        // A backslash ends the authority, as it does in Chrome's own GURL. Until
+        // 0.74.0's review this decided about `example.com:80` while the browser
+        // went to the loopback endpoint in front of the backslash.
+        assert_eq!(
+            target_of("http://127.0.0.1:11434\\@example.com/v1"),
+            Some("127.0.0.1:11434".into())
+        );
+        assert_eq!(
+            target_of("https://[::1]\\@example.com/v1"),
+            Some("[::1]:443".into())
+        );
         // A URL that reaches no host is not a network decision.
         assert_eq!(target_of("about:blank"), None);
         assert_eq!(target_of("data:text/html,<h1>hi</h1>"), None);
         assert_eq!(target_of("file:///etc/passwd"), None);
+    }
+
+    /// The floor, at the gate that never went through `NetGuard`.
+    ///
+    /// Every literal spelling of a local address is refused under a policy that
+    /// allows every host, and the row says the floor decided rather than naming
+    /// the glob that allowed it. A *name* that resolves onto one of these is not
+    /// refused — see `NavGate::permits` for why that limit is stated rather than
+    /// closed here.
+    #[test]
+    fn a_local_address_is_refused_at_the_navigation_gate_and_the_row_names_the_floor() {
+        let gate = NavGate::new(Policy::permissive());
+        for url in [
+            "http://127.0.0.1:8080/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://10.0.0.1/",
+            "http://[::1]:8080/",
+            "http://metadata.google.internal/",
+            "http://localhost:11434/",
+            // The authority-confusion shape: checked as `example.com:80` and
+            // navigated to the loopback endpoint, until the backslash ended the
+            // authority.
+            "http://127.0.0.1:11434\\@example.com/v1",
+        ] {
+            assert!(!gate.permits(url), "{url}");
+        }
+        for d in gate.drain() {
+            assert!(!d.permitted, "{d:?}");
+            assert_eq!(d.layer.as_deref(), Some("local-address floor"), "{d:?}");
+        }
+        // The control: an ordinary routable host is still permitted, and no
+        // resolver was consulted for any of this.
+        let gate = NavGate::new(Policy::permissive());
+        assert!(gate.permits("https://93.184.216.34/page"));
     }
 
     #[test]

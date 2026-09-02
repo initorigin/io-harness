@@ -253,11 +253,17 @@ makes it a number that does not move, which is what a refusal a run's behaviour
 turns on has to be. Both ceilings apply to every read, and the refusal names the
 one that bit.
 
-It is one of four keys a project-scoped `io.toml` may only **lower** — the other
-three are the `[memory]` caps below. The keys a cloned repository may not widen
-are otherwise refused by their widening value (`exec = "allow"`); a number has no
-such value, so the smaller of the two wins instead. `io.local.toml` and the
-user-scope file set them outright.
+It is one of five keys a project-scoped `io.toml` may only **lower** — the others
+are `run.max_wait_secs` and the three `[memory]` caps below. The keys a cloned
+repository may not widen are otherwise refused by their widening value
+(`exec = "allow"`); a number has no such value, so the smaller of the two wins
+instead. `io.local.toml` and the user-scope file set them outright — and that is
+the asymmetry to know about, because 0.74.0 went the other way for the refusals:
+`io.local.toml` is held to every refused key and every refused section, and is
+*not* held to this lower-only rule. A number written there still overrides yours.
+The two rules answer different questions — a number a workspace file lowers is a
+ceiling an operator still chose, where a section a workspace file declares is a
+program an operator never saw.
 
 ## `[memory]` — what a workspace's durable notes may hold
 
@@ -604,9 +610,14 @@ allowed_domains = ["docs.rs"]          # empty means the vendor's default: anywh
 blocked_domains = ["evil.test"]        # empty means no block-list
 ```
 
-The table lands on the same `WebAccess` the programmatic builder produces, and it
-merges key by key like any other table: a local scope writing `search = false`
-switches it off without dropping the project's `max_uses` or domain lists.
+**The table is refused in both workspace files since 0.74.0**, so the only file
+that may carry it is the user-scope one — see
+[the trust rule](#a-file-inside-the-workspace-may-narrow-and-may-never-widen-0270).
+That takes the merge with it in practice: there is one scope left to write the
+table, so it lands on the same `WebAccess` the programmatic builder produces
+rather than being assembled key by key from two files. A caller that wants
+per-project web access sets it on the `TaskContract` in Rust, which is where the
+decision is the application's rather than the repository's.
 
 Nothing here is on by default, and writing the table is not the same as switching
 it on — a file that carries `[web]` with `search = false` has stated a decision,
@@ -724,24 +735,53 @@ this is a narrower print rather than a blank one. And it is `Debug` alone:
 
 `io.toml` is committed. It travels with a `git clone`, and until 0.27.0 a cloned
 repository's file could switch off the parts of the boundary that stop it mattering.
-Five keys are therefore refused, and only when the value written is the one that
+Twelve keys are therefore refused, and only when the value written is one that
 widens:
 
-| Key | Refused when it says | Still legal |
-| --- | --- | --- |
-| `policy.defaults.exec` | `"allow"` | `"ask"`, `"deny"` |
-| `policy.defaults.net` | `"allow"` | `"ask"`, `"deny"` |
-| `sandbox.allow_network` | `true` | `false` |
-| `sandbox.force_floor` | `false` | `true` |
-| `sandbox.mode` | `"full-access"` | `"read-only"`, `"workspace-write"` |
+| Key | Refused when it says | Still legal | Since |
+| --- | --- | --- | --- |
+| `policy.defaults.read` | `"allow"` | `"ask"`, `"deny"` | 0.74.0 |
+| `policy.defaults.write` | `"allow"` | `"ask"`, `"deny"` | 0.74.0 |
+| `policy.defaults.exec` | `"allow"` | `"ask"`, `"deny"` | 0.27.0 |
+| `policy.defaults.net` | `"allow"` | `"ask"`, `"deny"` | 0.27.0 |
+| `sandbox.allow_network` | `true` | `false` | 0.27.0 |
+| `sandbox.force_floor` | `false` | `true` | 0.27.0 |
+| `sandbox.mode` | `"full-access"`, `"workspace-write"` | `"read-only"` | 0.46.0, `"workspace-write"` 0.74.0 |
+| `sandbox.limits.max_cpu_secs` | `0` | any other number | 0.74.0 |
+| `sandbox.limits.max_wall_secs` | `0` | any other number | 0.74.0 |
+| `sandbox.limits.max_memory_bytes` | `0` | any other number | 0.74.0 |
+| `sandbox.limits.max_processes` | `0` | any other number | 0.74.0 |
+| `sandbox.limits.max_open_files` | `0` | any other number | 0.74.0 |
 
 Value-dependent rather than key-dependent, deliberately: a project file *denying*
 `exec` is exactly what the scope is for, and a rule that refused the key outright
 would forbid the good half to stop the bad one.
 
-**Five whole sections are refused as well**, and they implement one sentence rather
-than a list: *anything that names a program to run, or names an endpoint a
-credential is sent to, may not be declared by a file inside the workspace.*
+The five keys 0.74.0 added to the top of that table, and the two values it added
+beside them, were each a hole rather than an oversight, and each is worth reading
+once:
+
+- **`read` and `write` were missing.** The shipped defaults are `read = "allow"`
+  and `write = "ask"`, a later scope *overrides* an earlier one, and the project
+  scope outranks the user scope in the merge — so a cloned `io.toml` writing
+  `write = "allow"` turned every unmatched write from a question the approver
+  answers into a silent grant, whatever the operator had written in their own file.
+- **`sandbox.mode = "workspace-write"` is refused as well as `"full-access"`.**
+  The merge lets a project file *replace* the user scope's value, so
+  `workspace-write` written in a workspace file raised an operator's own
+  `read-only` back to the crate's own default. `read-only` is the one value that
+  narrows in every direction, and it is the one that stays legal — which is all the
+  scope needs, since `workspace-write` is what a file saying nothing already gets.
+- **`0` in a `[sandbox.limits]` key means *no cap*.** Each of the five written as
+  zero in a cloned file removes a wall the operator put up. Only the categorical
+  value is refused: a merely large finite cap is still a cap, and refusing one
+  would need the user scope's number, which a check that reads one file at a time
+  does not have.
+
+**Six whole sections are refused as well**, and they implement one sentence rather
+than a list: *anything that names a program to run, names an endpoint a credential
+is sent to, or opens a route out of the boundary the `Policy` does not gate, may
+not be declared by a file inside the workspace.*
 
 | Section | Since | Why it is on the list |
 | --- | --- | --- |
@@ -750,6 +790,20 @@ credential is sent to, may not be declared by a file inside the workspace.*
 | `[[provider]]` | 0.74.0 | names the endpoint this run's credential is sent to, contacted before the first step |
 | `[[mcp]]` | 0.74.0 | a command, an argv and an environment this process spawns at run start |
 | `[[lsp]]` | 0.74.0 | the same, by another name |
+| `[web]` | 0.74.0 | a provider-executed search or fetch is dialled by the provider, so `Act::Net` never sees it and no sandbox is on the path |
+
+`[web]` is the entry the sentence does not read out word for word, and it is the
+third clause's reason for existing. The provider dials the URL, so the run's egress
+proxy is not on the path and the domain lists beside it are a filter this crate
+*states* rather than enforces — a workspace file writing `[web] search = true` is
+therefore switching on an egress surface no rung of this crate mediates, and
+`fetch = true` beside it lets the model be pointed at a URL, which is a repository
+choosing where the run's context may be sent. `sandbox.allow_network = true` is a
+refused *key* for re-opening egress inside the sandbox; this opens one outside it
+entirely. The cost is stated rather than hidden: `[web] search = false` is a
+narrowing sentence and a workspace file can no longer write it either. The feature
+is off unless the user scope turns it on, so there is nothing for that narrowing to
+narrow that the operator did not choose from outside the workspace.
 
 A section is refused **whole** rather than by its hazardous key — the 0.28.0
 argument about `[[hook]]`'s `run`/`append` pair, generalised. A rule that permits
@@ -760,6 +814,37 @@ somebody thought of it in time. What names neither a program nor a credentialled
 endpoint stays legal, which is what keeps the scope worth having: `[policy]`,
 `[[agent]]`, `[run]`, `[[plugin]]` and the rest still let a repository narrow a
 boundary from its own committed file.
+
+**A `[[policy.layers]]` in a workspace file may carry `deny` rules and nothing
+else (0.74.0).** `[policy]` is not a refused section — a repository narrowing its
+own boundary from its own committed file is what the scope is for — but a layer
+reached the widening keys' destination by a different door. Layers are appended to
+the shipped defaults with no effect filter, `Policy::explain` resolves deny → ask →
+allow across the whole stack, and the default contributes no `Act::Exec` or
+`Act::Net` deny for an allow to lose to. So
+
+```toml
+# Refused in `io.toml` and in `io.local.toml` since 0.74.0.
+[[policy.layers]]
+name = "ci-tools"
+rules = [{ act = "exec", effect = "allow", pattern = "*" }]
+```
+
+was `policy.defaults.exec = "allow"` written five lines away from where that is
+refused — and the `net` spelling of it also switched the sandbox's own
+`allow_network` back on, because every spawn site resolves that flag from the
+policy rather than from `[sandbox]`. The key on the list was not the key that
+decided.
+
+An **`ask` rule is refused too**, not only an `allow`: an ask hands capability out
+as well, since it converts an act the operator's own default *denied* into one an
+approver is asked to wave through. A rule whose `effect` is missing or is not a
+string is refused on the same reading — the question is "is this the word `deny`",
+and the answer for anything else is no. The refusal names the layer, the effect,
+the act and the pattern. This is the rule a `plugin.toml` has been held to since
+0.35.0, and that file is the *more* trusted of the two; an `io.toml` arriving with
+a clone getting the looser treatment was the asymmetry 0.74.0 removed. Write an
+allow layer in the user-scope file.
 
 **`run.skills` and `run.templates` may not leave the workspace root** in either
 workspace file (0.74.0). Both are resolved by joining onto the discovery root,
@@ -794,10 +879,21 @@ the whole reason the scope exists. A widening key or a refused section hidden in
 only looked at the base would let it reach the same place by a different path.
 
 **What this does not claim.** Not that a cloned repository is safe. `[toolchain]`
-still names an argv, a `[[policy.layers]]` entry can still allow what the defaults
-did not, and `${cmd:...}` is refused in `io.toml` and not in `io.local.toml`. This
-is a specific narrowing of specific hazards, and it is the file half of a boundary
-whose enforcing half is still the `Policy` you loaded.
+still names an argv the embedding application may act on, `[instructions]` still
+puts the repository's own prose in front of the model, and a workspace file may
+still declare a `[[plugin]]` — what a bundle it names may *contribute* is bounded
+(see [Capability bundles](plugins.md)), not the naming. This is a specific
+narrowing of specific hazards, and it is the file half of a boundary whose
+enforcing half is still the `Policy` you loaded.
+
+**And it does not claim there is a key for everything.** The address floor under
+every network decision (0.74.0) is lifted by the environment variable
+`IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1` and by nothing in this file, deliberately: a
+config key that widens is one a cloned repository could set, and the environment of
+a process that has already started is the one thing a workspace cannot write. If
+you are looking for `net.allow_local_addresses`, it does not exist and is not
+coming — see
+[the local-address floor](mcp-and-network.md#the-local-address-floor-0740).
 
 ## An unknown key is an error
 
@@ -867,8 +963,9 @@ ending, so it cannot be the last word. Treat a workspace whose instructions file
 you have not read the way you would treat any other text a stranger wrote into
 your prompt.
 
-**A project file may narrow and never widen, and that is all it does.** See the
-section above for the four keys, and for the sentence it is not.
+**A file inside the workspace may narrow and never widen, and that is all it
+does.** See the section above for the twelve keys, the six sections, the
+deny-only rule on a `[[policy.layers]]`, and for the sentence it is not.
 
 **An origin reports the merge and does not take part in it.** `Config::origin`
 changed what a caller can *see* about a resolution in 0.30.0 and changed no

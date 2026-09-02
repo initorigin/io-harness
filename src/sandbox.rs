@@ -1226,7 +1226,8 @@ impl Sandbox for FloorSandbox {
 /// use io_harness::sandbox::{BoundaryProbe, SandboxConfig};
 ///
 /// # async fn demo() {
-/// let probe = BoundaryProbe::measure(&SandboxConfig::new(), &[]).await;
+/// // No extra writable roots, and no egress proxy on this run.
+/// let probe = BoundaryProbe::measure(&SandboxConfig::new(), &[], None).await;
 /// if probe.contradicts_claim() {
 ///     // The backend named an isolation this host did not deliver. The run is
 ///     // told what was measured, not what was advertised.
@@ -1258,6 +1259,22 @@ pub struct BoundaryProbe {
     /// [`WindowsAppContainer`](Backend::WindowsAppContainer)) a refusal would say
     /// nothing about egress, so the arm is left unmeasured rather than answered.
     pub dial_refused: Option<bool>,
+    /// Did **this run** ask its backend to confine writes?
+    ///
+    /// [`Backend::confines_writes`] answers for the backend; this answers for the
+    /// run, and [`contradicts_claim`](BoundaryProbe::contradicts_claim) needs the
+    /// second one. A [`FullAccess`](ExecMode::FullAccess) run on macOS selects
+    /// `MacosSandboxExec` — `select` reads the platform, not the mode — and then
+    /// wraps nothing, so the backend's own answer is `true` while the run made no
+    /// claim at all. Comparing the measurement against the backend's answer
+    /// reported every such run as a backend that had lied.
+    pub claimed_confinement: bool,
+    /// Did **this run** ask its backend to deny egress? Same distinction.
+    ///
+    /// False whenever the run permits network — a dial that lands is then the
+    /// configuration working — and false for a proxied run, whose egress is
+    /// scoped by the proxy rather than denied by the boundary.
+    pub claimed_egress_denial: bool,
 }
 
 /// The program the probe runs.
@@ -1303,15 +1320,26 @@ impl BoundaryProbe {
             backend,
             write_refused: None,
             dial_refused: None,
+            claimed_confinement: false,
+            claimed_egress_denial: false,
         }
     }
 
     /// Attempt a write and a dial outside the boundary this config selects, and
     /// report what happened.
     ///
-    /// `writable_roots` are the roots the run grants besides the workdir, so the
-    /// probe measures the boundary the run will actually have rather than a
-    /// different one.
+    /// `writable_roots` are the roots the run grants besides the workdir, and
+    /// `proxy` is the run's loopback proxy when it has one, so the probe measures
+    /// the boundary the run will actually have rather than a different one.
+    ///
+    /// **The proxy is not optional detail.** It is an input to the rung a backend
+    /// picks, not only to the rules inside it: on Linux the namespace rungs cannot
+    /// serve a proxied run at all, so a proxied run measured with `proxy: None`
+    /// would be measured under `bwrap` while the run itself takes Landlock — a
+    /// different boundary reported under a backend name no command of that run
+    /// went through. A caller that cannot supply the address must record
+    /// [`unmeasured`](BoundaryProbe::unmeasured) instead of measuring the wrong
+    /// thing.
     ///
     /// Three short-lived child processes at most: one **control** run outside the
     /// boundary, which is what separates "the boundary refused it" from "this host
@@ -1322,7 +1350,11 @@ impl BoundaryProbe {
     /// Nothing here asserts a duration. The caps on the contained runs exist so a
     /// wedged child cannot outlive the probe; a run they killed is reported as
     /// unmeasured rather than as a refusal.
-    pub async fn measure(config: &SandboxConfig, writable_roots: &[PathBuf]) -> Self {
+    pub async fn measure(
+        config: &SandboxConfig,
+        writable_roots: &[PathBuf],
+        proxy: Option<std::net::SocketAddr>,
+    ) -> Self {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
@@ -1330,14 +1362,32 @@ impl BoundaryProbe {
         // `FullAccess` reaches no backend at all — the command is not wrapped —
         // so there is nothing to attempt and nothing is confined. Measured by not
         // needing to be, rather than left unknown.
+        //
+        // And it claims nothing. `select` reads the platform, so this config still
+        // names a backend whose own `confines_writes` is `true` on macOS and
+        // Linux; holding an unwrapped run to that answer reported every
+        // `FullAccess` run as a backend that had lied.
         if !config.mode.is_contained() {
             return Self {
                 backend,
                 write_refused: Some(false),
                 dial_refused: Some(false),
+                claimed_confinement: false,
+                claimed_egress_denial: false,
             };
         }
-        let mut probe = Self::unmeasured(backend);
+        let mut probe = Self {
+            claimed_confinement: backend.confines_writes(),
+            // A run that simply permits network denies no egress: a dial that
+            // lands there is the configuration working, not a backend that lied.
+            // A run that denies it, and a PROXIED run, both do make a claim the
+            // dial arm can test — for the proxied one the claim is narrower but
+            // no weaker, that there is no route out except the proxy, which is
+            // what the arm's `--noproxy '*'` goes looking for.
+            claimed_egress_denial: backend.denies_egress()
+                && (!config.allow_network || proxy.is_some()),
+            ..Self::unmeasured(backend)
+        };
 
         let found = resolve_program(PROBE_PROGRAM);
         let Some(tool) = found.as_deref().and_then(Path::to_str) else {
@@ -1404,7 +1454,8 @@ impl BoundaryProbe {
             let spec = RunSpec::new(&argv, dir.path(), &limits)
                 .with_network(config.allow_network)
                 .with_mode(config.mode)
-                .with_writable_roots(writable_roots);
+                .with_writable_roots(writable_roots)
+                .with_proxy(proxy);
             // A run the caps killed measured nothing: `cap_hit` is the difference
             // between "the boundary refused it" and "it never got that far".
             if let Ok(outcome) = select(config).run(spec).await {
@@ -1416,6 +1467,16 @@ impl BoundaryProbe {
         // listener cannot measure: the refusal would be the loopback boundary
         // rather than the egress answer, and reporting it as egress would be the
         // same misattribution this type exists to catch.
+        //
+        // **Under a proxy this arm asks a different question, and `probe_argv`'s
+        // `--noproxy '*'` is what changes it.** A proxied run does not deny egress
+        // — it scopes it — so "was a dial outside refused" would be a question
+        // about a boundary the run does not have. What matters there is whether a
+        // command that *ignores* the proxy can still reach the network, which is
+        // the C3/C4 question and the one an operator needs answered before the
+        // prompt calls that boundary enforced. Bypassing the proxy asks exactly
+        // that, and it also keeps the arm from dialling the run's own proxy and
+        // leaving a `dial` row for a connection the run never made.
         if dial_arm_runs && backend.reaches_loopback_proxy() {
             let before = dialled.load(Ordering::SeqCst);
             let sink = dir.path().join("probe-dial-sink");
@@ -1423,7 +1484,8 @@ impl BoundaryProbe {
             let spec = RunSpec::new(&argv, dir.path(), &limits)
                 .with_network(config.allow_network)
                 .with_mode(config.mode)
-                .with_writable_roots(writable_roots);
+                .with_writable_roots(writable_roots)
+                .with_proxy(proxy);
             if let Ok(outcome) = select(config).run(spec).await {
                 probe.dial_refused = outcome
                     .cap_hit
@@ -1465,9 +1527,19 @@ impl BoundaryProbe {
     /// [`confines_writes`](BoundaryProbe::confines_writes) and
     /// [`denies_egress`](BoundaryProbe::denies_egress). This is narrower: the
     /// attempt was made and it succeeded, under a backend that said it would not.
+    /// The claim compared against is **this run's**
+    /// ([`claimed_confinement`](BoundaryProbe::claimed_confinement),
+    /// [`claimed_egress_denial`](BoundaryProbe::claimed_egress_denial)), not the
+    /// backend's own. A run that permits network, and a `FullAccess` run on a
+    /// platform whose backend confines writes by design, both land what they
+    /// attempt because that is what they asked for — and reading the backend's
+    /// unconditional answer here turned each of them into a report that the host
+    /// had failed to apply an isolation nobody requested. A guard that cries wolf
+    /// on correct configurations is worse than no guard, because the one real
+    /// warning arrives in a stream of false ones.
     pub fn contradicts_claim(&self) -> bool {
-        (self.backend.confines_writes() && self.write_refused == Some(false))
-            || (self.backend.denies_egress() && self.dial_refused == Some(false))
+        (self.claimed_confinement && self.write_refused == Some(false))
+            || (self.claimed_egress_denial && self.dial_refused == Some(false))
     }
 
     /// The probe as one stable line for the trace and the agent's own prompt.
@@ -1520,6 +1592,19 @@ fn probe_argv(
         argv.push(source.to_string());
     }
     if let (Some(sink), Some(addr)) = (dial_sink, dial) {
+        // **`--noproxy '*'` is what makes this arm mean something under a proxy.**
+        // A contained child of a proxied run is handed that proxy in its
+        // environment, so a plain `curl` would dial the proxy rather than the
+        // listener: the arm would answer "landed" whatever the boundary did, and
+        // the run's trace would carry a `dial` row for a connection the run never
+        // made. Bypassing it asks the question that actually matters for such a
+        // run — the C3/C4 question — which is not "is egress denied" but "can a
+        // command that ignores the proxy settings still reach the network".
+        //
+        // On a run with no proxy the flag is a no-op, so both kinds of run take
+        // one code path rather than two that can drift.
+        argv.push("--noproxy".into());
+        argv.push("*".into());
         argv.push("-o".into());
         argv.push(sink.display().to_string());
         argv.push(format!("http://{addr}/"));

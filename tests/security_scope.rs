@@ -319,7 +319,8 @@ fn l13_a_manifest_may_not_point_skills_or_templates_out_of_the_bundle() {
     }
 }
 
-/// **L13.** A `[[plugin]]`'s own `path` is resolved under the discovery root.
+/// **L13.** A `[[plugin]]`'s own `path` written in a file inside the workspace is
+/// resolved under the discovery root.
 ///
 /// Fails on 0.73.0's behaviour: `Plugins::load` took an absolute `path` as written
 /// and joined a relative one without checking where the join landed, so a file
@@ -328,8 +329,18 @@ fn l13_a_manifest_may_not_point_skills_or_templates_out_of_the_bundle() {
 ///
 /// The symbolic-link case is the one a lexical rule cannot see, and it is why this
 /// resolves through `contain_under_root` rather than scanning components.
+///
+/// **Renamed in 0.74.0.** The old name left the qualifier out — it read
+/// `l13_a_declared_plugin_path…` — and so claimed the rule for every scope. The
+/// containment is held against the scopes a workspace can supply and not against
+/// the user scope, which is the split `refuse_widening` already makes for
+/// `run.skills` and makes for the same reason: the operator's own file sits
+/// outside every workspace, an installed bundle kept outside the project is the
+/// ordinary case, and refusing it would take the feature away rather than move a
+/// boundary. The control at the end is what stops the old claim being read back
+/// into the code.
 #[test]
-fn l13_a_declared_plugin_path_may_not_escape_the_discovery_root() {
+fn l13_a_workspace_files_plugin_path_may_not_escape_the_discovery_root() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("project");
     let outside = parent.path().join("outside");
@@ -369,6 +380,34 @@ fn l13_a_declared_plugin_path_may_not_escape_the_discovery_root() {
             "{declared}: the refusal says where the boundary is: {why}"
         );
     }
+
+    // The control, and the reason this is a boundary that *moved*: the same
+    // directory named from the operator's own file loads, and its skills directory
+    // is the one inside it. That scope sits outside every workspace — a run that
+    // can write its own root cannot reach `$IO_CONFIG`, `$IO_CONFIG_HOME` or
+    // `~/.config/io` — and naming a bundle kept outside the project is what it is
+    // for. Without this arm a loader that dropped every declaration from every
+    // scope would satisfy all four refusals above.
+    //
+    // What the user scope does *not* carry is trust in a manifest that lands
+    // inside the workspace; `tests/plugin.rs` holds that half.
+    write(&root.join("io.local.toml"), "");
+    let plugins = discover_with_user(
+        &root,
+        Some(&format!(
+            "[[plugin]]\npath = {:?}\n",
+            outside.display().to_string()
+        )),
+    )
+    .unwrap()
+    .plugins();
+    assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
+    let kit = plugins.get("kit").expect("the operator's own bundle loads");
+    assert_eq!(
+        kit.skills_dir().expect("it contributes a skills directory"),
+        outside.join("skills"),
+        "and the directory it points at is the one inside it"
+    );
 }
 
 /// **L13, the companion.** An ordinary in-root bundle still loads, its `skills`

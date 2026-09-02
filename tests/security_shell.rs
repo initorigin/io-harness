@@ -12,10 +12,18 @@
 //! taken at the door where a model chooses a directory name — a `cd` target — and
 //! that door is this tool.
 //!
+//! F2b is the half of H4 that fix left open. It closed the symlinked *parent* and
+//! said so in as many words; the leaf was still followed, because a dangling link
+//! reads as a file about to be created and because the redirect's open carried no
+//! `O_NOFOLLOW` while `write_file`'s did. The two doors are claimed to answer
+//! alike about the same path, so the tests here are the ones that say they do.
+//!
 //! Every refusal carries a companion showing the legitimate case still works. For
 //! C1 the companions are most of the point: the set that would have been easy to
 //! write is one that also refuses `My Project`, and a workspace named that is not
-//! an attack.
+//! an attack. For F2b the companion is a leaf link pointing *inside* the root,
+//! which a repository is allowed to contain and which must still be written and
+//! read through.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -157,6 +165,91 @@ async fn h4_a_cd_through_a_symlinked_parent_that_leaves_the_root_is_refused() {
     assert!(
         obs.contains("outside the workspace root"),
         "the model is told why: {obs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F2b — a redirect through a dangling link at the leaf
+// ---------------------------------------------------------------------------
+
+/// `docs/ext -> $HOME/.bashrc`, dangling, and `rustc --version > docs/ext`.
+///
+/// H4's fix asserted that the escape is the *parent*, not the leaf, and that
+/// sentence is what left this open. `contain_under_root` could not tell a
+/// dangling link from a file about to be created, so `resolve` graded the link's
+/// own name; `open_for_write` had no `O_NOFOLLOW`, so `open(2)` followed the link
+/// out of the root and created the file. Two things answer it: the containment
+/// walk resolves a dangling link now, and the open refuses to follow one.
+#[cfg(unix)]
+#[tokio::test]
+async fn f2b_a_redirect_through_a_dangling_leaf_symlink_cannot_leave_the_root() {
+    let (root, outside) = fixture();
+    let target = outside.path().join(".bashrc");
+    std::os::unix::fs::symlink(&target, root.path().join("docs/ext")).unwrap();
+
+    let obs = run_line(root.path(), "rustc --version > docs/ext").await;
+
+    assert!(
+        !target.exists(),
+        "nothing may be created outside the canonical root: {obs}"
+    );
+    assert!(
+        obs.contains("outside the workspace root"),
+        "the model is told why: {obs}"
+    );
+}
+
+/// Appending is the same open with a different flag, and had the same hole.
+#[cfg(unix)]
+#[tokio::test]
+async fn f2b_an_appending_redirect_through_a_dangling_leaf_symlink_is_refused_too() {
+    let (root, outside) = fixture();
+    let target = outside.path().join("authorized_keys");
+    std::os::unix::fs::symlink(&target, root.path().join("docs/keys")).unwrap();
+
+    let obs = run_line(root.path(), "rustc --version >> docs/keys").await;
+
+    assert!(!target.exists(), "{obs}");
+}
+
+/// The companion to F2b, and the capability the `O_NOFOLLOW` open must not cost.
+/// A link at the leaf pointing *inside* the root still receives the redirect —
+/// the open is retried once against where it points — and that holds whether the
+/// file it names is already there or not.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_redirect_onto_a_leaf_symlink_that_stays_inside_the_root_still_writes_through() {
+    let (root, _outside) = fixture();
+    std::fs::write(root.path().join("src/log.txt"), "").unwrap();
+    std::os::unix::fs::symlink("../src/log.txt", root.path().join("docs/here")).unwrap();
+    std::os::unix::fs::symlink("../src/later.txt", root.path().join("docs/dangling")).unwrap();
+
+    let obs = run_line(root.path(), "rustc --version > docs/here").await;
+    let written = std::fs::read_to_string(root.path().join("src/log.txt"))
+        .unwrap_or_else(|e| panic!("the redirect did not write through the leaf link: {e}: {obs}"));
+    assert!(written.contains("rustc"), "{written}");
+
+    let obs = run_line(root.path(), "rustc --version > docs/dangling").await;
+    let written = std::fs::read_to_string(root.path().join("src/later.txt")).unwrap_or_else(|e| {
+        panic!("a dangling link inside the root did not create what it names: {e}: {obs}")
+    });
+    assert!(written.contains("rustc"), "{written}");
+}
+
+/// The input redirect took the same opener in the same change, so it gets the
+/// same companion: `< link` still reads the file a link inside the root names.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_input_redirect_through_a_leaf_symlink_inside_the_root_still_reads() {
+    let (root, _outside) = fixture();
+    std::fs::write(root.path().join("src/in.txt"), "hello from inside\n").unwrap();
+    std::os::unix::fs::symlink("../src/in.txt", root.path().join("docs/src.txt")).unwrap();
+
+    let obs = run_line(root.path(), "cat < docs/src.txt").await;
+
+    assert!(
+        obs.contains("hello from inside"),
+        "the read follows a link that stays inside the root: {obs}"
     );
 }
 

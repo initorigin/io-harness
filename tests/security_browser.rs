@@ -321,6 +321,85 @@ async fn a_permitted_host_is_still_reached_and_decided_once() {
     );
 }
 
+/// M10 — the address floor at the navigation gate, and the authority the gate
+/// was reading wrong.
+///
+/// The last two entries are the finding: a backslash ends the authority for every
+/// scheme this gate reduces, as it does in the WHATWG parser and in Chrome's own
+/// GURL, and until 0.74.0's review it did not here. So
+/// `http://127.0.0.1:11434\@example.com/` was **decided about** as
+/// `example.com:80` — allowed by the policy below, recorded as `example.com:80`,
+/// permitted — and **navigated to** at the loopback endpoint in front of the
+/// backslash, because the browser's parser stops at the backslash and this one
+/// did not. The checked host and the dialled host were different hosts.
+///
+/// Every entry is a literal or a reserved name, so no resolver is consulted; the
+/// fixture browser records what it was told and connects to nothing.
+///
+/// What this does **not** cover is a *name* that resolves onto one of these
+/// addresses. `browser_navigate("http://169.254.169.254.nip.io/")` still reaches
+/// cloud metadata under this policy, and `NavGate::permits` carries the argument
+/// for why grading it here would not close it: Chrome resolves the URL itself, so
+/// an address graded here is not the address dialled unless the navigation is
+/// pinned to it, and pinning breaks SNI and certificate validation. The close is
+/// to route the browser through the run's egress proxy, which resolves once and
+/// dials what it graded.
+#[tokio::test]
+async fn m10_a_navigation_to_a_local_address_is_refused_and_the_authority_ends_at_a_backslash() {
+    for (url, host) in [
+        ("http://127.0.0.1:8080/", "127.0.0.1:8080"),
+        (
+            "http://169.254.169.254/latest/meta-data/",
+            "169.254.169.254:80",
+        ),
+        // Carrier-grade NAT, where Alibaba Cloud's metadata service answers.
+        (
+            "http://100.100.100.200/latest/meta-data/",
+            "100.100.100.200:80",
+        ),
+        ("http://10.0.0.1/", "10.0.0.1:80"),
+        ("http://[::1]:8080/", "[::1]:8080"),
+        ("http://localhost:11434/", "localhost:11434"),
+        ("http://127.0.0.1:11434\\@example.com/v1", "127.0.0.1:11434"),
+        ("https://[::1]\\@example.com/v1", "[::1]:443"),
+    ] {
+        let (lines, navigations, _transcript) = navigate_to(url, permitted().allow_net("*")).await;
+
+        assert!(
+            !lines.iter().any(|l| l.contains("continue ")),
+            "the browser was allowed to go to {url}: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("fail ")),
+            "the browser was not told to block the request for {url}: {lines:?}"
+        );
+        assert!(
+            navigations.contains(&(host.to_string(), false)),
+            "{url} was not recorded as a refusal of {host}: {navigations:?}"
+        );
+    }
+}
+
+/// The companion: an ordinary routable host is untouched by the floor.
+///
+/// A literal rather than a name, and that is the constraint rather than a
+/// preference — a permitted name would have to resolve for this suite to know it
+/// was permitted, and this suite does not query resolvers.
+#[tokio::test]
+async fn m10_an_ordinary_public_address_is_still_navigated_to() {
+    let (lines, navigations, _transcript) = navigate_to(
+        "https://93.184.216.34/page",
+        permitted().allow_net("93.184.216.34"),
+    )
+    .await;
+
+    assert!(
+        lines.iter().any(|l| l.contains("continue ")),
+        "an ordinary host was stopped by the floor: {lines:?}"
+    );
+    assert_eq!(navigations, vec![("93.184.216.34:443".to_string(), true)]);
+}
+
 /// The other control: a denied *host* is still refused at the request, which is
 /// the path the scheme gate must not have taken over.
 #[tokio::test]

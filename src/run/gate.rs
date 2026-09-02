@@ -90,14 +90,27 @@ pub(super) async fn authorize_provider<P: Provider>(
             NetGuard::new(policy)
                 .tracing(store, run_id, 0)
                 .watching(watch, 0)
-                .check_target(&target)?;
+                .check_target(&target)
+                .await?;
         }
         effective = effective.merge(net::provider_layer(&target));
         // Step 0: the authorization happens before the run's first step.
-        let verdict = NetGuard::new(&effective)
+        //
+        // M10 — the guard resolves the endpoint here and grades what came back, so
+        // a `base_url` pointed at a name that resolves onto loopback, cloud
+        // metadata or the internal network is refused before the run's first step.
+        // The addresses are dropped rather than dialled, and that is the honest
+        // limit of this site: a `Provider` owns its own HTTP client and resolves
+        // the name again when it dials, so what is closed here is a name that
+        // *always* answers with a local address, not a name that answers
+        // differently the second time it is asked. Pinning the dial as well would
+        // mean every `Provider` taking a client it did not build, which is an API
+        // change and not this release's.
+        let (verdict, _) = NetGuard::new(&effective)
             .tracing(store, run_id, 0)
             .watching(watch, 0)
-            .check_target(&target)?;
+            .check_target(&target)
+            .await?;
         if verdict.effect == Effect::Ask {
             // One human decision covers the run; the first host that needs asking
             // is the one asked about. The verdict rides along because the approver

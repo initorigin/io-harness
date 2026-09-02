@@ -3363,8 +3363,15 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             let lsp = lsp_for(contract, &effective, store, run_id, watch).await?;
             let browser = browser_for(contract, &effective);
             // Once for the whole tree, before the root agent runs. See `Tree::probe`.
-            let probe =
-                probe_tree_boundary(store, watch, run_id, &contract.exec_sandbox, &root).await;
+            let probe = probe_tree_boundary(
+                store,
+                watch,
+                run_id,
+                &contract.exec_sandbox,
+                &root,
+                will_proxy(&effective, contract),
+            )
+            .await;
             let tree = Tree {
                 mcp: &mcp,
                 lsp: &lsp,
@@ -3474,8 +3481,15 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             let lsp = lsp_for(contract, &effective, store, run_id, watch).await?;
             let browser = browser_for(contract, &effective);
             // Once for the whole tree, before the root agent runs. See `Tree::probe`.
-            let probe =
-                probe_tree_boundary(store, watch, run_id, &contract.exec_sandbox, &root).await;
+            let probe = probe_tree_boundary(
+                store,
+                watch,
+                run_id,
+                &contract.exec_sandbox,
+                &root,
+                will_proxy(&effective, contract),
+            )
+            .await;
             let tree = Tree {
                 mcp: &mcp,
                 lsp: &lsp,
@@ -4188,7 +4202,15 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
     let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
     let browser = browser_for(contract, policy);
     // Once for the whole tree, before the root agent runs. See `Tree::probe`.
-    let probe = probe_tree_boundary(store, watch, run_id, &contract.exec_sandbox, &root).await;
+    let probe = probe_tree_boundary(
+        store,
+        watch,
+        run_id,
+        &contract.exec_sandbox,
+        &root,
+        will_proxy(policy, contract),
+    )
+    .await;
     let tree = Tree {
         mcp: &mcp,
         lsp: &lsp,
@@ -4420,7 +4442,15 @@ pub async fn resume_tree_observed<P: Provider>(
     let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
     let browser = browser_for(contract, policy);
     // Once for the whole tree, before the root agent runs. See `Tree::probe`.
-    let probe = probe_tree_boundary(store, watch, run_id, &contract.exec_sandbox, &root).await;
+    let probe = probe_tree_boundary(
+        store,
+        watch,
+        run_id,
+        &contract.exec_sandbox,
+        &root,
+        will_proxy(policy, contract),
+    )
+    .await;
     let tree = Tree {
         mcp: &mcp,
         lsp: &lsp,

@@ -522,12 +522,18 @@ impl McpSession {
                     })?
                 }
                 McpTransport::Http { url, headers } => {
-                    NetGuard::new(policy)
+                    // The addresses come back with the verdict and the client is
+                    // pinned to them (0.74.0). Resolving the host again inside
+                    // reqwest would put a second answer where the graded one
+                    // belongs, and an operator-configured server URL is the one
+                    // string in this crate that a hostile `io.toml` gets to choose.
+                    let (_, addrs) = NetGuard::new(policy)
                         .tracing(store, run_id, 0)
                         .watching(watch, 0)
-                        .check(url)?;
+                        .check(url)
+                        .await?;
                     let transport = StreamableHttpClientTransport::with_client(
-                        net::http_client(),
+                        net::pinned_client(url, &addrs),
                         http_config(url, headers),
                     );
                     ().serve(transport).await.map_err(|e| Error::Mcp {
@@ -927,10 +933,11 @@ pub async fn probe_mcp(server: &McpServer, policy: &Policy) -> McpProbe {
             finish_probe(().serve(transport), server, deadline).await
         }
         McpTransport::Http { url, headers } => {
-            match NetGuard::new(policy).check(url) {
+            let addrs = match NetGuard::new(policy).check(url).await {
                 // `Ask` comes back as a verdict rather than an error, and is let
-                // through here exactly as `connect` lets it through.
-                Ok(_) => {}
+                // through here exactly as `connect` lets it through. The addresses
+                // are kept because the client below dials them and nothing else.
+                Ok((_, addrs)) => addrs,
                 Err(Error::Refused {
                     act,
                     target,
@@ -949,9 +956,9 @@ pub async fn probe_mcp(server: &McpServer, policy: &Policy) -> McpProbe {
                         reason: e.to_string(),
                     }
                 }
-            }
+            };
             let transport = StreamableHttpClientTransport::with_client(
-                net::http_client(),
+                net::pinned_client(url, &addrs),
                 http_config(url, headers),
             );
             finish_probe(().serve(transport), server, deadline).await

@@ -1004,6 +1004,15 @@ pub(crate) struct Planned {
     pub(crate) cwd: PathBuf,
     /// Its redirects, targets absolute. `None` for `2>&1`, which names no file.
     pub(crate) redirects: Vec<(RedirectKind, Option<PathBuf>)>,
+    /// The workspace root these paths were contained under (0.74.0).
+    ///
+    /// Carried with them rather than resolved again at the spawn site, for the
+    /// reason this whole type exists: a second resolution is a second chance to
+    /// disagree. It is needed there because a symbolic link at the final component
+    /// is the one thing [`plan`] cannot decide once and for all — the link may be
+    /// planted after the plan is made, and the file the descriptor names is then
+    /// not the file that was checked.
+    pub(crate) root: PathBuf,
     /// Where a `cd` moves to, absolute, or `None` for every other command.
     ///
     /// Recorded here so the caller can check the destination against
@@ -1071,6 +1080,7 @@ pub(crate) fn plan(line: &Line, root: &Path) -> Result<Vec<Planned>> {
         };
         out.push(Planned {
             cwd: here.clone(),
+            root: root.to_path_buf(),
             redirects,
             cd_target: cd_target.clone(),
         });
@@ -1589,19 +1599,26 @@ fn apply_redirects(cmd: &mut TokioCommand, planned: &Planned) -> Result<()> {
             // `2>&1` — see the note above; there is nothing to open.
             continue;
         };
+        let root = planned.root.as_path();
         match kind {
             RedirectKind::Stdin => {
-                cmd.stdin(Stdio::from(std::fs::File::open(path).map_err(Error::Io)?));
+                cmd.stdin(Stdio::from(open_leaf(
+                    path,
+                    root,
+                    std::fs::OpenOptions::new().read(true),
+                )?));
             }
             RedirectKind::Stdout | RedirectKind::StdoutAppend => {
                 cmd.stdout(Stdio::from(open_for_write(
                     path,
+                    root,
                     *kind == RedirectKind::StdoutAppend,
                 )?));
             }
             RedirectKind::Stderr | RedirectKind::StderrAppend => {
                 cmd.stderr(Stdio::from(open_for_write(
                     path,
+                    root,
                     *kind == RedirectKind::StderrAppend,
                 )?));
             }
@@ -1626,14 +1643,72 @@ fn append_to(path: &Path) -> Result<std::fs::File> {
         .map_err(Error::Io)
 }
 
-fn open_for_write(path: &Path, append: bool) -> Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .append(append)
-        .truncate(!append)
-        .open(path)
-        .map_err(Error::Io)
+fn open_for_write(path: &Path, root: &Path, append: bool) -> Result<std::fs::File> {
+    open_leaf(
+        path,
+        root,
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(append)
+            .truncate(!append),
+    )
+}
+
+/// Open a redirect target without following a symbolic link at the final
+/// component (0.74.0, F2b).
+///
+/// The treatment `Workspace::write_leaf` already gave
+/// [`write_file`](super::workspace::Workspace::write_file), taken here because the
+/// two doors are claimed to answer alike about the same path and this one did not:
+/// [`resolve`]'s helper decided containment, and then an ordinary `open` followed
+/// whatever link was at the leaf straight out of the root. With
+/// `docs/ext -> /home/user/.bashrc` checked into the repository, `> docs/ext`
+/// wrote the home file. `resolve` refuses that link now — a dangling one included,
+/// which is the half that used to slip past — and this is the second line for the
+/// link planted *after* the plan is made, which no check taken before the spawn
+/// can see.
+///
+/// A link that stays *inside* the root still opens, because a repository is
+/// allowed to contain one: the open is retried once against where the link points,
+/// and that destination goes through [`contain_under_root`] first. The policy is
+/// not re-asked here, and deliberately — this runner holds no
+/// [`Policy`](crate::Policy) at all, for the reason [`Shell`] gives — so what this
+/// enforces is containment, and the destination's *policy* verdict is the one
+/// `dispatch` took from the path [`plan`] resolved.
+///
+/// **Windows** has no `O_NOFOLLOW` and no `OpenOptions` equivalent, so the open
+/// there is an ordinary one and containment rests on [`resolve`] alone. Creating a
+/// symbolic link on Windows needs `SeCreateSymbolicLinkPrivilege` or developer
+/// mode, which is not something an unprivileged agent has.
+///
+/// [`contain_under_root`]: super::workspace::contain_under_root
+fn open_leaf(path: &Path, root: &Path, opts: &mut std::fs::OpenOptions) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        opts.custom_flags(libc::O_NOFOLLOW);
+        match opts.open(path) {
+            // `ELOOP` here means the leaf is a symlink and nothing else: the flag
+            // is the only reason this open can report it.
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                let dest = std::fs::read_link(path).map_err(Error::Io)?;
+                let dest = match path.parent() {
+                    Some(parent) if dest.is_relative() => parent.join(dest),
+                    _ => dest,
+                };
+                opts.open(super::workspace::contain_under_root(root, &dest)?)
+                    .map_err(Error::Io)
+            }
+            other => other.map_err(Error::Io),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        opts.open(path).map_err(Error::Io)
+    }
 }
 
 /// Join `rel` onto `base` and refuse anything that leaves `root`.
@@ -1649,13 +1724,22 @@ fn open_for_write(path: &Path, append: bool) -> Result<std::fs::File> {
 ///
 /// The second is [`contain_under_root`](super::workspace::contain_under_root),
 /// added in 0.74.0 for audit H4. A lexical answer says nothing about symbolic
-/// links, and the escape it missed is the *parent*, not the leaf: with
-/// `docs/ext -> /home/user` checked into the repository, `> docs/ext/.bashrc` is
-/// lexically inside the root, and `open_for_write` follows the link and creates a
-/// file in the home directory. The helper resolves the deepest existing ancestor,
-/// requires *that* under the canonical root, and so refuses the redirect before
-/// anything is opened. `write_file` takes the same helper, which is what makes
-/// the two doors answer the same way about the same path.
+/// links: with `docs/ext -> /home/user` checked into the repository,
+/// `> docs/ext/.bashrc` is lexically inside the root, and an ordinary open follows
+/// the link and creates a file in the home directory. The helper resolves the
+/// deepest existing ancestor, requires *that* under the canonical root, and so
+/// refuses the redirect before anything is opened.
+///
+/// The escape is the leaf as well as the parent, and saying otherwise is what left
+/// `> docs/ext` open when `docs/ext` was itself a link to a file outside the root
+/// that did not exist yet. Two things answer it. The helper resolves a *dangling*
+/// link instead of mistaking it for a leaf about to be created, so the destination
+/// is what both this check and `dispatch`'s policy check grade; and
+/// [`open_leaf`] opens with `O_NOFOLLOW`, so the link planted after this ran —
+/// which no check taken before the spawn can see — does not redirect the
+/// descriptor either. `write_file` takes the same helper and the same
+/// `O_NOFOLLOW` open, which is what makes the two doors answer the same way about
+/// the same path.
 ///
 /// The helper's answer is checked and discarded rather than returned. What comes
 /// back is the path as written, still under `root` component for component,

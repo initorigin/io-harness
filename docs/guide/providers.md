@@ -36,7 +36,9 @@ key removed:
 use io_harness::Compatible;
 
 // A model on this machine. No key, no bill, no network beyond localhost — the
-// shape to develop a contract against before pointing it at a vendor.
+// shape to develop a contract against before pointing it at a vendor. Since
+// 0.74.0 it needs `IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1` in the environment;
+// see "The local half costs nothing" below.
 let local = Compatible::ollama("llama3.2");
 ```
 
@@ -134,6 +136,24 @@ at, and each base is that project's own documented default bind:
 | Jan | `http://localhost:1337/v1` |
 | KoboldCpp | `http://localhost:5001/v1` |
 | SGLang | `http://localhost:30000/v1` |
+
+**Every one of those bases is refused by default since 0.74.0, and one
+environment variable is what turns them back on.** An address-level floor sits
+under every net decision the crate takes, and it refuses loopback, link-local,
+private, carrier-grade-NAT, unique-local and cloud-metadata addresses whatever the
+policy says — `localhost` included. A local runtime is the case the floor's
+widening exists for, so a run against one needs
+
+```bash
+IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1
+```
+
+in the environment of the process that embeds the harness. It is an environment
+variable and not an `io.toml` key on purpose: a key that widens is a key a cloned
+repository could set. The refusal, if you forget, is an `Error::Refused` naming
+the address, the reason and this variable, attributed to the layer
+`local-address floor` — see
+[the floor](mcp-and-network.md#the-local-address-floor-0740).
 
 A runtime bound somewhere else is `Compatible::new` with the URL, which is one
 line and not a release of this crate:

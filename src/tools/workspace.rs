@@ -433,7 +433,12 @@ impl Workspace {
     ///
     /// A symlink is checked by its own path *and* by its resolved target, so a
     /// link sitting inside an allowed directory but pointing at a denied file is
-    /// refused — the target fails even though the link's own path passes.
+    /// refused — the target fails even though the link's own path passes. That
+    /// holds for a link whose target does not exist yet as well (0.74.0): a
+    /// *dangling* link used to be indistinguishable from a leaf about to be
+    /// created, so `src/a.rs -> ../io.local.toml` was graded as `src/a.rs` and a
+    /// hostile clone could ship one. `read_link` tells the two apart now, where
+    /// `canonicalize` reports the same "not found" for both.
     ///
     /// **A path that leaves the root is denied outright, whether or not it exists
     /// yet (0.74.0).** Two holes made that untrue before. The escape test sat
@@ -490,6 +495,29 @@ impl Workspace {
             });
         }
         Ok(())
+    }
+
+    /// Refuse the action against an already-contained *absolute* path, graded by
+    /// the workspace-relative name a policy rule matches (0.74.0).
+    ///
+    /// [`Workspace::write_leaf`]'s retry is the caller and the reason this exists.
+    /// Everything else arrives holding the relative path the model wrote; a
+    /// symbolic link's destination is discovered from the link, so it has no such
+    /// name until one is derived from it — and without one it was never graded at
+    /// all, which is how a link at the leaf reached a denied file.
+    ///
+    /// The refusal that comes back names the destination rather than the link, so
+    /// the model reads which file was actually refused.
+    ///
+    /// Unix only, because the retry it serves is: Windows has no `O_NOFOLLOW`, so
+    /// there is no second open there to re-decide.
+    #[cfg(unix)]
+    fn enforce_contained(&self, act: Act, abs: &Path) -> Result<()> {
+        let root_real = deepest_existing(&self.root)?;
+        let rel = abs
+            .strip_prefix(&root_real)
+            .map_err(|_| outside_root(abs, &self.root))?;
+        self.enforce(act, &rel.to_string_lossy().replace('\\', "/"))
     }
 
     /// Resolve a model-supplied relative path under the root, refusing absolute
@@ -811,8 +839,16 @@ impl Workspace {
     /// A link that stays *inside* the root is still writable, because that is a
     /// capability 0.73.0 had and nothing here is meant to remove: the open is
     /// retried once against where the link points, and that destination goes
-    /// through [`contain_under_root`] before it is opened. So following a link
-    /// can only ever land where an ordinary write to its destination would have.
+    /// through [`contain_under_root`] **and through the policy** before it is
+    /// opened. Both, because they answer different questions and only the pair of
+    /// them makes "following a link lands where an ordinary write to its
+    /// destination would have" true. Containment alone was the claim this
+    /// docstring used to make, and it was false: a link is a different path from
+    /// its destination — that is the whole argument for re-deciding containment —
+    /// and a different path gets a different verdict. A link planted between the
+    /// gate and this open, which is the race `O_NOFOLLOW` exists to close, reached
+    /// `io.local.toml` and `.git/hooks/*` through a name the gate had allowed
+    /// while the deny that names those files was never consulted.
     ///
     /// **Windows** has no `O_NOFOLLOW` and no `OpenOptions` equivalent, so the
     /// write there is an ordinary one and containment rests on
@@ -851,7 +887,9 @@ impl Workspace {
                         Some(parent) if dest.is_relative() => parent.join(dest),
                         _ => dest,
                     };
-                    open(&contain_under_root(&self.root, &dest)?).map_err(Error::Io)?
+                    let dest = contain_under_root(&self.root, &dest)?;
+                    self.enforce_contained(Act::Write, &dest)?;
+                    open(&dest).map_err(Error::Io)?
                 }
                 Err(e) => return Err(Error::Io(e)),
             };
@@ -1131,14 +1169,17 @@ fn denied(rule: &str) -> Verdict {
 /// - no symbolic link is followed *out* of the root at any depth, because the
 ///   whole existing prefix is canonical;
 /// - a link that stays inside the root still resolves and is still usable;
+/// - a *dangling* link resolves to what it names rather than to itself (0.74.0),
+///   so a link checked into a repository is graded by its destination whether or
+///   not that destination exists yet — see [`deepest_existing`];
 /// - a root that does not exist yet is resolved the same way, so a workspace
 ///   whose directory is about to be created behaves as it did before this check.
 ///
-/// What it does not promise: that the returned path contains no symbolic link at
-/// all. The leaf may still be one pointing inside the root, and a component
-/// created after this returns is outside its knowledge. A writer that needs the
-/// checked path to be the written path opens the leaf with `O_NOFOLLOW` — see
-/// [`Workspace::write_leaf`].
+/// What it does not promise: that the path *stays* what this returned. Every link
+/// on it is resolved at the moment of the call, and a component swapped for a link
+/// after this returns is outside its knowledge. A writer that needs the checked
+/// path to be the written path opens the leaf with `O_NOFOLLOW` and re-decides
+/// about the destination — see [`Workspace::write_leaf`].
 ///
 /// The error is an [`Error::Config`] naming the path, the root, and what to
 /// write instead.
@@ -1163,17 +1204,60 @@ pub(crate) fn contain_under_root(root: &Path, path: &Path) -> Result<PathBuf> {
 /// file rather than a directory, a link that loops, a directory that cannot be
 /// searched — is refused rather than walked past, because a component this
 /// cannot read is a component whose target it cannot vouch for.
+///
+/// **A dangling symbolic link is not an absent path (0.74.0).** `canonicalize`
+/// answers `NotFound` for both, so a link whose target does not exist *yet* was
+/// graded as a leaf about to be created and answered with the link's own name —
+/// while every writer that followed it landed on the destination. That is
+/// precisely the case a hostile clone ships: git stores a symbolic link as a blob
+/// holding its target string and never requires the target to exist, so
+/// `src/a.rs -> ../io.local.toml` arrives with a checkout and needs no `exec`
+/// permission to plant. A link whose target *does* exist was never affected —
+/// `canonicalize` resolves it and the destination is what gets graded — which is
+/// why the dangling half was the only one that escaped.
+///
+/// `read_link` tells the two apart where `canonicalize` cannot: it succeeds on a
+/// link and fails with `EINVAL` on anything else, so no second `stat` is needed.
+/// The walk then goes on resolving from where the link points, which is the
+/// destination's own answer: outside the root it is refused by
+/// [`contain_under_root`] like any other escape, inside the root it resolves to
+/// the file it names and is graded as that file.
+///
+/// The hop ceiling is not there for cycles — `canonicalize` reports a cycle as
+/// `ELOOP`, which is already refused above — but so that a chain no bound is known
+/// for cannot spin here.
 fn deepest_existing(path: &Path) -> Result<PathBuf> {
-    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut at = path;
+    // Links followed before the path is refused instead. `SYMLOOP_MAX` is 8 on
+    // the hosts this runs on; 40 is what Linux's own resolver allows.
+    const MAX_LINK_HOPS: u32 = 40;
+
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut at = path.to_path_buf();
+    let mut hops = 0u32;
     loop {
         match at.canonicalize() {
             Ok(canon) => {
                 let mut out = canon;
-                out.extend(tail.iter().rev().copied());
+                out.extend(tail.iter().rev().map(|c| c.as_os_str()));
                 return Ok(out);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(dest) = std::fs::read_link(&at) {
+                    hops += 1;
+                    if hops > MAX_LINK_HOPS {
+                        return Err(escape(&path.to_string_lossy()));
+                    }
+                    // A relative target is relative to the link's own directory,
+                    // not to the process's; resolving it any other way is how a
+                    // `../` in a link target stops meaning what it says.
+                    let next = match at.parent() {
+                        Some(parent) if dest.is_relative() => parent.join(dest),
+                        _ => dest,
+                    };
+                    at = next;
+                    continue;
+                }
+            }
             Err(_) => return Err(escape(&path.to_string_lossy())),
         }
         // `file_name` is `None` for `..`, for `.` and for a bare root. None of
@@ -1182,6 +1266,7 @@ fn deepest_existing(path: &Path) -> Result<PathBuf> {
         let (Some(name), Some(parent)) = (at.file_name(), at.parent()) else {
             return Err(escape(&path.to_string_lossy()));
         };
+        let (name, parent) = (name.to_os_string(), parent.to_path_buf());
         tail.push(name);
         at = parent;
     }

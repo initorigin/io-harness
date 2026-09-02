@@ -16,22 +16,50 @@
 //!   contract that reimplementation has to get right.
 //! - `NetGuard` evaluates that target against a [`Policy`] and records the
 //!   verdict, mirroring [`crate::ExecGuard`] so the two boundaries read alike.
-//! - The **local-address floor** (0.74.0) sits *under* all of that: `floor_by_name`
-//!   and `dialable` refuse loopback, link-local, cloud metadata, unique-local and
-//!   RFC 1918 addresses whatever the policy says, because until 0.74.0 every net
+//! - The **local-address floor** (0.74.0) sits *under* all of that: loopback,
+//!   link-local, cloud metadata, carrier-grade NAT, unique-local and RFC 1918
+//!   addresses are refused whatever the policy says, because until 0.74.0 every net
 //!   decision in the crate was a hostname glob and `Policy::permissive()` therefore
 //!   handed the model cloud metadata, localhost admin ports and the internal
 //!   network. `IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1` lifts it for the local-model
 //!   case — an environment variable and not a config key, because a config key
 //!   that widens is one a cloned repository could set.
 //!
-//! What this cannot do is govern a connection some *other* process opens. A
+//! # Where the floor resolves, and where it cannot
+//!
+//! A floor that graded only *names* is a floor `http://169.254.169.254.nip.io/`
+//! walks straight through: `nip.io` and `sslip.io` answer `<anything>.<ip>` with
+//! that address, so a model that can type a URL reaches cloud metadata with no
+//! attacker infrastructure at all. So the floor resolves. Where that resolution
+//! happens decides how much it is worth, and there are three answers in this
+//! crate rather than one:
+//!
+//! - **Resolved and pinned.** `NetGuard::check` resolves the target once and
+//!   hands the graded addresses back; the caller dials *those* — the MCP HTTP
+//!   client through `pinned_client`, the egress proxy through
+//!   `TcpStream::connect(&addrs[..])`. Check and dial are the same answer, so
+//!   there is no rebinding window between them.
+//! - **Resolved, not pinned.** A provider endpoint is graded by the same guard,
+//!   but the [`Provider`](crate::Provider) owns its own client and resolves the
+//!   name again when it dials. A name that resolves to a local address is refused
+//!   before the run's first step; a name whose *second* answer differs from its
+//!   first is not, and closing that would mean every provider taking a pinned
+//!   client, which is an API change and not this release's.
+//! - **Not resolved.** The browser navigation gate (`browser::NavGate`) grades by
+//!   name only. Chrome resolves every URL itself and a navigation cannot be
+//!   pinned to an address without breaking SNI and certificate validation, so
+//!   resolving at the gate would refuse names Chrome would have reached and still
+//!   not decide what Chrome dialled. The way to close it is to route the browser
+//!   through the run's egress proxy — which already resolves once, grades, and
+//!   dials the graded set — and that is wiring this release did not do.
+//!
+//! What this cannot do at all is govern a connection some *other* process opens. A
 //! stdio MCP server is a separate process; the harness decides whether it may
 //! start (an [`Act::Exec`] check) and which of its tools may be called, but once
 //! running it dials whatever it likes. That limit is real and documented rather
 //! than implied away.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime};
 
 use crate::error::{Error, Result};
@@ -102,11 +130,56 @@ pub(crate) fn http_client() -> reqwest::Client {
 /// a configuration this small — the fallback exists so a client is infallible to
 /// construct, not because failure is expected.
 pub(crate) fn http_client_with_timeout(timeout: Duration) -> reqwest::Client {
+    client_builder(timeout)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// The settings every client in the crate shares, as a builder a pinning caller
+/// can add to.
+///
+/// Factored out rather than repeated so [`pinned_client`] cannot drift from
+/// [`http_client_with_timeout`] on the thing that matters here: redirects are off
+/// for both, and a client that followed a 3xx would dial a host after the check,
+/// which is the same hole in a different shape.
+fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
+}
+
+/// A client that dials exactly `addrs` when it resolves `url`'s host.
+///
+/// This is what turns a *graded* answer into a *dialled* one. Without it reqwest
+/// resolves the name again at connect time, so the addresses [`NetGuard::check`]
+/// graded and the addresses the request reached are two answers with a permission
+/// decision in between — the DNS-rebinding window the egress proxy closed in
+/// 0.74.0 and every other caller did not.
+///
+/// The port comes from the URL, not from `addrs`: reqwest's override is a name to
+/// address map and an explicit port in the URL wins over any port in the set, so
+/// the pin cannot move the request to a port that was never checked.
+///
+/// Pins nothing in two cases, both of which need no pin. An IP-literal host is
+/// never handed to a resolver, so there is nothing to override; and an empty
+/// address set means the target was not one [`target`] could reduce, where
+/// pinning to nothing would break a request the guard has already refused or
+/// allowed on other grounds.
+pub(crate) fn pinned_client(url: &str, addrs: &[SocketAddr]) -> reqwest::Client {
+    let host = target(url)
+        .as_deref()
+        .and_then(split_target)
+        .map(|(host, _)| unbracket(host).to_string());
+    let Some(host) = host else {
+        return http_client();
+    };
+    if addrs.is_empty() || host.parse::<IpAddr>().is_ok() {
+        return http_client();
+    }
+    client_builder(REQUEST_TIMEOUT)
+        .resolve_to_addrs(&host, addrs)
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .unwrap_or_else(|_| http_client())
 }
 
 /// The wait a response asks for in its `Retry-After` header, if it asks for one.
@@ -239,6 +312,12 @@ fn parse_http_date(value: &str) -> Option<SystemTime> {
 /// assert_eq!(target("https://[::1]/x").as_deref(), Some("[::1]:443"));
 /// assert_eq!(target("https://[::1]:8080/x").as_deref(), Some("[::1]:8080"));
 ///
+/// // A backslash ends the authority, as it does in the WHATWG parser and in
+/// // Chrome for these schemes. The host is the one a dial would use, not the
+/// // one that follows the `@`.
+/// let got = target("http://127.0.0.1:11434\\@example.com/v1");
+/// assert_eq!(got.as_deref(), Some("127.0.0.1:11434"));
+///
 /// // And the half that matters: these are refusals, not blanks.
 /// for url in [
 ///     "file:///etc/passwd",
@@ -265,9 +344,18 @@ fn parse_http_date(value: &str) -> Option<SystemTime> {
 /// ```
 pub fn target(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
-    // Authority ends at the first '/', '?', or '#'.
+    // Authority ends at the first '/', '?', '#' — or '\', which the WHATWG URL
+    // parser and Chrome's GURL both read as a path separator for exactly the
+    // schemes this function accepts (`http`, `https`, `ws`, `wss` are all
+    // *special*). Leaving it out was authority confusion in a permission
+    // boundary rather than a parsing nicety: in
+    // `http://127.0.0.1:11434\@example.com/v1` the backslash left the userinfo
+    // split below an `@` to find, so this reduced the URL to `example.com:80`
+    // while every parser that went on to dial it read the host as
+    // `127.0.0.1:11434`. The checked host and the dialled host were different
+    // hosts.
     let authority = rest
-        .split(['/', '?', '#'])
+        .split(['/', '?', '#', '\\'])
         .next()
         .filter(|a| !a.is_empty())?;
     // Drop any userinfo; credentials are not part of the host. Dropping it can
@@ -404,13 +492,36 @@ const METADATA_HOSTS: &[&str] = &["metadata.google.internal", "metadata.goog"];
 /// it permitted.
 const LOCAL_HOSTS: &[&str] = &["localhost", "localhost.localdomain"];
 
-/// The address every major cloud's instance-metadata service listens on — AWS,
-/// GCE, Azure, Oracle and DigitalOcean all use it.
+/// The addresses a cloud instance-metadata service listens on, each with the
+/// reason a refusal quotes back.
 ///
-/// Inside 169.254.0.0/16, so the link-local rule below already covers it; named
-/// separately so the refusal says "metadata" rather than "link-local", and so it
-/// stays refused when the operator lifts the floor.
-const METADATA_ADDR: [u8; 4] = [169, 254, 169, 254];
+/// `169.254.169.254` is AWS, GCE, Azure, Oracle and DigitalOcean.
+/// `100.100.100.200` is Alibaba Cloud's, and it is the reason 100.64.0.0/10 is
+/// graded at all: that range is carrier-grade NAT rather than RFC 1918, so
+/// `Ipv4Addr::is_private` does not cover it and this floor did not either until
+/// the range was added below.
+///
+/// Both are inside a range the rules below already refuse, and both are named
+/// here anyway for two reasons: so the refusal says "metadata" rather than
+/// "link-local" or "carrier-grade NAT", and so they stay refused when the
+/// operator lifts the floor. No local model runtime answers on either.
+const METADATA_ADDRS: &[([u8; 4], &str)] = &[
+    (
+        [169, 254, 169, 254],
+        "the cloud instance-metadata address 169.254.169.254",
+    ),
+    (
+        [100, 100, 100, 200],
+        "the Alibaba Cloud instance-metadata address 100.100.100.200",
+    ),
+];
+
+/// Why `octets` is a metadata address, or `None` for anything else.
+fn metadata_reason(octets: [u8; 4]) -> Option<&'static str> {
+    METADATA_ADDRS
+        .iter()
+        .find_map(|(addr, why)| (*addr == octets).then_some(*why))
+}
 
 /// Why `addr` is on the floor, or `None` for an ordinary routable address.
 ///
@@ -421,8 +532,8 @@ fn floor_reason(addr: IpAddr) -> Option<&'static str> {
     match addr {
         IpAddr::V4(v4) => {
             let o = v4.octets();
-            if o == METADATA_ADDR {
-                Some("the cloud instance-metadata address 169.254.169.254")
+            if let Some(why) = metadata_reason(o) {
+                Some(why)
             } else if v4.is_loopback() {
                 // 127.0.0.0/8 — the whole /8, not just 127.0.0.1.
                 Some("loopback, 127.0.0.0/8")
@@ -437,6 +548,15 @@ fn floor_reason(addr: IpAddr) -> Option<&'static str> {
             } else if v4.is_private() {
                 // RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16.
                 Some("a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)")
+            } else if o[0] == 100 && (64..=127).contains(&o[1]) {
+                // 100.64.0.0/10, carrier-grade NAT (RFC 6598). Not RFC 1918, so
+                // `is_private` says nothing about it and the floor let it through
+                // until 0.74.0's own review. It is a provider's internal address
+                // space with the same reachability as one of the private blocks,
+                // and Alibaba Cloud's instance-metadata service answers inside it
+                // at 100.100.100.200 — which is refused by name above, and stays
+                // refused when the operator lifts the floor.
+                Some("carrier-grade NAT, 100.64.0.0/10 (RFC 6598)")
             } else {
                 None
             }
@@ -478,14 +598,22 @@ fn floor_reason(addr: IpAddr) -> Option<&'static str> {
     }
 }
 
-/// Whether `addr` is the cloud metadata address, in either family's spelling.
+/// Whether `addr` is a cloud metadata address, in any of the three spellings a
+/// socket layer will route.
+///
+/// Both IPv6 forms are reduced, not only the mapped one: the widening must not
+/// lift `::169.254.169.254` on the strength of a spelling, for the same reason
+/// [`floor_reason`] grades both.
 fn is_metadata_addr(addr: IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(v4) => v4.octets() == METADATA_ADDR,
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .is_some_and(|v4| v4.octets() == METADATA_ADDR),
-    }
+    let v4 = match addr {
+        IpAddr::V4(v4) => Some(v4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().or_else(|| {
+            let s = v6.segments();
+            (s[..6] == [0, 0, 0, 0, 0, 0])
+                .then(|| Ipv4Addr::from((u32::from(s[6]) << 16) | u32::from(s[7])))
+        }),
+    };
+    v4.is_some_and(|v4| metadata_reason(v4.octets()).is_some())
 }
 
 /// Whether `host` names the metadata service. Case-insensitive, and the
@@ -564,12 +692,12 @@ fn hold(target: &str, host: &str, addrs: &[SocketAddr], local: LocalNet) -> Resu
 /// The half of the floor that needs no resolver: metadata names, names reserved
 /// to this machine, and hosts written as an IP literal.
 ///
-/// This is what [`NetGuard::check_target`] applies, so every existing caller of
-/// the guard gets it without a signature change and without a DNS query at
-/// decision time. It is **not** the whole floor: a name that is not on the lists
-/// above can still resolve onto a local address, and only [`dialable`] can see
-/// that. A call site that opens a socket calls [`dialable`]; one that only
-/// renders or previews a verdict calls this.
+/// It is **not** the whole floor, and on its own it is not much of one: a name
+/// that is not on the lists above resolves onto whatever its owner points it at,
+/// and `169.254.169.254.nip.io` is a name. Only [`dialable_async`] — which calls
+/// this first and then resolves — can see that, and every call site in the crate
+/// that opens a socket goes through it. This form is what remains for the one
+/// gate that cannot: see [`floor_target`].
 ///
 /// `host` may carry brackets (`[::1]`), which is the shape [`target`] produces.
 pub(crate) fn floor_by_name(host: &str, port: u16, local: LocalNet) -> Result<()> {
@@ -593,7 +721,9 @@ pub(crate) fn floor_by_name(host: &str, port: u16, local: LocalNet) -> Result<()
     match bare.parse::<IpAddr>() {
         Ok(ip) => hold(&target, bare, &[SocketAddr::new(ip, port)], local),
         // A name that is not a literal still has to be resolved before it can be
-        // graded, and resolving is `dialable`'s job, not this one's.
+        // graded, and resolving is `dialable_async`'s job, not this one's. A
+        // short-form spelling — `2130706433`, `127.1` — takes this arm too: it is
+        // a literal to `inet_aton` and to nothing here.
         Err(_) => Ok(()),
     }
 }
@@ -605,9 +735,8 @@ pub(crate) fn floor_by_name(host: &str, port: u16, local: LocalNet) -> Result<()
 /// is that the caller does not name the host a second time: a second resolution
 /// between this check and the `connect` is the DNS-rebinding window this closes,
 /// and a caller that takes the `Ok` as a yes and then dials `host` again has
-/// reopened it. `TcpStream::connect(&addrs[..])` and
-/// `reqwest::ClientBuilder::resolve_to_addrs(host, &addrs)` both take the set
-/// directly, which is what makes doing it right the shorter code.
+/// reopened it. `TcpStream::connect(&addrs[..])` and [`pinned_client`] both take
+/// the set directly, which is what makes doing it right the shorter code.
 ///
 /// Fails closed on every uncertainty: an unresolvable name, a name that resolves
 /// to nothing, and a name that resolves to a mix of permitted and refused
@@ -615,33 +744,15 @@ pub(crate) fn floor_by_name(host: &str, port: u16, local: LocalNet) -> Result<()
 /// address that decided and the key that would restore it.
 ///
 /// An IP literal is its own resolution and consults no resolver at all, which is
-/// what keeps a check of `127.0.0.1` offline.
-// The callers are the browser navigation gate and the MCP HTTP client —
-// synchronous sites that open a socket. Nothing in this module dials, so the
-// compiler cannot see them from here; drop the attribute when one lands.
-#[allow(dead_code)]
-pub(crate) fn dialable(host: &str, port: u16, local: LocalNet) -> Result<Vec<SocketAddr>> {
-    floor_by_name(host, port, local)?;
-    let target = format!("{host}:{port}");
-    let bare = unbracket(host);
-    let addrs = match bare.parse::<IpAddr>() {
-        Ok(ip) => vec![SocketAddr::new(ip, port)],
-        // ponytail: blocking resolver on the calling thread. Callers already
-        // inside an async task use `dialable_async`; this form exists for
-        // `NavGate::permits` and every other synchronous decision site.
-        Err(_) => (bare, port)
-            .to_socket_addrs()
-            .map_err(|e| unresolvable(&target, bare, &e))?
-            .collect::<Vec<_>>(),
-    };
-    hold(&target, bare, &addrs, local)?;
-    Ok(addrs)
-}
-
-/// [`dialable`] for a caller already inside an async task, so the resolver does
-/// not block the runtime's worker.
+/// what keeps a check of `127.0.0.1` offline — and is why this crate's own test
+/// suite, whose endpoints are all literals or loopback names, issues no DNS query
+/// even though every decision now runs through here.
 ///
-/// Same contract, same refusals, same "dial what comes back" rule.
+/// A *short-form* literal is not a literal to `IpAddr::from_str`, which wants a
+/// dotted quad: `2130706433` and `127.1` both parse as `127.0.0.1` in
+/// `getaddrinfo` and in neither Rust nor a policy glob. Those reach the resolver
+/// arm below, are answered from `inet_aton` without a query, and are graded like
+/// any other answer — which is the only reason they are refused at all.
 pub(crate) async fn dialable_async(
     host: &str,
     port: u16,
@@ -683,7 +794,7 @@ fn split_target(target: &str) -> Option<(&str, u16)> {
     Some((host, port.parse().ok()?))
 }
 
-/// [`floor_by_name`] for a target already in `host:port` form.
+/// [`dialable_async`] for a target already in `host:port` form.
 ///
 /// The entry point for a decision site that holds a target rather than a host and
 /// a port — which is every one of them, since [`target`] is what produces the
@@ -692,7 +803,30 @@ fn split_target(target: &str) -> Option<(&str, u16)> {
 /// that gets split wrong, and it should be split wrong in at most one place.
 ///
 /// A target this cannot split is one [`target`] did not build, so there is no
-/// host to grade and the caller's own parse is what refused it.
+/// host to grade and the caller's own parse is what refused it. The empty set
+/// that comes back says "nothing to pin", not "nothing objected" — [`hold`]
+/// answers the second question and answers it with a refusal.
+pub(crate) async fn dialable_target(target: &str, local: LocalNet) -> Result<Vec<SocketAddr>> {
+    match split_target(target) {
+        Some((host, port)) => dialable_async(host, port, local).await,
+        None => Ok(Vec::new()),
+    }
+}
+
+/// [`floor_by_name`] for a target already in `host:port` form — the name-only
+/// floor, for the one gate that cannot resolve.
+///
+/// That gate is `browser::NavGate::permits`. Chrome resolves every URL it is
+/// given, and a navigation cannot be pinned to an address without breaking SNI
+/// and certificate validation, so resolving here would refuse names Chrome would
+/// have reached while still not deciding what Chrome dialled. Grading the name is
+/// what is left, and the gap that leaves is stated in this module's own docs and
+/// at the call site rather than implied away.
+///
+/// Feature-gated because the browser is: a guard nothing calls is a defect in its
+/// own right, and `cfg` is how that stays true in a build where the caller is
+/// compiled out.
+#[cfg(feature = "browser")]
 pub(crate) fn floor_target(target: &str, local: LocalNet) -> Result<()> {
     match split_target(target) {
         Some((host, port)) => floor_by_name(host, port, local),
@@ -746,14 +880,19 @@ impl<'a> NetGuard<'a> {
     }
 
     /// Authorize one connection to `url`, returning the verdict for the caller
-    /// to act on.
+    /// to act on and the addresses it may dial.
     ///
     /// `Deny` is an [`Error::Refused`] here rather than a returned verdict,
     /// because there is nothing a caller can usefully do with a denial except
     /// not connect — making it the error type removes the option of ignoring it.
     /// `Allow` and `Ask` come back as verdicts; routing `Ask` to a human is the
     /// caller's job, since only the run loop holds the approver.
-    pub(crate) fn check(&self, url: &str) -> Result<Verdict> {
+    ///
+    /// **Dial the addresses that come back.** They are the ones that were graded,
+    /// and a caller that resolves the host again instead has put a second answer
+    /// where the checked one belongs. [`pinned_client`] is how an HTTP caller does
+    /// that in one line.
+    pub(crate) async fn check(&self, url: &str) -> Result<(Verdict, Vec<SocketAddr>)> {
         let Some(target) = target(url) else {
             // An unparseable target cannot be checked, and an unchecked
             // connection is exactly what this guard exists to prevent.
@@ -764,33 +903,56 @@ impl<'a> NetGuard<'a> {
                 layer: None,
             });
         };
-        self.check_target(&target)
+        self.check_target(&target).await
     }
 
     /// As [`NetGuard::check`], for a target already in `host:port` form.
     ///
     /// The local-address floor (0.74.0) is applied here, underneath the policy: a
-    /// target the operator's rules would allow is refused anyway when it names a
-    /// loopback, link-local, metadata, unique-local or RFC 1918 address, or a name
-    /// reserved to this machine. Only the half of the floor that needs no resolver
-    /// runs here — see [`floor_by_name`] for why, and [`dialable`] for the half a
-    /// call site that actually opens a socket has to run as well.
-    pub(crate) fn check_target(&self, target: &str) -> Result<Verdict> {
+    /// target the operator's rules would allow is refused anyway when it resolves
+    /// onto a loopback, link-local, metadata, carrier-grade NAT, unique-local or
+    /// RFC 1918 address, or names a host reserved to this machine.
+    ///
+    /// **The whole floor runs here, resolver included**, which is the correction
+    /// this method needed: it applied the name-only half, so `allow_net("*")` plus
+    /// `http://169.254.169.254.nip.io/` was a metadata read that no rule and no
+    /// floor said a word about. The cost is one resolution per decision — free for
+    /// an IP literal, which is what every endpoint in this crate's test suite is,
+    /// and one lookup on the runtime's resolver for a name. The benefit is that
+    /// the addresses come back with the verdict, so the caller can dial the set
+    /// that was graded instead of asking a resolver a second question.
+    pub(crate) async fn check_target(&self, target: &str) -> Result<(Verdict, Vec<SocketAddr>)> {
         let mut verdict = self.policy.check(Act::Net, target);
         // Folded into the verdict rather than returned early so the trace row, the
         // observer's `Refused` event and the returned error all say the same thing
         // — the one place those three surfaces have ever disagreed is the thing
         // the observer's headline test exists to catch. A policy that already said
-        // Deny keeps its own attribution: the floor narrows, it does not relabel.
-        let floored = (verdict.effect != Effect::Deny)
-            .then(|| floor_target(target, LocalNet::configured()).err())
-            .flatten();
-        if let Some(Error::Refused { rule, layer, .. }) = floored {
-            verdict = Verdict {
-                effect: Effect::Deny,
-                rule,
-                layer,
-            };
+        // Deny keeps its own attribution: the floor narrows, it does not relabel,
+        // and a target already denied is not resolved at all — there is nothing
+        // for a lookup to change, and a denied host should not have its name sent
+        // to a resolver for the pleasure of whoever is answering.
+        let mut addrs = Vec::new();
+        if verdict.effect != Effect::Deny {
+            match dialable_target(target, LocalNet::configured()).await {
+                Ok(graded) => addrs = graded,
+                Err(Error::Refused { rule, layer, .. }) => {
+                    verdict = Verdict {
+                        effect: Effect::Deny,
+                        rule,
+                        layer,
+                    };
+                }
+                // No other error shape reaches here today. It is handled as a deny
+                // rather than with an `unreachable!` because the fail-open reading
+                // of an unexpected error is the one this boundary must not have.
+                Err(e) => {
+                    verdict = Verdict {
+                        effect: Effect::Deny,
+                        rule: Some(e.to_string()),
+                        layer: Some(FLOOR_LAYER.into()),
+                    };
+                }
+            }
         }
         if let Some((store, run_id, step)) = self.trace {
             let mut ev = match verdict.effect {
@@ -817,7 +979,7 @@ impl<'a> NetGuard<'a> {
                 layer: verdict.layer,
             });
         }
-        Ok(verdict)
+        Ok((verdict, addrs))
     }
 }
 
@@ -1115,6 +1277,15 @@ mod tests {
             ("wss://[fe80::1]/sse", "[fe80::1]:443"),
             // The scheme is matched case-insensitively; the host is not rewritten.
             ("HTTPS://example.com/x", "example.com:443"),
+            // A backslash ends the authority for a special scheme, as it does in
+            // the WHATWG parser and in Chrome's GURL. Until 0.74.0's own review
+            // it did not here, so the first two of these reduced to
+            // `example.com:80` while every parser that went on to dial them read
+            // the host as the loopback endpoint before the backslash. The checked
+            // host and the dialled host were different hosts.
+            ("http://127.0.0.1:11434\\@example.com/v1", "127.0.0.1:11434"),
+            ("https://[::1]\\@example.com/v1", "[::1]:443"),
+            ("https://example.com\\path", "example.com:443"),
         ] {
             assert_eq!(target(url).as_deref(), Some(want), "{url}");
         }
@@ -1128,8 +1299,8 @@ mod tests {
     /// reads `None` as "nothing to check" passes the first and fails the second,
     /// and that is exactly the fail-open reading this test exists to make
     /// impossible to hold — the `None` is the refusal, not a gap before one.
-    #[test]
-    fn an_uncheckable_url_is_refused_not_waved_through() {
+    #[tokio::test]
+    async fn an_uncheckable_url_is_refused_not_waved_through() {
         for url in [
             "",
             "not a url",
@@ -1167,7 +1338,7 @@ mod tests {
             // Even a policy that allows everything cannot allow what it cannot see.
             assert!(
                 matches!(
-                    NetGuard::new(&p).check(url),
+                    NetGuard::new(&p).check(url).await,
                     Err(Error::Refused { act, target, .. })
                         if act == "net" && target == url
                 ),
@@ -1176,16 +1347,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn deny_is_an_error_and_allow_is_a_verdict() {
-        let p = Policy::default().layer("l").allow_net("api.example.com");
+    /// Both hosts are routable literals rather than names, and deliberately: the
+    /// guard resolves what it grades, and a test that named a host would put a DNS
+    /// query in a suite that must not make one.
+    #[tokio::test]
+    async fn deny_is_an_error_and_allow_is_a_verdict() {
+        let p = Policy::default().layer("l").allow_net("93.184.216.34");
         let guard = NetGuard::new(&p);
+        let (verdict, addrs) = guard.check("https://93.184.216.34/v1").await.unwrap();
+        assert_eq!(verdict.effect, Effect::Allow);
+        // And the addresses come back with the verdict, so the caller dials the
+        // set that was graded rather than resolving the host a second time.
         assert_eq!(
-            guard.check("https://api.example.com/v1").unwrap().effect,
-            Effect::Allow
+            addrs,
+            vec!["93.184.216.34:443".parse::<SocketAddr>().unwrap()]
         );
         assert!(matches!(
-            guard.check("https://evil.example.com/v1"),
+            guard.check("https://8.8.8.8/v1").await,
             Err(Error::Refused { act, .. }) if act == "net"
         ));
     }
@@ -1222,6 +1400,22 @@ mod tests {
             (
                 "192.168.1.1",
                 "a private network, RFC 1918 (10/8, 172.16/12, 192.168/16)",
+            ),
+            // Carrier-grade NAT, and the metadata service that lives inside it.
+            // `is_private` says nothing about 100.64.0.0/10, so this range was
+            // permitted until it was named here — and 100.100.100.200 with it.
+            (
+                "100.100.100.200",
+                "the Alibaba Cloud instance-metadata address 100.100.100.200",
+            ),
+            ("100.64.0.1", "carrier-grade NAT, 100.64.0.0/10 (RFC 6598)"),
+            (
+                "100.127.255.255",
+                "carrier-grade NAT, 100.64.0.0/10 (RFC 6598)",
+            ),
+            (
+                "::ffff:100.100.100.200",
+                "the Alibaba Cloud instance-metadata address 100.100.100.200",
             ),
             ("::1", "loopback, ::1"),
             ("::", "the unspecified address, ::"),
@@ -1266,9 +1460,11 @@ mod tests {
         for ok in [
             "93.184.216.34",
             "8.8.8.8",
-            "172.32.0.1",  // just past 172.16/12
-            "172.15.0.1",  // just before it
-            "192.169.0.1", // just past 192.168/16
+            "172.32.0.1",     // just past 172.16/12
+            "172.15.0.1",     // just before it
+            "192.169.0.1",    // just past 192.168/16
+            "100.63.255.255", // just before 100.64/10
+            "100.128.0.1",    // just past it
             "2606:4700::1111",
             "2001:db8::1",
         ] {
@@ -1284,7 +1480,17 @@ mod tests {
             assert!(grade(ip, LocalNet::Denied).is_some(), "{local}");
             assert!(grade(ip, LocalNet::Allowed).is_none(), "{local}");
         }
-        for meta in ["169.254.169.254", "::ffff:169.254.169.254"] {
+        for meta in [
+            "169.254.169.254",
+            "::ffff:169.254.169.254",
+            // The deprecated IPv4-compatible spelling. `is_metadata_addr` reduced
+            // only the mapped one until 0.74.0's own review, so the widening lifted
+            // this one — a spelling was enough to make the floor let go of the
+            // single most valuable address behind it.
+            "::169.254.169.254",
+            "100.100.100.200",
+            "::ffff:100.100.100.200",
+        ] {
             let ip: IpAddr = meta.parse().unwrap();
             assert!(grade(ip, LocalNet::Allowed).is_some(), "{meta}");
         }
@@ -1355,23 +1561,75 @@ mod tests {
         assert!(floor_by_name("127.0.0.1", 8080, LocalNet::Denied).is_err());
         assert!(floor_by_name("[::1]", 8080, LocalNet::Denied).is_err());
         assert!(floor_by_name("[fd00::1]", 8080, LocalNet::Denied).is_err());
-        // And a name that is neither is not decided here — only `dialable` can
-        // see what it resolves to.
+        // And a name that is neither is not decided here — only `dialable_async`
+        // can see what it resolves to, which is why nothing in the crate stops at
+        // this function.
         assert!(floor_by_name("api.example.com", 443, LocalNet::Denied).is_ok());
     }
 
-    /// M10 — a literal target reaches `dialable` without a resolver, and comes
-    /// back as exactly the address the caller must dial.
-    #[test]
-    fn m10_dialable_returns_the_addresses_it_graded() {
-        let got = dialable("93.184.216.34", 443, LocalNet::Denied).unwrap();
+    /// M10 — a literal target reaches `dialable_async` without a resolver, and
+    /// comes back as exactly the address the caller must dial.
+    #[tokio::test]
+    async fn m10_dialable_returns_the_addresses_it_graded() {
+        let got = dialable_async("93.184.216.34", 443, LocalNet::Denied)
+            .await
+            .unwrap();
         assert_eq!(
             got,
             vec!["93.184.216.34:443".parse::<SocketAddr>().unwrap()]
         );
-        let got = dialable("[::1]", 8080, LocalNet::Allowed).unwrap();
+        let got = dialable_async("[::1]", 8080, LocalNet::Allowed)
+            .await
+            .unwrap();
         assert_eq!(got, vec!["[::1]:8080".parse::<SocketAddr>().unwrap()]);
-        assert!(dialable("127.0.0.1", 8080, LocalNet::Denied).is_err());
+        assert!(dialable_async("127.0.0.1", 8080, LocalNet::Denied)
+            .await
+            .is_err());
+        // And a target this cannot split has no host to grade, so it pins nothing
+        // rather than claiming an answer it does not have.
+        assert_eq!(
+            dialable_target("example.com", LocalNet::Denied)
+                .await
+                .unwrap(),
+            Vec::<SocketAddr>::new()
+        );
+    }
+
+    /// M10 — a short-form IPv4 host is resolved and graded, not waved through.
+    ///
+    /// `2130706433` and `127.1` are `127.0.0.1` to `inet_aton`, and to nothing
+    /// else: `IpAddr::from_str` wants a dotted quad, so `floor_by_name`'s literal
+    /// arm does not see them and a policy glob written against `127.0.0.1` does
+    /// not match them either. `2852039166` is the metadata address in the same
+    /// spelling. Only the resolver knows, which is the whole argument for asking
+    /// it — and it answers these from `inet_aton` without a query, so this costs
+    /// no DNS.
+    ///
+    /// Unix only, deliberately: Windows' `getaddrinfo` documents dotted-decimal
+    /// and would send these to a resolver, and a test that emits a DNS query is
+    /// not one this suite may run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn m10_a_short_form_ipv4_host_is_resolved_before_it_is_graded() {
+        for host in ["2130706433", "127.1", "2852039166"] {
+            // The name half sees nothing wrong with it, which is the defect.
+            assert!(
+                floor_by_name(host, 8080, LocalNet::Denied).is_ok(),
+                "{host} is not a literal to the name half"
+            );
+            // The resolving form refuses it, and the widening does not restore
+            // the metadata one.
+            assert!(
+                dialable_async(host, 8080, LocalNet::Denied).await.is_err(),
+                "{host}"
+            );
+        }
+        assert!(
+            dialable_async("2852039166", 80, LocalNet::Allowed)
+                .await
+                .is_err(),
+            "the widening is for local runtimes, not for metadata"
+        );
     }
 
     /// M10 — a `host:port` target splits back the way `target` built it.
