@@ -9,6 +9,101 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What ranking a turn's recall costs now (0.75.0)
+
+**What is being measured.** The same thing 0.57.0 measured, after 0.75.0 stopped
+recomputing it. Recall used to normalise every entry of every scope into a token
+set on every turn, and `remember`'s duplicate check did the same work again over
+the same entries. Each entry's token sets are now written when its value is, so a
+turn reads them where it used to recompute the whole store's worth twice per step.
+
+**The shape to expect, stated before it was measured.** The tokenising is gone
+from the turn and a read is added, so the curve should flatten rather than
+disappear: what remains is one query per scope, the comparison itself, and the
+clone the permutation makes. The gain should grow with the entry count, because
+the entry count is what used to be paid twice.
+
+**Method.** `memory_recall_cost` in `src/run.rs`, `#[ignore]`d because it prints
+rather than asserts. Unchanged from 0.57.0 — same entry counts, same recall rows,
+same medians of 20 — so the two columns are comparable. Run it with:
+
+```text
+cargo test --release --lib memory_recall_cost -- --ignored --nocapture
+```
+
+**Machine.** Apple M1, macOS 26.5.2, release profile, 2026-09-02. The 0.57.0
+column was taken on the same machine on 2026-08-15.
+
+**Numbers.** Medians of 20, against the 0.57.0 figures recorded below:
+
+| Entries | Recall rows | ms/rank 0.57.0 | ms/rank 0.75.0 | ms/`remember` 0.57.0 | ms/`remember` 0.75.0 |
+| --- | --- | --- | --- | --- | --- |
+| 64 (the default) | 1,280 | 1.106 | **0.701** | 1.946 | **0.944** |
+| 512 | 10,240 | 11.088 | **3.149** | 21.172 | **5.170** |
+| 4,096 | 81,920 | 119.171 | **29.038** | 201.369 | **47.816** |
+
+The signal set was 208 tokens. At the default the ranking is about a third
+cheaper; at 4,096 entries it is roughly four times cheaper, and `remember` — which
+paid the cost twice — is a little over four times cheaper. The curve is still
+linear in the entry count, which is expected: what was removed is the tokenising,
+not the walk.
+
+**What it does not measure.** Whether `max_entries` should be raised, which is a
+question about what fits in a *prompt* rather than what fits in a millisecond —
+see `docs/guide/context-and-memory.md`. It also says nothing about a cold store: a
+first turn against entries written by an older binary recomputes and pays roughly
+the 0.57.0 figure once, after which the rows are there.
+
+## What per-step latency attribution costs the step it measures (0.75.0)
+
+**What is being measured.** 0.75.0 records where each committed step's wall clock
+went, and the instrument has to be cheap enough that the number it reports is
+about the work rather than about the measurement.
+
+**The shape to expect, stated before it was measured.** Six `Instant` reads and
+some arithmetic into a small struct per step, plus five nullable columns on an
+`INSERT` that was already happening inside a transaction that was already open. No
+allocation per phase, no extra statement, no extra round trip. So: too small to
+see against the write it rides on.
+
+**Method.** `what_step_attribution_costs_per_step` in `src/state/trace.rs`,
+`#[ignore]`d because it prints rather than asserts. Forty committed steps against
+a fresh in-memory store per round, twenty-one rounds, medians reported. Both arms
+assert they wrote the same number of `steps` rows, and that the attributions are
+present exactly when they were staged, before anything is reported — 0.63.0's
+first facade measurement was itself the defect for want of that check. Run it with:
+
+```text
+cargo test --release --lib what_step_attribution_costs -- --ignored --nocapture
+```
+
+**Machine.** Apple M1, macOS 26.5.2, release profile, 2026-09-02.
+
+**Numbers.** Four separate runs of the pair, medians of 21 rounds each, for 40
+committed steps:
+
+| Run | steps row only | steps row + attribution |
+| --- | --- | --- |
+| 1 | 335.833 µs | 285.291 µs |
+| 2 | 277.750 µs | 279.166 µs |
+| 3 | 300.083 µs | 283.000 µs |
+| 4 | 278.959 µs | 285.250 µs |
+
+**The attributed arm is faster in three of the four runs, which is the finding.**
+Not that attribution is free in some interesting sense — that the difference
+between the arms is smaller than the variation between runs of the same arm, and
+the *sign* of the difference changes from run to run. The cost is below what this
+measurement can resolve, which for 40 steps is a few microseconds, or well under a
+microsecond per step. Four runs are reported rather than one for exactly that
+reason: a single pair would have read as "attribution made it faster", which is
+not a claim anybody should make.
+
+**What it does not measure.** The cost of *reading* the attribution back, which is
+a join against `provider_calls` and is paid by whoever asks rather than by the
+run. Nor the event: `EventKind::StepAttributed` is emitted only when an observer
+is attached, and an unobserved run pays for it exactly what it pays for every
+other event, which is one `Ignore::event` call.
+
 ## What proving the boundary costs a run (0.74.0)
 
 **What is being measured.** 0.74.0 stops taking a backend's word for its own
@@ -397,3 +492,15 @@ streaming, and streaming follows the turn entry point: only the `_observed` and
 or `Session::turn` shows no saving at all, for a reason that has nothing to do
 with this feature — that was the first result this example produced, and it was
 wrong.
+
+**0.75.0 widened the eligible set and did not re-measure the window, deliberately.**
+`list_dir` and the three git readers join `grep`, `find` and `read_file`, so four
+more call shapes now qualify. What the number above measures is the *window* — the
+tail after the tool call, against the time the read takes — and that is a property
+of the completion and the call, not of which tool it is. Widening the set changes
+how often the saving is available, not how large it is on a given call, and "how
+often" is a property of a workload rather than of this crate. The one thing that
+would be worth its own measurement is a **git reader**, because it spawns a process
+where the other six read a file, and a spawn is the larger thing to overlap. That
+is left unmeasured rather than guessed at, and it is the honest gap in this
+release's numbers.

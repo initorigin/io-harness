@@ -465,6 +465,31 @@ pinned entry like any other, because an operator who cannot clear their own stor
 has been locked out by their own correction. Neither is a boundary against
 anything but the agent's own `remember`.
 
+**Ranking is no longer paid for on every turn (0.75.0).** Recall used to normalise
+every entry of every scope into a token set on each turn, and `remember`'s
+duplicate check did the same work again over the same entries — which is why
+`docs/MEASUREMENTS.md` priced a ranking at 119 ms at 4,096 entries and why
+`memory.max_entries` was a knob nobody could raise. Each entry's token sets are
+now computed once and kept in the store beside it.
+
+The ranking itself is unchanged: the same notes, in the same order, printed in the
+store's own `(created_at, key)` order. Two details are worth knowing because they
+decide what the cache can and cannot get wrong:
+
+- **Two token sets per entry, not one.** The ranking scores an entry on its key
+  and value together — a note keyed `parser-quirk` is about the parser whatever
+  its prose says — while the duplicate check compares values alone, because
+  rewriting a key is not restating a fact.
+- **The stamp is the invalidation.** A cached line is used only while it matches
+  the entry's `created_at`, and any other case recomputes. `memory_write` refreshes
+  that stamp on an overwrite, so a changed value misses. `memory_restore` — the
+  rewind path — deliberately does **not**, so that putting a value back does not
+  reorder the memory block; the cache is invalidated explicitly there instead.
+
+A miss is indistinguishable in result from a cold pass. The cache is an
+optimisation and may never change a ranking, which is what makes a store written
+by an older binary, carrying no cached lines at all, read correctly.
+
 **A rewind ignores the pin, and that is deliberate (0.36.0).** `rewind_run` puts
 every entry a run wrote back to the value that was there before its **first**
 write to that key — the same restore-point rule files have had since 0.28.0 — and

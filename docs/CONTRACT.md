@@ -884,6 +884,37 @@ way any wrong slug fails: at the vendor, on the next request.
 overrode a role's own model would be the roster's author being ignored by a
 counter.
 
+**The rules decide from what the run has done; `mechanical` decides from which
+call it is (0.75.0).** `Routing::mechanical` names the model for a completion the
+crate issues on its own behalf rather than the caller's, and it is read from the
+contract at that call site rather than through `apply_routing`, which asks about
+consecutive gate failures and bytes written and has nothing to say about which
+completion this is. The two never reach each other: a run carrying both sends the
+downshift's model on its steps and the mechanical one on its fold.
+
+**There is exactly one mechanical completion, and the crate says which two things
+are not.** The fold's summary is one. The plan classification is **not** — it
+reads the turn's own first completion and issues no request. The duplicate-memory
+check is **not** — it is local token overlap, with no model and nothing over a
+network. Neither can be routed because neither is a call, and this is stated
+rather than left to be discovered by someone looking for a knob.
+
+**Unset changes nothing.** The request the crate builds for a fold is
+byte-identical to 0.74.0's when no mechanical model is named, and no model
+identifier for any vendor appears anywhere in this crate. What is small for a
+vendor is the operator's knowledge.
+
+**The knob's failure mode is quiet, so the trace is loud.** A summary from a model
+too small to summarise degrades every later turn of the run without failing
+anything. The routed call is announced as `EventKind::Routed`, naming the model
+that answered it.
+
+**`[routing]` is refused at project scope.** A table deciding which model answers
+a run — and which model reads the whole transcript when the context is folded — is
+one a cloned repository must not write. It names no program and no endpoint, so it
+is not caught by the clauses 0.74.0 wrote for those; it is refused on the same
+principle, in `io.toml` and `io.local.toml` alike and inside a `[profile]` body.
+
 ## What a capability bundle contributes, and what it may not (0.35.0)
 
 A **plugin** is a directory with a `plugin.toml` at its root, named by a
@@ -1128,6 +1159,72 @@ only — could never hit it. The OpenAI-shaped wire puts text first, so the two 
 blocks lead, the images follow, and the boundary is honoured. Same request, two
 vendors, two different answers, and the difference is a property of the orderings
 rather than a policy this crate chose.
+
+## What the cache hit rate reports, and what one wire cannot tell it (0.75.0)
+
+The counters above have been recorded since 0.18.0. `Usage::cache_hit_rate` and
+`Spend::cache_hit_rate` divide the read by the prompt, which is what makes the two
+breakpoints' effect observable rather than merely sent.
+
+**A rate is a read rate. It is not a statement about what the run paid.** The
+OpenAI wire — OpenAI, OpenRouter and every `Compatible` endpoint — carries no
+cache-write counter. Before 0.75.0 the crate recorded that absence as `0`, which
+is indistinguishable from a call that wrote nothing.
+`Usage::cache_write_tokens` is now `Option<u64>` and
+`Usage::cache_writes_reported` answers which case you have. A high rate over calls
+whose writes were never reported is a partial accounting, and
+`Spend::unreported_cache_writes` counts exactly those calls.
+
+**The crate never infers a write.** Not from the prompt length, not from a
+difference between two calls. An invented number is worse than an absent one, and
+this is the same rule the pricing table follows in refusing to ship vendor prices.
+
+**Nothing about money changed.** An unreported write is billed as fresh input, as
+it always was.
+
+**A rate of zero and no rate are different answers.** A call with a prompt that
+hit nothing rates `Some(0.0)`; a call with no prompt rates `None`. A group's rate
+is `None` when the calls it summed carried no prompt tokens between them —
+**pricing does not enter into it**. A group whose every call is unpriced still
+rates, because usage is summed before a price is looked for, and with no vendor
+prices shipped that is the ordinary case for a partial `PriceTable`. Read
+`Spend::unpriced_calls` for what the group could not cost.
+
+## What a step's attribution accounts for, and what it does not (0.75.0)
+
+Each committed step records its own span and how that span divides — the provider,
+tool execution, the policy gate of which, and the durable write that ended the
+previous step. `Store::step_attributions` reads them with the step's time to first
+token joined beside them; `EventKind::StepAttributed` carries the same numbers onto
+the event stream, beside `EventKind::Step` rather than in place of it.
+
+**An absent phase did not happen. It did not take zero.** A step that dispatched
+no tool has no tool phase. A step whose span was never closed — a tree paused for a
+child's approval, or any commit outside the loop — is not attributed at all,
+because a `0` would be indistinguishable from a step that finished inside a
+millisecond.
+
+**The gate is a part of the tool phase, not a sibling of it**, and it includes
+waiting for a human on a call an approver must answer. A gate that is most of a
+step usually means somebody was asked something, not that anything is slow.
+
+**The store phase belongs to the step that follows it.** It is the commit
+transaction and the ledger persist that ended the previous step, which is the only
+step whose row can still be open to hold it — so a run's first committed step has
+none, always.
+
+**The parts need not sum to the span, and the remainder is reported rather than
+absorbed.** Prompt assembly, the fold and the loop's own bookkeeping are real time
+that no phase claims. Folding it into a neighbour to make the arithmetic tidy would
+make one phase a lie.
+
+**It is written inside the step's own transaction, after the lease check.** A
+driver that lost its lease cannot write an attribution, for the same reason it
+cannot write the step.
+
+**None of these numbers is ever asserted.** No test gates on any duration here, on
+a CI runner or anywhere else; what the instrument itself costs is recorded in
+`docs/MEASUREMENTS.md` with the machine that measured it.
 
 ## What a contained session turn gives you, and what it does not (0.39.0)
 
@@ -1523,17 +1620,58 @@ same as the serial run of the same recorded case — identical rows, not equival
 ones. Concurrency here is an execution detail and the release treats any drift in
 that as the defect it would be.
 
-**Only read-only calls overlap.** Three built-ins are read-only: `grep`, `find`
-and `read_file`. Everything else built in runs one at a time, in order, exactly as
-it did before — `write_file`, `edit_file`, `exec`, the four shell tools, the git
-built-ins, `list_dir`, `view_image`, spawn, `remember`, `todo_write`,
-`ask_question`, `ask_questions`, `propose_plan`, and every built-in added since. That list names
-the tools this paragraph was written against and is deliberately not maintained
-as an enumeration: the rule is the enumeration — three names are read-only and
-everything else built in is not. That includes the git readers and `list_dir`,
-which change nothing: `list_dir` is outside the set the release measured, and the
-git readers reach the world through a process, which a later release will decide
-about with its own evidence rather than by extension.
+**Only read-only calls overlap.** Seven built-ins are read-only as of 0.75.0:
+`grep`, `find`, `read_file`, `list_dir`, and the three git readers `git_log`,
+`git_status` and `git_diff`. Everything else built in runs one at a time, in
+order, exactly as it did before — `write_file`, `edit_file`, `exec`, the four
+shell tools, `git_add`, `git_commit`, `git_branch`, `git_worktree`, `view_image`,
+spawn, `remember`, `todo_write`, `ask_question`, `ask_questions`, `propose_plan`,
+and every built-in added since. That list names the tools this paragraph was
+written against and is deliberately not maintained as an enumeration: the rule is
+the enumeration — a built-in overlaps only if it is named in the first sentence.
+
+**The four that joined in 0.75.0, and the evidence 0.41.0 asked for.** That
+release deferred exactly these, saying a later one would decide "with its own
+evidence rather than by extension". `list_dir` was outside the set 0.41.0
+measured and changes nothing. The three git readers reach the world through a
+process, and that is what needed deciding rather than assuming: each has a
+**fixed argv**, is asked `Act::Exec` on `git` and `Act::Read` on `.git` and on
+every path it names before anything starts, and runs under the same containment
+`dispatch` would have given it. A run whose policy denies `Act::Exec` speculates
+none of them and runs them no earlier than 0.74.0 did.
+
+**The writing git built-ins stay serial, and the line is what they touch rather
+than what they are called.** `git_add` stages — it copies bytes into the object
+store — and `git_commit`, `git_branch` and `git_worktree` each write a ref, a
+commit or a directory. `view_image` also stays serial, for its own unchanged
+reason: it keeps `PendingMedia` unshared.
+
+**A speculated git reader's sandbox rows are written where it is collected, not
+where it spawned.** `Speculation` holds no `Store` — `rusqlite::Connection` is not
+`Sync`, which is the same fact that shaped the whole read path in 0.41.0 — so the
+create, exec and destroy rows a contained spawn owes the trace are written by the
+loop when it folds the call back in, in call order. The **set** of rows a run
+leaves is therefore the same whether a read started early or not; their position
+relative to other events within the step is not. The batched path, which runs on a
+thread that does hold the store, writes them around the spawn as before. The row
+names the containment the call was **narrowed** to — a git reader runs `read-only`
+inside a run granting `workspace-write` — rather than the run's own grant.
+
+**A speculation the settled completion discards leaves no sandbox rows, and the
+process did run.** Speculation starts a call off the stream and keeps it only if
+the settled completion asks for that same call with the same arguments; a
+discarded one is counted in `EventKind::Speculated`'s `discarded` and its result is
+thrown away. For a git reader that means a `git` process really was spawned,
+under containment, and the trace carries no row for it. The count is the honest
+record of it. Nothing else is claimed.
+
+**A spawn that fails outright ends a serial run and does not end an overlapped
+one.** `dispatch` returns the error and the run stops; the overlapping half has
+only a `Dispatched` to return, so the failure becomes an observation the model
+reads and the run continues. The refusals that carry a policy row are not among
+them — `Git::argv` is asked on the caller's own thread, before anything starts,
+precisely so that the row can still be written. What remains is a sandbox backend
+refusing the wrap and an IO error on the spawn itself.
 
 **An MCP tool is never overlapped.** A server can advertise `readOnlyHint`, and
 honouring it means issuing overlapping requests on one `McpSession`. Whether that

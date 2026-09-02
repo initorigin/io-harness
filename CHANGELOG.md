@@ -26,6 +26,113 @@ notes are produced from it.
 
 ### Security
 
+## [0.75.0] - 2026-09-02
+
+**A slow or expensive run is diagnosable from the trace, and the two costs the
+crate paid silently stop being silent.** This crate measures more than any of its
+peers and measured almost nothing about itself: the cache counters it has
+recorded since 0.18.0 were never divided by anything, a step's wall clock was not
+attributed at all, and the memory ranking re-tokenised the whole store on every
+turn — which is why `memory.max_entries` was a knob nobody could raise.
+
+### Breaking changes
+
+- **BREAKING** — `Usage::cache_write_tokens` is now `Option<u64>`. `None` means
+  the wire carries no cache-write counter at all, which is every OpenAI-shaped
+  endpoint and therefore OpenRouter; `Some(0)` means a call that measured zero.
+  Collapsing the two made a hit rate computed on that wire read as a complete
+  accounting of a call that also paid to write the cache. This is the same
+  distinction `CompletionResponse::ttft_ms` has always drawn — a provider that
+  measured nothing reports nothing rather than zero.
+  *Migration:* read the counter as an option, and treat `None` as unknown rather
+  than as zero. Where you previously summed it:
+
+  ```rust
+  // Before
+  let written = usage.cache_write_tokens;
+  // After — an unreported write is not a free one
+  let written = usage.cache_write_tokens.unwrap_or(0);
+  // Better: say which it was
+  if !usage.cache_writes_reported() { /* this wire cannot tell you */ }
+  ```
+
+  Pricing is unchanged: an unreported write is billed as fresh input exactly as
+  it was before.
+- **BREAKING** — `pricing::Spend` gained `unreported_cache_writes`, so a struct
+  literal naming every field no longer compiles.
+  *Migration:* construct with `..Default::default()`, as the type's siblings
+  already document. The field counts calls in the group whose write cost the wire
+  never reported, in the same "this group is a floor, not a total" role
+  `unpriced_calls` already has.
+- **BREAKING (trace)** — `EventKind::StepAttributed` is a new variant. The enum
+  has carried `#[non_exhaustive]` since 0.24.0, so a `match` with a catch-all is
+  unaffected.
+  *Migration:* there is nothing to write for a consumer that already has a
+  wildcard arm. A consumer that wants the new fact matches the variant; one that
+  does not, ignores it.
+
+### Added
+
+- The achieved prompt-cache hit rate is readable from the accounting surface:
+  `Usage::cache_hit_rate()` and `Spend::cache_hit_rate()` return the share of the
+  prompt served from the provider's cache, and `Usage::cache_writes_reported()`
+  says whether the wire reported a write cost at all. A call with no prompt has
+  no rate rather than a rate of zero.
+- `Store::spend_by_session`, beside `spend_by_model`, `spend_by_day` and
+  `spend_by_run`. A session's cost was previously reachable only by folding its
+  turns by hand, because every turn is its own run and the session tables carry
+  no token columns. A run belonging to no session is absent from the grouping
+  rather than bucketed under a sentinel.
+- Per-step latency attribution: each committed step records where its wall clock
+  went — the provider, tool execution, the policy gate of which, and the durable
+  write that ended the step before — read with `Store::step_attributions`, which
+  carries the step's time to first token beside it. Written inside the checkpoint
+  transaction, so a driver that lost its lease cannot write one.
+- `EventKind::StepAttributed` announces that attribution beside `EventKind::Step`,
+  so a live run can be diagnosed without waiting for it to end and reading the
+  store.
+- `Routing::mechanical` names the model that answers the completions the crate
+  makes on its own behalf. There is exactly one today — the summary a fold writes
+  when the context is compacted, which until now was answered by whatever model
+  was doing the work. Unset, nothing changes.
+- A `[routing]` section in `io.toml`, projecting `escalate_after`/`escalate_to`,
+  `downshift_under`/`downshift_to`, `require_primary` and `mechanical`. Routing
+  has been able to change which model answers mid-run since 0.34.0 and was
+  reachable only from Rust. A rule is a threshold and a model, and naming one
+  without the other is refused at load rather than half-applied.
+
+### Changed
+
+- **BREAKING (behaviour)** — `list_dir`, `git_log`, `git_status` and `git_diff`
+  are read-only calls now, so they overlap with each other and with `grep`,
+  `find` and `read_file` inside one completion, and can start before the
+  completion finishes streaming. 0.41.0 deferred exactly these four pending
+  evidence; each is asked `Act::Exec`, `Act::Read` on `.git` and `Act::Read` on
+  every path it names before anything starts, and runs under the same containment
+  it would have had serially. `git_add`, `git_commit`, `git_branch`,
+  `git_worktree` and `view_image` are unchanged.
+  *Migration:* there is nothing to write for most callers — the results and the
+  observations are identical, and a run whose policy denies `Act::Exec`
+  speculates none of them. Two things move for a caller that inspects the trace:
+  these calls may now run concurrently rather than in call order, and a
+  *speculated* git reader's sandbox rows are written when the call is collected
+  rather than around its spawn. `TaskContract::with_max_parallel_reads(1)`
+  restores 0.40.0's fully serial execution shape, as it always has.
+- The memory ranking and `remember`'s duplicate check read each entry's
+  normalised token sets from the store instead of recomputing them every turn.
+  The ranking is unchanged — the same notes in the same order — and
+  `memory.max_entries` is now a number an operator can raise. See
+  `docs/MEASUREMENTS.md` for the before and after.
+
+### Security
+
+- `[routing]` is refused in a file inside the workspace, `io.toml` and
+  `io.local.toml` alike, and inside a `[profile]` body. A table that decides
+  which model answers a run, and which model reads the whole transcript when the
+  context is folded, is one a cloned repository must not write. It names no
+  program and no endpoint, so it is refused on the principle 0.74.0 wrote down
+  rather than by the same clause. Declare it in the user-scope file instead.
+
 ## [0.74.0] - 2026-09-01
 
 **The boundary this crate is built to be is now actually on the path, and it

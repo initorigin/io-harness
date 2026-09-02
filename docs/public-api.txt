@@ -228,6 +228,7 @@ struct StdinResponder src/approve.rs
 struct Steer src/session.rs
 struct SteerInbox src/session.rs
 struct Steering src/session.rs
+struct StepAttribution src/state.rs
 struct StepRecord src/state.rs
 struct Store src/state.rs
 struct StoreSize src/state.rs
