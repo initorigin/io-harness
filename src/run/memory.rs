@@ -127,6 +127,13 @@ pub(super) fn recall_signals(
 ///
 /// The decoration is computed once per entry rather than inside a comparator,
 /// which would re-tokenise every value `n log n` times on the turn's own path.
+///
+/// Since 0.75.0 it is not tokenised here at all. Each entry's normalised tokens
+/// are written when its value is ([`Store::memory_token_lines`]), so a turn reads
+/// them where it used to recompute the whole store's worth of them twice per
+/// step — once for the workspace scope and once for the global one. What the
+/// ranking *is* did not change: a cache miss recomputes, and the three terms and
+/// their order are 0.57.0's.
 pub(super) fn rank_notes(
     store: &Store,
     workspace: &str,
@@ -137,13 +144,13 @@ pub(super) fn rank_notes(
         return Ok(());
     }
     let draws = store.memory_draws(workspace)?;
+    let lines = store.memory_token_lines(workspace, notes)?;
     let mut ranked: Vec<(usize, usize, usize)> = notes
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            let tokens = crate::state::memory_tokens(&format!("{} {}", e.key, e.value));
             (
-                signals.intersection(&tokens).count(),
+                Store::memory_token_line_shared(signals, &lines[i].0),
                 draws.get(&e.key).copied().unwrap_or(0),
                 i,
             )
@@ -478,8 +485,37 @@ pub(super) async fn compact_ledger<P: Provider>(
                 // No tools. A summariser describes the run's work; it does not do
                 // any, and a tool schema it cannot call is tokens spent on nothing.
                 tools: Vec::new(),
+                // (0.75.0) The one completion this crate makes on its own behalf
+                // rather than the caller's, and the only one an operator can point
+                // at a cheaper model. `apply_routing` never reaches here — it is
+                // called once, from the workspace loop, against the step's own
+                // request — so this is set from the contract directly rather than
+                // through the routing rules, which decide the model from what the
+                // *run* has done and have nothing to say about which call this is.
+                //
+                // Unset, this is `None` and the request is byte-identical to
+                // 0.74.0's, which is what keeps the knob opt-in.
+                model: contract.routing.as_ref().and_then(|r| r.mechanical.clone()),
                 ..Default::default()
             };
+            // Announced, because a routed call that is invisible is one an
+            // operator can only find on a bill. `from` is empty exactly as it is
+            // in the step's own routing event when the run was on the provider's
+            // default — which is what a fold has always been on — and `why` names
+            // the call rather than a threshold, because this rule fires on which
+            // completion it is and not on what the run has done.
+            if let Some(model) = &request.model {
+                watch.emit(RunEvent::at_depth(
+                    run_id,
+                    step,
+                    depth,
+                    EventKind::Routed {
+                        from: String::new(),
+                        to: model.clone(),
+                        why: "the fold's summary, on the mechanical model".into(),
+                    },
+                ));
+            }
             // Through the same choke point as every other completion, so the fold
             // lands one `provider_calls` row, is retried by the same policy, is
             // inside the run's token budget, and is billed where an operator is
