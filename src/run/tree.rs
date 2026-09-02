@@ -300,6 +300,14 @@ where
         // reads the empty set, so the four rules below are structurally inert for
         // anything this agent spawns rather than inert by four separate tests.
         let extras = tree.extras(depth);
+        // And the turn is typed immediately, the same order — and for the same
+        // reason — the flat loop writes it in: `Store::check_resumable` refuses a
+        // `running` reply as work to continue, so every instruction between the
+        // row's creation and this one is a window in which a killed process
+        // leaves a row that says nothing about what it was and is offered as
+        // resumable work. Moved here from below the ledger in 0.74.0, where the
+        // egress proxy had grown in front of it.
+        open_turn_kind(tree.store, run_id, extras)?;
         // 0.31.0 — the plan gate, at the root only. A child that could hold its own
         // plan open would mean a hundred pending plans from one `run_tree`, which is
         // the problem the gate exists to prevent rather than a feature of it. As in
@@ -518,9 +526,6 @@ where
         // criterion failing the same way every step is reported once rather than
         // once per step. Per agent, like everything else in this loop.
         let mut last_gate_feedback: Option<String> = None;
-        // And the turn is typed before its first completion is billed, the same
-        // order the flat loop writes it in.
-        open_turn_kind(tree.store, run_id, extras)?;
         let mut progress = Progress::new();
         // Per agent, not per tree. A child's handles are the child's: it is the
         // one that knows when they are finished with, and a shared registry

@@ -701,8 +701,8 @@ impl Plugins {
     ///   a manifest's `[[hook]]`, `[[mcp]]` and `[[bin]]` are returned like any
     ///   other contribution. What that scope does *not* carry is the bundle's
     ///   location: a user-scope `[[plugin]]` whose `path` resolves inside the
-    ///   discovery root is graded by [`Plugins::load`] as the workspace file it
-    ///   is, and the same manifest is refused there. An installer that writes a
+    ///   discovery root is graded at load time as the workspace file it is, and
+    ///   the same manifest is refused there. An installer that writes a
     ///   bundle into the project it is working on wants that answer, not this
     ///   one.
     /// - [`Scope::Project`] is the committed `io.toml` that arrives with a

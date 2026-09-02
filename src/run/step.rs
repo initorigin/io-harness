@@ -195,12 +195,25 @@ pub(super) fn seed_conversation(ledger: &mut ContextLedger, extras: &TurnExtras<
     }
 }
 
-/// Type a classifying turn as a reply before its first completion is billed.
+/// Type a classifying turn as a reply **as the first thing either loop does**.
 ///
-/// Written in this order rather than at the close, so a process killed
-/// mid-answer leaves a row that says what it was doing: `check_resumable`
-/// refuses it as work to continue, because there is no committed step to
-/// continue from and re-asking replaces the one completion at the same price.
+/// Written this early rather than at the close, so a process killed mid-answer
+/// leaves a row that says what it was doing: `check_resumable` refuses it as work
+/// to continue, because there is no committed step to continue from and re-asking
+/// replaces the one completion at the same price.
+///
+/// **"Before the first completion is billed" was the rule until 0.74.0 and it was
+/// too weak.** It is satisfied by any position above the step loop, so run start
+/// was free to grow work in front of it — and it did: an egress proxy, then a
+/// boundary probe that spawns up to three children with timeouts of their own.
+/// Each of those is a window in which the run row exists, says nothing about what
+/// it is, and is therefore offered as resumable work if the process dies inside
+/// it. The rule is now positional and has no budget to spend: this call is the
+/// first statement of `run_workspace_from`, and the first after `extras` is bound
+/// in `agent_loop`. A race that only opens on a slow host is one a fast
+/// development machine will not show you — `session_reply`'s
+/// `a_turn_that_died_while_answering_is_not_resumable_work` failed on two CI
+/// platforms and passed locally, which is what that looks like from the outside.
 pub(super) fn open_turn_kind(store: &Store, run_id: i64, extras: &TurnExtras<'_>) -> Result<()> {
     if extras.classify {
         store.set_turn_kind(run_id, TURN_KIND_REPLY)?;
@@ -627,6 +640,29 @@ pub(super) async fn run_workspace_from<P: Provider>(
     watch: &Watch<'_>,
     extras: &TurnExtras<'_>,
 ) -> Result<RunResult> {
+    // 0.37.0 — a turn that may answer is typed as a reply before anything else
+    // this function does, and corrected to a run the moment its first completion
+    // reaches for a tool. `Store::check_resumable` refuses a `running` reply as
+    // work to continue, because there is no committed step to continue from and
+    // re-asking replaces the one completion at the same price.
+    //
+    // **Moved to the top of the function in 0.74.0, and the reason is a defect
+    // this release introduced.** It used to sit just above the step loop, which
+    // was "before the first completion is billed" and so satisfied the rule as
+    // written. Then run start grew work in front of it — an egress proxy, and a
+    // boundary probe that spawns up to three short-lived children with timeouts
+    // of their own — and every millisecond of that was a window in which the run
+    // row existed, said nothing about what it was, and was therefore offered as
+    // resumable work if the process died inside it.
+    // `session_reply`'s `a_turn_that_died_while_answering_is_not_resumable_work`
+    // caught it on two CI platforms while passing on a fast development machine,
+    // which is what a race looks like from the outside.
+    //
+    // Nothing between here and the loop needs the row untyped, and the ordering
+    // is now robust to whatever else run start grows: this is the first statement,
+    // so the window is as small as the row's own creation.
+    open_turn_kind(store, run_id, extras)?;
+
     // 0.34.0 — every precondition a review criterion and a routing rule bring,
     // checked before the first completion is billed. A contract that cannot be
     // honoured should cost nothing to find out about, which is why this is here
@@ -911,14 +947,6 @@ pub(super) async fn run_workspace_from<P: Provider>(
     // of the conversation: the model that wants it again asks again, and the
     // request stays bounded by what one step actually needed.
     let pending_media = &mut PendingMedia::default();
-    // 0.37.0 — a turn that may answer is typed as a reply before its first
-    // completion is billed, and corrected to a run the moment that completion
-    // reaches for a tool. Written in this order rather than at the close, so a
-    // process killed mid-answer leaves a row that says what it was doing:
-    // `Store::check_resumable` refuses it as work to continue, because there is no
-    // committed step to continue from and re-asking replaces the one completion at
-    // the same price.
-    open_turn_kind(store, run_id, extras)?;
 
     for step in start_step..=contract.max_steps {
         // The store's copy of each live handle's processes, refreshed each step.
