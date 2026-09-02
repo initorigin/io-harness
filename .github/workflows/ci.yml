@@ -139,7 +139,7 @@ jobs:
           key: ${{ matrix.features }}
       # nextest, installed from a prebuilt binary by a SHA-pinned action like
       # every other `uses:` in this file. Not a crate dependency.
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
         with:
           tool: cargo-nextest
       # `--tests` plus the fixture examples by name, NOT `--all-targets`.
@@ -313,7 +313,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: contained
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
         with:
           tool: cargo-nextest
       # Deliberately no `sysctl` step. Reported so a reader of the log can see
