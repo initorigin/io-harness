@@ -84,8 +84,16 @@ fn report(label: &str, model: &Option<String>, usage: Option<Usage>) -> u64 {
         Some(u) => {
             println!(
                 "  {label:<28} model={model:<32} prompt={:<7} cache_read={:<7} cache_write={:<7} \
-                 completion={}",
-                u.prompt_tokens, u.cache_read_tokens, u.cache_write_tokens, u.completion_tokens,
+                 hit_rate={:<7} completion={}",
+                u.prompt_tokens,
+                u.cache_read_tokens,
+                // `{:?}` because the counter is `Option` as of 0.75.0: this
+                // example runs against OpenRouter, whose wire reports no write
+                // counter, so the honest rendering here is `None` rather than a
+                // zero a reader would take for a measurement.
+                format!("{:?}", u.cache_write_tokens),
+                format!("{:?}", u.cache_hit_rate()),
+                u.completion_tokens,
             );
             u.cache_read_tokens
         }
@@ -294,9 +302,10 @@ async fn main() -> io_harness::Result<()> {
     }
 
     println!(
-        "\nNote: OpenRouter reports no cache-write counter, so every `cache_write` above is \
-         zero by construction on this wire and the writing call's cost is unreported rather \
-         than measured. Do not infer it from the prompt length."
+        "\nNote: OpenRouter reports no cache-write counter, so every `cache_write` above reads \
+         `None` — unreported, not measured as zero (0.75.0). Every hit rate here is therefore a \
+         read rate over an unknown write cost, and that is the honest reading of this wire. Do \
+         not infer the write from the prompt length."
     );
     Ok(())
 }

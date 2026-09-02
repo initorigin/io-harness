@@ -590,10 +590,13 @@ impl Accumulator {
                 total_tokens: get("total_tokens"),
                 cache_read_tokens: detail("/prompt_tokens_details/cached_tokens"),
                 // The OpenAI wire has no cache-write counter: a cached prefix is
-                // written implicitly and billed as a normal prompt token. Left at
-                // zero rather than inferred, because inferring it would invent a
-                // number the invoice does not contain.
-                cache_write_tokens: 0,
+                // written implicitly and billed as a normal prompt token. Left
+                // absent rather than inferred, because inferring it would invent
+                // a number the invoice does not contain — and (0.75.0) absent
+                // rather than zero, because a hit rate read beside a zero here
+                // would read as a complete accounting of a call whose write cost
+                // this wire never reported.
+                cache_write_tokens: None,
                 reasoning_tokens: detail("/completion_tokens_details/reasoning_tokens"),
                 // Reported by neither OpenAI nor OpenRouter in this shape today;
                 // the counter is read where a provider does report it and stays
@@ -989,7 +992,8 @@ mod tests {
         assert_eq!(u.total_tokens, 1_200);
         // No cache-write counter exists here: a cached prefix is billed as a
         // normal prompt token, and inventing a split would invent money.
-        assert_eq!(u.cache_write_tokens, 0);
+        assert_eq!(u.cache_write_tokens, None);
+        assert!(!u.cache_writes_reported());
         assert_eq!(out.model.as_deref(), Some("gpt-5"));
         assert_eq!(out.finish_reason.as_deref(), Some("length"));
     }

@@ -62,7 +62,7 @@ async fn main() -> io_harness::Result<()> {
         let u = c.usage.unwrap_or_default();
         println!(
             "  step {} attempt {} — model {:?}\n    \
-             prompt {} (cache read {}, write {}), completion {} (reasoning {}), total {}\n    \
+             prompt {} (cache read {}, write {:?}), completion {} (reasoning {}), total {}\n    \
              latency {}ms, ttft {:?}, finish {:?}, failure {:?}",
             c.step,
             c.attempt,
