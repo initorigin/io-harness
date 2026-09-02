@@ -54,6 +54,25 @@
 //! nothing about the network — and [`super::linux::rung`] therefore refuses to
 //! hand it a run that denies egress, rather than letting it report a boundary it
 //! did not apply.
+//!
+//! And what arrives at ABI 4 is **TCP**: `LANDLOCK_ACCESS_NET_BIND_TCP` and
+//! `LANDLOCK_ACCESS_NET_CONNECT_TCP` are the whole network vocabulary the
+//! interface has, so a datagram socket is outside every rule this rung can
+//! write. A run that denied egress could still `sendto` any host in the world,
+//! with DNS as the channel that needs nothing installed. The other half of that
+//! denial is the seccomp filter installed beside the rule set, which refuses
+//! `socket` for every family but `AF_UNIX` and for anything but a stream over
+//! `AF_INET`/`AF_INET6`. Neither half is the boundary on its own, and
+//! [`Plan::restricts_network`] is the one answer both are built from.
+//!
+//! ## The mask has a floor as well as a ceiling
+//!
+//! An access the rule set does not *handle* is restricted nowhere, not merely
+//! outside the granted hierarchies. `FS_TRUNCATE` arrives at ABI 3, so on an
+//! ABI 1–2 kernel `truncate` reaches every file the run's uid can write —
+//! emptying a key file outside the workspace is a write by any reading of that
+//! word — while the rung reports that it confines writes. [`usable_abi`] refuses
+//! such a kernel outright rather than reporting a boundary with that hole in it.
 
 // On a host that is not Linux this module is compiled for its tests and for
 // nothing else — `landlock_run` is a stub returning `None` — so the whole
@@ -116,6 +135,31 @@ const ALL_FS: u64 = FS_EXECUTE
     | FS_REFER
     | FS_TRUNCATE
     | FS_IOCTL_DEV;
+
+/// The first ABI whose rule set can restrict `truncate` (Linux 6.2), and
+/// therefore the lowest ABI this rung will take at all.
+///
+/// The sibling of [`super::linux::LANDLOCK_NET_ABI`], which lives beside the
+/// chain that consults it. This one is about the rights, so it lives with them.
+pub(crate) const LANDLOCK_TRUNCATE_ABI: u32 = 3;
+
+/// The ABI this rung will accept from a host, or `None` when the kernel's
+/// Landlock cannot enforce what the rung would report.
+///
+/// A right the rule set does not handle is not restricted anywhere, so an
+/// ABI 1–2 kernel leaves `truncate` alone over the whole filesystem while
+/// [`Backend::confines_writes`](crate::Backend::confines_writes) answers true
+/// for this rung — `truncate` on a key file outside the workspace succeeds, and
+/// the run reports that its writes were confined. The rung refuses the host
+/// instead, exactly as [`super::linux::rung`] refuses to hand it an
+/// egress-denying run below [`super::linux::LANDLOCK_NET_ABI`], and for the same
+/// reason: a rung that cannot apply what it reports must not be the one chosen.
+///
+/// The next rung down is a mount namespace, which has no such gap. A host with
+/// no rung below it takes the portable floor, which claims neither boundary.
+pub(crate) fn usable_abi(reported: u32) -> Option<u32> {
+    (reported >= LANDLOCK_TRUNCATE_ABI).then_some(reported)
+}
 
 /// The filesystem rights an ABI of `abi` knows about.
 ///
@@ -183,6 +227,20 @@ pub(crate) struct Plan {
     pub(crate) net_ports: Vec<u16>,
 }
 
+impl Plan {
+    /// Is this run's outbound network the rung's business at all?
+    ///
+    /// True for the two runs whose outbound TCP the rule set takes control of:
+    /// one that denies egress, and one routed through the loopback proxy. Both
+    /// need the same answer twice, because Landlock's network rights are TCP
+    /// only and the seccomp filter installed beside the rule set is what refuses
+    /// the datagram socket underneath them. A run that may reach the network is
+    /// false here and keeps every socket it ever had.
+    pub(crate) fn restricts_network(&self) -> bool {
+        self.handled_net != 0
+    }
+}
+
 /// Build the rule set for a run.
 ///
 /// `writable` is the run's already-resolved writable roots — exists-filtered by
@@ -224,10 +282,21 @@ pub(crate) fn plan(
         write_roots.push(workdir.to_path_buf());
     }
     write_roots.extend(writable.iter().cloned());
-    // The system temporary directory, unconditionally. Not a convenience: it is
-    // the same allowance the macOS profile makes for `/private/var/folders` and
-    // the mount setup makes for `${TMPDIR:-/tmp}`, and without it most
-    // toolchains fail on their first temporary file.
+    // Whatever temporary directory the caller resolved, unconditionally. Not a
+    // convenience: it is the same allowance the macOS profile makes for
+    // `/private/var/folders`, and without somewhere to open a temporary file
+    // most toolchains fail immediately.
+    //
+    // Both callers still resolve it as `std::env::temp_dir()`, so on this rung
+    // that grant is the whole system temporary directory — and
+    // `crate::sandbox::workdir` puts every run's ephemeral workspace inside it,
+    // so two concurrent runs can read and rewrite each other's workspace from
+    // inside their own sandboxes. 0.74.0 narrowed the two mount rungs to a
+    // directory the run owns (`super::linux::tmp_target`, with `TMPDIR` pointed
+    // at it) and left this one as it was: narrowing it means changing what both
+    // `super::linux::landlock_run` and `crate::sandbox::contain_command` pass
+    // here, and pointing the child's `TMPDIR` at the result, or the grant and
+    // the directory a toolchain reaches for stop being the same place.
     write_roots.push(tmp.to_path_buf());
 
     for root in write_roots {
@@ -347,6 +416,11 @@ mod imp {
     /// The kernel's Landlock ABI, or `None` when this host has no usable
     /// Landlock.
     ///
+    /// *Usable* is [`usable_abi`]'s word and it is narrower than "present": an
+    /// ABI this rung cannot report honestly is answered as no Landlock at all,
+    /// so the whole chain — [`super::linux::rung`], the plan, the rule set —
+    /// reads one answer rather than each deciding again.
+    ///
     /// **This asks the LSM rather than reading `/sys/kernel/security/lsm`**, so
     /// a kernel built with Landlock and booted without it in `lsm=` answers
     /// honestly. What it deliberately does *not* do is apply a restriction:
@@ -372,7 +446,7 @@ mod imp {
             if v <= 0 {
                 return None;
             }
-            let abi = v as u32;
+            let abi = usable_abi(v as u32)?;
             // Creating a real rule set is where a kernel that answers the
             // version query and still cannot serve one fails, and it costs one
             // file descriptor that is closed immediately.
@@ -608,6 +682,112 @@ mod tests {
         // A kernel newer than anything this module knows must not be asked for
         // a bit this module invented.
         assert_eq!(fs_rights_for(9), fs_rights_for(5));
+    }
+
+    /// L10 — a kernel whose Landlock cannot restrict `truncate` is not a
+    /// Landlock host as far as this rung is concerned.
+    ///
+    /// Fails on 0.73.0's behaviour, where the probe reported ABI 1 and ABI 2 as
+    /// usable and the chain selected the rung on them: `truncate` was then
+    /// unrestricted over the whole filesystem — the right was not *handled*, so
+    /// it was not confined anywhere — while the run reported a backend whose
+    /// [`Backend::confines_writes`](crate::Backend::confines_writes) is true.
+    #[test]
+    fn l10_the_rung_is_refused_below_the_abi_that_can_restrict_truncate() {
+        use crate::sandbox::linux::{rung, Rungs};
+        use crate::Backend;
+
+        assert_eq!(usable_abi(1), None, "no FS_TRUNCATE, so no rung");
+        assert_eq!(usable_abi(2), None);
+        assert_eq!(usable_abi(LANDLOCK_TRUNCATE_ABI), Some(3));
+        assert_eq!(usable_abi(6), Some(6));
+        // The floor is the ABI that can restrict the right, and the mask agrees
+        // with it: this is the first ABI whose rule set carries FS_TRUNCATE.
+        assert_ne!(fs_rights_for(LANDLOCK_TRUNCATE_ABI) & FS_TRUNCATE, 0);
+        assert_eq!(fs_rights_for(LANDLOCK_TRUNCATE_ABI - 1) & FS_TRUNCATE, 0);
+
+        // The chain reads that one answer, so an ABI 2 host takes the rung below
+        // this one — a mount namespace, which has no such gap — for every run,
+        // whatever its egress requirement.
+        let old = Rungs {
+            landlock_abi: usable_abi(2),
+            bubblewrap: false,
+            unshare: true,
+        };
+        for deny_egress in [false, true] {
+            assert_eq!(
+                rung(old, deny_egress, false),
+                Backend::LinuxNamespaces,
+                "an ABI 2 kernel must not be handed this rung"
+            );
+        }
+        // And a host that can enforce it still takes the rung it always took.
+        let new = Rungs {
+            landlock_abi: usable_abi(3),
+            ..old
+        };
+        assert_eq!(rung(new, false, false), Backend::LinuxLandlock);
+
+        // The refusal can leave nothing above the floor, and the floor is where
+        // it lands rather than an unconfined spawn wearing a rung's name. It
+        // claims neither boundary, which is what keeps that honest.
+        let bare = Rungs {
+            landlock_abi: usable_abi(2),
+            bubblewrap: false,
+            unshare: false,
+        };
+        assert_eq!(rung(bare, true, false), Backend::PortableFloor);
+        assert!(!Backend::PortableFloor.confines_writes());
+        assert!(!Backend::PortableFloor.denies_egress());
+    }
+
+    /// H9 — Landlock's network rights are TCP only, so the plan's network answer
+    /// is also the seccomp filter's: a run whose outbound TCP this rung takes
+    /// control of is a run whose datagram sockets have to be refused by the
+    /// filter installed beside the rule set.
+    ///
+    /// 0.73.0 had no such answer to give and installed one filter for every run,
+    /// which is why an egress-denying run could `sendto` anywhere.
+    #[test]
+    fn h9_the_plan_says_whether_the_socket_filter_is_needed() {
+        let denied = plan(
+            4,
+            ExecMode::WorkspaceWrite,
+            true,
+            Path::new("/w"),
+            &[],
+            Path::new("/tmp"),
+            None,
+        );
+        assert!(denied.restricts_network(), "a run that denied egress");
+
+        let proxied = plan(
+            4,
+            ExecMode::WorkspaceWrite,
+            false,
+            Path::new("/w"),
+            &[],
+            Path::new("/tmp"),
+            Some(54321),
+        );
+        assert!(
+            proxied.restricts_network(),
+            "a proxied run's UDP must not walk past the port its TCP is scoped to"
+        );
+
+        let open = plan(
+            4,
+            ExecMode::WorkspaceWrite,
+            false,
+            Path::new("/w"),
+            &[],
+            Path::new("/tmp"),
+            None,
+        );
+        assert!(
+            !open.restricts_network(),
+            "a run that may reach the network keeps every socket it had"
+        );
     }
 
     /// The egress half of the honesty rule, at the layer that builds the

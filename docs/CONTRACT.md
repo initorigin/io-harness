@@ -150,6 +150,22 @@ a link, a redirect, a script assigning `location`. Each decision is one
 `BrowserNavigated { host, permitted }` event, so a trace records every place the
 browser went *and every place it was stopped from going*.
 
+**A URL that reaches no host is decided by its scheme instead, before the
+navigation is issued (0.74.0).** Only `http`, `https`, `ws` and `wss` reduce to a
+`host:port`, so only they take the check above; every other spelling produced no
+request for the gate to pause and was therefore permitted by default and recorded
+nowhere, which is how `file:` read a local file past `Act::Read` and past every
+secret deny with no row saying it happened. The rule is an allowlist and not a
+list of known-bad schemes: `about:blank` is permitted, because it is the empty
+page the browser is opened on and a run that wants to leave a page has nowhere
+else to go, and `file:`, `data:`, `blob:`, `javascript:` and every scheme nobody
+has considered are refused. An unrecognised scheme is not a harmless one. Each of
+those decisions is a `BrowserNavigated` event too, whose `host` is the **scheme**
+— lowercased, with its colon — and never the URL: a `data:` URL is its own
+payload and a `javascript:` URL is a program, so writing either into the trace
+and into the model's observation would copy the thing that was refused into two
+places it was refused from reaching.
+
 What it does **not** claim, stated rather than left to be discovered:
 
 - **Subresources are not individually policy-checked.** Images, stylesheets,
@@ -171,14 +187,22 @@ What it does **not** claim, stated rather than left to be discovered:
 - **A selector that matches nothing fails, naming the selector.** It is never
   reported as a click that happened — a model cannot detect that from a
   successful-looking result.
-- **`[browser]` is refused at project scope**, like `[[hook]]`, because it names a
-  program to execute and `io.toml` arrives with a `git clone`.
+- **`[browser]` is refused in any file inside the workspace**, like `[[hook]]`,
+  because it names a program to execute: `io.toml` arrives with a `git clone`, and
+  `io.local.toml` is a path the run's own agent can write. The user-scope file is
+  where it goes.
 
 `Workspace::read_bytes`, `Workspace::write_bytes` and
 `Verification::DocumentContains` are present in **every** build. Without the
 features, `DocumentContains` returns a typed error naming the missing feature
 rather than the variant disappearing — a conditional enum variant is a breaking
-change for every `match` a caller wrote.
+change for every `match` a caller wrote. Since 0.74.0 `Workspace::read_bytes`
+refuses a file over **64 MiB** rather than reading it into memory, and a path that
+escapes the workspace root is denied rather than graded on its collapsed spelling
+— `check_path` graded `../../x` as `x` until then — with a write no longer
+following a symlink at the leaf out of the root. A path that stays inside the
+root, including one that uses `..` to get there or goes through a symlink pointing
+inside, is unaffected.
 
 ## Platform support
 
@@ -247,10 +271,17 @@ must not be read as the same claim.
 `SandboxConfig::with_access_confinement()` selects it.**
 `io_harness::sandbox::appcontainer` creates a container profile, derives
 its SID, grants a path to it with an explicit ACE, and spawns into it through
-`CreateProcessW` with a `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute
-list. On the Windows CI runner a payload inside one is refused a read it was not
-granted and has no route off the machine, each against a negative control that
-must succeed outside the container.
+`CreateProcessW` with a process-thread attribute list carrying **two** attributes:
+`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, which puts the child in the
+container, and — since 0.74.0 — `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, which
+decides what crosses into it. Without the second, `bInheritHandles` is a blanket:
+*every* inheritable handle this process holds is duplicated into the child
+carrying the access it was opened with, and no ACL sees it, because a handle does
+not go back through an access check. The list names the capture file the two
+standard streams are redirected to plus whatever the caller asked for by name, and
+nothing else. On the Windows CI runner a payload inside one is refused a read it
+was not granted and has no route off the machine, each against a negative control
+that must succeed outside the container.
 
 **The boundary is opt-in and the Windows default has not moved.**
 `sandbox::select` chooses the Job Object unless the config asked for access
@@ -871,14 +902,15 @@ no checksum, no provenance. Nothing fetches, installs or updates a bundle either
 distribution is the application's. What *is* bounded is what an untrusted bundle
 may contribute, which is a different and achievable claim.
 
-**A project-scoped declaration may not contribute a hook, an MCP server or an
-executable.** All three name a program this machine would run, and `io.toml` is
-the file a `git clone`
-delivers — the 0.28.0 rule for `[[hook]]`, applied to a new declaration site and
-extended to `[[bin]]` in 0.73.0. The
-refusal is whole: a project-scoped bundle whose manifest declares one contributes
-none of its other kinds either, because a half-applied stranger's manifest is the
-failure the rule exists to prevent. **A manifest is not substituted at all**:
+**A declaration from any file inside the workspace may not contribute a hook, an
+MCP server or an executable.** All three name a program this machine would run;
+`io.toml` is the file a `git clone` delivers, and `io.local.toml` is a path in the
+workspace root the run's own agent can write — the 0.28.0 rule for `[[hook]]`,
+applied to a new declaration site, extended to `[[bin]]` in 0.73.0 and to the local
+scope in 0.74.0. Only a bundle declared from the **user-scope** file contributes
+all seven kinds. The refusal is whole: a workspace-declared bundle whose manifest
+declares one contributes none of its other kinds either, because a half-applied
+stranger's manifest is the failure the rule exists to prevent. **A manifest is not substituted at all**:
 `${env:}`, `${file:}` and `${cmd:}` are each refused in every scope, as of
 0.71.0. Before that only `${cmd:}` was, which was enough while a manifest could
 be reached only after an operator had written a `[[plugin]]` entry naming it —
@@ -886,12 +918,28 @@ a trust act. `Plugins::inspect` is pointed at directories nobody has agreed to
 yet, so the other two became reachable on untrusted input, and reading a host's
 environment or its files is the same class of act as running a program on it.
 
-**This does not narrow the standing `[[mcp]]` gap in `io.toml` itself.** A
-project-scoped `io.toml` may still name an MCP command directly, and an unknown
-key inside an `[[mcp]]` table is still accepted, because serde refuses `flatten`
-beside `deny_unknown_fields`. A *plugin's* `[[mcp]]` is refused there, so the new
-surface is stricter than the old one — deliberately: new surface starts closed,
-existing surface is not narrowed under a release nobody asked to break.
+**A bundle points only at itself, and a declaration only inside the workspace
+(0.74.0).** `skills` and `templates` join `[[bin]]`'s `path` under the rule that a
+bundle contributes a directory it ships rather than one it points at somewhere else
+on this machine: absolute, or climbing out with `..`, is refused at load, lexically,
+in every scope. The cost is higher for the first two than for a `[[bin]]`, which is
+a path handed back for a caller to decide about — a skills directory is *read* at
+run start, and the frontmatter of every `*.md` under it is composed into the model's
+system prompt on every turn. A `[[plugin]]`'s own `path` is contained under the
+discovery root for the same reason, through `contain_under_root` rather than
+lexically, because that directory has to exist for there to be a manifest at all
+and a symbolic link is therefore a live route; one that resolves outside is
+**dropped** with its reason rather than refused, like every other bundle that fails
+to load.
+
+**0.74.0 closed the `[[mcp]]` gap in `io.toml` itself.** Through 0.73.0 a
+project-scoped `io.toml` could still name an MCP command directly while a
+*plugin's* `[[mcp]]` was refused there — the new surface started closed and the
+existing one was left alone. That asymmetry is gone: `[[mcp]]` and `[[lsp]]` are
+refused sections in both workspace files, so the same declaration is refused with
+a bundle around it and without one. What has not changed is that an unknown key
+inside an `[[mcp]]` table is still accepted, because serde refuses `flatten`
+beside `deny_unknown_fields`.
 
 **Plugin-supplied policy may only narrow.** A `[policy]` block may carry layers of
 `deny` rules; an `allow` rule, an `ask` rule or a `defaults` block drops the
@@ -1241,9 +1289,10 @@ and an absent event is not a statement. The per-command `SandboxEvent` rows are
 unchanged.
 
 **An `io.toml` may name the mode**, as `[sandbox] mode = "read-only"`. It obeys
-the standing trust rule: a project-scoped file may narrow and may never widen, so
-`mode = "full-access"` is refused there exactly as `force_floor = false` and
-`allow_network = true` already are.
+the standing trust rule: a file inside the workspace may narrow and may never
+widen, so `mode = "full-access"` is refused in `io.toml` and — since 0.74.0 — in
+`io.local.toml`, exactly as `force_floor = false` and `allow_network = true`
+already are.
 
 **A contained command keeps the workspace root as its working directory.** This is
 what makes containment usable for a build at all. The sandbox never discarded a
@@ -1288,6 +1337,49 @@ into it, so only the network namespace was real. A host whose kernel refuses the
 remounts degrades to `PortableFloor` and **reports the floor** rather than naming
 an isolation that was never applied — the recorded backend is the one that
 applied, which is the point of recording it.
+
+**Since 0.74.0 what a run reports is measured rather than declared.**
+`sandbox::BoundaryProbe` attempts a write and a dial outside the boundary before
+the first step, and `confines_writes()`, `denies_egress()` and the boundary
+sentence the agent is given answer from what happened rather than from the
+backend's own claim — three findings in this release were a backend reporting a
+containment it had not applied. Every arm fails closed, and a **control** child
+runs outside the boundary first, so a host that could never have performed an arm
+reports it *unmeasured* rather than refused: a run on such a host is told the
+boundary could not be established, not that there is none. The probe is taken once
+per boundary — once per flat run, and once per tree before the root agent runs, so
+a child's trace carries no probe row of its own — and an uncontained run is not
+probed at all, because a row naming the backend that *would* have applied is the
+same misattribution the probe exists to catch. What is recorded is one
+`sandbox_events` row of kind `boundary_probe` at step 0, announced on the event
+stream like every other row in that table.
+
+**What the probe contradicts is the run's own claim, not the backend's.**
+`claimed_confinement` and `claimed_egress_denial` are what *this* run asked for;
+`Backend::confines_writes` and `Backend::denies_egress` are unconditional
+properties of a backend, and comparing against those reported two correct
+configurations as a backend that had lied — a run that permits network, where the
+dial is supposed to land, and every `ExecMode::FullAccess` run on macOS and Linux,
+where `select` reads the platform rather than the mode so an unwrapped run still
+names a confining backend. **A proxied run claims neither arm**: its egress is
+scoped by the proxy rather than denied by the boundary. A tree that will be
+proxied is therefore recorded **unmeasured** rather than measured — on Linux the
+proxy decides which rung the chain picks, so a measurement taken before it exists
+is a measurement of a different boundary.
+
+**The Linux namespace rung requires `setpriv`, and 0.74.0 is where it started
+to.** `unshare --user --map-root-user` runs the mount setup as uid 0, and a root
+process exec'ing a file with no file capabilities keeps a full permitted set — so
+the payload arrived holding `CAP_SYS_ADMIN` over the very mount namespace the
+setup had just made read-only, and one `mount -o remount,bind,rw /` undid every
+remount above it. `ExecMode::ReadOnly` was a label on that rung while
+`Backend::confines_writes` answered `true`. The setup now ends
+`exec setpriv --no-new-privs --inh-caps=-all --bounding-set=-all`, which empties
+the bounding set so nothing on the far side can add a capability back; a nested
+user namespace does not recover it either, because mounts propagated into a new
+mount namespace arrive locked. `setpriv` ships in util-linux beside `unshare`, and
+a host without it fails the rung's own probe rather than running the payload — the
+chain skips that rung and the run is reported under the backend it actually got.
 
 **On Linux the "Yes" in that table depends on which rung of the chain the host
 admits.** Three of the four rungs need an unprivileged user namespace, and Ubuntu
@@ -1352,18 +1444,22 @@ handles were not, and it did not mention that the git built-ins were not either 
 so which tool the model happened to pick decided whether the boundary applied.
 Both now take the same containment every other spawn takes, per stage.
 
-**That is not every process the crate starts, and three later releases each added
-one.** The automatic post-edit checker and the `check` tool build their own
-uncontained `Exec` (0.51.0); a language server named in `[[lsp]]` is spawned
+**That is not every process the crate starts, and 0.74.0 closed the two that
+mattered most.** The automatic post-edit checker and the `check` tool built their
+own uncontained `Exec` (0.51.0); a language server named in `[[lsp]]` is spawned
 directly (0.52.0); and on unix the browser child is spawned directly (0.53.0).
-None of the three is wrapped by the backend `select` chose, so on those paths the
-filesystem boundary is the policy's alone. What each still passes through is
-stated where it is specified: starting a language server is an `Act::Exec` check,
-`check` is an `Act::Exec` check on program and argv, the post-edit checker is
-deliberately ungated as the crate's own reflex after a write the policy already
-allowed, and every navigation the browser makes is an `Act::Net` check whose
-egress takes the run's own proxy. Wrapping them is a later release's work, and it
-is recorded here rather than left to be discovered.
+Both checker spawns now take the run's own containment and are asked of the
+policy first, which matters because a checker is a compiler and a compiler runs
+the workspace's own `build.rs`, its proc macros and any `rustc-wrapper` — code
+chosen by whoever wrote the files in the tree, which under this crate's threat
+model is not the operator. A language server and the browser child are still not
+wrapped by the backend `select` chose, so on those two paths the filesystem
+boundary is the policy's alone. What each passes through is stated where it is
+specified: starting a language server is an `Act::Exec` check, both the `check`
+tool and the post-edit reflex are `Act::Exec` checks on the program and on the
+whole argv, and every navigation the browser makes is an `Act::Net` check whose
+egress takes the run's own proxy. Wrapping the remaining two is a later release's
+work, and it is recorded here rather than left to be discovered.
 
 The design question that paragraph deferred — what a resumed run does with a
 handle whose sandbox no longer exists — is answered by construction rather than
@@ -1682,10 +1778,12 @@ characters) becomes the reason the model reads, and the run adapts. `on_failure`
 chooses otherwise — `cancel` ends the run at the next step boundary, `continue`
 lets the call through — and `refuse` is the default for a lifecycle hook.
 
-**It is refused in a project-scoped `io.toml`, exactly as any hook is**, inside a
-`[profile]` too. A hook runs an argv on this machine and `io.toml` is the file a
-`git clone` delivers; one that can stop a tool is strictly more dangerous than one
-that appends a log line. Write it in `io.local.toml` or the user-scope file.
+**It is refused in any file inside the workspace, exactly as any hook is**, inside
+a `[profile]` too. A hook runs an argv on this machine; `io.toml` is the file a
+`git clone` delivers, and `io.local.toml` — refused since 0.74.0 — is a path in
+the workspace root the run's own agent can write. One that can stop a tool is
+strictly more dangerous than one that appends a log line. Write it in the
+user-scope file, which is the one file no workspace can reach.
 
 **It costs a process spawn per matching call.** The `tools` filter is how an
 operator pays for the check they wanted rather than for one per read, and an
@@ -1992,7 +2090,20 @@ One further line names the run's `ExecMode` and the backend `sandbox::select`
 **actually returned** on this host — not the one that was asked for. Where that is
 the portable floor or a Windows Job Object, the line says the resource caps apply
 and filesystem and outbound-network confinement do not — the truth an agent would
-otherwise have to discover (0.40.0). A stock Ubuntu 24.04 is no longer an example
+otherwise have to discover (0.40.0). **Since 0.74.0 what that line claims comes
+from the `BoundaryProbe`'s measurement rather than from the backend's design**:
+`Backend::confines_writes` and `Backend::denies_egress` say what a backend is
+built to apply, and twice — 0.40.0 and 0.48.0 — this block was wrong in the same
+direction because the code was right about the design and wrong about the host.
+The behaviour change an operator will see is the fail-closed one: an arm the probe
+could not attempt answers `false`, so a host with no probe program, or none with a
+directory outside the boundary to aim at, is told the boundary could not be
+established even under a backend that would have confined it. That sentence says
+what this run could not establish rather than that there is no confinement,
+because only the first of those is known to be true. The proxied egress half is
+worded off the same measurement: a dial that was attempted and refused reads as
+the proxy being the only way through, one that was watched leaving reads as
+advisory, and one that could not be attempted says so. A stock Ubuntu 24.04 is no longer an example
 of it: that host takes the Landlock rung, which needs no namespace. A run under
 `ExecMode::FullAccess` gets the line too, saying it is not contained: since 0.46.0
 that is a decision the caller made, and an agent that may write anywhere should
@@ -2153,15 +2264,27 @@ callable before one. It takes no arguments, so what runs is the detection's
 answer and not the model's. It reports and never blocks: a failing check does not
 undo an edit.
 
-**`check` is `Act::Exec`-gated and the automatic post-edit check is not**, and the
-difference is deliberate rather than an oversight. The automatic one is the
-crate's own reflex after a write the policy already allowed. The tool is a
-model-callable path to the project's build command, so it is checked on the
-program *and* on the whole argv, exactly as `exec` is — `deny_exec("cargo")` and
-`deny_exec("cargo check*")` both reach it, and a refused call spawns nothing. The
-other difference: when there is no checker, the tool says so and the automatic
-path stays silent. Silence costs nothing when nobody asked and reads as "your
-project is clean" when somebody did.
+**Both checkers are `Act::Exec`-gated, and they differ only in what they do with
+a refusal (0.74.0).** Each is checked on the program *and* on the whole argv,
+exactly as `exec` is — `deny_exec("cargo")` and `deny_exec("cargo check*")` both
+reach either — and each runs what it does run inside the run's own containment.
+Until 0.74.0 the automatic one was ungated and uncontained on the argument that it
+was the crate's own reflex after a write the policy had already allowed; that
+argument was wrong, because `cargo check` compiles and compiling runs the
+workspace's `build.rs`, so a run that wrote a `Cargo.toml` and then wrote a build
+script reached host execution through two calls an approver saw as writes.
+
+The tool reports a refusal and the reflex is silent about one, and only
+`Effect::Allow` runs the reflex — an `Effect::Ask` is a skip rather than a
+question, because this path has no approver to route one to and a write that
+paused on an approval prompt would be the very thing the paragraph above forbids:
+a successful write turned into something else by what happens after it.
+**`Policy::default()` sets `exec: Ask`, so under it the post-edit check does not
+run at all.** A run that wants it names the checker with `allow_exec`; the write
+itself is unaffected and still cannot fail, and the diagnostics are simply absent.
+The other difference is older: when there is no checker, the tool says so and the
+automatic path stays silent. Silence costs nothing when nobody asked and reads as
+"your project is clean" when somebody did.
 
 **`rewind_step` undoes one step, and you walk backwards.** `rewind` puts a file
 back to before the run's **first** write to it and `rewind_run` does that for a
@@ -2511,6 +2634,12 @@ completion:
   a boundary another process enforces, and records what it stated. Enforcement in
   *this* process means not turning the feature on and using a tool the harness
   executes itself.
+- **Only the user scope may declare it in a file (0.74.0).** `[web]` is a refused
+  section in `io.toml` and in `io.local.toml`, on the same rule `[[hook]]` and
+  `[[provider]]` are refused by: the bullet above is exactly why — a route out of
+  the boundary that no rung of this crate mediates is not a repository's to switch
+  on. `TaskContract::with_web` is unaffected, because that is the application
+  deciding rather than the workspace.
 - **A declaration a vendor cannot carry is refused, not narrowed.** OpenAI's Chat
   Completions takes an allow-list and has no fetch tool; OpenRouter's web plugin
   takes no domain filter and has no fetch tool. Either mismatch is an
@@ -2631,24 +2760,91 @@ a projection onto the typed API and never a second path into the run loop:
   the `Policy` the caller loaded; the file is where it was written down. An agent
   that can write the workspace root can write an `io.toml`, and the *next* load —
   the caller's act, not the agent's — will read it.
-- **A project-scoped file may narrow the boundary and may never widen it
-  (0.27.0).** Four keys are refused in `io.toml` when, and only when, the value
-  written is the widening one: `policy.defaults.exec = "allow"`,
-  `policy.defaults.net = "allow"`, `sandbox.allow_network = true`, and
-  `sandbox.force_floor = false`. So is `${cmd:...}` anywhere in that file, including
-  inside a `[profile]`. **So is the whole `[[hook]]` array (0.28.0)** — not its
-  executing half: a hook that runs an argv is the `${cmd:...}` primitive arriving one
-  release later, and a hook that appends is a write to a path a stranger chose, which
-  is the same hazard by a shorter route. Each is accepted unchanged in
-  `io.local.toml` and in the user scope, and the narrowing value of each of the four
-  keys stays legal in `io.toml`. **A number has no widening value, so five keys are
+- **A file inside the workspace may narrow the boundary and may never widen it
+  (0.27.0, extended to `io.local.toml` in 0.74.0).** Twelve keys are refused when,
+  and only when, the value written is a widening one: `policy.defaults.read`,
+  `policy.defaults.write`, `policy.defaults.exec` and `policy.defaults.net` set to
+  `"allow"`; `sandbox.allow_network = true`; `sandbox.force_floor = false`;
+  `sandbox.mode` set to `"full-access"` **or** `"workspace-write"`; and each of the
+  five `[sandbox.limits]` caps set to `0`, which is the spelling that means *no
+  cap*. `read` and `write` (0.74.0) were the omission that mattered most: the
+  shipped defaults are `read = "allow"` and `write = "ask"`, a later scope overrides
+  an earlier one, and the project scope outranks the user scope — so a cloned file
+  writing `write = "allow"` turned every unmatched write from a question into a
+  silent grant whatever the operator's own file said. `"workspace-write"` (0.74.0)
+  is refused for the same merge reason: written in a workspace file it raised an
+  operator's `read-only` back to the crate's default, and `read-only` is the one
+  value that narrows in every direction. Also refused are `${cmd:...}` and — since
+  0.74.0 — `${file:...}`, in **both** workspace files: `${cmd:}` runs a program at
+  load, and `${file:}`'s argument is joined onto the file's own directory, where an
+  absolute one replaces that directory outright. Both refusals reach inside a
+  `[profile]`. And **a `[[policy.layers]]` entry may carry `deny` rules and nothing
+  else** (0.74.0): layers append to the shipped defaults with no effect filter and
+  `Policy::explain` resolves deny → ask → allow, so an `allow` layer in a cloned
+  `io.toml` was `policy.defaults.exec = "allow"` written five lines from where that
+  is refused — and its `net` spelling also switched the sandbox's own
+  `allow_network` back on, because every spawn site resolves that flag from the
+  policy. An `ask` rule is refused too, because an ask hands capability out as
+  well: it converts an act the operator's default denied into one an approver is
+  asked to wave through. This is the rule `plugin.rs` has held a *more* trusted
+  file to since 0.35.0.
+
+  **So are six whole sections**, and the rule they implement is one sentence rather
+  than a list: *anything that names a program to run, names an endpoint a credential
+  is sent to, or opens a route out of the boundary the `Policy` does not gate, is
+  refused outside the user scope.* `[[hook]]` (0.28.0), `[browser]` (0.53.0), and
+  `[[provider]]`, `[[mcp]]`, `[[lsp]]` and `[web]` (0.74.0). The third clause is
+  0.74.0's and `[web]` is what it was written for: a provider-executed search or
+  fetch is dialled by the provider, so `Act::Net` never sees it, no rung of the
+  sandbox is on the path, and the domain lists beside it are a filter this crate
+  states rather than enforces. A section is refused whole rather
+  than by its hazardous key: a rule that permits half a table is a rule a reader has
+  to hold two halves of, and the next key added to that table lands on the permitted
+  side by default. The cost is stated rather than hidden — `[web] search = false` is
+  a narrowing sentence a workspace file can no longer write either, which is the
+  0.28.0 whole-section argument being paid the same way `[[hook]]` pays it. And two
+  keys that name a **directory** are held to the root:
+  `run.skills` and `run.templates` may not be absolute and may not climb out with
+  `..` (0.74.0), because both are joined onto the discovery root and the frontmatter
+  of every `*.md` under them is composed into the model's system prompt on every
+  turn — a read, not an act, and one that happens before any `Policy` exists to have
+  an opinion about it. A `[[plugin]]`'s own `path` is held to the same boundary,
+  through `contain_under_root`, so a symbolic link out of the workspace is caught
+  too; such a declaration is dropped with its reason rather than refused, like every
+  other bundle that fails to load.
+
+  **`io.local.toml` is held to all of it since 0.74.0.** It is the operator's own
+  file in intent; in fact it is a path in the workspace root, and a run's agent
+  writes paths in the workspace root. One `write_file` of an unremarkable name
+  declared a `[[hook]]`, an `[[mcp]]` command or a `[[provider]]` endpoint that the
+  next `Config::discover` would act on, outside the `Policy` and outside the sandbox,
+  and nothing about that write looked like an escalation. The **user scope** is the
+  one file no workspace can reach — `$IO_CONFIG`, else `$IO_CONFIG_HOME/io.toml`,
+  else `$XDG_CONFIG_HOME/io/io.toml` or `~/.config/io/io.toml`; on Windows
+  `%IO_CONFIG%`, else `%IO_CONFIG_HOME%\io.toml`, else `%APPDATA%\io\io.toml` — so it
+  is the one still trusted to widen, and every refusal above names it. The narrowing
+  value of each of the twelve keys stays legal in both workspace files, because a
+  project file denying `exec` is exactly what the scope is for. **A number has no
+  widening value, so five keys are
   held to the lower of the two instead** — `run.max_read_chars` (0.55.0),
   `run.max_wait_secs` (0.60.0) and the three `[memory]` caps (0.56.0): a project file may tighten an operator's ceiling
-  and may not loosen it, while `io.local.toml` and the user scope set it outright. **This does not claim that a cloned repository is
-  safe** — `[[mcp]]` still names a command, `[toolchain]` still names an argv, and a
-  policy layer can still allow what the defaults did not. It is a specific narrowing
-  of a specific hazard: the keys whose effect is to remove containment from a file
-  that arrives with a `git clone`.
+  and may not loosen it, while `io.local.toml` and the user scope set it outright.
+  That asymmetry is deliberate and is the one an operator trips over: 0.74.0 grew
+  the *refusals* to cover `io.local.toml` and deliberately left the lower-only rule
+  at the project scope alone, because the two answer different questions — a number
+  a workspace file lowers is a ceiling an operator still chose, where a section a
+  workspace file declares is a program an operator never saw.
+  A `[sandbox.limits]` cap is the other way round and is refused categorically at
+  `0` rather than compared, because `0` means *no cap* and a check that reads one
+  file at a time does not have the user scope's number to compare against.
+  **This does not claim that a cloned repository is
+  safe** — `[toolchain]` still names an argv the embedding application may act on,
+  `[instructions]` still puts the repository's own prose in front of the model, and
+  a workspace file may still name a `[[plugin]]`, with what that bundle may
+  contribute bounded rather than the naming. It is a specific narrowing of specific hazards: the keys
+  whose effect is to remove containment, and the sections that name a program or a
+  credentialled endpoint, in a file the workspace supplies. The boundary against the
+  agent is still the `Policy` the caller loaded.
 - **An unknown key is an error**, naming the key and the file, rather than being
   ignored. There are exactly two exceptions and they are stated together: a key
   inside a `[[mcp]]` table, because `McpServer` is `#[serde(flatten)]`-based and
@@ -2713,8 +2909,11 @@ about how a run is watched; it changes who can write one.
   talks by exiting non-zero. A failure is traced at warn level with the hook's index
   and the reason, and never with the event, which may carry a goal or a target.
 - **Hooks do not accumulate across scopes.** Unlike `[[policy.layers]]` and
-  `[[agent]]`, the array is not in `APPENDING`: a later scope replaces it whole, so
-  one `[[hook]]` in `io.local.toml` discards every hook the user-scope file declared.
+  `[[agent]]`, the array is not in `APPENDING`: a later scope replaces it whole. Since
+  0.74.0 only the user scope may declare it, so there is no second file left for that
+  rule to arbitrate between — what a run gets is that file's hooks, and then whatever
+  a user-scope bundle contributed, which `Plugins::apply_to_hooks` **appends** to
+  them.
 
 **What every recorded number is, and is not (0.18.0).** The trace now answers
 what a run cost and which model spent it, and the provenance of each figure
@@ -2876,10 +3075,18 @@ starts, not what a started thing then does.
 **What a command the agent runs is bounded by.** As of 0.17.0 the agent can run
 a command with the `exec` tool. Every call is an `Act::Exec` check on the program
 *and* on the whole argv, so `allow_exec("cargo test*")` beside
-`deny_exec("cargo publish*")` means what it reads. A refusal, and an approver's
-decision, land in `policy_events` attributed to the rule and layer; a silent
-allow does not write a row, exactly as it does not for a read or a write. What
-the policy does **not** decide is what the command then does.
+`deny_exec("cargo publish*")` narrows an allowlist to the sub-command it names.
+An argv deny is sound **inside** an allowlist and nowhere else: it holds where
+`defaults.exec` is `Deny` or `Ask` and explicit `allow_exec` rules say what may
+run, and it is not a blocklist over a permissive default. A joined argv can be
+spelled in more ways than a pattern can enumerate — `["git","-c","x","push"]`
+puts a flag between the program and the sub-command, and `["env","rm"]` and
+`["busybox","rm"]` reach the program under another name — so a denylist over a
+permissive tier is a boundary with an unbounded number of ways around it, and no
+pattern makes it complete. Write the allowlist, then narrow it. A refusal, and an
+approver's decision, land in `policy_events` attributed to the rule and layer; a
+silent allow does not write a row, exactly as it does not for a read or a write.
+What the policy does **not** decide is what the command then does.
 
 A command runs with the **workspace root as its working directory**, and since
 0.46.0 it runs **contained by default**: `ExecMode::WorkspaceWrite` is the
@@ -3293,10 +3500,33 @@ nothing is resolved from `PATH` by ecosystem, and the detected toolchain is
 deliberately not consulted — mapping an ecosystem to a binary would be a guess
 about the operator's machine.
 
-**`lsp_rename` writes nothing.** It answers with a patch series in `patch_file`'s
+**The `path` a navigation names is an `Act::Read` check, taken before the server
+is told anything (0.74.0).** Until this release the path was only ever joined onto
+the workspace root — which an absolute argument discards outright and a `../..`
+climbs out of — and then read from disk and shipped to the server as a `didOpen`,
+so `lsp_hover {"path": "../../../../etc/shadow"}` moved a file across the boundary
+`read_file` would have refused, and left no row saying so. The check is
+`Workspace::check_path`, so it refuses what `resolve` refuses — an absolute path,
+and a `..` that leaves the root whether or not the file exists — before it grades
+anything, and the refusal is written through the same gate every other refusal in
+a run is: one `policy_events` row, attributed to the rule and layer. A read tier
+of `Ask` therefore **prompts** on a navigation where it used to pass silently,
+which is the treatment `read_file` already gets. `Policy::default()` allows reads,
+so the common configuration is unchanged.
+
+**`lsp_rename` writes nothing, and renders a patch only for files the policy
+allows reading outright.** It answers with a patch series in `patch_file`'s
 format. Every byte that reaches the workspace goes through `write_file`,
 `edit_file` or `patch_file` and their gates: one `Act::Write` check per path,
-all-or-nothing per file.
+all-or-nothing per file. The reading side is the server's choice rather than the
+model's — a `WorkspaceEdit` names whatever files the server decided the rename
+touches — and rendering a diff for one puts its removed lines in the model's
+context, so each is resolved under the workspace root and must be `Effect::Allow`
+(0.74.0). An `Ask` is not permission here: there is no approver on this path to
+answer the question, and an unanswered question is not a yes. Under a policy that
+asks about reads a rename renders no patch and says so; a run that wants the patch
+grants `allow_read` over the tree it is renaming in, which is the grant applying
+that patch already needs.
 
 **Positions are 1-based** on the way in and out, as `read_file` shows them and a
 compiler reports them. The protocol's zero base is an internal detail. Line 0 is
@@ -3431,9 +3661,9 @@ loaded set and none of them can forget the check.
 
 **A disabled bundle is still validated, and still held to its scope's trust
 rule.** It is loaded, so a broken one is reported as broken whether or not it is
-switched on, and a project-scoped bundle declaring a hook is refused even while
-disabled — switching it on is a one-character edit, and a refusal that can be
-sidestepped by shipping something switched off is not a refusal.
+switched on, and a workspace-declared bundle declaring a hook is refused even
+while disabled — switching it on is a one-character edit, and a refusal that can
+be sidestepped by shipping something switched off is not a refusal.
 
 **And it claims no id.** A bundle's id is what namespaces the names it
 contributes, and a disabled one contributes nothing, so holding the id against it
@@ -3480,6 +3710,27 @@ comparison appeared at four sites and all four are fixed: the git spawn, every
 MCP tool invocation, and both checks in a spawned agent's worktree creation (the
 write *and* the `git` exec beneath it — gating only the first would have left
 `worktree = true` dead under the default policy).
+
+**A git built-in's `Act::Exec` target is the program alone.** The string put to
+the policy and to the approver is `git`, so `deny_exec("git")` reaches every one
+of them and `deny_exec("git commit*")` reaches none — no built-in ever presents a
+joined argv the way `exec` does, and it could not: the argv these tools build
+carries the `-c` hardening flags between the program and the sub-command, so the
+text an operator would have to write is one this crate composes rather than one
+they chose. A sub-command is denied by naming what it touches instead —
+`deny_write(".git")` stops `git_commit` and `git_branch`, and a `deny_read` on a
+path stops `git_add` staging it. Undocumented until 0.74.0, and stated here rather
+than changed: adding a joined-argv target would break every policy written
+`allow_exec("git")` under a deny-by-default tier.
+
+**`git_worktree`'s path is contained, absolute spellings included (0.74.0).** It
+is the one built-in that *creates* the path the model named, so it is asked of
+`Workspace::check_path` directly rather than only of the gate, whose relaxation
+for an absolute read or write target exists so `read_skill` can reach a bundle
+outside the root. Under a policy with broad writes, `{"path":"/tmp/escaped"}` put
+a full checkout outside the workspace and wrote an allow-shaped row to match. An
+absolute path and a `..` that climbs out are now the same refusal, with the same
+row, as every other path in this crate.
 
 **A `Deny` posture still refuses without asking, and that is the arm that
 matters.** The fix is not `!= Deny`; that would turn `Ask` into `Allow` for any
@@ -3601,12 +3852,16 @@ one to `exec`. Where a host places a contributed binary, and whether the policy
 lets the agent invoke it, are the host's decisions and are governed by
 `Act::Exec` like any other program.
 
-**Only a trusted scope may contribute one.** `[[bin]]` joins `[[hook]]` and
-`[[mcp]]` as a contribution a project-scoped `io.toml` may not make, for the
-same reason: it names a program this machine would run and `io.toml` arrives
-with a `git clone`. A manifest declaring one from that scope is refused **whole**
-and the bundle lands on `Plugins::dropped()` — none of its other kinds are
-applied either.
+**Only the user scope may contribute one.** `[[bin]]` joins `[[hook]]` and
+`[[mcp]]` as a contribution a bundle declared from a file **inside the workspace**
+may not make, for the same reason: it names a program this machine would run.
+`io.toml` arrives with a `git clone`, and `io.local.toml` — on the trusted side of
+this line until 0.74.0 — is a path in the workspace root the run's own agent can
+write, which is how two ordinary writes carried a `[[hook]]` in with no refusal
+anywhere on the path. Declaring a bundle from either file is still permitted; the
+refusal is on what the *manifest* contributes. A manifest declaring one from such
+a scope is refused **whole** and the bundle lands on `Plugins::dropped()` — none of
+its other kinds are applied either.
 
 **The path is validated lexically, and nothing is stat'd at load.** An absolute
 `path`, or one climbing out of the plugin root with `..`, is refused at load. A
@@ -3666,3 +3921,76 @@ the turn it would otherwise spend guessing a filename.
 and does not enumerate the directory. A skill pointing at a file it no longer
 ships is a typo, and reporting it as a refusal would send an operator hunting for
 a breach that did not happen.
+
+## What a net rule reaches, and what sits under it (0.74.0)
+
+Every net decision this crate took up to 0.73.0 was a hostname glob. That is a
+boundary against the hosts an operator thought to name and against nothing else,
+so `Policy::permissive()` handed the model this host's own admin ports, the
+private network around it and the cloud instance-metadata service — and no rule
+anybody wrote was wrong for permitting them.
+
+**An address floor sits under the policy, and a rule cannot lift it.** A target
+the policy allows is refused anyway when it resolves onto a loopback (`127/8`,
+`::1`), "this network" (`0/8`, `::`), link-local (`169.254/16`, `fe80::/10`),
+RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), carrier-grade NAT (`100.64/10`),
+or unique-local (`fc00::/7`) address, or names a host reserved to this machine or
+this link — `localhost`, `localhost.localdomain`, anything under `.localhost`
+(RFC 6761) or `.local` (RFC 6762). The two IPv6 spellings of an IPv4 address are
+reduced first, so `::ffff:127.0.0.1` and `::127.0.0.1` land on the same rules.
+The floor only refuses: a target the policy already denied keeps its own
+attribution and is not even resolved.
+
+**`IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1` is the whole of the widening, and it is an
+environment variable rather than an `io.toml` key on purpose.** A key that widens
+is a key a cloned repository could set, and `[policy]` is accepted from a
+workspace file on the rule that such a file may narrow and never widen — so a
+`net.allow_local_addresses` would have lifted this floor from inside the exact
+threat model it exists for. The environment of a process that has already started
+is the one thing a hostile repository cannot write. `1` and `true` lift it,
+anything else does not, and the value is re-read per connection rather than
+latched. **The metadata hostnames `metadata.google.internal` and `metadata.goog`
+and the metadata addresses `169.254.169.254` and `100.100.100.200` stay refused
+even then**, because the widening exists for a local model runtime and no local
+model runtime answers on one.
+
+**A refusal is attributed to the layer `local-address floor`**, so a trace tells
+"your rules refused this" apart from "the floor underneath your rules refused
+this", and it carries the address that decided, the reason and the key that would
+restore it. A host that resolves to a mix of permitted and refused addresses is
+refused whole — which address a later `connect` would pick is not this crate's to
+decide — and a host that resolves to nothing is refused too.
+
+**How much the floor is worth differs by call site, and the weaker answer is
+stated rather than implied.** A floor that graded only names is one
+`http://169.254.169.254.nip.io/` walks through, so the floor resolves; what that
+resolution binds is the question.
+
+| Call site | Check and dial | What stays open |
+| --- | --- | --- |
+| the HTTP MCP transport, the egress proxy | one resolution, graded, dialled as the graded set | nothing |
+| a provider endpoint | graded before the run's first step; the `Provider` owns its client and resolves again to dial | a name whose *second* answer is local. Closing it means every provider taking a pinned client, which is an API change this release did not make |
+| `browser_navigate` | graded by name only | a name that resolves onto a local address. Chrome resolves each URL itself, and pinning a navigation to an address breaks SNI and certificate validation. Under a policy that allows every host, `browser_navigate("http://169.254.169.254.nip.io/")` reaches cloud metadata |
+
+The close for the third row is routing the browser through the run's egress
+proxy, which already resolves once and dials what it graded. That wiring is not in
+this release.
+
+**A short-form IPv4 host is resolved before it is graded.** `2130706433` and
+`127.1` are `127.0.0.1` to `getaddrinfo` and neither parses as an `IpAddr`, so a
+floor that graded only what it could parse as a literal let them through.
+
+**A backslash ends the URL authority**, in `net::target` and at the browser's
+navigation gate, because the WHATWG parser and Chrome's GURL both read it as a
+path separator for `http`, `https`, `ws` and `wss`. Without that,
+`http://127.0.0.1:11434\@example.com/v1` was checked as `example.com:80` and would
+have been dialled at `127.0.0.1:11434`. An application that reduces a URL itself
+rather than calling `net::target` has to split the authority on `\` as well as
+`/`, `?` and `#`, or it is deciding about a different host than the one that gets
+dialled.
+
+**What the floor does not do** is govern a connection another process opens. A
+stdio MCP server, a language server and a `[[bin]]` the agent runs are separate
+processes; the harness decides whether each may start, and what it dials
+afterwards is between it and the network. See the
+[MCP and network egress guide](guide/mcp-and-network.md).

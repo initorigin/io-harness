@@ -23,13 +23,20 @@ pub(super) enum ProviderAccess {
 /// with the same answer — and asking a human it repeatedly would train them to
 /// wave it through.
 ///
-/// The provider layer is merged *before* the check, not consulted after it. That
-/// ordering is what makes a network-deny base usable: the `net` default denies,
-/// the provider layer's allow rule beats a default, and a caller's explicit
-/// `deny_net` still beats the allow because deny is absolute across layers. So
-/// "deny everything but the model" needs no host list from the caller, while
-/// "deny even the model" remains expressible — and fails fast as a refusal
-/// rather than hanging on a call that is never made.
+/// The provider layer is merged *before* the check for an endpoint of a trusted
+/// origin, and only for one (0.74.0, audit finding C3). That ordering is what
+/// makes a network-deny base usable: the `net` default denies, the provider
+/// layer's allow rule beats a default, and a caller's explicit `deny_net` still
+/// beats the allow because deny is absolute across layers. So "deny everything
+/// but the model" needs no host list from the caller, while "deny even the model"
+/// remains expressible — and fails fast as a refusal rather than hanging on a
+/// call that is never made.
+///
+/// An endpoint of an untrusted origin is put to the caller's own policy first,
+/// where a deny answers before the overlay can widen anything. The two origins
+/// that stay exempt are the user-scope `io.toml` and a provider the embedder
+/// built in its own Rust — see [`net::ProviderOrigin`] for how the distinction
+/// travels, and why an unmarked policy means the second of those.
 pub(super) async fn authorize_provider<P: Provider>(
     provider: &P,
     policy: &Policy,
@@ -62,12 +69,48 @@ pub(super) async fn authorize_provider<P: Provider>(
                 layer: None,
             });
         };
+        // C3 — the overlay below is an *allow* for this host. Until 0.74.0 it was
+        // merged before the host was checked, so a caller whose `net` default is
+        // Deny was never asked about its own provider's endpoint. It is asked
+        // first now, unless the endpoint came from an origin the operator owns.
+        //
+        // Against `policy`, never `effective`: `effective` already carries the
+        // overlay of every endpoint checked before this one, and a fallback
+        // chain's first host must not authorize its second.
+        //
+        // Only a Deny is intercepted. An `Ask` is still the overlay's to answer
+        // below, so this narrows the ordering and cannot turn an allowance into a
+        // question the caller never asked for.
+        if net::provider_origin(policy, &target) == net::ProviderOrigin::Untrusted
+            && policy.check(Act::Net, &target).effect == Effect::Deny
+        {
+            // Through the guard rather than as a bare `Error::Refused`, so the
+            // refusal is recorded and announced the way every other one is. It
+            // re-reads the same policy and reaches the same Deny.
+            NetGuard::new(policy)
+                .tracing(store, run_id, 0)
+                .watching(watch, 0)
+                .check_target(&target)
+                .await?;
+        }
         effective = effective.merge(net::provider_layer(&target));
         // Step 0: the authorization happens before the run's first step.
-        let verdict = NetGuard::new(&effective)
+        //
+        // M10 — the guard resolves the endpoint here and grades what came back, so
+        // a `base_url` pointed at a name that resolves onto loopback, cloud
+        // metadata or the internal network is refused before the run's first step.
+        // The addresses are dropped rather than dialled, and that is the honest
+        // limit of this site: a `Provider` owns its own HTTP client and resolves
+        // the name again when it dials, so what is closed here is a name that
+        // *always* answers with a local address, not a name that answers
+        // differently the second time it is asked. Pinning the dial as well would
+        // mean every `Provider` taking a client it did not build, which is an API
+        // change and not this release's.
+        let (verdict, _) = NetGuard::new(&effective)
             .tracing(store, run_id, 0)
             .watching(watch, 0)
-            .check_target(&target)?;
+            .check_target(&target)
+            .await?;
         if verdict.effect == Effect::Ask {
             // One human decision covers the run; the first host that needs asking
             // is the one asked about. The verdict rides along because the approver
@@ -780,14 +823,6 @@ pub(super) fn sandbox_create(
     created
 }
 
-/// Evaluate one action against the policy, consulting `approver` only for the
-/// sensitive-but-permitted tier.
-///
-/// A denied action never reaches the approver — refusal and approval are
-/// different things. An approver that rewrites the action has the rewritten
-/// form re-evaluated here, so it can narrow or redirect within the policy but
-/// cannot move an action across a deny.
-#[allow(clippy::too_many_arguments)]
 /// What the approver is told about the question, beyond the action itself
 /// (0.42.0).
 ///
@@ -829,6 +864,25 @@ pub(super) fn policy_verdict(ws: &Workspace, act: Act, target: &str) -> crate::p
     }
 }
 
+/// The word the store spells an act with — in a pending row's `act` column and
+/// in every `policy_events` row this module writes.
+///
+/// A total match over [`Act`] rather than `format!("{act:?}").to_lowercase()`,
+/// because the *reader* of that column has to reconstruct the same spelling and a
+/// derivation cannot be matched against. [`crate::resume_with_decision`] reads it
+/// back to decide what a resumed approval replays, and mapping a word it does not
+/// know onto a write is how an approved `exec` became a file named after the
+/// program (0.74.0, audit M1). Exhaustive here so a fifth act is a compile error
+/// in this crate rather than a silent write in a caller's workspace.
+pub(super) fn act_word(act: Act) -> &'static str {
+    match act {
+        Act::Read => "read",
+        Act::Write => "write",
+        Act::Exec => "exec",
+        Act::Net => "net",
+    }
+}
+
 /// What a refused action's observation tells the model to do instead.
 ///
 /// A path is one of many: a file it may not read usually has a sibling it may,
@@ -846,6 +900,20 @@ fn advice(act: Act) -> &'static str {
     }
 }
 
+/// Evaluate one action against the policy, consulting `approver` only for the
+/// sensitive-but-permitted tier.
+///
+/// A denied action never reaches the approver — refusal and approval are
+/// different things. An approver that rewrites a *read* or a *write* has the
+/// rewritten form re-evaluated here, so it can narrow or redirect within the
+/// policy but cannot move an action across a deny.
+///
+/// **A rewritten `Act::Exec` is refused rather than performed** (0.74.0, audit
+/// M4). No exec consumer reads `target` back off the returned [`Gated::Go`] — the
+/// argv was parsed before this gate ran — so honouring the rewrite is not on
+/// offer and discarding it silently would run the original while recording the
+/// rewrite. The approver's `remember` rules still travel; only the substitution
+/// is refused.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn gate(
     ws: &Workspace,
@@ -860,12 +928,12 @@ pub(super) async fn gate(
     depth: u32,
     goal: &str,
 ) -> Result<Gated> {
-    let kind = format!("{act:?}").to_lowercase();
+    let kind = act_word(act);
     let verdict = policy_verdict(ws, act, target);
 
     match verdict.effect {
         Effect::Deny => {
-            let mut ev = PolicyEvent::refusal(step, &kind, target);
+            let mut ev = PolicyEvent::refusal(step, kind, target);
             if let (Some(rule), layer) = (verdict.rule.clone(), verdict.layer.clone()) {
                 ev.rule = Some(rule);
                 ev.layer = layer;
@@ -900,7 +968,7 @@ pub(super) async fn gate(
                 step,
                 depth,
                 EventKind::ApprovalRequested {
-                    act: kind.clone(),
+                    act: kind.to_string(),
                     target: target.to_string(),
                 },
             ));
@@ -909,7 +977,7 @@ pub(super) async fn gate(
             // once the approver has deferred is a row no second process can answer
             // while the run is still holding the question, which is exactly the
             // gap this release closes.
-            let request_id = store.put_pending(run_id, step, &kind, target, content)?;
+            let request_id = store.put_pending(run_id, step, kind, target, content)?;
             let context = approval_context(goal, &verdict);
             let raced = race_gate(approver.decide_in_context(&request, &context), store, |s| {
                 Ok(s.pending(request_id)?.is_some_and(|p| p.resolved.is_some()))
@@ -920,7 +988,7 @@ pub(super) async fn gate(
             // unresolved so the run pauses with something a resume — or an
             // attached process — can still answer.
             if matches!(raced, Some(Decision::Defer)) {
-                let ev = PolicyEvent::decision(step, &kind, target, "defer", "approver");
+                let ev = PolicyEvent::decision(step, kind, target, "defer", "approver");
                 store.record_event(run_id, &ev)?;
                 decided(watch, run_id, depth, &ev);
                 return Ok(Gated::Paused { request_id });
@@ -960,7 +1028,7 @@ pub(super) async fn gate(
             let source = if mine { "approver" } else { "attached" };
 
             if landed != "approve" {
-                let ev = PolicyEvent::decision(step, &kind, target, &landed, source);
+                let ev = PolicyEvent::decision(step, kind, target, &landed, source);
                 store.record_event(run_id, &ev)?;
                 decided(watch, run_id, depth, &ev);
                 return Ok(Gated::Refused {
@@ -969,11 +1037,43 @@ pub(super) async fn gate(
                 });
             }
 
+            // 0.74.0 (audit M4) — a rewrite is honoured only where the performing
+            // side reads it back. The read and write paths take `target` and
+            // `content` off the `Gated::Go` below, so an approver can redirect one.
+            // Every `Act::Exec` consumer cannot: `exec`, `shell`, the git
+            // built-ins, a registered tool and an MCP tool all dispatch the argv
+            // they parsed *before* this gate was consulted and read only
+            // `remember`. Discarding the rewrite silently means a human approves
+            // one command while another runs and the trace records the one that
+            // did not — and, in the direction that matters more, an approver
+            // *narrowing* an argv is overruled without ever being told. Honouring
+            // it would mean re-splitting a command line inside the gate, which is
+            // the tool layer's job and not this one's, so the rewrite is refused
+            // and the refusal names both forms.
+            if let Some(rewrite) = modified
+                .as_ref()
+                .filter(|m| act == Act::Exec && m.target != target)
+            {
+                let ev = PolicyEvent::refusal(step, kind, target).with_performed(&rewrite.target);
+                store.record_event(run_id, &ev)?;
+                refused(watch, run_id, depth, &ev);
+                return Ok(Gated::Refused {
+                    decision: format!("{kind} rewrite refused"),
+                    obs: format!(
+                        "\n[{kind} refused] {target} — the approver rewrote it to {}, and a \
+                         rewritten command is not something this path can run: the argv was \
+                         parsed before the approval. Nothing ran. Approve {target} as asked, \
+                         deny it, or narrow it with an exec rule.\n",
+                        rewrite.target
+                    ),
+                });
+            }
+
             let performed = modified.unwrap_or_else(|| request.clone());
             // The rewritten action gets the same scrutiny as the original.
             let recheck = policy_verdict(ws, act, &performed.target);
             if recheck.effect == Effect::Deny {
-                let mut ev = PolicyEvent::refusal(step, &kind, &performed.target);
+                let mut ev = PolicyEvent::refusal(step, kind, &performed.target);
                 ev.rule = recheck.rule.clone();
                 ev.layer = recheck.layer.clone();
                 store.record_event(run_id, &ev)?;
@@ -988,7 +1088,7 @@ pub(super) async fn gate(
                     ),
                 });
             }
-            let mut ev = PolicyEvent::decision(step, &kind, target, "approve", source);
+            let mut ev = PolicyEvent::decision(step, kind, target, "approve", source);
             if performed.target != target {
                 ev = ev.with_performed(&performed.target);
             }

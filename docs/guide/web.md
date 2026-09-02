@@ -265,6 +265,8 @@ let requests: u64 = store.provider_calls(run_id)?
 ## In `io.toml`
 
 ```toml
+# The user-scope file. `[web]` is refused in `io.toml` and in `io.local.toml`
+# since 0.74.0 — see below.
 [web]
 search = true
 fetch = false
@@ -278,6 +280,25 @@ a switch is on: a file writing `search = false` is stating a decision, and dropp
 it would make the contract say "nothing was configured" instead. An unknown key
 inside it is an error naming the key, so a misspelled `blocked_domain` is not a
 boundary that quietly did not apply.
+
+**Only the user-scope file may declare it (0.74.0).** `[web]` joined the sections
+a file inside the workspace may not write at all, which is the same list
+`[[hook]]`, `[browser]`, `[[provider]]`, `[[mcp]]` and `[[lsp]]` are on. The reason
+is the fact this whole page turns on: the provider dials the URL, so `Act::Net`
+never sees it, the run's egress proxy is not on the path, and the domain lists are
+a filter this crate states rather than enforces. A committed `io.toml` writing
+`[web] search = true` was therefore a repository switching on an egress surface no
+rung of this crate mediates, and `fetch = true` beside it is a repository choosing
+where the run's context may be sent. `io.local.toml` is refused for the same
+reason it is refused everything else: it sits at the workspace root, which is a
+path the run's own agent can write.
+
+The cost is real and is not hidden: `[web] search = false` is a *narrowing*
+sentence, and a workspace file can no longer write that either — a whole section
+is refused whole, for the reason `[[hook]]` is. It narrows nothing in practice,
+because the feature is off unless the user scope turned it on. A per-project
+declaration that is the application's rather than the repository's goes on the
+`TaskContract` in Rust, with `with_web`.
 
 ## Reading it back
 
@@ -373,7 +394,8 @@ than zeros.
   and why a cost is derived rather than stored
 - [Observability and replay](observability.md) — the `ServerToolUsed` event and the
   rest of the trace
-- [Configuration — `io.toml`](configuration.md) — the scopes `[web]` is read across
+- [Configuration — `io.toml`](configuration.md) — the one scope `[web]` may be
+  declared from, and the rule that put it there
 - [Sessions](sessions.md) — the bounded turn that can carry a declaration
 - [The public contract](../CONTRACT.md)
 - [README](../../README.md)

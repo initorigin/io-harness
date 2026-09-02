@@ -74,10 +74,43 @@ impl Recording {
         }
     }
 
+    /// Write the recording, readable by its owner and nobody else (0.74.0, L3).
+    ///
+    /// A recording is the whole system prompt, every user message, every
+    /// response and every image of every exchange — so it holds whatever the run
+    /// read, which on a run that read a `.env` is a credential. Until 0.74.0 it
+    /// was created at the umask's mercy, which on a default umask is 0644: a
+    /// world-readable copy of the conversation, outliving the run, in whatever
+    /// directory the caller named.
+    ///
+    /// The mode is set on the `open` rather than after the write, because a
+    /// `set_permissions` afterwards leaves a window in which the content is
+    /// already on disk and still world-readable — and set again on the handle,
+    /// because `mode` applies only when the file is created and `save` is
+    /// documented as callable repeatedly onto a path that may already exist.
+    ///
+    /// On Windows there is no mode to set. The file inherits the directory's
+    /// ACL, which is the platform's own answer to the same question, and no
+    /// pretend 0600 is written that would read as a guarantee nothing enforces.
     fn save(&self, path: &Path) -> Result<()> {
         // Pretty, because a recording is a fixture a human reads and diffs.
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|e| Error::Config(format!("cannot serialise the recording: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(&bytes)?;
+        }
+        #[cfg(not(unix))]
         std::fs::write(path, bytes)?;
         Ok(())
     }
@@ -122,7 +155,6 @@ impl Recording {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
 pub struct Record<P> {
     inner: P,
     /// The exchanges so far, in call order.
@@ -134,6 +166,32 @@ pub struct Record<P> {
     /// site awaits *first* and then locks, mutates and drops within a single
     /// statement, so no guard can ever span an await point.
     seen: Mutex<Vec<Exchange>>,
+}
+
+impl<P: std::fmt::Debug> std::fmt::Debug for Record<P> {
+    /// Hand-written for the reason the four providers' impls are (0.74.0).
+    ///
+    /// Those redact the credential the provider holds, and a derive here would
+    /// have walked straight past them into the thing this type exists to keep:
+    /// `{:?}` on a recorder printed every system prompt, every user message and
+    /// every response it had captured — the same content [`Record::save`] is
+    /// careful to write 0600 — into whatever log the `{:?}` went to. The count
+    /// is what a `{:?}` on a recorder is actually asking, and the wrapped
+    /// provider prints as itself, redaction and all.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Record")
+            .field("inner", &self.inner)
+            .field("exchanges", &self.exchange_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P> Record<P> {
+    /// How many exchanges have been captured, for [`Debug`](std::fmt::Debug).
+    /// A poisoned lock still answers, for the reason `exchanges` gives.
+    fn exchange_count(&self) -> usize {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
 }
 
 impl<P: Provider> Record<P> {

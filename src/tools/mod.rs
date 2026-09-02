@@ -70,11 +70,19 @@ pub const PATCH_FILE_TOOL: &str = "patch_file";
 /// model's. It is an [`Act::Exec`](crate::Act::Exec) check on that program all
 /// the same, because a model-callable path to the project's build command must
 /// be refusable by the policy that refuses `exec`.
+///
+/// Since 0.74.0 the reflex is checked the same way and runs inside the same
+/// containment, so what separates the two is only what they do with a refusal:
+/// this one reports it, because somebody asked, and the reflex is silently
+/// skipped. Only [`Effect::Allow`](crate::Effect::Allow) runs the reflex, and
+/// [`Policy::default`](crate::Policy::default) asks about exec — so this tool is
+/// where a model under an asking policy gets an answer at all.
 pub const CHECK_TOOL: &str = "check";
 /// Where the thing at this position is defined (0.52.0).
 ///
-/// The five `lsp_*` names below are offered **only** when the contract or
-/// `io.toml` configured a language server. A run that configured none is offered
+/// The five `lsp_*` names below are offered **only** when the contract or the
+/// user-scope `io.toml` configured a language server — since 0.74.0 `[[lsp]]` is
+/// refused in both workspace files. A run that configured none is offered
 /// exactly the catalogue 0.51.0 offered, byte for byte — which is what makes this
 /// feature free for a consumer who does not want it, under 0.38.0's cacheable
 /// system prefix where every schema is paid for on every request of every run.
@@ -105,6 +113,17 @@ pub const LSP_HOVER_TOOL: &str = "lsp_hover";
 /// A tool that wrote N files on a server's say-so would be the multi-file write
 /// 0.51.0 excluded, with the additional property that this crate did not compute
 /// the change.
+///
+/// **It reads only what the policy allows outright** (0.74.0). Rendering a file's
+/// patch reads that file and puts every removed line in the model's context, and
+/// the paths are the *server's* choice rather than the model's, so each is
+/// resolved under the workspace root and must be
+/// [`Effect::Allow`](crate::Effect::Allow) for [`Act::Read`](crate::Act::Read).
+/// An [`Effect::Ask`](crate::Effect::Ask) is not
+/// permission here: there is no approver on this path, and an unanswered question
+/// is not a yes. A file that does not clear the bar is omitted with a count and
+/// the reason, so a run under an asking read policy is told why its patch is
+/// short rather than handed a quietly incomplete one.
 pub const LSP_RENAME_TOOL: &str = "lsp_rename";
 
 /// The names the model uses to drive a browser (0.53.0).
@@ -137,8 +156,20 @@ pub const BROWSER_SCROLL_TOOL: &str = "browser_scroll";
 /// The widest capability the crate grants, and the one that made a task in any
 /// language expressible. Every call is an [`Act::Exec`](crate::Act::Exec) check
 /// on the program *and* on the joined argv, so an operator can allow `cargo *`
-/// and deny `rm *` with the rule syntax the policy already has. See
-/// [`exec`] for what it does and does not bound.
+/// and then take `cargo publish *` back out of it with the rule syntax the policy
+/// already has. See [`exec`] for what it does and does not bound.
+///
+/// **An argv deny is sound inside an allowlist and nowhere else.** It narrows
+/// something already allowed — `defaults.exec` at
+/// [`Effect::Deny`](crate::Effect::Deny) or [`Effect::Ask`](crate::Effect::Ask),
+/// with explicit `allow_exec` rules saying what
+/// may run — and it is not a blocklist over a permissive default. A joined argv
+/// has more spellings than a pattern can enumerate: `["git", "-c", "x", "push"]`
+/// puts a flag between the program and the sub-command, and `["env", "rm"]` and
+/// `["busybox", "rm"]` reach the program under a name the rule never sees. No
+/// pattern completes that set, because the set is not finite. Documented here
+/// rather than fixed: the check is what it is, and a rule writer has to know
+/// which of the two shapes they are writing.
 pub const EXEC_TOOL: &str = "exec";
 /// The name the model uses to run a command *line* (0.24.0).
 ///

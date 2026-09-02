@@ -300,6 +300,14 @@ where
         // reads the empty set, so the four rules below are structurally inert for
         // anything this agent spawns rather than inert by four separate tests.
         let extras = tree.extras(depth);
+        // And the turn is typed immediately, the same order — and for the same
+        // reason — the flat loop writes it in: `Store::check_resumable` refuses a
+        // `running` reply as work to continue, so every instruction between the
+        // row's creation and this one is a window in which a killed process
+        // leaves a row that says nothing about what it was and is offered as
+        // resumable work. Moved here from below the ledger in 0.74.0, where the
+        // egress proxy had grown in front of it.
+        open_turn_kind(tree.store, run_id, extras)?;
         // 0.31.0 — the plan gate, at the root only. A child that could hold its own
         // plan open would mean a hundred pending plans from one `run_tree`, which is
         // the problem the gate exists to prevent rather than a feature of it. As in
@@ -321,12 +329,80 @@ where
         // while the phase is on. `policy` here is this agent's own — a child's is its
         // parent's narrowed by `Policy::contain` — so a child is told its boundary and
         // not the root's.
-        let after_planning =
-            boundary_section(policy, &contract.exec_sandbox, will_proxy(policy, contract));
+        // Children share their parent's workspace, so they share its detection too.
+        let toolchain = crate::toolchain::detect(&tree.root);
+        // Children share their parent's workspace, so they share its containment.
+        let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
+        // 0.48.0 — the same rule as the flat loop. A contained tree run whose
+        // policy names hosts must not silently take the boolean while the flat
+        // loop scopes its egress.
+        let egress = start_egress_proxy(policy, containment.as_ref()).await;
+        let containment = match (&containment, &egress) {
+            (Some(c), Some((proxy, _, _))) => {
+                #[cfg(feature = "browser")]
+                tree.browser.route_through(proxy.addr());
+                Some(std::sync::Arc::new(c.with_proxy(Some(proxy.addr()))))
+            }
+            _ => containment,
+        };
+        report_containment(
+            tree.watch,
+            run_id,
+            depth,
+            &contract.exec_sandbox,
+            containment.as_deref(),
+        );
+        // 0.74.0 — the tree's measurement, taken once before the root ran, rather
+        // than one probe per agent.
+        //
+        // **Why one is the honest number, not the cheap one.** A few lines up,
+        // this loop says children share their parent's workspace and share its
+        // containment, and that is the argument: the boundary a child runs under
+        // *is* the one the tree resolved. Measuring it once per agent asks one
+        // question N times and can only produce N answers to it — a twenty-agent
+        // tree that disagrees with itself about its own boundary is worse evidence
+        // than one number, quite apart from the sixty short-lived child processes
+        // it spends before any agent's first prompt is composed.
+        //
+        // **This is not the cache the release refused.** A cache is a value kept
+        // past the thing it was measured on — reused for a later run, for another
+        // process, or for a different configuration — and it is refused because a
+        // host's Landlock ABI, its `sandbox-exec` binary and its writable roots
+        // can all move underneath it. None of that applies here. It is one
+        // measurement of one containment, held for exactly the lifetime of the
+        // `Tree` that has that containment and dropped with it: no `static`, no
+        // `OnceLock`, nothing that outlives one tree.
+        //
+        // And it is never read for a boundary it did not measure. A spawned
+        // child's contract carries its own `exec_sandbox`, and a contract that
+        // asks for a different one is a different boundary — so that agent
+        // measures its own rather than being told what another configuration
+        // produced. That is the line between reusing a measurement and inventing
+        // one.
+        let probe = if contract.exec_sandbox == tree.probed {
+            tree.probe.clone()
+        } else {
+            probe_boundary(
+                tree.store,
+                tree.watch,
+                depth,
+                run_id,
+                &contract.exec_sandbox,
+                containment.as_deref(),
+            )
+            .await
+        };
+        let after_planning = boundary_section(
+            policy,
+            &contract.exec_sandbox,
+            will_proxy(policy, contract),
+            &probe,
+        );
         let while_planning = boundary_section(
             &effective,
             &contract.exec_sandbox,
             will_proxy(&effective, contract),
+            &probe,
         );
         let agent_root = contract.root.as_deref().unwrap_or(&tree.root);
         let mut ws = Workspace::with_policy(agent_root, effective);
@@ -450,9 +526,6 @@ where
         // criterion failing the same way every step is reported once rather than
         // once per step. Per agent, like everything else in this loop.
         let mut last_gate_feedback: Option<String> = None;
-        // And the turn is typed before its first completion is billed, the same
-        // order the flat loop writes it in.
-        open_turn_kind(tree.store, run_id, extras)?;
         let mut progress = Progress::new();
         // Per agent, not per tree. A child's handles are the child's: it is the
         // one that knows when they are finished with, and a shared registry
@@ -468,29 +541,6 @@ where
             }
         }
         let handles = &handles;
-        // Children share their parent's workspace, so they share its detection too.
-        let toolchain = crate::toolchain::detect(&tree.root);
-        // Children share their parent's workspace, so they share its containment.
-        let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
-        // 0.48.0 — the same rule as the flat loop. A contained tree run whose
-        // policy names hosts must not silently take the boolean while the flat
-        // loop scopes its egress.
-        let egress = start_egress_proxy(policy, containment.as_ref()).await;
-        let containment = match (&containment, &egress) {
-            (Some(c), Some((proxy, _, _))) => {
-                #[cfg(feature = "browser")]
-                tree.browser.route_through(proxy.addr());
-                Some(std::sync::Arc::new(c.with_proxy(Some(proxy.addr()))))
-            }
-            _ => containment,
-        };
-        report_containment(
-            tree.watch,
-            run_id,
-            depth,
-            &contract.exec_sandbox,
-            containment.as_deref(),
-        );
         // Children share their parent's workspace, so they share its memory: one
         // note store per workspace, every entry attributed to the run that wrote it.
         let mem_key = memory_key(&tree.root);
@@ -502,7 +552,19 @@ where
         // committed: a step left uncommitted is replayed, and replaying it
         // re-adopts its children through the ordinary spawn path — doing both
         // would adopt one child twice.
-        readopt_children(tree, run_id, depth, policy, start_step, inflight).await?;
+        // 0.74.0 — `ws.policy()`, not `policy`: while the plan phase is on that is
+        // `policy` narrowed by `plan_lock`, and a child re-adopted from a previous
+        // process must come back under the boundary this agent is actually running
+        // inside rather than the one its contract asked for. See the fan-out below,
+        // which passes the same thing for the same reason.
+        readopt_children(tree, run_id, depth, ws.policy(), start_step, inflight).await?;
+
+        // 0.74.0 — the rules an approver asked to stop being asked about, kept for
+        // the rest of this agent's run as the flat loop keeps them. Until now the
+        // tree dropped them at the end of every step, so "approve and stop asking"
+        // meant "approve again next step" inside a `run_tree` and meant what it said
+        // in a flat run.
+        let mut remembered: Vec<Rule> = Vec::new();
 
         for step in start_step..=contract.max_steps {
             // 0.48.0 — the same per-step refresh and drain the flat loop does. A
@@ -602,7 +664,11 @@ where
                     &global_notes,
                     Assembly {
                         ws: Some(&ws),
-                        policy,
+                        // 0.74.0 — the policy this agent is running under, which is
+                        // what the flat loop passes. A stale read refreshed against
+                        // the contract's own policy would re-read through a deny the
+                        // plan phase or an approver had since put in the way.
+                        policy: ws.policy(),
                         store: tree.store,
                         run_id,
                         step,
@@ -792,6 +858,11 @@ where
             let mut decisions: Vec<String> = Vec::new();
             let mut calls_json: Vec<String> = Vec::new();
             let mut step_changed = false;
+            // What an approver asked to remember during THIS step, applied once at
+            // the end of it. Per-step rather than per-call for the reason the flat
+            // loop gives: a policy rebuilt mid-step would decide two calls of one
+            // completion under two different boundaries.
+            let mut new_rules: Vec<Rule> = Vec::new();
             // The same note as the flat loop: a broken provider-executed search is
             // an observation the child can act on, not silence.
             if let Some(note) = web_failure_note(&response) {
@@ -856,7 +927,74 @@ where
             let mut spawn_calls: Vec<&ToolCall> = Vec::new();
             for call in &response.tool_calls {
                 calls_json.push(format!("{}:{}", call.name, call.arguments));
+                // 0.74.0 — the three tools this loop handles itself never reach
+                // `dispatch`, which is where every other call is put to the
+                // operator's `before_tool` checks. They are asked here instead,
+                // ahead of the short-circuits below, so a `[[hook]]` naming
+                // `spawn_agent`, `send_message` or `read_messages` fires rather than
+                // loading, validating, installing and then silently approving —
+                // which is the one failure a check attached to a tool cannot afford,
+                // and looks identical to a check that said yes. Everything past this
+                // point reaches `dispatch` and is gated there, so no call is asked
+                // about twice.
+                if call.name == SPAWN_TOOL
+                    || call.name == SEND_MESSAGE_TOOL
+                    || call.name == READ_MESSAGES_TOOL
+                {
+                    if let Some(refused) = tool_gate(
+                        contract.tool_hooks.as_deref(),
+                        call,
+                        tree.watch,
+                        run_id,
+                        step,
+                        depth,
+                    ) {
+                        // A hook can only refuse, and `tool_gate` renders that as a
+                        // `Continue` carrying the sentence the model reads. The
+                        // `continue` is outside the destructuring on purpose: any
+                        // other shape is still a refusal, and a call that fell
+                        // through to run would be this gate failing open.
+                        if let Dispatched::Continue {
+                            decision,
+                            obs,
+                            kind,
+                            target,
+                            ..
+                        } = refused
+                        {
+                            ledger.push(Observation::new(step, kind, target, obs));
+                            decisions.push(decision);
+                        }
+                        continue;
+                    }
+                }
                 if call.name == SPAWN_TOOL {
+                    // 0.74.0 — refused while the plan is unreviewed, for the reason
+                    // `remember` and `forget` are refused in `dispatch`: a spawn is
+                    // intercepted here and never resolves through `Policy::explain`,
+                    // so the `plan-gate` layer cannot cover it. A child started
+                    // before a human saw the plan inherits this run's whole boundary
+                    // and does the work outside the gate, which is not one act
+                    // slipping past the phase but the phase not existing.
+                    if planning {
+                        ledger.push(Observation::new(
+                            step,
+                            ObsKind::Error,
+                            None,
+                            bound(
+                                &format!(
+                                    "\n[{SPAWN_TOOL} refused] the plan has not been approved \
+                                     yet, so no sub-agent is being started — a child would \
+                                     inherit this run's permissions and work outside the \
+                                     phase. Call `{PROPOSE_PLAN_TOOL}` first.\n"
+                                ),
+                                entry_cap,
+                                ObsKind::Error,
+                            ),
+                        ));
+                        decisions.push(format!("{SPAWN_TOOL} refused (planning)"));
+                        continue;
+                    }
                     spawn_calls.push(call);
                     continue;
                 }
@@ -944,11 +1082,12 @@ where
                         kind,
                         target,
                         changed,
-                        ..
+                        remember,
                     } => {
                         step_changed |= changed;
                         ledger.push(Observation::new(step, kind, target, obs));
                         decisions.push(decision);
+                        new_rules.extend(remember);
                     }
                     Dispatched::Pause { request_id } => {
                         decisions.push(format!("awaiting approval (request {request_id})"));
@@ -980,10 +1119,22 @@ where
             }
             // The phase ends here, and the spawn calls below are the reason it must:
             // an approved plan names the agents it hands work to, and until it is
-            // approved a spawn is an `Act::Exec` the `plan-gate` layer refuses.
+            // approved a spawn is refused at the top of the loop above. 0.74.0
+            // corrected the sentence that used to stand here — it said the
+            // `plan-gate` layer refused a spawn as an `Act::Exec`, and it does not:
+            // a spawn is intercepted before `dispatch` and never reaches
+            // `Policy::explain` at all, which is why the refusal had to be written.
             if plan_approved {
                 planning = false;
-                ws = Workspace::with_policy(&tree.root, policy.clone());
+                // Rebuilt from the base rather than edited, so the `plan-gate` layer
+                // goes and every rule an approver remembered stays: an approval ends
+                // the phase, it does not undo a decision a human already made. The
+                // flat loop states the same argument at its own rebuild.
+                let mut unlocked = policy.clone();
+                if !remembered.is_empty() {
+                    unlocked = unlocked.merge(remembered_layer(&remembered));
+                }
+                ws = Workspace::with_policy(&tree.root, unlocked);
                 tools.retain(|t| t.name != PROPOSE_PLAN_TOOL);
                 system = base_system.clone();
                 if let Some(approved) = tree.store.approved_plan(run_id)? {
@@ -1038,7 +1189,15 @@ where
                 let results: Vec<Result<SpawnOutcome>> = stream::iter(
                     spawn_calls
                         .into_iter()
-                        .map(|c| spawn_child(tree, c, run_id, depth, policy, step)),
+                        // 0.74.0 — `ws.policy()`, not `policy`. A child may only
+                        // narrow what it is handed, so handing it the contract's own
+                        // policy while this agent is running under a narrowed one
+                        // gives the child MORE than its parent has: through the plan
+                        // phase that is `plan_lock`'s `deny_write("*")` and
+                        // `deny_exec("*")`, and after an approver has narrowed the
+                        // run it is that decision. What the parent is actually
+                        // running under is `ws`.
+                        .map(|c| spawn_child(tree, c, run_id, depth, ws.policy(), step)),
                 )
                 .buffered(width)
                 .collect()
@@ -1229,6 +1388,20 @@ where
                     request_id,
                     steps: step,
                 });
+            }
+
+            // 0.74.0 — rules an approver asked to remember apply as a top layer for
+            // the rest of this agent's run, exactly as they do in the flat loop.
+            // Until now the tree read them off `Dispatched::Continue` and threw them
+            // away, so an operator who said "allow this and stop asking" was asked
+            // again on the next step of the same run — and one who said "and never
+            // this other path" had that decision forgotten. Merging rather than
+            // editing is what keeps a remembered allow from defeating a deny
+            // beneath it.
+            if !new_rules.is_empty() {
+                let merged = ws.policy().clone().merge(remembered_layer(&new_rules));
+                ws = Workspace::with_policy(agent_root, merged);
+                remembered.extend(new_rules);
             }
 
             // Draw this step's tokens against the tree. The draw is recorded even

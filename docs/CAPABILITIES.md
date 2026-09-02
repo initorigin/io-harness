@@ -35,9 +35,9 @@ the limits that capability actually has.
 | [Accounting](guide/accounting.md) | One row per provider call, the cache and reasoning breakdown, latency and TTFT, and cost derived from a price table you own |
 | [Documents](guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut, with the reasoning |
 | [Images and git](guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
-| [Hooks](guide/hooks.md) | Reacting to a run from `io.toml`: an audit log, a notification, a formatter, a check that stops the run — and why the whole array is refused in the project scope |
+| [Hooks](guide/hooks.md) | Reacting to a run from `io.toml`: an audit log, a notification, a formatter, a check that stops the run — and why the whole array is refused in every file inside the workspace |
 | [Providers](guide/providers.md) | One `Compatible` provider over any OpenAI-shaped endpoint, the 21 vendor presets, the local runtimes, what `Provider::models()` reports, the routing rules that change which model answers mid-run, and the optional method that reports a finished tool call while the completion is still streaming |
-| [Capability bundles](guide/plugins.md) | A directory that contributes skills, templates, agents, MCP servers, hooks and deny-only policy at once; what a project-scoped declaration may not hand you; how a contribution names the bundle it came from; and why a broken bundle is dropped rather than fatal |
+| [Capability bundles](guide/plugins.md) | A directory that contributes skills, templates, agents, MCP servers, hooks and deny-only policy at once; what a declaration from inside the workspace may not hand you; how a contribution names the bundle it came from; and why a broken bundle is dropped rather than fatal |
 | [Retention](guide/retention.md) | What a session and a store are holding, removing a session whole, sweeping to a date and what that refuses, keeping every row while emptying every word, and returning the freed pages to the filesystem |
 | [The mailbox](guide/mailbox.md) | Giving each agent in a tree an address, sending a finding to a named sibling, reading an inbox oldest-first exactly once, and a bounded wait that returns on the message or on the sender finishing |
 
@@ -72,6 +72,7 @@ into it.
 
 | Version | What it introduced | Entry |
 | --- | --- | --- |
+| 0.74.0 | The boundary is on the path, and it proves itself rather than declaring it — an internal audit read the whole crate under the threat model that matters and returned 51 findings, two of which were this product's own thesis failing: the post-edit checker spawned the project's compiler with no `Act::Exec` gate and no containment, so two ordinary writes reached arbitrary host execution through `build.rs`, and three separate backends reported a containment that was not in force. A project- *or* local-scoped file may no longer name a program to run or an endpoint a credential is sent to, and neither may a bundle it declares; `.git/**` and the config files are deny-by-default to the write tools; a path escaping the workspace root is denied rather than graded on its collapsed spelling and a write no longer follows a leaf symlink out of the root; the macOS profile cannot be rewritten by a directory name; Windows refuses to spawn a tool it cannot actually contain; and a repository's own git config is neutralised where `-c` reaches it and refused where it does not. Beneath every net rule there is now an address floor — loopback, link-local, cloud metadata, carrier-grade NAT, unique-local and RFC 1918 are refused whatever the policy says, lifted only by `IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1` and never by a config key — and a `[[policy.layers]]` in a workspace file may carry `deny` rules and nothing else | [2026-09-01](../CHANGELOG.md#0740---2026-09-01) |
 | 0.73.0 | A skill reaches the files it points at and a bundle names the programs it ships — `read_skill` takes an optional `path` resolved under the skill's root (the bundle's root for a contributed skill, so `shared/` beside `skills/` is in reach), refusing an absolute path, a `..` or an escaping symlink with an observation rather than an error, passing the same `Act::Read` gate the body passes, returning a sorted listing for a directory and telling "not there" apart from "refused"; `plugin.toml` gains `[[bin]]` with `Plugin::bin()` and a seventh `contributions()` name, trusted-scope-only, validated lexically with nothing stat'd, and not namespaced because it is the program a human invokes; and `2>&1` on a non-last pipeline stage moved from a spawn-time error that ended the run to a named parse refusal the run continues past | [2026-08-31](../CHANGELOG.md#0730---2026-08-31) |
 | 0.72.0 | An agent asks everything it needs in one breath, and each offer explains itself — `ask_questions` takes several independent questions in one call, parsed strictly per index and capped at ten, so an interface can gather them into one surface instead of rendering a corridor of single questions with a round trip between each; `Responder::answer_all` is a defaulted method that loops the existing `answer`, so every implementor keeps working and one that wants a single overlay overrides it; a choice is a label with an optional sentence and an optional bounded preview rather than a bare string, and `Question::multiple` says several offers may be taken with `Question::answer_of` spelling such an answer once for every interface; and a batch parks as one durable row on two nullable columns, so a store 0.71.0 wrote still loads and a 0.71.0 binary still reads one this release wrote | [2026-08-30](../CHANGELOG.md#0720---2026-08-30) |
 | 0.71.0 | The crate answers for its own schema instead of a consumer keeping a copy of it — `Effect::ALL` and `ExecMode::ALL` with an in-crate exhaustive-`match` guard so a new variant breaks a build rather than shrinking a menu, the defaults behind `run.max_steps` and `run.max_retries` as named constants the constructors themselves read, the models a `PriceTable` can actually price, `net::target` public with `None` documented as a refusal rather than as nothing-to-check, a hook readable key by key from both the plugin that declared it and the operator's own configuration, and a plugin bundle inspected on disk without a declaration file being written first — and `{:?}` of a `Config`, a `File` or a `ProviderSpec` stops printing the operator's resolved credentials | [2026-08-29](../CHANGELOG.md#0710---2026-08-29) |
@@ -192,10 +193,11 @@ into it.
   click, a redirect and a script assigning `location` are gated by the same code
   as the URL the model typed
 - **LSP navigation** — definition, references, symbols, hover and rename answered
-  by a language server named in `io.toml` or on the contract, offered only to a
-  run that configured one; `lsp_rename` returns a patch you apply yourself, so
-  every byte reaching the workspace still passes an `Act::Write` check on where
-  it lands
+  by a language server named on the contract or in the user-scope `io.toml`,
+  offered only to a run that configured one; the path a question names is an
+  `Act::Read` check taken before the server is told anything, and `lsp_rename`
+  returns a patch you apply yourself, so every byte reaching the workspace still
+  passes an `Act::Write` check on where it lands
 - **Documents** — spreadsheets, Word, PowerPoint text, PDF and barcode decoding,
   each behind its own cargo feature, all off by default
 - **Images** — passthrough to any provider whose model accepts one, with BMP,
@@ -208,8 +210,9 @@ into it.
 - **Hooks** — `[[hook]]` tables in `io.toml` turn an audit log, a notification, a
   formatter and a local policy check that can stop the run into a path or an
   argv instead of Rust, reaching the run through the `Observer` the crate already
-  had; the whole array is refused in the project scope, because a committed file
-  that runs a command on a teammate's machine is not something to inherit
+  had; the whole array is refused in every file inside the workspace, because
+  neither a committed file that runs a command on a teammate's machine nor one the
+  run's own agent can write is something to inherit
 - **Retention** — the store answers what it and each session are holding, removes
   a session whole or every session older than a date, and empties a session of
   words while keeping every row an audit rests on; nothing expires on its own,

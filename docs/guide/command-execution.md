@@ -18,13 +18,15 @@ let contract = TaskContract::workspace(
     expect_exit: 0,
 });
 
-// What the agent may run, decided before it runs anything.
-let policy = Policy::permissive()
+// What the agent may run, decided before it runs anything. `Policy::default()`
+// asks about anything not named here, so the allows are the boundary and the
+// deny narrows one of them — see "What a rule can say" for why that order is
+// the only one that holds.
+let policy = Policy::default()
     .layer("app")
     .allow_exec("npm*")
     .allow_exec("node*")
-    .deny_exec("rm*")
-    .deny_exec("git push*");
+    .deny_exec("npm publish*");
 
 let result = run_with(&contract, &OpenRouter::from_env()?, &Store::open("runs.db")?,
                       &policy, &ApproveAll).await?;
@@ -267,10 +269,19 @@ number to something unrelated in between.
 Every call is checked twice, and the second check is what makes a useful rule
 writable:
 
-- on the **program** — `deny_exec("rm")` holds whatever the arguments are, and
-  matches by basename too, so it also covers `/bin/rm`;
+- on the **program** — `deny_exec("rm")` holds whatever the arguments are, and a
+  deny also matches by basename, so it covers `/bin/rm`;
 - on the **whole argv, joined by spaces** — `allow_exec("cargo test*")` beside
-  `deny_exec("cargo publish*")` means what it reads.
+  `deny_exec("cargo publish*")` narrows an allowlist to the sub-command it names.
+
+**An argv deny is sound inside an allowlist and nowhere else.** It is a way of
+taking a sub-command back out of something already allowed — `defaults.exec` at
+`Deny` or `Ask`, with explicit `allow_exec` rules saying what may run — and it is
+not a blocklist over a permissive default. A joined argv can be spelled in more
+ways than a pattern can enumerate: `["git","-c","x","push"]` puts a flag between
+the program and the sub-command, and `["env","rm"]` and `["busybox","rm"]` reach
+the program under a name the rule never sees. No pattern closes that, because the
+set is not finite. Write the allowlist first, then narrow it.
 
 A deny in any layer beats an allow in any other, so an operator base is safe to
 hand out: nothing an application stacks on top can take it back. An `Effect::Ask`
@@ -288,7 +299,11 @@ model asked for. So "what was refused" is one query against `policy_events`, and
 ```rust
 use io_harness::{Act, Effect, Policy};
 
-let policy = Policy::permissive()
+// `Policy::default()` and not `permissive()`: its `exec` tier is `Ask`, so the
+// allows below are what may run and the deny narrows them. Under a permissive
+// tier the deny would be the only thing standing, and `["env", "cargo"]` walks
+// straight past it.
+let policy = Policy::default()
     .layer("ops")
     .allow_exec("cargo*")
     .deny_exec("cargo publish*");

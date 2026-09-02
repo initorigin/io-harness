@@ -120,6 +120,91 @@ A caller that reads `None` as "no target, so nothing to decide" reports
 userinfo, a hostless target that a permissive policy matches and allows. An
 empty host is no host, so it is `None` now.
 
+**A backslash ends the authority (0.74.0)**, as it does in the WHATWG URL parser
+and in Chrome's GURL for exactly these four schemes:
+
+```rust
+use io_harness::net::target;
+
+assert_eq!(target("http://127.0.0.1:11434\\@example.com/v1").as_deref(),
+           Some("127.0.0.1:11434"));
+```
+
+Without it the backslash left the userinfo split an `@` to find, so that URL was
+*checked* as `example.com:80` and would have been *dialled* at `127.0.0.1:11434`.
+A reimplementation that splits the authority on `/`, `?` and `#` alone has that
+same gap, which is the reason this is stated rather than left to the source.
+
+## The local-address floor (0.74.0)
+
+**A target the policy allows is refused anyway when it is local.** Every net
+decision in this crate up to 0.73.0 was a hostname glob, so `Policy::permissive()`
+handed the model this host's own admin ports, the private network around it and
+the cloud instance-metadata service — and no rule an operator wrote was wrong for
+letting it, because none of those is a hostname anybody thinks to deny. The floor
+sits *under* the policy: it can refuse what your rules allowed, and it cannot
+permit what your rules denied. A target already denied is not even resolved.
+
+What is refused, quoted the way a refusal quotes it:
+
+| Range | Why |
+| --- | --- |
+| `127.0.0.0/8`, `::1` | loopback — the whole `/8`, not just `127.0.0.1` |
+| `0.0.0.0/8`, `::` | "this network"; a `connect()` to it reaches this host |
+| `169.254.0.0/16`, `fe80::/10` | link-local |
+| `10/8`, `172.16/12`, `192.168/16` | RFC 1918 private networks |
+| `100.64.0.0/10` | carrier-grade NAT (RFC 6598) — not RFC 1918, so it needed naming separately |
+| `fc00::/7` | unique-local, of which `fd00::/8` is the half anything real uses |
+| `169.254.169.254`, `100.100.100.200` | cloud instance metadata, named so the refusal says "metadata" |
+| `localhost`, `localhost.localdomain`, `*.localhost`, `*.local` | names reserved to this machine or this link (RFC 6761, RFC 6762) |
+| `metadata.google.internal`, `metadata.goog` | metadata by name, refused before any resolver is consulted |
+
+Both IPv6 spellings of an IPv4 address are reduced first — `::ffff:127.0.0.1` and
+the deprecated `::127.0.0.1` land on the same rules as `127.0.0.1` — and a
+short-form host that only a resolver expands (`2130706433`, `127.1`) is graded
+after it is resolved rather than before.
+
+**`IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1` is the only way off it**, and the local
+model runtime is what it is for: `Compatible::ollama` points at
+`http://localhost:11434/v1`, which is the whole point of that run and is refused
+without it. `1` and `true` lift the floor; anything else, including the variable
+being absent, leaves it in place, and the value is re-read per connection rather
+than latched at the first one. The metadata hostnames and the two metadata
+addresses stay refused even when it is set — no local model runtime answers on
+one.
+
+**It is an environment variable and there is deliberately no `io.toml` key beside
+it.** A config key that widens is a key a cloned repository could set, and
+`[policy]` is accepted from a workspace file on the rule that such a file may
+narrow and never widen. The environment of a process that has already started is
+the one thing a hostile repository cannot write, so the widening lives there and
+nowhere else. An embedder that wants it per-run sets the variable around the run
+rather than looking for a key.
+
+**A refusal names the floor as its layer** — `local-address floor` — so a trace
+tells "your rules refused this" apart from "the floor underneath your rules
+refused this", and the message carries the address that decided, the reason and
+the key that would restore it. A host that resolves to a mix of permitted and
+refused addresses is refused whole, and a host that resolves to nothing is refused
+too: "nothing came back" is not "nothing objected".
+
+**Where the check is made differs by call site, and the difference is not
+cosmetic.** A floor that graded only names is one
+`http://169.254.169.254.nip.io/` walks through — `nip.io` answers
+`<anything>.<ip>` with that address — so the floor resolves. What that resolution
+is worth depends on what dials afterwards:
+
+| Call site | What it does | What that leaves open |
+| --- | --- | --- |
+| the HTTP MCP transport, the egress proxy | resolve once, grade, dial exactly the graded addresses | nothing — check and dial are the same answer |
+| a provider endpoint | graded before the run's first step; the `Provider` owns its own client and resolves the name again to dial | a name that answers with a local address only the *second* time. Closing it means every provider taking a pinned client, which is an API change this release did not make |
+| `browser_navigate` | graded by name only | a *name* that resolves onto a local address. Chrome resolves each URL itself, and pinning a navigation to an address breaks SNI and certificate validation. `browser_navigate("http://169.254.169.254.nip.io/")` under a policy that allows every host reaches cloud metadata |
+
+The way to close the browser row is to route it through the run's egress proxy,
+which already resolves once and dials what it graded. That wiring is not in this
+release, and this table is here rather than a claim that the floor covers
+everything.
+
 ## Asking whether a server actually answers
 
 A policy preflight tells you whether a server is *permitted* to start. It cannot

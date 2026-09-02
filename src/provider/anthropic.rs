@@ -503,9 +503,14 @@ impl Anthropic {
                 // about the accumulated state rather than about this event.
                 acc.announce(on_call);
             }
-            false
+            // 0.74.0 — a stream that has already asked for more than one response
+            // may accumulate is stopped here rather than read to its end.
+            acc.budget.spent()
         })
         .await?;
+        if acc.budget.spent() {
+            return Err(super::over_budget());
+        }
         // A stream where nothing at all parsed is a failure, not a quiet model.
         super::ensure_parsed(acc.finish())
     }
@@ -562,6 +567,11 @@ struct Accumulator {
     /// zero.
     sent: Option<Instant>,
     ttft_ms: Option<u64>,
+    /// 0.74.0 — what this response is still allowed to accumulate. Every append
+    /// below draws against it, so a stream cannot grow `text`, `reasoning` and
+    /// the tool-call fragments without bound between the request and its
+    /// deadline. See [`super::MAX_RESPONSE_BYTES`].
+    budget: super::Budget,
 }
 
 impl Accumulator {
@@ -612,7 +622,15 @@ impl Accumulator {
                                 .and_then(|n| n.as_str())
                                 .unwrap_or_default()
                                 .to_string();
-                            self.tool_calls.entry(index()).or_default().0 = name;
+                            if self.budget.take(name.len()) {
+                                if let Some(entry) = super::call_entry(
+                                    &mut self.tool_calls,
+                                    index(),
+                                    &mut self.budget,
+                                ) {
+                                    entry.0 = name;
+                                }
+                            }
                         }
                         // The model asking Anthropic to run a search: not a call
                         // this crate dispatches, so it never joins `tool_calls`.
@@ -637,7 +655,9 @@ impl Accumulator {
                     Some("text_delta") => {
                         if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str())
                         {
-                            self.text.push_str(t);
+                            if self.budget.take(t.len()) {
+                                self.text.push_str(t);
+                            }
                         }
                     }
                     // 0.31.0 — extended thinking. `signature_delta` is deliberately
@@ -648,7 +668,9 @@ impl Accumulator {
                             .and_then(|d| d.get("thinking"))
                             .and_then(|t| t.as_str())
                         {
-                            self.reasoning.push_str(t);
+                            if self.budget.take(t.len()) {
+                                self.reasoning.push_str(t);
+                            }
                         }
                     }
                     Some("input_json_delta") => {
@@ -656,7 +678,15 @@ impl Accumulator {
                             .and_then(|d| d.get("partial_json"))
                             .and_then(|p| p.as_str())
                         {
-                            self.tool_calls.entry(index()).or_default().1.push_str(p);
+                            if self.budget.take(p.len()) {
+                                if let Some(entry) = super::call_entry(
+                                    &mut self.tool_calls,
+                                    index(),
+                                    &mut self.budget,
+                                ) {
+                                    entry.1.push_str(p);
+                                }
+                            }
                         }
                     }
                     // 0.22.0 — a source arriving mid-sentence, one delta per
@@ -696,6 +726,11 @@ impl Accumulator {
         ) else {
             return;
         };
+        // 0.74.0 — the id and the name are both the sender's, and this map is
+        // response state like any other, so it draws on the same budget.
+        if !self.budget.take(super::ROW_BYTES + id.len() + name.len()) {
+            return;
+        }
         self.server_tool_names
             .insert(id.to_string(), name.to_string());
     }
@@ -726,6 +761,14 @@ impl Accumulator {
                     .and_then(|c| c.get("error_code"))
                     .and_then(|c| c.as_str()),
             );
+        // 0.74.0 — as above: a result block is one more row this response is
+        // asking the process to hold, so it is drawn for rather than free.
+        if !self
+            .budget
+            .take(super::ROW_BYTES + tool.len() + error.map_or(0, str::len))
+        {
+            return;
+        }
         self.server_tools.push(match error {
             Some(code) => crate::web::ServerToolCall::failed("anthropic", tool, code),
             None => crate::web::ServerToolCall::ok("anthropic", tool),
@@ -777,9 +820,23 @@ impl Accumulator {
         // times is a trace nobody reads. The second mention still enriches the
         // first: a result block gives the url and title, and the citation delta a
         // few events later adds the quoted passage.
+        // ponytail: the dedupe is a linear scan, so the list is quadratic in the
+        // citations one answer carries. Bounded now by the budget below rather
+        // than by the deadline; a set keyed on the url is the upgrade path if a
+        // real answer ever cites enough sources for it to show.
         if let Some(seen) = self.citations.iter_mut().find(|c| c.url == found.url) {
             seen.title = seen.title.take().or(found.title);
             seen.cited_text = seen.cited_text.take().or(found.cited_text);
+            return;
+        }
+        // 0.74.0 — a new source is a new row, drawn for on the same budget as the
+        // text. Only the new one: enriching the row above allocates nothing that
+        // its first mention did not already pay for.
+        let cost = super::ROW_BYTES
+            + found.url.len()
+            + found.title.as_ref().map_or(0, String::len)
+            + found.cited_text.as_ref().map_or(0, String::len);
+        if !self.budget.take(cost) {
             return;
         }
         self.citations.push(found);
@@ -802,7 +859,13 @@ impl Accumulator {
         // number of billed requests, and summing rather than naming one keeps a
         // tool Anthropic adds later from being silently uncounted.
         if let Some(counts) = usage.get("server_tool_use").and_then(|v| v.as_object()) {
-            let sum = counts.values().filter_map(|v| v.as_u64()).sum();
+            // Saturating for the reason `finish` is: every one of these counters
+            // is a `u64` the response chose, and a plain `sum` over them wraps in
+            // a release build.
+            let sum = counts
+                .values()
+                .filter_map(|v| v.as_u64())
+                .fold(0u64, u64::saturating_add);
             if sum > 0 {
                 self.server_tool_requests = sum;
             }
@@ -839,10 +902,21 @@ impl Accumulator {
         // wire boundary, rather than leaving every reader of the trace to know
         // which vendor it came from. Before 0.18.0 the cached tokens were dropped
         // entirely, so a cache-heavy run under-reported its prompt.
-        let prompt = self.input_tokens + self.cache_read_tokens + self.cache_write_tokens;
+        //
+        // Saturating, and that is the load-bearing part (0.74.0, L6). Each term
+        // is an `as_u64` off the response with no ceiling on it, and a debug
+        // build's overflow panic becomes a *wrap* in release — where the wrapped
+        // total is what the run's token budget draws against, so four large
+        // counts summing past `u64::MAX` bought an unmetered step. `pricing.rs`
+        // has always been careful here in `u128`; this was the gap. Saturating
+        // matches the deliberate `saturating_sub` in `provider/mod.rs`.
+        let prompt = self
+            .input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens);
         // Anthropic reports no total, so this one is summed rather than taken as
         // reported.
-        let total = prompt + self.output_tokens;
+        let total = prompt.saturating_add(self.output_tokens);
         CompletionResponse {
             text: if self.text.is_empty() {
                 None
@@ -1837,5 +1911,170 @@ mod media_wire {
             ..Default::default()
         });
         assert_eq!(b["messages"][0]["content"], "no picture");
+    }
+}
+
+/// What one response is allowed to cost, and what its counters are allowed to do
+/// (0.74.0 — M13, L6).
+///
+/// Here rather than in `tests/` because the seams are crate-internal: the
+/// accumulator is private, and every provider is pinned to its vendor's URL in
+/// the public API, so only a crate test can point one at a local socket.
+#[cfg(test)]
+mod bounds {
+    use super::*;
+    use crate::provider::failures::{serve, stream_response};
+    use crate::provider::{MAX_RESPONSE_BYTES, MAX_TOOL_CALL_BLOCKS};
+
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+    fn request() -> CompletionRequest {
+        CompletionRequest {
+            system: "s".into(),
+            user: "u".into(),
+            ..Default::default()
+        }
+    }
+
+    /// One `text_delta` event carrying `bytes` bytes of text.
+    ///
+    /// Half a mebibyte per event, so the events themselves stay under the SSE
+    /// line cap and it is the *accumulation* bound this drives rather than that
+    /// one — two bounds that pass for each other prove neither.
+    fn text_event(bytes: usize) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": "x".repeat(bytes) },
+            })
+        )
+    }
+
+    #[tokio::test]
+    async fn m13_a_stream_past_the_accumulation_bound_is_refused_not_truncated() {
+        const CHUNK: usize = 512 * 1024;
+        let events: String = std::iter::repeat_with(|| text_event(CHUNK))
+            .take(MAX_RESPONSE_BYTES / CHUNK + 1)
+            .collect();
+        let url = serve(stream_response(&format!(
+            "{events}data: {{\"type\":\"message_stop\"}}\n\n"
+        )));
+
+        // Through 0.73.0 this was a *successful* completion carrying eight and a
+        // half mebibytes of text, and the only thing that had bounded the
+        // allocation was the 600 s request deadline.
+        let err = Anthropic::at(&url, Duration::from_secs(30))
+            .complete(request())
+            .await
+            .unwrap_err();
+        let Error::Provider { kind, message, .. } = &err else {
+            panic!("expected a provider error, got {err:?}");
+        };
+        assert_eq!(*kind, crate::error::ProviderErrorKind::Malformed);
+        assert!(message.contains("accumulate"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn m13_a_response_under_the_bound_is_untouched() {
+        // The negative control. A cap that refused everything would pass the test
+        // above while breaking every real answer, so a stream of the same shape
+        // that stays inside the bound must still arrive whole.
+        const CHUNK: usize = 512 * 1024;
+        let events: String = std::iter::repeat_with(|| text_event(CHUNK))
+            .take(4)
+            .collect();
+        let url = serve(stream_response(&format!(
+            "{events}data: {{\"type\":\"message_stop\"}}\n\n"
+        )));
+        let out = Anthropic::at(&url, Duration::from_secs(30))
+            .complete(request())
+            .await
+            .unwrap();
+        assert_eq!(out.text.as_deref().map(str::len), Some(4 * CHUNK));
+    }
+
+    #[test]
+    fn m13_a_response_cannot_open_unbounded_tool_call_blocks() {
+        // The cheaper door onto the same exhaustion: the block index is the
+        // sender's, so the map keyed on it grew with whatever arrived even when
+        // every block was empty and no byte bound would ever have noticed.
+        let mut acc = Accumulator::default();
+        for index in 0..=MAX_TOOL_CALL_BLOCKS as u64 {
+            acc.ingest(&json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": { "type": "tool_use", "name": "t" },
+            }));
+        }
+        assert!(acc.budget.spent(), "the cardinality bound must be reached");
+        assert_eq!(acc.tool_calls.len(), MAX_TOOL_CALL_BLOCKS);
+    }
+
+    #[test]
+    fn l6_a_token_total_saturates_where_it_used_to_wrap() {
+        // Every term is an `as_u64` off the response with no ceiling on it. In a
+        // debug build 0.73.0 panicked here; in release it *wrapped*, and the
+        // wrapped total is what the run's token budget draws against — so a
+        // response claiming these four counts bought an unmetered step.
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({
+            "type": "message_start",
+            "message": { "usage": {
+                "input_tokens": u64::MAX,
+                "cache_read_input_tokens": u64::MAX,
+                "cache_creation_input_tokens": u64::MAX,
+            }},
+        }));
+        acc.ingest(&json!({
+            "type": "message_delta",
+            "usage": { "output_tokens": 7 },
+        }));
+
+        let usage = acc.finish().usage.expect("a usage");
+        assert_eq!(usage.prompt_tokens, u64::MAX);
+        assert_eq!(usage.total_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn l6_the_server_tool_counters_saturate_too() {
+        // The same arithmetic one function up: `server_tool_use` is an object of
+        // response-chosen counters and their sum was a plain `sum()`.
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({
+            "type": "message_delta",
+            "usage": {
+                "output_tokens": 1,
+                "server_tool_use": { "web_search": u64::MAX, "web_fetch": u64::MAX },
+            },
+        }));
+        assert_eq!(
+            acc.finish().usage.expect("a usage").server_tool_requests,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn l6_an_ordinary_usage_object_still_adds_up_exactly() {
+        // The negative control for both: saturating arithmetic that clamped a
+        // real total would be a worse bug than the wrap it replaced.
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({
+            "type": "message_start",
+            "message": { "usage": {
+                "input_tokens": 11,
+                "cache_read_input_tokens": 300,
+                "cache_creation_input_tokens": 1_200,
+                "server_tool_use": { "web_search": 2, "web_fetch": 3 },
+            }},
+        }));
+        acc.ingest(&json!({
+            "type": "message_delta",
+            "usage": { "output_tokens": 7 },
+        }));
+        let usage = acc.finish().usage.expect("a usage");
+        assert_eq!(usage.prompt_tokens, 11 + 300 + 1_200);
+        assert_eq!(usage.total_tokens, 11 + 300 + 1_200 + 7);
+        assert_eq!(usage.server_tool_requests, 5);
     }
 }

@@ -16,7 +16,9 @@ use crate::error::Result;
 /// What a run asked the browser to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
-    /// Go to a URL. Gated at the paused request, like every other navigation.
+    /// Go to a URL. Gated at the paused request, like every other navigation —
+    /// and, for a URL that opens no request at all, gated on its scheme before
+    /// the browser is asked to go there (0.74.0, audit H6).
     Navigate { url: String },
     /// The page's text, or one element's.
     Read { selector: Option<String> },
@@ -53,6 +55,21 @@ pub(crate) async fn act(browser: &Browser, action: Action) -> Result<Outcome> {
     let mut image = None;
     let body = match action {
         Action::Navigate { url } => {
+            // 0.74.0, audit H6 — before the browser is told to go anywhere. The
+            // request pause is where every navigation to a host is decided, but
+            // `file:`, `data:`, `blob:` and `javascript:` produce a page without
+            // producing a request, so the pause never fires and the load happened
+            // by the time anything could refuse it. `Page.navigate` is not
+            // undoable: the bytes are in the page, and `browser_read` will return
+            // them. The gate records the decision, and the caller drains it
+            // whether this returns an error or not, so a refusal is reported as a
+            // refusal rather than as whatever the protocol called it.
+            if !browser.gate().admits_scheme(&url) {
+                return Err(fail(format!(
+                    "the browser was not sent to a `{}` URL",
+                    crate::browser::scheme_label(&url)
+                )));
+            }
             browser.page("Page.navigate", json!({"url": url})).await?;
             let settled = settle(browser).await;
             let mut out = format!("navigated to {url}");

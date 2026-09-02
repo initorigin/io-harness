@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use io_harness::config::Scope;
 use io_harness::hooks::OnFailure;
@@ -101,22 +101,80 @@ impl Observer for Recorder {
     }
 }
 
-/// One empty directory for the whole binary, so every test in it points the user
-/// scope at the same place.
+/// Guards `IO_CONFIG_HOME`, which the process has exactly one of.
 ///
-/// The same fix `tests/hooks.rs` applies, for the same reason: these tests assert
-/// what a *declared* bundle does, and a `[[plugin]]` entry in a real `io.toml` on
-/// the developer's own machine would be discovered as a fourth scope and change
-/// both `plugins.len()` and which entry `dropped()[0]` is. Green on CI and
-/// host-dependent locally is the worst shape a test can have.
-static USER: OnceLock<tempfile::TempDir> = OnceLock::new();
+/// Until 0.74.0 every test here wanted the same answer — an empty user scope, so a
+/// `[[plugin]]` entry in a real `io.toml` on the developer's own machine could not
+/// be discovered as a fourth scope and change both `plugins.len()` and which entry
+/// `dropped()[0]` is — and one shared directory removed the race without
+/// serializing around it. That is no longer available: a bundle contributing a
+/// `[[hook]]`, an `[[mcp]]` or a `[[bin]]` must now be declared from the user
+/// scope, so each test needs a *different* one. The same fix `tests/hooks.rs`
+/// applies, for the same reason.
+static ENV: Mutex<()> = Mutex::new(());
 
-/// Every root in this file comes from here, so the isolation is not something a
-/// new test has to remember to ask for.
+/// A workspace root of its own for every test, so nothing on the developer's
+/// machine can change what one measures.
 fn tmp() -> tempfile::TempDir {
-    let user = USER.get_or_init(|| tempfile::tempdir().unwrap());
-    std::env::set_var("IO_CONFIG_HOME", user.path());
     tempfile::tempdir().unwrap()
+}
+
+/// Discover `root` against an empty user scope — the shape every test in this file
+/// had before 0.74.0.
+fn discover(root: &Path) -> io_harness::Result<Config> {
+    discover_with(root, "")
+}
+
+/// Discover `root` against a user-scope `io.toml` holding `user_toml`.
+///
+/// Since 0.74.0 a bundle contributing a `[[hook]]`, an `[[mcp]]` or a `[[bin]]`
+/// loads in exactly one shape: its manifest outside the workspace, named from the
+/// user-scope file. `io.toml` arrives with a `git clone`, `io.local.toml` sits in
+/// the workspace root a run's own agent writes to, and a `plugin.toml` under that
+/// same root is an agent-authored file whatever scope pointed at it — so every
+/// test whose subject is *what a bundle contributes* rather than *where a bundle
+/// may sit* writes its declaration here and pairs it with `declared_outright`.
+///
+/// The tempdir is dropped on return, which is safe because discovery has already
+/// read the file into the returned value.
+///
+/// The lock is held across the two lines that touch the environment and the
+/// `Config::discover` that reads them, and released before the caller reaches an
+/// `.await` — half of these tests are `async`, and a lock held across one is a
+/// deadlock waiting for a reason.
+///
+/// `IO_CONFIG` is removed rather than left alone: it names the user-scope *file*
+/// outright and wins over `IO_CONFIG_HOME`, so a developer who has one exported
+/// would otherwise be running a different test.
+fn discover_with(root: &Path, user_toml: &str) -> io_harness::Result<Config> {
+    let user = tempfile::tempdir().unwrap();
+    std::fs::write(user.path().join("io.toml"), user_toml).unwrap();
+    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("IO_CONFIG");
+    std::env::set_var("IO_CONFIG_HOME", user.path());
+    Config::discover(root)
+}
+
+/// A user-scope `[[plugin]]` naming `dir` outright, followed by `extra`.
+///
+/// Since 0.74.0 trust follows where the manifest *is* rather than which file named
+/// it, and this is the shape that carries it. A `[[plugin]]`'s `path` resolves
+/// against the discovery root, so `path = "bundles/tools"` written in the
+/// operator's own file names a directory the run's own agent can put a
+/// `plugin.toml` into — one ordinary `write_file` — and the manifest found there
+/// is graded as the workspace file it is. A bundle contributing a `[[hook]]`, an
+/// `[[mcp]]` or a `[[bin]]` therefore has to sit *outside* the workspace and be
+/// named absolutely, which is the shape a bundle shared across projects has
+/// anyway. `contain_under_root` is not applied to a user-scope declaration, so an
+/// absolute path is not merely tolerated here: it is the supported form.
+///
+/// `{:?}` on the path rather than the path: a Windows path is full of backslashes
+/// and a TOML basic string would fail on the escapes.
+fn declared_outright(dir: &Path, extra: &str) -> String {
+    format!(
+        "[[plugin]]\npath = {:?}\n{extra}",
+        dir.display().to_string()
+    )
 }
 
 fn write(path: &Path, body: &str) {
@@ -223,7 +281,7 @@ async fn a_declared_bundle_contributes_and_an_undeclared_one_does_not() {
             write(&root.join("io.local.toml"), "[run]\nmax_steps = 4\n");
         }
 
-        let config = Config::discover(root).unwrap();
+        let config = discover(root).unwrap();
         let plugins = config.plugins();
         assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
         assert_eq!(plugins.len(), usize::from(expect));
@@ -283,10 +341,7 @@ async fn a_refusal_names_the_plugin_that_introduced_the_rule() {
                 &root.join("io.local.toml"),
                 "[[plugin]]\npath = \"bundles/rust-review\"\n",
             );
-            policy = Config::discover(root)
-                .unwrap()
-                .plugins()
-                .apply_to_policy(policy);
+            policy = discover(root).unwrap().plugins().apply_to_policy(policy);
         } else {
             policy = policy.layer("guard").deny_write("secrets/**");
         }
@@ -334,7 +389,12 @@ async fn a_refusal_names_the_plugin_that_introduced_the_rule() {
 async fn an_mcp_call_from_a_bundle_is_attributed_to_it() {
     let dir = tmp();
     let root = dir.path();
-    let plugin = root.join("bundles/tools");
+    // Outside the workspace, named outright from the user scope: an MCP server
+    // names a program to run, and since 0.74.0 a manifest that sits inside the
+    // workspace may not contribute one whatever scope pointed at it. F4 asserts
+    // that half.
+    let home = tmp();
+    let plugin = home.path().join("tools");
     write(
         &plugin.join("plugin.toml"),
         &format!(
@@ -342,14 +402,9 @@ async fn an_mcp_call_from_a_bundle_is_attributed_to_it() {
             fixture_server().display().to_string()
         ),
     );
-    // `io.local.toml`, not `io.toml`: an MCP server names a program to run, so a
-    // project-scoped declaration may not contribute one. F4 asserts that half.
-    write(
-        &root.join("io.local.toml"),
-        "[[plugin]]\npath = \"bundles/tools\"\n",
-    );
-
-    let plugins = Config::discover(root).unwrap().plugins();
+    let plugins = discover_with(root, &declared_outright(&plugin, ""))
+        .unwrap()
+        .plugins();
     assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
     assert_eq!(
         plugins.get("tools").unwrap().mcp_servers()[0].id,
@@ -401,7 +456,7 @@ fn a_bundle_agent_is_registered_under_its_namespaced_name_only() {
         "[[plugin]]\npath = \"bundles/rust-review\"\n",
     );
 
-    let plugins = Config::discover(root).unwrap().plugins();
+    let plugins = discover(root).unwrap().plugins();
     let contract = plugins.apply_to(contract(root));
     assert_eq!(contract.agents.names(), vec!["rust-review__reviewer"]);
     assert!(
@@ -419,18 +474,37 @@ fn a_bundle_agent_is_registered_under_its_namespaced_name_only() {
 
 // ------------------------------------------------------------------ F4
 
-/// **F4**, all three arms. A project-scoped declaration may not contribute a
-/// hook, an MCP server or — since 0.73.0 — a `[[bin]]`; the same directory
-/// declared locally may. The discriminating
-/// assertion on the refused arm is that the bundle contributes **nothing** — a
-/// loader that dropped the offending array and kept the rest would satisfy a
-/// weaker claim while leaving a stranger's manifest half-applied.
+/// **F4**, all three arms across every declaration site there is. A bundle whose
+/// `plugin.toml` sits *inside the workspace* may not contribute a hook, an MCP
+/// server or — since 0.73.0 — a `[[bin]]`; the same manifest outside it, named from
+/// the user-scope file, may. The discriminating assertion on a refused arm is that
+/// the bundle contributes **nothing** — a loader that dropped the offending array
+/// and kept the rest would satisfy a weaker claim while leaving a stranger's
+/// manifest half-applied.
 ///
 /// The `bin` arm is the same argument with a third key attached: a `[[bin]]`
 /// names a program on this machine and exists so that something will go looking
-/// for it, and `io.toml` arrives with a `git clone`.
+/// for it.
+///
+/// **Renamed and widened in 0.74.0**, from
+/// `a_bundle_named_by_a_workspace_file_contributes_nothing_that_runs_a_program`.
+/// The old name stated the axis the loader used to turn on — which *file* named the
+/// bundle — and that axis had a hole under it. A `[[plugin]]`'s `path` resolves
+/// against the discovery root, so an operator's own `~/.config/io/io.toml` writing
+/// `path = "bundles/tools"` names a directory in the workspace the run is writing
+/// to; one `write_file` of `bundles/tools/plugin.toml` carrying a `[[hook]]` was
+/// then a program installed as trusted, because the user scope is exactly the scope
+/// exempt from this rule. Both spellings of that declaration are arms below. The
+/// axis is now where the manifest is, and the user scope's trust reaches a bundle
+/// only where the scope's own premise holds — outside the workspace.
+///
+/// Both workspace files (audit H2), not `io.toml` alone. `io.toml` arrives with a
+/// `git clone` and `io.local.toml` sits in the workspace root the run's own agent
+/// writes to. The outside-the-workspace arm is the control that keeps this a
+/// boundary which *moved*: without it a loader that refused every bundle everywhere
+/// would pass every assertion above it.
 #[test]
-fn a_project_scoped_bundle_contributes_nothing_that_runs_a_program() {
+fn a_bundle_whose_manifest_is_inside_the_workspace_contributes_nothing_that_runs_a_program() {
     for offending in ["hook", "mcp", "bin"] {
         let body = match offending {
             "hook" => "[[hook]]\non = [\"finished\"]\nappend = \"audit.jsonl\"\n".to_string(),
@@ -441,81 +515,162 @@ fn a_project_scoped_bundle_contributes_nothing_that_runs_a_program() {
             ),
         };
 
-        for scope_file in ["io.toml", "io.local.toml"] {
+        for site in [
+            "io.toml",
+            "io.local.toml",
+            "the user scope, relative into the workspace",
+            "the user scope, absolute into the workspace",
+            "the user scope, outside the workspace",
+        ] {
             let dir = tmp();
             let root = dir.path();
-            let plugin = bundle(root, "rust-review");
+            let home = tmp();
+            let outside = site.ends_with("outside the workspace");
+            let plugin = bundle(if outside { home.path() } else { root }, "rust-review");
             let manifest = std::fs::read_to_string(plugin.join("plugin.toml")).unwrap();
             write(&plugin.join("plugin.toml"), &format!("{manifest}\n{body}"));
-            write(
-                &root.join(scope_file),
-                "[[plugin]]\npath = \"bundles/rust-review\"\n",
-            );
 
-            let plugins = Config::discover(root).unwrap().plugins();
-            if scope_file == "io.toml" {
-                assert_eq!(plugins.len(), 0, "{offending} from a project scope");
-                assert_eq!(plugins.dropped().len(), 1);
-                let error = &plugins.dropped()[0].error;
-                assert!(
-                    error.contains(offending) && error.contains("io.local.toml"),
-                    "the refusal names the key and where it may live: {error}"
-                );
-                // Nothing else of the manifest reached anything.
-                let contract = plugins.apply_to(contract(root));
-                let policy = plugins.apply_to_policy(Policy::permissive());
-                assert!(contract.agents.names().is_empty(), "no agent");
-                assert!(contract.mcp.is_empty(), "no server");
-                assert!(contract.plugins.is_empty(), "no skills");
-                assert_eq!(policy.layers.len(), 0, "no layer");
-            } else {
-                assert_eq!(plugins.len(), 1, "{offending} from a local scope");
+            // The relative form is the exploit as written: `path` is resolved
+            // against the discovery root by every scope, so the operator's own
+            // file and the committed one name the same directory by the same text.
+            let relative = "[[plugin]]\npath = \"bundles/rust-review\"\n";
+            let plugins = match site {
+                "io.toml" | "io.local.toml" => {
+                    write(&root.join(site), relative);
+                    discover(root).unwrap().plugins()
+                }
+                "the user scope, relative into the workspace" => {
+                    discover_with(root, relative).unwrap().plugins()
+                }
+                _ => discover_with(root, &declared_outright(&plugin, ""))
+                    .unwrap()
+                    .plugins(),
+            };
+
+            if outside {
+                assert_eq!(plugins.len(), 1, "{offending} from {site}");
                 assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
+                continue;
             }
+
+            assert_eq!(plugins.len(), 0, "{offending} from {site}");
+            assert_eq!(plugins.dropped().len(), 1, "{offending} from {site}");
+            let error = &plugins.dropped()[0].error;
+            assert!(
+                error.contains(offending) && error.contains("the user-scope file"),
+                "the refusal names the key and where it may live: {error}"
+            );
+            assert!(
+                !error.contains("io.local.toml"),
+                "and never sends an operator to a file held to the same rule: {error}"
+            );
+            // Nothing else of the manifest reached anything.
+            let contract = plugins.apply_to(contract(root));
+            let policy = plugins.apply_to_policy(Policy::permissive());
+            assert!(contract.agents.names().is_empty(), "no agent");
+            assert!(contract.mcp.is_empty(), "no server");
+            assert!(contract.plugins.is_empty(), "no skills");
+            assert_eq!(policy.layers.len(), 0, "no layer");
         }
     }
 }
 
-/// **F4**, the hook arm's positive half taken all the way: a locally declared
-/// bundle's hook is installed and fires on a real event.
+/// **F4**, the hook arm taken all the way in every direction — and the direction it
+/// separates changed twice.
+///
+/// **Renamed and rewritten in 0.74.0**, from
+/// `a_locally_declared_bundle_hook_does_not_run_and_a_user_declared_one_does`.
+/// Until this release `io.local.toml` was the trusted file and the test was named
+/// for the hook it ran; audit H2 established that the workspace root is a path the
+/// run's own agent writes to, so the local declaration became a refusal and
+/// "user-declared" became the name of the loading half. That name did not survive
+/// the release either: a `[[plugin]]`'s `path` resolves against the discovery root,
+/// so the operator's own file naming `bundles/rust-review` points at a directory
+/// inside the workspace, and the `plugin.toml` the agent writes there is an
+/// agent-authored file whatever scope pointed at it. Who declared the bundle is not
+/// the axis; where the manifest sits is. The middle arm below is the one that
+/// exists because of that, and it fails on the loader this release started with.
+///
+/// The refusing arms are asserted by *effect* rather than by the drop alone: no
+/// `audit.jsonl` exists on disk after a run that finished. The loading arm is what
+/// keeps that absence worth anything — a loader that installed no hook from
+/// anywhere, or a run that never reached `finished`, would satisfy every absence
+/// and fail there.
 #[tokio::test]
-async fn a_locally_declared_bundle_hook_runs() {
-    let dir = tmp();
-    let root = dir.path();
-    let plugin = bundle(root, "rust-review");
-    let manifest = std::fs::read_to_string(plugin.join("plugin.toml")).unwrap();
-    write(
-        &plugin.join("plugin.toml"),
-        &format!("{manifest}\n[[hook]]\non = [\"finished\"]\nappend = \"audit.jsonl\"\n"),
-    );
-    write(
-        &root.join("io.local.toml"),
-        "[[plugin]]\npath = \"bundles/rust-review\"\n",
-    );
+async fn a_bundle_hook_runs_only_when_the_manifest_is_outside_the_workspace() {
+    for site in [
+        "io.local.toml",
+        "the user scope, into the workspace",
+        "the user scope, outside the workspace",
+    ] {
+        let dir = tmp();
+        let root = dir.path();
+        let home = tmp();
+        let runs = site.ends_with("outside the workspace");
+        let plugin = bundle(if runs { home.path() } else { root }, "rust-review");
+        let manifest = std::fs::read_to_string(plugin.join("plugin.toml")).unwrap();
+        write(
+            &plugin.join("plugin.toml"),
+            &format!("{manifest}\n[[hook]]\non = [\"finished\"]\nappend = \"audit.jsonl\"\n"),
+        );
 
-    let config = Config::discover(root).unwrap();
-    let plugins = config.plugins();
-    let hooks = plugins.apply_to_hooks(config.hooks(), root);
-    assert!(!hooks.is_empty(), "the bundle's hook was installed");
+        // `append` resolves against the discovery root rather than the bundle, so
+        // the log lands in the workspace on every arm and the file's presence
+        // measures the same thing across all three.
+        let relative = "[[plugin]]\npath = \"bundles/rust-review\"\n";
+        let config = match site {
+            "io.local.toml" => {
+                write(&root.join("io.local.toml"), relative);
+                discover(root).unwrap()
+            }
+            "the user scope, into the workspace" => discover_with(root, relative).unwrap(),
+            _ => discover_with(root, &declared_outright(&plugin, "")).unwrap(),
+        };
+        let plugins = config.plugins();
 
-    let contract = plugins.apply_to(contract(root));
-    let policy = plugins.apply_to_policy(Policy::permissive());
-    io_harness::run_with_observed(
-        &contract,
-        &Script::of(vec![vec![]]),
-        &store(root),
-        &policy,
-        &ApproveAll,
-        &hooks,
-    )
-    .await
-    .unwrap();
+        assert_eq!(plugins.len(), usize::from(runs), "loaded, from {site}");
+        assert_eq!(
+            plugins.dropped().len(),
+            usize::from(!runs),
+            "dropped, from {site}"
+        );
+        if !runs {
+            assert!(
+                plugins.dropped()[0].error.contains("key `hook`"),
+                "refused for the hook and not for something else: {}",
+                plugins.dropped()[0].error
+            );
+        }
 
-    let log = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
-    assert!(
-        log.contains("finished"),
-        "the hook wrote the event it asked for: {log}"
-    );
+        let hooks = plugins.apply_to_hooks(config.hooks(), root);
+        assert_eq!(!hooks.is_empty(), runs, "installed, from {site}");
+
+        let contract = plugins.apply_to(contract(root));
+        let policy = plugins.apply_to_policy(Policy::permissive());
+        io_harness::run_with_observed(
+            &contract,
+            &Script::of(vec![vec![]]),
+            &store(root),
+            &policy,
+            &ApproveAll,
+            &hooks,
+        )
+        .await
+        .unwrap();
+
+        let log = std::fs::read_to_string(root.join("audit.jsonl"));
+        assert_eq!(
+            log.is_ok(),
+            runs,
+            "the hook wrote its log only where the manifest is outside the workspace: {log:?}"
+        );
+        if let Ok(log) = log {
+            assert!(
+                log.contains("finished"),
+                "and wrote the event it asked for: {log}"
+            );
+        }
+    }
 }
 
 // ------------------------------------------------------------------ F5
@@ -550,7 +705,7 @@ async fn plugin_policy_may_only_narrow() {
             "[[plugin]]\npath = \"bundles/wide\"\n",
         );
 
-        let plugins = Config::discover(root).unwrap().plugins();
+        let plugins = discover(root).unwrap().plugins();
         assert_eq!(plugins.len(), 0, "the {name} bundle is dropped");
         assert!(
             plugins.dropped()[0].error.contains(needle),
@@ -618,7 +773,7 @@ async fn a_broken_bundle_costs_exactly_itself() {
              [[plugin]]\npath = \"bundles/unknown\"\n",
         );
 
-        let plugins = Config::discover(root).unwrap().plugins();
+        let plugins = discover(root).unwrap().plugins();
         let expected_drops = if repaired { 0 } else { 3 };
         assert_eq!(
             plugins.dropped().len(),
@@ -701,7 +856,7 @@ fn a_bad_or_duplicate_id_drops_only_its_own_bundle() {
          [[plugin]]\npath = \"bundles/twin\"\n",
     );
 
-    let plugins = Config::discover(root).unwrap().plugins();
+    let plugins = discover(root).unwrap().plugins();
     assert_eq!(plugins.names(), vec!["good"]);
     assert_eq!(plugins.dropped().len(), 4);
     assert!(plugins
@@ -732,7 +887,7 @@ async fn namespacing_makes_a_collision_impossible() {
         "[[plugin]]\npath = \"bundles/alpha\"\n[[plugin]]\npath = \"bundles/beta\"\n",
     );
 
-    let plugins = Config::discover(root).unwrap().plugins();
+    let plugins = discover(root).unwrap().plugins();
     let contract = plugins
         .apply_to(contract(root))
         .with_skills(root.join("own"));
@@ -792,7 +947,7 @@ fn a_manifest_may_not_run_a_command_in_any_scope() {
             "[[plugin]]\npath = \"bundles/sneaky\"\n",
         );
 
-        let plugins = Config::discover(root).unwrap().plugins();
+        let plugins = discover(root).unwrap().plugins();
         assert_eq!(plugins.len(), 0, "dropped from {scope_file}");
         assert!(
             plugins.dropped()[0].error.contains("cmd"),
@@ -805,8 +960,10 @@ fn a_manifest_may_not_run_a_command_in_any_scope() {
 // --------------------------------------------------- 0.70.0, `enabled`
 
 /// The `bundle()` above grown to all seven contribution kinds — its four plus a
-/// hook, an MCP server and a `[[bin]]` (0.73.0), the three only a locally
-/// declared bundle may contribute.
+/// hook, an MCP server and a `[[bin]]` (0.73.0), the three a bundle may contribute
+/// only from outside the workspace, named by the user scope. Callers pass a `root`
+/// of their own for that reason: it is a directory the discovery root does not
+/// contain, not the workspace.
 /// Seven is the number that matters here: a disabled bundle has to contribute
 /// none of them, and a bundle declaring four would leave three untested.
 ///
@@ -841,16 +998,16 @@ async fn a_disabled_bundle_contributes_none_of_the_seven_and_stays_visible() {
     for enabled in [true, false] {
         let dir = tmp();
         let root = dir.path();
-        seven_kind_bundle(root, "rust-review");
-        write(
-            &root.join("io.local.toml"),
-            &format!(
-                "[[plugin]]\npath = \"bundles/rust-review\"\n{}",
-                if enabled { "" } else { "enabled = false\n" }
-            ),
-        );
-
-        let config = Config::discover(root).unwrap();
+        // Outside the workspace, named outright from the user scope: three of the
+        // seven name a program to run, and since 0.74.0 a manifest inside the
+        // workspace may contribute none of those three.
+        let home = tmp();
+        let plugin = seven_kind_bundle(home.path(), "rust-review");
+        let config = discover_with(
+            root,
+            &declared_outright(&plugin, if enabled { "" } else { "enabled = false\n" }),
+        )
+        .unwrap();
         let plugins = config.plugins();
         assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
         assert_eq!(plugins.len(), usize::from(enabled), "loaded, {enabled}");
@@ -943,7 +1100,7 @@ fn an_absent_enabled_key_is_indistinguishable_from_switched_on() {
             ),
         );
 
-        let plugins = Config::discover(root).unwrap().plugins();
+        let plugins = discover(root).unwrap().plugins();
         let contract = plugins.apply_to(contract(root));
         let policy = plugins.apply_to_policy(Policy::permissive());
         let templates = plugins.templates().unwrap();
@@ -990,7 +1147,7 @@ fn a_disabled_bundle_that_cannot_be_read_is_still_dropped() {
         "[[plugin]]\npath = \"bundles/broken\"\nenabled = false\n",
     );
 
-    let plugins = Config::discover(root).unwrap().plugins();
+    let plugins = discover(root).unwrap().plugins();
     assert!(plugins.disabled().is_empty(), "not switched off, broken");
     assert_eq!(plugins.dropped().len(), 1);
     assert!(
@@ -1024,7 +1181,7 @@ fn a_disabled_project_scoped_bundle_is_still_refused_its_hook() {
             ),
         );
 
-        let plugins = Config::discover(root).unwrap().plugins();
+        let plugins = discover(root).unwrap().plugins();
         assert_eq!(plugins.len(), 0, "nothing loaded, enabled = {enabled}");
         assert!(
             plugins.disabled().is_empty(),
@@ -1063,7 +1220,7 @@ fn a_disabled_twin_claims_no_id_and_the_enabled_one_loads() {
             ),
         );
 
-        let plugins = Config::discover(root).unwrap().plugins();
+        let plugins = discover(root).unwrap().plugins();
         assert!(
             plugins.dropped().is_empty(),
             "neither entry collides, first_enabled = {first_enabled}: {:?}",
@@ -1092,7 +1249,7 @@ fn two_enabled_bundles_sharing_an_id_still_collide() {
         "[[plugin]]\npath = \"bundles/good\"\n[[plugin]]\npath = \"bundles/twin\"\n",
     );
 
-    let plugins = Config::discover(root).unwrap().plugins();
+    let plugins = discover(root).unwrap().plugins();
     assert_eq!(plugins.dropped().len(), 1, "the second is dropped");
     assert!(
         plugins.dropped()[0].error.contains("already declared"),
@@ -1212,18 +1369,18 @@ timeout_ms = 1234
 fn a_bundle_hook_is_readable_key_by_key_and_not_merely_counted() {
     let dir = tmp();
     let root = dir.path();
+    // Outside the workspace, named outright from the user scope: since 0.74.0 that
+    // is the only shape in which a bundle contributing a `[[hook]]` loads at all,
+    // which is the rule the whole of `tests/plugin.rs` already asserts.
+    let home = tmp();
+    let plugin_dir = home.path().join("gated");
     write(
-        &root.join("bundles/gated/plugin.toml"),
+        &plugin_dir.join("plugin.toml"),
         &format!("name = \"gated\"\n\n{SEVEN_KEYS}"),
     );
-    // `io.local.toml`: only a trusted scope may declare a bundle that runs a
-    // program, which is the rule the whole of `tests/plugin.rs` already asserts.
-    write(
-        &root.join("io.local.toml"),
-        "[[plugin]]\npath = \"bundles/gated\"\n",
-    );
-
-    let plugins = Config::discover(root).unwrap().plugins();
+    let plugins = discover_with(root, &declared_outright(&plugin_dir, ""))
+        .unwrap()
+        .plugins();
     assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
     let plugin = plugins.get("gated").unwrap();
     assert_eq!(
@@ -1296,9 +1453,16 @@ fn executing_bundle(root: &Path) -> PathBuf {
 /// `Config::discover`, no temporary file.
 ///
 /// And the answer depends on the scope the caller intends to declare it from,
-/// which is the marketplace-install semantics rather than a quirk: the operator's
-/// own files get the hook and the MCP server, and the committed `io.toml` that
-/// arrives with a `git clone` is refused the manifest whole.
+/// which is the marketplace-install semantics rather than a quirk. 0.74.0 moves
+/// the line the answer turns on: it used to run between the operator's own two
+/// files and the committed one, and audit H2 established that `io.local.toml` sits
+/// in the workspace root a run's own agent writes to. Both files under the
+/// workspace are now refused the manifest whole, and the user-scope file is the
+/// one answer that still carries the hook and the MCP server.
+///
+/// The refused scopes are asserted beside the loading one rather than alone,
+/// because a call that refused every scope would satisfy both refusals and take
+/// the feature away.
 #[test]
 fn inspect_reads_an_undeclared_bundle_and_answers_by_the_scope_it_was_asked_about() {
     let dir = tmp();
@@ -1309,36 +1473,42 @@ fn inspect_reads_an_undeclared_bundle_and_answers_by_the_scope_it_was_asked_abou
         "nothing was declared: this is the whole point of the call"
     );
 
-    for scope in [Scope::User, Scope::Local] {
-        let plugin = Plugins::inspect(scope, &bundle).unwrap();
-        assert_eq!(plugin.id(), "installer");
-        assert_eq!(plugin.root(), bundle.as_path());
-        assert_eq!(plugin.description(), Some("downloaded, not yet declared"));
-        assert_eq!(
-            plugin.contributions(),
-            vec!["mcp", "hooks"],
-            "{scope:?}: what declaring it would bring"
+    let plugin = Plugins::inspect(Scope::User, &bundle).unwrap();
+    assert_eq!(plugin.id(), "installer");
+    assert_eq!(plugin.root(), bundle.as_path());
+    assert_eq!(plugin.description(), Some("downloaded, not yet declared"));
+    assert_eq!(
+        plugin.contributions(),
+        vec!["mcp", "hooks"],
+        "what declaring it from the user scope would bring"
+    );
+    assert_eq!(plugin.hooks().len(), 1);
+    assert_eq!(
+        plugin.hooks()[0].run(),
+        Some(&["notify".to_string()][..]),
+        "the argv an operator would be agreeing to run"
+    );
+    assert_eq!(
+        plugin.mcp_servers()[0].id,
+        "installer__docs",
+        "namespaced exactly as a real load namespaces it"
+    );
+
+    // Either file inside the workspace: refused whole, and the refusal names the
+    // offending key rather than handing back a shortened bundle.
+    for scope in [Scope::Project, Scope::Local] {
+        let err = Plugins::inspect(scope, &bundle).unwrap_err().to_string();
+        assert!(err.contains("may not contribute"), "{scope:?}: {err}");
+        assert!(err.contains("hook"), "{scope:?}: {err}");
+        assert!(
+            err.contains("the user-scope file"),
+            "{scope:?}: and points at the scope that still works: {err}"
         );
-        assert_eq!(plugin.hooks().len(), 1, "{scope:?}");
-        assert_eq!(
-            plugin.hooks()[0].run(),
-            Some(&["notify".to_string()][..]),
-            "{scope:?}: the argv an operator would be agreeing to run"
-        );
-        assert_eq!(
-            plugin.mcp_servers()[0].id,
-            "installer__docs",
-            "{scope:?}: namespaced exactly as a real load namespaces it"
+        assert!(
+            !err.contains("io.local.toml"),
+            "{scope:?}: never at a file held to the same rule: {err}"
         );
     }
-
-    // The committed file: refused whole, and the refusal names the offending key
-    // rather than handing back a shortened bundle.
-    let err = Plugins::inspect(Scope::Project, &bundle)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("may not contribute"), "{err}");
-    assert!(err.contains("hook"), "{err}");
 }
 
 /// **#224**. *Every* substitution — `${cmd:}`, `${env:}` and `${file:}` — is
@@ -1409,63 +1579,97 @@ fn inspect_refuses_a_manifest_substitution_at_every_scope() {
 /// agrees with a copy of today.
 #[test]
 fn an_inspect_refusal_is_the_string_the_loader_would_have_dropped() {
+    // The `needle` is what stops the five collapsing into three. Since 0.74.0 a
+    // bundle carrying a `[[hook]]` or a `[[bin]]` is refused by the trust rule
+    // whenever its manifest sits inside the workspace, so the two cases that exist
+    // to exercise the hook validator and the `[[bin]]` containment check put their
+    // bundle *outside* the workspace and name it from the user scope — asserted
+    // here, or a later widening of the trust rule would silently take both of them
+    // over and this test would still be green.
+    //
+    // `Scope::User` in the table is therefore two facts at once: the scope the
+    // declaration is written in, and — through the branch below — the fact that the
+    // bundle is somewhere the discovery root does not contain. `Plugins::inspect`
+    // has no discovery root to consult and answers `Scope::User` as the trusted
+    // case, so the two sides agree only when the load is trusted too.
     let cases: [(&str, &str, Scope, &str); 5] = [
         // A name the id grammar does not admit.
         (
             "badid",
             "name = \"Bad_Id\"\n",
             Scope::Local,
-            "io.local.toml",
+            "is not a usable plugin id",
         ),
         // An executing contribution named from the file a clone delivers.
         (
             "untrusted",
             "name = \"untrusted\"\n\n[[hook]]\non = [\"finished\"]\nrun = [\"notify\"]\n",
             Scope::Project,
-            "io.toml",
+            "may not contribute",
         ),
         // A table the hook validator refuses: an event this crate never emits.
         (
             "badhook",
             "name = \"badhook\"\n\n[[hook]]\non = [\"finshed\"]\nappend = \"a.jsonl\"\n",
-            Scope::Local,
-            "io.local.toml",
+            Scope::User,
+            "is not an event this crate emits",
         ),
-        // A substitution, from the operator's *own* file — the scope that gets
-        // the hook and the MCP server still does not get to be read by a bundle.
-        // `PATH` is set on every platform this runs on, so a regression here does
-        // not error for some other reason: it loads, and the count assertion below
-        // is what fails.
+        // A substitution, from a file the operator writes themselves — a scope
+        // being trusted with a program still does not make it readable by a
+        // bundle. `PATH` is set on every platform this runs on, so a regression
+        // here does not error for some other reason: it loads, and the count
+        // assertion below is what fails.
         (
             "reader",
             "name = \"reader\"\ndescription = '${env:PATH}'\n",
             Scope::Local,
-            "io.local.toml",
+            "substitution is refused",
         ),
-        // 0.73.0. A `[[bin]]` that climbs out of the bundle. From the operator's
-        // own file, so it is the containment rule being refused and not the
-        // project-scope one the case above already covers.
+        // 0.73.0. A `[[bin]]` that climbs out of the bundle. From the user scope,
+        // so it is the containment rule being refused and not the trust rule the
+        // `untrusted` case already covers.
         (
             "escapee",
             "name = \"escapee\"\n\n[[bin]]\nname = \"ssh\"\npath = \"../../../bin/ssh\"\n",
-            Scope::Local,
-            "io.local.toml",
+            Scope::User,
+            "climbs out of the plugin root",
         ),
     ];
 
-    for (name, manifest, scope, scope_file) in cases {
+    for (name, manifest, scope, needle) in cases {
         let dir = tmp();
         let root = dir.path();
-        let bundle = root.join(format!("bundles/{name}"));
+        let home = tmp();
+        let bundle = if scope == Scope::User {
+            home.path().join(name)
+        } else {
+            root.join(format!("bundles/{name}"))
+        };
         write(&bundle.join("plugin.toml"), manifest);
-        write(
-            &root.join(scope_file),
-            &format!("[[plugin]]\npath = \"bundles/{name}\"\n"),
-        );
 
-        let plugins = Config::discover(root).unwrap().plugins();
+        let plugins = match scope {
+            Scope::User => discover_with(root, &declared_outright(&bundle, ""))
+                .unwrap()
+                .plugins(),
+            Scope::Project | Scope::Local => {
+                let file = if scope == Scope::Project {
+                    "io.toml"
+                } else {
+                    "io.local.toml"
+                };
+                write(
+                    &root.join(file),
+                    &format!("[[plugin]]\npath = \"bundles/{name}\"\n"),
+                );
+                discover(root).unwrap().plugins()
+            }
+        };
         assert_eq!(plugins.len(), 0, "{name}: nothing loaded");
         let dropped = plugins.dropped()[0].error.clone();
+        assert!(
+            dropped.contains(needle),
+            "{name}: refused by the rule this case exists for: {dropped}"
+        );
 
         let inspected = Plugins::inspect(scope, &bundle).unwrap_err().to_string();
         assert_eq!(inspected, dropped, "{name}");
@@ -1478,9 +1682,11 @@ fn an_inspect_refusal_is_the_string_the_loader_would_have_dropped() {
 /// [`Plugin::bin`] with its path joined onto the plugin root and absolute; and
 /// `contributions()` reports `bin`.
 ///
-/// Declared from `io.local.toml`, because a `[[bin]]` names a program on this
-/// machine and the project scope refuses one — the other half of that rule is
-/// `a_project_scoped_bundle_contributes_nothing_that_runs_a_program`.
+/// The bundle sits outside the workspace and is named outright from the user
+/// scope, because a `[[bin]]` names a program on this machine and since 0.74.0 a
+/// manifest inside the workspace may not contribute one whatever scope pointed at
+/// it — the other half of that rule is
+/// `a_bundle_whose_manifest_is_inside_the_workspace_contributes_nothing_that_runs_a_program`.
 ///
 /// Nothing under `bin/` is ever created, and the last assertion is that the
 /// resolved paths do **not** exist. Loading performs no filesystem check of any
@@ -1491,7 +1697,8 @@ fn an_inspect_refusal_is_the_string_the_loader_would_have_dropped() {
 fn a_bundle_bin_is_resolved_onto_the_plugin_root_and_reported() {
     let dir = tmp();
     let root = dir.path();
-    let plugin = root.join("bundles/ultraship");
+    let home = tmp();
+    let plugin = home.path().join("ultraship");
     write(
         &plugin.join("plugin.toml"),
         "name = \"ultraship\"\n\
@@ -1500,12 +1707,10 @@ fn a_bundle_bin_is_resolved_onto_the_plugin_root_and_reported() {
          \n\
          [[bin]]\nname = \"ultraship-doctor\"\npath = \"bin/doctor/main.mjs\"\n",
     );
-    write(
-        &root.join("io.local.toml"),
-        "[[plugin]]\npath = \"bundles/ultraship\"\n",
-    );
 
-    let plugins = Config::discover(root).unwrap().plugins();
+    let plugins = discover_with(root, &declared_outright(&plugin, ""))
+        .unwrap()
+        .plugins();
     assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
     let loaded = plugins.get("ultraship").unwrap();
 
@@ -1557,7 +1762,8 @@ fn a_manifest_with_no_bin_loads_exactly_as_a_0_72_0_manifest_did() {
     let summarise = |extra: &str| {
         let dir = tmp();
         let root = dir.path();
-        let plugin = seven_kind_bundle(root, "rust-review");
+        let home = tmp();
+        let plugin = seven_kind_bundle(home.path(), "rust-review");
         // Back to the 0.72.0 shape — every key that release knew, and no other —
         // then whatever this arm appends.
         let manifest = std::fs::read_to_string(plugin.join("plugin.toml")).unwrap();
@@ -1567,12 +1773,14 @@ fn a_manifest_with_no_bin_loads_exactly_as_a_0_72_0_manifest_did() {
         );
         assert!(!manifest.contains("[[bin]]"), "the 0.72.0 shape");
         write(&plugin.join("plugin.toml"), &format!("{manifest}{extra}"));
-        write(
-            &root.join("io.local.toml"),
-            "[[plugin]]\npath = \"bundles/rust-review\"\n",
-        );
 
-        let config = Config::discover(root).unwrap();
+        // Outside the workspace, named outright from the user scope: the manifest
+        // keeps its `[[hook]]` and `[[mcp]]` on both sides, and since 0.74.0 a
+        // manifest inside the workspace may contribute neither. Paths are reported
+        // relative to `home` for the same reason — the bundle is no longer under
+        // the discovery root, and both arms strip the same prefix so the comparison
+        // is still between two summaries of the same shape.
+        let config = discover_with(root, &declared_outright(&plugin, "")).unwrap();
         let plugins = config.plugins();
         assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
         let loaded = plugins.get("rust-review").unwrap();
@@ -1587,7 +1795,7 @@ fn a_manifest_with_no_bin_loads_exactly_as_a_0_72_0_manifest_did() {
                 loaded.description().map(String::from),
                 loaded
                     .skills_dir()
-                    .map(|d| d.strip_prefix(root).unwrap().to_path_buf()),
+                    .map(|d| d.strip_prefix(home.path()).unwrap().to_path_buf()),
                 contract.agents.names().join(","),
                 contract
                     .mcp
@@ -1605,7 +1813,12 @@ fn a_manifest_with_no_bin_loads_exactly_as_a_0_72_0_manifest_did() {
             loaded
                 .bin()
                 .into_iter()
-                .map(|(n, p)| (n.to_string(), p.strip_prefix(root).unwrap().to_path_buf()))
+                .map(|(n, p)| {
+                    (
+                        n.to_string(),
+                        p.strip_prefix(home.path()).unwrap().to_path_buf(),
+                    )
+                })
                 .collect::<Vec<_>>(),
         )
     };
@@ -1651,6 +1864,12 @@ fn a_manifest_with_no_bin_loads_exactly_as_a_0_72_0_manifest_did() {
 /// The offender is the *second* table in every case, so the reported index is a
 /// real index rather than a constant `bin[0]`. And the refusal is lexical — no
 /// case here touches a path that exists.
+///
+/// Outside the workspace and named outright from the user scope, so it is the
+/// containment rule that fires. Since 0.74.0 a bundle carrying any `[[bin]]` at all
+/// is refused by `refuse_executing_contributions` when its manifest sits inside the
+/// workspace, and this test would then be asserting that other rule under this
+/// one's name.
 #[test]
 fn a_bin_path_that_leaves_the_plugin_root_drops_the_bundle_and_names_the_entry() {
     let cases = [
@@ -1671,8 +1890,10 @@ fn a_bin_path_that_leaves_the_plugin_root_drops_the_bundle_and_names_the_entry()
     for (path, reason) in cases {
         let dir = tmp();
         let root = dir.path();
+        let home = tmp();
+        let plugin = home.path().join("escapee");
         write(
-            &root.join("bundles/escapee/plugin.toml"),
+            &plugin.join("plugin.toml"),
             &format!(
                 "name = \"escapee\"\n\
                  skills = \"skills\"\n\
@@ -1682,12 +1903,10 @@ fn a_bin_path_that_leaves_the_plugin_root_drops_the_bundle_and_names_the_entry()
                  [[bin]]\nname = \"ssh\"\npath = {path:?}\n"
             ),
         );
-        write(
-            &root.join("io.local.toml"),
-            "[[plugin]]\npath = \"bundles/escapee\"\n",
-        );
 
-        let plugins = Config::discover(root).unwrap().plugins();
+        let plugins = discover_with(root, &declared_outright(&plugin, ""))
+            .unwrap()
+            .plugins();
         assert_eq!(plugins.len(), 0, "{path}: nothing loaded");
         assert_eq!(plugins.dropped().len(), 1, "{path}");
         let error = &plugins.dropped()[0].error;

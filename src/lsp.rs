@@ -217,6 +217,27 @@ impl LspServer {
 /// The frame header this protocol uses, lowercased for comparison.
 const CONTENT_LENGTH: &str = "content-length:";
 
+/// The most bytes one frame body may claim before [`read_frame`] refuses it
+/// (0.74.0, audit M12).
+///
+/// The length is chosen by the server, and the server is not trusted: a
+/// repository decides which one a run spawns. Allocating what it asks for is an
+/// abort on macOS and Windows and a pinned address space on Linux, from one
+/// header line — and a stream that has desynchronised produces the same header
+/// by accident, so this is reached without any malice at all.
+///
+/// Eight mebibytes is the ceiling `provider::MAX_RESPONSE_BYTES`
+/// already puts on an untrusted body, and the same number is used here so the
+/// crate has one answer to "how big may something a stranger sent get" rather
+/// than two. Nothing a server legitimately sends approaches it: the largest
+/// frames this client ever asks for are a whole-workspace `workspace/diagnostic`
+/// answer and a `documentSymbol` tree, both of which are hundreds of kilobytes
+/// of JSON on a large repository. A frame over this is refused by name rather
+/// than truncated, because half a JSON body is not a message and a client that
+/// resynchronises on a length it did not believe is guessing where the next
+/// frame starts.
+const MAX_FRAME: usize = 8 * 1024 * 1024;
+
 /// Frame one JSON body the way the protocol requires.
 ///
 /// The length is the body's **byte** count, not its character count, and the
@@ -274,6 +295,13 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<O
         }
     }
     let len = len.ok_or_else(|| protocol("frame has no Content-Length"))?;
+    // Checked before the allocation, not after: the failure this stops is the
+    // allocation itself, and a length read back off a refused frame is free.
+    if len > MAX_FRAME {
+        return Err(protocol(&format!(
+            "frame claims {len} bytes, over the {MAX_FRAME}-byte ceiling this client allocates for"
+        )));
+    }
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
     let value: Value = serde_json::from_slice(&body)
@@ -478,6 +506,27 @@ impl LspSession {
     /// Every navigation tool comes through here, and that is deliberate: the
     /// `deny_read` filter below is one check on one path, and a filter written
     /// four times is a filter missing from one of them.
+    ///
+    /// **The model's `path` is checked for [`Act::Read`](crate::Act::Read) before
+    /// anything reads it** (0.74.0, audit H7). Until this release the path was
+    /// only ever `ws.root().join`ed — which discards the root outright when the
+    /// argument is absolute, and climbs without bound when it is `../..` — and
+    /// then handed to `read_to_string` and shipped to the server as a `didOpen`.
+    /// A `lsp_hover {"path": "../../../../etc/shadow"}` moved a file across the
+    /// boundary that `read_file` would have refused, and left no row saying so.
+    /// The check is here rather than at the five call sites for the reason the
+    /// filter below is: a boundary written five times is a boundary missing from
+    /// one of them.
+    ///
+    /// `Ask` passes and only `Deny` refuses, which is the bar
+    /// [`Workspace::read_file`](crate::tools::Workspace::read_file) is held to
+    /// once its gate has run. Nothing on this path can ask anybody: `navigate`
+    /// has no approver, so requiring `Allow` would turn every policy that *asks*
+    /// about reads into one where navigation answers nothing — a refusal the
+    /// operator never wrote. `Deny` is the verdict that was already unenforced
+    /// here, and enforcing it is the narrowing this release is allowed to make.
+    /// A path that cannot be resolved under the root at all is a `Deny` no layer
+    /// wrote; see [`Workspace::check_path`](crate::tools::Workspace::check_path).
     pub(crate) async fn navigate(
         &self,
         ask: Nav<'_>,
@@ -486,6 +535,21 @@ impl LspSession {
         watch: &crate::run::Watch<'_>,
     ) -> Result<String> {
         let path = ask.path();
+        if let Some(path) = path {
+            // `check_path` refuses everything `Workspace::resolve` refuses — an
+            // absolute path, and a `..` that climbs out whether or not the file
+            // exists — before it grades anything, so the resolution check and the
+            // policy check are this one call rather than two that could drift.
+            let verdict = ws.check_path(crate::Act::Read, path);
+            if verdict.effect == crate::Effect::Deny {
+                return Err(Error::Refused {
+                    act: "read".to_string(),
+                    target: path.to_string(),
+                    rule: verdict.rule,
+                    layer: verdict.layer,
+                });
+            }
+        }
         let server = match self.server_for(path) {
             Some(s) => s,
             None => {
@@ -585,6 +649,15 @@ impl LspSession {
     /// it was before its own edit. Re-opening is one file re-parsed and leaves the
     /// index warm; tracking changes incrementally would mean this crate keeping a
     /// second copy of the workspace correct.
+    ///
+    /// **`path` must already have been checked for
+    /// [`Act::Read`](crate::Act::Read).** This is where a file's bytes leave the
+    /// boundary — read from disk and sent to a third-party process — and the join
+    /// below is a plain `join`, which an absolute `path` replaces outright. Both
+    /// callers check first: [`LspSession::navigate`] does it at the top for every
+    /// navigation tool, and [`LspSession::diagnose`] is only ever reached with the
+    /// whole workspace rather than a model-supplied file. A third caller that
+    /// takes a path from a model owes the same check (0.74.0, audit H7).
     async fn sync(&self, server: &Started, ws: &crate::tools::Workspace, path: &str) -> Result<()> {
         let full = ws.root().join(path);
         let text = std::fs::read_to_string(&full).map_err(|e| Error::Lsp {
@@ -948,11 +1021,50 @@ fn with_omissions(body: String, omitted: usize) -> String {
 /// Whether this run may be told about a path at all.
 ///
 /// Only an outright `Deny` omits. `Ask` does not, and that is deliberate: naming
-/// a path is not reading its contents, and `Policy::default()` *asks* about any
-/// path no rule covers — under which treating `Ask` as an omission would empty
-/// every answer this feature gives.
+/// a path is not reading its contents, and a policy that *asks* about reads has
+/// nobody to ask on this path — treating `Ask` as an omission would empty every
+/// answer this feature gives to such a policy, which is a refusal the operator
+/// never wrote.
+///
+/// **This is the bar for a path that is only ever printed.** A path whose
+/// *contents* this crate is about to read on a server's say-so is held to
+/// [`may_read_contents`] instead; the distinction is the whole of audit M11.
 fn readable(ws: &crate::tools::Workspace, path: &str) -> bool {
     ws.policy().check(crate::Act::Read, path).effect != crate::Effect::Deny
+}
+
+/// Where a server-named file's bytes may be read from, or `None` if they may not
+/// be (0.74.0, audit M11).
+///
+/// [`readable`]'s bar is wrong here in both directions. A `WorkspaceEdit` names
+/// files the *server* chose, and [`rename_patch`] does not merely print them: it
+/// reads each one and renders a diff, so every removed line lands in the model's
+/// context. Under that use "naming a path is not reading it" is simply false.
+///
+/// So two things change, and it is the second that carries the weight.
+///
+/// The path is **resolved under the workspace root** rather than opened where the
+/// server pointed. [`Workspace::check_path`](crate::tools::Workspace::check_path)
+/// refuses an absolute path, a `..` that climbs out and a symlink that lands
+/// outside, and [`Workspace::resolve`](crate::tools::Workspace::resolve) then
+/// yields the path that was actually graded — so the file opened is the file
+/// checked rather than the string the server sent. Grading the effect alone never
+/// closed this: [`Policy::default`](crate::Policy::default) *allows* reads by
+/// default, so a server naming `~/.aws/credentials` was answered `Allow`, not
+/// `Ask`, and a bar of "`Allow`, not `Deny`" would have let it through unchanged.
+///
+/// And `Ask` no longer passes, which closes the narrower case of a policy whose
+/// read default is [`Effect::Ask`](crate::Effect::Ask) or that asks about the
+/// subtree being renamed. An unanswered question is not permission, and there is
+/// no approver on this path to answer it. The cost is stated rather than hidden:
+/// under such a policy a rename now renders no patch and says so. A run that
+/// wants the patch grants `allow_read` over the tree it is renaming in — the same
+/// grant applying that patch with `patch_file` already needs.
+fn may_read_contents(ws: &crate::tools::Workspace, rel: &str) -> Option<std::path::PathBuf> {
+    if ws.check_path(crate::Act::Read, rel).effect != crate::Effect::Allow {
+        return None;
+    }
+    ws.resolve(rel).ok()
 }
 
 /// Every location in an answer, as `path:line:column`, with denied ones dropped.
@@ -1166,6 +1278,13 @@ fn kind_name(kind: u64) -> &'static str {
 /// [`Act::Write`](crate::Act::Write) check per path. A tool that wrote N files on
 /// a server's say-so would be the multi-file write 0.51.0 excluded on purpose,
 /// with the additional property that this crate did not compute the change.
+///
+/// **It does read, though, and on a server's say-so.** Rendering a diff means
+/// reading each named file's current bytes, and every removed line is then in the
+/// model's context. The server is untrusted — a repository chooses which one a run
+/// spawns — so each path it names is confined under the workspace root and must
+/// be an outright [`Effect::Allow`](crate::Effect::Allow) before it is opened. See
+/// [`may_read_contents`], which is where the reasoning lives (0.74.0, audit M11).
 fn rename_patch(result: &Value, ws: &crate::tools::Workspace, new_name: &str) -> String {
     let mut per_file: Vec<(String, Vec<Value>)> = Vec::new();
     // A server answers with `changes` or with `documentChanges`, and a client
@@ -1194,11 +1313,13 @@ fn rename_patch(result: &Value, ws: &crate::tools::Workspace, new_name: &str) ->
     for (uri, edits) in per_file {
         let Some(path) = path_of(&uri) else { continue };
         let shown = relative(ws, &path);
-        if !readable(ws, &shown) {
+        // The server chose this path and this reads what is in it, so the bar is
+        // `may_read_contents`, not `readable`. See audit M11.
+        let Some(under_root) = may_read_contents(ws, &shown) else {
             omitted += 1;
             continue;
-        }
-        let Ok(before) = std::fs::read_to_string(&path) else {
+        };
+        let Ok(before) = std::fs::read_to_string(&under_root) else {
             skipped.push(format!("{shown} (could not be read)"));
             continue;
         };
@@ -1229,7 +1350,20 @@ fn rename_patch(result: &Value, ws: &crate::tools::Workspace, new_name: &str) ->
     if !skipped.is_empty() {
         text.push_str(&format!("\n(not patched: {})\n", skipped.join(", ")));
     }
-    with_omissions(text, omitted)
+    // Not `with_omissions`: its reason is a `deny_read` rule, and here an omission
+    // is just as likely to be a path the policy only *asks* about or one the
+    // server named outside the workspace entirely. Saying "the policy denies it"
+    // about either would send the model looking for a rule that does not exist.
+    if omitted > 0 {
+        let plural = if omitted == 1 { "" } else { "s" };
+        text.push_str(&format!(
+            "\n\n({omitted} file{plural} omitted: the server named {} this run may not read — \
+             a rename renders a file's contents, so it needs an outright allow_read, \
+             not an unanswered ask.)",
+            if omitted == 1 { "a path" } else { "paths" }
+        ));
+    }
+    text
 }
 
 /// Apply a file's `TextEdit`s to its text, or `None` if one names a position the
@@ -1848,6 +1982,47 @@ mod tests {
 
         let mut reader = BufReader::new(std::io::Cursor::new(b"Content-Length: 9\r\n".to_vec()));
         assert!(read_frame(&mut reader).await.is_err());
+    }
+
+    /// M12 — a length a server made up is refused before anything is allocated.
+    ///
+    /// The regression test lives here rather than in `tests/security_lsp.rs`
+    /// because `read_frame` is the private half of this module and the frame
+    /// tests above are its suite. The exploit needs a server that lies in its
+    /// *header*, which the fixture in `examples/lsp_fixture_server.rs` cannot be
+    /// asked to do — it lengths every frame from the body it is about to write.
+    ///
+    /// The first assertion is what fails on 0.73.0's behaviour: the header alone
+    /// reached `vec![0u8; len]`, which is a `handle_alloc_error` abort on macOS
+    /// and Windows — uncatchable, so no `#[should_panic]` could have caught it —
+    /// and a pinned address space on Linux. The second pins the boundary as `>`
+    /// rather than `>=`, and the third pins the refusal as the ceiling's rather
+    /// than a truncated read's: 0.73.0 refuses an over-long frame too, but only
+    /// after it has allocated for it and then run out of stream.
+    #[tokio::test]
+    async fn m12_a_content_length_over_the_ceiling_is_refused_before_the_allocation() {
+        // The audit's own number. A 64-bit host parses it into `usize` and would
+        // have tried to allocate 8 petabytes.
+        let mut reader = BufReader::new(std::io::Cursor::new(
+            b"Content-Length: 9007199254740991\r\n\r\n".to_vec(),
+        ));
+        assert!(read_frame(&mut reader).await.is_err());
+
+        // One byte over, and the refusal names the ceiling rather than the end of
+        // the stream — which is what says the check ran before the allocation.
+        let header = format!("Content-Length: {}\r\n\r\n", MAX_FRAME + 1);
+        let mut reader = BufReader::new(std::io::Cursor::new(header.into_bytes()));
+        let err = read_frame(&mut reader).await.unwrap_err().to_string();
+        assert!(err.contains("ceiling"), "{err}");
+
+        // A frame exactly at the ceiling is still a frame. The companion: the cap
+        // must not clip a legitimate answer, and a large `workspace/diagnostic`
+        // body is the one that gets close.
+        let body = format!("\"{}\"", "a".repeat(MAX_FRAME - 2));
+        assert_eq!(body.len(), MAX_FRAME);
+        let mut reader = BufReader::new(std::io::Cursor::new(frame(&body)));
+        let message = read_frame(&mut reader).await.unwrap().unwrap();
+        assert_eq!(message.as_str().map(str::len), Some(MAX_FRAME - 2));
     }
 
     /// A client and the server end of its pipe, split so each side can be read

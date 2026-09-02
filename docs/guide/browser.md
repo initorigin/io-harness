@@ -19,7 +19,8 @@ Two switches, both off by default. The cargo feature:
 io-harness = { version = "0.53", features = ["browser"] }
 ```
 
-and a browser on the contract, or in a `io.local.toml` / user-scope `io.toml`:
+and a browser on the contract, or in the user-scope file — the one scope
+`[browser]` may be declared from since 0.74.0:
 
 ```rust
 use io_harness::{BrowserConfig, TaskContract};
@@ -69,6 +70,25 @@ same code as the one it did. Each decision is one `BrowserNavigated { host,
 permitted }` event, so a trace records every place the browser went **and every
 place it was stopped from going**.
 
+**A URL that reaches no host is decided by its scheme, before the navigation is
+issued (0.74.0).** Only `http`, `https`, `ws` and `wss` reduce to a `host:port`,
+so only they reach the check above; everything else opened no request for the gate
+to pause, was therefore permitted by default, and was recorded nowhere. That is how
+`browser_navigate` to a `file:` URL read a local file past `Act::Read` and past
+every secret deny with no row saying it happened. The rule is an allowlist and not
+a list of known-bad schemes: `about:blank` is permitted — it is the empty page the
+browser opens on, and a run leaving a page has nowhere else to go — while `file:`,
+`data:`, `blob:`, `javascript:` and every scheme nobody has considered are refused.
+An unrecognised scheme is not a harmless one.
+
+Each of those is recorded too, and what reaches the trace is the **scheme** and
+never the URL: a `data:` URL is its own payload and a `javascript:` URL is a
+program, so writing either into the trace and into the model's observation would
+copy the thing that was refused into two places it was refused from reaching. This
+also closes the subresource question by construction rather than by interception —
+`Fetch.enable` pauses documents only, so a `data:` page's `<img>` was never going
+to be intercepted; the document simply never loads.
+
 Starting the browser is an `Act::Exec` check on its binary, through the same gate
 a configured MCP or language server child goes through. Configuring a browser does
 not grant access to it.
@@ -117,9 +137,10 @@ move.
   reported as a click that happened. This is the one failure a model genuinely
   cannot detect for itself: it would read a successful result and reason forward
   from a state that never existed.
-- **`[browser]` is refused in a project-scoped `io.toml`**, like `[[hook]]`,
-  because it names a program to execute and that file arrives with a `git clone`.
-  Write it in `io.local.toml` or the user-scope file.
+- **`[browser]` is refused in any file inside the workspace**, like `[[hook]]`,
+  because it names a program to execute: `io.toml` arrives with a `git clone`, and
+  `io.local.toml` — refused since 0.74.0 — is a path the run's own agent can write.
+  Write it in the user-scope file.
 - **A screenshot is not free.** Measured on one page: 44 bytes as text against
   13,166 bytes as a PNG. Take one when how the page *looks* is the question —
   text says a heading exists, a screenshot says it is off-screen or behind a

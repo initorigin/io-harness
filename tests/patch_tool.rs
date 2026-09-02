@@ -340,15 +340,22 @@ async fn the_checker_answers_clean_findings_and_no_checker_at_all() {
     assert!(obs.contains("no project marker"), "{obs}");
 }
 
-/// F6 — the checker tool is policy-gated and the automatic post-edit path is
-/// not, and the distinction between them is the release's claim.
+/// F6, as amended by 0.74.0 — the checker tool and the automatic post-edit path
+/// are **both** policy-gated, and a refused reflex is a silent skip.
 ///
-/// Both halves in one test, because either alone is satisfiable by the wrong
-/// build: gate everything and the reflex stops working; gate nothing and a model
-/// has a way to run the project's build command on a policy written to refuse
-/// exactly that.
+/// This test asserted the opposite until 0.74.0, and the sentence it used to
+/// carry — "the automatic post-edit check is ungated and did run" — was audit
+/// finding C2 written down as a passing test. `CHECKERS` maps `Cargo.toml` to
+/// `cargo check`, which compiles and *runs* `build.rs`, so an ungated reflex let
+/// two ordinary `write_file` calls execute arbitrary code on the host while the
+/// approver saw two `Act::Write` prompts and nothing else.
+///
+/// Three arms, because no two of them pin the behaviour alone: gate everything
+/// and the reflex stops working for everyone; gate nothing and a model reaches
+/// the project's build command under a policy written to refuse exactly that;
+/// and assert only the absence and a build with the reflex *deleted* passes.
 #[tokio::test]
-async fn the_check_tool_is_exec_gated_while_the_automatic_check_is_not() {
+async fn the_check_tool_and_the_automatic_check_are_both_exec_gated() {
     let dir = rust_fixture("pub fn ok() -> u32 { 1 }\n");
     let denied = || Policy::permissive().layer("ops").deny_exec("cargo");
 
@@ -366,9 +373,9 @@ async fn the_check_tool_is_exec_gated_while_the_automatic_check_is_not() {
         "a refused check must spawn nothing at all, and cargo always makes target/"
     );
 
-    // The same policy, an edit instead. It happens, and it still carries whatever
-    // its automatic check had to say — that path is the crate's own reflex after
-    // a write the policy already allowed, not a capability the model reached for.
+    // The same policy, an edit instead. The edit still lands — a write can never
+    // fail, which is the property the skip is silent to preserve — but the reflex
+    // that follows it is refused, so nothing is spawned. This is C2.
     let (store, run_id) = drive(
         dir.path(),
         denied(),
@@ -384,8 +391,25 @@ async fn the_check_tool_is_exec_gated_while_the_automatic_check_is_not() {
     );
     assert_eq!(store.edits(run_id).unwrap().len(), 1);
     assert!(
-        dir.path().join("target").exists(),
-        "the automatic post-edit check is ungated and did run"
+        !dir.path().join("target").exists(),
+        "a policy that refuses exec must refuse the reflex too, and cargo always makes target/"
+    );
+
+    // The control, and the reason this test cannot pass for a build that simply
+    // deleted the reflex: allow exec and the same edit must still run it.
+    let allowed = rust_fixture("pub fn ok() -> u32 { 1 }\n");
+    let (_store, _run_id) = drive(
+        allowed.path(),
+        Policy::permissive(),
+        vec![vec![call(
+            "edit_file",
+            json!({ "path": "src/lib.rs", "search": "1 }", "replace": "2 }" }),
+        )]],
+    )
+    .await;
+    assert!(
+        allowed.path().join("target").exists(),
+        "the reflex is gated, not removed: a policy that allows exec still gets its check"
     );
 }
 

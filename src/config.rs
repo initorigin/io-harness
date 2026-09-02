@@ -94,14 +94,45 @@
 //! naming the key — because an empty string in a boundary rule is a rule that
 //! matches nothing.
 //!
-//! **A project-scoped file may narrow the boundary and may never widen it**
-//! (0.27.0). `io.toml` arrives with a `git clone`, so four keys are refused there
-//! when the value written is the widening one — `policy.defaults.exec = "allow"`,
-//! `policy.defaults.net = "allow"`, `sandbox.allow_network = true`,
-//! `sandbox.force_floor = false` — and so is `${cmd:}` anywhere in that file. Each
-//! is accepted in `io.local.toml` and in the user scope. This does not claim that a
-//! cloned repository is safe: `[[mcp]]` still names a command and the boundary
-//! against the agent is still the [`Policy`] the caller loaded.
+//! **A credential file readable by other accounts is named, not refused**
+//! (0.74.0). On unix, `io.local.toml`, the user-scope `io.toml` and every
+//! `${file:}` target are warned about through `tracing` when any group or other
+//! permission bit is set — the file, its mode, and the `chmod 600` that fixes it.
+//! It is a warning rather than `ssh`'s refusal because this is a library inside
+//! somebody else's binary and `0644` is what a `umask 022` host produces by
+//! default: refusing would turn an upgrade into a startup failure for the common
+//! case. The committed `io.toml` is not checked at all — it is world-readable by
+//! design, and a warning on every run is one an operator learns to ignore.
+//!
+//! **A file inside a workspace may narrow the boundary and may never widen it**
+//! (0.27.0; extended from the project scope to `io.local.toml` in 0.74.0).
+//! `io.toml` arrives with a `git clone`, and `io.local.toml` sits in the workspace
+//! root a run's own agent can write to — one `write_file` of an unremarkable path
+//! — so both are held to one rule. Twelve keys are refused there when the value
+//! written is a widening one: the four `policy.defaults` acts set to `"allow"`,
+//! `sandbox.allow_network = true`, `sandbox.force_floor = false`,
+//! `sandbox.mode` set to anything but `"read-only"`, and each of the five
+//! `sandbox.limits` caps set to `0`, which means *no cap*. **A
+//! `[[policy.layers]]` there may carry `deny` rules and nothing else** (0.74.0):
+//! layers are appended to the policy with no effect filter, and a rule that allows
+//! is a default that widens reached by another door — `exec` allow `*` in a cloned
+//! `io.toml` was `policy.defaults.exec = "allow"` under a different key, and its
+//! `net` spelling switched the sandbox's own `allow_network` back on besides. So
+//! are `[[hook]]`, `[browser]`, `[[provider]]`, `[[mcp]]` and `[[lsp]]` whole, each
+//! because it names a program to run or an endpoint a credential is sent to. So
+//! are `${cmd:}` and `${file:}` anywhere in a file inside the workspace — the
+//! first runs a program while the file is being parsed, which is the same door
+//! reached without any of the tables above. And `run.skills`
+//! and `run.templates` may not leave the workspace root there (0.74.0): both are
+//! joined onto the discovery root, where an absolute value replaces it and a `..`
+//! climbs out, and every `*.md` under whatever they name is composed into the
+//! model's system prompt on every turn.
+//!
+//! The **user scope** is where all of them are written instead. It is the one file
+//! nothing in a workspace can reach, which is the whole of why it is the one still
+//! trusted. This does not claim that a cloned repository is safe: `[toolchain]`
+//! still names an argv, and the boundary against the agent is still the [`Policy`]
+//! the caller loaded.
 //!
 //! ```
 //! use io_harness::Config;
@@ -157,6 +188,26 @@ pub const CONFIG_VAR: &str = "IO_CONFIG";
 /// The instruction files [`Config::discover`] looks for when `[instructions]` is
 /// present and names none itself.
 const DEFAULT_INSTRUCTIONS: &[&str] = &["AGENTS.md"];
+
+/// Where a refusal tells an operator to write what a workspace file may not
+/// (0.74.0).
+///
+/// Every scope refusal in this module ends with this, because a refusal that
+/// names only what is forbidden leaves an operator with a setting and nowhere to
+/// put it. It names the **user scope** and nothing else: 0.74.0 holds
+/// `io.local.toml` to the same rule as `io.toml`, so the answer 0.27.0 gave —
+/// "write it in the local file" — is no longer an answer for a workspace whose
+/// root that file sits in.
+///
+/// The spelling tracks [`user_path`], which is the function that resolves it; the
+/// two are a pair, and a lookup order changed in one is a lie told by the other.
+#[cfg(windows)]
+const USER_SCOPE: &str = "the user-scope file (`%IO_CONFIG%`, else \
+                          `%IO_CONFIG_HOME%\\io.toml`, else `%APPDATA%\\io\\io.toml`)";
+/// See the Windows arm above: the same sentence, this platform's lookup order.
+#[cfg(not(windows))]
+const USER_SCOPE: &str = "the user-scope file (`$IO_CONFIG`, else `$IO_CONFIG_HOME/io.toml`, \
+                          else `$XDG_CONFIG_HOME/io/io.toml` or `~/.config/io/io.toml`)";
 
 /// Which file a value came from.
 ///
@@ -248,12 +299,17 @@ struct File {
     // `McpServer` is `#[serde(flatten)]`-based and serde refuses `flatten`
     // beside `deny_unknown_fields`, so an unknown key *inside* one of these
     // tables is not rejected. Stated in the guide rather than papered over.
+    //
+    // 0.74.0 — in `REFUSED_SECTIONS`, so no file under the workspace root may
+    // declare one. The 0.19.0 argument for allowing it there was that the spawn is
+    // an `Act::Exec` check on the named binary, so the boundary is the caller's
+    // policy rather than the scope of the file: that holds for the *binary* and
+    // says nothing about the argv beside it, which the same table supplies.
     #[serde(default)]
     mcp: Vec<McpServer>,
-    // 0.52.0. Language servers, for the navigation tools. Allowed in the project
-    // scope for the reason `[[mcp]]` is, stated in the module doc above: the
-    // spawn is an `Act::Exec` check on the named binary, so the boundary is the
-    // policy the caller loaded rather than the scope of the file that named it.
+    // 0.52.0. Language servers, for the navigation tools. In `REFUSED_SECTIONS`
+    // since 0.74.0 for the reason `[[mcp]]` is, and it was allowed at project
+    // scope until then on the same argument that stopped holding there.
     // `LspServer` carries `deny_unknown_fields` of its own — there is no
     // `#[serde(flatten)]` here to forbid it — so a misspelled key in a table that
     // names a program to spawn IS rejected, unlike `[[mcp]]`. Deliberately *not*
@@ -261,9 +317,9 @@ struct File {
     // appended set of servers is not a set.
     #[serde(default)]
     lsp: Vec<crate::lsp::LspServer>,
-    // 0.53.0. The browser a run may drive. Refused in the project scope by
-    // `refuse_widening` for the reason `[[hook]]` is: it names a program to
-    // execute on this machine, and `io.toml` arrives with a `git clone`.
+    // 0.53.0. The browser a run may drive. In `REFUSED_SECTIONS` for the reason
+    // `[[hook]]` is: it names a program to execute on this machine, and `io.toml`
+    // arrives with a `git clone`.
     #[cfg(feature = "browser")]
     #[serde(default)]
     browser: Option<crate::browser::BrowserConfig>,
@@ -285,6 +341,11 @@ struct File {
     // next link in the fallback chain. Deliberately *not* in `APPENDING`: a later
     // scope replaces the chain whole, because a half-appended fallback chain is
     // not a chain.
+    //
+    // 0.74.0 — in `REFUSED_SECTIONS`. `base_url` chooses where every completion
+    // goes and `api_key` chooses which of this host's secrets goes with it, and
+    // the request leaves before the run's first step, so a file under the
+    // workspace root may not write either.
     #[serde(default)]
     provider: Vec<ProviderSpec>,
     // 0.27.0. The one section this crate stores and never validates, so an
@@ -327,10 +388,18 @@ struct File {
 /// `Box<dyn Provider>` for an accessor to return. The application reads the spec and
 /// builds from it, which is three lines and keeps every entry point generic.
 ///
+/// **`[[provider]]` is a user-scope table** (0.74.0). It names the endpoint every
+/// completion of the run is sent to and the credential sent with it, so a file
+/// inside a workspace — `io.toml`, which a `git clone` delivers, or
+/// `io.local.toml`, which a run's own agent can write — may not declare it.
+///
 /// ```
 /// use io_harness::{Config, ProviderSpec};
 ///
-/// let config = Config::from_toml(r#"
+/// # fn demo() -> io_harness::Result<()> {
+/// let home = tempfile::tempdir()?;
+/// std::env::set_var("IO_CONFIG_HOME", home.path());
+/// std::fs::write(home.path().join("io.toml"), r#"
 ///     [[provider]]
 ///     kind = "openrouter"
 ///     model = "anthropic/claude-sonnet-4"
@@ -338,7 +407,10 @@ struct File {
 ///     [[provider]]
 ///     kind = "anthropic"
 ///     model = "claude-sonnet-4"
-/// "#).unwrap();
+/// "#)?;
+///
+/// let workspace = tempfile::tempdir()?;
+/// let config = Config::discover(workspace.path())?;
 ///
 /// // The first entry is the provider; the rest are the chain behind it, in order.
 /// let ProviderSpec::OpenRouter { model, api_key } = config.provider_spec().unwrap() else {
@@ -347,6 +419,14 @@ struct File {
 /// assert_eq!(model, "anthropic/claude-sonnet-4");
 /// assert_eq!(*api_key, None, "no key written means the provider's own environment variable");
 /// assert_eq!(config.fallback_specs().len(), 1);
+///
+/// // The same two tables in the workspace are refused, naming the key.
+/// let committed = "[[provider]]\nkind = \"openai\"\nmodel = \"x\"\n";
+/// std::fs::write(workspace.path().join("io.toml"), committed)?;
+/// let err = Config::discover(workspace.path()).unwrap_err();
+/// assert!(err.to_string().contains("key `provider`"), "{err}");
+/// # Ok(()) }
+/// # demo().unwrap();
 /// ```
 ///
 /// It is `#[non_exhaustive]` from the first release it exists, because a later one
@@ -403,7 +483,10 @@ pub enum ProviderSpec {
     /// ```
     /// use io_harness::{Config, ProviderSpec};
     ///
-    /// let config = Config::from_toml(r#"
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let home = tempfile::tempdir()?;
+    /// std::env::set_var("IO_CONFIG_HOME", home.path());
+    /// std::fs::write(home.path().join("io.toml"), r#"
     ///     [[provider]]
     ///     kind = "compatible"
     ///     preset = "groq"
@@ -414,7 +497,10 @@ pub enum ProviderSpec {
     ///     base_url = "http://localhost:11434/v1"
     ///     model = "llama3.2"
     ///     auth = "none"
-    /// "#).unwrap();
+    /// "#)?;
+    ///
+    /// let workspace = tempfile::tempdir()?;
+    /// let config = Config::discover(workspace.path())?;
     ///
     /// let ProviderSpec::Compatible { preset, model, .. } = config.provider_spec().unwrap() else {
     ///     panic!("the file named a compatible provider");
@@ -424,6 +510,8 @@ pub enum ProviderSpec {
     ///
     /// // The fallback is a model on this machine, which costs nothing to run.
     /// assert_eq!(config.fallback_specs().len(), 1);
+    /// # Ok(()) }
+    /// # demo().unwrap();
     /// ```
     #[serde(rename = "compatible")]
     Compatible {
@@ -896,6 +984,18 @@ impl Config {
     /// A scope whose file is absent is skipped; a workspace with no files at all
     /// is not an error, it is the crate's defaults.
     ///
+    /// **Both files under `root` are widening-checked, not just the committed one**
+    /// (0.74.0). `io.local.toml` is read from the workspace root, and the workspace
+    /// root is where a run's agent writes: a `write_file` of that one path used to
+    /// be a way to declare a `[[hook]]` argv, an `[[mcp]]` command or a
+    /// `[[provider]]` endpoint that the next call to this function would act on,
+    /// with no `Policy` and no sandbox in front of it. So the rule that has bounded
+    /// `io.toml` since 0.27.0 now bounds `io.local.toml` too, and the user scope —
+    /// which is not under `root`, and which this function reaches by
+    /// [`user_path`] rather than by walking anywhere — is the one scope that may
+    /// still widen. What is refused, and where to write it instead, is in the
+    /// module documentation.
+    ///
     /// ```
     /// use io_harness::config::{Config, Scope};
     ///
@@ -966,10 +1066,16 @@ impl Config {
     /// know about, and for tests. `${file:...}` resolves against the current
     /// directory, since there is no file to resolve against.
     ///
-    /// **It is the project scope**, so the 0.27.0 rules that bound that scope apply:
-    /// `${cmd:...}` is refused here, and a key whose value would widen a boundary is
-    /// refused here. `[instructions]` finds nothing, because there is no root to
-    /// discover against.
+    /// **It is the project scope**, so every rule that bounds that scope applies:
+    /// `${cmd:...}` and `${file:...}` are refused here, a key whose value would
+    /// widen a boundary is refused here, and so is any section that names a program
+    /// to run, an endpoint a credential is sent to, or a route out of the boundary
+    /// the [`Policy`] does not gate — `[[hook]]`, `[browser]`, `[[provider]]`,
+    /// `[[mcp]]`, `[[lsp]]` and `[web]`. A caller holding one of those in
+    /// text of its own is holding the user scope's content and wants
+    /// [`Config::discover`] against a `$IO_CONFIG_HOME` it controls.
+    /// `[instructions]` finds nothing, because there is no root to discover
+    /// against.
     ///
     /// ```
     /// use io_harness::Config;
@@ -993,7 +1099,7 @@ impl Config {
     pub fn from_toml(text: &str) -> Result<Self> {
         let path = Path::new(PROJECT_FILE);
         let table = parse(Scope::Project, text, path)?;
-        refuse_widening(&table, path)?;
+        refuse_widening(Scope::Project, &table, path)?;
         let file: File = deserialize(toml::Value::Table(table.clone()), path)?;
         refuse_nested_profiles(&file, path)?;
         crate::hooks::Hooks::check(&file.hook, path)?;
@@ -1212,13 +1318,17 @@ impl Config {
     /// ```
     /// use io_harness::{Config, ProviderSpec};
     ///
-    /// let config = Config::from_toml(r#"
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let home = tempfile::tempdir()?;
+    /// std::env::set_var("IO_CONFIG_HOME", home.path());
+    /// std::fs::write(home.path().join("io.toml"), r#"
     ///     [[provider]]
     ///     kind = "anthropic"
     ///     model = "claude-sonnet-4"
     ///     api_key = "sk-written-here-or-left-out-for-ANTHROPIC_API_KEY"
-    /// "#).unwrap();
+    /// "#)?;
     ///
+    /// let config = Config::discover(tempfile::tempdir()?.path())?;
     /// assert!(matches!(config.provider_spec(), Some(ProviderSpec::Anthropic { .. })));
     /// assert!(Config::from_toml("").unwrap().provider_spec().is_none());
     ///
@@ -1228,6 +1338,8 @@ impl Config {
     /// assert!(rendered.contains("api_key: <redacted>"), "{rendered}");
     /// assert!(rendered.contains("claude-sonnet-4"), "{rendered}");
     /// assert!(!rendered.contains("sk-written-here"), "{rendered}");
+    /// # Ok(()) }
+    /// # demo().unwrap();
     /// ```
     pub fn provider_spec(&self) -> Option<&ProviderSpec> {
         self.file.provider.first()
@@ -1244,7 +1356,10 @@ impl Config {
     /// ```
     /// use io_harness::{Config, ProviderSpec};
     ///
-    /// let config = Config::from_toml(r#"
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let home = tempfile::tempdir()?;
+    /// std::env::set_var("IO_CONFIG_HOME", home.path());
+    /// std::fs::write(home.path().join("io.toml"), r#"
     ///     [[provider]]
     ///     kind = "openrouter"
     ///     model = "primary"
@@ -1256,7 +1371,9 @@ impl Config {
     ///     [[provider]]
     ///     kind = "openai"
     ///     model = "third"
-    /// "#).unwrap();
+    /// "#)?;
+    ///
+    /// let config = Config::discover(tempfile::tempdir()?.path())?;
     ///
     /// // Order is the configuration, not a detail of it.
     /// let models: Vec<&str> = config.fallback_specs().iter().map(|s| match s {
@@ -1266,6 +1383,8 @@ impl Config {
     ///     _ => "unknown",
     /// }).collect();
     /// assert_eq!(models, ["second", "third"]);
+    /// # Ok(()) }
+    /// # demo().unwrap();
     /// ```
     pub fn fallback_specs(&self) -> &[ProviderSpec] {
         self.file.provider.get(1..).unwrap_or_default()
@@ -1352,6 +1471,12 @@ impl Config {
     /// built-in ones, and the type's own rule still holds across the seam: a
     /// later layer may add capability and may never re-allow an earlier deny.
     ///
+    /// **Which layers can reach here is decided before this runs.** Appending is
+    /// unconditional, so nothing on this path distinguishes a layer the operator
+    /// wrote from one a cloned repository shipped; the scope rule that a file
+    /// inside the workspace may contribute `deny` rules and nothing else is
+    /// enforced at load, against every scope but the user's.
+    ///
     /// ```
     /// use io_harness::{Act, Config, Effect};
     ///
@@ -1361,14 +1486,23 @@ impl Config {
     ///
     ///     [[policy.layers]]
     ///     name = "ops-baseline"
-    ///     rules = [{ act = "read", effect = "allow", pattern = "src/*" }]
+    ///     rules = [{ act = "read", effect = "deny", pattern = "infra/*" }]
     /// "#).unwrap();
     ///
     /// let policy = config.policy().unwrap();
     /// assert_eq!(policy.check(Act::Write, "src/lib.rs").effect, Effect::Deny);
+    /// assert_eq!(policy.check(Act::Read, "infra/prod.tf").effect, Effect::Deny);
     /// assert_eq!(policy.check(Act::Read, "src/lib.rs").effect, Effect::Allow);
     /// // The built-in secret denies survive a file that never mentioned them.
     /// assert_eq!(policy.check(Act::Read, ".env").effect, Effect::Deny);
+    ///
+    /// // `Config::from_toml` is the *project* scope, so the same layer granting
+    /// // rather than taking away is refused at load (0.74.0).
+    /// let err = Config::from_toml(
+    ///     "[[policy.layers]]\nname = \"ci\"\n\
+    ///      rules = [{ act = \"exec\", effect = \"allow\", pattern = \"*\" }]\n",
+    /// ).unwrap_err();
+    /// assert!(err.to_string().contains("`deny` rules and nothing else"), "{err}");
     /// ```
     pub fn policy(&self) -> Option<Policy> {
         let section = self.file.policy.as_ref()?;
@@ -1394,20 +1528,26 @@ impl Config {
     /// that lowers the wall clock keeps the default memory cap. `0` means *no
     /// cap* — TOML has no null, and "absent" already means "inherit".
     ///
+    /// Because `0` takes a wall down rather than moving it in, it is a widening
+    /// value, and since 0.74.0 it is refused in a file inside the workspace like
+    /// every other one. It is the user scope's to write.
+    ///
     /// ```
     /// use io_harness::Config;
     ///
     /// let config = Config::from_toml(r#"
     ///     [sandbox.limits]
     ///     max_wall_secs = 30
-    ///     max_cpu_secs = 0
     /// "#).unwrap();
     ///
     /// let sandbox = config.sandbox().unwrap();
     /// assert_eq!(sandbox.limits.max_wall_secs, Some(30));
-    /// assert_eq!(sandbox.limits.max_cpu_secs, None, "0 is no cap, not a zero-second cap");
     /// assert_eq!(sandbox.limits.max_open_files, Some(512), "untouched caps keep their default");
     /// assert!(!sandbox.allow_network, "and the default-deny on egress still holds");
+    ///
+    /// // `Config::from_toml` is the project scope, where `0` removes a cap.
+    /// let err = Config::from_toml("[sandbox.limits]\nmax_cpu_secs = 0\n").unwrap_err();
+    /// assert!(err.to_string().contains("widens"), "{err}");
     /// ```
     pub fn sandbox(&self) -> Option<SandboxConfig> {
         let section = self.file.sandbox.as_ref()?;
@@ -1528,18 +1668,36 @@ impl Config {
 
     /// The MCP servers this configuration declares.
     ///
+    /// **`[[mcp]]` is a user-scope table** (0.74.0). It names a command, an argv
+    /// and an environment that this process spawns at run start, and the spawn gate
+    /// is an `Act::Exec` check on the binary name alone — so a workspace file that
+    /// could write `command = "node"` in a repository that legitimately allows
+    /// `node` could run anything. `plugin.rs` has refused the same declaration from
+    /// a project-scoped bundle since 0.35.0; this closes the route around it.
+    ///
     /// ```
     /// use io_harness::Config;
     ///
-    /// let config = Config::from_toml(r#"
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let home = tempfile::tempdir()?;
+    /// std::env::set_var("IO_CONFIG_HOME", home.path());
+    /// std::fs::write(home.path().join("io.toml"), r#"
     ///     [[mcp]]
     ///     id = "github"
     ///     transport = "stdio"
     ///     command = "github-mcp-server"
     ///     args = ["stdio"]
-    /// "#).unwrap();
+    /// "#)?;
     ///
+    /// let config = Config::discover(tempfile::tempdir()?.path())?;
     /// assert_eq!(config.mcp_servers()[0].id, "github");
+    ///
+    /// // The same table in a committed `io.toml` is refused, naming the key.
+    /// let err = Config::from_toml("[[mcp]]\nid = \"x\"\ntransport = \"stdio\"\ncommand = \"x\"\n")
+    ///     .unwrap_err();
+    /// assert!(err.to_string().contains("key `mcp`"), "{err}");
+    /// # Ok(()) }
+    /// # demo().unwrap();
     /// ```
     pub fn mcp_servers(&self) -> &[McpServer] {
         &self.file.mcp
@@ -1547,29 +1705,46 @@ impl Config {
 
     /// The language servers this configuration declares (0.52.0).
     ///
+    /// **`[[lsp]]` is a user-scope table** (0.74.0), for the reason `[[mcp]]` is
+    /// and stated in full there: it names a command this process spawns at run
+    /// start. Until 0.74.0 it was allowed at project scope on the argument that the
+    /// boundary is the `Act::Exec` check on the named binary — which an argv the
+    /// same table supplies walks straight through.
+    ///
     /// ```
     /// use io_harness::Config;
     ///
-    /// let config = Config::from_toml(r#"
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let home = tempfile::tempdir()?;
+    /// std::env::set_var("IO_CONFIG_HOME", home.path());
+    /// std::fs::write(home.path().join("io.toml"), r#"
     ///     [[lsp]]
     ///     id = "rust"
     ///     command = "rust-analyzer"
     ///     extensions = [".rs"]
-    /// "#).unwrap();
+    /// "#)?;
     ///
+    /// let config = Config::discover(tempfile::tempdir()?.path())?;
     /// assert_eq!(config.lsp_servers()[0].id, "rust");
     /// // Unset keys take their defaults rather than becoming absent.
     /// assert_eq!(config.lsp_servers()[0].timeout_secs, 60);
     ///
-    /// // A misspelled key is rejected by name rather than ignored: this table
-    /// // names a program to spawn.
-    /// let err = Config::from_toml(r#"
-    ///     [[lsp]]
-    ///     id = "rust"
-    ///     command = "rust-analyzer"
-    ///     extension = [".rs"]
-    /// "#).unwrap_err();
+    /// // The same table in a committed `io.toml` is refused, naming the key.
+    /// let err = Config::from_toml(
+    ///     "[[lsp]]\nid = \"rust\"\ncommand = \"rust-analyzer\"\nextensions = [\".rs\"]\n",
+    /// ).unwrap_err();
+    /// assert!(err.to_string().contains("key `lsp`"), "{err}");
+    ///
+    /// // A misspelled key is still rejected by name rather than ignored, in the
+    /// // scope that may write the table: this one names a program to spawn.
+    /// std::fs::write(
+    ///     home.path().join("io.toml"),
+    ///     "[[lsp]]\nid = \"rust\"\ncommand = \"rust-analyzer\"\nextension = [\".rs\"]\n",
+    /// )?;
+    /// let err = Config::discover(tempfile::tempdir()?.path()).unwrap_err();
     /// assert!(err.to_string().contains("extension"), "{err}");
+    /// # Ok(()) }
+    /// # demo().unwrap();
     /// ```
     pub fn lsp_servers(&self) -> &[crate::lsp::LspServer] {
         &self.file.lsp
@@ -1577,12 +1752,13 @@ impl Config {
 
     /// The browser this configuration declares, if any (0.53.0).
     ///
-    /// `[browser]` is refused in the project scope, because it names a program to
-    /// execute and `io.toml` arrives with a `git clone` — the same rule that
-    /// refuses `[[hook]]` there, for the same reason.
+    /// `[browser]` is refused in any file inside a workspace, because it names a
+    /// program to execute: `io.toml` arrives with a `git clone`, and since 0.74.0
+    /// `io.local.toml` is held to the same rule because a run's own agent can write
+    /// it. The same rule refuses `[[hook]]`, for the same reason.
     ///
-    /// Write it in `io.local.toml` or the user-scope file, which
-    /// [`Config::discover`] reads; there is no project-scope route to a browser.
+    /// Write it in the user-scope file, which [`Config::discover`] also reads;
+    /// there is no route to a browser from a file under the workspace root.
     ///
     /// ```
     /// use io_harness::Config;
@@ -1665,17 +1841,28 @@ impl Config {
     /// use io_harness::Config;
     ///
     /// # fn demo() -> io_harness::Result<()> {
+    /// let home = tempfile::tempdir()?;
+    /// std::env::set_var("IO_CONFIG_HOME", home.path());
+    /// std::fs::write(
+    ///     home.path().join("io.toml"),
+    ///     "[[hook]]\non = [\"finished\"]\nrun = [\"cargo\", \"fmt\"]\n",
+    /// )?;
+    ///
     /// let dir = tempfile::tempdir()?;
+    /// let config = Config::discover(dir.path())?;
+    /// assert!(!config.hooks().is_empty());
+    ///
+    /// // The same table in either file under the workspace root is refused:
+    /// // `io.toml` arrives with a clone, and `io.local.toml` is a path the run's
+    /// // own agent can write (0.74.0).
+    /// let err = Config::from_toml("[[hook]]\nrun = [\"cargo\", \"fmt\"]\n").unwrap_err();
+    /// assert!(err.to_string().contains("may not declare hooks"), "{err}");
+    ///
     /// std::fs::write(
     ///     dir.path().join("io.local.toml"),
     ///     "[[hook]]\non = [\"finished\"]\nrun = [\"cargo\", \"fmt\"]\n",
     /// )?;
-    ///
-    /// let config = Config::discover(dir.path())?;
-    /// assert!(!config.hooks().is_empty());
-    ///
-    /// // The same table in the committed file is refused: `io.toml` arrives with a clone.
-    /// let err = Config::from_toml("[[hook]]\nrun = [\"cargo\", \"fmt\"]\n").unwrap_err();
+    /// let err = Config::discover(dir.path()).unwrap_err();
     /// assert!(err.to_string().contains("may not declare hooks"), "{err}");
     /// # Ok(()) }
     /// # demo().unwrap();
@@ -1736,11 +1923,27 @@ impl Config {
     /// is the task itself — `goal`, `file`, `root` and `verify` are what the
     /// caller is asking for now, not a property of the project.
     ///
+    /// `[web]` is written from the user scope here, not beside the `[run]` keys: it
+    /// is a refused section since 0.74.0, so no file under the workspace root
+    /// may declare it and [`Config::from_toml`] — which *is* the project scope —
+    /// refuses it too.
+    ///
     /// ```
     /// use std::time::Duration;
     /// use io_harness::{Config, TaskContract, Verification, WebAccess};
     ///
-    /// let config = Config::from_toml(r#"
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let home = tempfile::tempdir()?;
+    /// std::env::set_var("IO_CONFIG_HOME", home.path());
+    /// std::fs::write(home.path().join("io.toml"), r#"
+    ///     [web]
+    ///     search = true
+    ///     max_uses = 3
+    ///     allowed_domains = ["docs.rs"]
+    /// "#)?;
+    ///
+    /// let workspace = tempfile::tempdir()?;
+    /// std::fs::write(workspace.path().join("io.toml"), r#"
     ///     [run]
     ///     max_steps = 30
     ///     max_duration_secs = 900
@@ -1751,12 +1954,8 @@ impl Config {
     ///
     ///     [run.stall]
     ///     window = 5
-    ///
-    ///     [web]
-    ///     search = true
-    ///     max_uses = 3
-    ///     allowed_domains = ["docs.rs"]
-    /// "#).unwrap();
+    /// "#)?;
+    /// let config = Config::discover(workspace.path())?;
     ///
     /// let contract = config.apply_to(TaskContract::new(
     ///     "make the suite pass",
@@ -1778,6 +1977,12 @@ impl Config {
     ///     contract.web,
     ///     Some(WebAccess::search().max_uses(3).allow("docs.rs")),
     /// );
+    ///
+    /// // The same table in a workspace file is refused, naming the key.
+    /// let err = Config::from_toml("[web]\nsearch = true\n").unwrap_err();
+    /// assert!(err.to_string().contains("key `web`"), "{err}");
+    /// # Ok(()) }
+    /// # demo().unwrap();
     /// ```
     #[must_use]
     pub fn apply_to(&self, contract: TaskContract) -> TaskContract {
@@ -1930,14 +2135,76 @@ fn env_dir(var: &str) -> Option<PathBuf> {
 // Parse, substitute, validate, merge
 // ---------------------------------------------------------------------------
 
+/// Name a credential file that other accounts on this host can reach (0.74.0).
+///
+/// `io.local.toml`, the user-scope `io.toml` and every `${file:}` target hold the
+/// one thing in this format worth stealing — an `api_key`, a bearer token, a
+/// header. They were read with `read_to_string` and their mode was never looked
+/// at, so a file left at `0644` by an editor's umask handed every account on a
+/// shared host a working credential, and nothing anywhere said so.
+///
+/// **A warning, not a refusal**, and the difference is the whole decision. `ssh`
+/// refuses because it is an interactive client that can say why and be re-run a
+/// second later; this is a library inside somebody else's binary, where the same
+/// rule turns an upgrade into a startup failure for every operator whose config
+/// arrived at `0644` — which is the default outcome of a `umask 022` host and so
+/// is the *common* case, not the exceptional one. Refusing would break far more
+/// working setups than the finding is worth, and an operator who reads the
+/// warning fixes it with one `chmod`.
+///
+/// `Scope::Project` is deliberately not checked. `io.toml` is committed and
+/// arrives from a `git clone` world-readable by design; warning on it every time
+/// is what teaches an operator to ignore the warning that matters.
+///
+/// Unix only. Windows expresses this with ACLs, which have no mode to compare and
+/// no `chmod` to recommend, so there is nothing here that would be true there.
+#[cfg(unix)]
+fn warn_if_exposed(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    // The same mask `ssh` uses: any group or other bit at all, not the read bits
+    // alone. A file another account may *write* is a file whose credential that
+    // account chooses next time.
+    if mode & 0o077 != 0 {
+        tracing::warn!(
+            "{}: mode {mode:04o} — this file is accessible to accounts other than its owner, \
+             and a credential in it is readable by every one of them. Run `chmod 600 {}`.",
+            path.display(),
+            path.display()
+        );
+    }
+}
+
+/// Windows has no mode to compare: see the unix half.
+#[cfg(not(unix))]
+fn warn_if_exposed(_path: &Path) {}
+
 /// Read one scope: parse it, substitute against its own directory, and validate
 /// it on its own so an error can name the file it came from.
 fn read_scope(scope: Scope, path: &Path) -> Result<toml::value::Table> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+    if scope != Scope::Project {
+        warn_if_exposed(path);
+    }
     let table = parse(scope, &text, path)?;
-    if scope == Scope::Project {
-        refuse_widening(&table, path)?;
+    // 0.74.0 — `Scope::Local` is held to this too. `io.local.toml` is the
+    // operator's own file in intent; in fact it is a path in the workspace root,
+    // and a run's agent writes paths in the workspace root. One `write_file` of an
+    // unremarkable name declared a `[[hook]]`, an `[[mcp]]` command or a
+    // `[[provider]]` endpoint that the next `Config::discover` would act on,
+    // outside the `Policy` and outside the sandbox, and nothing about that write
+    // looked like an escalation.
+    //
+    // Only [`Scope::User`] is exempt, and the exemption is the whole reason the
+    // scope exists: `$IO_CONFIG`, `$IO_CONFIG_HOME` and `~/.config/io` are outside
+    // every workspace, so a run that can write its own root cannot reach them.
+    if scope != Scope::User {
+        refuse_widening(scope, &table, path)?;
     }
     // Validated here and discarded: the value that is kept is the merged one,
     // but an error found now can name this file rather than "<merged>".
@@ -1970,9 +2237,13 @@ fn declared_plugins(
 
 /// Parse and substitute, in that order — a substitution is a value, not syntax.
 ///
-/// `scope` reaches all the way down to [`expand`] because one substitution —
-/// `${cmd:...}` — is refused in the project scope, and the project scope is the one
-/// a `git clone` delivers.
+/// `scope` reaches all the way down to [`expand`] because two substitutions —
+/// `${cmd:...}`, which runs a program, and `${file:...}` (0.74.0), whose argument
+/// is joined onto the file's directory and so names any path when written absolute
+/// — are refused in every file inside the workspace. `io.toml` arrives with a
+/// `git clone`; `io.local.toml` is a path the run's own agent can write. Both are
+/// therefore somewhere a program to run may not be named, and `${cmd:}` runs its
+/// one here, during parsing, before any `Policy` or sandbox exists.
 pub(crate) fn parse(scope: Scope, text: &str, path: &Path) -> Result<toml::value::Table> {
     let mut table: toml::value::Table = toml::from_str(text)
         .map_err(|e| Error::Config(format!("{}: {}", path.display(), e.message())))?;
@@ -1986,26 +2257,187 @@ pub(crate) fn parse(scope: Scope, text: &str, path: &Path) -> Result<toml::value
     Ok(table)
 }
 
-/// The keys a project-scoped file may not set to the value that *widens* a boundary,
-/// paired with that value (0.27.0).
+/// The keys a file inside a workspace may not set to a value that *widens* a
+/// boundary, paired with every such value (0.27.0).
 ///
-/// `io.toml` is committed and arrives with a `git clone`. These four are the keys
-/// that turn reading a stranger's configuration into a risk: two that default an act
-/// to `allow`, one that re-opens egress inside the sandbox, one that switches the
-/// portable floor off, and one that hands a cloned repository the host's own
-/// privileges. The *narrowing* value of each is still legal in a project
-/// file, because a project file denying `exec` is exactly what the scope is for.
-const PROJECT_WIDENING: &[(&[&str], &str)] = &[
-    (&["policy", "defaults", "exec"], "allow"),
-    (&["policy", "defaults", "net"], "allow"),
-    (&["sandbox", "allow_network"], "true"),
-    (&["sandbox", "force_floor"], "false"),
+/// `io.toml` is committed and arrives with a `git clone`; since 0.74.0 the same
+/// rule covers `io.local.toml`, which a run's own agent can write. These are the
+/// keys that turn reading a file nobody vetted into a risk: four that default an
+/// act to `allow`, one that re-opens egress inside the sandbox, one that switches
+/// the portable floor off, one that decides where a command may write, and the
+/// five resource caps. The *narrowing* value of each is still legal in both
+/// files, because a project file denying `exec` is exactly what the scope is for.
+///
+/// A list of values per key rather than one, because the widening half of a key
+/// is not always a single spelling — `sandbox.mode` has two of the three, and a
+/// key added later may have more. One entry per key keeps the refusal, the
+/// documentation and the test that derives from this table reading as one rule.
+///
+/// Where [`REFUSED_SECTIONS`] refuses a section outright, these are keys with a
+/// widening *value* and a narrowing one, so the value decides. Both rules run in
+/// [`refuse_widening`].
+const PROJECT_WIDENING: &[(&[&str], &[&str])] = &[
+    // 0.74.0 — `read` and `write` were missing, and the omission was not
+    // cosmetic. The shipped defaults are `read = "allow"` and `write = "ask"`
+    // (`Policy::default`), and a later scope *overrides* an earlier one, so a
+    // cloned `io.toml` writing `write = "allow"` turned every unmatched write
+    // from a question the approver answers into a silent grant — and did it
+    // whatever the operator had written in their own file, since the project
+    // scope outranks the user scope in the merge.
+    (&["policy", "defaults", "read"], &["allow"]),
+    (&["policy", "defaults", "write"], &["allow"]),
+    (&["policy", "defaults", "exec"], &["allow"]),
+    (&["policy", "defaults", "net"], &["allow"]),
+    (&["sandbox", "allow_network"], &["true"]),
+    (&["sandbox", "force_floor"], &["false"]),
     // 0.46.0 — `full-access` is the widest grant the crate makes, so a repository
-    // may not hand it to whoever clones it. The narrowing values (`read-only`,
-    // and `workspace-write` where the caller asked for less) stay legal at
-    // project scope, which is what the scope is for.
-    (&["sandbox", "mode"], "full-access"),
+    // may not hand it to whoever clones it. 0.74.0 adds `workspace-write` beside
+    // it: the merge lets a project file *replace* the user scope's value, so
+    // `workspace-write` written there raised an operator's own `read-only` back
+    // to the crate's default, and only the literal `full-access` was being
+    // refused. `read-only` is the one value that narrows in every direction and
+    // it is the one that stays legal — which is also all the scope needs, since
+    // `workspace-write` is what a file that says nothing already gets.
+    (&["sandbox", "mode"], &["full-access", "workspace-write"]),
+    // 0.74.0 — `0` means *no cap* (see `Config::sandbox`), so each of these
+    // written as zero in a cloned file removes a wall the operator put up. Only
+    // the categorical value is refused: a merely large finite cap is still a cap,
+    // and refusing one would need the user scope's number, which a check that
+    // reads one file at a time does not have.
+    (&["sandbox", "limits", "max_cpu_secs"], &["0"]),
+    (&["sandbox", "limits", "max_wall_secs"], &["0"]),
+    (&["sandbox", "limits", "max_memory_bytes"], &["0"]),
+    (&["sandbox", "limits", "max_processes"], &["0"]),
+    (&["sandbox", "limits", "max_open_files"], &["0"]),
 ];
+
+/// The sections a file inside a workspace may not declare at all, each with the
+/// noun a refusal names it by and the reason it is on the list (0.28.0, 0.53.0,
+/// 0.74.0).
+///
+/// **The rule, written once: anything that names a program to run, names an
+/// endpoint a credential is sent to, or opens a route out of the boundary that
+/// [`Policy`] does not gate, is refused at project scope, without exception.**
+/// The third clause is 0.74.0's, and `[web]` is what it was written for: a
+/// provider-executed search is dialled by the provider, so `Act::Net` never sees
+/// it and no rung of the sandbox is on the path. This list is that sentence's
+/// implementation and its only one. A
+/// table added to the file format later belongs here because the sentence covers
+/// it — not because someone happened to think of it, and not after an exploit
+/// demonstrates the omission. A section that names neither a program nor a
+/// credentialled endpoint stays legal, which is what keeps the scope worth
+/// having: `[policy]`, `[[agent]]`, `[run]`, `[[plugin]]` and the rest still let a
+/// repository narrow a boundary from its own committed file.
+///
+/// Refusing the **section** rather than the hazardous key inside it is the 0.28.0
+/// argument about `[[hook]]`'s `run`/`append` pair, generalised: a rule that
+/// permits half a table is a rule a reader has to hold two halves of, and the next
+/// key added to that table lands on the permitted side by default. `[[provider]]`
+/// is refused whole for exactly that reason rather than `base_url` and `api_key`
+/// being refused individually.
+///
+/// `browser` is on the list in every build. The `[browser]` field only exists
+/// with the feature, but [`refuse_widening`] runs against the raw table before
+/// anything deserializes, and a boundary that moved with a feature flag would be
+/// one an operator could not state.
+const REFUSED_SECTIONS: &[(&str, &str, &str)] = &[
+    // 0.28.0. The whole array, not its executing half: `run` is the `${cmd:}`
+    // primitive by another name, and `append` is a write to a path the file chose,
+    // which is the same hazard by a shorter route. Refusing one and allowing the
+    // other would be a rule a reader has to hold two halves of.
+    (
+        "hook",
+        "hooks",
+        "a hook runs an argv on this machine, or appends to a path the file itself \
+         chose, on an event the file itself picks",
+    ),
+    // 0.53.0. Same hazard, same answer: `[browser]` names a binary to execute, and
+    // the run then drives it against whatever the page contains. A repository that
+    // could choose the browser could choose the program.
+    (
+        "browser",
+        "a browser",
+        "a browser is a program on this machine, which the run then drives against \
+         whatever a page contains",
+    ),
+    // 0.74.0. `base_url` redirects every completion of the run, and `api_key` —
+    // through `${env:}` or `${file:}` — decides which of this host's secrets is
+    // sent as the `Authorization` header of that redirected request. The endpoint
+    // is contacted before the run's first step, so nothing the policy does later
+    // is in front of it.
+    (
+        "provider",
+        "providers",
+        "a provider names the endpoint this run's credential is sent to, and it is \
+         contacted before the run's first step",
+    ),
+    // 0.74.0. Both name a command, an argv and an environment, and both are
+    // spawned at run start. The spawn gate is an `Act::Exec` check on the binary
+    // name alone, so `command = "node"` in a repository that legitimately allows
+    // `node` is arbitrary execution with the argument doing the work. `plugin.rs`
+    // has refused precisely this for a project-scoped *plugin* since 0.35.0; these
+    // two are the same declaration reached without a bundle around it.
+    (
+        "mcp",
+        "MCP servers",
+        "an MCP server is a command, an argv and an environment that this process \
+         spawns at run start",
+    ),
+    (
+        "lsp",
+        "language servers",
+        "a language server is a command, an argv and an environment that this process \
+         spawns at run start",
+    ),
+    // 0.74.0. The one entry the sentence above does not read out word for word,
+    // and it is on the list because the sentence is about a route out of the
+    // boundary rather than about the two shapes it happens to name. `src/web.rs`
+    // states the arrangement: the provider dials the URL, so `Act::Net` never sees
+    // it, the run's egress proxy is not on the path, and `WebAccess`'s own domain
+    // lists are filled into the vendor's filter rather than enforced here. A file
+    // writing `[web] search = true` therefore switches on an egress surface no
+    // rung of this crate mediates, and `fetch = true` beside it lets the model be
+    // pointed at a URL — which is a repository choosing where the run's context
+    // may be sent.
+    //
+    // `sandbox.allow_network = true` is in `PROJECT_WIDENING` for re-opening
+    // egress *inside* the sandbox. This opens one outside it entirely, so refusing
+    // the narrower key while permitting the wider table would not be one rule.
+    //
+    // The cost is stated rather than hidden: `[web] search = false` is a narrowing
+    // sentence and a workspace file can no longer write it. That is the 0.28.0
+    // whole-section argument being paid the same way `[[hook]]` pays it — the
+    // feature is off unless the user scope turns it on, so the narrowing form has
+    // nothing to narrow that the operator did not choose from outside the
+    // workspace.
+    (
+        "web",
+        "provider-executed web access",
+        "a provider-executed search or fetch is dialled by the provider, so `Act::Net` never \
+         sees it, no sandbox is on the path, and the domain lists beside it are a filter this \
+         crate states rather than enforces",
+    ),
+];
+
+/// How a refusal names a scope, and why that scope is not trusted to widen.
+///
+/// One fragment pair per scope, so every rule in [`refuse_widening`] produces a
+/// message with the same shape and an operator reading two of them is reading one
+/// rule. [`Scope::User`] never reaches here — it is the scope the refusals point
+/// *to* — and is worded as the project scope rather than given a fourth spelling
+/// nothing can print.
+fn untrusted(scope: Scope) -> (&'static str, &'static str) {
+    match scope {
+        Scope::Local => (
+            "a workspace-root `io.local.toml`",
+            "it sits in the workspace root a run's own agent can write to",
+        ),
+        Scope::Project | Scope::User => (
+            "a project-scoped file",
+            "`io.toml` arrives with a `git clone`",
+        ),
+    }
+}
 
 /// Validate every `[[provider]]` entry, reporting the index of the one at fault
 /// (0.29.0).
@@ -2020,39 +2452,41 @@ fn check_providers(providers: &[ProviderSpec]) -> Result<()> {
     Ok(())
 }
 
-/// A project-scoped file may narrow the boundary and may never widen it.
+/// A file inside a workspace may narrow the boundary and may never widen it.
 ///
-/// What this does **not** claim: that a cloned repository is safe. `[[mcp]]` still
-/// names a command and `[toolchain]` still names an argv, and the boundary against
-/// the agent is still the [`Policy`] the caller loaded. This is a specific narrowing
-/// of a specific hazard — four keys, `${cmd:}` and `[[hook]]`, no more.
+/// Four rules, and [`REFUSED_SECTIONS`] states the first of them as a sentence:
+/// no section that names a program to run or an endpoint a credential is sent to,
+/// no [`PROJECT_WIDENING`] key set to a widening value, no `[[policy.layers]]`
+/// rule whose effect is anything but `deny` (0.74.0, [`refuse_granting_layers`]),
+/// and no `run.skills` or `run.templates` naming a directory outside the workspace
+/// root (0.74.0) — that last one is a *read* rather than an act, and it is here
+/// because the directory it names is composed into the model's system prompt on
+/// every turn.
+///
+/// Held against the project scope since 0.27.0 and against `io.local.toml` since
+/// 0.74.0. `io.toml` arrives with a `git clone`; `io.local.toml` is the operator's
+/// own file in intent, and in fact is a path inside the workspace root the run's
+/// agent can write to, so a single `write_file` of it declared an argv the next
+/// [`Config::discover`] would run — outside the [`Policy`] and outside the
+/// sandbox. The user scope is the one file no workspace can reach, so it is the
+/// one still trusted to widen and the one every refusal here points at.
+///
+/// What this does **not** claim: that a cloned repository is safe. `[toolchain]`
+/// still names an argv, and the boundary against the agent is still the [`Policy`]
+/// the caller loaded.
 ///
 /// Profile bodies are checked too. A widening key hidden in `[profile.x.sandbox]`
 /// would otherwise reach the same place by a different path.
-fn refuse_widening(table: &toml::value::Table, path: &Path) -> Result<()> {
-    // 0.28.0. The whole array, not its executing half: `run` is the `${cmd:}`
-    // primitive by another name, and `append` is a write to a path the file chose,
-    // which is the same hazard by a shorter route. Refusing one and allowing the
-    // other would be a rule a reader has to hold two halves of.
-    if table.contains_key("hook") {
-        return Err(Error::Config(format!(
-            "{}: key `hook`: a project-scoped file may not declare hooks, because a hook \
-             runs or writes on this machine and `{PROJECT_FILE}` arrives with a `git clone`. \
-             Write it in `{LOCAL_FILE}` or the user-scope file instead.",
-            path.display()
-        )));
-    }
-    // 0.53.0. Same hazard, same answer: `[browser]` names a binary to execute,
-    // and the run then drives it against whatever the page contains. A repository
-    // that could choose the browser could choose the program.
-    #[cfg(feature = "browser")]
-    if table.contains_key("browser") {
-        return Err(Error::Config(format!(
-            "{}: key `browser`: a project-scoped file may not configure a browser, because \
-             it names a program to execute on this machine and `{PROJECT_FILE}` arrives \
-             with a `git clone`. Write it in `{LOCAL_FILE}` or the user-scope file instead.",
-            path.display()
-        )));
+fn refuse_widening(scope: Scope, table: &toml::value::Table, path: &Path) -> Result<()> {
+    let (who, because) = untrusted(scope);
+    for (key, plural, why) in REFUSED_SECTIONS {
+        if table.contains_key(*key) {
+            return Err(Error::Config(format!(
+                "{}: key `{key}`: {who} may not declare {plural} — {why} — and {because}. \
+                 Write it in {USER_SCOPE} instead.",
+                path.display()
+            )));
+        }
     }
     for (keys, widening) in PROJECT_WIDENING {
         let mut node = table.get(keys[0]);
@@ -2063,24 +2497,159 @@ fn refuse_widening(table: &toml::value::Table, path: &Path) -> Result<()> {
         }
         let Some(value) = node else { continue };
         let written = match value {
-            toml::Value::String(s) => s.as_str(),
-            toml::Value::Boolean(true) => "true",
-            toml::Value::Boolean(false) => "false",
+            toml::Value::String(s) => s.clone(),
+            toml::Value::Boolean(b) => b.to_string(),
+            // 0.74.0, for `sandbox.limits.*`, where the widening value is the
+            // number `0` rather than a word.
+            toml::Value::Integer(i) => i.to_string(),
             _ => continue,
         };
-        if written == *widening {
+        if widening.contains(&written.as_str()) {
             return Err(Error::Config(format!(
-                "{}: key `{}`: `{written}` widens the boundary, and a project-scoped \
-                 file may narrow it and never widen it. Write it in `{LOCAL_FILE}` or \
-                 the user-scope file instead.",
+                "{}: key `{}`: `{written}` widens the boundary, and {who} may narrow it and \
+                 never widen it, because {because}. Write it in {USER_SCOPE} instead.",
                 path.display(),
                 keys.join(".")
             )));
         }
     }
+    refuse_granting_layers(scope, table, path)?;
+    // 0.74.0, audit L13. `run.skills` and `run.templates` name directories whose
+    // `*.md` frontmatter is composed into the system prompt of every turn, and
+    // both are resolved by joining onto the discovery root — where an absolute
+    // value replaces that root outright and a relative one climbs out of it with
+    // `..`. A cloned `io.toml` saying `skills = "/home/you/.ssh"` therefore put
+    // this host's files into the model's context on the first turn, read-only and
+    // unasked, before any `Policy` existed to have an opinion about the read.
+    //
+    // Refused only in the scopes a workspace can supply. The user scope still
+    // points wherever the operator wants, which is what keeps a shared skills
+    // directory kept outside the project working.
+    //
+    // Lexical, like `plugin.rs`'s `[[bin]]` rule and for the same reason: nothing
+    // on this path touches the filesystem, and a directory that has not been
+    // checked out yet is not a config error. `Component` rather than a string
+    // test, so a Windows prefix (`C:\`), a bare root (`/etc`, which
+    // `Path::is_absolute` calls relative on Windows) and a `..` buried mid-path
+    // are one rule.
+    for key in ["skills", "templates"] {
+        let Some(written) = table
+            .get("run")
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get(key))
+            .and_then(toml::Value::as_str)
+        else {
+            continue;
+        };
+        let wrong = Path::new(written).components().find_map(|c| match c {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                Some("is an absolute path")
+            }
+            std::path::Component::ParentDir => Some("climbs out of the workspace root with `..`"),
+            _ => None,
+        });
+        if let Some(wrong) = wrong {
+            return Err(Error::Config(format!(
+                "{}: key `run.{key}`: `{written}` {wrong}, and {who} may narrow the boundary and \
+                 never widen it, because {because}. Every `*.md` under that directory reaches the \
+                 model's system prompt. Write it relative to the workspace root, or name it from \
+                 {USER_SCOPE} instead.",
+                path.display()
+            )));
+        }
+    }
     if let Some(profiles) = table.get("profile").and_then(toml::Value::as_table) {
         for body in profiles.values().filter_map(toml::Value::as_table) {
-            refuse_widening(body, path)?;
+            refuse_widening(scope, body, path)?;
+        }
+    }
+    Ok(())
+}
+
+/// A `[[policy.layers]]` inside a workspace may contribute `deny` rules and
+/// nothing else (0.74.0).
+///
+/// [`PROJECT_WIDENING`] refuses `policy.defaults.exec = "allow"` and its four
+/// siblings, and a layer reached the same place by a different door: rules are
+/// appended to [`Policy::default`]'s in [`Config::policy`] with no scope check and
+/// no effect filter, [`Policy::explain`] resolves deny → ask → allow across the
+/// whole stack, and the shipped default contributes no `Act::Exec` or `Act::Net`
+/// deny for an allow to lose to. So
+///
+/// ```toml
+/// [[policy.layers]]
+/// name = "ci-tools"
+/// rules = [{ act = "exec", effect = "allow", pattern = "*" }]
+/// ```
+///
+/// in a cloned `io.toml` was `policy.defaults.exec = "allow"` written five lines
+/// away from where that is refused — and, through
+/// [`Policy::permits_any_egress`](crate::policy::Policy), the `net` spelling of it
+/// also switched the sandbox's own `allow_network` back on, because every spawn
+/// site resolves that flag from the policy rather than from `[sandbox]`. The key
+/// on the list was not the key that decided.
+///
+/// This is `plugin.rs`'s `check_narrowing`, which has held a **more** trusted file
+/// to exactly this rule since 0.35.0: a `plugin.toml` named from the operator's own
+/// user scope may not contribute an allow, while an `io.toml` arriving with a
+/// `git clone` could. The argument is the same one and is worth restating: a
+/// boundary is a thing a file may take capability away from and may never hand
+/// capability out from, and an `ask` is handing it out too — it converts an act the
+/// operator's own default *denied* into one an approver is asked to wave through.
+///
+/// The user scope is untouched, which is what keeps the rule payable: it is outside
+/// every workspace, so it is where an allow rule is written.
+fn refuse_granting_layers(scope: Scope, table: &toml::value::Table, path: &Path) -> Result<()> {
+    let (who, because) = untrusted(scope);
+    let layers = table
+        .get("policy")
+        .and_then(toml::Value::as_table)
+        .and_then(|policy| policy.get("layers"))
+        .and_then(toml::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for layer in layers {
+        // Named the way the rest of this module names an entry with nothing usable
+        // in it: by what is there. A layer with no `name` is refused by the
+        // deserializer a few lines later, and a refusal that panicked on the way to
+        // saying so would be the worse error.
+        let name = layer
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("<unnamed>");
+        let rules = layer
+            .get("rules")
+            .and_then(toml::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for rule in rules {
+            // Fail closed on a rule whose `effect` is absent or is not a string:
+            // this runs before anything deserializes, and "not the word `deny`"
+            // is the question being asked. A genuinely malformed rule is reported
+            // by the deserializer with its own message.
+            let effect = rule
+                .get("effect")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("<unnamed>");
+            if effect == "deny" {
+                continue;
+            }
+            let act = rule
+                .get("act")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("<unnamed>");
+            let pattern = rule
+                .get("pattern")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("<unnamed>");
+            return Err(Error::Config(format!(
+                "{}: key `policy.layers`: layer `{name}` carries a `{effect}` rule for `{act}` on \
+                 {pattern:?}, and {who} may contribute `deny` rules and nothing else, because \
+                 {because}. A layer that allows is a default that widens by another route — a \
+                 rule with no deny above it decides — so it is refused here for the reason \
+                 `policy.defaults.exec = \"allow\"` is. Write it in {USER_SCOPE} instead.",
+                path.display()
+            )));
         }
     }
     Ok(())
@@ -2226,8 +2795,37 @@ fn expand(scope: Scope, raw: &str, dir: &Path, key: &[String], path: &Path) -> R
                     format!("environment variable `{arg}` is not set"),
                 )
             })?,
+            // 0.74.0. Refused in the project scope for the reason `${cmd:}` is,
+            // one step short of running a program: the argument is joined onto the
+            // file's own directory, and `Path::join` lets an absolute argument
+            // replace that directory outright while a relative one climbs out of
+            // it with `..`. So `api_key = "${file:/home/you/.ssh/id_rsa}"` in a
+            // cloned `io.toml` is an arbitrary read of this host, resolved at load
+            // and then sent wherever the file's other keys point. The read happens
+            // before any `Policy` exists, so `Act::Read` never sees it.
             "file" => {
+                // 0.74.0, audit H2 — every scope inside the workspace, not just
+                // the committed one. `io.local.toml` sits at the workspace root,
+                // which is a path the run's own agent can write, so refusing this
+                // for `io.toml` alone left the same arbitrary read one file over.
+                if scope != Scope::User {
+                    return Err(bad_key(
+                        path,
+                        key,
+                        format!(
+                            "`${{file:}}` is refused in a file inside the workspace, because \
+                             `{PROJECT_FILE}` travels with a clone, `{LOCAL_FILE}` is a path this \
+                             run's own agent can write, and the argument is joined onto the file's \
+                             directory — an absolute one names any path on this machine. Write it \
+                             in {USER_SCOPE} instead."
+                        ),
+                    ));
+                }
                 let at = dir.join(arg);
+                // A `${file:}` target is a credential by construction — the
+                // feature exists to keep one out of a committed file — so this
+                // one is checked in every scope that reaches it.
+                warn_if_exposed(&at);
                 std::fs::read_to_string(&at)
                     .map_err(|e| {
                         bad_key(path, key, format!("cannot read `{}`: {e}", at.display()))
@@ -2239,14 +2837,24 @@ fn expand(scope: Scope, raw: &str, dir: &Path, key: &[String], path: &Path) -> R
             // file a `git clone` delivers — so the one scope that cannot use this is
             // the one an operator did not write.
             "cmd" => {
-                if scope == Scope::Project {
+                // 0.74.0, audit H2 — and this one is the sharpest edge of that
+                // finding rather than a tidy-up beside it. `${cmd:}` runs a
+                // program at load: outside the `Policy`, outside the sandbox,
+                // before the run has a first step. Refusing it for `io.toml`
+                // alone left the whole of H2 open by a shorter route than the one
+                // the finding describes — the agent writes `io.local.toml` with
+                // any key at all carrying a `${cmd:}`, and the next
+                // `Config::discover` runs it. No `[[hook]]` needed, and `[app]`
+                // takes arbitrary keys.
+                if scope != Scope::User {
                     return Err(bad_key(
                         path,
                         key,
                         format!(
-                            "`${{cmd:}}` is refused in the project scope, because `{PROJECT_FILE}` \
-                             travels with a clone. Write it in `{LOCAL_FILE}` or the user-scope \
-                             file instead."
+                            "`${{cmd:}}` is refused in a file inside the workspace: it runs a \
+                             program at load, before any policy or sandbox exists. `{PROJECT_FILE}` \
+                             travels with a clone and `{LOCAL_FILE}` is a path this run's own agent \
+                             can write. Write it in {USER_SCOPE} instead."
                         ),
                     ));
                 }
@@ -2300,9 +2908,11 @@ const APPENDING: &[&[&str]] = &[&["policy", "layers"], &["agent"], &["plugin"]];
 /// later scope, and `io.toml` can tighten an operator's ceiling without being
 /// able to loosen it.
 ///
-/// Only the project scope is held to this. `io.local.toml` and the user scope
-/// are the operator's own files and set the key outright, which is the same
-/// distinction [`refuse_widening`] already draws.
+/// Only the project scope is held to this, and 0.74.0 leaves that alone while
+/// [`refuse_widening`] grows to cover `io.local.toml`. The two rules answer
+/// different questions: a number a workspace file lowers is a ceiling an operator
+/// still chose, where a section a workspace file declares is a program an operator
+/// never saw. `io.local.toml` and the user scope set these five outright.
 const NARROWING: &[&[&str]] = &[
     &["run", "max_read_chars"],
     // 0.60.0 — the ceiling on a blocking mailbox read. A number, like
@@ -2444,7 +3054,12 @@ mod tests {
 
         let key = ["run".to_string()];
         let path = Path::new("io.toml");
-        let at = Scope::Local;
+        // The user scope, because since 0.74.0 it is the only one `${file:}`
+        // resolves in at all. The claim here is about what a substitution turns
+        // into — a value, or an error naming the key, and never an empty string —
+        // not about which file may carry one, so it is asserted in the scope where
+        // every form still runs.
+        let at = Scope::User;
         assert_eq!(
             expand(at, "${env:IO_HARNESS_TEST_SET}", dir.path(), &key, path).unwrap(),
             "from-the-environment"
@@ -2475,8 +3090,15 @@ mod tests {
         );
     }
 
+    /// 0.74.0, audit H2 — the boundary is the workspace, not the committed file.
+    ///
+    /// `io.local.toml` sits at the workspace root, which is a path the run's own
+    /// agent writes to, so a rule that refused `${cmd:}` in `io.toml` alone left the
+    /// same load-time execution one file over. Both workspace scopes are asserted
+    /// here, and `${file:}` beside `${cmd:}`, because they are one rule with two
+    /// arms and an arm with no assertion is an arm nothing holds.
     #[test]
-    fn a_command_substitution_runs_outside_the_project_scope_and_never_inside_it() {
+    fn a_command_substitution_runs_in_the_user_scope_and_never_in_a_workspace_file() {
         // Each platform's own spelling of "print this", "succeed silently" and
         // "fail". Named rather than skipped: `${cmd:}` is a real feature on Windows
         // and a test that ran on two platforms out of three would prove it there.
@@ -2486,13 +3108,15 @@ mod tests {
         let (echo, quiet, fail) = ("printf s3cret", "true", "false");
 
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("token"), "s3cret\n").unwrap();
         let key = ["mcp".to_string()];
-        let path = Path::new("io.local.toml");
+        // The user-scope file, which is the only one either of these runs in now.
+        let path = Path::new("io.toml");
 
         // A trailing newline is trimmed, and the value composes inside a larger string.
         assert_eq!(
             expand(
-                Scope::Local,
+                Scope::User,
                 &format!("Bearer ${{cmd:{echo}}}"),
                 dir.path(),
                 &key,
@@ -2512,37 +3136,50 @@ mod tests {
             (format!("${{cmd:{quiet}}}"), "resolved to nothing"),
         ] {
             let input = input.as_str();
-            let err = expand(Scope::Local, input, dir.path(), &key, path)
+            let err = expand(Scope::User, input, dir.path(), &key, path)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(expect), "{input}: {err}");
         }
 
-        // The project scope refuses it outright, before running anything.
-        let err = expand(
-            Scope::Project,
-            &format!("${{cmd:{echo}}}"),
-            dir.path(),
-            &key,
-            Path::new(PROJECT_FILE),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("refused in the project scope"), "{err}");
-        // The negative control: it is `cmd:` that is refused there, not substitution.
-        // A rule that disarmed `${env:}` in the project scope would be a much worse
-        // feature that this test would otherwise pass.
-        std::env::set_var("IO_HARNESS_TEST_SET", "from-the-environment");
-        assert_eq!(
-            expand(
-                Scope::Project,
-                "${env:IO_HARNESS_TEST_SET}",
-                dir.path(),
-                &key,
-                Path::new(PROJECT_FILE),
-            )
-            .unwrap(),
-            "from-the-environment"
-        );
+        // Both files inside the workspace refuse both substitutions outright, before
+        // running or reading anything. The success above is what proves the refusal
+        // is the scope and not a `${cmd:}` that stopped working.
+        for (scope, file) in [(Scope::Project, PROJECT_FILE), (Scope::Local, LOCAL_FILE)] {
+            for (input, needle) in [
+                (format!("${{cmd:{echo}}}"), "`${cmd:}`"),
+                ("${file:token}".to_string(), "`${file:}`"),
+            ] {
+                let err = expand(scope, &input, dir.path(), &key, Path::new(file))
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains(&format!(
+                        "{needle} is refused in a file inside the workspace"
+                    )),
+                    "{file}: {err}"
+                );
+                assert!(
+                    err.contains(USER_SCOPE),
+                    "the error says where to write it instead: {err}"
+                );
+            }
+
+            // The negative control: it is `cmd:` and `file:` that a workspace file
+            // refuses, not substitution. A rule that disarmed `${env:}` there would
+            // be a much worse feature that this test would otherwise pass.
+            std::env::set_var("IO_HARNESS_TEST_SET", "from-the-environment");
+            assert_eq!(
+                expand(
+                    scope,
+                    "${env:IO_HARNESS_TEST_SET}",
+                    dir.path(),
+                    &key,
+                    Path::new(file),
+                )
+                .unwrap(),
+                "from-the-environment"
+            );
+        }
     }
 }

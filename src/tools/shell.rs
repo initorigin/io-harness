@@ -1004,6 +1004,15 @@ pub(crate) struct Planned {
     pub(crate) cwd: PathBuf,
     /// Its redirects, targets absolute. `None` for `2>&1`, which names no file.
     pub(crate) redirects: Vec<(RedirectKind, Option<PathBuf>)>,
+    /// The workspace root these paths were contained under (0.74.0).
+    ///
+    /// Carried with them rather than resolved again at the spawn site, for the
+    /// reason this whole type exists: a second resolution is a second chance to
+    /// disagree. It is needed there because a symbolic link at the final component
+    /// is the one thing [`plan`] cannot decide once and for all — the link may be
+    /// planted after the plan is made, and the file the descriptor names is then
+    /// not the file that was checked.
+    pub(crate) root: PathBuf,
     /// Where a `cd` moves to, absolute, or `None` for every other command.
     ///
     /// Recorded here so the caller can check the destination against
@@ -1056,13 +1065,22 @@ pub(crate) fn plan(line: &Line, root: &Path) -> Result<Vec<Planned>> {
         let cd_target = if cmd.argv[0] == CD {
             Some(match cmd.argv.get(1) {
                 None => root.to_path_buf(),
-                Some(t) => resolve(&here, t, root)?,
+                Some(t) => {
+                    // The word, not the resolved path: what is checked here is
+                    // the name the *model* chose, and the root it is joined onto
+                    // was chosen by whoever configured the run. A root that
+                    // cannot be named in a profile is the sandbox backend's
+                    // refusal to make, and it makes it.
+                    check_workdir_word(t)?;
+                    resolve(&here, t, root)?
+                }
             })
         } else {
             None
         };
         out.push(Planned {
             cwd: here.clone(),
+            root: root.to_path_buf(),
             redirects,
             cd_target: cd_target.clone(),
         });
@@ -1226,6 +1244,30 @@ impl Shell {
     }
 
     async fn run_line(&self, line: &Line, plan: &[Planned]) -> Result<ShellOutcome> {
+        // **H11 (0.74.0) — the same refusal the git built-ins make, and for the
+        // same reason.** A line's stages are piped into one another, so this tool
+        // owns every `Child` and reaches containment only through `wrap_argv` and
+        // `contain_command`. Neither has a Windows branch and neither can have
+        // one: an AppContainer is entered at `CreateProcessW` through a
+        // process-thread attribute list, so there is no argv to prepend and no
+        // `pre_exec` to install. Every stage of every line — `shell` and
+        // `shell_start` alike, which both arrive here — spawned completely
+        // unwrapped while the run reported `windows-appcontainer`.
+        if let Some(sb) = &self.sandbox {
+            let backend = sb.containment.backend();
+            if crate::sandbox::windows::applied_only_by_sandbox_run(backend) {
+                return Err(Error::Sandbox {
+                    reason: format!(
+                        "this run asked for access confinement and the `{}` backend is applied \
+                         only by the sandbox's own runner, which a shell line's stages do not \
+                         go through. Nothing was started — a stage spawned here would have had \
+                         no filesystem and no network boundary while the run reported that it \
+                         had both",
+                        backend.as_str()
+                    ),
+                });
+            }
+        }
         let mut out = String::new();
         let mut err = String::new();
         let mut code = Some(0);
@@ -1557,19 +1599,26 @@ fn apply_redirects(cmd: &mut TokioCommand, planned: &Planned) -> Result<()> {
             // `2>&1` — see the note above; there is nothing to open.
             continue;
         };
+        let root = planned.root.as_path();
         match kind {
             RedirectKind::Stdin => {
-                cmd.stdin(Stdio::from(std::fs::File::open(path).map_err(Error::Io)?));
+                cmd.stdin(Stdio::from(open_leaf(
+                    path,
+                    root,
+                    std::fs::OpenOptions::new().read(true),
+                )?));
             }
             RedirectKind::Stdout | RedirectKind::StdoutAppend => {
                 cmd.stdout(Stdio::from(open_for_write(
                     path,
+                    root,
                     *kind == RedirectKind::StdoutAppend,
                 )?));
             }
             RedirectKind::Stderr | RedirectKind::StderrAppend => {
                 cmd.stderr(Stdio::from(open_for_write(
                     path,
+                    root,
                     *kind == RedirectKind::StderrAppend,
                 )?));
             }
@@ -1594,24 +1643,111 @@ fn append_to(path: &Path) -> Result<std::fs::File> {
         .map_err(Error::Io)
 }
 
-fn open_for_write(path: &Path, append: bool) -> Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .append(append)
-        .truncate(!append)
-        .open(path)
-        .map_err(Error::Io)
+fn open_for_write(path: &Path, root: &Path, append: bool) -> Result<std::fs::File> {
+    open_leaf(
+        path,
+        root,
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(append)
+            .truncate(!append),
+    )
+}
+
+/// Open a redirect target without following a symbolic link at the final
+/// component (0.74.0, F2b).
+///
+/// The treatment `Workspace::write_leaf` already gave
+/// [`write_file`](super::workspace::Workspace::write_file), taken here because the
+/// two doors are claimed to answer alike about the same path and this one did not:
+/// [`resolve`]'s helper decided containment, and then an ordinary `open` followed
+/// whatever link was at the leaf straight out of the root. With
+/// `docs/ext -> /home/user/.bashrc` checked into the repository, `> docs/ext`
+/// wrote the home file. `resolve` refuses that link now — a dangling one included,
+/// which is the half that used to slip past — and this is the second line for the
+/// link planted *after* the plan is made, which no check taken before the spawn
+/// can see.
+///
+/// A link that stays *inside* the root still opens, because a repository is
+/// allowed to contain one: the open is retried once against where the link points,
+/// and that destination goes through [`contain_under_root`] first. The policy is
+/// not re-asked here, and deliberately — this runner holds no
+/// [`Policy`](crate::Policy) at all, for the reason [`Shell`] gives — so what this
+/// enforces is containment, and the destination's *policy* verdict is the one
+/// `dispatch` took from the path [`plan`] resolved.
+///
+/// **Windows** has no `O_NOFOLLOW` and no `OpenOptions` equivalent, so the open
+/// there is an ordinary one and containment rests on [`resolve`] alone. Creating a
+/// symbolic link on Windows needs `SeCreateSymbolicLinkPrivilege` or developer
+/// mode, which is not something an unprivileged agent has.
+///
+/// [`contain_under_root`]: super::workspace::contain_under_root
+fn open_leaf(path: &Path, root: &Path, opts: &mut std::fs::OpenOptions) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        opts.custom_flags(libc::O_NOFOLLOW);
+        match opts.open(path) {
+            // `ELOOP` here means the leaf is a symlink and nothing else: the flag
+            // is the only reason this open can report it.
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                let dest = std::fs::read_link(path).map_err(Error::Io)?;
+                let dest = match path.parent() {
+                    Some(parent) if dest.is_relative() => parent.join(dest),
+                    _ => dest,
+                };
+                opts.open(super::workspace::contain_under_root(root, &dest)?)
+                    .map_err(Error::Io)
+            }
+            other => other.map_err(Error::Io),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        opts.open(path).map_err(Error::Io)
+    }
 }
 
 /// Join `rel` onto `base` and refuse anything that leaves `root`.
 ///
-/// Lexical rather than `canonicalize`, and deliberately: `canonicalize` requires
-/// the path to exist, and a redirect target usually does not — it is about to be
-/// created. So `..` is resolved by walking components, and a walk that would rise
-/// above the root is refused rather than clamped. Clamping would silently
-/// redirect `> ../../etc/passwd` into the workspace, which is a surprise in the
-/// one direction that matters.
+/// Two checks, because one of them is not enough.
+///
+/// The first is lexical, and deliberately so: `canonicalize` requires the path to
+/// exist, and a redirect target usually does not — it is about to be created. So
+/// `..` is resolved by walking components, and a walk that would rise above the
+/// root is refused rather than clamped. Clamping would silently redirect
+/// `> ../../etc/passwd` into the workspace, which is a surprise in the one
+/// direction that matters.
+///
+/// The second is [`contain_under_root`](super::workspace::contain_under_root),
+/// added in 0.74.0 for audit H4. A lexical answer says nothing about symbolic
+/// links: with `docs/ext -> /home/user` checked into the repository,
+/// `> docs/ext/.bashrc` is lexically inside the root, and an ordinary open follows
+/// the link and creates a file in the home directory. The helper resolves the
+/// deepest existing ancestor, requires *that* under the canonical root, and so
+/// refuses the redirect before anything is opened.
+///
+/// The escape is the leaf as well as the parent, and saying otherwise is what left
+/// `> docs/ext` open when `docs/ext` was itself a link to a file outside the root
+/// that did not exist yet. Two things answer it. The helper resolves a *dangling*
+/// link instead of mistaking it for a leaf about to be created, so the destination
+/// is what both this check and `dispatch`'s policy check grade; and
+/// [`open_leaf`] opens with `O_NOFOLLOW`, so the link planted after this ran —
+/// which no check taken before the spawn can see — does not redirect the
+/// descriptor either. `write_file` takes the same helper and the same
+/// `O_NOFOLLOW` open, which is what makes the two doors answer the same way about
+/// the same path.
+///
+/// The helper's answer is checked and discarded rather than returned. What comes
+/// back is the path as written, still under `root` component for component,
+/// because the caller derives the policy target from it by stripping `root` — and
+/// on a host whose temporary directory is itself a link, the canonical form does
+/// not start with `root` and would be graded as an absolute path from outside.
+/// The two forms name the same file: containment is what the helper decides, and
+/// naming is what this returns.
 ///
 /// This is a second line rather than the first: `dispatch` checks each of these
 /// paths against the policy through `Workspace::check_path`. It is here because
@@ -1638,7 +1774,68 @@ fn resolve(base: &Path, rel: &str, root: &Path) -> Result<PathBuf> {
     if !out.starts_with(root) {
         return Err(Error::Config(format!("`{rel}` leaves the workspace root")));
     }
+    super::workspace::contain_under_root(root, &out)?;
     Ok(out)
+}
+
+/// Refuse a `cd` target word whose *name* could become structure in a sandbox
+/// profile (0.74.0, audit C1).
+///
+/// A `cd` is the one place a model chooses a directory name that this crate then
+/// interpolates into something it did not write. `planned.cwd` is handed to
+/// `wrap_argv` and `contain_command` as the stage's workdir, and on macOS the
+/// seatbelt backend renders that workdir into an SBPL string literal. SBPL's last
+/// matching rule wins, so a directory named
+/// `p")) (allow network*) (allow file-write* (subpath "/` appended its own rules
+/// to the profile while the backend went on reporting a confining rung.
+///
+/// `sbpl_literal` already refuses those characters at the profile, and that is
+/// the fix that closes the hole. This is the second line, taken at the door
+/// rather than at the wall: it removes the *class* — a model-chosen name that
+/// carries syntax into a generated artefact — instead of one instance of it, it
+/// applies on every platform rather than only where a profile is generated, and
+/// it refuses while the model can still read a reason, rather than after the run
+/// has silently collapsed to a profile that grants nothing.
+///
+/// ## What the set admits, and why it is not narrower
+///
+/// Admitted: every character that is not refused below. That is spaces, hyphens,
+/// dots, underscores, apostrophes, parentheses, and every non-ASCII character —
+/// `My Project`, `my-project`, `my.project`, `Project (old)`, `josé's notes` and
+/// `проект` are all ordinary directory names on the platforms this runs on, and
+/// none of them is significant inside a quoted profile literal. A restriction to
+/// a literal bare word — letters, digits, `-`, `_`, `.` — was considered and
+/// rejected: it would refuse `cd "My Project"`, which is a real thing to do in a
+/// real workspace, and it would buy nothing, because a space cannot end a string
+/// literal.
+///
+/// Refused: `"` and `\`, which are the two characters that can end an SBPL string
+/// literal or change what the next one means, and every control character,
+/// newline included, which can end a line in generated text of almost any shape.
+/// A directory whose name holds one of those is refused rather than escaped, for
+/// the reason `sbpl_literal` gives: the escape rules are not something this crate
+/// can pin down from the platform's documentation, and a guess about them is a
+/// guess about where the boundary is.
+fn check_workdir_word(word: &str) -> Result<()> {
+    let Some(bad) = word
+        .chars()
+        .find(|&c| matches!(c, '"' | '\\') || c.is_control())
+    else {
+        return Ok(());
+    };
+    let what = match bad {
+        '"' => "a double quote".to_string(),
+        '\\' => "a backslash".to_string(),
+        '\n' => "a newline".to_string(),
+        c => format!("the control character U+{:04X}", c as u32),
+    };
+    Err(Error::Config(format!(
+        "`cd {word}` names a directory whose name holds {what}. This directory becomes the \
+         working directory of every later stage, and that path is written into the sandbox \
+         profile that confines them, where such a character can end the profile's own string \
+         literal and whatever followed would become rules. Run the command from a directory \
+         whose name holds no quote, backslash or control character."
+    )))
 }
 
 #[cfg(test)]
@@ -2220,6 +2417,57 @@ mod tests {
         ];
         for (src, want) in cases {
             assert_eq!(ok(src).commands().count(), want, "for `{src}`");
+        }
+    }
+
+    /// C1 — the whole refused set, and the reason it is not larger.
+    ///
+    /// A `cd` target becomes the workdir every later stage runs in, and that path
+    /// is written into the sandbox profile confining them. The three shapes here
+    /// are the ones that can end a generated line or a generated string literal;
+    /// everything else is a directory name somebody really has.
+    #[test]
+    fn c1_a_cd_target_that_could_carry_syntax_into_a_profile_is_refused() {
+        for hostile in [
+            r#"p")) (allow network*) (allow file-write* (subpath "/"#,
+            "back\\slash",
+            "two\nlines",
+            "bell\u{7}",
+            "nul\0byte",
+        ] {
+            assert!(
+                check_workdir_word(hostile).is_err(),
+                "`cd {hostile:?}` must be refused"
+            );
+        }
+    }
+
+    /// The companion, and the argument against a literal bare-word set.
+    ///
+    /// A space cannot end a string literal, and neither can a hyphen, a dot, an
+    /// underscore, a parenthesis, an apostrophe or a non-ASCII letter. Refusing
+    /// them would break workspaces people really have and close nothing —
+    /// `Project (old)` is in the list because parentheses are structure in SBPL
+    /// *outside* a literal and characters inside one, which is exactly where this
+    /// boundary is drawn.
+    #[test]
+    fn c1_an_ordinary_directory_name_is_still_a_valid_cd_target() {
+        for ordinary in [
+            "src",
+            "My Project",
+            "my-project",
+            "my.project",
+            "my_project",
+            "Project (old)",
+            "josé's notes",
+            "проект",
+            "../sibling",
+        ] {
+            assert!(
+                check_workdir_word(ordinary).is_ok(),
+                "`cd {ordinary}` must still be allowed here — containment is \
+                 `resolve`'s question, not this one"
+            );
         }
     }
 }
