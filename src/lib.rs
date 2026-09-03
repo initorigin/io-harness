@@ -532,7 +532,7 @@ pub use approve::{
 pub use browser::BrowserConfig;
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
-pub use context::{Compaction, ContextBudget};
+pub use context::{Collapse, Compaction, ContextBudget};
 pub use contract::{
     Preset, Routing, SystemPrompt, TaskContract, DEFAULT_MAX_RETRIES, DEFAULT_MAX_STEPS,
     DEFAULT_WORKSPACE_MAX_STEPS,
@@ -606,8 +606,8 @@ pub use state::{
 pub use template::{Template, Templates};
 pub use tools::git::Identity;
 pub use tools::{
-    Tool, ToolEffect, ToolFuture, ToolRecovery, Toolbox, ASK_QUESTIONS_TOOL, ASK_QUESTION_TOOL,
-    DEFAULT_EXEC_TIMEOUT, PROPOSE_PLAN_TOOL, TODO_WRITE_TOOL,
+    Tool, ToolEffect, ToolFuture, ToolMask, ToolRecovery, Toolbox, ASK_QUESTIONS_TOOL,
+    ASK_QUESTION_TOOL, DEFAULT_EXEC_TIMEOUT, PROPOSE_PLAN_TOOL, TODO_WRITE_TOOL,
 };
 pub use verify::{
     ChangeReview, ExecGuard, FileChange, ModelReviewer, Review, ReviewRequest, Reviewer, Reviewing,

@@ -46,6 +46,8 @@ fn widen_for_loopback() {
 struct Sink {
     addr: String,
     seen: Arc<AtomicUsize>,
+    /// Dials this helper made itself, subtracted from `connections()`.
+    controls: AtomicUsize,
 }
 
 impl Sink {
@@ -63,15 +65,78 @@ impl Sink {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
         });
-        Self { addr, seen }
+        Self {
+            addr,
+            seen,
+            controls: AtomicUsize::new(0),
+        }
     }
 
     fn url(&self) -> String {
         format!("http://{}/v1", self.addr)
     }
 
+    /// Connections the code under test opened.
+    ///
+    /// **The control dials this helper makes itself are subtracted**, so a second
+    /// `assert_only` on one `Sink` is not satisfied by the first one's dial, and a
+    /// later positive assertion is not made unfailable by an earlier absence
+    /// check. Both were true of the first version of this helper.
     fn connections(&self) -> usize {
-        self.seen.load(Ordering::SeqCst)
+        self.seen.load(Ordering::SeqCst) - self.controls.load(Ordering::SeqCst)
+    }
+
+    /// Wait until at least `n` connections have been accepted (0.76.0).
+    ///
+    /// **`connect` returning is not `accept` returning.** The kernel completes
+    /// the handshake into the accept backlog and the counting thread running is a
+    /// later, unordered event, so reading the counter straight after a run races
+    /// the scheduler. Bounded, so a socket that never arrives fails rather than
+    /// hangs.
+    fn wait_for(&self, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.connections() < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waited 30s for {n} connection(s) and saw {}",
+                self.connections()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Assert nothing beyond `n` connections was opened, without winning a race
+    /// (0.76.0).
+    ///
+    /// A bare `assert_eq!(connections(), 0)` is true whenever the accept thread
+    /// has not been scheduled yet, so it passes over a genuinely leaked socket.
+    /// That is a silent false pass rather than a flake, which is what makes it
+    /// worse: nothing ever reports it. This dials the sink itself and waits for
+    /// that connection — the OS cannot deliver a later dial ahead of an earlier
+    /// one, so once the control is accepted, anything the run opened has been too.
+    fn assert_only(&self, n: usize) {
+        let already = self.controls.load(Ordering::SeqCst);
+        let _control = std::net::TcpStream::connect(&self.addr).expect("dial our own sink");
+        // Wait on the RAW total, because `connections()` subtracts the controls
+        // and this dial has not been counted as one yet.
+        let want = already + n + 1;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.seen.load(Ordering::SeqCst) < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waited 30s for this test's own control dial to be accepted; raw total is {}",
+                self.seen.load(Ordering::SeqCst)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.controls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            self.connections(),
+            n,
+            "a socket was opened that this test forbids: {} beyond the {} expected",
+            self.connections(),
+            n
+        );
     }
 }
 
@@ -230,6 +295,7 @@ async fn a_deny_all_base_still_reaches_its_provider_through_the_provider_layer()
         matches!(result.outcome, RunOutcome::Success { .. }),
         "{result:?}"
     );
+    sink.wait_for(1);
     assert!(sink.connections() >= 1, "the provider should have dialled");
 
     let allowed = store
@@ -282,7 +348,9 @@ async fn an_untrusted_provider_endpoint_is_refused_by_a_deny_all_base() {
         matches!(&err, Error::Refused { act, .. } if act == "net"),
         "{err:?}"
     );
-    assert_eq!(sink.connections(), 0, "refused before a socket was opened");
+    // 0.76.0 — refused before a socket was opened, asserted through a control
+    // dial so the absence does not depend on the accept thread being scheduled.
+    sink.assert_only(0);
 }
 
 /// F8 — an explicit deny of the provider's own host still wins, and fails fast.
@@ -309,7 +377,7 @@ async fn denying_your_own_provider_is_legal_and_fails_as_a_refusal() {
     .unwrap_err();
 
     assert!(matches!(&err, Error::Refused { act, .. } if act == "net"));
-    assert_eq!(sink.connections(), 0);
+    sink.assert_only(0);
 }
 
 /// F5 — `Ask` routes to the approver; an approval dials exactly once.
@@ -339,11 +407,10 @@ async fn an_ask_on_the_network_is_approved_and_dials() {
         matches!(result.outcome, RunOutcome::Success { .. }),
         "{result:?}"
     );
-    assert_eq!(
-        sink.connections(),
-        1,
-        "one authorization, one dial — not two"
-    );
+    // 0.76.0 — "one dial, not two" is an absence assertion about the second dial,
+    // so it needs the same control: waiting for exactly one and no more.
+    sink.wait_for(1);
+    sink.assert_only(1);
 }
 
 /// F5 — a denial at the gate blocks the call.
@@ -364,7 +431,7 @@ async fn an_ask_denied_at_the_gate_never_dials() {
         .unwrap_err();
 
     assert!(matches!(&err, Error::Refused { act, .. } if act == "net"));
-    assert_eq!(sink.connections(), 0);
+    sink.assert_only(0);
 }
 
 /// An approver that answers `Deny` and counts how many times it was asked.
@@ -441,11 +508,9 @@ async fn resuming_a_refused_run_reports_the_refusal_instead_of_asking_again() {
         1,
         "the human was asked once, not once per resume"
     );
-    assert_eq!(
-        sink.connections(),
-        0,
-        "and no socket was opened on either attempt"
-    );
+    // 0.76.0 — and no socket was opened on either attempt, asserted through a
+    // control dial so the absence cannot be a race the accept thread lost.
+    sink.assert_only(0);
 }
 
 /// F6 — a deferred network decision is persisted and delivered later, against a
@@ -480,7 +545,8 @@ async fn a_deferred_network_decision_persists_and_resumes() {
             other => panic!("expected a pause, got {other:?}"),
         }
     };
-    assert_eq!(sink.connections(), 0, "a paused run has not dialled");
+    // 0.76.0 — a paused run has not dialled, asserted through a control dial.
+    sink.assert_only(0);
 
     // A fresh process: new store handle, new provider, the decision arrives now.
     let store = Store::open(&file).unwrap();
@@ -506,6 +572,7 @@ async fn a_deferred_network_decision_persists_and_resumes() {
         matches!(result.outcome, RunOutcome::Success { .. }),
         "{result:?}"
     );
+    sink.wait_for(1);
     assert!(sink.connections() >= 1, "the resumed run dialled");
 }
 
@@ -689,11 +756,9 @@ async fn a_provider_endpoint_that_resolves_to_no_target_is_refused_under_an_allo
         );
     }
 
-    assert_eq!(
-        sink.connections(),
-        0,
-        "no socket may be opened for a URL the boundary could not resolve"
-    );
+    // 0.76.0 — no socket may be opened for a URL the boundary could not resolve,
+    // asserted through a control dial rather than by winning a race.
+    sink.assert_only(0);
 }
 
 /// The policy is act-complete: a network rule cannot be smuggled in as a path.

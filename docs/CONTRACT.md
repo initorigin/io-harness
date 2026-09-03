@@ -1160,6 +1160,65 @@ blocks lead, the images follow, and the boundary is honoured. Same request, two
 vendors, two different answers, and the difference is a property of the orderings
 rather than a policy this crate chose.
 
+## What a tool mask changes, and what it leaves exactly as it was (0.76.0)
+
+**A mask withholds availability, never membership.** `TaskContract::tool_mask`
+names the tools a turn may not call. The catalogue the request carries is
+byte-identical to the one an unmasked run carries — the same `ToolSpec` values, in
+the same order, serialised to the same bytes, and paid for in the same tokens. The
+definitions are not removed, not reordered, and not annotated. A caller reading the
+wire will find every schema they would have found without the mask.
+
+**Removal was rejected, and the reason is the ordering above.** The tool array sits
+ahead of the first breakpoint, so any byte changed in it invalidates that cache
+entry and everything after it in the same ordering. Dropping a withheld tool's
+definition would save that definition's tokens once and pay a cache *write* on every
+later turn of the run — a saving on the first request bought with a loss on all the
+rest. The trade is stated here rather than left as a property of the implementation,
+because a future change that filters the catalogue would be undoing a decision
+rather than making an improvement.
+
+**What the model is told, and where.** The withheld names are stated in one sentence
+appended after the observation section of the user prompt, in the mask's own sorted
+order. That position is load-bearing: it falls past the first breakpoint at the end
+of `system` and past the frozen transcript prefix a fold's marker covers, so a mask
+that changes between turns costs no cache entry. The same sentence written into the
+system block or into a tool's description would convert every later turn's cache
+read into a write. Anything added to that sentence must stay after the observations
+for that reason and not merely for readability.
+
+**Enforcement is at both places a call can begin.** The head of `dispatch`, and
+`read_batch`'s per-call loop — because a batch of read-only calls does not route
+through `dispatch` at all, so a rule installed in one place would let a batched call
+through. A mask applied only where the catalogue is built would be advisory in a
+stronger sense still: `dispatch` matches on the tool's name and answers a name it
+does not recognise with an unknown-tool message rather than a refusal, so a model
+that named a withheld tool anyway would be obeyed.
+
+**A refusal is the refusal this crate already has.** `EventKind::Refused`, with the
+tool's name where a rule's pattern would be and `turn tool mask` where a layer would
+be. There is no new event kind and no new `Error` variant. The mask is checked
+*before* the operator's `before_tool` hook: a call the caller themselves withheld is
+not one anyone else needs to rule on.
+
+**It is a deny set, and a name it does not recognise is kept.** A list of permitted
+names would silently withhold the next tool anyone adds, so a caller's list written
+against this version would narrow their agent on the next one without saying so.
+And the catalogue depends on cargo features and on what the run configured, so a
+mask naming a tool this build does not have is asking for something already true;
+refusing it would make a portable mask impossible to write.
+
+**It is a property of a turn, and it stops at a spawn.** It is read where
+`fold_now` is read. A spawned child's contract is built fresh and carries no mask,
+which is the boundary `fold_now` and `compaction` already draw: the mask is a
+request about the operator's own turn, and a child's work is not that turn.
+
+**It is not a boundary.** A mask is the caller's instruction about one turn, layered
+above `Policy` and never instead of it. It grants nothing, narrows no act, and
+survives nothing — a run resumed from a contract that names no mask withholds
+nothing. What stops an agent from acting is the policy and the containment, as
+before.
+
 ## What the cache hit rate reports, and what one wire cannot tell it (0.75.0)
 
 The counters above have been recorded since 0.18.0. `Usage::cache_hit_rate` and
@@ -2098,6 +2157,58 @@ window was the one the recovery could not help. The seed is now written before t
 loop, which is not a relaxation of the rule that an observation must not outlive a
 step that never committed: the seed belongs to no step of the run.
 
+## What a collapse carries, and where it sits in the ladder (0.76.0)
+
+**It is a read-time projection, not a rewrite.** Until this release an observation
+that did not fit the turn's budget had two shapes: carried whole, or replaced by a
+one-line stub saying to re-run it. `context::Collapse` is the rung between them —
+the entry is carried *shortened*. No provider is called, no `summaries` row is
+written, and `Ledger` is left exactly as long as it was.
+
+**It sits beneath a fold, and a fold remains the last rung.** A collapse only ever
+changes what happens to an entry that was going to be stubbed anyway. `Compaction`
+still decides when the history is folded, `fold_now` and `Steer::fold` are still
+how somebody asks, and nothing about any of the three changes. A caller who
+configures no collapse is projected exactly what 0.75.0 projected, byte for byte —
+`Collapse { keep_chars: 0 }` is off and is the default.
+
+**It is reversible, and a fold is not.** Turn the collapse off on a later turn and
+every entry it shortened is assembled whole again, because nothing was consumed to
+make it short. A fold cannot do that: it has already replaced the entries it
+covered and bought a paragraph to stand in for them.
+
+**A collapsed entry keeps its `ObsKind` and its `target`; a folded one keeps
+neither.** That is the reason the ladder takes this rung first. Assembly's
+invalidation and re-read rules are keyed on kind and target — a later observation
+supersedes an earlier one of the same kind and target, and a write invalidates an
+earlier read of that path — and a shortened entry still answers both questions.
+Behind a fold those entries have become one prose paragraph with no path and no
+write kind, and the stale-read machinery is structurally blind to them.
+
+**The shortening is the crate's existing truncation.** `keep_chars` is a character
+count, not a token count, and it is applied by the same `bound` helper that caps a
+single oversized observation — so a collapsed entry carries the marker a truncated
+one carries, and an `ObsKind::Read` keeps its tail while every other kind keeps its
+head. A reader learns one convention rather than two.
+
+**What it will not do.** It shortens only an entry that both exceeds `keep_chars`
+and does not fit the turn's remaining budget whole. An entry already inside
+`keep_chars` cannot be made smaller, so a budget it does not fit ends the walk
+exactly as it did in 0.75.0; so does a shortened form that still does not fit.
+Carrying one shortened entry does not end the walk, because an older entry may
+still fit in the room the shortening just made.
+
+**What it is counted as.** A collapsed entry is carried, so it counts in
+`Assembled::carried`; it counts separately in `Assembled::shortened`, which is zero
+on every turn that configures no collapse. `carried` alone still means whole. The
+assembly trace prints it as `shortened=`, beside `stubs_collapsed=` — which is the
+older, unrelated fact that the elision lines themselves were merged into one to
+hold the ceiling.
+
+**It is a property of a turn, and it stops at a spawn**, exactly as `fold_now` does
+and for the same reason: a spawned child's contract is built fresh and carries the
+default.
+
 ## What a context overflow does now (0.43.0)
 
 **It is classified from the vendor's own words.** `ProviderErrorKind::from_response`
@@ -2161,6 +2272,13 @@ crate asserts is the composition: in the workspace loop the sentence is present,
 byte-exact, and last, under every `SystemPrompt` including `Replace("")`, and
 under any text a repository carries. **What a model then does with a prompt is not a claim this
 crate can make.**
+
+**A tool mask adds nothing to this list (0.76.0).** The sentence naming the tools a
+turn withholds is not composed here and is not part of the system prompt. It is
+appended to the user prompt, after the observation section, so that a mask which
+changes on every turn cannot move the block this list describes — which is the
+cached prefix. The composition above is unchanged under any mask, including the
+guarantee that nothing a caller or a repository supplies is emitted after step 7.
 
 **The ending moved in 0.45.0.** Until 0.44.0 it sat inside the base description,
 which put the tool and skill catalogues after it. Every sentence a 0.44.0 prompt

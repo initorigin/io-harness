@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use io_harness::context::{
-    assemble, entry_cap_chars, estimate_tokens, Assembled, Assembly, Compaction, ContextBudget,
-    Ledger, ObsKind, Observation, Piece,
+    assemble, entry_cap_chars, estimate_tokens, Assembled, Assembly, Collapse, Compaction,
+    ContextBudget, Ledger, ObsKind, Observation, Piece,
 };
 use io_harness::provider::{CompletionRequest, CompletionResponse, Message, ToolCall};
 use io_harness::tools::{Tool, ToolFuture, Toolbox, Workspace};
@@ -433,6 +433,7 @@ async fn a_policy_refused_reread_is_a_stub_naming_the_invalidating_step_and_the_
         &[],
         &[],
         Assembly {
+            collapse: Collapse::default(),
             ws: Some(&ws),
             policy: &policy,
             store: &store,
@@ -688,6 +689,7 @@ async fn assembling_one_turn_costs_a_bounded_amount_of_time() {
             &[],
             &[],
             Assembly {
+                collapse: Collapse::default(),
                 ws: Some(&workspace),
                 policy: &policy,
                 store: &store,
@@ -698,13 +700,26 @@ async fn assembling_one_turn_costs_a_bounded_amount_of_time() {
         .await
         .unwrap();
         assert!(out.carried > 0);
+        // 0.76.0 — the structural property the duration below used to stand in
+        // for, and the one worth gating a merge on: assembly is bounded by the
+        // turn's budget rather than by the ledger's length. A 200-entry log of
+        // 1,000 chars each is ~50,000 tokens of raw observation against a 24,000
+        // budget, so a projection that grew with the ledger would exceed it here.
+        assert!(
+            out.est_tokens <= 24_000,
+            "a 200-entry ledger assembled to {} tokens against a 24,000 budget: the section is \
+             tracking the log's length rather than the turn's budget",
+            out.est_tokens
+        );
     }
     let per_turn = started.elapsed() / TURNS;
 
-    assert!(
-        per_turn < std::time::Duration::from_millis(25),
-        "assembling a 200-entry log took {per_turn:?} per turn, over the 25ms bound"
-    );
+    // 0.76.0 — printed, never asserted. A wall-clock threshold on a shared CI
+    // runner fails for the runner's reasons and says nothing about the code, and
+    // this repository already applies exactly that rule to every other duration it
+    // records: timing goes to `docs/MEASUREMENTS.md` with a machine beside it, and
+    // the merge gate is the structural assertion above.
+    println!("assembling a 200-entry log: {per_turn:?} per turn");
 }
 
 // ---------------------------------------------------------------- unit-level budget maths
@@ -769,6 +784,7 @@ async fn two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_colla
         &[],
         &[],
         Assembly {
+            collapse: Collapse::default(),
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -834,6 +850,7 @@ async fn a_re_read_cannot_escape_the_workspace_root() {
         &[],
         &[],
         Assembly {
+            collapse: Collapse::default(),
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -912,6 +929,7 @@ async fn the_rendered_note_block_is_byte_identical_whatever_run_id_the_notes_car
                 &notes,
                 &[],
                 Assembly {
+                    collapse: Collapse::default(),
                     ws: None,
                     policy,
                     store,
@@ -1066,6 +1084,7 @@ async fn a_long_runs_stubs_collapse_so_the_ceiling_still_holds() {
         &[],
         &[],
         Assembly {
+            collapse: Collapse::default(),
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -1337,6 +1356,7 @@ async fn a_surviving_result_keeps_the_position_of_the_call_it_answers() {
         &[],
         &[],
         Assembly {
+            collapse: Collapse::default(),
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -1611,6 +1631,7 @@ async fn emitted_for(ledger: &Ledger, budget: u64) -> Assembled {
         &[],
         &[],
         Assembly {
+            collapse: Collapse::default(),
             ws: Some(&ws),
             policy: &policy,
             store: &store,
@@ -1942,6 +1963,7 @@ async fn a_read_that_no_longer_fits_is_a_stub_and_not_a_tail() {
         &[],
         &[],
         Assembly {
+            collapse: Collapse::default(),
             ws: None,
             policy: &policy,
             store: &store,

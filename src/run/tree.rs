@@ -672,15 +672,21 @@ where
                         store: tree.store,
                         run_id,
                         step,
+                        // A child's contract is built fresh and carries the
+                        // default, which is off — the same boundary `compaction`
+                        // and `fold_now` already draw at a spawn.
+                        collapse: contract.collapse,
                     },
                 )
                 .await?;
                 // 0.48.0 — the same rule as the flat loop, and for the same reason
                 // the system half is chosen this way here too.
                 let user = match &conversational {
-                    Some(_) if step == start_step => {
-                        conversational_user_prompt(&contract.goal, &assembled.text)
-                    }
+                    Some(_) if step == start_step => conversational_user_prompt(
+                        &contract.goal,
+                        &assembled.text,
+                        &contract.tool_mask,
+                    ),
                     _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
                 };
                 // 0.44.0 — the same rule as the flat loop, through the same helper.
@@ -1073,6 +1079,11 @@ where
                     },
                     &contract.goal,
                     contract.tool_hooks.as_deref(),
+                    // A child's contract is built fresh by `spawn_child` and
+                    // carries no mask, which is the same boundary `fold_now`
+                    // draws: the mask is a request about the operator's own turn,
+                    // and a child's work is not that turn.
+                    &contract.tool_mask,
                 )
                 .await?
                 {

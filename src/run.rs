@@ -4629,10 +4629,12 @@ impl<'a> Speculation<'a> {
         max_parallel: usize,
         run_id: i64,
         step: u32,
+        mask: crate::ToolMask,
     ) -> Self {
         Self {
             ws,
             tools,
+            mask,
             sandbox,
             cap,
             max_read,
@@ -4676,6 +4678,18 @@ impl<'a> Speculation<'a> {
             || self.started.len() >= self.max_parallel
             || tool_effect(&call.name, self.tools) != ToolEffect::ReadOnly
         {
+            self.closed = true;
+            return;
+        }
+        // (0.76.0) The turn's mask, for the same reason `resolve_call_mode` is
+        // asked below: this path starts work before the completion that asked for
+        // it has settled, so a check it skips is a check that never happens. A
+        // speculated read of a withheld tool would read the file and fold the
+        // contents into the ledger without ever reaching `mask_gate`, because a
+        // speculated result is taken in place of a dispatch rather than before
+        // one. Declining closes speculation for the step; the settled completion
+        // then dispatches the call, where the mask refuses it and says so.
+        if self.mask.withholds(&call.name) {
             self.closed = true;
             return;
         }

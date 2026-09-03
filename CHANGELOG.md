@@ -26,6 +26,162 @@ notes are produced from it.
 
 ### Security
 
+## [0.76.0] - 2026-09-03
+
+**A turn can withhold a tool without moving the catalogue, and an observation that
+will not fit whole can be carried shortened rather than thrown away.** Both are the
+same decision made twice: the part of a request a caller wants to vary per turn is
+the part the cached prefix must not cover. A mask leaves the tool array
+byte-identical and refuses the call at the gate instead; a collapse shortens an
+entry while the turn is assembled and buys no summary to do it. Beside them, the
+two ways this repository's own suite could report a pass that meant nothing are
+closed.
+
+### Breaking changes
+
+- **BREAKING** — `context::Assembly` gained a `collapse` field, so a struct literal
+  naming every field no longer compiles. The type holds borrows and has no
+  `Default`, so the field has to be written out.
+  *Migration:* name it, and name it `Collapse::default()` unless you want the new
+  rung — off assembles exactly what 0.75.0 assembled.
+
+  ```rust
+  use io_harness::context::{assemble, Assembly, Collapse};
+
+  // Before
+  let out = assemble(&ledger, budget, &notes, &global, Assembly {
+      ws, policy, store, run_id, step,
+  }).await?;
+  // After
+  let out = assemble(&ledger, budget, &notes, &global, Assembly {
+      ws, policy, store, run_id, step,
+      collapse: Collapse::default(),
+  }).await?;
+  ```
+
+- **BREAKING** — `context::Assembled` gained a `shortened` counter, so a struct
+  literal naming every field no longer compiles. It counts the observations a
+  collapse carried shortened rather than stubbed, and it is zero on every run that
+  configures no collapse.
+  *Migration:* construct with `..Assembled::default()`, which the type has derived
+  since it existed, and read the new counter beside `stubbed` wherever you report
+  on a turn's projection. An entry counted in both `carried` and `shortened` was
+  carried short rather than whole; `carried` alone still means whole.
+
+  ```rust
+  use io_harness::context::Assembled;
+
+  // Before
+  let a = Assembled { text, carried, stubbed, reread, recalled, recalled_keys,
+                      collapsed, est_tokens, emitted };
+  // After
+  let a = Assembled { text, carried, stubbed, ..Assembled::default() };
+  ```
+
+### Added
+
+- `ToolMask` and `TaskContract::with_tool_mask`: the tools a turn may not call,
+  withheld by name. **It withholds availability, not membership.** The catalogue a
+  masked run sends is byte-identical to an unmasked one's — the same `ToolSpec`
+  values in the same order, the same schemas, the same tokens paid for them.
+  Nothing is removed from the request. What changes is that the turn's prompt names
+  the withheld tools after the observation section, and a call to one of them is
+  refused before anything is started. Removing the definitions instead would save
+  each one's tokens once and pay a cache *write* on every later turn of the run,
+  because the tool array sits ahead of 0.38.0's breakpoint at the end of the system
+  block and any byte changed in it invalidates that entry and everything after it
+  in the same ordering.
+- Masking is enforced at both places a tool call can begin — the head of `dispatch`
+  and `read_batch`'s per-call loop — because a batched read-only call does not route
+  through `dispatch`. A refusal is the existing `EventKind::Refused` with the tool's
+  name where a rule's pattern would be and `turn tool mask` where a layer would be;
+  there is no new event kind and no new error variant.
+- A mask is a deny set rather than an allow set, for the reason every other refusal
+  in this crate is deny-first: a list of permitted names silently withholds the next
+  tool anyone adds, and a caller's list written against this version would quietly
+  narrow their agent on the next one. A withheld name that no tool answers to is
+  kept rather than rejected, so a mask stays portable across feature flags and
+  across runs that configured different toolboxes.
+- A mask is a property of a turn, not of a run and not of a tree. It is read where
+  `fold_now` is read, and it does not reach a spawned child: a child's contract is
+  built fresh and carries none.
+- Context Collapse — `Collapse` and `TaskContract::with_collapse`: an observation
+  that will not fit the turn's budget is carried shortened rather than replaced by a
+  one-line stub. It is a read-time projection and not a rewrite, so it costs no
+  provider call, writes no `summaries` row, and leaves the ledger exactly as long as
+  it was. Turning it off on a later turn assembles every entry it shortened whole
+  again, which a fold cannot do.
+- A shortened entry keeps its `ObsKind` and its `target`, so assembly's
+  invalidation and re-read rules still find the write that supersedes an earlier
+  read of the same path. Behind a fold those entries have become one prose paragraph
+  with no path and no kind, and the stale-read machinery cannot see them — which is
+  why the ladder takes this rung before a fold's.
+- The shortening reuses `bound`, the same helper that caps a single oversized
+  observation, so a collapsed entry carries the marker a truncated one carries and a
+  reader learns one convention rather than two: an `ObsKind::Read` keeps its tail,
+  every other kind keeps its head.
+- `Collapse { keep_chars: 0 }` is off and is the default, so a caller who configures
+  nothing gets 0.75.0's projection byte for byte. `fold` remains the last rung and
+  remains the default trigger; a collapse only ever changes what happens to an entry
+  that was going to be stubbed anyway.
+
+### Changed
+
+- The per-turn assembly trace line gained `shortened=` and renamed its existing
+  `collapsed=` to `stubs_collapsed=`. The two are different events and the release
+  notes make the words collide: `stubs_collapsed` has meant "the elision lines were
+  merged into one to hold the ceiling" since 0.10.0 and has nothing to do with
+  Context Collapse. Both are printed so neither has to be inferred, and each names
+  the other where it is defined. This is a trace string rather than a public type,
+  so nothing stops compiling; a reader parsing that line by key will need the new
+  spelling.
+
+### Fixed
+
+- Two tests reported a slow host as a broken product (#232). Both asserted against a
+  fixed wall-clock budget under a runner whose scheduling they do not control, so a
+  missed deadline and a real defect arrived at the same assertion with the same
+  message. The sandbox test that proves a forked child does not outlive the
+  wall-clock kill now waits on the child process disappearing — an ordering the
+  scheduler cannot reverse — and separates three outcomes: alive at the ceiling is a
+  leak, gone with its marker written is a child that outran the kill, gone without
+  one is a pass. A diagnostic CI round on the leg where it failed established that
+  the group kill is sound there, so this is a test being made honest rather than a
+  containment defect being hidden.
+- The fleet queue poll asserted "the fixture never filled its queue" on whatever a
+  fixed poll budget had found, naming a cause it had no evidence for. Its ceiling is
+  a liveness bound now, and every failed read is kept rather than discarded — the
+  fixture writes to the database while the test reads it, so a busy store was being
+  swallowed and then blamed on the fixture.
+- Three more cut-offs waited out a budget instead of waiting for a state. The
+  crash-mid-fan-out test kept "no child has finished" true with a 500 ms child
+  delay, which is a bet on the scheduler; a child parked for an hour cannot finish,
+  and the cut-off above it was already a condition. The recovery matrix cut off at
+  400 ms, which had to cover opening SQLite, the startup boundary probe's child
+  spawns, composing a prompt, answering it and journalling an attempt — and when it
+  did not, the run parked in the probe rather than at the kill point, the timeout
+  still elapsed, the "was it cut off" assertion still passed, and the failure
+  surfaced far away as an index panic on an empty attempts list. Each arm now waits
+  for its own observable, and that suite runs in 0.34 s rather than 30.2 s.
+- Six socket-absence assertions passed over a genuinely leaked socket. Each read a
+  counter incremented by a separate accept thread with nothing ordering that thread
+  against the assertion, and a count of zero is true whenever the thread has not been
+  scheduled yet. `Sink` gains `wait_for` and `assert_only` in both copies that lacked
+  them: the test dials its own sink and waits for that connection, and the OS cannot
+  deliver a later dial ahead of an earlier one, so once the control is accepted
+  anything the run opened has been accepted too. The same fix already existed in
+  `tests/replay.rs` and had not been applied to the other two copies — nor, at one
+  site, to the file that defined it.
+- Two bare wall-clock thresholds asserted a duration on a shared runner and proved
+  nothing about the code when they failed, which is the rule this repository already
+  applies to every other duration it records. Both print now, and the property each
+  stood in for is asserted structurally instead: that assembly is bounded by the
+  turn's budget rather than by the ledger's length, and that skill discovery is paid
+  once per run, which the test below it already proves by changing the directory
+  mid-run.
+- None of the changes in this section alters shipped behaviour. They change what
+  this crate's suite is able to report.
+
 ## [0.75.0] - 2026-09-02
 
 **A slow or expensive run is diagnosable from the trace, and the two costs the

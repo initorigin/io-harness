@@ -249,16 +249,24 @@ async fn cut_off_when<F: std::future::Future>(
 ///
 /// The moment is [`cut_off_when`]'s: the store showing the root plus one child,
 /// which is the number the wall-clock version asserted after the fact.
-/// `TreeProvider`'s 500ms `child_delay` keeps the other half true — no child can
-/// have finished — and stays a duration, because "nothing has happened yet" is
-/// not a state the store can be polled for. It is asserted instead.
+/// The other half — no child can have finished — was a 500ms `child_delay`, and
+/// 500ms is a bet on the scheduler rather than a fact about the run. Under load
+/// a child could clear it and write its file before the drop landed, and then a
+/// starved runner and a child that ignored its delay failed the same assertion
+/// with the same message. It failed on CI for exactly that (0.76.0, issue #232).
+///
+/// The delay is now longer than any run of this test can be, which makes "no
+/// child has finished" true by construction rather than by a margin: a child
+/// parked for an hour cannot finish, and the cut-off above is a condition on the
+/// store rather than a clock, so nothing waits for it. The run future is dropped
+/// while the child is still parked, which aborts it.
 async fn crash_a_tree_mid_fan_out(dir: &std::path::Path, db: &std::path::Path, policy: &Policy) {
     // Root + one child: the fan-out has happened.
     const FANNED_OUT: u32 = 2;
 
     let store = Store::open(db).unwrap();
     let slow = TreeProvider {
-        child_delay: Duration::from_millis(500),
+        child_delay: Duration::from_secs(3_600),
     };
     // Bound rather than built inline, so nothing the run borrows is a temporary
     // of the call expression.

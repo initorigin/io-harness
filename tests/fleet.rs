@@ -406,20 +406,42 @@ async fn crashed_fleet() -> (tempfile::TempDir, std::path::PathBuf) {
         .expect("spawn fleet_fixture");
 
     // Wait until the backlog is durable.
-    let mut queued = 0usize;
-    for _ in 0..200 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Ok(store) = Store::open(&db) {
-            if let Ok(q) = store.queued_agents(1) {
-                if q.len() == 4 {
-                    queued = q.len();
-                    break;
-                }
-            }
+    //
+    // 0.76.0 — issue #232's first site, and the reason it is worth care: the old
+    // form polled a fixed 200 × 50 ms and then asserted "the fixture never filled
+    // its queue" on whatever it had. That sentence names a cause the test has no
+    // evidence for. A missed deadline on a loaded runner and a fan-out that
+    // genuinely queues three arrive at the same assertion with the same message,
+    // and it failed twice on CI for the first reason while reading as the second.
+    //
+    // Two changes, and both matter. The ceiling becomes a liveness bound rather
+    // than the thing being measured, so a slow host takes longer and still says
+    // what it found. And every failed read is *kept* instead of discarded: the
+    // fixture writes to this database while the test reads it, so `Store::open`
+    // and `queued_agents` can legitimately answer `SQLITE_BUSY` — swallowing
+    // those with `if let Ok` burned poll iterations and then blamed the fixture.
+    let mut last: Result<usize, String>;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        last = Store::open(&db)
+            .map_err(|e| e.to_string())
+            .and_then(|store| {
+                store
+                    .queued_agents(1)
+                    .map(|q| q.len())
+                    .map_err(|e| e.to_string())
+            });
+        if last.as_ref().is_ok_and(|&n| n == 4) || std::time::Instant::now() >= deadline {
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     child.kill().await.expect("SIGKILL the fixture");
-    assert_eq!(queued, 4, "the fixture never filled its queue");
+    assert_eq!(
+        last,
+        Ok(4),
+        "the queue never reached 4 within 60s; the last thing this test could read was {last:?}"
+    );
     (dir, db)
 }
 

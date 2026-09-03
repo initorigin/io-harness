@@ -3015,10 +3015,12 @@ mod tests {
         // The payload forks a child that outlives the wall clock and leaves a
         // file behind if it is still alive. Killing only the pid the harness
         // spawned reparents that child and it goes on to write the file.
+        // The child writes down its own pid, so what follows can wait on the
+        // process rather than on a stopwatch.
         let argv = vec![
             "sh".into(),
             "-c".into(),
-            "(sleep 4; touch survived) & wait".into(),
+            "(sleep 4; touch survived) & echo \"$!\" > child.pid; wait".into(),
         ];
         let limits = SandboxLimits {
             max_wall_secs: Some(1),
@@ -3035,10 +3037,39 @@ mod tests {
             "wall must kill it, got {out:?}"
         );
         assert!(!out.success());
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        // 0.76.0 — the discriminator is the child process disappearing, which the
+        // scheduler cannot reorder, rather than a fixed sleep. The old form slept
+        // five seconds against a child that writes its marker at four, so the
+        // whole proof rested on a three-second margin: on a loaded runner the kill
+        // could land late, the marker was already on disk, and a starved host and
+        // a leaked child failed identically. It flaked twice on CI for exactly
+        // that reason and is issue #232's second site.
+        //
+        // A diagnostic round on the leg where it failed settled that the group
+        // kill is sound there — the shell is its own process group leader, so
+        // `killpg` reaches the fork — which is why this is a test being made
+        // honest rather than a containment defect being papered over.
+        let pid: i32 = std::fs::read_to_string(dir.path().join("child.pid"))
+            .expect("the payload must record the pid it forked, or there is nothing to wait on")
+            .trim()
+            .parse()
+            .expect("the recorded pid must be a number");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // SAFETY: signal 0 performs the permission and existence check and
+        // delivers nothing. It dereferences no memory.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the wall-clock kill never reached the forked child: pid {pid} was still alive \
+                 30s after the run returned, which is a leak rather than a slow host"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
         assert!(
             !marker.exists(),
-            "a forked child must not outlive the wall-clock kill"
+            "the forked child ran to completion despite the wall-clock kill: it is gone now, but \
+             it wrote its marker before it went"
         );
     }
 
