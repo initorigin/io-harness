@@ -208,11 +208,26 @@ pub(super) fn seed_conversation(ledger: &mut ContextLedger, extras: &TurnExtras<
     for (speaker, entry) in extras.seed {
         // 0.49.0 — tagged with who was speaking, so the transcript can send it as
         // that speaker's own turn rather than as narration inside another.
+        //
+        // 0.77.0 — and *stated* here rather than re-derived from that tag. One
+        // seed carries both parties and a folded span, so a single origin literal
+        // for the loop would be wrong for two of the three; the speaker the seed
+        // already knows is what chooses it. The target stays because a trace and a
+        // transcript render it — a label, not the classifier it used to be.
+        let origin = match *speaker {
+            crate::context::SEED_OPERATOR => Origin::Operator,
+            crate::context::SEED_AGENT => Origin::Agent,
+            // `SEED_SUMMARY`, and anything a later release seeds: narration about
+            // the conversation rather than a turn of it. Never `Unmarked` — that
+            // variant means "a row older than this column" and nothing else.
+            _ => Origin::Prose,
+        };
         ledger.push(Observation::new(
             0,
             ObsKind::Message,
             Some((*speaker).to_string()),
             entry.clone(),
+            origin,
         ));
     }
 }
@@ -422,6 +437,11 @@ pub(super) fn drain_steer(
             ObsKind::Message,
             None,
             format!("\n[operator, mid-turn] {message}\n"),
+            // The operator's own words, so the transcript sends them as the
+            // operator's turn rather than as narration inside somebody else's —
+            // which is what 0.76.0 did, because a `Message` with no target was
+            // indistinguishable from a replan directive.
+            Origin::Operator,
         ));
     }
     Ok(None)
@@ -1358,6 +1378,11 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     entry_cap,
                     ObsKind::Message,
                 ),
+                // This crate's note ABOUT a web search, never the search's own
+                // results: the provider executed the tool and what failed is all
+                // that reaches here. Marking it `Web` would frame the harness's
+                // own report of a failure as untrusted page content.
+                Origin::Prose,
             ));
         }
         if response.tool_calls.is_empty() {
@@ -1371,6 +1396,9 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     entry_cap,
                     ObsKind::Message,
                 ),
+                // The model's own final text. There is no tool call on this step,
+                // so nothing is answered and it can be sent as the agent's turn.
+                Origin::Agent,
             ));
             decisions.push("no tool call".into());
         }
@@ -1605,11 +1633,17 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     obs,
                     kind,
                     target,
+                    origin,
                     changed,
                     remember,
                 } => {
                     step_changed |= changed;
-                    ledger.push(Observation::new(step, kind, target, obs));
+                    // The origin is forwarded, never chosen here. Every dispatched
+                    // result in the flat loop enters the ledger through this one
+                    // line, so a literal at this site would mark an MCP response
+                    // and a file read identically — which is the derivation
+                    // 0.77.0 exists to delete, rebuilt one level up.
+                    ledger.push(Observation::new(step, kind, target, obs, origin));
                     decisions.push(decision);
                     new_rules.extend(remember);
                 }
@@ -1670,6 +1704,10 @@ pub(super) async fn run_workspace_from<P: Provider>(
                         entry_cap,
                         ObsKind::Message,
                     ),
+                    // The plan is the operator's, but the notice is this crate's
+                    // framing of it — the same words `record_plan_decision`
+                    // writes on the resumed path, and marked the same way there.
+                    Origin::Prose,
                 ));
             }
         }
@@ -1746,6 +1784,10 @@ pub(super) async fn run_workspace_from<P: Provider>(
                         entry_cap,
                         ObsKind::Message,
                     ),
+                    // The harness telling the agent to change approach. Nothing
+                    // outside the run supplied a word of it, so it must not be
+                    // framed as content from outside.
+                    Origin::Prose,
                 ));
                 info!(run_id, step, "agent told to change approach");
                 watch.emit(RunEvent::new(
@@ -1907,6 +1949,16 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     ObsKind::Error,
                     None,
                     bound(&section, entry_cap, ObsKind::Error),
+                    // The gate's report, composed here — and this is the one site
+                    // in the flat loop where stating the origin CHANGES what the
+                    // transcript sends. `ObsKind::Error` used to derive to
+                    // `Piece::Result`, so a feedback block carrying this step's
+                    // number took a position in that step's positional ordinal
+                    // count for a call that does not exist, which pushed the
+                    // whole step past `turns`' bounds check and dropped it back
+                    // to prose. It is narration about the run, it says so now,
+                    // and the step it rides keeps its structure.
+                    Origin::Prose,
                 ));
                 last_gate_feedback = Some(key);
             }
@@ -2011,6 +2063,11 @@ pub(super) fn navigated(name: &str, answer: Result<String>, cap: usize) -> Dispa
         obs: bound(&obs, cap, ObsKind::Tool),
         kind: ObsKind::Tool,
         target: None,
+        // A language server answered, and this is the only site that knows it:
+        // the navigation tools wear `ObsKind::Tool` alongside `exec`, the
+        // browser and every registered tool, so the kind cannot say which of
+        // them spoke.
+        origin: Origin::Lsp,
         // A question changes nothing, so it is not progress for the stall signal —
         // the same reasoning `check` is not.
         changed: false,

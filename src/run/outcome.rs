@@ -689,6 +689,11 @@ pub(super) fn restore_ledger(store: &Store, run_id: i64) -> Result<(ContextLedge
                 ObsKind::Message,
                 Some("summary".into()),
                 format!("\n[earlier work, summarised]\n{}\n", summary.text),
+                // A paragraph this crate wrote about the conversation, not a
+                // thing either party said — the same origin `compact_ledger`
+                // states when it writes the fold in the first place, so a
+                // restored fold and a live one are the same row.
+                Origin::Prose,
             ),
         );
     }
@@ -703,9 +708,9 @@ pub(super) fn restore_ledger(store: &Store, run_id: i64) -> Result<(ContextLedge
 ///
 /// The other half of what [`restore_ledger`] restores. The ledger holds every
 /// tool *result* and, because [`Piece::of`](crate::context::Piece) classifies by
-/// kind and ordinals are counted positionally per step, a restored ledger
-/// correlates every result with the call it answers — as soon as there is a call
-/// to correlate it with. This is those calls.
+/// the origin each row recorded and ordinals are counted positionally per step, a
+/// restored ledger correlates every result with the call it answers — as soon as
+/// there is a call to correlate it with. This is those calls.
 ///
 /// Empty for a run written before 0.64.0 and for a run that took no step. Those
 /// are the same to a reader and both mean "there is nothing to restore", which is

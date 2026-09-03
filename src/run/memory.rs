@@ -561,6 +561,13 @@ pub(super) async fn compact_ledger<P: Provider>(
             // three turns ago.
             Some(crate::context::SEED_SUMMARY.into()),
             crate::context::summarised_entry(&text),
+            // Narration about the conversation rather than a turn of it, whoever
+            // the summarised observations came from: a fold of a shell result and
+            // a fold of an operator steer are both this crate's paragraph. The
+            // seed and `restore_ledger` state the same origin for the same
+            // paragraph, which is what keeps a folded span reading identically
+            // whether it was folded three steps ago or three turns ago.
+            Origin::Prose,
         ),
     );
     if folded == 0 {

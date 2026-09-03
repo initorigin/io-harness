@@ -562,11 +562,21 @@ pub(super) enum Dispatched {
     /// what a later observation supersedes, and which read a write invalidates,
     /// is a question about the tool and its subject — not something to recover by
     /// re-parsing the text afterwards.
+    ///
+    /// (0.77.0) `origin` travels for the sharper version of the same reason. Every
+    /// dispatched result enters the ledger through ONE `Observation::new` in
+    /// [`step`](super::step) and one in [`tree`](super::tree), so an origin chosen
+    /// there would mark an MCP response and a file read identically — the arm is
+    /// the last place that still knows which. It is carried, not re-derived: the
+    /// pair `(kind, target)` says which tool ran, never who supplied the words,
+    /// which is the derivation 0.77.0 exists to delete.
     Continue {
         decision: String,
         obs: String,
         kind: ObsKind,
         target: Option<String>,
+        /// Where `obs` came from, stated by the arm that produced it.
+        origin: Origin,
         /// Whether this call moved the workspace. Only a write can, and only a
         /// write that wrote something different — the signal stall detection reads.
         changed: bool,
@@ -594,18 +604,21 @@ pub(super) enum Dispatched {
 }
 
 impl Dispatched {
-    /// A tool result: what it was, and the subject it names (if any).
+    /// A tool result: what it was, the subject it names (if any), and where its
+    /// words came from.
     pub(super) fn seen(
         decision: impl Into<String>,
         obs: impl Into<String>,
         kind: ObsKind,
         target: Option<String>,
+        origin: Origin,
     ) -> Self {
         Dispatched::Continue {
             decision: decision.into(),
             obs: obs.into(),
             kind,
             target,
+            origin,
             changed: false,
             remember: Vec::new(),
         }
@@ -613,8 +626,31 @@ impl Dispatched {
 
     /// A failure or a refusal. Kept subject-less on purpose: an error about a
     /// path is not an observation *of* that path, so it must never supersede one.
+    ///
+    /// (0.77.0) [`Origin::Tool`] rather than [`Origin::Prose`], and the reason is
+    /// the transcript rather than the prose. A refusal is the answer to a tool
+    /// call, and [`Piece::of`](crate::context::Piece) sends every external origin
+    /// as a result while sending `Prose` as narration — so an origin that read
+    /// "the harness wrote this" would take the call's position out of the
+    /// positional ordinal count, hand the *next* call's result to the refused
+    /// call, and leave an assistant turn carrying a tool call nothing answers.
+    /// `Tool` is the origin that says "external, and this crate cannot attribute
+    /// it more precisely", which is what these texts are: a tool's own error
+    /// string inside the harness's framing of it. It also renders exactly as
+    /// 0.76.0 rendered a refusal, so no run's transcript shape moves on this
+    /// release.
     pub(super) fn go(decision: impl Into<String>, obs: impl Into<String>) -> Self {
-        Self::seen(decision, obs, ObsKind::Error, None)
+        // `Prose`, not `Tool`: a refusal is the harness speaking about a call it
+        // declined, and it carries no byte the tool produced — the call never
+        // ran. Marking it external would put a `tool` provenance on text this
+        // crate wrote about its own policy.
+        //
+        // Safe to say now, and it was not during the first pass of 0.77.0: while
+        // `Piece` was derived from the origin, a non-external origin here would
+        // have pulled ~100 refusal sites out of `Piece::Result` and orphaned the
+        // tool calls they answer. `Piece` derives from `(kind, target)` again,
+        // so this is a free and truthful choice rather than a trade.
+        Self::seen(decision, obs, ObsKind::Error, None, Origin::Prose)
     }
 }
 

@@ -18,12 +18,12 @@ use std::time::Instant;
 
 use io_harness::context::{
     assemble, entry_cap_chars, estimate_tokens, Assembled, Assembly, Collapse, Compaction,
-    ContextBudget, Ledger, ObsKind, Observation, Piece,
+    ContextBudget, Ledger, ObsKind, Observation, Origin, Piece,
 };
 use io_harness::provider::{CompletionRequest, CompletionResponse, Message, ToolCall};
 use io_harness::tools::{Tool, ToolFuture, Toolbox, Workspace};
 use io_harness::{
-    run_with, ApproveAll, McpServer, MemoryEntry, MemoryKind, Policy, Provider, Store,
+    run_with, ApproveAll, McpServer, MemoryEntry, MemoryKind, Policy, Provider, StallPolicy, Store,
     TaskContract, ToolSpec, Verification,
 };
 use serde_json::json;
@@ -414,12 +414,14 @@ async fn a_policy_refused_reread_is_a_stub_naming_the_invalidating_step_and_the_
         ObsKind::Read,
         Some("notes.txt".into()),
         "\n[read notes.txt]\nOLD-CONTENT\n",
+        Origin::File,
     ));
     ledger.push(Observation::new(
         2,
         ObsKind::Write,
         Some("notes.txt".into()),
         "\n[wrote notes.txt] (12 chars)\n",
+        Origin::File,
     ));
     let policy = Policy::default()
         .layer("test")
@@ -677,6 +679,7 @@ async fn assembling_one_turn_costs_a_bounded_amount_of_time() {
             },
             Some(format!("f{}.txt", i % 40)),
             format!("\n[entry {i}]\n{}\n", "y".repeat(1_000)),
+            Origin::File,
         ));
     }
 
@@ -758,24 +761,28 @@ async fn two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_colla
         ObsKind::Tool,
         Some("weather".into()),
         "\n[weather]\nLONDON-RAIN\n",
+        Origin::Tool,
     ));
     ledger.push(Observation::new(
         2,
         ObsKind::Tool,
         Some("weather".into()),
         "\n[weather]\nCAIRO-SUN\n",
+        Origin::Tool,
     ));
     ledger.push(Observation::new(
         3,
         ObsKind::Read,
         Some("a.txt".into()),
         "\n[read a.txt]\nFIRST\n",
+        Origin::File,
     ));
     ledger.push(Observation::new(
         4,
         ObsKind::Read,
         Some("a.txt".into()),
         "\n[read a.txt]\nSECOND\n",
+        Origin::File,
     ));
 
     let out = assemble(
@@ -836,12 +843,14 @@ async fn a_re_read_cannot_escape_the_workspace_root() {
         ObsKind::Read,
         Some("../secret.txt".into()),
         "\n[read ../secret.txt]\nOLD\n",
+        Origin::File,
     ));
     ledger.push(Observation::new(
         2,
         ObsKind::Write,
         Some("../secret.txt".into()),
         "\n[wrote ../secret.txt] (3 chars)\n",
+        Origin::File,
     ));
 
     let out = assemble(
@@ -1074,6 +1083,7 @@ async fn a_long_runs_stubs_collapse_so_the_ceiling_still_holds() {
             ObsKind::Grep,
             Some(format!("pattern-{}", i % 40)),
             format!("\n[grep \"pattern-{}\"]\n{}\n", i % 40, "m".repeat(200)),
+            Origin::File,
         ));
     }
 
@@ -1334,18 +1344,21 @@ async fn a_surviving_result_keeps_the_position_of_the_call_it_answers() {
         ObsKind::Read,
         Some("a.txt".into()),
         "\n[read a.txt]\nOLD-A\n",
+        Origin::File,
     ));
     ledger.push(Observation::new(
         1,
         ObsKind::Read,
         Some("b.txt".into()),
         "\n[read b.txt]\nB-CONTENT\n",
+        Origin::File,
     ));
     ledger.push(Observation::new(
         2,
         ObsKind::Write,
         Some("a.txt".into()),
         "\n[wrote a.txt] (11 chars)\n",
+        Origin::File,
     ));
 
     let policy = open_policy().deny_read("a.txt");
@@ -1643,8 +1656,12 @@ async fn emitted_for(ledger: &Ledger, budget: u64) -> Assembled {
     .unwrap()
 }
 
+/// Every caller of this helper builds a read, a grep or a write, so it states the
+/// origin those share rather than taking a sixth argument nothing would vary. A
+/// test that needs a different one builds the `Observation` itself — which is the
+/// point of there being no defaulting constructor.
 fn observed(step: u32, kind: ObsKind, target: &str, text: &str) -> Observation {
-    Observation::new(step, kind, Some(target.to_string()), text)
+    Observation::new(step, kind, Some(target.to_string()), text, Origin::File)
 }
 
 /// The transcript and the flat string are two renderings of ONE emission.
@@ -1667,6 +1684,7 @@ async fn the_emitted_pieces_reconstruct_the_assembled_text_exactly() {
         ObsKind::Message,
         None,
         "\n[note] the model said something\n",
+        Origin::Prose,
     ));
     ledger.push(observed(2, ObsKind::Read, "b.txt", "\n[read b.txt]\nBBB\n"));
 
@@ -1695,6 +1713,7 @@ async fn a_results_ordinal_is_the_index_of_the_call_it_answers() {
         ObsKind::Message,
         None,
         "\n[note] prose\n",
+        Origin::Prose,
     ));
     ledger.push(observed(2, ObsKind::Read, "b.txt", "\n[read b.txt]\nBBB\n"));
 
@@ -1946,6 +1965,7 @@ async fn a_read_that_no_longer_fits_is_a_stub_and_not_a_tail() {
         ObsKind::Read,
         Some("src/lib.rs".into()),
         format!("\n[read src/lib.rs]\nHEAD-SENTINEL\n{filler}\nMIDDLE-SENTINEL\n{filler}\nTAIL-SENTINEL\n"),
+        Origin::File,
     ));
     // Something newer, so the older read is the one that loses the fit.
     ledger.push(Observation::new(
@@ -1953,6 +1973,7 @@ async fn a_read_that_no_longer_fits_is_a_stub_and_not_a_tail() {
         ObsKind::Grep,
         Some("needle".into()),
         "\n[grep \"needle\"]\nsrc/other.rs:4: needle\n",
+        Origin::File,
     ));
 
     let out = assemble(
@@ -2005,4 +2026,108 @@ fn a_search_and_a_command_are_still_bounded_rather_than_refused() {
             "and it is the head that survives for these kinds: {bounded}"
         );
     }
+}
+
+// ------------------------------------------------ 0.77.0: the recorded origin
+
+/// The origin each row carries, keyed by a fragment of the text it holds.
+///
+/// Read off the store rather than off the prompt, because the origin is the one
+/// thing an observation carries that no rendering of it shows: a `[read a.txt]`
+/// and a `[shell ...]` look the same distance apart in a prompt whether they were
+/// attributed correctly or given one literal between them.
+fn origin_holding(store: &Store, run_id: i64, needle: &str) -> Origin {
+    store
+        .observations(run_id)
+        .unwrap()
+        .into_iter()
+        .find(|o| o.text.contains(needle))
+        .unwrap_or_else(|| panic!("no observation holding {needle:?}"))
+        .origin
+}
+
+/// (0.77.0) Three sources in one step leave three different origins.
+///
+/// Every dispatched result in the flat loop enters the ledger through a single
+/// `Observation::new`, and this is the assertion that the line is a conduit rather
+/// than a decision. A funnel that named an origin of its own — however carefully
+/// chosen — would mark a file read, a command's output and a server's reply
+/// identically, and would still satisfy every assertion this suite made before
+/// this release, because nothing else in a prompt distinguishes them.
+///
+/// One step and not three, deliberately: the three calls share a completion, so
+/// they share everything the funnel can see except what the arm handed it.
+#[tokio::test]
+async fn three_sources_in_one_step_leave_three_different_origins() {
+    let dir = ws();
+    std::fs::write(dir.path().join("a.txt"), "FILE-CONTENT\n").unwrap();
+    let contract = never_passes(dir.path(), 1).with_mcp([McpServer::stdio(
+        "fix",
+        fixture_server().display().to_string(),
+    )]);
+    // `rustc` for the shell half, for the reason `tests/shell.rs` gives: it is the
+    // one binary guaranteed present wherever `cargo test` runs.
+    let provider = MockScript::new(vec![vec![
+        call("read_file", json!({ "path": "a.txt" })),
+        call("shell", json!({ "line": "rustc --version" })),
+        call("mcp__fix__echo", json!({ "text": "SERVER-SAID" })),
+    ]]);
+    let store = Store::memory().unwrap();
+    let result = run_with(&contract, &provider, &store, &open_policy(), &ApproveAll)
+        .await
+        .unwrap();
+
+    let file = origin_holding(&store, result.run_id, "[read a.txt]");
+    let shell = origin_holding(&store, result.run_id, "[shell `rustc --version`");
+    let mcp = origin_holding(&store, result.run_id, "[mcp__fix__echo]");
+    assert_eq!(file, Origin::File, "a read of a path is a file's content");
+    assert_eq!(shell, Origin::Shell, "a command's output is a process's");
+    assert_eq!(mcp, Origin::Mcp, "a server's reply is that server's");
+    // The anti-vacuity half, stated as the difference rather than as three
+    // equalities: this is the claim the release is actually making, and it is the
+    // one a funnel with an origin literal of its own fails.
+    assert!(
+        file != shell && shell != mcp && file != mcp,
+        "one step's three results must not share an origin: {file:?}, {shell:?}, {mcp:?}"
+    );
+}
+
+/// (0.77.0) A replan directive is the harness talking, and is never external.
+///
+/// Asserted through `is_external` as well as on the variant, because the variant
+/// is only half of what the recording is for: `is_external` is the one place that
+/// decides what gets framed to the model as untrusted, and a sentence this crate
+/// wrote about the run's own progress is not content from outside it. The failure
+/// this guards against is the plausible one — the directive is an
+/// `ObsKind::Message` sitting among tool results, and a site that reached for the
+/// nearest external origin would look entirely reasonable in the diff.
+#[tokio::test]
+async fn a_replan_directive_is_harness_prose_and_never_marked_external() {
+    let dir = ws();
+    std::fs::write(dir.path().join("a.txt"), "FILE-CONTENT\n").unwrap();
+    // The same read every step: nothing changes in the workspace and the call
+    // signature repeats, which is both halves of the stall signal.
+    let repeat = || vec![call("read_file", json!({ "path": "a.txt" }))];
+    let contract = never_passes(dir.path(), 4).with_stall_policy(StallPolicy {
+        window: 2,
+        max_replans: 1,
+    });
+    let provider = MockScript::new(vec![repeat(), repeat(), repeat(), repeat()]);
+    let store = Store::memory().unwrap();
+    let result = run_with(&contract, &provider, &store, &open_policy(), &ApproveAll)
+        .await
+        .unwrap();
+
+    let directive = origin_holding(&store, result.run_id, "[no progress]");
+    assert_eq!(directive, Origin::Prose, "the harness wrote every word of it");
+    assert!(
+        !directive.is_external(),
+        "a directive this crate wrote must never be framed as content from outside the run"
+    );
+    // The control: the same run's reads are external, so the assertion above is
+    // about this observation rather than about a build where nothing is.
+    assert!(
+        origin_holding(&store, result.run_id, "[read a.txt]").is_external(),
+        "the reads beside it are external, or the negative above proves nothing"
+    );
 }

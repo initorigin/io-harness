@@ -27,7 +27,7 @@ use crate::approve::{Plan, PlanGate, PlanStep, PlanVerdict};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::context::{
     assemble, bound, entry_cap_chars, last_lines, Assembled, Assembly, Ledger as ContextLedger,
-    ObsKind, Observation, Piece, GATE_FEEDBACK_CHARS, GATE_FEEDBACK_LINES,
+    ObsKind, Observation, Origin, Piece, GATE_FEEDBACK_CHARS, GATE_FEEDBACK_LINES,
 };
 use crate::contract::{Preset, SystemPrompt, TaskContract};
 use crate::error::{Error, Result};
@@ -126,7 +126,7 @@ use crate::verify::{ExecGuard, Verification};
 ///     fn event(&self, event: &RunEvent) -> Flow {
 ///         match &event.kind {
 ///             // A parent asking for a child, before the child exists.
-///             EventKind::ToolCall { name, target } if name == SPAWN_TOOL => {
+///             EventKind::ToolCall { name, target, .. } if name == SPAWN_TOOL => {
 ///                 println!("{:indent$}spawning: {target}", "", indent = event.depth as usize * 2);
 ///             }
 ///             // The child that resulted, with its own run id to route on.
@@ -1913,6 +1913,12 @@ fn record_answer(store: &Store, run_id: i64, question_id: i64, answer: &str) -> 
                  {}. It is not permission for anything.)\n",
                 question.question
             ),
+            // A human wrote it, so the transcript sends it as the operator's own
+            // turn. This is the resumed path and there is no `ask_question` call
+            // left to answer — the step that asked was committed before the run
+            // paused — which is why this site can be `Operator` while the
+            // in-dispatch answer, which does hold a call's position, cannot.
+            Origin::Operator,
         )],
     )?;
     Ok(())
@@ -1975,7 +1981,16 @@ fn record_plan_decision(
     };
     store.record_observations(
         run_id,
-        &[Observation::new(pending.step, ObsKind::Message, None, text)],
+        // The verdict is a human's; every word of `text` is this crate's framing
+        // of it, down to the sentence telling the model what to do next. The
+        // in-loop sites that write the same three notices state the same origin.
+        &[Observation::new(
+            pending.step,
+            ObsKind::Message,
+            None,
+            text,
+            Origin::Prose,
+        )],
     )?;
     Ok(())
 }
@@ -2612,6 +2627,14 @@ pub async fn resume_with_recovery_observed<P: Provider>(
                     crate::context::ObsKind::Tool,
                     Some(attempt.tool.clone()),
                     format!("\n[{}]\n{}\n", attempt.tool, observation),
+                    // A human typed these words, and they still are not the
+                    // operator's: they stand in for what a tool would have
+                    // returned had the call not been interrupted, and the tool is
+                    // one this crate never got to inspect. `Origin::Tool` is that
+                    // exactly — external, unattributable further — and it is the
+                    // distrusting answer, which is the right way to be wrong
+                    // about content nobody in this process saw produced.
+                    Origin::Tool,
                 )],
             )?;
             store.resolve_attempt(attempt_id, "completed")?;
@@ -5079,6 +5102,7 @@ mod tests {
                 crate::context::ObsKind::Read,
                 Some(format!("src/module{i}/handler.rs")),
                 "…",
+                Origin::File,
             ));
         }
         let signals = recall_signals(goal, &ledger);
