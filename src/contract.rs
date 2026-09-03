@@ -412,6 +412,17 @@ pub struct TaskContract {
     ///
     /// Set it with [`TaskContract::with_fold_now`].
     pub fold_now: bool,
+    /// The tools this turn may not call.
+    ///
+    /// Empty by default, which is every run that does not ask. A mask changes
+    /// what may be **called**, never what is **offered**: the catalogue sent is
+    /// byte-identical to an unmasked run's, because the tool array sits ahead of
+    /// 0.38.0's cache breakpoint and moving it costs a cache write on every later
+    /// turn. See [`ToolMask`](crate::ToolMask) for why that is the design rather
+    /// than an implementation detail, and why it is a deny set.
+    ///
+    /// Set it with [`TaskContract::with_tool_mask`].
+    pub tool_mask: crate::ToolMask,
     /// How long a command the agent runs with the `exec` tool may take before it
     /// is killed and reported as a timeout.
     ///
@@ -722,6 +733,7 @@ impl TaskContract {
             memory: MemoryLimits::default(),
             compaction: Compaction::default(),
             fold_now: false,
+            tool_mask: crate::ToolMask::none(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -802,6 +814,7 @@ impl TaskContract {
             memory: MemoryLimits::default(),
             compaction: Compaction::default(),
             fold_now: false,
+            tool_mask: crate::ToolMask::none(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -1752,6 +1765,37 @@ impl TaskContract {
     #[must_use]
     pub fn with_fold_now(mut self, fold_now: bool) -> Self {
         self.fold_now = fold_now;
+        self
+    }
+
+    /// Withhold tools from this turn without changing what is offered.
+    ///
+    /// The model is told, after the observations, which names it may not call,
+    /// and a call to one of them is refused before anything is started. The
+    /// definitions themselves are unchanged — see [`ToolMask`](crate::ToolMask)
+    /// for why that is load-bearing rather than incidental.
+    ///
+    /// ```
+    /// use io_harness::{TaskContract, ToolMask};
+    ///
+    /// // A session that will never open a spreadsheet stops being able to.
+    /// let contract = TaskContract::workspace("summarise the changelog", "/repo")
+    ///     .with_tool_mask(ToolMask::withholding([
+    ///         "xlsx_read",
+    ///         "xlsx_write",
+    ///         "xlsx_sheets",
+    ///         "xlsx_set_cell",
+    ///     ]));
+    /// assert!(contract.tool_mask.withholds("xlsx_write"));
+    /// assert!(!contract.tool_mask.withholds("read_file"));
+    ///
+    /// // Unset is the default, and it withholds nothing.
+    /// let plain = TaskContract::workspace("summarise the changelog", "/repo");
+    /// assert!(plain.tool_mask.is_empty());
+    /// ```
+    #[must_use]
+    pub fn with_tool_mask(mut self, mask: crate::ToolMask) -> Self {
+        self.tool_mask = mask;
         self
     }
 

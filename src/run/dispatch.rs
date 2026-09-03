@@ -162,6 +162,9 @@ pub(super) async fn dispatch(
     goal: &str,
     // 0.42.0 — the operator's own `before_tool` checks, or `None`.
     hooks: Option<&crate::hooks::Hooks>,
+    // 0.76.0 — the tools this turn withholds. Applied at the head, beside the
+    // hook gate, because this is one of the two places a call can begin.
+    mask: &crate::ToolMask,
 ) -> Result<Dispatched> {
     // The browser session is threaded to every dispatch site unconditionally, so
     // the call sites need no `#[cfg]`; without the feature the arm that reads it
@@ -179,6 +182,9 @@ pub(super) async fn dispatch(
     // 0.42.0 — the operator's own check, before anything happens. Every call that
     // is not part of a read batch arrives here, and a batched one is checked in
     // `read_batch` instead, so each call is asked about exactly once.
+    if let Some(refused) = mask_gate(mask, call, watch, run_id, step, depth) {
+        return Ok(refused);
+    }
     if let Some(refused) = tool_gate(hooks, call, watch, run_id, step, depth) {
         return Ok(refused);
     }

@@ -29,6 +29,99 @@ pub use exec::DEFAULT_EXEC_TIMEOUT;
 pub use fs::FsTool;
 pub use workspace::{Entry, EntryKind, FileContent, Match, TextEncoding, Workspace, Wrote};
 
+/// The tools a turn may not call, withheld by name.
+///
+/// **Availability, never membership.** A masked run offers the model exactly the
+/// catalogue an unmasked one offers — the same [`ToolSpec`](crate::ToolSpec)
+/// values, in the same order, serialised to the same bytes. Only the permission
+/// to call them changes. That is the whole design and it is not a detail of the
+/// implementation: Anthropic orders a request's cacheable prefix tools-then-system,
+/// so 0.38.0's breakpoint at the end of `system` covers the tool schemas, and any
+/// byte change in the tool array invalidates that entry and everything after it in
+/// the same ordering. Removing a tool would save its definition's tokens once and
+/// pay a cache **write** on every later turn of the run.
+///
+/// **A deny set rather than an allow set**, for the reason every other refusal in
+/// this crate is deny-first: a set of permitted names silently withholds the next
+/// tool anyone adds, and a caller who wrote their list against this version would
+/// get a quietly narrower agent on the next one. Withholding is the thing the
+/// caller asked for and the thing they are answerable for.
+///
+/// A mask is a request about **one turn**, not a setting that governs a run — the
+/// same distinction [`TaskContract::fold_now`](crate::TaskContract::fold_now)
+/// draws. Set it with
+/// [`TaskContract::with_tool_mask`](crate::TaskContract::with_tool_mask).
+///
+/// A name that no tool answers to is kept rather than rejected. The catalogue
+/// depends on cargo features and on what the run configured, so a caller
+/// withholding `browser_click` in a build without the `browser` feature is asking
+/// for something already true, and refusing them would make a portable mask
+/// impossible to write.
+///
+/// ```
+/// use io_harness::ToolMask;
+///
+/// let mask = ToolMask::withholding(["xlsx_write", "pdf_fill_form"]);
+/// assert!(mask.withholds("xlsx_write"));
+/// assert!(!mask.withholds("grep"));
+/// assert_eq!(mask.len(), 2);
+///
+/// // The default withholds nothing, which is what every run gets unless it asks.
+/// assert!(ToolMask::default().is_empty());
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolMask {
+    // A `BTreeSet` rather than a `Vec`: the lookup is per tool call, and the
+    // ordering makes the rendered sentence stable without a sort at every use.
+    // No `#[non_exhaustive]` — the field is private, so a struct literal is
+    // already impossible outside this crate and the attribute would add nothing
+    // but a forbidden `..Default::default()`.
+    withheld: std::collections::BTreeSet<String>,
+}
+
+impl ToolMask {
+    /// A mask that withholds nothing. The same value as [`ToolMask::default`].
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Withhold these names for the turn.
+    #[must_use]
+    pub fn withholding<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            withheld: names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Whether this mask withholds `name`.
+    #[must_use]
+    pub fn withholds(&self, name: &str) -> bool {
+        self.withheld.contains(name)
+    }
+
+    /// Whether this mask withholds nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.withheld.is_empty()
+    }
+
+    /// How many names are withheld.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.withheld.len()
+    }
+
+    /// The withheld names, in sorted order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.withheld.iter().map(String::as_str)
+    }
+}
+
 /// The name the model uses to write a file (single-file 0.1/0.2 form: content only).
 pub const WRITE_FILE_TOOL: &str = "write_file";
 /// The name the model uses to change part of a file, leaving the rest alone

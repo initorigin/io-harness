@@ -606,8 +606,8 @@ pub use state::{
 pub use template::{Template, Templates};
 pub use tools::git::Identity;
 pub use tools::{
-    Tool, ToolEffect, ToolFuture, ToolRecovery, Toolbox, ASK_QUESTIONS_TOOL, ASK_QUESTION_TOOL,
-    DEFAULT_EXEC_TIMEOUT, PROPOSE_PLAN_TOOL, TODO_WRITE_TOOL,
+    Tool, ToolEffect, ToolFuture, ToolMask, ToolRecovery, Toolbox, ASK_QUESTIONS_TOOL,
+    ASK_QUESTION_TOOL, DEFAULT_EXEC_TIMEOUT, PROPOSE_PLAN_TOOL, TODO_WRITE_TOOL,
 };
 pub use verify::{
     ChangeReview, ExecGuard, FileChange, ModelReviewer, Review, ReviewRequest, Reviewer, Reviewing,

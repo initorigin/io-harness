@@ -679,7 +679,7 @@ where
                 // the system half is chosen this way here too.
                 let user = match &conversational {
                     Some(_) if step == start_step => {
-                        conversational_user_prompt(&contract.goal, &assembled.text)
+                        conversational_user_prompt(&contract.goal, &assembled.text, &contract.tool_mask)
                     }
                     _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
                 };
@@ -1073,6 +1073,11 @@ where
                     },
                     &contract.goal,
                     contract.tool_hooks.as_deref(),
+                    // A child's contract is built fresh by `spawn_child` and
+                    // carries no mask, which is the same boundary `fold_now`
+                    // draws: the mask is a request about the operator's own turn,
+                    // and a child's work is not that turn.
+                    &contract.tool_mask,
                 )
                 .await?
                 {

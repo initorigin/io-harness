@@ -1060,6 +1060,9 @@ pub(super) async fn read_batch(
     hooks: Option<&crate::hooks::Hooks>,
     // 0.75.0 — the run's containment, for the git readers in this batch.
     sandbox: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
+    // 0.76.0 — the turn's tool mask. Here as well as in `dispatch`, because this
+    // is the other place a call can begin and it does not route through it.
+    mask: &crate::ToolMask,
 ) -> Result<std::collections::VecDeque<Dispatched>> {
     let mut out: Vec<Option<Dispatched>> = Vec::with_capacity(calls.len());
     let mut queued: std::collections::VecDeque<(usize, Option<i64>, bool, ReadWork)> =
@@ -1068,6 +1071,10 @@ pub(super) async fn read_batch(
         // Announced here rather than in the concurrent half, so a watcher sees
         // the calls in the order the model made them however they then run.
         announce(watch, run_id, step, depth, call);
+        if let Some(refused) = mask_gate(mask, call, watch, run_id, step, depth) {
+            out.push(Some(refused));
+            continue;
+        }
         if let Some(refused) = tool_gate(hooks, call, watch, run_id, step, depth) {
             out.push(Some(refused));
             continue;
@@ -1184,6 +1191,52 @@ pub(super) fn announce(watch: &Watch<'_>, run_id: i64, step: u32, depth: u32, ca
 /// A refusal is reported through [`EventKind::Refused`] with the hook's program
 /// where a rule's pattern would be: a refusal that did not come from the policy
 /// is still a refusal, and an observer already routing on them should see it.
+/// The caller's own per-turn mask, applied before anything is started (0.76.0).
+///
+/// **Called from both places a tool call can begin** — the head of [`dispatch`]
+/// and [`read_batch`]'s per-call loop — for the same reason [`tool_gate`] is: a
+/// rule that must see every call has to live at both, and `read_batch` does not
+/// route through `dispatch`. A mask enforced only where the catalogue is built
+/// would be advisory, because `dispatch` matches on the tool's name and answers
+/// anything it does not recognise with an unknown-tool message rather than a
+/// refusal — so a model that names a withheld tool anyway would be obeyed.
+///
+/// Refused with [`Error::Refused`](crate::Error::Refused)'s existing shape rather
+/// than a new variant, and before the operator's `before_tool` hook: the mask is
+/// the caller's own instruction about this turn, and a call the caller withheld is
+/// not a call anyone else needs to rule on.
+pub(super) fn mask_gate(
+    mask: &crate::ToolMask,
+    call: &ToolCall,
+    watch: &Watch<'_>,
+    run_id: i64,
+    step: u32,
+    depth: u32,
+) -> Option<Dispatched> {
+    if !mask.withholds(&call.name) {
+        return None;
+    }
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        step,
+        depth,
+        EventKind::Refused {
+            act: "tool".into(),
+            target: call.name.clone(),
+            rule: Some(call.name.clone()),
+            layer: Some("turn tool mask".into()),
+        },
+    ));
+    Some(Dispatched::go(
+        format!("{} refused: withheld from this turn", call.name),
+        format!(
+            "\n[{} refused] this turn withholds that tool, so nothing was started. \
+             Use one of the tools that is available.\n",
+            call.name
+        ),
+    ))
+}
+
 pub(super) fn tool_gate(
     hooks: Option<&crate::hooks::Hooks>,
     call: &ToolCall,
