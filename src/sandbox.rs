@@ -3007,6 +3007,49 @@ mod tests {
         assert!(!out.success());
     }
 
+    /// TEMPORARY DIAGNOSTIC — not part of any release. Delete with the branch.
+    ///
+    /// `kill_tree_and_group` sends the group signal only when `getpgid(pid) == pid`.
+    /// The forked-child wall-clock test fails only on the leg that runs with
+    /// unprivileged user namespaces restricted, and there is no evidence either way
+    /// about whether that leg establishes a process group at all. This test always
+    /// panics, so nextest prints what the kernel actually reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diag_report_the_process_group_this_host_established() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let facts = dir.path().join("facts.txt");
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "{ echo \"shell_pid=$$\"; echo \"shell_pgid=$(ps -o pgid= -p $$ | tr -d ' ')\"; } \
+             > facts.txt; (sleep 4; touch survived) & echo \"child_pid=$!\" >> facts.txt; wait"
+                .into(),
+        ];
+        let limits = SandboxLimits {
+            max_wall_secs: Some(1),
+            max_cpu_secs: None,
+            ..SandboxLimits::default()
+        };
+        let out = FloorSandbox.run(spec(&argv, dir.path(), &limits)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let reported = std::fs::read_to_string(&facts).unwrap_or_else(|e| format!("unreadable: {e}"));
+        let child_alive = reported
+            .lines()
+            .find_map(|l| l.strip_prefix("child_pid="))
+            .and_then(|p| p.trim().parse::<i32>().ok())
+            .map(|p| unsafe { libc::kill(p, 0) } == 0);
+        panic!(
+            "DIAGNOSTIC — backend={:?} cap_hit={:?}\nfacts:\n{}\nmarker_exists={} child_alive={:?}",
+            out.as_ref().map(|o| o.backend),
+            out.as_ref().map(|o| o.cap_hit),
+            reported.trim(),
+            marker.exists(),
+            child_alive,
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn the_wall_clock_kill_reaches_the_children_the_run_forked() {
