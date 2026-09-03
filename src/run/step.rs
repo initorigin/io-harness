@@ -645,7 +645,7 @@ pub(super) async fn run_from<P: Provider>(
             if let Some(Err(errors)) = conforms(contract, &response) {
                 store.record_context_event(
                     run_id,
-                    &ContextEvent::replan(step, &format!("output shape: {}", errors.join("; "))),
+                    &ContextEvent::replan(step, format!("output shape: {}", errors.join("; "))),
                 )?;
                 finish(store, watch, run_id, 0, step, "schema_unsatisfied")?;
                 return Ok(RunResult::new(
@@ -1945,7 +1945,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 let left = contract.max_retries.saturating_sub(schema_attempts);
                 store.record_context_event(
                     run_id,
-                    &ContextEvent::replan(step, &format!("output shape: {}", errors.join("; "))),
+                    &ContextEvent::replan(step, format!("output shape: {}", errors.join("; "))),
                 )?;
                 if left == 0 {
                     finish(store, watch, run_id, 0, step, "schema_unsatisfied")?;

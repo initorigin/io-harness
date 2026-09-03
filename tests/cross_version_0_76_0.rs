@@ -83,17 +83,57 @@ const GOAL: &str = "port the parser";
 /// The texts differ from each other so that a reader which got the rows back in the
 /// wrong order fails on content rather than passing by symmetry.
 const WRITTEN: [(ObsKind, Option<&str>, &str, Origin); 11] = [
-    (ObsKind::Message, None, "the operator asked", Origin::Operator),
+    (
+        ObsKind::Message,
+        None,
+        "the operator asked",
+        Origin::Operator,
+    ),
     (ObsKind::Message, None, "the agent answered", Origin::Agent),
-    (ObsKind::Message, None, "the harness narrated", Origin::Prose),
-    (ObsKind::Read, Some("src/lib.rs"), "a file was read", Origin::File),
-    (ObsKind::Tool, Some("shell"), "a command printed", Origin::Shell),
-    (ObsKind::Tool, Some("browser"), "a page was fetched", Origin::Web),
+    (
+        ObsKind::Message,
+        None,
+        "the harness narrated",
+        Origin::Prose,
+    ),
+    (
+        ObsKind::Read,
+        Some("src/lib.rs"),
+        "a file was read",
+        Origin::File,
+    ),
+    (
+        ObsKind::Tool,
+        Some("shell"),
+        "a command printed",
+        Origin::Shell,
+    ),
+    (
+        ObsKind::Tool,
+        Some("browser"),
+        "a page was fetched",
+        Origin::Web,
+    ),
     (ObsKind::Mcp, Some("fix"), "a server replied", Origin::Mcp),
-    (ObsKind::Tool, Some("lsp_hover"), "a server hovered", Origin::Lsp),
-    (ObsKind::Skill, Some("porting"), "a skill was loaded", Origin::Skill),
+    (
+        ObsKind::Tool,
+        Some("lsp_hover"),
+        "a server hovered",
+        Origin::Lsp,
+    ),
+    (
+        ObsKind::Skill,
+        Some("porting"),
+        "a skill was loaded",
+        Origin::Skill,
+    ),
     (ObsKind::Child, None, "a child concluded", Origin::Child),
-    (ObsKind::Tool, Some("custom"), "a tool returned", Origin::Tool),
+    (
+        ObsKind::Tool,
+        Some("custom"),
+        "a tool returned",
+        Origin::Tool,
+    ),
 ];
 
 /// A run holding one observation of every origin, and its id.
@@ -177,7 +217,8 @@ fn f17_a_current_store_is_read_by_a_0_76_0_binary() {
     // and its `check_resumable` still says yes. This is the assertion that fails first
     // if someone bumps `CHECKPOINT_FORMAT` for an additive column.
     assert_eq!(
-        seen["checkpoint_format"], io_harness::CHECKPOINT_FORMAT,
+        seen["checkpoint_format"],
+        io_harness::CHECKPOINT_FORMAT,
         "0.76.0 read a different checkpoint format than this tree writes"
     );
 
@@ -190,7 +231,9 @@ fn f17_a_current_store_is_read_by_a_0_76_0_binary() {
         "0.76.0 refused to resume a store 0.77.0 wrote"
     );
 
-    let observations = run["observations"].as_array().expect("an observations array");
+    let observations = run["observations"]
+        .as_array()
+        .expect("an observations array");
     assert_eq!(
         observations.len(),
         WRITTEN.len(),

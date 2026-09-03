@@ -109,8 +109,7 @@ fn origin_from_wire(origin: Option<&str>) -> Origin {
     let Some(origin) = origin else {
         return Origin::Unmarked;
     };
-    serde_json::from_value(serde_json::Value::String(origin.to_string()))
-        .unwrap_or(Origin::Tool)
+    serde_json::from_value(serde_json::Value::String(origin.to_string())).unwrap_or(Origin::Tool)
 }
 
 /// The checkpoint layout version stamped into `PRAGMA user_version`. Bump when

@@ -1638,7 +1638,13 @@ mod tests {
             (2, "\n[wrote a] (1 chars)\n"),
             (4, "\n[read a]\nB\n"),
         ] {
-            l.push(Observation::new(step, ObsKind::Read, None, text, Origin::File));
+            l.push(Observation::new(
+                step,
+                ObsKind::Read,
+                None,
+                text,
+                Origin::File,
+            ));
         }
         // The property the trace's per-step delta rests on: rows concatenated in
         // step order are the whole log, so nothing is lost by not repeating it.

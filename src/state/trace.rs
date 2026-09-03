@@ -2075,7 +2075,9 @@ mod tests {
         let store = Store::memory().unwrap();
         let session = store.create_session("/repo").unwrap();
         let run = store.start_run("read a file", "/repo").unwrap();
-        store.record_turn(session, None, run, "what does it say").unwrap();
+        store
+            .record_turn(session, None, run, "what does it say")
+            .unwrap();
 
         store
             .record_observations(

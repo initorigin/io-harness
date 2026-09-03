@@ -1232,8 +1232,12 @@ fn announced_origin(name: &str) -> Option<Origin> {
         SHELL_TOOL | SHELL_START_TOOL | SHELL_POLL_TOOL | SHELL_KILL_TOOL | EXEC_TOOL => {
             Origin::Shell
         }
-        BROWSER_NAVIGATE_TOOL | BROWSER_READ_TOOL | BROWSER_SCREENSHOT_TOOL
-        | BROWSER_CLICK_TOOL | BROWSER_TYPE_TOOL | BROWSER_SCROLL_TOOL => Origin::Web,
+        BROWSER_NAVIGATE_TOOL
+        | BROWSER_READ_TOOL
+        | BROWSER_SCREENSHOT_TOOL
+        | BROWSER_CLICK_TOOL
+        | BROWSER_TYPE_TOOL
+        | BROWSER_SCROLL_TOOL => Origin::Web,
         LSP_DEFINITION_TOOL | LSP_REFERENCES_TOOL | LSP_HOVER_TOOL | LSP_SYMBOLS_TOOL
         | LSP_RENAME_TOOL => Origin::Lsp,
         READ_SKILL_TOOL => Origin::Skill,
@@ -1244,8 +1248,8 @@ fn announced_origin(name: &str) -> Option<Origin> {
         | GIT_COMMIT_TOOL | GIT_BRANCH_TOOL | GIT_WORKTREE_TOOL => Origin::Tool,
         // Named rather than left to the catch-all, so that "these put no outside
         // content in play" reads as a decision instead of a gap.
-        REMEMBER_TOOL | FORGET_TOOL | TODO_WRITE_TOOL | ASK_QUESTION_TOOL
-        | ASK_QUESTIONS_TOOL | PROPOSE_PLAN_TOOL => return None,
+        REMEMBER_TOOL | FORGET_TOOL | TODO_WRITE_TOOL | ASK_QUESTION_TOOL | ASK_QUESTIONS_TOOL
+        | PROPOSE_PLAN_TOOL => return None,
         _ => return None,
     })
 }

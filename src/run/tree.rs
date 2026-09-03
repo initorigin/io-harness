@@ -268,7 +268,13 @@ pub(super) async fn drain_children<P: Provider>(
         ));
         tree.store.record_observations(
             run_id,
-            &[Observation::new(step, ObsKind::Child, None, text, Origin::Child)],
+            &[Observation::new(
+                step,
+                ObsKind::Child,
+                None,
+                text,
+                Origin::Child,
+            )],
         )?;
     }
     Ok(())

@@ -113,7 +113,9 @@ const KEYWORDS: &[(&str, Keyword)] = &[
 /// The type names `type` may carry, which are the seven JSON types and nothing
 /// else — no `any`, and no union array, both of which would be a second way to
 /// say something the subset already says once.
-const TYPES: &[&str] = &["object", "array", "string", "number", "integer", "boolean", "null"];
+const TYPES: &[&str] = &[
+    "object", "array", "string", "number", "integer", "boolean", "null",
+];
 
 impl Keyword {
     /// The keyword a schema key names, or `None` when it names none of them —
@@ -311,9 +313,11 @@ pub fn extract_json(text: &str) -> std::result::Result<Value, String> {
             return Ok(value);
         }
     }
-    Err("your reply does not contain a JSON document. Reply with the JSON alone — \
+    Err(
+        "your reply does not contain a JSON document. Reply with the JSON alone — \
          no explanation before or after it, and nothing after the closing brace."
-        .to_string())
+            .to_string(),
+    )
 }
 
 /// The body of the first fenced block, with its language tag line dropped.

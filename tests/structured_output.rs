@@ -95,7 +95,14 @@ async fn run(
     provider: &Scripted,
     store: &Store,
 ) -> io_harness::Result<io_harness::RunResult> {
-    run_with(contract, provider, store, &Policy::permissive(), &ApproveAll).await
+    run_with(
+        contract,
+        provider,
+        store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------- tests
@@ -111,9 +118,7 @@ async fn a_run_declaring_no_schema_finishes_on_text_a_schema_would_have_refused(
     let store = Store::memory().unwrap();
     let provider = Scripted::new(&["not JSON at all"]);
 
-    let result = run(&contract(dir.path()), &provider, &store)
-        .await
-        .unwrap();
+    let result = run(&contract(dir.path()), &provider, &store).await.unwrap();
 
     assert!(matches!(result.outcome, RunOutcome::Finished { .. }));
     assert!(

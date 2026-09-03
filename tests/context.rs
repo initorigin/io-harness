@@ -2119,7 +2119,11 @@ async fn a_replan_directive_is_harness_prose_and_never_marked_external() {
         .unwrap();
 
     let directive = origin_holding(&store, result.run_id, "[no progress]");
-    assert_eq!(directive, Origin::Prose, "the harness wrote every word of it");
+    assert_eq!(
+        directive,
+        Origin::Prose,
+        "the harness wrote every word of it"
+    );
     assert!(
         !directive.is_external(),
         "a directive this crate wrote must never be framed as content from outside the run"

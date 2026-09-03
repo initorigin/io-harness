@@ -8,7 +8,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use io_harness::provider::{CompletionRequest, CompletionResponse, Message, PromptFamily, ToolCall};
+use io_harness::provider::{
+    CompletionRequest, CompletionResponse, Message, PromptFamily, ToolCall,
+};
 use io_harness::sandbox::{select, Sandbox, SandboxConfig};
 use io_harness::{
     run_tree, run_with, run_with_observed, Act, ApproveAll, Containment, ContextBudget, Effect,
@@ -1905,8 +1907,16 @@ async fn the_framed_span_is_the_observation_and_nothing_around_it_moved() {
 
     // One read, so one span. A second pair would mean the frame is being opened
     // somewhere it was not asked for.
-    assert_eq!(user.matches(OPEN).count(), 1, "not one opening tag:\n{user}");
-    assert_eq!(user.matches(CLOSE).count(), 1, "not one closing tag:\n{user}");
+    assert_eq!(
+        user.matches(OPEN).count(),
+        1,
+        "not one opening tag:\n{user}"
+    );
+    assert_eq!(
+        user.matches(CLOSE).count(),
+        1,
+        "not one closing tag:\n{user}"
+    );
 
     let open = user.find(OPEN).expect("checked above");
     let close = user.find(CLOSE).expect("checked above");
