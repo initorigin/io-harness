@@ -1,0 +1,54 @@
+# Pinned to io-harness 0.76.0 — the PREVIOUS release — on purpose, with an `=`
+# requirement so cargo cannot drift it forward. Never bump this. Its whole job is to
+# read a SQLite database exactly the way 0.76.0 reads one, and to write into one
+# exactly the way 0.76.0 writes, so `tests/cross_version_0_76_0.rs` can prove a real
+# 0.76.0 binary still reads a store 0.77.0 wrote. A binary built from the current tree
+# and labelled "0.76.0" would prove nothing; bumping this dependency turns the evidence
+# back into a label.
+#
+# This crate exists because of what 0.72.0 cost. 0.72.0 changed `Question::choices`
+# from `Vec<String>` to `Vec<Choice>`, and its entire green suite could not see the
+# consequence, because every test in it read rows the same tree had just written. Only
+# a real previous-release binary could. The rule 0.72.0 wrote for itself is that every
+# release after it carries the same fixture against its own predecessor, whether or
+# not that release believes it changed anything a store can see.
+#
+# 0.77.0 changes a store once, and calls the change additive: a nullable `origin`
+# column on `ledger_observations`, carrying where a piece of transcript content came
+# from. `CHECKPOINT_FORMAT` is deliberately not bumped. "Additive" is exactly the claim
+# 0.72.0 made about itself, so what this crate reads is the ledger — the one surface
+# this release moves.
+#
+# **The alternative that would have failed is worth naming here, because this fixture
+# is the only thing in the tree that could have caught it.** Provenance could have been
+# expressed as a new `ObsKind` variant instead of a column. `ObsKind` is read back
+# through `kind_from_wire`, which hard-errors on a value it does not know — so a
+# 0.76.0 binary handed a ledger containing that variant would refuse to restore the run
+# entirely. Every test in 0.77.0's own suite would still have passed. This job is the
+# difference between believing a change is additive and knowing it.
+#
+# There is deliberately no committed `store-0.76.0/` database and no `write`-only mode
+# to produce one. The forwards direction — this tree reading a 0.76.0 store — passed
+# from the first run in 0.72.0 and proved nothing, because a release that only adds a
+# nullable column reads an older store by construction. The direction that has ever
+# caught anything is the backwards one, and that one needs a binary rather than a file.
+#
+# It is listed in the root manifest's `exclude`, so it is never packaged, and it is
+# built with its own `target/` (run it from this directory) so it never drags a second
+# `libsqlite3-sys` into the main crate's build.
+[package]
+name = "gen-0-76-0"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Empty on purpose: without it cargo walks up and tries to join the io-harness package
+# as a workspace member, which fails because the root manifest excludes this directory.
+[workspace]
+
+[dependencies]
+io-harness = "=0.76.0"
+serde_json = "1"
+# No `tokio` and no `tempfile`, for the reasons gen-0.74.0 states: nothing this binary
+# calls is async, and both modes are handed a database path by the test that spawned
+# them, so it never chooses a location for anything.

@@ -26,6 +26,146 @@ notes are produced from it.
 
 ### Security
 
+## [0.77.0] - 2026-09-03
+
+**The transcript says what kind of thing each part of it is, and a caller can demand
+a shape.** Two absences with one root: this crate recorded what happened with unusual
+precision and said almost nothing about the *kind* of what happened.
+
+Every piece of content in the transcript now carries where its bytes came from —
+an operator's instruction, the agent's own words, the harness's prose, or external
+content by source: a file, a shell, a web page, an MCP or LSP server, a skill body,
+a child agent. The mark is set at the construction site rather than inferred later,
+stored beside the observation, readable on the `Observer` channel, and **framed in
+the prompt** so the model reads external content as content rather than as
+instruction. That is the middle of the field's three-part answer to prompt
+injection: the boundary shipped in 0.4.0 and was proven in 0.74.0; neutralization at
+the subagent boundary is still not shipped and is named for a later release.
+
+Alongside it, a caller can declare a JSON Schema for a run's final output. The
+schema rides the wire natively where a wire has a place for it, the model's final
+text is validated locally before the run may report success, and a failure
+re-prompts with the validation error — bounded, traced, and drawing against the
+budgets the run already has.
+
+**What this release does not claim.** Whether a marked and framed transcript changes
+what a model actually does is a scoring question, and the instrument for it is
+`io-eval`, built separately. This release delivers a structural distinction and
+declines to imply the measurement.
+
+### Breaking changes
+
+- **BREAKING** — `context::Observation::new` takes a fifth argument, the
+  `context::Origin` of the content. There is deliberately no defaulting form and no
+  `new_unmarked`: a construction site that does not say where its bytes came from is
+  a compile error, which is the only enforcement that survives the next release
+  adding a tool.
+  *Migration:* pass the origin. Use `Origin::Operator` for what a human said,
+  `Origin::Agent` for the model's own words, `Origin::Prose` for text your own code
+  wrote, and the matching external variant for anything that arrived from a file, a
+  process, the network, a server, a skill or a child. Do **not** pass
+  `Origin::Unmarked` — it exists only as what a row written before 0.77.0 reads back
+  as.
+
+  ```rust
+  use io_harness::context::{ObsKind, Observation};
+  use io_harness::Origin;
+
+  // Before
+  let obs = Observation::new(step, ObsKind::Read, Some(path), text);
+  // After
+  let obs = Observation::new(step, ObsKind::Read, Some(path), text, Origin::File);
+  ```
+
+- **BREAKING** — `context::Observation` and `context::Emitted` each gained an
+  `origin` field, so a struct literal naming every field no longer compiles.
+  *Migration:* `Observation` is built through `Observation::new` above. For
+  `Emitted`, name the field; carry it through from the entry it came from rather
+  than deriving it from the `piece` beside it, which answers a different question
+  (see below).
+
+- **BREAKING** — `provider::CompletionRequest` gained `output_schema`, so an
+  exhaustive struct literal no longer compiles. This is the same break `media`
+  (0.15.0), `model` (0.21.0), `web` (0.22.0) and `effort` (0.31.0) each took, and
+  for the same reason: the type's whole ergonomic is a struct literal with
+  `..Default::default()`.
+  *Migration:* construct with `..Default::default()`, which the type has derived
+  since it existed.
+
+- **BREAKING** — `observe::EventKind::ToolCall` gained an optional `origin` field.
+  `#[non_exhaustive]` covers new *variants*, not new *fields* on a variant, so a
+  pattern naming every field no longer compiles. Same breakage class as 0.68.0's
+  `EventKind::Mcp::tools`.
+  *Migration:* end the pattern with `..`.
+
+  ```rust
+  // Before
+  EventKind::ToolCall { name, target } => { /* … */ }
+  // After
+  EventKind::ToolCall { name, target, .. } => { /* … */ }
+  ```
+
+- **BREAKING (behaviour)** — the prompt bytes moved for every run. External content
+  in the observation section is wrapped in an `external_content` tag, and the user
+  block carries one note saying what the tag means. **The tag is emitted for every
+  prompt family, not only Anthropic**, because a boundary made of prose alone can be
+  forged by the quoted content itself, which is the attack the framing exists to
+  stop — an Anthropic-only delimiter would ship the defence off for most of the
+  fleet. The note is unconditional, so runs that never call a tool see it too; a
+  constant never moves, and a sentence that appeared only on the turn a run first
+  read a file would withdraw the cache marker for nothing.
+  *Migration:* none required. If you compare prompt bytes against a stored baseline,
+  regenerate it. Nothing about what the agent may do changed — a mark is a statement
+  about the record, never a grant.
+
+### Added
+
+- `context::Origin`, re-exported at the crate root: where a piece of transcript
+  content came from. Twelve variants, `#[non_exhaustive]`, with `is_external()` —
+  the one place that decides what "untrusted" means — and `as_str()`.
+- `schema::OutputSchema`, re-exported at the crate root: a JSON Schema validated
+  against a stated, closed keyword subset. Construction is fallible and refuses any
+  keyword the crate does not implement, **naming it**, so a schema that exists has
+  been understood in full. Deserialization goes through the same constructor, so a
+  config file cannot smuggle in an unchecked schema.
+- `TaskContract::with_output_schema` and a `[run] output_schema` config key.
+- `provider::CompletionRequest::output_schema`, emitted to the OpenAI-shaped wire as
+  `response_format` with `strict: false`. Anthropic's body is deliberately
+  untouched: that API has no `response_format`, its native route to a shape is a
+  forced tool call, and the schema is enforced locally on that path regardless.
+
+### Changed
+
+- An observation's origin is persisted in a new nullable `ledger_observations.origin`
+  column, added by `ALTER TABLE` with `CHECKPOINT_FORMAT` **unmoved**. A store written
+  by 0.76.0 opens unchanged and no migration runs; a row written before this release
+  reads back as `Origin::Unmarked` rather than as an error or as a guess. Proven
+  against a real 0.76.0 binary from crates.io, in both directions, by
+  `tests/cross_version_0_76_0.rs`.
+- `context::Piece` and `context::Origin` are **independent on purpose**, and this is
+  worth knowing if you consume either. A `Piece` is a *layout role* — `Piece::Result`
+  is what makes an entry occupy a tool call's position — while an `Origin` is a
+  *provenance fact*. Deriving one from the other was tried during this release and
+  reverted: it forces every entry answering a tool call to claim an external origin
+  whatever its bytes are, so an operator's own answer to `ask_question` would have to
+  be recorded as tool output to keep the transcript well formed.
+
+### Security
+
+- Tool output, a fetched page, an MCP server's reply and a child agent's conclusion
+  are now structurally distinguishable in the transcript from an operator's
+  instruction, both on the record and in the prompt the model reads.
+- **A resumed pre-0.77.0 run is not framed.** Rows written before the origin column
+  read back `Unmarked`, which is not external, so their content carries no frame.
+  Unmarked is a fact rather than an error, and nothing infers a provenance for a
+  historical row — but the defence does not reach a ledger restored from an older
+  store.
+- **Known ceiling:** external text containing a closing `external_content` tag can
+  end its own frame early. The body passes through byte for byte because this
+  release marks content and explicitly does not transform it, and an escaping scheme
+  is a second silent thing to get wrong. Neutralization at the subagent boundary,
+  which is where transformation belongs, is named for a later release.
+
 ## [0.76.0] - 2026-09-03
 
 **A turn can withhold a tool without moving the catalogue, and an observation that

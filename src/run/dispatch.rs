@@ -380,6 +380,11 @@ pub(super) async fn dispatch(
                 format!("\n[remember {key}]\n{restated}"),
                 ObsKind::Tool,
                 None,
+                // The harness restating what it just stored. No byte here came
+                // from outside — `remember` writes to this crate's own memory —
+                // so it is prose, and holding the call's position is `Piece`'s
+                // separate business.
+                Origin::Prose,
             )
         }
         FORGET_TOOL => {
@@ -460,6 +465,8 @@ pub(super) async fn dispatch(
                         format!("\n[forget {key}]\n"),
                         ObsKind::Tool,
                         None,
+                        // Harness prose, for `remember`'s reason.
+                        Origin::Prose,
                     )
                 }
             }
@@ -518,6 +525,9 @@ pub(super) async fn dispatch(
                 obs,
                 ObsKind::Tool,
                 None,
+                // The model's own plan, read back by the harness. Not external
+                // and not the operator; prose, for `remember`'s reason.
+                Origin::Prose,
             )
         }
         ASK_QUESTION_TOOL => {
@@ -608,6 +618,14 @@ pub(super) async fn dispatch(
                         ),
                         ObsKind::Tool,
                         None,
+                        // A human wrote these words, so the record says so. It
+                        // still holds the `ask_question` call's position in the
+                        // transcript — that is `Piece`'s job, decided from
+                        // `(kind, target)`, and it is decided independently of
+                        // this. The resumed path (`record_answer`) marks the same
+                        // words the same way, which is what a reader should see:
+                        // one operator answer, two arrival routes.
+                        Origin::Operator,
                     )
                 }
                 None => {
@@ -736,6 +754,8 @@ pub(super) async fn dispatch(
                         ),
                         ObsKind::Tool,
                         None,
+                        // The singular's origin, for the singular's reason.
+                        Origin::Operator,
                     )
                 }
                 None => {
@@ -852,6 +872,12 @@ pub(super) async fn dispatch(
                     ),
                     ObsKind::Message,
                     None,
+                    // The gate's own framing of a verdict, which is this crate
+                    // talking about the run — and already narration rather than a
+                    // result before this release, since `ObsKind::Message` with no
+                    // target is what 0.76.0's derivation read as `Piece::Prose`.
+                    // Stating `Prose` records what was already true here.
+                    Origin::Prose,
                 ),
                 other => Dispatched::Plan {
                     plan_id,
@@ -923,6 +949,7 @@ pub(super) async fn dispatch(
                             // context layer would treat it differently.
                             kind: ObsKind::Find,
                             target: Some(target.clone()),
+                            origin: Origin::File,
                             changed: false,
                             remember,
                         }
@@ -1008,6 +1035,9 @@ pub(super) async fn dispatch(
                             obs,
                             kind: ObsKind::Read,
                             target: Some(target.clone()),
+                            // The bytes are a file's, even though what the model
+                            // reads here is the digest rather than the image.
+                            origin: Origin::File,
                             changed: false,
                             remember,
                         }
@@ -1115,6 +1145,10 @@ pub(super) async fn dispatch(
                                 ),
                                 kind: ObsKind::Write,
                                 target: Some(target.clone()),
+                                // A write's confirmation is a fact about the
+                                // filesystem, and the diagnostics folded into it
+                                // are about the file that was just written.
+                                origin: Origin::File,
                                 changed: wrote.moved_the_workspace(),
                                 remember,
                             }
@@ -1232,6 +1266,7 @@ pub(super) async fn dispatch(
                                 ),
                                 kind: ObsKind::Write,
                                 target: Some(target.clone()),
+                                origin: Origin::File,
                                 changed: wrote.moved_the_workspace(),
                                 remember,
                             }
@@ -1336,6 +1371,7 @@ pub(super) async fn dispatch(
                                 ),
                                 kind: ObsKind::Write,
                                 target: Some(target.clone()),
+                                origin: Origin::File,
                                 changed: wrote.moved_the_workspace(),
                                 remember,
                             }
@@ -1433,6 +1469,12 @@ pub(super) async fn dispatch(
                 obs: bound(&obs, cap, ObsKind::Tool),
                 kind: ObsKind::Tool,
                 target: None,
+                // Two sources in one observation — a checker process's stream and
+                // a language server's diagnostics — so neither `Shell` nor `Lsp`
+                // is true of the whole of it. `Tool` is the origin for exactly
+                // that: external, and no finer attribution this crate can make
+                // without splitting one answer into two.
+                origin: Origin::Tool,
                 // Deliberately not `changed`, for the reason `exec` is not: the
                 // stall signal asks whether the agent is getting anywhere, and
                 // running the same check a fourth time without editing anything
@@ -1668,6 +1710,11 @@ pub(super) async fn dispatch(
                         obs: bound(&obs, cap, ObsKind::Tool),
                         kind: ObsKind::Tool,
                         target: None,
+                        // A page's own text, whoever put the page there. The
+                        // `ObsKind` cannot say this — it is `Tool` here as it is
+                        // for `exec` — which is the pair the recorded origin
+                        // exists to separate.
+                        origin: Origin::Web,
                         // Looking at a page changes nothing in the workspace, so
                         // it is not progress for the stall signal — the same
                         // reasoning `check` and the navigation tools follow.
@@ -1829,6 +1876,10 @@ pub(super) async fn dispatch(
                 // the later one supersede the earlier would discard one of them.
                 kind: ObsKind::Tool,
                 target: Some(line_src.to_string()),
+                // A process wrote this, under an argv the model composed — the
+                // least attributable content a run handles, and the reason
+                // `Origin::Shell` exists rather than folding it into `Tool`.
+                origin: Origin::Shell,
                 changed: false,
                 remember: remembered,
             }
@@ -2045,6 +2096,10 @@ pub(super) async fn dispatch(
                 ),
                 kind: ObsKind::Tool,
                 target: Some(line_src.to_string()),
+                // The handle's receipt rather than its output, but it is the
+                // shell family's answer and the polls that follow carry the
+                // process's own bytes under the same origin.
+                origin: Origin::Shell,
                 changed: false,
                 remember: remembered,
             }
@@ -2079,6 +2134,7 @@ pub(super) async fn dispatch(
                     ),
                     ObsKind::Tool,
                     None,
+                    Origin::Shell,
                 ));
             }
             let (text, skipped) = handles.poll(id)?;
@@ -2142,6 +2198,9 @@ pub(super) async fn dispatch(
                 ),
                 ObsKind::Tool,
                 None,
+                // What the process printed, verbatim inside this crate's framing
+                // of it.
+                Origin::Shell,
             )
         }
         SHELL_KILL_TOOL => {
@@ -2201,6 +2260,7 @@ pub(super) async fn dispatch(
                         ),
                         ObsKind::Tool,
                         None,
+                        Origin::Shell,
                     )
                 }
                 Err(reason) => Dispatched::go(
@@ -2386,6 +2446,9 @@ pub(super) async fn dispatch(
                 obs,
                 kind: ObsKind::Tool,
                 target: None,
+                // `shell`'s origin, for `shell`'s reason: the argv is the model's
+                // and a process wrote the answer.
+                origin: Origin::Shell,
                 // Deliberately not `changed`, even for a command that plainly
                 // wrote files. The stall signal asks whether the agent is getting
                 // anywhere, and running the same build a fourth time without
@@ -2513,6 +2576,11 @@ pub(super) async fn dispatch(
                             obs: format!("\n[skill {label}]\n{body}\n"),
                             kind: ObsKind::Skill,
                             target: Some(label),
+                            // A file on disk, but its own origin rather than
+                            // `File`: a skill body is instructions somebody wrote
+                            // for the agent, which is a different thing to trust
+                            // than a source file the task is about.
+                            origin: Origin::Skill,
                             changed: false,
                             remember,
                         }
@@ -2575,6 +2643,7 @@ pub(super) async fn dispatch(
                             ),
                             kind: ObsKind::Read,
                             target: Some(target.clone()),
+                            origin: Origin::File,
                             changed: false,
                             remember,
                         },
@@ -2657,6 +2726,7 @@ pub(super) async fn dispatch(
                             ),
                             kind: ObsKind::Write,
                             target: Some(target.clone()),
+                            origin: Origin::File,
                             changed: w.moved_the_workspace(),
                             remember,
                         },
@@ -2706,6 +2776,7 @@ pub(super) async fn dispatch(
                         ),
                         kind: ObsKind::Read,
                         target: Some(target.clone()),
+                        origin: Origin::File,
                         changed: false,
                         remember,
                     },
@@ -2759,6 +2830,7 @@ pub(super) async fn dispatch(
                         ),
                         kind: ObsKind::Write,
                         target: Some(target.clone()),
+                        origin: Origin::File,
                         changed: w.moved_the_workspace(),
                         remember,
                     },
@@ -3112,6 +3184,10 @@ pub(super) async fn dispatch(
                         ),
                         kind: ObsKind::Tool,
                         target: None,
+                        // The overlapping half's origin, stated the same way and
+                        // for the same reason — see `ReadWork::Git` in
+                        // `src/run/read.rs`.
+                        origin: Origin::Tool,
                         changed: matches!(cmd, GitCmd::Add { .. } | GitCmd::Commit { .. }) && ok,
                         remember: remembered,
                     }
@@ -3217,6 +3293,12 @@ pub(super) async fn dispatch(
                 obs: format!("\n[{name}]\n{out}\n"),
                 kind: ObsKind::Mcp,
                 target: Some(name.to_string()),
+                // A server this crate does not run answered. `ObsKind::Mcp`
+                // happens to agree here, and the funnel still must not read it
+                // off the kind: the two agree for MCP and disagree for `exec`,
+                // the browser and a registered tool, which all wear
+                // `ObsKind::Tool`.
+                origin: Origin::Mcp,
                 changed: false,
                 remember,
             }

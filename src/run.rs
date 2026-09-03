@@ -27,7 +27,7 @@ use crate::approve::{Plan, PlanGate, PlanStep, PlanVerdict};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::context::{
     assemble, bound, entry_cap_chars, last_lines, Assembled, Assembly, Ledger as ContextLedger,
-    ObsKind, Observation, Piece, GATE_FEEDBACK_CHARS, GATE_FEEDBACK_LINES,
+    ObsKind, Observation, Origin, Piece, GATE_FEEDBACK_CHARS, GATE_FEEDBACK_LINES,
 };
 use crate::contract::{Preset, SystemPrompt, TaskContract};
 use crate::error::{Error, Result};
@@ -126,7 +126,7 @@ use crate::verify::{ExecGuard, Verification};
 ///     fn event(&self, event: &RunEvent) -> Flow {
 ///         match &event.kind {
 ///             // A parent asking for a child, before the child exists.
-///             EventKind::ToolCall { name, target } if name == SPAWN_TOOL => {
+///             EventKind::ToolCall { name, target, .. } if name == SPAWN_TOOL => {
 ///                 println!("{:indent$}spawning: {target}", "", indent = event.depth as usize * 2);
 ///             }
 ///             // The child that resulted, with its own run id to route on.
@@ -321,6 +321,22 @@ pub enum RunOutcome {
     /// of a gate, not a gate that says no — and a run under it that spends its
     /// whole budget still reports `StepCapReached`.
     VerificationFailed { steps: u32 },
+    /// (0.77.0) The contract declared an output schema, and the model's final
+    /// answer never satisfied it within the attempts allowed.
+    ///
+    /// Distinct from [`Finished`](RunOutcome::Finished) and from
+    /// [`StepCapReached`](RunOutcome::StepCapReached), and the distinction is the
+    /// point: a run that exhausts its schema attempts has produced text a caller
+    /// asked to be a particular shape and did not get, so reporting it as
+    /// finished would hand back malformed output under a success. Reporting it as
+    /// a step cap would send an operator to raise `max_steps`, which buys more
+    /// attempts at the same failure — what the run needs is a look at the
+    /// validation errors, which are on the trace, one per rejected attempt.
+    ///
+    /// Not terminal: a model that could not produce the shape under one prompt
+    /// may under another, and a schema the caller narrows is a different
+    /// question.
+    SchemaUnsatisfied { steps: u32 },
     /// (0.65.0) The run died in the middle of a call the harness cannot inspect —
     /// a charge, a deployment, a posted message, an MCP call, any registered
     /// [`Tool`](crate::tools::Tool) whose
@@ -1913,6 +1929,12 @@ fn record_answer(store: &Store, run_id: i64, question_id: i64, answer: &str) -> 
                  {}. It is not permission for anything.)\n",
                 question.question
             ),
+            // A human wrote it, so the transcript sends it as the operator's own
+            // turn. This is the resumed path and there is no `ask_question` call
+            // left to answer — the step that asked was committed before the run
+            // paused — which is why this site can be `Operator` while the
+            // in-dispatch answer, which does hold a call's position, cannot.
+            Origin::Operator,
         )],
     )?;
     Ok(())
@@ -1975,7 +1997,16 @@ fn record_plan_decision(
     };
     store.record_observations(
         run_id,
-        &[Observation::new(pending.step, ObsKind::Message, None, text)],
+        // The verdict is a human's; every word of `text` is this crate's framing
+        // of it, down to the sentence telling the model what to do next. The
+        // in-loop sites that write the same three notices state the same origin.
+        &[Observation::new(
+            pending.step,
+            ObsKind::Message,
+            None,
+            text,
+            Origin::Prose,
+        )],
     )?;
     Ok(())
 }
@@ -2612,6 +2643,14 @@ pub async fn resume_with_recovery_observed<P: Provider>(
                     crate::context::ObsKind::Tool,
                     Some(attempt.tool.clone()),
                     format!("\n[{}]\n{}\n", attempt.tool, observation),
+                    // A human typed these words, and they still are not the
+                    // operator's: they stand in for what a tool would have
+                    // returned had the call not been interrupted, and the tool is
+                    // one this crate never got to inspect. `Origin::Tool` is that
+                    // exactly — external, unattributable further — and it is the
+                    // distrusting answer, which is the right way to be wrong
+                    // about content nobody in this process saw produced.
+                    Origin::Tool,
                 )],
             )?;
             store.resolve_attempt(attempt_id, "completed")?;
@@ -4922,7 +4961,7 @@ mod tests {
     /// the two counts meet.
     #[test]
     fn a_step_whose_results_outnumber_its_calls_is_still_sent_as_prose() {
-        use crate::context::{Emitted, Piece};
+        use crate::context::{Emitted, Origin, Piece};
 
         let section = "\n[read a.txt]\nA\n\n[read b.txt]\nB\n";
         let user = format!("HEAD{section}TAIL");
@@ -4933,12 +4972,14 @@ mod tests {
                     step: 1,
                     ordinal: 0,
                     piece: Piece::Result,
+                    origin: Origin::File,
                     text: "\n[read a.txt]\nA\n".into(),
                 },
                 Emitted {
                     step: 1,
                     ordinal: 1,
                     piece: Piece::Result,
+                    origin: Origin::File,
                     text: "\n[read b.txt]\nB\n".into(),
                 },
             ],
@@ -5079,6 +5120,7 @@ mod tests {
                 crate::context::ObsKind::Read,
                 Some(format!("src/module{i}/handler.rs")),
                 "…",
+                Origin::File,
             ));
         }
         let signals = recall_signals(goal, &ledger);

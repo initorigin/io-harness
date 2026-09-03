@@ -884,6 +884,13 @@ struct RunSection {
     // `max_read_chars` because it is the same kind of key: a number an operator
     // chose, which a project scope may lower and may not raise.
     max_wait_secs: Option<u64>,
+    // 0.77.0 — the shape the run's final output must take. Typed as the validated
+    // wrapper rather than as a raw `serde_json::Value`, because `OutputSchema`
+    // deserializes through its own fallible constructor: a schema using a keyword
+    // this crate does not implement is refused while the operator is still reading
+    // their own config file, naming the keyword, rather than being accepted here
+    // and half-checked three steps into a run.
+    output_schema: Option<crate::schema::OutputSchema>,
     commit_identity: Option<Identity>,
 }
 
@@ -2130,6 +2137,9 @@ impl Config {
         }
         if let Some(v) = run.max_wait_secs {
             out = out.with_max_wait_secs(v);
+        }
+        if let Some(v) = &run.output_schema {
+            out = out.with_output_schema(v.clone());
         }
         if let Some(v) = &run.commit_identity {
             out = out.with_commit_identity(v.name.clone(), v.email.clone());

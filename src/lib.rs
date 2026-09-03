@@ -512,6 +512,7 @@ pub mod provider;
 pub mod resilience;
 mod run;
 pub mod sandbox;
+pub mod schema;
 pub mod session;
 pub mod skills;
 mod state;
@@ -532,7 +533,11 @@ pub use approve::{
 pub use browser::BrowserConfig;
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
-pub use context::{Collapse, Compaction, ContextBudget};
+// `Origin` joins them in 0.77.0 for a reason the other three do not have:
+// `EventKind::ToolCall`, a root-level type, now names it in a field. A caller
+// matching on that field would otherwise have to reach into `context` for a type
+// the root already hands them the container of.
+pub use context::{Collapse, Compaction, ContextBudget, Origin};
 pub use contract::{
     Preset, Routing, SystemPrompt, TaskContract, DEFAULT_MAX_RETRIES, DEFAULT_MAX_STEPS,
     DEFAULT_WORKSPACE_MAX_STEPS,
@@ -582,6 +587,10 @@ pub use sandbox::{
     copy_back, select, Backend, Cap, ExecMode, Sandbox, SandboxConfig, SandboxLimits,
     SandboxOutcome, Selected,
 };
+// The type only. `schema::extract_json` stays in its module: at the crate root
+// it would be a name with no subject, and the one caller that wants it is the
+// run loop, which is already naming the module to build the schema.
+pub use schema::OutputSchema;
 pub use session::{
     Session, Steer, SteerInbox, Steering, Transcript, TranscriptTurn, TurnKind, TurnResult,
 };

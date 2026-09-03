@@ -365,6 +365,52 @@ fn the_boundary_is_one_helper_that_both_loops_call() {
     );
 }
 
+/// 0.77.0 — provenance framing is the same shape of rule, held to the same shape of
+/// assertion.
+///
+/// It belongs in this file rather than beside its own tests because what it must not
+/// do is disturb the boundary above, and the way it would come to disturb one loop
+/// and not the other is by being written twice or called once. A tree run whose
+/// external content is unframed while a flat run's is framed is the 0.44.0 drift
+/// again, with a security marker in place of a cache marker.
+///
+/// The position is asserted too, and it is the load-bearing half: framing after
+/// `user` is derived leaves the flat string and the transcript as two different
+/// accounts of one turn, which is the thing three subsystems assume cannot happen.
+#[test]
+fn framing_is_one_helper_both_loops_call_before_they_derive_the_user_block() {
+    let src = run_subsystem_source();
+
+    assert_eq!(
+        src.matches("fn frame_external").count(),
+        1,
+        "frame_external is defined exactly once"
+    );
+    let calls = src.matches("frame_external(&mut assembled);").count();
+    assert_eq!(
+        calls, 2,
+        "frame_external is called by both loops and by nothing else, found {calls} call sites"
+    );
+
+    // Each loop assembles, frames, then derives `user` — in that order. Asserted by
+    // position rather than by presence, because all three lines can be there in the
+    // wrong order and every other test in this file still passes.
+    for (assembled_at, _) in src.match_indices("let mut assembled = assemble(") {
+        let rest = &src[assembled_at..];
+        let framed_at = rest
+            .find("frame_external(&mut assembled);")
+            .expect("an assembly this loop never frames");
+        let user_at = rest
+            .find("let user = match &conversational {")
+            .expect("an assembly this loop never turns into a user block");
+        assert!(
+            framed_at < user_at,
+            "a loop derives `user` before framing, so its flat string and its transcript \
+             are no longer the same bytes"
+        );
+    }
+}
+
 // ------------------------------------------------------------------------ O3
 
 /// O3 — no shipped sentence still says the transcript carries no breakpoint.
@@ -641,6 +687,66 @@ async fn a_run_that_never_folds_marks_no_messages() {
 
     for (i, req) in provider.working().iter().enumerate() {
         assert_eq!(req.cache_through, None, "request {i} was marked");
+    }
+}
+
+// ---------------------------------------------- 0.77.0: the framing pays no cache
+
+/// **F20** — 0.77.0's provenance framing is confined to transcript content, so the
+/// system block is byte-identical across turns whose tool output changed.
+///
+/// The first breakpoint is the end of the `system` block, and it is a byte-prefix
+/// condition like the second one: a single byte moved there is a cache *write* on
+/// every step of every run, not a smaller read. Provenance framing wraps what a tool
+/// returned — which sits after both markers — and this is the arm that says so
+/// mechanically rather than by reading the diff and believing it.
+///
+/// Asserted on a run that reads a **different file every step**, so the observation
+/// section, the transcript and every framed span move underneath a block that must
+/// not. A framing applied one layer too high — to the whole prompt, to the
+/// instructions, or to anything `compose` emits — fails here while F3, F4 and F7
+/// still pass, because none of those looks at `system` at all.
+///
+/// The inequality on `user` is the anti-vacuity guard. Without it a run whose steps
+/// happened to send the same prompt twice would pass this by asserting that nothing
+/// changed anywhere, which is not the claim.
+#[tokio::test]
+async fn the_system_block_is_byte_identical_across_turns_whose_tool_output_changed() {
+    let dir = workspace();
+    let provider = Recorder::new(NAMES.iter().map(|n| vec![read(n)]).collect());
+    let store = Store::memory().unwrap();
+
+    run_with(
+        &contract(dir.path(), NAMES.len() as u32),
+        &provider,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let working = provider.working();
+    assert!(
+        working.len() > 1,
+        "one working request proves nothing about what moves between turns"
+    );
+    assert!(
+        working
+            .iter()
+            .any(|r| r.user != working[0].user && !r.messages.is_empty()),
+        "the fixture must actually change its tool output and carry a transcript, \
+         or this passes vacuously"
+    );
+
+    let first = &working[0].system;
+    for (i, req) in working.iter().enumerate() {
+        assert_eq!(
+            &req.system, first,
+            "the system block moved on working request {i}: the first cache breakpoint \
+             is a byte prefix, so anything emitted into `system` per turn is a cache \
+             write on every step of every run"
+        );
     }
 }
 

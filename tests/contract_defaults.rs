@@ -9,7 +9,8 @@
 //! That is the drift this release exists to end, so it is the thing asserted.
 
 use io_harness::{
-    TaskContract, Verification, DEFAULT_MAX_RETRIES, DEFAULT_MAX_STEPS, DEFAULT_WORKSPACE_MAX_STEPS,
+    OutputSchema, TaskContract, Verification, DEFAULT_MAX_RETRIES, DEFAULT_MAX_STEPS,
+    DEFAULT_WORKSPACE_MAX_STEPS,
 };
 
 fn single() -> TaskContract {
@@ -54,4 +55,39 @@ fn the_two_step_budgets_stay_distinct() {
 fn a_caller_can_scale_the_default_without_knowing_it() {
     let patient = single().with_max_steps(DEFAULT_MAX_STEPS * 2);
     assert_eq!(patient.max_steps, single().max_steps * 2);
+}
+
+/// 0.77.0, F1. Declaring no output schema is the default, from both
+/// constructors, and the default is what every release before 0.77.0 did: no
+/// declaration reaches a vendor and nothing is validated locally.
+///
+/// Asserted from the constructors rather than from `Default`, for the reason
+/// this whole file exists — a constructor that stopped reading the default is
+/// the drift being watched for, not the literal it was written with.
+#[test]
+fn neither_constructor_declares_an_output_schema() {
+    assert!(single().output_schema.is_none());
+    assert!(workspace().output_schema.is_none());
+}
+
+/// And declaring one is the only way to get one. A schema on the contract came
+/// from a caller saying so, never from a default that happened to be set
+/// somewhere — which is what makes the absence above a real negative control
+/// rather than a coincidence of construction order.
+#[test]
+fn a_declared_output_schema_is_the_one_the_caller_built() {
+    let document = serde_json::json!({
+        "type": "object",
+        "properties": { "summary": { "type": "string" } },
+        "required": ["summary"],
+    });
+    let schema = OutputSchema::new(document.clone()).expect("a supported schema");
+
+    let declared = single().with_output_schema(schema);
+
+    assert_eq!(
+        declared.output_schema.as_ref().map(OutputSchema::as_value),
+        Some(&document),
+        "the document sent to a vendor must be the one the caller wrote"
+    );
 }

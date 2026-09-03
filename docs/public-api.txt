@@ -96,6 +96,7 @@ enum MemoryForget src/state.rs
 enum MemoryKind src/state.rs
 enum Message src/provider/mod.rs
 enum OnFailure src/hooks.rs
+enum Origin src/context.rs
 enum PlanVerdict src/approve.rs
 enum PriceSource src/provider/mod.rs
 enum Progressing src/resilience.rs
@@ -183,6 +184,7 @@ struct ModelInfo src/provider/mod.rs
 struct ModelReviewer src/verify.rs
 struct OpenAi src/provider/openai.rs
 struct OpenRouter src/provider/openrouter.rs
+struct OutputSchema src/schema.rs
 struct Pending src/state.rs
 struct PendingPlan src/state.rs
 struct PendingQuestion src/state.rs

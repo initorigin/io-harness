@@ -545,6 +545,67 @@ pub(super) fn finished(contract: &TaskContract, response: &CompletionResponse) -
     matches!(contract.verify, Verification::None) && answered(response)
 }
 
+/// Does this completion's text satisfy the shape the caller demanded (0.77.0)?
+///
+/// `None` means there is nothing to answer — no schema was declared, so every
+/// existing contract reaches [`finished`] exactly as it did in 0.76.0. `Some(Ok)`
+/// is a conforming answer. `Some(Err)` carries the reasons, already worded for
+/// the model to act on, in `parse_plan`'s register rather than `serde_json`'s.
+///
+/// **Which text.** The model's own final words — the same string the
+/// `(no tool call)` marker carries into the ledger and the same one
+/// `Session::last_message` reads back out. A caller reads back exactly what was
+/// checked; validating anything else would let a run report success over text
+/// nobody will ever see.
+///
+/// **Where this sits relative to the gate, and why that order.** A schema is
+/// checked *before* [`finished`] can end the run, and a
+/// [`Verification`](crate::Verification) gate is unaffected by it. On the
+/// `Verification::None` path the schema is the only judge, which is the whole
+/// point of declaring one. On a gated path the gate still decides whether the
+/// work is right — a schema says the answer is well formed, never that it is
+/// correct — so the two compose rather than one replacing the other. Ordering it
+/// the other way round would let a malformed answer satisfy a gate that reads the
+/// workspace and never looks at the reply.
+pub(super) fn conforms(
+    contract: &TaskContract,
+    response: &CompletionResponse,
+) -> Option<std::result::Result<(), Vec<String>>> {
+    let schema = contract.output_schema.as_ref()?;
+    let text = response.text.as_deref().unwrap_or_default();
+    Some(schema.validate_text(text).map(|_| ()))
+}
+
+/// What the model is told when its answer did not fit the declared shape
+/// (0.77.0).
+///
+/// Written for the model rather than for a log, in the register
+/// [`parse_plan`](crate::run::gate) uses: it names what is wrong and what to do,
+/// and it does not name a Rust type. Delivered as an ordinary
+/// [`ObsKind::Message`](crate::context::ObsKind) observation with
+/// [`Origin::Prose`](crate::context::Origin), because the harness wrote it —
+/// marking it external would frame this crate's own words as untrusted content.
+pub(super) fn schema_directive(errors: &[String], attempts_left: u32) -> String {
+    let mut out = String::from(
+        "\n[output shape] Your last answer did not match the shape this task requires:\n",
+    );
+    for error in errors {
+        out.push_str("  - ");
+        out.push_str(error);
+        out.push('\n');
+    }
+    out.push_str(
+        "Reply again with only the JSON document, and nothing else — no prose around it and no \
+         code fence. ",
+    );
+    if attempts_left == 1 {
+        out.push_str("This is the last attempt.\n");
+    } else {
+        out.push_str(&format!("{attempts_left} attempts remain.\n"));
+    }
+    out
+}
+
 /// Did this completion end the exchange — no tool call, and not a pause?
 ///
 /// The half of [`finished`] that is about the *response* rather than about the
@@ -689,6 +750,11 @@ pub(super) fn restore_ledger(store: &Store, run_id: i64) -> Result<(ContextLedge
                 ObsKind::Message,
                 Some("summary".into()),
                 format!("\n[earlier work, summarised]\n{}\n", summary.text),
+                // A paragraph this crate wrote about the conversation, not a
+                // thing either party said — the same origin `compact_ledger`
+                // states when it writes the fold in the first place, so a
+                // restored fold and a live one are the same row.
+                Origin::Prose,
             ),
         );
     }
@@ -703,9 +769,9 @@ pub(super) fn restore_ledger(store: &Store, run_id: i64) -> Result<(ContextLedge
 ///
 /// The other half of what [`restore_ledger`] restores. The ledger holds every
 /// tool *result* and, because [`Piece::of`](crate::context::Piece) classifies by
-/// kind and ordinals are counted positionally per step, a restored ledger
-/// correlates every result with the call it answers — as soon as there is a call
-/// to correlate it with. This is those calls.
+/// the origin each row recorded and ordinals are counted positionally per step, a
+/// restored ledger correlates every result with the call it answers — as soon as
+/// there is a call to correlate it with. This is those calls.
 ///
 /// Empty for a run written before 0.64.0 and for a run that took no step. Those
 /// are the same to a reader and both mean "there is nothing to restore", which is

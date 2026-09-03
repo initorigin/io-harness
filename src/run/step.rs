@@ -208,11 +208,26 @@ pub(super) fn seed_conversation(ledger: &mut ContextLedger, extras: &TurnExtras<
     for (speaker, entry) in extras.seed {
         // 0.49.0 — tagged with who was speaking, so the transcript can send it as
         // that speaker's own turn rather than as narration inside another.
+        //
+        // 0.77.0 — and *stated* here rather than re-derived from that tag. One
+        // seed carries both parties and a folded span, so a single origin literal
+        // for the loop would be wrong for two of the three; the speaker the seed
+        // already knows is what chooses it. The target stays because a trace and a
+        // transcript render it — a label, not the classifier it used to be.
+        let origin = match *speaker {
+            crate::context::SEED_OPERATOR => Origin::Operator,
+            crate::context::SEED_AGENT => Origin::Agent,
+            // `SEED_SUMMARY`, and anything a later release seeds: narration about
+            // the conversation rather than a turn of it. Never `Unmarked` — that
+            // variant means "a row older than this column" and nothing else.
+            _ => Origin::Prose,
+        };
         ledger.push(Observation::new(
             0,
             ObsKind::Message,
             Some((*speaker).to_string()),
             entry.clone(),
+            origin,
         ));
     }
 }
@@ -422,6 +437,11 @@ pub(super) fn drain_steer(
             ObsKind::Message,
             None,
             format!("\n[operator, mid-turn] {message}\n"),
+            // The operator's own words, so the transcript sends them as the
+            // operator's turn rather than as narration inside somebody else's —
+            // which is what 0.76.0 did, because a `Message` with no target was
+            // indistinguishable from a replan directive.
+            Origin::Operator,
         ));
     }
     Ok(None)
@@ -536,6 +556,9 @@ pub(super) async fn run_from<P: Provider>(
             // images are in play here.
             #[cfg(feature = "media")]
             media: attach_media(contract, &mut PendingMedia::default())?,
+            // 0.77.0 — as in the workspace loop. The single-file loop validates
+            // through the same helper, so a schema means the same thing here.
+            output_schema: contract.output_schema.clone(),
             ..Default::default()
         };
 
@@ -604,6 +627,29 @@ pub(super) async fn run_from<P: Provider>(
                 finish(store, watch, run_id, 0, step, "cost_budget_exceeded")?;
                 return Ok(RunResult::new(
                     RunOutcome::CostBudgetExceeded { steps: step },
+                    run_id,
+                ));
+            }
+        }
+
+        // 0.77.0 — the declared shape, checked here too.
+        //
+        // This loop has no ledger to re-prompt through — it is the single-file
+        // path, whose whole context is the file and the goal — so a schema that
+        // is not satisfied ends the run rather than asking again. That is the
+        // narrow reading and it is the honest one: the alternative is sending
+        // `response_format` on this path and never checking the reply, which is
+        // the "accepted but never checked" defect that `OutputSchema`'s own
+        // constructor exists to make impossible one level down.
+        if answered(&response) {
+            if let Some(Err(errors)) = conforms(contract, &response) {
+                store.record_context_event(
+                    run_id,
+                    &ContextEvent::replan(step, format!("output shape: {}", errors.join("; "))),
+                )?;
+                finish(store, watch, run_id, 0, step, "schema_unsatisfied")?;
+                return Ok(RunResult::new(
+                    RunOutcome::SchemaUnsatisfied { steps: step },
                     run_id,
                 ));
             }
@@ -990,6 +1036,16 @@ pub(super) async fn run_workspace_from<P: Provider>(
     let mut span_from = std::time::Instant::now();
     let mut store_tail: Option<std::time::Duration> = None;
 
+    // 0.77.0 — how many times the model has answered in the wrong shape.
+    //
+    // Bounded by `max_retries` rather than by a knob of its own. That field
+    // already means "how many times may this run re-ask the same question", which
+    // is exactly what a schema re-prompt is; a second budget for one release would
+    // be a number an operator has to discover, set, and keep consistent with the
+    // first for no gain. If a caller ever needs them separately, splitting one
+    // field into two is a smaller change than removing a knob nobody wanted.
+    let mut schema_attempts: u32 = 0;
+
     for step in start_step..=contract.max_steps {
         // 0.75.0 — this step is the one being attributed from here on. Whatever the
         // last step left staged is discarded: a step that never reached its commit
@@ -1160,7 +1216,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 fold_forced(recovered, 0, &mut fold_asked),
             )
             .await?;
-            let assembled = assemble(
+            let mut assembled = assemble(
                 &ledger,
                 budget_tokens,
                 &notes,
@@ -1175,6 +1231,12 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 },
             )
             .await?;
+            // 0.77.0 — provenance framing, here and nowhere else: after assembly,
+            // because only the emission knows which bytes came from outside, and
+            // before `user` is derived, because `user` and the transcript must stay
+            // the same bytes. Moving this one line below the `user` binding is the
+            // whole of how that invariant breaks.
+            frame_external(&mut assembled);
             // 0.48.0 — asked by the same condition that already chooses the system
             // half below, so the two halves of one completion cannot disagree.
             let user = match &conversational {
@@ -1212,6 +1274,11 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 // 0.49.0 — the same breakpoint the line above names, counted in
                 // messages because that is what this request sends.
                 cache_through: cache_through_for(cache_boundary, &messages),
+                // 0.77.0 — the shape the caller demanded, carried to the vendors
+                // whose wire has a place for it. A hint that reduces attempts, and
+                // never the thing trusted: `validate_final_output` below is the
+                // gate, and it runs whether or not the vendor honoured this.
+                output_schema: contract.output_schema.clone(),
                 #[cfg(feature = "media")]
                 media: attach_media(contract, pending_media)?,
                 ..Default::default()
@@ -1358,6 +1425,11 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     entry_cap,
                     ObsKind::Message,
                 ),
+                // This crate's note ABOUT a web search, never the search's own
+                // results: the provider executed the tool and what failed is all
+                // that reaches here. Marking it `Web` would frame the harness's
+                // own report of a failure as untrusted page content.
+                Origin::Prose,
             ));
         }
         if response.tool_calls.is_empty() {
@@ -1371,6 +1443,9 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     entry_cap,
                     ObsKind::Message,
                 ),
+                // The model's own final text. There is no tool call on this step,
+                // so nothing is answered and it can be sent as the agent's turn.
+                Origin::Agent,
             ));
             decisions.push("no tool call".into());
         }
@@ -1605,11 +1680,17 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     obs,
                     kind,
                     target,
+                    origin,
                     changed,
                     remember,
                 } => {
                     step_changed |= changed;
-                    ledger.push(Observation::new(step, kind, target, obs));
+                    // The origin is forwarded, never chosen here. Every dispatched
+                    // result in the flat loop enters the ledger through this one
+                    // line, so a literal at this site would mark an MCP response
+                    // and a file read identically — which is the derivation
+                    // 0.77.0 exists to delete, rebuilt one level up.
+                    ledger.push(Observation::new(step, kind, target, obs, origin));
                     decisions.push(decision);
                     new_rules.extend(remember);
                 }
@@ -1670,6 +1751,10 @@ pub(super) async fn run_workspace_from<P: Provider>(
                         entry_cap,
                         ObsKind::Message,
                     ),
+                    // The plan is the operator's, but the notice is this crate's
+                    // framing of it — the same words `record_plan_decision`
+                    // writes on the resumed path, and marked the same way there.
+                    Origin::Prose,
                 ));
             }
         }
@@ -1746,6 +1831,10 @@ pub(super) async fn run_workspace_from<P: Provider>(
                         entry_cap,
                         ObsKind::Message,
                     ),
+                    // The harness telling the agent to change approach. Nothing
+                    // outside the run supplied a word of it, so it must not be
+                    // framed as content from outside.
+                    Origin::Prose,
                 ));
                 info!(run_id, step, "agent told to change approach");
                 watch.emit(RunEvent::new(
@@ -1840,6 +1929,50 @@ pub(super) async fn run_workspace_from<P: Provider>(
             }
         }
 
+        // 0.77.0 — the shape the caller demanded, checked before the run may end.
+        //
+        // Ahead of `finished` on purpose: a schema exists to stop a malformed
+        // answer being reported as a finished one. A failure is not an error —
+        // it is a re-prompt, delivered the way `replan_directive` is, and the
+        // loop takes another step. **That step is an ordinary step**: it is
+        // counted, its tokens are counted, and the budget checks above run before
+        // this block, so a run whose step budget is smaller than its attempt cap
+        // stops on the step budget. A retry loop no budget can see is how a
+        // bounded run becomes unbounded.
+        if answered(&response) {
+            if let Some(Err(errors)) = conforms(contract, &response) {
+                schema_attempts += 1;
+                let left = contract.max_retries.saturating_sub(schema_attempts);
+                store.record_context_event(
+                    run_id,
+                    &ContextEvent::replan(step, format!("output shape: {}", errors.join("; "))),
+                )?;
+                if left == 0 {
+                    finish(store, watch, run_id, 0, step, "schema_unsatisfied")?;
+                    return Ok(RunResult::new(
+                        RunOutcome::SchemaUnsatisfied { steps: step },
+                        run_id,
+                    )
+                    .with_remembered(remembered));
+                }
+                ledger.push(Observation::new(
+                    step,
+                    ObsKind::Message,
+                    None,
+                    bound(
+                        &schema_directive(&errors, left),
+                        entry_cap,
+                        ObsKind::Message,
+                    ),
+                    // The harness wrote this sentence. Marking it external would
+                    // frame this crate's own words to the model as untrusted.
+                    Origin::Prose,
+                ));
+                decisions.push("output shape rejected".into());
+                continue;
+            }
+        }
+
         // A run with no criterion ends when the agent stops calling tools. Checked
         // after the budgets, so a step that also crossed a ceiling reports the
         // ceiling, and before the gate, which for this variant can never pass.
@@ -1907,6 +2040,16 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     ObsKind::Error,
                     None,
                     bound(&section, entry_cap, ObsKind::Error),
+                    // The gate's report, composed here — and this is the one site
+                    // in the flat loop where stating the origin CHANGES what the
+                    // transcript sends. `ObsKind::Error` used to derive to
+                    // `Piece::Result`, so a feedback block carrying this step's
+                    // number took a position in that step's positional ordinal
+                    // count for a call that does not exist, which pushed the
+                    // whole step past `turns`' bounds check and dropped it back
+                    // to prose. It is narration about the run, it says so now,
+                    // and the step it rides keeps its structure.
+                    Origin::Prose,
                 ));
                 last_gate_feedback = Some(key);
             }
@@ -2011,6 +2154,11 @@ pub(super) fn navigated(name: &str, answer: Result<String>, cap: usize) -> Dispa
         obs: bound(&obs, cap, ObsKind::Tool),
         kind: ObsKind::Tool,
         target: None,
+        // A language server answered, and this is the only site that knows it:
+        // the navigation tools wear `ObsKind::Tool` alongside `exec`, the
+        // browser and every registered tool, so the kind cannot say which of
+        // them spoke.
+        origin: Origin::Lsp,
         // A question changes nothing, so it is not progress for the stall signal —
         // the same reasoning `check` is not.
         changed: false,

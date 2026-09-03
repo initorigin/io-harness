@@ -79,6 +79,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::context::Origin;
+
 /// Whether the run should keep going.
 ///
 /// Returned from every [`Observer::event`] call. This is the only way to stop a
@@ -374,6 +376,41 @@ pub enum EventKind {
         name: String,
         /// What it was pointed at — a path, a host, a server.
         target: String,
+        /// (0.77.0) How whatever this call returns will be marked in the
+        /// transcript: the [`Origin`] the dispatch site will hand to
+        /// [`Observation::new`](crate::context::Observation::new).
+        ///
+        /// It rides this event rather than a new one because the alternative is
+        /// an event per observation, and a run makes several of those per step —
+        /// a live channel someone is watching would be flooded to carry a word
+        /// that is already knowable here. An origin is a property of the *tool*,
+        /// not of its output: a fetch returns [`Origin::Web`]
+        /// whatever it fetches, so announcing it before the result exists is a
+        /// true statement, not a prediction. That makes this the one place the
+        /// question "was anything in this run external, and from what kind of
+        /// source" is answerable from the stream alone — every external piece of
+        /// content enters through a tool dispatch, and every dispatch is
+        /// announced here. Before 0.77.0 the answer meant opening
+        /// `ledger_observations` and reading the `origin` column, which is the
+        /// thing [`Observer`] exists to make unnecessary.
+        ///
+        /// The word is exactly what the stored column holds — this is
+        /// [`Origin`] itself, not a second enumeration
+        /// of the same list, so a `mcp` on the channel and a `mcp` in the ledger
+        /// cannot drift apart into two vocabularies that agree by hand.
+        ///
+        /// `None` is a dispatch this release did not mark, not an origin of
+        /// "none" and never a claim the content was internal: a reader deciding
+        /// what to trust must treat an unmarked call as it treats
+        /// [`Origin::Unmarked`] — unknown, not safe.
+        ///
+        /// Both serde attributes are load-bearing, for the reasons
+        /// [`Mcp`](EventKind::Mcp)'s `tools` field records in 0.68.0: `default`
+        /// is what lets a `run_events` row written before 0.77.0 deserialize,
+        /// and `skip_serializing_if` is what keeps an unmarked `tool_call`
+        /// byte-identical to the one 0.76.0 wrote.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Origin>,
     },
     /// The policy refused an action. It did not happen.
     Refused {
@@ -1624,6 +1661,138 @@ mod tests {
         assert_eq!(v["step"], 9);
     }
 
+    /// N6, the channel's half. The `origin` on a `tool_call` and the `origin`
+    /// column of `ledger_observations` are one vocabulary or they are two that
+    /// happen to agree today, and the difference shows up the release somebody
+    /// renames a word in one of them. Walking every origin is what makes the
+    /// mapping total in both directions rather than spot-checked.
+    ///
+    /// The `match` is exhaustive on purpose and legal because this is the crate
+    /// that defines [`Origin`](crate::context::Origin): `#[non_exhaustive]`
+    /// stops *another* crate matching this way, not this one. The words are
+    /// typed out rather than asked of
+    /// [`Origin::as_str`](crate::context::Origin::as_str) — comparing `as_str`
+    /// to itself would pass through any rename — so a thirteenth origin fails to
+    /// compile here instead of reaching the wire under a word nothing pinned.
+    #[test]
+    fn every_origin_reaches_the_channel_under_the_word_the_ledger_stores() {
+        const ALL_ORIGINS: [Origin; 12] = [
+            Origin::Operator,
+            Origin::Agent,
+            Origin::Prose,
+            Origin::File,
+            Origin::Shell,
+            Origin::Web,
+            Origin::Mcp,
+            Origin::Lsp,
+            Origin::Skill,
+            Origin::Child,
+            Origin::Tool,
+            Origin::Unmarked,
+        ];
+
+        for origin in ALL_ORIGINS {
+            let word = match origin {
+                Origin::Operator => "operator",
+                Origin::Agent => "agent",
+                Origin::Prose => "prose",
+                Origin::File => "file",
+                Origin::Shell => "shell",
+                Origin::Web => "web",
+                Origin::Mcp => "mcp",
+                Origin::Lsp => "lsp",
+                Origin::Skill => "skill",
+                Origin::Child => "child",
+                Origin::Tool => "tool",
+                Origin::Unmarked => "unmarked",
+            };
+            assert_eq!(
+                word,
+                origin.as_str(),
+                "{origin:?} renders one word for a trace and another here"
+            );
+
+            let v = serde_json::to_value(RunEvent::new(
+                1,
+                1,
+                EventKind::ToolCall {
+                    name: "read_file".into(),
+                    target: "src/a.rs".into(),
+                    origin: Some(origin),
+                },
+            ))
+            .unwrap();
+            assert_eq!(
+                v["origin"], word,
+                "{origin:?} does not reach the channel as the word the ledger stores"
+            );
+
+            let back: RunEvent = serde_json::from_value(v).unwrap();
+            let EventKind::ToolCall { origin: got, .. } = back.kind else {
+                panic!("a tool_call did not read back as one")
+            };
+            assert_eq!(
+                got,
+                Some(origin),
+                "{origin:?} did not survive the round trip"
+            );
+        }
+    }
+
+    /// The 0.77.0 field is additive or it is nothing. An unmarked `tool_call`
+    /// must be the *same object* 0.76.0 wrote, not merely one 0.76.0's reader
+    /// tolerates — which is why this asserts the whole value and the absence of
+    /// the key, rather than that it deserializes. Without
+    /// `skip_serializing_if` the field would render as `"origin": null`: legal
+    /// JSON, accepted everywhere, and a diff on every stored `run_events` row
+    /// ever written for a call nobody marked.
+    ///
+    /// The second half is the read side of the same promise — a row written by a
+    /// binary that had no such key at all.
+    #[test]
+    fn an_unmarked_tool_call_keeps_the_0_76_0_shape_exactly() {
+        let v = serde_json::to_value(RunEvent::at_depth(
+            7,
+            3,
+            1,
+            EventKind::ToolCall {
+                name: "read_file".into(),
+                target: "src/a.rs".into(),
+                origin: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "run_id": 7,
+                "step": 3,
+                "depth": 1,
+                "event": "tool_call",
+                "name": "read_file",
+                "target": "src/a.rs",
+            }),
+            "an unmarked tool_call is not the shape 0.76.0 serialized"
+        );
+        assert!(
+            v.get("origin").is_none(),
+            "an unmarked origin must be an absent key, not a null"
+        );
+
+        let old: RunEvent = serde_json::from_str(
+            r#"{"run_id":7,"step":3,"depth":1,"event":"tool_call","name":"read_file","target":"src/a.rs"}"#,
+        )
+        .expect("a run_events row written before 0.77.0 still deserializes");
+        assert_eq!(
+            old.kind,
+            EventKind::ToolCall {
+                name: "read_file".into(),
+                target: "src/a.rs".into(),
+                origin: None,
+            }
+        );
+    }
+
     /// F3, first assertion. [`EVENT_NAMES`] is the list a `[[hook]]`'s `on` is
     /// validated against, so a variant missing from it is a filter an operator can
     /// write and that will never fire — a silence, not an error. The only way to
@@ -1806,6 +1975,9 @@ mod tests {
             EventKind::ToolCall {
                 name: "n".into(),
                 target: "t".into(),
+                // Marked, so `every_variant_round_trips` carries the 0.77.0 field
+                // through serde too. The unmarked shape has its own test.
+                origin: Some(Origin::Shell),
             },
             EventKind::Refused {
                 act: "read".into(),

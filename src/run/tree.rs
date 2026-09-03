@@ -192,6 +192,11 @@ pub(super) fn fold_collected<P: Provider>(
             ObsKind::Child,
             None,
             bound(&text, entry_cap, ObsKind::Child),
+            // A sub-agent composed this. It is the child's own words in the
+            // `Composed` arm and this crate's notice in the other two, and it is
+            // marked `Child` throughout: the model cannot tell which arm it is
+            // reading, and the distrusting answer is the one to be wrong with.
+            Origin::Child,
         ));
     }
     Ok(())
@@ -263,7 +268,13 @@ pub(super) async fn drain_children<P: Provider>(
         ));
         tree.store.record_observations(
             run_id,
-            &[Observation::new(step, ObsKind::Child, None, text)],
+            &[Observation::new(
+                step,
+                ObsKind::Child,
+                None,
+                text,
+                Origin::Child,
+            )],
         )?;
     }
     Ok(())
@@ -657,7 +668,7 @@ where
                     fold_forced(recovered, depth, &mut fold_asked),
                 )
                 .await?;
-                let assembled = assemble(
+                let mut assembled = assemble(
                     &ledger,
                     budget_tokens,
                     &notes,
@@ -679,6 +690,13 @@ where
                     },
                 )
                 .await?;
+                // 0.77.0 — the same rule as the flat loop, through the same helper,
+                // in the same position: after assembly and before `user`. A frame
+                // applied in one loop and not the other would leave a contained run
+                // and a flat one marking provenance differently while every test
+                // still passed — the constraint `cache_boundary_for` above is here
+                // for as well.
+                frame_external(&mut assembled);
                 // 0.48.0 — the same rule as the flat loop, and for the same reason
                 // the system half is chosen this way here too.
                 let user = match &conversational {
@@ -881,6 +899,10 @@ where
                         entry_cap,
                         ObsKind::Message,
                     ),
+                    // The flat loop's origin for the flat loop's reason: this is
+                    // the harness's note ABOUT a search, never the search's
+                    // results.
+                    Origin::Prose,
                 ));
             }
             if response.tool_calls.is_empty() {
@@ -894,6 +916,8 @@ where
                         entry_cap,
                         ObsKind::Message,
                     ),
+                    // The model's own text, on a step with no call to answer.
+                    Origin::Agent,
                 ));
                 decisions.push("no tool call".into());
             }
@@ -965,10 +989,11 @@ where
                             obs,
                             kind,
                             target,
+                            origin,
                             ..
                         } = refused
                         {
-                            ledger.push(Observation::new(step, kind, target, obs));
+                            ledger.push(Observation::new(step, kind, target, obs, origin));
                             decisions.push(decision);
                         }
                         continue;
@@ -997,6 +1022,13 @@ where
                                 entry_cap,
                                 ObsKind::Error,
                             ),
+                            // This crate's own refusal, and marked the way
+                            // `Dispatched::go` marks the refusals that come back
+                            // through the funnel — for that reason and not for a
+                            // claim about the words. It answers the `spawn_agent`
+                            // call and so has to hold that call's position; see
+                            // `Dispatched::go` in `src/run/gate.rs`.
+                            Origin::Tool,
                         ));
                         decisions.push(format!("{SPAWN_TOOL} refused (planning)"));
                         continue;
@@ -1039,6 +1071,13 @@ where
                         ObsKind::Child,
                         None,
                         bound(&obs, entry_cap, ObsKind::Child),
+                        // `read_messages` returns another agent's words verbatim,
+                        // which is the shape this has to be right for; the send
+                        // receipt that shares the arm carries none and is marked
+                        // the same way rather than split, because one origin per
+                        // observation is the contract and the distrusting answer
+                        // is the one to be wrong with.
+                        Origin::Child,
                     ));
                     decisions.push(decision);
                     // Reading is not progress and sending is: an agent that only
@@ -1092,11 +1131,16 @@ where
                         obs,
                         kind,
                         target,
+                        origin,
                         changed,
                         remember,
                     } => {
                         step_changed |= changed;
-                        ledger.push(Observation::new(step, kind, target, obs));
+                        // Forwarded, never chosen here — the tree's copy of the
+                        // flat loop's funnel, and the same argument applies: one
+                        // literal at this line would mark an MCP response and a
+                        // file read identically.
+                        ledger.push(Observation::new(step, kind, target, obs, origin));
                         decisions.push(decision);
                         new_rules.extend(remember);
                     }
@@ -1162,6 +1206,8 @@ where
                             entry_cap,
                             ObsKind::Message,
                         ),
+                        // The flat loop's origin for the same notice.
+                        Origin::Prose,
                     ));
                 }
             }
@@ -1225,6 +1271,13 @@ where
                                 ObsKind::Child,
                                 None,
                                 bound(&obs, entry_cap, ObsKind::Child),
+                                // No child bytes yet — this is the notice that
+                                // one detached — but it answers the `spawn_agent`
+                                // call and holds that call's position, and the
+                                // report that arrives at a later step under the
+                                // same origin is the child's own. Marked `Child`
+                                // so the two halves of one spawn read alike.
+                                Origin::Child,
                             ));
                             decisions.push(decision);
                             // Starting a child is work the parent did, whether or
@@ -1242,6 +1295,9 @@ where
                                 ObsKind::Child,
                                 None,
                                 bound(&obs, entry_cap, ObsKind::Child),
+                                // The sub-agent's own composed result — the case
+                                // `Origin::Child` exists for.
+                                Origin::Child,
                             ));
                             decisions.push(decision);
                             // A child that ran did work the parent did not have to.
@@ -1331,6 +1387,9 @@ where
                             entry_cap,
                             ObsKind::Message,
                         ),
+                        // The harness telling the agent to change approach — the
+                        // flat loop's origin for the flat loop's directive.
+                        Origin::Prose,
                     ));
                     info!(run_id, depth, step, "agent told to change approach");
                     tree.watch.emit(RunEvent::at_depth(
@@ -1543,6 +1602,11 @@ where
                         ObsKind::Error,
                         None,
                         bound(&section, entry_cap, ObsKind::Error),
+                        // The flat loop's origin, and the same correction: gate
+                        // feedback is narration about the run, so it no longer
+                        // takes a position in this step's ordinal count for a
+                        // call that does not exist. See `step.rs`.
+                        Origin::Prose,
                     ));
                     last_gate_feedback = Some(key);
                 }
