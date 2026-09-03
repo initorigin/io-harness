@@ -435,6 +435,44 @@ and the folded observations are still in the store: what got shorter is the seed
 not the record. Nothing new is stored for it — it is a join between the turn rows
 and the `summaries` rows, both of which were already there.
 
+## Shortening instead of eliding: Context Collapse (0.76.0)
+
+A fold is the last rung of a ladder, and until 0.76.0 it was the only rung. An
+observation that did not fit the turn's budget had two shapes: carried whole, or
+replaced by a one-line stub telling the model to re-run it. Context Collapse is
+the rung between them — the entry is carried *shortened*.
+
+```rust
+use io_harness::{Collapse, TaskContract};
+
+let contract = TaskContract::workspace("audit the handlers", "/repo")
+    .with_collapse(Collapse { keep_chars: 4_000 });
+```
+
+`keep_chars` is a character count, and it is applied by the same helper that caps
+a single oversized observation — so a shortened entry carries the marker a
+truncated one carries, and a read keeps its tail while everything else keeps its
+head.
+
+Three things follow, and they are the reason to reach for this before a fold:
+
+- **It costs no model call.** The shortening happens while the turn is being
+  assembled. Nothing is summarised, so nothing is bought.
+- **It is reversible.** Turn it off on a later turn and every entry it shortened
+  is assembled whole again. A fold cannot do that: it has already replaced the
+  entries and bought a paragraph to stand in for them.
+- **A shortened entry is still an observation of a path.** It keeps its kind and
+  its target, so the rules that invalidate a stale read and re-read it still find
+  it. Behind a fold those entries are one prose paragraph with neither.
+
+`Collapse { keep_chars: 0 }` is off, and off is the default. A caller who
+configures nothing is projected exactly what 0.75.0 projected. `fold` stays the
+last rung and stays the default trigger; a collapse only ever changes what happens
+to an entry that was going to be stubbed anyway.
+
+There is no `io.toml` key for it. It is set on the contract, like the budget and
+unlike the memory limits.
+
 ## The limits, stated plainly
 
 Assembly **bounds** what a request carries and applies exactly the two staleness
