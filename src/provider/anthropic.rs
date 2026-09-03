@@ -116,6 +116,29 @@ impl Anthropic {
         Ok(Self::new(api_key, model))
     }
 
+    /// The Messages request body.
+    ///
+    /// **(0.77.0) [`CompletionRequest::output_schema`] is deliberately not carried
+    /// here, and its absence is not an oversight.** The Messages API has no
+    /// `response_format`: the OpenAI-shaped wire's fifth key has no counterpart on
+    /// this one. Anthropic's native route to a shape is a *forced tool call* — a
+    /// tool whose `input_schema` is the document, plus a `tool_choice` naming it —
+    /// which is a different mechanism, not a different spelling. It reshapes the
+    /// turn this crate's run loop is built around: the final answer stops arriving
+    /// as text and arrives as a call, alongside the real tools, that the loop would
+    /// then have to recognise and not dispatch. That is out of scope for 0.77.0 and
+    /// is stated here so the next reader does not add a key to close a gap that was
+    /// measured and left open.
+    ///
+    /// Nothing is lost that this release claimed. The schema is validated locally on
+    /// arrival by [`OutputSchema::validate_text`](crate::schema::OutputSchema::validate_text)
+    /// whatever the provider was told, so a run on Anthropic is checked exactly as
+    /// strictly as one on OpenAI; it may simply take more attempts to get there.
+    /// Emulating the key — inventing a shape Anthropic does not read, or folding the
+    /// document into the system prompt from here — would be worse than the gap: the
+    /// prompt is built in `src/run/prompts.rs`, and a provider that quietly edits the
+    /// instructions it was handed makes the sent prompt something no caller can
+    /// predict from what it wrote.
     fn body(&self, request: &CompletionRequest) -> serde_json::Value {
         let mut tools: Vec<serde_json::Value> = request
             .tools
@@ -1639,6 +1662,31 @@ mod web_wire {
         assert_eq!(b["tools"][0]["blocked_domains"], json!(["evil.test"]));
         assert!(b["tools"][0].get("allowed_domains").is_none());
         assert!(b["tools"][0].get("max_uses").is_none(), "no cap declared");
+    }
+
+    /// F3 — the Messages API has no `response_format`, so a declared output schema
+    /// leaves this body exactly as it was: the same keys carrying the same values,
+    /// with and without one.
+    ///
+    /// The whole body rather than the key set alone, because "no new key" would still
+    /// pass an implementation that folded the schema into `system` or appended a
+    /// forced tool to `tools` — the two emulations 0.77.0 considered and declined. A
+    /// shape reaches an Anthropic run through local validation and a retry, never
+    /// through anything invented here.
+    #[test]
+    fn a_declared_schema_leaves_the_anthropic_body_exactly_as_it_was() {
+        let mut asked = req(None);
+        asked.output_schema = Some(
+            crate::schema::OutputSchema::new(json!({
+                "type": "object",
+                "properties": { "title": { "type": "string" } },
+                "required": ["title"],
+            }))
+            .expect("a valid schema"),
+        );
+        let declared = Anthropic::new("k", "claude-x").body(&asked);
+        assert!(declared.get("response_format").is_none());
+        assert_eq!(declared, Anthropic::new("k", "claude-x").body(&req(None)));
     }
 
     /// NF3, the negative control: a request that declares nothing sends exactly
