@@ -402,13 +402,24 @@ async fn a_masked_call_is_refused_even_when_it_is_speculated_off_the_stream() {
     struct Streaming {
         calls: Vec<ToolCall>,
         at: AtomicUsize,
+        /// Anti-vacuity: how many times the run took the STREAMING entry point.
+        /// Without this the test passes whenever the run never streams at all,
+        /// which is what the first two versions of it did.
+        streamed: AtomicUsize,
     }
 
     impl Provider for Streaming {
-        async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> io_harness::Result<CompletionResponse> {
             let i = self.at.fetch_add(1, Ordering::SeqCst);
             Ok(CompletionResponse {
-                tool_calls: if i == 0 { self.calls.clone() } else { Vec::new() },
+                tool_calls: if i == 0 {
+                    self.calls.clone()
+                } else {
+                    Vec::new()
+                },
                 ..Default::default()
             })
         }
@@ -421,8 +432,13 @@ async fn a_masked_call_is_refused_even_when_it_is_speculated_off_the_stream() {
             _on_token: &(dyn Fn(&str) + Send + Sync),
             on_call: &(dyn Fn(usize, &ToolCall) + Send + Sync),
         ) -> io_harness::Result<CompletionResponse> {
+            self.streamed.fetch_add(1, Ordering::SeqCst);
             let i = self.at.fetch_add(1, Ordering::SeqCst);
-            let calls = if i == 0 { self.calls.clone() } else { Vec::new() };
+            let calls = if i == 0 {
+                self.calls.clone()
+            } else {
+                Vec::new()
+            };
             for (at, call) in calls.iter().enumerate() {
                 on_call(at, call);
             }
@@ -448,6 +464,7 @@ async fn a_masked_call_is_refused_even_when_it_is_speculated_off_the_stream() {
             arguments: json!({ "path": "secret.txt" }),
         }],
         at: AtomicUsize::new(0),
+        streamed: AtomicUsize::new(0),
     };
 
     let store = Store::memory().unwrap();
@@ -486,6 +503,11 @@ async fn a_masked_call_is_refused_even_when_it_is_speculated_off_the_stream() {
         .iter()
         .map(|o| o.text.clone())
         .collect();
+    assert!(
+        provider.streamed.load(Ordering::SeqCst) > 0,
+        "the run never took the streaming entry point, so this test asserts over a path it \
+         never entered — which is the false pass this release exists to stop"
+    );
     assert!(
         !observed.contains("ZZ-MUST-NOT-BE-READ-ZZ"),
         "a masked read was speculated off the stream and its contents reached the ledger \
