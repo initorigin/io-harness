@@ -662,7 +662,7 @@ where
                     fold_forced(recovered, depth, &mut fold_asked),
                 )
                 .await?;
-                let assembled = assemble(
+                let mut assembled = assemble(
                     &ledger,
                     budget_tokens,
                     &notes,
@@ -684,6 +684,13 @@ where
                     },
                 )
                 .await?;
+                // 0.77.0 — the same rule as the flat loop, through the same helper,
+                // in the same position: after assembly and before `user`. A frame
+                // applied in one loop and not the other would leave a contained run
+                // and a flat one marking provenance differently while every test
+                // still passed — the constraint `cache_boundary_for` above is here
+                // for as well.
+                frame_external(&mut assembled);
                 // 0.48.0 — the same rule as the flat loop, and for the same reason
                 // the system half is chosen this way here too.
                 let user = match &conversational {

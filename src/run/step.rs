@@ -1180,7 +1180,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 fold_forced(recovered, 0, &mut fold_asked),
             )
             .await?;
-            let assembled = assemble(
+            let mut assembled = assemble(
                 &ledger,
                 budget_tokens,
                 &notes,
@@ -1195,6 +1195,12 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 },
             )
             .await?;
+            // 0.77.0 — provenance framing, here and nowhere else: after assembly,
+            // because only the emission knows which bytes came from outside, and
+            // before `user` is derived, because `user` and the transcript must stay
+            // the same bytes. Moving this one line below the `user` binding is the
+            // whole of how that invariant breaks.
+            frame_external(&mut assembled);
             // 0.48.0 — asked by the same condition that already chooses the system
             // half below, so the two halves of one completion cannot disagree.
             let user = match &conversational {
