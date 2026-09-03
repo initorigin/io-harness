@@ -614,7 +614,7 @@ fn commas(n: usize) -> String {
 
 /// Where one assembly happens: the run it belongs to, and what it may read.
 ///
-/// Bundled rather than passed loose because these five travel together and never
+/// Bundled rather than passed loose because these six travel together and never
 /// vary independently — the turn changes, the run does not.
 // No `Debug`: `Store` has none, and what a caller wants printed is the run, not the
 // connection.
@@ -645,8 +645,12 @@ pub struct Assembled {
     /// Observations replaced by a one-line stub.
     pub stubbed: usize,
     /// Observations carried shortened rather than stubbed, by Context Collapse
-    /// (0.76.0). Zero on every run that does not configure one, which is what
-    /// makes a collapsed turn distinguishable from a folded one in the trace.
+    /// (0.76.0). Zero on every run that does not configure one.
+    ///
+    /// **Not to be confused with [`Assembled::collapsed`]**, which is older and
+    /// means the one-line stubs were themselves collapsed into a single line. The
+    /// two are printed side by side in the assembly trace as `shortened=` and
+    /// `stubs_collapsed=` for exactly that reason.
     pub shortened: usize,
     /// Stale reads re-read at assembly time (whether or not the re-read worked).
     pub reread: usize,
@@ -660,6 +664,13 @@ pub struct Assembled {
     /// see [`Store::memory_recalls`](crate::Store::memory_recalls).
     pub recalled_keys: Vec<String>,
     /// Whether the stubs were collapsed into one line to hold the ceiling.
+    ///
+    /// **This is not Context Collapse** — that is [`Assembled::shortened`], and
+    /// the two are different events. This one says the *elision lines* were
+    /// merged because naming each one had begun to cost more than the
+    /// observations themselves; that one says an entry was carried in shortened
+    /// form rather than elided at all. The trace prints this as
+    /// `stubs_collapsed=` to keep the words apart.
     pub collapsed: bool,
     /// Estimated tokens for `text` — see [`estimate_tokens`].
     pub est_tokens: u64,
@@ -1041,8 +1052,19 @@ pub async fn assemble(
         &ContextEvent::assembled(
             step,
             format!(
-                "carried={} stubbed={} reread={} recalled={} collapsed={}",
-                out.carried, out.stubbed, out.reread, out.recalled, out.collapsed
+                // 0.76.0 — `shortened` joins the line, because the release's own
+                // delivery says a collapsed turn must be visible as such and
+                // distinguishable from a folded one, and a counter that never
+                // reaches a trace is not visible to anybody.
+                //
+                // `collapsed` here is the OLDER field and means something else:
+                // that the one-line stubs were themselves collapsed into a single
+                // line to hold the ceiling. Both words are load-bearing and they
+                // are not the same event, so both are printed and each names the
+                // other at its own definition. A reader with the release notes in
+                // hand would otherwise read `collapsed=` as Context Collapse.
+                "carried={} stubbed={} shortened={} reread={} recalled={} stubs_collapsed={}",
+                out.carried, out.stubbed, out.shortened, out.reread, out.recalled, out.collapsed
             ),
             out.est_tokens,
         ),

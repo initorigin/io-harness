@@ -532,7 +532,7 @@ pub use approve::{
 pub use browser::BrowserConfig;
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
-pub use context::{Compaction, ContextBudget};
+pub use context::{Collapse, Compaction, ContextBudget};
 pub use contract::{
     Preset, Routing, SystemPrompt, TaskContract, DEFAULT_MAX_RETRIES, DEFAULT_MAX_STEPS,
     DEFAULT_WORKSPACE_MAX_STEPS,
