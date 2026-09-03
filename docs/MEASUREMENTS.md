@@ -9,6 +9,60 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What Context Collapse carries that a stub does not (0.76.0)
+
+**What is being measured.** How much of a turn's history survives into the
+projection at one fixed budget, with the collapse rung off and at three settings,
+and what the rung itself costs to compute.
+
+**The shape to expect, stated before it was measured.** More observations carried
+and fewer stubbed, at roughly the same token total — the budget is a ceiling and
+the rung does not raise it, so the saving is not fewer tokens but *more of the run
+inside the same tokens*. A smaller `keep_chars` should carry more entries, because
+each shortened one leaves more room for the next. The rung's own cost should be
+too small to matter beside a provider call, since it is one truncation per entry
+that was going to be elided anyway.
+
+**Method.** `n5_what_a_collapse_carries_that_a_stub_does_not` in
+`tests/context_collapse.rs`, `#[ignore]`d and printed rather than asserted:
+
+```text
+cargo test --release --test context_collapse n5_ -- --ignored --nocapture
+```
+
+Forty grep observations of 2,000 characters each — 40,000 characters against a
+4,000-token ceiling, so the ledger is far larger than the turn — over distinct
+targets, so nothing is elided by supersession rather than by the budget.
+
+**Machine.** Apple M1, macOS 26.5.2, release profile, 2026-09-03.
+
+**Numbers.**
+
+| `keep_chars` | carried | shortened | stubbed | est_tokens | assemble |
+| --- | --- | --- | --- | --- | --- |
+| 0 (off) | 7 | 0 | 33 | 3,554 | 289 µs |
+| 300 | 11 | 4 | 29 | 3,947 | 54 µs |
+| 600 | 9 | 2 | 31 | 3,901 | 42 µs |
+| 1,200 | 8 | 1 | 32 | 3,877 | 35 µs |
+
+At `keep_chars: 300` the same budget carries **eleven** observations instead of
+seven, four of them shortened. The token total rises slightly — 3,554 to 3,947 —
+which is the ceiling being used rather than a cost: what was being spent on
+thirty-three elision lines is spent on content instead.
+
+Assembly is *faster* with the rung on, which was not predicted and is worth
+stating: an elision line is a `format!` with two allocations and a character
+count over the entry it replaces, so shortening an entry is cheaper than
+describing it. The 289 µs at `keep_chars: 0` is the same work 0.75.0 did.
+
+**What it does not measure.** Whether either setting costs accuracy. That needs a
+case suite and scorers this repository does not have; the instrument is `io-eval`,
+built separately. Nor does it measure a tool mask's saving, which is not a token
+saving at all: masking keeps the definitions in the request on purpose, so what it
+buys is a prompt prefix that stays cached while the turn's permitted tools change.
+The number for that is a cache hit rate on a live run over several turns, and this
+release did not take it.
+
 ## What ranking a turn's recall costs now (0.75.0)
 
 **What is being measured.** The same thing 0.57.0 measured, after 0.75.0 stopped

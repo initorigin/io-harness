@@ -525,3 +525,29 @@ async fn an_unconfigured_collapse_assembles_the_same_bytes() {
     assert_eq!(a.stubbed, b.stubbed);
     assert_eq!(a.carried, b.carried);
 }
+
+// ------------------------------------------------------------------- N5 / N6
+
+/// N5/N6 — what the rung saves, and what it costs to compute.
+///
+/// Printed, never asserted: a number asserted on a CI runner is a flake, and this
+/// release is partly about a suite that asserted on clocks. The method and the
+/// machine go in `docs/MEASUREMENTS.md`.
+///
+/// `cargo test --release --test context_collapse n5_ -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "measurement, not a gate — see docs/MEASUREMENTS.md"]
+async fn n5_what_a_collapse_carries_that_a_stub_does_not() {
+    let f = fixture();
+    let l = ledger(40, 2_000);
+    println!("entries=40 chars_each=2000 budget=4000");
+    for keep in [0usize, 300, 600, 1_200] {
+        let started = std::time::Instant::now();
+        let out = assembled(&f, &l, 4_000, Collapse { keep_chars: keep }).await;
+        let took = started.elapsed();
+        println!(
+            "keep_chars={keep:<5} carried={:<3} shortened={:<3} stubbed={:<3} est_tokens={:<5} assemble={:?}",
+            out.carried, out.shortened, out.stubbed, out.est_tokens, took
+        );
+    }
+}
