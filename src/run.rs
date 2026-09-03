@@ -321,6 +321,22 @@ pub enum RunOutcome {
     /// of a gate, not a gate that says no — and a run under it that spends its
     /// whole budget still reports `StepCapReached`.
     VerificationFailed { steps: u32 },
+    /// (0.77.0) The contract declared an output schema, and the model's final
+    /// answer never satisfied it within the attempts allowed.
+    ///
+    /// Distinct from [`Finished`](RunOutcome::Finished) and from
+    /// [`StepCapReached`](RunOutcome::StepCapReached), and the distinction is the
+    /// point: a run that exhausts its schema attempts has produced text a caller
+    /// asked to be a particular shape and did not get, so reporting it as
+    /// finished would hand back malformed output under a success. Reporting it as
+    /// a step cap would send an operator to raise `max_steps`, which buys more
+    /// attempts at the same failure — what the run needs is a look at the
+    /// validation errors, which are on the trace, one per rejected attempt.
+    ///
+    /// Not terminal: a model that could not produce the shape under one prompt
+    /// may under another, and a schema the caller narrows is a different
+    /// question.
+    SchemaUnsatisfied { steps: u32 },
     /// (0.65.0) The run died in the middle of a call the harness cannot inspect —
     /// a charge, a deployment, a posted message, an MCP call, any registered
     /// [`Tool`](crate::tools::Tool) whose

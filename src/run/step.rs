@@ -556,6 +556,9 @@ pub(super) async fn run_from<P: Provider>(
             // images are in play here.
             #[cfg(feature = "media")]
             media: attach_media(contract, &mut PendingMedia::default())?,
+            // 0.77.0 — as in the workspace loop. The single-file loop validates
+            // through the same helper, so a schema means the same thing here.
+            output_schema: contract.output_schema.clone(),
             ..Default::default()
         };
 
@@ -624,6 +627,29 @@ pub(super) async fn run_from<P: Provider>(
                 finish(store, watch, run_id, 0, step, "cost_budget_exceeded")?;
                 return Ok(RunResult::new(
                     RunOutcome::CostBudgetExceeded { steps: step },
+                    run_id,
+                ));
+            }
+        }
+
+        // 0.77.0 — the declared shape, checked here too.
+        //
+        // This loop has no ledger to re-prompt through — it is the single-file
+        // path, whose whole context is the file and the goal — so a schema that
+        // is not satisfied ends the run rather than asking again. That is the
+        // narrow reading and it is the honest one: the alternative is sending
+        // `response_format` on this path and never checking the reply, which is
+        // the "accepted but never checked" defect that `OutputSchema`'s own
+        // constructor exists to make impossible one level down.
+        if answered(&response) {
+            if let Some(Err(errors)) = conforms(contract, &response) {
+                store.record_context_event(
+                    run_id,
+                    &ContextEvent::replan(step, &format!("output shape: {}", errors.join("; "))),
+                )?;
+                finish(store, watch, run_id, 0, step, "schema_unsatisfied")?;
+                return Ok(RunResult::new(
+                    RunOutcome::SchemaUnsatisfied { steps: step },
                     run_id,
                 ));
             }
@@ -1010,6 +1036,16 @@ pub(super) async fn run_workspace_from<P: Provider>(
     let mut span_from = std::time::Instant::now();
     let mut store_tail: Option<std::time::Duration> = None;
 
+    // 0.77.0 — how many times the model has answered in the wrong shape.
+    //
+    // Bounded by `max_retries` rather than by a knob of its own. That field
+    // already means "how many times may this run re-ask the same question", which
+    // is exactly what a schema re-prompt is; a second budget for one release would
+    // be a number an operator has to discover, set, and keep consistent with the
+    // first for no gain. If a caller ever needs them separately, splitting one
+    // field into two is a smaller change than removing a knob nobody wanted.
+    let mut schema_attempts: u32 = 0;
+
     for step in start_step..=contract.max_steps {
         // 0.75.0 — this step is the one being attributed from here on. Whatever the
         // last step left staged is discarded: a step that never reached its commit
@@ -1238,6 +1274,11 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 // 0.49.0 — the same breakpoint the line above names, counted in
                 // messages because that is what this request sends.
                 cache_through: cache_through_for(cache_boundary, &messages),
+                // 0.77.0 — the shape the caller demanded, carried to the vendors
+                // whose wire has a place for it. A hint that reduces attempts, and
+                // never the thing trusted: `validate_final_output` below is the
+                // gate, and it runs whether or not the vendor honoured this.
+                output_schema: contract.output_schema.clone(),
                 #[cfg(feature = "media")]
                 media: attach_media(contract, pending_media)?,
                 ..Default::default()
@@ -1885,6 +1926,50 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     RunResult::new(RunOutcome::CostBudgetExceeded { steps: step }, run_id)
                         .with_remembered(remembered),
                 );
+            }
+        }
+
+        // 0.77.0 — the shape the caller demanded, checked before the run may end.
+        //
+        // Ahead of `finished` on purpose: a schema exists to stop a malformed
+        // answer being reported as a finished one. A failure is not an error —
+        // it is a re-prompt, delivered the way `replan_directive` is, and the
+        // loop takes another step. **That step is an ordinary step**: it is
+        // counted, its tokens are counted, and the budget checks above run before
+        // this block, so a run whose step budget is smaller than its attempt cap
+        // stops on the step budget. A retry loop no budget can see is how a
+        // bounded run becomes unbounded.
+        if answered(&response) {
+            if let Some(Err(errors)) = conforms(contract, &response) {
+                schema_attempts += 1;
+                let left = contract.max_retries.saturating_sub(schema_attempts);
+                store.record_context_event(
+                    run_id,
+                    &ContextEvent::replan(step, &format!("output shape: {}", errors.join("; "))),
+                )?;
+                if left == 0 {
+                    finish(store, watch, run_id, 0, step, "schema_unsatisfied")?;
+                    return Ok(RunResult::new(
+                        RunOutcome::SchemaUnsatisfied { steps: step },
+                        run_id,
+                    )
+                    .with_remembered(remembered));
+                }
+                ledger.push(Observation::new(
+                    step,
+                    ObsKind::Message,
+                    None,
+                    bound(
+                        &schema_directive(&errors, left),
+                        entry_cap,
+                        ObsKind::Message,
+                    ),
+                    // The harness wrote this sentence. Marking it external would
+                    // frame this crate's own words to the model as untrusted.
+                    Origin::Prose,
+                ));
+                decisions.push("output shape rejected".into());
+                continue;
             }
         }
 
