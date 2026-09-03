@@ -4945,7 +4945,7 @@ mod tests {
     /// the two counts meet.
     #[test]
     fn a_step_whose_results_outnumber_its_calls_is_still_sent_as_prose() {
-        use crate::context::{Emitted, Piece};
+        use crate::context::{Emitted, Origin, Piece};
 
         let section = "\n[read a.txt]\nA\n\n[read b.txt]\nB\n";
         let user = format!("HEAD{section}TAIL");
@@ -4956,12 +4956,14 @@ mod tests {
                     step: 1,
                     ordinal: 0,
                     piece: Piece::Result,
+                    origin: Origin::File,
                     text: "\n[read a.txt]\nA\n".into(),
                 },
                 Emitted {
                     step: 1,
                     ordinal: 1,
                     piece: Piece::Result,
+                    origin: Origin::File,
                     text: "\n[read b.txt]\nB\n".into(),
                 },
             ],

@@ -990,6 +990,15 @@ pub struct Emitted {
     /// What this piece is: a tool result, an earlier turn of the conversation, or
     /// prose belonging to no turn of its own.
     pub piece: Piece,
+    /// Where this piece's bytes came from (0.77.0).
+    ///
+    /// Carried beside [`Self::piece`] rather than derived from it, because the
+    /// two answer different questions and disagree exactly where it matters: an
+    /// operator's answer to `ask_question` is a [`Piece::Result`] — it occupies
+    /// that call's position — and an [`Origin::Operator`], because a human typed
+    /// it. Anything deciding whether to treat this text as untrusted must read
+    /// this field and never the piece.
+    pub origin: Origin,
     /// The text, exactly as it appears in [`Assembled::text`].
     pub text: String,
 }
@@ -1227,6 +1236,9 @@ pub async fn assemble(
         step,
         ordinal: 0,
         piece: Piece::Prose,
+        // The memory block and the collapse line are the crate's own narration
+        // about the run, not content that arrived from anywhere.
+        origin: Origin::Prose,
         text: text.to_string(),
     };
     if !notes_text.is_empty() {
@@ -1236,6 +1248,10 @@ pub async fn assemble(
         step: entries[i].step,
         ordinal: ordinals[i],
         piece: Piece::of(&entries[i]),
+        // Carried through from the entry rather than inferred from the piece
+        // beside it — see the field's own doc for why those two must not be
+        // collapsed into one.
+        origin: entries[i].origin,
         text: text.to_string(),
     };
     if stub_tokens <= stub_ceiling {
