@@ -377,15 +377,14 @@ pub enum EventKind {
         /// What it was pointed at — a path, a host, a server.
         target: String,
         /// (0.77.0) How whatever this call returns will be marked in the
-        /// transcript: the [`Origin`](crate::context::Origin) the dispatch site
-        /// will hand to
+        /// transcript: the [`Origin`] the dispatch site will hand to
         /// [`Observation::new`](crate::context::Observation::new).
         ///
         /// It rides this event rather than a new one because the alternative is
         /// an event per observation, and a run makes several of those per step —
         /// a live channel someone is watching would be flooded to carry a word
         /// that is already knowable here. An origin is a property of the *tool*,
-        /// not of its output: a fetch returns [`Origin::Web`](crate::context::Origin::Web)
+        /// not of its output: a fetch returns [`Origin::Web`]
         /// whatever it fetches, so announcing it before the result exists is a
         /// true statement, not a prediction. That makes this the one place the
         /// question "was anything in this run external, and from what kind of
@@ -396,15 +395,14 @@ pub enum EventKind {
         /// thing [`Observer`] exists to make unnecessary.
         ///
         /// The word is exactly what the stored column holds — this is
-        /// [`Origin`](crate::context::Origin) itself, not a second enumeration
+        /// [`Origin`] itself, not a second enumeration
         /// of the same list, so a `mcp` on the channel and a `mcp` in the ledger
         /// cannot drift apart into two vocabularies that agree by hand.
         ///
         /// `None` is a dispatch this release did not mark, not an origin of
         /// "none" and never a claim the content was internal: a reader deciding
         /// what to trust must treat an unmarked call as it treats
-        /// [`Origin::Unmarked`](crate::context::Origin::Unmarked) — unknown, not
-        /// safe.
+        /// [`Origin::Unmarked`] — unknown, not safe.
         ///
         /// Both serde attributes are load-bearing, for the reasons
         /// [`Mcp`](EventKind::Mcp)'s `tools` field records in 0.68.0: `default`
