@@ -682,9 +682,11 @@ where
                 // 0.48.0 — the same rule as the flat loop, and for the same reason
                 // the system half is chosen this way here too.
                 let user = match &conversational {
-                    Some(_) if step == start_step => {
-                        conversational_user_prompt(&contract.goal, &assembled.text, &contract.tool_mask)
-                    }
+                    Some(_) if step == start_step => conversational_user_prompt(
+                        &contract.goal,
+                        &assembled.text,
+                        &contract.tool_mask,
+                    ),
                     _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
                 };
                 // 0.44.0 — the same rule as the flat loop, through the same helper.

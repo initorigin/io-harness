@@ -19,9 +19,7 @@ use io_harness::context::{
 };
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::Workspace;
-use io_harness::{
-    run_with, ApproveAll, Policy, Provider, Store, TaskContract, Verification,
-};
+use io_harness::{run_with, ApproveAll, Policy, Provider, Store, TaskContract, Verification};
 use serde_json::json;
 
 /// The text of the first observation the folding control makes, so the assertion
@@ -445,7 +443,10 @@ async fn an_unconfigured_collapse_assembles_the_same_bytes() {
     let a = assembled(&f, &l, 4_000, Collapse::default()).await;
     let b = assembled(&f, &l, 4_000, Collapse { keep_chars: 0 }).await;
 
-    assert!(!a.text.is_empty(), "an empty section compares equal to itself");
+    assert!(
+        !a.text.is_empty(),
+        "an empty section compares equal to itself"
+    );
     assert_eq!(a.text, b.text, "zero is off and default is zero");
     assert_eq!(a.shortened, 0);
     assert_eq!(a.stubbed, b.stubbed);

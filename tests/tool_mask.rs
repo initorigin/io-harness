@@ -271,13 +271,7 @@ async fn a_session_whose_turns_carry_different_masks_composes_one_system_block()
         let provider = Rec::new(vec![vec![]]);
         let turn = contract(dir.path()).with_tool_mask(mask);
         let _ = session
-            .turn_bounded(
-                &turn,
-                &provider,
-                &store,
-                &Policy::permissive(),
-                &ApproveAll,
-            )
+            .turn_bounded(&turn, &provider, &store, &Policy::permissive(), &ApproveAll)
             .await;
         let seen = provider.requests();
         assert!(

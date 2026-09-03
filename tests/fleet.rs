@@ -425,7 +425,12 @@ async fn crashed_fleet() -> (tempfile::TempDir, std::path::PathBuf) {
     loop {
         last = Store::open(&db)
             .map_err(|e| e.to_string())
-            .and_then(|store| store.queued_agents(1).map(|q| q.len()).map_err(|e| e.to_string()));
+            .and_then(|store| {
+                store
+                    .queued_agents(1)
+                    .map(|q| q.len())
+                    .map_err(|e| e.to_string())
+            });
         if last.as_ref().is_ok_and(|&n| n == 4) || std::time::Instant::now() >= deadline {
             break;
         }
