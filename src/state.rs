@@ -8,7 +8,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::context::{ObsKind, Observation};
+use crate::context::{ObsKind, Observation, Origin};
 use crate::error::{Error, Result};
 use crate::policy::Policy;
 use crate::pricing::{PriceTable, Spend};
@@ -68,6 +68,48 @@ fn kind_from_wire(kind: &str, run_id: i64) -> Result<ObsKind> {
     serde_json::from_value(serde_json::Value::String(kind.to_string())).map_err(|e| Error::Resume {
         reason: format!("run {run_id} has a ledger observation of unknown kind {kind:?}: {e}"),
     })
+}
+
+/// An observation's origin as it is stored (0.77.0), through serde for the same
+/// reason [`kind_wire`] is: the mapping stays total and the pair cannot drift.
+fn origin_wire(origin: Origin) -> String {
+    match serde_json::to_value(origin) {
+        Ok(serde_json::Value::String(s)) => s,
+        other => format!("{other:?}"),
+    }
+}
+
+/// The inverse of [`origin_wire`], and **deliberately not the inverse of
+/// [`kind_from_wire`]'s strictness** — the two columns fail in opposite
+/// directions on purpose.
+///
+/// A kind that does not parse is a refusal, because a ledger that came back
+/// silently shorter than it was would assemble a context nobody can account for.
+/// An origin that does not parse must not refuse, because `origin` is additive
+/// and `CHECKPOINT_FORMAT` was deliberately not bumped for it: a 0.78.0 store
+/// carrying an origin this binary has never heard of is a store this binary is
+/// still allowed to open, and refusing it would re-introduce exactly the
+/// incompatibility the column was chosen over an [`ObsKind`] variant to avoid.
+///
+/// So the two absent cases are answered differently, and the difference is the
+/// point:
+///
+/// * `NULL` — written before 0.77.0, when no origin existed — is
+///   [`Origin::Unmarked`]. That is the honest answer and it renders exactly as
+///   the row always rendered: [`Piece::Result`](crate::context::Piece), which is
+///   what the old `(kind, target)` derivation produced.
+/// * A **non-null value this binary does not know** is [`Origin::Tool`], the
+///   unattributed *external* origin — not `Unmarked`. Some newer binary wrote a
+///   word it thought mattered, and the safe reading of an origin we cannot
+///   interpret is the conservative one: external content gets framed as
+///   untrusted, and the failure mode of guessing wrong is a frame around
+///   something that did not need one rather than a missing frame around
+///   something that did.
+fn origin_from_wire(origin: Option<&str>) -> Origin {
+    let Some(origin) = origin else {
+        return Origin::Unmarked;
+    };
+    serde_json::from_value(serde_json::Value::String(origin.to_string())).unwrap_or(Origin::Tool)
 }
 
 /// The checkpoint layout version stamped into `PRAGMA user_version`. Bump when
@@ -3969,6 +4011,16 @@ fn is_fact_column(table: &str, column: &str) -> bool {
         // What a policy event was about — the target is a path or a command,
         // which is what "what did it touch" means for a refusal.
         ("policy_events", "target") | ("ledger_observations", "target") => true,
+        // 0.77.0 — where an observation's content came from. A classification,
+        // not a word: it says an MCP server spoke, never what the server said,
+        // and the text column beside it is still cleared.
+        //
+        // Named here **because the default is to clear**, and an archive that
+        // silently emptied this column would leave a trace that cannot answer
+        // the one question the release added — was this content external? —
+        // while every other test in the tree passed, since they all read rows
+        // the same run had just written. This one line is the whole of F16.
+        ("ledger_observations", "origin") => true,
         // A memory key names an entry that still exists; the note itself is not
         // this session's to clear.
         ("memory_recalls", "key") | ("memory_snapshots", "key") => true,

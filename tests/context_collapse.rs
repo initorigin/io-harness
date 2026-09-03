@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use io_harness::context::{
-    assemble, Assembly, Collapse, Compaction, ContextBudget, Ledger, ObsKind, Observation,
+    assemble, Assembly, Collapse, Compaction, ContextBudget, Ledger, ObsKind, Observation, Origin,
 };
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::Workspace;
@@ -98,6 +98,7 @@ fn ledger(n: u32, chars: usize) -> Ledger {
             ObsKind::Grep,
             Some(format!("f{i}.txt")),
             format!("\n[entry {i}]\n{}\n", "y".repeat(chars)),
+            Origin::File,
         ));
     }
     l
@@ -375,12 +376,14 @@ async fn a_shortened_entry_is_still_a_read_of_a_path() {
         ObsKind::Read,
         Some("f.txt".into()),
         format!("\n[the file]\n{}\n", "y".repeat(6_000)),
+        Origin::File,
     ));
     l.push(Observation::new(
         2,
         ObsKind::Write,
         Some("f.txt".into()),
         "\n[wrote f.txt]\n".to_string(),
+        Origin::File,
     ));
 
     // A grep of the same path, large enough to be the collapse candidate. The
@@ -390,6 +393,7 @@ async fn a_shortened_entry_is_still_a_read_of_a_path() {
         ObsKind::Grep,
         Some("f.txt".into()),
         format!("\n[grep f.txt]\n{}\n", "z".repeat(20_000)),
+        Origin::File,
     ));
 
     let out = assembled(&f, &l, 2_000, Collapse { keep_chars: 400 }).await;
@@ -439,6 +443,7 @@ async fn a_read_is_never_collapsed_because_a_collapsed_read_would_be_a_tail() {
             "\n[read src/lib.rs]\nHEAD-SENTINEL\n{}\nTAIL-SENTINEL\n",
             "y".repeat(6_000)
         ),
+        Origin::File,
     ));
     // Something newer and small, so the read is the entry that does not fit.
     l.push(Observation::new(
@@ -446,6 +451,7 @@ async fn a_read_is_never_collapsed_because_a_collapsed_read_would_be_a_tail() {
         ObsKind::Grep,
         Some("other".into()),
         "\n[grep other]\nnothing\n".to_string(),
+        Origin::File,
     ));
 
     let out = assembled(&f, &l, 500, Collapse { keep_chars: 200 }).await;

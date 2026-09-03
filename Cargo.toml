@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.76.0"
+version = "0.77.0"
 edition = "2021"
 # `libsqlite3-sys` 0.38.1 sets the floor from 0.23.0 on: its build script — and
 # `rusqlite` 0.40's own source — call the std `cfg_select!` macro, stabilised in
@@ -66,6 +66,7 @@ exclude = [
     "tests/fixtures/gen-0.72.0",
     "tests/fixtures/gen-0.73.0",
     "tests/fixtures/gen-0.74.0",
+    "tests/fixtures/gen-0.76.0",
     "tests/fixtures/links-consumer",
     "tests/fixtures/throughput-0.22.0",
 ]

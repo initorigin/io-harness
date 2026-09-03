@@ -598,6 +598,26 @@ pub struct TaskContract {
     /// spawned child takes the tier on its [`AgentDef`](crate::AgentDef) instead,
     /// which is where "search cheaply, write carefully" is said.
     pub effort: Option<crate::provider::Effort>,
+    /// The shape the run's final output must take (0.77.0).
+    ///
+    /// `None` — the default, and every release before 0.77.0 — asks for nothing,
+    /// sends the body 0.76.0 sent, and validates nothing. `Some(schema)` does two
+    /// separate things, and the second is the one that matters: the schema is
+    /// carried to the vendors whose wire has a place for it, *and* the model's
+    /// final text is validated against it locally before the run may report
+    /// success. A vendor that honours the declaration makes the first attempt more
+    /// likely to pass; a vendor that ignores it changes nothing about whether the
+    /// run passes, because the gate is here rather than there.
+    ///
+    /// A failure re-prompts the model with the validation error, bounded, and each
+    /// attempt is an ordinary step drawing against
+    /// [`Self::max_steps`], [`Self::max_tokens`] and [`Self::max_duration`] — a
+    /// retry loop no budget can see is how a bounded run becomes unbounded.
+    ///
+    /// Set it with [`TaskContract::with_output_schema`]. The schema is checked when
+    /// it is declared, not when output arrives: see
+    /// [`OutputSchema`](crate::schema::OutputSchema).
+    pub output_schema: Option<crate::schema::OutputSchema>,
     /// Who answers a [`Verification::Review`](crate::Verification::Review)
     /// criterion (0.34.0).
     ///
@@ -722,6 +742,7 @@ impl TaskContract {
             conversational: None,
             plan_gate: None,
             effort: None,
+            output_schema: None,
             reviewer: None,
             tool_hooks: None,
             routing: None,
@@ -807,6 +828,7 @@ impl TaskContract {
             tool_hooks: None,
             routing: None,
             effort: None,
+            output_schema: None,
             max_steps: DEFAULT_WORKSPACE_MAX_STEPS,
             max_duration: None,
             max_tokens: None,
@@ -1312,6 +1334,41 @@ impl TaskContract {
     /// ```
     pub fn with_effort(mut self, effort: crate::provider::Effort) -> Self {
         self.effort = Some(effort);
+        self
+    }
+
+    /// Demand a shape for the run's final output (0.77.0).
+    ///
+    /// The declaration is validated when it is made — an
+    /// [`OutputSchema`](crate::schema::OutputSchema) is constructed fallibly and
+    /// refuses any keyword outside the subset this crate implements — so a schema
+    /// that reaches this method has been understood in full. That is what makes the
+    /// later acceptance mean something: validation cannot silently skip a keyword
+    /// nothing ever checked.
+    ///
+    /// The schema is a request to the vendor and a gate here. Vendors whose wire
+    /// has a place for it are asked in their own dialect; a vendor that ignores it,
+    /// or one whose wire has no such key at all, changes nothing about whether the
+    /// run passes.
+    ///
+    /// ```
+    /// use io_harness::{schema::OutputSchema, TaskContract};
+    /// use serde_json::json;
+    ///
+    /// let schema = OutputSchema::new(json!({
+    ///     "type": "object",
+    ///     "properties": { "summary": { "type": "string" } },
+    ///     "required": ["summary"],
+    /// }))?;
+    ///
+    /// let contract = TaskContract::workspace("summarise the crate", "/repo")
+    ///     .with_output_schema(schema);
+    ///
+    /// assert!(contract.output_schema.is_some());
+    /// # Ok::<(), io_harness::Error>(())
+    /// ```
+    pub fn with_output_schema(mut self, schema: crate::schema::OutputSchema) -> Self {
+        self.output_schema = Some(schema);
         self
     }
 

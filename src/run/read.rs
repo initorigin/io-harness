@@ -276,6 +276,7 @@ impl ReadWork {
                             ),
                             ObsKind::Grep,
                             Some(pattern),
+                            Origin::File,
                         )
                     }
                     Err(e) => Dispatched::go("grep error", format!("\n[grep error] {e}\n")),
@@ -291,6 +292,7 @@ impl ReadWork {
                     ),
                     ObsKind::Find,
                     Some(glob),
+                    Origin::File,
                 ),
                 Err(e) => Dispatched::go("find error", format!("\n[find error] {e}\n")),
             },
@@ -341,6 +343,7 @@ impl ReadWork {
                         obs: format!("\n[read {target}{note}]\n{body}\n"),
                         kind: ObsKind::Read,
                         target: Some(target),
+                        origin: Origin::File,
                         changed: false,
                         remember,
                     }
@@ -389,6 +392,7 @@ impl ReadWork {
                         ),
                         kind: ObsKind::Find,
                         target: Some(target),
+                        origin: Origin::File,
                         changed: false,
                         remember,
                     }
@@ -464,6 +468,14 @@ impl ReadWork {
                             ),
                             kind: ObsKind::Tool,
                             target: None,
+                            // Not `Shell`, though a process printed it: the argv
+                            // is `GitCmd::argv`'s and not the model's, so what
+                            // reaches here is one of a finite set of git answers
+                            // rather than arbitrary command output. `Tool` is the
+                            // origin the `check` tool takes for the same reason —
+                            // external, and no finer attribution this crate can
+                            // honestly make.
+                            origin: Origin::Tool,
                             changed: false,
                             remember,
                         }
@@ -495,6 +507,11 @@ impl ReadWork {
                         obs: format!("\n[{name}]\n{out}\n"),
                         kind: ObsKind::Tool,
                         target: Some(name),
+                        // The embedding program's own code answered, and this
+                        // crate cannot see what it did — shell out, fetch a URL,
+                        // read a file. That unattributable case is exactly what
+                        // `Origin::Tool` is for, and it is external on purpose.
+                        origin: Origin::Tool,
                         changed: false,
                         remember,
                     }
@@ -509,6 +526,11 @@ impl ReadWork {
                         obs: format!("\n[{name} error] {e}\n"),
                         kind: ObsKind::Error,
                         target: None,
+                        // The tool's own words, so the tool's own origin: a
+                        // failure message is content the registered tool wrote,
+                        // and the framing around it does not make it this
+                        // crate's.
+                        origin: Origin::Tool,
                         changed: false,
                         remember,
                     }
@@ -1169,6 +1191,69 @@ pub(super) async fn read_batch(
         .collect())
 }
 
+/// (0.77.0) Where a built-in's answer will come from, decided from the only thing
+/// an announcement has: the name the model called.
+///
+/// The same answer the dispatch arm states on its own observation, one step
+/// earlier. The two have to agree — an operator watching the event stream and an
+/// operator reading the ledger are looking at the same call — so this list is
+/// maintained against `dispatch`'s arms, and a tool whose arm changes origin
+/// changes it here in the same edit.
+///
+/// `None` means nothing is claimed, and it is deliberately not
+/// [`Origin::Unmarked`]: that variant means "a row written before this column
+/// existed" and new code never constructs it. Two groups take `None` for two
+/// different reasons. The harness's own tools — `remember`, `todo_write`,
+/// `ask_question` and their siblings — put no outside content in play at all. A
+/// name no arm here claims is a registered tool, an MCP tool, or a name nothing
+/// serves, and this function cannot tell those three apart: both registries live
+/// in [`dispatch`](super::dispatch), so an announcement says nothing rather than
+/// guessing one of them.
+fn announced_origin(name: &str) -> Option<Origin> {
+    // Named here rather than relied on from `super::*`, because the parent's
+    // imports of these families are `#[cfg]`-ed on their features while the
+    // *names* exist in every build (see [`VIEW_IMAGE_TOOL`](crate::tools::VIEW_IMAGE_TOOL)
+    // for why the crate owns them unconditionally). Without this the list would
+    // go quietly dark in a default build — a classification that stops
+    // classifying, which is the failure mode this whole release is about.
+    use crate::tools::{
+        BARCODE_DECODE_TOOL, BROWSER_CLICK_TOOL, BROWSER_NAVIGATE_TOOL, BROWSER_READ_TOOL,
+        BROWSER_SCREENSHOT_TOOL, BROWSER_SCROLL_TOOL, BROWSER_TYPE_TOOL, DOCX_READ_TOOL,
+        DOCX_WRITE_TOOL, PDF_FILL_FORM_TOOL, PDF_READ_TOOL, PDF_WATERMARK_TOOL, PDF_WRITE_TOOL,
+        PPTX_READ_TOOL, VIEW_IMAGE_TOOL, XLSX_READ_TOOL, XLSX_SET_CELL_TOOL, XLSX_SHEETS_TOOL,
+        XLSX_WRITE_TOOL,
+    };
+    Some(match name {
+        GREP_TOOL | FIND_TOOL | READ_FILE_TOOL | LIST_DIR_TOOL | VIEW_IMAGE_TOOL
+        | WRITE_FILE_TOOL | EDIT_FILE_TOOL | PATCH_FILE_TOOL | XLSX_READ_TOOL
+        | XLSX_SHEETS_TOOL | XLSX_WRITE_TOOL | XLSX_SET_CELL_TOOL | DOCX_READ_TOOL
+        | DOCX_WRITE_TOOL | PPTX_READ_TOOL | PDF_READ_TOOL | PDF_WRITE_TOOL
+        | PDF_WATERMARK_TOOL | PDF_FILL_FORM_TOOL | BARCODE_DECODE_TOOL => Origin::File,
+        SHELL_TOOL | SHELL_START_TOOL | SHELL_POLL_TOOL | SHELL_KILL_TOOL | EXEC_TOOL => {
+            Origin::Shell
+        }
+        BROWSER_NAVIGATE_TOOL
+        | BROWSER_READ_TOOL
+        | BROWSER_SCREENSHOT_TOOL
+        | BROWSER_CLICK_TOOL
+        | BROWSER_TYPE_TOOL
+        | BROWSER_SCROLL_TOOL => Origin::Web,
+        LSP_DEFINITION_TOOL | LSP_REFERENCES_TOOL | LSP_HOVER_TOOL | LSP_SYMBOLS_TOOL
+        | LSP_RENAME_TOOL => Origin::Lsp,
+        READ_SKILL_TOOL => Origin::Skill,
+        // The checker and the git readers reach the world through a process, and
+        // `Origin::Tool` is what their arms record: external, and no finer
+        // attribution this crate can honestly make.
+        CHECK_TOOL | GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL | GIT_ADD_TOOL
+        | GIT_COMMIT_TOOL | GIT_BRANCH_TOOL | GIT_WORKTREE_TOOL => Origin::Tool,
+        // Named rather than left to the catch-all, so that "these put no outside
+        // content in play" reads as a decision instead of a gap.
+        REMEMBER_TOOL | FORGET_TOOL | TODO_WRITE_TOOL | ASK_QUESTION_TOOL | ASK_QUESTIONS_TOOL
+        | PROPOSE_PLAN_TOOL => return None,
+        _ => return None,
+    })
+}
+
 /// Tell a watcher what the run is about to do.
 ///
 /// The subject is whichever of the conventional argument names this tool uses; a
@@ -1187,6 +1272,9 @@ pub(super) fn announce(watch: &Watch<'_>, run_id: i64, step: u32, depth: u32, ca
                 .find_map(s)
                 .unwrap_or(&call.name)
                 .to_string(),
+            // Every dispatch goes through this door, so this is where the event
+            // stream learns what the ledger is about to record.
+            origin: announced_origin(&call.name),
         },
     ));
 }

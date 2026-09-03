@@ -915,6 +915,35 @@ pub struct CompletionRequest {
     /// field keeps working and is honestly non-thinking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
+    /// (0.77.0) The shape the final answer must take, or `None` (the default, and
+    /// every caller before 0.77.0) for free-form text.
+    ///
+    /// It exists so that a wire which can be *told* the shape is told it. The
+    /// declaration is checked where it is written — an
+    /// [`OutputSchema`](crate::schema::OutputSchema) cannot be constructed
+    /// without having been walked in full — so what reaches a provider here is a
+    /// document this crate has already understood, and `None` sends the body
+    /// 0.76.0 sent, byte for byte.
+    ///
+    /// A *request*, not a fact, exactly as [`CompletionRequest::model`] and
+    /// [`CompletionRequest::effort`] are, and the distinction is load-bearing
+    /// here in a way it is nowhere else: a vendor may honour this, approximate
+    /// it, or ignore it, and **the response says nothing about which happened**.
+    /// So nothing downstream may read a declared schema as a promise about the
+    /// text that came back. [`OutputSchema::validate_text`] is the authority and
+    /// runs on the reply either way; this field only buys fewer attempts, and
+    /// that is deliberately all it is asked to buy. Treating "the model was told
+    /// the shape" as "the model produced the shape" is the failure — a run that
+    /// reports success on unvalidated output because a key was set on the
+    /// request.
+    ///
+    /// An out-of-tree [`Provider`] that ignores this field keeps working and is
+    /// honestly unconstrained; its replies are checked by the same validator as
+    /// everyone else's.
+    ///
+    /// [`OutputSchema::validate_text`]: crate::schema::OutputSchema::validate_text
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<crate::schema::OutputSchema>,
     /// (0.44.0) A byte offset into [`user`](CompletionRequest::user): the end of the
     /// prefix the caller states is byte-stable across requests, or `None` (the
     /// default, and every caller before 0.44.0) for a request with no such prefix.

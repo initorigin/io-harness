@@ -312,7 +312,7 @@ struct Listener {
 impl Observer for Listener {
     fn event(&self, event: &RunEvent) -> Flow {
         match &event.kind {
-            EventKind::ToolCall { name, target } => {
+            EventKind::ToolCall { name, target, .. } => {
                 self.kinds.lock().unwrap().push("tool_call".into());
                 self.tool_calls
                     .lock()

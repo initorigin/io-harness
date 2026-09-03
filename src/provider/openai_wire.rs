@@ -60,6 +60,12 @@ pub(crate) fn body(
     if let Some((key, value)) = effort_key(flavor, request.effort) {
         body[key] = value;
     }
+    // 0.77.0 — the fifth key, added the same way, and the only one of the five both
+    // vendors spell identically. Absent entirely when no schema was declared, which is
+    // what keeps a request that declares none byte-identical to the one 0.76.0 sent.
+    if let Some(value) = response_format(request.output_schema.as_ref()) {
+        body["response_format"] = value;
+    }
     // 0.38.0 — the cache breakpoint, added the third time in the shape the two
     // above established: a per-vendor difference resolved here rather than in each
     // provider, and absent entirely for a wire that does not take one — which is
@@ -301,6 +307,67 @@ pub(crate) fn effort_key(
         WebFlavor::OpenAi => ("reasoning_effort", json!(effort.as_str())),
         WebFlavor::OpenRouter => ("reasoning", json!({ "effort": effort.as_str() })),
     })
+}
+
+/// The `response_format` an output schema adds to the shared body, or `None` when
+/// none was declared.
+///
+/// The one key of the five this file adds that both vendors spell the same, so it
+/// takes no [`WebFlavor`]: OpenAI's Chat Completions and OpenRouter both read
+/// `response_format` in the `json_schema` form, and OpenRouter documents itself as
+/// passing it through to whatever model serves the request.
+///
+/// **`strict` is `false`, deliberately.** OpenAI's strict mode is not "the schema,
+/// enforced" — it is a *narrower subset of JSON Schema* than the one
+/// [`OutputSchema`](crate::schema::OutputSchema) accepts, and a schema outside it is
+/// a `400`, not a shrug. Strict requires `additionalProperties: false` on every
+/// object and every declared property named in `required`, and it rejects
+/// `minLength`, `maxLength`, `minimum`, `maximum`, `minItems` and `maxItems`
+/// outright — six keywords `src/schema.rs` validates in full and states in its
+/// subset. So `strict: true` would take a schema this crate has already checked,
+/// declared valid, and told the caller it would enforce, and turn it into a failed
+/// request at run time on a rule that lives at the vendor. That is the failure this
+/// choice prevents: a declaration accepted at the boundary and refused on the wire,
+/// where the caller can neither see the rule nor act on it.
+///
+/// The other direction is worse, not better. Narrowing the document here to fit
+/// strict — dropping the six bounds keywords, closing every object — would send the
+/// model a *different* schema from the one the caller wrote and the one
+/// [`OutputSchema::validate`](crate::schema::OutputSchema::validate) then enforces,
+/// so the model would be asked for one shape and graded against another. This key
+/// carries the document verbatim or it does not carry it.
+///
+/// None of this weakens the guarantee, because the guarantee was never here: the
+/// reply is validated locally on arrival whatever the vendor did, and `strict: false`
+/// is still read by both vendors as "produce JSON in this shape". The key exists to
+/// reduce retries. It is never the thing relied upon.
+///
+/// Unlike [`cached_system`], this is **not** withheld from the `OpenAi` flavour on
+/// account of the endpoints `Compatible` reaches. The two cases differ in kind:
+/// `cache_control` is a vendor extension, and an endpoint that has never heard of it
+/// answers a `400` nobody asked for, so that surface started closed. `response_format`
+/// is part of the OpenAI Chat Completions request schema those endpoints exist to
+/// implement — vLLM and SGLang read it and drive constrained decoding from it, and
+/// Ollama's compatibility layer reads it too. A server that refuses it is refusing the
+/// schema it advertises. If one does, the escape is exact and local: declare no schema
+/// on that provider and lose only the hint, because the reply is validated here either
+/// way.
+///
+/// `name` is required by both vendors and is an identifier (`^[a-zA-Z0-9_-]+$`),
+/// not prose the model reads as instruction. A [`CompletionRequest`] carries exactly
+/// one schema and it describes the final answer, so the constant `"output"` says
+/// what it is; there is no per-schema name to thread through, and inventing one from
+/// the document would make the wire body depend on schema contents for no gain.
+fn response_format(schema: Option<&crate::schema::OutputSchema>) -> Option<serde_json::Value> {
+    let schema = schema?;
+    Some(json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "output",
+            "strict": false,
+            "schema": schema.as_value(),
+        },
+    }))
 }
 
 /// What each OpenAI-wire vendor can actually do with a
@@ -1544,6 +1611,8 @@ mod web_wire {
             let b = body("m", &req(None), flavor);
             assert!(b.get("web_search_options").is_none());
             assert!(b.get("plugins").is_none());
+            // 0.77.0 — and no schema key either, for a request that declares no schema.
+            assert!(b.get("response_format").is_none());
             // And exactly the keys 0.21.0 sent, in case a future key is added
             // without a thought for what an untouched request should look like.
             let keys: Vec<&str> = b.as_object().unwrap().keys().map(String::as_str).collect();
@@ -1551,6 +1620,60 @@ mod web_wire {
                 keys,
                 ["messages", "model", "stream", "stream_options", "tools"]
             );
+        }
+    }
+
+    /// F2's positive half, against the control above: a declared schema adds
+    /// `response_format` to each body and adds **nothing else**, changes no key that
+    /// was already there, and carries the caller's document verbatim where the vendor
+    /// looks for it.
+    ///
+    /// "Exactly one key, nothing else touched" is the claim worth holding: a schema is
+    /// a declaration about the answer, and a declaration that quietly reshaped
+    /// `messages` or `tools` would be editing what the run loop believes it controls.
+    /// The added key is computed against the undeclared body rather than spelled out,
+    /// so this stays a statement about the *difference* when a sixth key one day joins
+    /// the five — the sibling test above is what pins the undeclared list itself.
+    #[test]
+    fn a_declared_schema_adds_exactly_the_response_format_key_to_either_body() {
+        use crate::schema::OutputSchema;
+
+        // `minLength` is deliberately in here: it is in this crate's stated subset and
+        // it is refused by OpenAI's strict mode, which is the whole reason `strict` is
+        // `false` below.
+        let document = json!({
+            "type": "object",
+            "properties": { "title": { "type": "string", "minLength": 1 } },
+            "required": ["title"],
+        });
+        let mut asked = req(None);
+        asked.output_schema = Some(OutputSchema::new(document.clone()).expect("a valid schema"));
+
+        for flavor in [WebFlavor::OpenAi, WebFlavor::OpenRouter] {
+            let plain = body("m", &req(None), flavor);
+            let b = body("m", &asked, flavor);
+            let keys = |v: &serde_json::Value| -> Vec<String> {
+                v.as_object().unwrap().keys().cloned().collect()
+            };
+
+            let was = keys(&plain);
+            let added: Vec<String> = keys(&b).into_iter().filter(|k| !was.contains(k)).collect();
+            assert_eq!(added, ["response_format"], "{flavor:?}");
+            for key in &was {
+                assert_eq!(b[key], plain[key], "{flavor:?}: `{key}` changed");
+            }
+
+            assert_eq!(b["response_format"]["type"], "json_schema", "{flavor:?}");
+            let declared = &b["response_format"]["json_schema"];
+            assert_eq!(declared["name"], "output", "{flavor:?}");
+            // The document as the caller wrote it — not a re-serialised approximation
+            // and not one narrowed to fit a vendor's strict subset. The model is asked
+            // for the shape `OutputSchema::validate` will grade its answer against, or
+            // the two disagree and the caller is billed for the difference.
+            assert_eq!(declared["schema"], document, "{flavor:?}");
+            // `strict: true` would refuse the `minLength` above at the vendor, turning a
+            // schema this crate checked and accepted into a 400 on the wire.
+            assert_eq!(declared["strict"], false, "{flavor:?}");
         }
     }
 

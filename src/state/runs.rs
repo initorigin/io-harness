@@ -1460,6 +1460,7 @@ mod tests {
                                 crate::context::ObsKind::Read,
                                 Some("src/lib.rs".into()),
                                 "an observation of ordinary length",
+                                crate::context::Origin::File,
                             )],
                         )
                         .unwrap();

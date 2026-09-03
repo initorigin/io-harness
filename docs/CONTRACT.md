@@ -2802,6 +2802,28 @@ string is those pieces concatenated, and the conversation is those same pieces
 interleaved with the assistant turns — which is why they cannot drift into two
 accounts of one run.
 
+**0.77.0 frames external pieces, and this promise is why the framing happens where
+it does.** Content whose [`Origin`] is external is wrapped in an `external_content`
+tag before `user` is derived, not while the transcript is built. Framing the
+messages alone would have left the flat string unframed and the two renderings
+would have become two accounts of one run — which `replay`'s key exclusion and
+`cache_through_for`'s byte-offset translation both silently depend on not
+happening. So the frame is written into each piece and the flat string is rebuilt
+from the pieces afterwards: there is one formatting of a frame in the crate, and
+the concatenation identity above still holds byte for byte.
+
+**The prompt bytes moved in 0.77.0, for every family.** The `external_content` tag
+is emitted whatever the [`PromptFamily`], unlike `repository_guidance` and
+`boundary`, where the delimiter is a formatting convention over a byte-identical
+body. A provenance marker is a different kind of object: given the explanatory
+sentence and no delimiter, the only thing separating quoted content from an
+instruction is prose, and the quoted content can forge any convincing
+end-of-quote line it likes. A one-family delimiter would ship the defence off for
+most of the fleet. The note explaining the tag is emitted unconditionally, so a
+run that never calls a tool carries it too — a constant never moves, and a
+sentence that appeared the first time a run read a file would withdraw the cache
+marker for nothing.
+
 **Two cases were sent as prose. One is left, and it is deliberate.** A step whose
 results do not line up with the calls it made falls back to prose, because
 correlating them positionally would answer the wrong call and a `tool_result`
