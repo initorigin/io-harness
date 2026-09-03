@@ -336,8 +336,7 @@ async fn a_fold_is_not_reversible_which_is_why_the_ladder_takes_the_collapse_fir
     // the summary purchase — no longer carries what the fold replaced.
     let after = seen
         .iter()
-        .filter(|r| !r.tools.is_empty())
-        .next_back()
+        .rfind(|r| !r.tools.is_empty())
         .expect("there must be a step after the fold");
     assert!(
         !after.user.contains(FIRST_OBSERVATION),
