@@ -1148,7 +1148,22 @@ mod requested {
         let refusals = Arc::new(AtomicUsize::new(0));
         let fussy = Fussy {
             // Under the seeded conversation whole, over it once folded.
-            ceiling: 2_000,
+            //
+            // 0.77.0 raised this from 2,000 by 320. The number is not a budget
+            // that was found to be too tight — it is a fixture parameter chosen
+            // to sit *between* two prompt sizes, and this release moved both of
+            // them by the same constant: `EXTERNAL_CONTENT_NOTE` is 311 bytes and
+            // is emitted unconditionally in every workspace user block. Nothing
+            // in this conversation is external — the seeded entries are
+            // `Origin::Operator` and `Origin::Agent` — so no per-entry frame is
+            // added and the note is the whole of the difference.
+            //
+            // The relationship under test is unchanged and still asserted below:
+            // one refusal, exactly one fold, and a retry smaller than what was
+            // refused. Raising this to make a *deadline* pass would be papering
+            // over a defect; raising it to track a constant the release
+            // deliberately added keeps the gate measuring what it measured.
+            ceiling: 2_320,
             sizes: Arc::clone(&sizes),
             refusals: Arc::clone(&refusals),
         };

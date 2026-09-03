@@ -328,6 +328,19 @@ const COLUMNS_ADDED_SINCE_0_22_0: &[(&str, &[&str])] = &[
             "store_ms INTEGER",
         ],
     ),
+    // 0.77.0 — where a ledger observation's content came from, as the snake_case
+    // rendering of `Origin`. Nullable, and deliberately with no `DEFAULT`: a row
+    // written before this release genuinely has no origin, so `NULL` is the
+    // honest reading and it comes back as `Origin::Unmarked`. A default would be
+    // a guess wearing the shape of a record, and this crate's traces are used as
+    // evidence.
+    //
+    // A column rather than a new `ObsKind` variant, and this test is where that
+    // decision is visible: `kind` is read back through a function that
+    // hard-errors on a value it does not know, so an origin expressed as a
+    // variant would make a previous binary refuse to restore the whole run
+    // instead of quietly ignoring a column it never selects.
+    ("ledger_observations", &["origin TEXT"]),
 ];
 
 /// Whether `new` is `old` with exactly the declared columns added, and nothing
