@@ -66,6 +66,7 @@ exclude = [
     "tests/fixtures/gen-0.72.0",
     "tests/fixtures/gen-0.73.0",
     "tests/fixtures/gen-0.74.0",
+    "tests/fixtures/gen-0.76.0",
     "tests/fixtures/links-consumer",
     "tests/fixtures/throughput-0.22.0",
 ]
