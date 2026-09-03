@@ -1232,6 +1232,32 @@ impl Store {
             let _ = conn.execute(&format!("ALTER TABLE steps ADD COLUMN {col}"), []);
         }
 
+        // 0.77.0 — where a ledger observation's content came from, as the
+        // snake_case rendering of [`Origin`](crate::context::Origin).
+        //
+        // A COLUMN rather than a new [`ObsKind`](crate::context::ObsKind) variant,
+        // and the distinction is the whole compatibility story of this release.
+        // `kind` is read back through `kind_from_wire`, which **hard-errors** on a
+        // value it does not know — so an origin expressed as a new `ObsKind`
+        // variant would make a 0.76.0 binary refuse to restore any ledger a 0.77.0
+        // binary wrote. A column it never selects costs it nothing.
+        //
+        // Additive, and NOT a `CHECKPOINT_FORMAT` bump, for the reason every
+        // addition since 0.13.0 has not been one: no checkpoint layout changed, an
+        // older binary never selects the column, and bumping the format would make
+        // [`Self::check_resumable`] refuse every 0.76.x store over a column it does
+        // not read.
+        //
+        // Not named in the `CREATE TABLE` above, deliberately, per the rule stated
+        // at the `edits`/`rewinds` additions: declaring it in both would put the
+        // column in the middle for a fresh store and at the end for a migrated one,
+        // and the two would no longer be the same database.
+        //
+        // No `DEFAULT`. A row written before this release has no origin, and NULL
+        // is how that is said — it reads back as `Origin::Unmarked`, which is
+        // honest, where a default would be a guess wearing the shape of a record.
+        let _ = conn.execute("ALTER TABLE ledger_observations ADD COLUMN origin TEXT", []);
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses

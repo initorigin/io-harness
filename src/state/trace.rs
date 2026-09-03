@@ -404,11 +404,18 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO ledger_observations (run_id, step, kind, target, text)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO ledger_observations (run_id, step, kind, target, text, origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             for e in entries {
-                stmt.execute((run_id, e.step as i64, kind_wire(e.kind), &e.target, &e.text))?;
+                stmt.execute((
+                    run_id,
+                    e.step as i64,
+                    kind_wire(e.kind),
+                    &e.target,
+                    &e.text,
+                    origin_wire(e.origin),
+                ))?;
             }
         }
         tx.commit()?;
@@ -750,7 +757,7 @@ impl Store {
     /// restore", which is 0.12.0's behaviour and not a lie about it.
     pub fn observations(&self, run_id: i64) -> Result<Vec<Observation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT step, kind, target, text
+            "SELECT step, kind, target, text, origin
              FROM ledger_observations WHERE run_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map([run_id], |r| {
@@ -759,16 +766,23 @@ impl Store {
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (step, kind, target, text) = row?;
+            let (step, kind, target, text, origin) = row?;
             out.push(Observation::new(
                 step,
                 kind_from_wire(&kind, run_id)?,
                 target,
                 text,
+                // NULL for every row written before 0.77.0, which reads back as
+                // `Origin::Unmarked` and renders exactly as it always did. The
+                // asymmetry with `kind_from_wire` above — that one refuses an
+                // unknown value and this one does not — is argued where
+                // `origin_from_wire` is defined.
+                origin_from_wire(origin.as_deref()),
             ));
         }
         Ok(out)
@@ -1931,6 +1945,164 @@ mod tests {
             "{STEPS} committed steps, median of {ROUNDS} rounds:\n  \
              steps row only          {without:?}\n  \
              steps row + attribution {with:?}"
+        );
+    }
+
+    /// 0.77.0, F12 — an origin written at the construction site is the origin
+    /// read back, for every variant, through the SQL round trip rather than the
+    /// serde one.
+    ///
+    /// The serde default in `context.rs` covers a JSON-serialized `Ledger`. It
+    /// does **not** cover this path, which is the one a resume actually takes, so
+    /// a feature that worked in memory and came back `Unmarked` on every resume
+    /// would pass every test in that file. This is the test that would not pass.
+    #[test]
+    fn every_origin_survives_the_sql_round_trip() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("mark every origin", "/repo").unwrap();
+
+        let written: Vec<Observation> = [
+            Origin::Operator,
+            Origin::Agent,
+            Origin::Prose,
+            Origin::File,
+            Origin::Shell,
+            Origin::Web,
+            Origin::Mcp,
+            Origin::Lsp,
+            Origin::Skill,
+            Origin::Child,
+            Origin::Tool,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, origin)| {
+            Observation::new(
+                i as u32 + 1,
+                ObsKind::Message,
+                None,
+                format!("content {i}"),
+                origin,
+            )
+        })
+        .collect();
+
+        store.record_observations(run, &written).unwrap();
+
+        let read = store.observations(run).unwrap();
+        assert_eq!(read.len(), written.len());
+        for (before, after) in written.iter().zip(read.iter()) {
+            assert_eq!(
+                before.origin, after.origin,
+                "origin {:?} did not survive the round trip",
+                before.origin
+            );
+        }
+    }
+
+    /// 0.77.0, F15 — a row written before this release reads back `Unmarked`,
+    /// not as an error and not as a guess.
+    ///
+    /// The row is inserted with the column list 0.76.0 used, which leaves
+    /// `origin` NULL exactly as a 0.76.0 binary would. Writing it any other way
+    /// would be testing this release against itself.
+    #[test]
+    fn a_row_written_without_an_origin_reads_back_unmarked() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("an older store", "/repo").unwrap();
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO ledger_observations (run_id, step, kind, target, text)
+                 VALUES (?1, 1, 'read', 'src/lib.rs', 'what 0.76.0 wrote')",
+                [run],
+            )
+            .unwrap();
+
+        let read = store.observations(run).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].origin, Origin::Unmarked);
+        assert_eq!(read[0].text, "what 0.76.0 wrote");
+    }
+
+    /// 0.77.0, F15 — and an origin written by some *newer* binary, whose word
+    /// this one has never heard, reads back as external rather than as unmarked
+    /// or as an error.
+    ///
+    /// Refusing it would re-introduce the incompatibility the column was chosen
+    /// over an `ObsKind` variant to avoid. Reading it as `Unmarked` would be
+    /// worse than refusing: `Unmarked` is not external, so content some future
+    /// release marked as coming from a server would quietly stop being framed as
+    /// untrusted. `Tool` is the conservative answer — external, unattributed.
+    #[test]
+    fn an_origin_from_a_newer_binary_reads_back_external() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("a newer store", "/repo").unwrap();
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO ledger_observations (run_id, step, kind, target, text, origin)
+                 VALUES (?1, 1, 'tool', NULL, 'from somewhere later', 'satellite')",
+                [run],
+            )
+            .unwrap();
+
+        let read = store.observations(run).unwrap();
+        assert_eq!(read.len(), 1);
+        assert!(
+            read[0].origin.is_external(),
+            "an origin this binary cannot interpret must still be treated as external"
+        );
+    }
+
+    /// 0.77.0, F16 — an archived session keeps its provenance while losing its
+    /// words.
+    ///
+    /// `is_fact_column` **defaults to clearing** any column it does not name, so
+    /// a new column is emptied by an archive unless somebody wrote one line. No
+    /// other test in the tree would notice: every one of them reads rows the same
+    /// run has just written, and an archive is the only path that rewrites them.
+    /// The sabotage arm is deleting that line — this test is what fails.
+    ///
+    /// Both halves are asserted, because the criterion is not "the column
+    /// survives" but "the classification survives and the content does not". A
+    /// change that kept the text too would pass a test that only checked the
+    /// origin, and it would be a broken promise rather than a bug.
+    #[test]
+    fn an_archived_session_keeps_the_origin_and_loses_the_text() {
+        let store = Store::memory().unwrap();
+        let session = store.create_session("/repo").unwrap();
+        let run = store.start_run("read a file", "/repo").unwrap();
+        store.record_turn(session, None, run, "what does it say").unwrap();
+
+        store
+            .record_observations(
+                run,
+                &[Observation::new(
+                    1,
+                    ObsKind::Read,
+                    Some("src/lib.rs".into()),
+                    "the exact contents of the file, which the archive removes",
+                    Origin::File,
+                )],
+            )
+            .unwrap();
+
+        store.archive_session(session).unwrap();
+
+        let read = store.observations(run).unwrap();
+        assert_eq!(read.len(), 1, "an archive keeps every row");
+        assert_eq!(
+            read[0].origin,
+            Origin::File,
+            "the archive cleared the origin, so the trace can no longer say whether \
+             this content was external"
+        );
+        assert!(
+            read[0].text.is_empty(),
+            "the archive is supposed to have taken the words"
         );
     }
 }
