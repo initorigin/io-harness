@@ -1142,6 +1142,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 contract.max_parallel_reads,
                 run_id,
                 step,
+                contract.tool_mask.clone(),
             )
         });
         let (response, assembled, user) = loop {

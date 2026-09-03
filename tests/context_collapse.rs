@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use io_harness::context::{
-    assemble, Assembly, Collapse, Compaction, ContextBudget, Ledger, ObsKind, Observation, Piece,
+    assemble, Assembly, Collapse, Compaction, ContextBudget, Ledger, ObsKind, Observation,
 };
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::Workspace;
@@ -81,19 +81,22 @@ impl Provider for Folding {
     }
 }
 
-/// A ledger of `n` entries, each `chars` long, alternating read and grep over a
-/// small set of paths so supersession and invalidation have something to bite on.
+/// A ledger of `n` collapsible entries, each `chars` long, over distinct targets.
+///
+/// **Greps, and every target distinct, both deliberately.** A read is never
+/// collapsed — see `a_read_is_never_collapsed_because_a_collapsed_read_would_be_a_tail`
+/// — so a fixture that interleaved reads would have the fit walk stop at the first
+/// one and measure that instead of the rung. Distinct targets keep supersession
+/// out of it for the same reason: two entries of one kind and target are one
+/// answer, and an elision that happens for *that* reason is 0.10.0's, not this
+/// release's.
 fn ledger(n: u32, chars: usize) -> Ledger {
     let mut l = Ledger::new();
     for i in 0..n {
         l.push(Observation::new(
             i + 1,
-            if i % 3 == 0 {
-                ObsKind::Read
-            } else {
-                ObsKind::Grep
-            },
-            Some(format!("f{}.txt", i % 7)),
+            ObsKind::Grep,
+            Some(format!("f{i}.txt")),
             format!("\n[entry {i}]\n{}\n", "y".repeat(chars)),
         ));
     }
@@ -381,22 +384,92 @@ async fn a_shortened_entry_is_still_a_read_of_a_path() {
         "\n[wrote f.txt]\n".to_string(),
     ));
 
+    // A grep of the same path, large enough to be the collapse candidate. The
+    // read above is deliberately NOT the candidate: a read is never collapsed.
+    l.push(Observation::new(
+        3,
+        ObsKind::Grep,
+        Some("f.txt".into()),
+        format!("\n[grep f.txt]\n{}\n", "z".repeat(20_000)),
+    ));
+
     let out = assembled(&f, &l, 2_000, Collapse { keep_chars: 400 }).await;
 
-    // The write supersedes the read, so the read is not carried whole — but the
-    // pairing only happens if the read still declares itself a read of `f.txt`.
-    let mentions_path = out
+    // The anti-vacuity guard this test was missing, and its absence is why it
+    // passed while proving nothing. Every other test in this file carries it.
+    assert!(
+        out.shortened > 0,
+        "nothing was shortened, so nothing here is about the collapse at all"
+    );
+
+    // The claim, asserted on the piece that was actually shortened rather than on
+    // any non-prose piece: a shortened entry still declares its kind and its
+    // target, which is what invalidation and re-read are keyed on. The previous
+    // form of this assertion was satisfied by the tiny write observation and by
+    // any non-prose piece whatever its text, so it could not fail.
+    let shortened_piece = out
         .emitted
         .iter()
-        .any(|e| e.piece != Piece::Prose || e.text.contains("f.txt"));
+        .find(|e| e.text.contains("grep f.txt") && e.text.contains("elided"))
+        .expect("the shortened grep must still name itself a grep of f.txt");
     assert!(
-        mentions_path || out.text.contains("f.txt"),
-        "the path must survive the projection, or invalidation and re-read cannot find it: {}",
+        shortened_piece.text.len() < 6_000,
+        "the piece found is the whole entry, not a shortened one"
+    );
+}
+
+/// F7's other half, and the one the adversarial review found missing: a read is
+/// never collapsed, because a collapsed read would be a tail.
+///
+/// `bound` keeps a read's *tail* — the end of a file is what a writer needs when
+/// one oversized read is capped. Inside an assembled projection that shape puts
+/// the end of a file into the prompt under a header saying the file was read,
+/// with no filename and no `offset`/`limit` advice, and the model cannot tell it
+/// from a whole read. 0.55.0 removed exactly that and its own test still asserts
+/// it; this is the same assertion with the rung turned on, which is the variant
+/// that was missing.
+#[tokio::test]
+async fn a_read_is_never_collapsed_because_a_collapsed_read_would_be_a_tail() {
+    let f = fixture();
+    let mut l = Ledger::new();
+    l.push(Observation::new(
+        1,
+        ObsKind::Read,
+        Some("src/lib.rs".into()),
+        format!(
+            "\n[read src/lib.rs]\nHEAD-SENTINEL\n{}\nTAIL-SENTINEL\n",
+            "y".repeat(6_000)
+        ),
+    ));
+    // Something newer and small, so the read is the entry that does not fit.
+    l.push(Observation::new(
+        2,
+        ObsKind::Grep,
+        Some("other".into()),
+        "\n[grep other]\nnothing\n".to_string(),
+    ));
+
+    let out = assembled(&f, &l, 500, Collapse { keep_chars: 200 }).await;
+
+    assert!(
+        !out.text.contains("TAIL-SENTINEL"),
+        "a collapsed read served its tail: that is the shape 0.55.0 removed, and the model \
+         cannot tell it from a whole read. Projection was:\n{}",
+        out.text
+    );
+    assert_eq!(
+        out.shortened, 0,
+        "the read was collapsed; a read is whole or a stub, never a partial"
+    );
+    assert!(
+        out.text.contains("src/lib.rs"),
+        "the stub must still name the file, which is the thing a tail cannot do: {}",
         out.text
     );
     assert!(
-        !out.text.is_empty(),
-        "an empty projection would satisfy the assertion above vacuously"
+        out.text.contains("offset"),
+        "the stub must still say how to get the part that matters back: {}",
+        out.text
     );
 }
 

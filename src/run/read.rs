@@ -727,6 +727,17 @@ pub(super) struct Speculation<'a> {
     /// The clone is the same one `read_batch` already makes per spawned task.
     pub(super) ws: Workspace,
     pub(super) tools: &'a Toolbox,
+    /// The turn's tool mask (0.76.0).
+    ///
+    /// **The third place a tool call can begin.** A speculated read never reaches
+    /// `dispatch` or `read_batch` — the loop folds its result directly — so a mask
+    /// enforced only at those two gates is bypassed by every streaming provider,
+    /// which is all four shipped ones. The gates cannot cover this path and this
+    /// path cannot borrow them: `Speculation` runs off the stream with no `Store`
+    /// and no `Watch`, so it refuses by declining to start rather than by emitting
+    /// a refusal, and the settled completion then dispatches the call normally,
+    /// where `mask_gate` refuses it and says so.
+    pub(super) mask: crate::ToolMask,
     /// 0.48.0's containment for this run, so a registered tool needing more than
     /// the run grants is refused here rather than started here. `dispatch` makes
     /// that decision before any tool arm (`resolve_call_mode`), and a speculated
@@ -1180,17 +1191,6 @@ pub(super) fn announce(watch: &Watch<'_>, run_id: i64, step: u32, depth: u32, ca
     ));
 }
 
-/// Ask the operator's `before_tool` hooks whether this call may happen (0.42.0).
-///
-/// One definition, two call sites: the head of [`dispatch`], which every
-/// non-batched call passes through, and [`read_batch`]'s per-call loop, which is
-/// where 0.41.0's concurrent reads are prepared. Both are serial and on the
-/// loop's own thread, so a hook runs in the model's call order and the read work
-/// it approves still runs concurrently. `None` means nothing objected.
-///
-/// A refusal is reported through [`EventKind::Refused`] with the hook's program
-/// where a rule's pattern would be: a refusal that did not come from the policy
-/// is still a refusal, and an observer already routing on them should see it.
 /// The caller's own per-turn mask, applied before anything is started (0.76.0).
 ///
 /// **Called from both places a tool call can begin** — the head of [`dispatch`]
@@ -1237,6 +1237,17 @@ pub(super) fn mask_gate(
     ))
 }
 
+/// Ask the operator's `before_tool` hooks whether this call may happen (0.42.0).
+///
+/// One definition, two call sites: the head of [`dispatch`], which every
+/// non-batched call passes through, and [`read_batch`]'s per-call loop, which is
+/// where 0.41.0's concurrent reads are prepared. Both are serial and on the
+/// loop's own thread, so a hook runs in the model's call order and the read work
+/// it approves still runs concurrently. `None` means nothing objected.
+///
+/// A refusal is reported through [`EventKind::Refused`] with the hook's program
+/// where a rule's pattern would be: a refusal that did not come from the policy
+/// is still a refusal, and an observer already routing on them should see it.
 pub(super) fn tool_gate(
     hooks: Option<&crate::hooks::Hooks>,
     call: &ToolCall,

@@ -46,6 +46,8 @@ fn widen_for_loopback() {
 struct Sink {
     addr: String,
     seen: Arc<AtomicUsize>,
+    /// Dials this helper made itself, subtracted from `connections()`.
+    controls: AtomicUsize,
 }
 
 impl Sink {
@@ -63,15 +65,25 @@ impl Sink {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
         });
-        Self { addr, seen }
+        Self {
+            addr,
+            seen,
+            controls: AtomicUsize::new(0),
+        }
     }
 
     fn url(&self) -> String {
         format!("http://{}/v1", self.addr)
     }
 
+    /// Connections the code under test opened.
+    ///
+    /// **The control dials this helper makes itself are subtracted**, so a second
+    /// `assert_only` on one `Sink` is not satisfied by the first one's dial, and a
+    /// later positive assertion is not made unfailable by an earlier absence
+    /// check. Both were true of the first version of this helper.
     fn connections(&self) -> usize {
-        self.seen.load(Ordering::SeqCst)
+        self.seen.load(Ordering::SeqCst) - self.controls.load(Ordering::SeqCst)
     }
 
     /// Wait until at least `n` connections have been accepted (0.76.0).
@@ -103,13 +115,25 @@ impl Sink {
     /// that connection — the OS cannot deliver a later dial ahead of an earlier
     /// one, so once the control is accepted, anything the run opened has been too.
     fn assert_only(&self, n: usize) {
+        let already = self.controls.load(Ordering::SeqCst);
         let _control = std::net::TcpStream::connect(&self.addr).expect("dial our own sink");
-        self.wait_for(n + 1);
+        // Wait on the RAW total, because `connections()` subtracts the controls
+        // and this dial has not been counted as one yet.
+        let want = already + n + 1;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.seen.load(Ordering::SeqCst) < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waited 30s for this test's own control dial to be accepted; raw total is {}",
+                self.seen.load(Ordering::SeqCst)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.controls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(
             self.connections(),
-            n + 1,
-            "a socket was opened that this test forbids: {} accepted where {} plus this test's \
-             own control dial were expected",
+            n,
+            "a socket was opened that this test forbids: {} beyond the {} expected",
             self.connections(),
             n
         );
@@ -383,11 +407,10 @@ async fn an_ask_on_the_network_is_approved_and_dials() {
         matches!(result.outcome, RunOutcome::Success { .. }),
         "{result:?}"
     );
-    assert_eq!(
-        sink.connections(),
-        1,
-        "one authorization, one dial — not two"
-    );
+    // 0.76.0 — "one dial, not two" is an absence assertion about the second dial,
+    // so it needs the same control: waiting for exactly one and no more.
+    sink.wait_for(1);
+    sink.assert_only(1);
 }
 
 /// F5 — a denial at the gate blocks the call.
@@ -485,11 +508,9 @@ async fn resuming_a_refused_run_reports_the_refusal_instead_of_asking_again() {
         1,
         "the human was asked once, not once per resume"
     );
-    assert_eq!(
-        sink.connections(),
-        0,
-        "and no socket was opened on either attempt"
-    );
+    // 0.76.0 — and no socket was opened on either attempt, asserted through a
+    // control dial so the absence cannot be a race the accept thread lost.
+    sink.assert_only(0);
 }
 
 /// F6 — a deferred network decision is persisted and delivered later, against a
@@ -735,11 +756,9 @@ async fn a_provider_endpoint_that_resolves_to_no_target_is_refused_under_an_allo
         );
     }
 
-    assert_eq!(
-        sink.connections(),
-        0,
-        "no socket may be opened for a URL the boundary could not resolve"
-    );
+    // 0.76.0 — no socket may be opened for a URL the boundary could not resolve,
+    // asserted through a control dial rather than by winning a race.
+    sink.assert_only(0);
 }
 
 /// The policy is act-complete: a network rule cannot be smuggled in as a path.

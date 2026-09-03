@@ -471,23 +471,16 @@ impl Compaction {
 /// assert!(!Collapse::default().enabled(), "off unless a caller asks");
 /// assert!(Collapse { keep_chars: 4_000 }.enabled());
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Collapse {
     /// Chars an entry that will not fit whole may still contribute.
     ///
-    /// Zero is off. The shortening itself is [`bound`], the same helper that caps
-    /// a single oversized observation, so a collapsed entry carries the same
-    /// marker a truncated one does and a reader learns one convention rather than
-    /// two — and, as there, a [`ObsKind::Read`] keeps its tail while every other
-    /// kind keeps its head.
+    /// Zero is off, and zero is the default. The shortening itself is [`bound`],
+    /// the same helper that caps a single oversized observation, so a collapsed
+    /// entry carries the same marker a truncated one does and a reader learns one
+    /// convention rather than two.
     pub keep_chars: usize,
-}
-
-impl Default for Collapse {
-    fn default() -> Self {
-        Self { keep_chars: 0 }
-    }
 }
 
 impl Collapse {
@@ -496,11 +489,22 @@ impl Collapse {
         self.keep_chars > 0
     }
 
-    /// The shortened form of `text`, or `None` when this setting is off or the
-    /// text is already inside the ceiling — in which case there is nothing to
-    /// collapse and the caller's ordinary path applies.
+    /// The shortened form of `text`, or `None` when there is nothing to collapse
+    /// — this setting is off, the text is already inside the ceiling, or the kind
+    /// is one this rung must not touch.
+    ///
+    /// **A [`ObsKind::Read`] is never collapsed, and that is 0.55.0's rule rather
+    /// than a limitation of this one.** A read is whole or it is a stub, never a
+    /// partial: [`bound`] keeps a read's *tail*, because when a single oversized
+    /// read is capped the end of the file is what a writer needs — but that shape
+    /// inside an assembled projection puts the end of a file into the prompt under
+    /// a header saying the file was read, and the model cannot tell the difference.
+    /// 0.55.0 removed exactly that, and a stub is strictly better here anyway: it
+    /// names the file and says to re-read it with `offset` and `limit`, where a
+    /// tail names nothing. Collapsing greps, tool results, child results and
+    /// messages is where the room is, and none of them make that promise.
     pub(crate) fn shorten(&self, text: &str, kind: ObsKind) -> Option<String> {
-        if !self.enabled() || text.chars().count() <= self.keep_chars {
+        if !self.enabled() || kind == ObsKind::Read || text.chars().count() <= self.keep_chars {
             return None;
         }
         Some(bound(text, self.keep_chars, kind))

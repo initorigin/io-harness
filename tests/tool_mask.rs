@@ -381,6 +381,118 @@ async fn a_masked_call_inside_a_read_batch_is_refused_and_its_sibling_still_runs
     );
 }
 
+/// F2, the third place a call can begin — and the one no other test in this file
+/// can reach.
+///
+/// **This is the defect an adversarial review found behind a fully green suite.**
+/// 0.54.0 starts a read-only call off the provider's *stream*, before the
+/// completion settles, and the loop then folds that result in place of
+/// dispatching the call. So a speculated call passes through neither
+/// `mask_gate` site: not `dispatch`, which is never reached, and not
+/// `read_batch`, which the loop explicitly skips for a speculated position. A
+/// masked `read_file` read the file and put its contents in the ledger.
+///
+/// It was invisible because `Provider::complete_streaming_calls` has a default
+/// body that reports no calls at all, so every fixture in this suite left
+/// speculation unreachable — while all four shipped providers override it, which
+/// makes the bypass the production path. This fixture overrides it, which is the
+/// whole reason the test exists.
+#[tokio::test]
+async fn a_masked_call_is_refused_even_when_it_is_speculated_off_the_stream() {
+    struct Streaming {
+        calls: Vec<ToolCall>,
+        at: AtomicUsize,
+    }
+
+    impl Provider for Streaming {
+        async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+            let i = self.at.fetch_add(1, Ordering::SeqCst);
+            Ok(CompletionResponse {
+                tool_calls: if i == 0 { self.calls.clone() } else { Vec::new() },
+                ..Default::default()
+            })
+        }
+
+        // Reports the call the moment it is "streamed", which is what puts the
+        // run on the speculative path.
+        async fn complete_streaming_calls(
+            &self,
+            req: CompletionRequest,
+            _on_token: &(dyn Fn(&str) + Send + Sync),
+            on_call: &(dyn Fn(usize, &ToolCall) + Send + Sync),
+        ) -> io_harness::Result<CompletionResponse> {
+            let i = self.at.fetch_add(1, Ordering::SeqCst);
+            let calls = if i == 0 { self.calls.clone() } else { Vec::new() };
+            for (at, call) in calls.iter().enumerate() {
+                on_call(at, call);
+            }
+            let _ = req;
+            Ok(CompletionResponse {
+                tool_calls: calls,
+                ..Default::default()
+            })
+        }
+
+        fn name(&self) -> &str {
+            "streaming"
+        }
+    }
+
+    let dir = workspace();
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, "ZZ-MUST-NOT-BE-READ-ZZ\n").unwrap();
+
+    let provider = Streaming {
+        calls: vec![ToolCall {
+            name: "read_file".into(),
+            arguments: json!({ "path": "secret.txt" }),
+        }],
+        at: AtomicUsize::new(0),
+    };
+
+    let store = Store::memory().unwrap();
+    let contract = contract(dir.path())
+        .with_tool_mask(ToolMask::withholding(["read_file"]))
+        .with_max_steps(2);
+    let mut session = Session::open(&store, dir.path()).unwrap();
+    // **`turn_bounded_observed`, and the choice is load-bearing.** Streaming is a
+    // property of the turn entry point, not of the provider: `run_with` sets
+    // `stream: false` outright and `turn_bounded` passes `TurnExtras::default()`,
+    // so neither can reach the speculative path at all. Written first against
+    // `turn_bounded`, this test passed with the fix sabotaged — it was asserting
+    // over a path it never entered, which is the same false pass the release is
+    // about. `max_parallel_reads` defaults above 1 and no tool hooks are set, so
+    // the other two conditions of the switch hold.
+    struct Silent;
+    impl io_harness::Observer for Silent {
+        fn event(&self, _e: &io_harness::RunEvent) -> io_harness::Flow {
+            io_harness::Flow::Continue
+        }
+    }
+    let _ = session
+        .turn_bounded_observed(
+            &contract,
+            &provider,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &Silent,
+        )
+        .await;
+
+    let observed: String = store
+        .observations(1)
+        .unwrap_or_default()
+        .iter()
+        .map(|o| o.text.clone())
+        .collect();
+    assert!(
+        !observed.contains("ZZ-MUST-NOT-BE-READ-ZZ"),
+        "a masked read was speculated off the stream and its contents reached the ledger \
+         without ever passing a mask gate: {observed}"
+    );
+}
+
 // ------------------------------------------------------------------------- F4
 
 /// F4 — a contract that names no mask sends what it sent before.

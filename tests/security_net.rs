@@ -72,6 +72,8 @@ fn floored() -> std::sync::MutexGuard<'static, ()> {
 struct Sink {
     addr: String,
     seen: Arc<AtomicUsize>,
+    /// Dials this helper made itself, subtracted from `connections()`.
+    controls: AtomicUsize,
 }
 
 impl Sink {
@@ -88,15 +90,25 @@ impl Sink {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
         });
-        Self { addr, seen }
+        Self {
+            addr,
+            seen,
+            controls: AtomicUsize::new(0),
+        }
     }
 
     fn url(&self) -> String {
         format!("http://{}/v1", self.addr)
     }
 
+    /// Connections the code under test opened.
+    ///
+    /// **The control dials this helper makes itself are subtracted**, so a second
+    /// `assert_only` on one `Sink` is not satisfied by the first one's dial, and a
+    /// later positive assertion is not made unfailable by an earlier absence
+    /// check. Both were true of the first version of this helper.
     fn connections(&self) -> usize {
-        self.seen.load(Ordering::SeqCst)
+        self.seen.load(Ordering::SeqCst) - self.controls.load(Ordering::SeqCst)
     }
 
     /// Wait until at least `n` connections have been accepted (0.76.0).
@@ -129,13 +141,25 @@ impl Sink {
     /// deliver a later dial ahead of an earlier one, so once the control has been
     /// accepted, anything the run under test opened has been accepted too.
     fn assert_only(&self, n: usize) {
+        let already = self.controls.load(Ordering::SeqCst);
         let _control = std::net::TcpStream::connect(&self.addr).expect("dial our own sink");
-        self.wait_for(n + 1);
+        // Wait on the RAW total, because `connections()` subtracts the controls
+        // and this dial has not been counted as one yet.
+        let want = already + n + 1;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.seen.load(Ordering::SeqCst) < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waited 30s for this test's own control dial to be accepted; raw total is {}",
+                self.seen.load(Ordering::SeqCst)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.controls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(
             self.connections(),
-            n + 1,
-            "a socket was opened that this test forbids: {} accepted where {} plus this test's \
-             own control dial were expected",
+            n,
+            "a socket was opened that this test forbids: {} beyond the {} expected",
             self.connections(),
             n
         );
