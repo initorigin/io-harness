@@ -399,9 +399,14 @@ async fn crashed_fleet() -> (tempfile::TempDir, std::path::PathBuf) {
     let root = dir.path().join("ws");
     std::fs::create_dir(&root).unwrap();
 
+    // stderr is captured rather than inherited so a fixture that dies can say why
+    // (0.76.0). Without this a dead fixture and a slow one both read as an empty
+    // queue, which is the same conflation the deadline below was rewritten to
+    // remove — the first rewrite fixed the clock and left this half.
     let mut child = tokio::process::Command::new(&bin)
         .arg(&db)
         .arg(&root)
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn fleet_fixture");
 
@@ -436,11 +441,24 @@ async fn crashed_fleet() -> (tempfile::TempDir, std::path::PathBuf) {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    // Whether the fixture is still alive is the fact that separates "slow" from
+    // "dead", and it is the one the first rewrite of this test still could not
+    // report. A store that reads `Ok(0)` for sixty seconds is not a slow host.
+    let alive = matches!(child.try_wait(), Ok(None));
     child.kill().await.expect("SIGKILL the fixture");
+    let stderr = match last {
+        Ok(4) => String::new(),
+        _ => {
+            let out = child.wait_with_output().await;
+            let bytes = out.map(|o| o.stderr).unwrap_or_default();
+            String::from_utf8_lossy(&bytes).trim().to_string()
+        }
+    };
     assert_eq!(
         last,
         Ok(4),
-        "the queue never reached 4 within 60s; the last thing this test could read was {last:?}"
+        "the queue never reached 4 within 60s. Last read: {last:?}. Fixture still running: \
+         {alive}. Its stderr:\n{stderr}"
     );
     (dir, db)
 }
