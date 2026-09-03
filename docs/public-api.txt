@@ -143,6 +143,7 @@ struct BrowserConfig src/browser.rs
 struct CheckpointEvent src/state.rs
 struct Citation src/web.rs
 struct Compatible src/provider/compatible.rs
+struct Collapse src/context.rs
 struct CompletionRequest src/provider/mod.rs
 struct CompletionResponse src/provider/mod.rs
 struct Compaction src/context.rs
@@ -242,6 +243,7 @@ struct ToolAttempt src/state.rs
 struct Transcript src/session.rs
 struct TranscriptTurn src/session.rs
 struct ToolCall src/provider/mod.rs
+struct ToolMask src/tools/mod.rs
 struct ToolResult src/provider/mod.rs
 struct ToolSpec src/provider/mod.rs
 struct Toolbox src/tools/custom.rs

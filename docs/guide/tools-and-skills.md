@@ -304,6 +304,43 @@ user's workspace is dispatched as a built-in instead, gated per call on the real
 path it names — so `deny_write("secrets/*")` refuses it for exactly the reason it
 refuses `write_file` to the same path.
 
+## Withholding a tool from one turn (0.76.0)
+
+A session that will never open a spreadsheet is still offered the spreadsheet
+tools on every request. `ToolMask` withholds them for a turn:
+
+```rust
+use io_harness::{TaskContract, ToolMask};
+
+let contract = TaskContract::workspace("summarise the changelog", "/repo")
+    .with_tool_mask(ToolMask::withholding([
+        "xlsx_read", "xlsx_write", "xlsx_sheets", "xlsx_set_cell",
+    ]));
+```
+
+The model is told, after the observation section, which tools are unavailable
+this turn, and a call to one of them is refused before anything is started.
+
+**What this does not do is remove them from the request.** The catalogue sent is
+byte-identical to an unmasked run's — the same schemas, in the same order, paid
+for in the same tokens. That is deliberate, and it is the whole design: on the
+Anthropic wire the tool array sits ahead of the cache breakpoint at the end of the
+system block, so changing a byte of it invalidates that cache entry and everything
+after it. Dropping a withheld tool's definition would save its tokens once and pay
+a cache *write* on every later turn of the run. What a mask buys is a prefix that
+stays cached while what the turn may do changes.
+
+It is a **deny** set rather than an allow set, for the reason every other refusal
+here is deny-first: a list of permitted names would silently withhold the next
+tool anyone adds. A name no tool answers to is kept rather than rejected, so a
+mask stays portable across builds with different features compiled in.
+
+A mask is a property of one turn. It does not reach a spawned child, and a run
+resumed from a contract that names no mask withholds nothing. It is an
+instruction, not a boundary: it layers above the policy and never instead of it,
+so it grants nothing and narrows no permission. What stops an agent from acting is
+still the policy and the containment.
+
 ## See also
 
 - [MCP and network egress](mcp-and-network.md) — the out-of-process half, and the

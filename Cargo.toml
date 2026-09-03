@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.75.0"
+version = "0.76.0"
 edition = "2021"
 # `libsqlite3-sys` 0.38.1 sets the floor from 0.23.0 on: its build script — and
 # `rusqlite` 0.40's own source — call the std `cfg_select!` macro, stabilised in
@@ -138,7 +138,7 @@ pdf-extract = { version = "0.12", optional = true }
 rxing = { version = "0.9", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "bmp", "tiff", "ico", "tga", "pnm"] }
 calamine = { version = "0.36", optional = true }
-rust_xlsxwriter = { version = "0.98", optional = true }
+rust_xlsxwriter = { version = "0.99", optional = true }
 umya-spreadsheet = { version = "3.0", optional = true }
 
 rmcp = { version = "3.0.0", default-features = false, features = [

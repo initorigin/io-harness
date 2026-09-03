@@ -278,7 +278,12 @@ async fn a_replay_opens_no_connection() {
     // replayed run needs no egress grant.
     assert_eq!(replay.endpoint(), None);
     assert!(replay.endpoints().is_empty());
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // 0.76.0 — the 50ms sleep here was a guess that the accept thread would have
+    // run by now, and this file's own `wait_for` was written to say exactly that
+    // and then not used at this site. Waiting for the recording pass's connection
+    // makes the "and no more" half an observation rather than a race: once that
+    // accept has landed, a connection the replay opened would have landed too.
+    sink.wait_for(1).await;
     assert_eq!(
         sink.connections(),
         1,

@@ -100,7 +100,6 @@ fn a_replayable_call_writes_no_row() {
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::{Tool, ToolEffect, ToolFuture, Toolbox};
@@ -176,13 +175,59 @@ impl Tool for Charge {
 /// decided by what is in the request, so one provider serves the run and the
 /// resume. `park_first` is case (a) — the completion that would have asked for
 /// the call never returns.
+/// Drive `run` until `ready` answers, then stop driving it — dropping it where it
+/// stands (0.76.0).
+///
+/// The same shape `tests/checkpoint.rs` uses, and it is duplicated rather than
+/// shared because Cargo compiles each file under `tests/` as its own crate: the
+/// alternative is a `#[path]` module, which is more machinery than twenty lines.
+///
+/// The bound is a **liveness** bound, never a budget. A slow host takes longer
+/// and still reaches the condition; a run that cannot reach it fails and says so.
+/// `Ok(None)` is the intended outcome — the run was cut off. `Ok(Some(_))` means
+/// it finished, which is a different failure and is reported as one.
+async fn cut_off_when<F: std::future::Future>(
+    run: F,
+    mut ready: impl FnMut() -> bool,
+) -> Result<Option<F::Output>, tokio::time::error::Elapsed> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(5);
+    const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let mut run = Box::pin(run);
+    loop {
+        tokio::select! {
+            done = &mut run => return Ok(Some(done)),
+            _ = tokio::time::sleep(POLL) => {
+                if ready() {
+                    return Ok(None);
+                }
+                if started.elapsed() > GIVE_UP {
+                    // The only error this returns, and it means the condition was
+                    // never reached — not that a deadline for reaching it expired.
+                    return tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+                        .await
+                        .map(|_| None);
+                }
+            }
+        }
+    }
+}
+
 struct Cashier {
     park_first: bool,
     park_after_charge: bool,
+    /// How many completions this provider has been asked for (0.76.0).
+    ///
+    /// The observable the cut-off waits on for `Kill::BeforeJournal`, which is
+    /// the one arm with no durable row to poll for: the run parks *before* it
+    /// journals anything, so "has the run got far enough to be cut off" cannot
+    /// be answered from the store. Being asked for a completion can.
+    entered: Arc<AtomicUsize>,
 }
 
 impl Provider for Cashier {
     async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
         if req.user.contains("[charge]") {
             if self.park_after_charge {
                 std::future::pending::<()>().await;
@@ -246,18 +291,65 @@ async fn crashed(
     let calls = Arc::new(AtomicUsize::new(0));
     let store = Store::open(&db).unwrap();
     let contract = contract(dir, &calls, kill, read_only);
+    let entered = Arc::new(AtomicUsize::new(0));
     let provider = Cashier {
         park_first: kill == Kill::BeforeJournal,
         park_after_charge: kill == Kill::AfterCompletion,
+        entered: Arc::clone(&entered),
     };
-    let cut_off = tokio::time::timeout(
-        Duration::from_millis(400),
+
+    // 0.76.0 — the cut-off was a 400ms budget, and 400ms had to cover opening
+    // SQLite, the startup boundary probe's child spawns, composing a prompt,
+    // answering it and journalling the attempt. On a loaded Windows runner it did
+    // not, and the run then parked in the probe rather than at the kill point —
+    // so the timeout still elapsed, `cut_off.is_err()` still passed, and the
+    // failure surfaced far away as an index panic on an empty attempts list. That
+    // is the sharpest case in this repository of slow and broken reporting the
+    // same way, and it is issue #232's `recovery.rs` site.
+    //
+    // The cut-off is now the state itself. `BeforeJournal` parks before anything
+    // durable exists, so its observable is the provider having been asked at all;
+    // every other arm journals an attempt, which is a row. The ceiling is a
+    // liveness bound rather than the thing being measured.
+    // Each arm parks somewhere different, so each has a different observable.
+    // `BeforeJournal` parks inside its first completion, before anything durable
+    // exists. A read-only tool is journalled nowhere on purpose — that is the
+    // claim its own test makes — so there is never a row to wait for, and the
+    // second completion being asked for is what says the tool has run.
+    // `AfterCompletion` parks inside the charge's completion, which is also the
+    // second. Everything else journals an attempt, which is a row.
+    let reached = || {
+        let asked = entered.load(Ordering::SeqCst);
+        match kill {
+            Kill::BeforeJournal => asked > 0,
+            Kill::AfterCompletion => asked >= 2,
+            // The read-only arm's own counter is the observable: its tool leaves
+            // no row anywhere, which is the claim, so "the tool has run" cannot
+            // be read from the store and the provider is asked only once.
+            _ if read_only => calls.load(Ordering::SeqCst) > 0,
+            _ => store
+                .open_attempts(1)
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+        }
+    };
+    let cut_off = cut_off_when(
         run_with(&contract, &provider, &store, &open_policy(), &ApproveAll),
+        reached,
     )
     .await;
+    let cut_off = cut_off.unwrap_or_else(|_| {
+        panic!(
+            "the run never reached its kill point within the liveness bound: the provider was \
+             asked {} time(s) and the store holds {} open attempt(s). That is a run that does \
+             not get there, not a slow machine",
+            entered.load(Ordering::SeqCst),
+            store.open_attempts(1).map(|a| a.len()).unwrap_or(0)
+        )
+    });
     assert!(
-        cut_off.is_err(),
-        "the run must be cut off mid-flight, not finish"
+        cut_off.is_none(),
+        "the run finished instead of being cut off mid-flight: {cut_off:?}"
     );
     drop(store);
     (db, 1, calls)
@@ -289,6 +381,7 @@ async fn killed_before_the_journal_the_call_is_replayed() {
         &Cashier {
             park_first: false,
             park_after_charge: false,
+            entered: Arc::new(AtomicUsize::new(0)),
         },
         &store,
         run,
@@ -326,6 +419,7 @@ async fn killed_after_the_journal_and_before_the_effect_the_run_pauses() {
         &Cashier {
             park_first: false,
             park_after_charge: false,
+            entered: Arc::new(AtomicUsize::new(0)),
         },
         &store,
         run,
@@ -367,6 +461,7 @@ async fn killed_after_the_effect_and_before_the_completion_the_run_pauses() {
         &Cashier {
             park_first: false,
             park_after_charge: false,
+            entered: Arc::new(AtomicUsize::new(0)),
         },
         &store,
         run,
@@ -409,6 +504,7 @@ async fn killed_after_the_call_completed_the_run_resumes_without_pausing() {
         &Cashier {
             park_first: false,
             park_after_charge: false,
+            entered: Arc::new(AtomicUsize::new(0)),
         },
         &store,
         run,
@@ -459,6 +555,7 @@ async fn a_read_only_tool_is_journalled_nowhere_and_pauses_nothing() {
         &Cashier {
             park_first: false,
             park_after_charge: false,
+            entered: Arc::new(AtomicUsize::new(0)),
         },
         &store,
         run,
@@ -502,6 +599,7 @@ async fn retry_makes_the_call_again() {
         &Cashier {
             park_first: false,
             park_after_charge: false,
+            entered: Arc::new(AtomicUsize::new(0)),
         },
         &store,
         run,
@@ -540,6 +638,7 @@ async fn completed_does_not_call_the_tool_and_the_operators_account_reaches_the_
         &Cashier {
             park_first: false,
             park_after_charge: false,
+            entered: Arc::new(AtomicUsize::new(0)),
         },
         &store,
         run,
@@ -581,6 +680,7 @@ async fn abort_ends_the_run_without_making_the_call() {
         &Cashier {
             park_first: false,
             park_after_charge: false,
+            entered: Arc::new(AtomicUsize::new(0)),
         },
         &store,
         run,
@@ -616,6 +716,7 @@ async fn a_decision_about_an_attempt_that_is_not_open_is_refused() {
     let provider = Cashier {
         park_first: false,
         park_after_charge: false,
+        entered: Arc::new(AtomicUsize::new(0)),
     };
 
     resume_with_recovery(

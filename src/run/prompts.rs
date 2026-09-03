@@ -952,9 +952,35 @@ pub(super) fn workspace_user_prompt(
         "Goal: {goal}\nConstraints: {constraints}\nSuccess criterion: {criterion}\n\
          {project}\n\
          Observations so far (results of your tool calls):\n{obs}\n\n\
-         Call a tool to make progress toward the success criterion.",
+         {withheld}Call a tool to make progress toward the success criterion.",
         goal = contract.goal,
         criterion = contract.verify.describe(),
+        withheld = withheld_sentence(&contract.tool_mask),
+    )
+}
+
+/// What a turn is told about the tools it may not call, or nothing (0.76.0).
+///
+/// **Where this lands is the whole reason masking is affordable.** It is appended
+/// *after* the observation section, so it falls in the `tail` [`transcript`]
+/// splits off — past 0.38.0's breakpoint at the end of `system` and past the
+/// frozen prefix `PrefixGuard` marks, both of which sit earlier in the request.
+/// A mask that changes on every step therefore costs no cache entry, while the
+/// same sentence written into the system block or into the tool array would
+/// convert every later turn's cache read into a write. Anything added here must
+/// stay after the observations for that reason, not merely for readability.
+///
+/// The names are rendered in the mask's own sorted order, so the same mask
+/// renders the same bytes twice — which is what lets a replay and a determinism
+/// comparison see a masked run as one run rather than two.
+pub(super) fn withheld_sentence(mask: &crate::ToolMask) -> String {
+    if mask.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Unavailable this turn — these tools are listed above but calling one is \
+         refused and starts nothing: {}.\n\n",
+        mask.names().collect::<Vec<_>>().join(", "),
     )
 }
 
@@ -983,11 +1009,25 @@ pub(super) fn workspace_user_prompt(
 /// relative order keeps a classifying turn marking the same prefix a promoted one
 /// marks. A second user-prompt shape that reordered them would change what is
 /// cached while nothing failed.
-pub(super) fn conversational_user_prompt(goal: &str, observations: &str) -> String {
-    if observations.is_empty() {
+pub(super) fn conversational_user_prompt(
+    goal: &str,
+    observations: &str,
+    mask: &crate::ToolMask,
+) -> String {
+    let base = if observations.is_empty() {
         goal.to_string()
     } else {
         format!("{goal}\n\n{observations}")
+    };
+    // Appended last for the same reason it is appended last to the workspace
+    // prompt: the boundary `cache_boundary_for` marks sits inside `observations`,
+    // so anything after that string is past the marker and costs no cache entry
+    // however often it changes. A masked classifying turn is told the same thing
+    // a masked promoted one is — the enforcement covers both either way, and a
+    // refusal the model was never warned about is a worse turn, not a safer one.
+    match withheld_sentence(mask).trim_end() {
+        "" => base,
+        withheld => format!("{base}\n\n{withheld}"),
     }
 }
 

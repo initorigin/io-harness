@@ -1142,6 +1142,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 contract.max_parallel_reads,
                 run_id,
                 step,
+                contract.tool_mask.clone(),
             )
         });
         let (response, assembled, user) = loop {
@@ -1170,6 +1171,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     store,
                     run_id,
                     step,
+                    collapse: contract.collapse,
                 },
             )
             .await?;
@@ -1177,7 +1179,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
             // half below, so the two halves of one completion cannot disagree.
             let user = match &conversational {
                 Some(_) if step == start_step => {
-                    conversational_user_prompt(&contract.goal, &assembled.text)
+                    conversational_user_prompt(&contract.goal, &assembled.text, &contract.tool_mask)
                 }
                 _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
             };
@@ -1499,6 +1501,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                         // (0.75.0) The batch can now contain a call that spawns —
                         // a git reader — so the run's containment has to reach it.
                         containment.as_ref(),
+                        &contract.tool_mask,
                     )
                     .await?;
                     store.attribute_tool(run_id, step, batched_at.elapsed());
@@ -1589,6 +1592,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                         },
                         &contract.goal,
                         contract.tool_hooks.as_deref(),
+                        &contract.tool_mask,
                     )
                     .await;
                     store.attribute_tool(run_id, step, dispatched_at.elapsed());

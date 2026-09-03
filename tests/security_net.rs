@@ -72,6 +72,8 @@ fn floored() -> std::sync::MutexGuard<'static, ()> {
 struct Sink {
     addr: String,
     seen: Arc<AtomicUsize>,
+    /// Dials this helper made itself, subtracted from `connections()`.
+    controls: AtomicUsize,
 }
 
 impl Sink {
@@ -88,15 +90,79 @@ impl Sink {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
         });
-        Self { addr, seen }
+        Self {
+            addr,
+            seen,
+            controls: AtomicUsize::new(0),
+        }
     }
 
     fn url(&self) -> String {
         format!("http://{}/v1", self.addr)
     }
 
+    /// Connections the code under test opened.
+    ///
+    /// **The control dials this helper makes itself are subtracted**, so a second
+    /// `assert_only` on one `Sink` is not satisfied by the first one's dial, and a
+    /// later positive assertion is not made unfailable by an earlier absence
+    /// check. Both were true of the first version of this helper.
     fn connections(&self) -> usize {
-        self.seen.load(Ordering::SeqCst)
+        self.seen.load(Ordering::SeqCst) - self.controls.load(Ordering::SeqCst)
+    }
+
+    /// Wait until at least `n` connections have been accepted (0.76.0).
+    ///
+    /// **`connect` returning is not `accept` returning.** The handshake is
+    /// completed by the kernel into the accept backlog, and the counting thread
+    /// running is a later, unordered event — so reading the counter straight
+    /// after a run races the scheduler. `tests/replay.rs` already says this in
+    /// its own `wait_for`; this is the same fix applied to the second copy of
+    /// `Sink`. Bounded, so a socket that never arrives fails rather than hangs.
+    fn wait_for(&self, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.connections() < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waited 30s for {n} connection(s) and saw {}",
+                self.connections()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Assert nothing beyond `n` connections was opened, without winning a race
+    /// (0.76.0).
+    ///
+    /// A bare `assert_eq!(connections(), 0)` is true whenever the accept thread
+    /// has not been scheduled yet, so it passes over a genuinely leaked socket —
+    /// a silent false pass rather than a flake, which is why it is worse. This
+    /// dials the sink itself and waits for *that* connection: the OS cannot
+    /// deliver a later dial ahead of an earlier one, so once the control has been
+    /// accepted, anything the run under test opened has been accepted too.
+    fn assert_only(&self, n: usize) {
+        let already = self.controls.load(Ordering::SeqCst);
+        let _control = std::net::TcpStream::connect(&self.addr).expect("dial our own sink");
+        // Wait on the RAW total, because `connections()` subtracts the controls
+        // and this dial has not been counted as one yet.
+        let want = already + n + 1;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.seen.load(Ordering::SeqCst) < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waited 30s for this test's own control dial to be accepted; raw total is {}",
+                self.seen.load(Ordering::SeqCst)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.controls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            self.connections(),
+            n,
+            "a socket was opened that this test forbids: {} beyond the {} expected",
+            self.connections(),
+            n
+        );
     }
 }
 
@@ -278,11 +344,9 @@ async fn m10_a_loopback_endpoint_is_refused_under_a_policy_that_allows_every_hos
         "it names the key that restores it: {rule}"
     );
 
-    assert_eq!(
-        sink.connections(),
-        0,
-        "no socket may be opened for an endpoint the floor refuses"
-    );
+    // 0.76.0 — an absence the OS cannot reorder: no socket may be opened for an
+    // endpoint the floor refuses. See `Sink::assert_only`.
+    sink.assert_only(0);
 
     // And the refusal is in the trace beside every other permission decision,
     // attributed to the floor rather than to a rule the operator wrote.
@@ -396,7 +460,8 @@ async fn m10_an_http_mcp_server_on_a_local_address_is_refused() {
             "{url}: the server was never reached"
         );
     }
-    assert_eq!(sink.connections(), 0, "nothing was dialled");
+    // 0.76.0 — an absence the OS cannot reorder. See `Sink::assert_only`.
+    sink.assert_only(0);
 }
 
 /// M10 — a host that is a literal only to the *resolver* is resolved and graded.
@@ -447,7 +512,8 @@ async fn m10_a_host_only_the_resolver_reads_as_local_is_refused() {
                 && rule.as_deref().is_some_and(|r| r.contains("127.0.0.1"))),
         "expected a floor refusal naming the resolved address, got {err:?}"
     );
-    assert_eq!(sink.connections(), 0, "no socket may be opened");
+    // 0.76.0 — an absence the OS cannot reorder. See `Sink::assert_only`.
+    sink.assert_only(0);
 
     // The same, by name, for the addresses this suite must not send a packet to.
     for endpoint in [
@@ -483,7 +549,8 @@ async fn m10_a_host_only_the_resolver_reads_as_local_is_refused() {
             if act == "net" && layer.as_deref() == Some("local-address floor")),
         "expected a floor refusal, got {err:?}"
     );
-    assert_eq!(sink.connections(), 0, "nothing was dialled");
+    // 0.76.0 — an absence the OS cannot reorder. See `Sink::assert_only`.
+    sink.assert_only(0);
 }
 
 /// M10 — the widening lifts a short-form local address and never the metadata one.
@@ -514,6 +581,7 @@ async fn m10_the_opt_out_reaches_a_short_form_loopback_endpoint() {
         matches!(result.outcome, RunOutcome::Success { .. }),
         "{result:?}"
     );
+    sink.wait_for(1);
     assert!(sink.connections() >= 1, "a socket, not a verdict");
 
     // Metadata stays refused, in this spelling as in the dotted one.
@@ -638,6 +706,9 @@ async fn m10_the_opt_out_restores_a_local_model_endpoint() {
         matches!(result.outcome, RunOutcome::Success { .. }),
         "{result:?}"
     );
+    // 0.76.0 — waited for rather than read. The run returning does not mean the
+    // accept thread has run, and this assertion failed on CI for exactly that.
+    sink.wait_for(1);
     assert!(
         sink.connections() >= 1,
         "the widening is what a local runtime needs: a socket, not a verdict"
