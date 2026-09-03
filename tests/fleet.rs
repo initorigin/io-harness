@@ -420,7 +420,7 @@ async fn crashed_fleet() -> (tempfile::TempDir, std::path::PathBuf) {
     // fixture writes to this database while the test reads it, so `Store::open`
     // and `queued_agents` can legitimately answer `SQLITE_BUSY` — swallowing
     // those with `if let Ok` burned poll iterations and then blamed the fixture.
-    let mut last: Result<usize, String> = Err("the store was never opened".into());
+    let mut last: Result<usize, String>;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         last = Store::open(&db)

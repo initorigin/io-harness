@@ -700,13 +700,26 @@ async fn assembling_one_turn_costs_a_bounded_amount_of_time() {
         .await
         .unwrap();
         assert!(out.carried > 0);
+        // 0.76.0 — the structural property the duration below used to stand in
+        // for, and the one worth gating a merge on: assembly is bounded by the
+        // turn's budget rather than by the ledger's length. A 200-entry log of
+        // 1,000 chars each is ~50,000 tokens of raw observation against a 24,000
+        // budget, so a projection that grew with the ledger would exceed it here.
+        assert!(
+            out.est_tokens <= 24_000,
+            "a 200-entry ledger assembled to {} tokens against a 24,000 budget: the section is \
+             tracking the log's length rather than the turn's budget",
+            out.est_tokens
+        );
     }
     let per_turn = started.elapsed() / TURNS;
 
-    assert!(
-        per_turn < std::time::Duration::from_millis(25),
-        "assembling a 200-entry log took {per_turn:?} per turn, over the 25ms bound"
-    );
+    // 0.76.0 — printed, never asserted. A wall-clock threshold on a shared CI
+    // runner fails for the runner's reasons and says nothing about the code, and
+    // this repository already applies exactly that rule to every other duration it
+    // records: timing goes to `docs/MEASUREMENTS.md` with a machine beside it, and
+    // the merge gate is the structural assertion above.
+    println!("assembling a 200-entry log: {per_turn:?} per turn");
 }
 
 // ---------------------------------------------------------------- unit-level budget maths

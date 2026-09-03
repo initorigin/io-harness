@@ -73,6 +73,47 @@ impl Sink {
     fn connections(&self) -> usize {
         self.seen.load(Ordering::SeqCst)
     }
+
+    /// Wait until at least `n` connections have been accepted (0.76.0).
+    ///
+    /// **`connect` returning is not `accept` returning.** The kernel completes
+    /// the handshake into the accept backlog and the counting thread running is a
+    /// later, unordered event, so reading the counter straight after a run races
+    /// the scheduler. Bounded, so a socket that never arrives fails rather than
+    /// hangs.
+    fn wait_for(&self, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.connections() < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waited 30s for {n} connection(s) and saw {}",
+                self.connections()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Assert nothing beyond `n` connections was opened, without winning a race
+    /// (0.76.0).
+    ///
+    /// A bare `assert_eq!(connections(), 0)` is true whenever the accept thread
+    /// has not been scheduled yet, so it passes over a genuinely leaked socket.
+    /// That is a silent false pass rather than a flake, which is what makes it
+    /// worse: nothing ever reports it. This dials the sink itself and waits for
+    /// that connection — the OS cannot deliver a later dial ahead of an earlier
+    /// one, so once the control is accepted, anything the run opened has been too.
+    fn assert_only(&self, n: usize) {
+        let _control = std::net::TcpStream::connect(&self.addr).expect("dial our own sink");
+        self.wait_for(n + 1);
+        assert_eq!(
+            self.connections(),
+            n + 1,
+            "a socket was opened that this test forbids: {} accepted where {} plus this test's \
+             own control dial were expected",
+            self.connections(),
+            n
+        );
+    }
 }
 
 /// A provider that opens a real TCP connection to its endpoint before answering.
@@ -230,6 +271,7 @@ async fn a_deny_all_base_still_reaches_its_provider_through_the_provider_layer()
         matches!(result.outcome, RunOutcome::Success { .. }),
         "{result:?}"
     );
+    sink.wait_for(1);
     assert!(sink.connections() >= 1, "the provider should have dialled");
 
     let allowed = store
@@ -282,7 +324,9 @@ async fn an_untrusted_provider_endpoint_is_refused_by_a_deny_all_base() {
         matches!(&err, Error::Refused { act, .. } if act == "net"),
         "{err:?}"
     );
-    assert_eq!(sink.connections(), 0, "refused before a socket was opened");
+    // 0.76.0 — refused before a socket was opened, asserted through a control
+    // dial so the absence does not depend on the accept thread being scheduled.
+    sink.assert_only(0);
 }
 
 /// F8 — an explicit deny of the provider's own host still wins, and fails fast.
@@ -309,7 +353,7 @@ async fn denying_your_own_provider_is_legal_and_fails_as_a_refusal() {
     .unwrap_err();
 
     assert!(matches!(&err, Error::Refused { act, .. } if act == "net"));
-    assert_eq!(sink.connections(), 0);
+    sink.assert_only(0);
 }
 
 /// F5 — `Ask` routes to the approver; an approval dials exactly once.
@@ -364,7 +408,7 @@ async fn an_ask_denied_at_the_gate_never_dials() {
         .unwrap_err();
 
     assert!(matches!(&err, Error::Refused { act, .. } if act == "net"));
-    assert_eq!(sink.connections(), 0);
+    sink.assert_only(0);
 }
 
 /// An approver that answers `Deny` and counts how many times it was asked.
@@ -480,7 +524,8 @@ async fn a_deferred_network_decision_persists_and_resumes() {
             other => panic!("expected a pause, got {other:?}"),
         }
     };
-    assert_eq!(sink.connections(), 0, "a paused run has not dialled");
+    // 0.76.0 — a paused run has not dialled, asserted through a control dial.
+    sink.assert_only(0);
 
     // A fresh process: new store handle, new provider, the decision arrives now.
     let store = Store::open(&file).unwrap();
@@ -506,6 +551,7 @@ async fn a_deferred_network_decision_persists_and_resumes() {
         matches!(result.outcome, RunOutcome::Success { .. }),
         "{result:?}"
     );
+    sink.wait_for(1);
     assert!(sink.connections() >= 1, "the resumed run dialled");
 }
 
