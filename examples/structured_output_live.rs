@@ -37,8 +37,8 @@
 //!
 //! Requires `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` in the environment.
 
-use io_harness::{OutputSchema, OpenRouter, Provider};
 use io_harness::provider::CompletionRequest;
+use io_harness::{OpenRouter, OutputSchema, Provider};
 use serde_json::json;
 
 #[tokio::main]
@@ -100,9 +100,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let text = reply.text.clone().unwrap_or_default();
     println!("reply: {text}");
     match schema.validate_text(&text) {
-        Ok(value) => println!(
-            "  the vendor honoured the declaration and answered in shape anyway: {value}"
-        ),
+        Ok(value) => {
+            println!("  the vendor honoured the declaration and answered in shape anyway: {value}")
+        }
         Err(errors) => {
             println!(
                 "  the vendor did not constrain this reply, and the LOCAL gate refused it — \
