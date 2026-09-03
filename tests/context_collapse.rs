@@ -175,6 +175,17 @@ async fn a_collapse_carries_what_would_have_been_stubbed_and_leaves_the_ledger_a
         collapsed.shortened > 0,
         "the collapse carried nothing shortened, so this proves nothing about it"
     );
+    // 0.76.0 — added because a sabotage survived without it. Turning the fit
+    // walk's `continue` into a `break` collapses exactly one entry and stubs
+    // every older one, and every assertion here passed over that: "more than
+    // zero" cannot tell one from many. Carrying on past a collapsed entry is the
+    // whole point — stopping there throws away the room the collapse just made.
+    assert!(
+        collapsed.shortened > 1,
+        "only {} entry was shortened: the walk stopped at the first collapse instead of \
+         continuing, so the budget the collapse freed went unused",
+        collapsed.shortened
+    );
     assert!(
         collapsed.carried > plain.carried,
         "a collapse must carry more than the same turn stubbing everything: {} against {}",
