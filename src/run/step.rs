@@ -1170,6 +1170,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     store,
                     run_id,
                     step,
+                    collapse: contract.collapse,
                 },
             )
             .await?;

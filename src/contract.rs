@@ -423,6 +423,16 @@ pub struct TaskContract {
     ///
     /// Set it with [`TaskContract::with_tool_mask`].
     pub tool_mask: crate::ToolMask,
+    /// Context Collapse — the rung beneath a fold (0.76.0).
+    ///
+    /// Off by default, which assembles exactly what 0.75.0 assembled. Turned on,
+    /// an observation that will not fit the turn's budget is carried *shortened*
+    /// rather than replaced by a one-line stub: no provider call, no `summaries`
+    /// row, and the ledger is untouched, so it is reversible and it composes with
+    /// [`rewind`](crate::rewind). See [`Collapse`](crate::context::Collapse).
+    ///
+    /// Set it with [`TaskContract::with_collapse`].
+    pub collapse: crate::context::Collapse,
     /// How long a command the agent runs with the `exec` tool may take before it
     /// is killed and reported as a timeout.
     ///
@@ -734,6 +744,7 @@ impl TaskContract {
             compaction: Compaction::default(),
             fold_now: false,
             tool_mask: crate::ToolMask::none(),
+            collapse: crate::context::Collapse::default(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -815,6 +826,7 @@ impl TaskContract {
             compaction: Compaction::default(),
             fold_now: false,
             tool_mask: crate::ToolMask::none(),
+            collapse: crate::context::Collapse::default(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -1796,6 +1808,31 @@ impl TaskContract {
     #[must_use]
     pub fn with_tool_mask(mut self, mask: crate::ToolMask) -> Self {
         self.tool_mask = mask;
+        self
+    }
+
+    /// Shorten what will not fit instead of stubbing it, without a model call.
+    ///
+    /// The rung beneath a fold. An observation that exceeds the turn's remaining
+    /// budget is carried shortened rather than replaced by a one-line stub — no
+    /// provider call, no `summaries` row, and [`Ledger`](crate::context::Ledger)
+    /// is left exactly as long as it was, so turning it off on a later turn
+    /// assembles every one of those entries whole again.
+    ///
+    /// ```
+    /// use io_harness::context::Collapse;
+    /// use io_harness::TaskContract;
+    ///
+    /// let contract = TaskContract::workspace("audit the handlers", "/repo")
+    ///     .with_collapse(Collapse { keep_chars: 4_000 });
+    /// assert!(contract.collapse.enabled());
+    ///
+    /// // Unset is off, and off assembles what 0.75.0 assembled.
+    /// assert!(!TaskContract::workspace("audit", "/repo").collapse.enabled());
+    /// ```
+    #[must_use]
+    pub fn with_collapse(mut self, collapse: crate::context::Collapse) -> Self {
+        self.collapse = collapse;
         self
     }
 

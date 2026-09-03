@@ -672,6 +672,10 @@ where
                         store: tree.store,
                         run_id,
                         step,
+                        // A child's contract is built fresh and carries the
+                        // default, which is off — the same boundary `compaction`
+                        // and `fold_now` already draw at a spawn.
+                        collapse: contract.collapse,
                     },
                 )
                 .await?;

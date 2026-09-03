@@ -438,6 +438,75 @@ impl Compaction {
     }
 }
 
+/// Context Collapse: the rung beneath a fold (0.76.0).
+///
+/// **A read-time projection, not a rewrite.** Until this release an observation
+/// that did not fit the turn's budget had exactly two shapes — carried whole, or
+/// replaced by a one-line stub that says to re-run it. The rung between them is to
+/// carry it *shortened*, which costs no provider call, writes no `summaries` row,
+/// and leaves [`Ledger`] exactly as long as it was. That is what makes it
+/// reversible: turn it off on a later turn and every entry it shortened is
+/// assembled whole again, which a fold cannot do because a fold has already
+/// replaced the entries and bought a paragraph to stand in for them.
+///
+/// **It composes with `rewind`, and that is the reason the ladder takes it first.**
+/// A shortened entry keeps its [`ObsKind`] and its `target`, so assembly's
+/// invalidation and re-read rules still find the write that supersedes an earlier
+/// read of the same path. Behind a fold those entries have become one prose
+/// paragraph with no path and no write kind, and the stale-read machinery is
+/// structurally blind to them.
+///
+/// `keep_chars: 0` is off, and off is the default — a caller who configures
+/// nothing gets 0.75.0's projection byte for byte. `fold` remains the last rung
+/// and remains the default trigger; this one only ever changes what happens to an
+/// entry that was going to be stubbed anyway.
+///
+/// Not `#[non_exhaustive]`, for the reason [`Compaction`] is not: the ergonomic is
+/// `Collapse { keep_chars: 4_000 }` and a builder for one number would be ceremony.
+/// The cost — a second field would be a break — is stated here rather than hidden.
+///
+/// ```
+/// use io_harness::context::Collapse;
+///
+/// assert!(!Collapse::default().enabled(), "off unless a caller asks");
+/// assert!(Collapse { keep_chars: 4_000 }.enabled());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Collapse {
+    /// Chars an entry that will not fit whole may still contribute.
+    ///
+    /// Zero is off. The shortening itself is [`bound`], the same helper that caps
+    /// a single oversized observation, so a collapsed entry carries the same
+    /// marker a truncated one does and a reader learns one convention rather than
+    /// two — and, as there, a [`ObsKind::Read`] keeps its tail while every other
+    /// kind keeps its head.
+    pub keep_chars: usize,
+}
+
+impl Default for Collapse {
+    fn default() -> Self {
+        Self { keep_chars: 0 }
+    }
+}
+
+impl Collapse {
+    /// Whether this setting can shorten anything.
+    pub fn enabled(&self) -> bool {
+        self.keep_chars > 0
+    }
+
+    /// The shortened form of `text`, or `None` when this setting is off or the
+    /// text is already inside the ceiling — in which case there is nothing to
+    /// collapse and the caller's ordinary path applies.
+    pub(crate) fn shorten(&self, text: &str, kind: ObsKind) -> Option<String> {
+        if !self.enabled() || text.chars().count() <= self.keep_chars {
+            return None;
+        }
+        Some(bound(text, self.keep_chars, kind))
+    }
+}
+
 /// Chars a single observation may contribute. Derived from the same budget as the
 /// whole prompt, so the four independent constants this replaces cannot drift
 /// apart.
@@ -561,6 +630,9 @@ pub struct Assembly<'a> {
     pub run_id: i64,
     /// The step whose request this is.
     pub step: u32,
+    /// Context Collapse for this turn (0.76.0). [`Collapse::default`] is off,
+    /// which assembles exactly what 0.75.0 assembled.
+    pub collapse: Collapse,
 }
 
 /// The observation section for one turn, and what it cost.
@@ -572,6 +644,10 @@ pub struct Assembled {
     pub carried: usize,
     /// Observations replaced by a one-line stub.
     pub stubbed: usize,
+    /// Observations carried shortened rather than stubbed, by Context Collapse
+    /// (0.76.0). Zero on every run that does not configure one, which is what
+    /// makes a collapsed turn distinguishable from a folded one in the trace.
+    pub shortened: usize,
     /// Stale reads re-read at assembly time (whether or not the re-read worked).
     pub reread: usize,
     /// Notes from earlier runs carried into this turn.
@@ -712,6 +788,7 @@ pub async fn assemble(
         store,
         run_id,
         step,
+        collapse,
     } = at;
     let entries = ledger.entries();
     let n = entries.len();
@@ -797,6 +874,11 @@ pub async fn assemble(
     // stale-unrefreshable entries never consume budget — they are stubs already.
     let mut used = 0u64;
     let mut whole = vec![false; n];
+    // 0.76.0 — Context Collapse. Where an entry would have been stubbed, its
+    // shortened text, which is carried instead. Empty on every turn that
+    // configures no collapse, which is what keeps this release's projection
+    // byte-identical to 0.75.0's for a caller who changed nothing.
+    let mut shortened: Vec<Option<String>> = vec![None; n];
     for i in (0..n).rev() {
         if superseded[i].is_some() || matches!(shapes[i], Some(Shape::Stub(_))) {
             continue;
@@ -807,7 +889,23 @@ pub async fn assemble(
         };
         let t = estimate_tokens(text);
         if used + t > budget_tokens {
-            break;
+            // The rung beneath a fold: an entry that will not fit whole may still
+            // fit shortened, and a shortened entry keeps its kind and its target
+            // where a stub keeps neither. Carrying it does not end the walk —
+            // an older entry may still fit, and stopping here would throw away
+            // room the collapse just made. Without a collapse configured
+            // `shorten` answers `None` and this is 0.75.0's `break` exactly.
+            let Some(short) = collapse.shorten(text, entries[i].kind) else {
+                break;
+            };
+            let st = estimate_tokens(&short);
+            if used + st > budget_tokens {
+                break;
+            }
+            used += st;
+            shortened[i] = Some(short);
+            whole[i] = true;
+            continue;
         }
         used += t;
         whole[i] = true;
@@ -839,8 +937,15 @@ pub async fn assemble(
         let e = &entries[i];
         if whole[i] {
             out.carried += 1;
-            let text = match &shapes[i] {
-                Some(Shape::Whole(t)) => t.clone(),
+            let text = match (&shortened[i], &shapes[i]) {
+                // A collapsed entry is carried, so it counts as carried — and
+                // separately as shortened, which is what lets a reader of the
+                // trace tell a collapsed turn from a folded one.
+                (Some(short), _) => {
+                    out.shortened += 1;
+                    short.clone()
+                }
+                (None, Some(Shape::Whole(t))) => t.clone(),
                 _ => e.text.clone(),
             };
             pieces.push((true, text));
