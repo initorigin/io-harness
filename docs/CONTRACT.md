@@ -4337,3 +4337,56 @@ count and token total as they would have been. The only trace of the failure is 
 — `gen_ai.system` became `gen_ai.provider.name`. A later revision that renames an
 attribute is followed in a release, with the change named in `CHANGELOG.md`, and
 never silently.
+
+## What serving over MCP grants, and what it does not (0.78.0)
+
+Behind the `mcp-server` feature this crate serves its own tools over MCP on stdio.
+The thing being lent is not the tool — a tool is a few lines of process spawning —
+it is the boundary around it: a deny-first layered policy, an approval tier, an
+execution sandbox and a durable journal.
+
+**Every served call takes the path a model's call takes.** It routes through
+`dispatch`, so the policy gate decides it, a `policy_events` row records the
+decision, the journal opens and closes an attempt for it, and it is announced on
+the `Observer` channel. A served session opens a store and starts one run, so
+afterwards it reads back through `Attach` and `Store::events_since` exactly as any
+run does. There is deliberately no second, shorter execution path: one would have
+been easier to write and would have skipped the gate while passing every
+functional test.
+
+**An asking rule refuses.** There is no human at the far end of a pipe, so
+`serve_mcp` uses `DenyAll` and an `Effect::Ask` resolves as a refusal carrying this
+crate's own words rather than blocking on somebody who is not there. The default
+policy is `Policy::default()` — reads allowed, writes and execs asking, egress
+denied — so out of the box reads work and every mutation refuses until an operator
+names it. `serve_mcp_with` takes an `Approver` for an operator who wants a
+different answer; that is their decision, and a client cannot make it for them.
+
+**A refusal is a result, not a transport error.** A denied `tools/call` comes back
+as a successful protocol exchange whose result carries `isError: true` and the
+crate's refusal text. A JSON-RPC error means the request could not be processed;
+a denial means it was processed and the answer is no.
+
+**What is not served**, named in `MCP_SERVER_UNSERVED`: `ask_question`,
+`ask_questions`, `propose_plan`, `spawn`, `send_message`, `read_messages` and
+`read_skill`. Each needs something a served session has not got — a person to
+answer, a plan gate to decide, children to talk to, or a server-side document a
+remote caller should not be handed. Offering one and refusing every call to it
+would be a worse answer than not offering it. The served set and that list
+partition the catalogue, asserted against the catalogue the code builds, so a tool
+added later lands in one of them rather than in neither.
+
+**What it does not grant, stated plainly.** A stdio pipe carries no identity, so
+the server does not authenticate its client and cannot: whoever can spawn the
+process can call whatever the policy allows. The boundary being lent is the
+policy, not an access-control list, and the operator who starts the server is the
+one who decides what is inside it. This is the same sentence the network guide
+states with the roles swapped — the harness governs the calls it is asked to make,
+and nothing about the process asking.
+
+**Stdio only, tools only, and not a proxy.** No HTTP listener, which would be a
+bind address, an auth story and a session manager. No resources, prompts, sampling,
+roots or elicitation — `initialize` advertises the `tools` capability and nothing
+else. And this crate's own MCP client reaches other people's servers, which this
+server does not re-export: two policies in one path would make it unclear which one
+refused.
