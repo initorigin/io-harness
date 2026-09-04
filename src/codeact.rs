@@ -14,10 +14,8 @@
 //! `RunSpec` to completion, which is right for every other contained execution in
 //! this crate and is exactly wrong for a program that has to ask questions while
 //! it runs. So the containment is composed from the pieces underneath that trait
-//! — [`wrap_argv`](crate::sandbox::wrap_argv),
-//! [`contain_command`](crate::sandbox::contain_command),
-//! [`apply_rlimits`](crate::sandbox::apply_rlimits) and
-//! [`own_process_group`](crate::sandbox::own_process_group) — which is what
+//! — `wrap_argv`, `contain_command`, `apply_rlimits` and `own_process_group`,
+//! all `pub(crate)` in `crate::sandbox` and so not linkable from here — which is what
 //! `shell_start` already does for a line that outlives the call that made it. The
 //! backend selected is the same, chosen by the same rules, and the caps are the
 //! same `SandboxLimits`.
@@ -41,7 +39,7 @@
 //! started here on a Windows host would therefore have had the full filesystem
 //! and the full network while the run reported a backend granting neither, which
 //! is 0.74.0's rule exactly: a boundary named in the trace and not applied to the
-//! process is worse than no boundary at all. See [`containment_refusal`].
+//! process is worse than no boundary at all.
 //!
 //! # What the program can and cannot reach
 //!
