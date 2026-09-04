@@ -184,6 +184,15 @@ jobs:
       # runner.
       - if: matrix.features == 'all'
         run: cargo build --all-features --example browser_fixture
+      # 0.78.0: the served MCP example is in exactly the position browser_fixture
+      # is. Its `required-features = ["mcp-server"]` are off on the default
+      # polarity, so naming it on the line above fails outright — cargo refuses a
+      # `--example` whose required features are not enabled. It is built on the
+      # all-features leg only, which is the leg whose test spawns it:
+      # `tests/mcp_server_interop.rs` is `#![cfg(feature = "mcp-server")]` and
+      # compiles to nothing without the feature.
+      - if: matrix.features == 'all'
+        run: cargo build --all-features --example mcp_server_stdio
       # 0.15.0: the git built-ins are in the default build but need the binary.
       # Git is preinstalled on all three runners — asserted rather than
       # installed, because "no system package on any runner" is the constraint
@@ -484,6 +493,12 @@ jobs:
       # enabled fails here, on a warm cache, in single-digit seconds.
       - run: cargo clippy --all-targets --features documents -- -D warnings
       - run: cargo clippy --all-targets --features media -- -D warnings
+      # 0.78.0's two, for the same isolation reason and for one more: neither
+      # adds a dependency, so neither is reached by the `--all-features` leg in
+      # any way the others are not — a `#[cfg]` that is wrong only when exactly
+      # one of them is on is invisible everywhere else in this file.
+      - run: cargo clippy --all-targets --features otel -- -D warnings
+      - run: cargo clippy --all-targets --features mcp-server -- -D warnings
 
   # 0.23.0 — the `links` wall, proven gone. This job exists because of a defect
   # no other job in this file could see, for the same reason the `docs` job

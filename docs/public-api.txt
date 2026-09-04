@@ -45,6 +45,8 @@ async_fn run_tree src/run.rs
 async_fn run_tree_observed src/run.rs
 async_fn run_with src/run.rs
 async_fn run_with_observed src/run.rs
+async_fn serve_mcp src/mcp_server.rs
+async_fn serve_mcp_with src/mcp_server.rs
 const ASK_QUESTION_TOOL src/tools/mod.rs
 const ASK_QUESTIONS_TOOL src/tools/mod.rs
 const BUSY_TIMEOUT src/state.rs
@@ -55,14 +57,18 @@ const DEFAULT_MAX_RETRIES src/contract.rs
 const DEFAULT_MAX_STEPS src/contract.rs
 const DEFAULT_MAX_WAIT src/run.rs
 const DEFAULT_WORKSPACE_MAX_STEPS src/contract.rs
+const GENAI_CONVENTIONS src/otel.rs
 const GLOBAL_MEMORY_WORKSPACE src/state.rs
 const IMAGE_MEDIA_TYPES src/provider/mod.rs (feature = "media")
 const MAX_ID src/plugin.rs
+const MCP_SERVER_PROTOCOL_VERSION src/mcp_server.rs
+const MCP_SERVER_UNSERVED src/mcp_server.rs
 const MCP_TOOL_PREFIX src/mcp.rs
 const MEMORY_MAX_CHARS src/state.rs
 const MEMORY_MAX_ENTRIES src/state.rs
 const MEMORY_MAX_ENTRY_CHARS src/state.rs
 const NAMESPACE src/plugin.rs
+const OTEL_DEFAULT_ENDPOINT src/otel.rs
 const PLUGIN_FILE src/plugin.rs
 const POLL_LIMIT src/attach.rs
 const PROPOSE_PLAN_TOOL src/tools/mod.rs
@@ -174,6 +180,7 @@ struct LeaseRow src/state.rs
 struct LspServer src/lsp.rs
 struct McpEvent src/state.rs
 struct McpServer src/mcp.rs
+struct McpServerConfig src/mcp_server.rs
 struct Media src/provider/mod.rs (feature = "media")
 struct MemoryEntry src/state.rs
 struct MemoryLimits src/state.rs
@@ -184,6 +191,8 @@ struct ModelInfo src/provider/mod.rs
 struct ModelReviewer src/verify.rs
 struct OpenAi src/provider/openai.rs
 struct OpenRouter src/provider/openrouter.rs
+struct OtelConfig src/otel.rs
+struct OtelExporter src/otel.rs
 struct OutputSchema src/schema.rs
 struct Pending src/state.rs
 struct PendingPlan src/state.rs

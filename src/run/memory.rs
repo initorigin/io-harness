@@ -11,7 +11,7 @@ use super::*;
 /// Canonicalised, so the same directory reached by two different paths is one
 /// workspace rather than two. The path as given is the fallback: a root that cannot
 /// be canonicalised yet should still have memory rather than none.
-pub(super) fn memory_key(root: &Path) -> String {
+pub(crate) fn memory_key(root: &Path) -> String {
     std::fs::canonicalize(root)
         .unwrap_or_else(|_| root.to_path_buf())
         .to_string_lossy()

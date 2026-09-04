@@ -214,11 +214,11 @@ pub(super) fn responder_of(contract: &TaskContract) -> &dyn Responder {
 #[derive(Clone, Copy)]
 pub(crate) struct PlanPhase<'a> {
     /// Who reviews a proposal, or `None` when no gate is registered.
-    pub(super) gate: Option<&'a dyn PlanGate>,
+    pub(crate) gate: Option<&'a dyn PlanGate>,
     /// The roster a proposed step's owner must be on.
-    pub(super) agents: &'a crate::agent::Agents,
+    pub(crate) agents: &'a crate::agent::Agents,
     /// Whether the run is still waiting for an approved plan.
-    pub(super) active: bool,
+    pub(crate) active: bool,
 }
 
 /// The policy layer that holds a run still while its plan is unreviewed.
@@ -554,7 +554,7 @@ pub(super) fn assemble_answers(questions: &[Question], answers: &[Option<String>
     out.trim_end().to_string()
 }
 
-pub(super) enum Dispatched {
+pub(crate) enum Dispatched {
     /// The call resolved; fold `obs` into the observation log and carry any
     /// rules an approver asked to remember.
     ///

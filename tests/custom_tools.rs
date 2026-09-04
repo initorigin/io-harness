@@ -513,14 +513,21 @@ async fn a_name_the_harness_does_not_answer_is_still_the_callers_to_take() {
 
 /// A constant whose identifier ends in `_TOOL` and which is not a tool name.
 ///
-/// Exactly one exists: `AT_BEFORE_TOOL` (`src/hooks.rs`) is a hook stage whose
-/// value is `"before_tool"`, caught here only by the shape of its identifier.
+/// Two exist. `AT_BEFORE_TOOL` (`src/hooks.rs`) is a hook stage whose value is
+/// `"before_tool"`, caught here only by the shape of its identifier.
+/// `OPERATION_EXECUTE_TOOL` (`src/otel.rs`, 0.78.0) is an OpenTelemetry GenAI
+/// *operation* name whose value `"execute_tool"` is half of a span's name —
+/// `execute_tool {gen_ai.tool.name}` — and names no tool the harness answers.
 /// `MCP_TOOL_PREFIX` and `NO_TOOL_CALL` do not match the pattern and need no
 /// entry.
 ///
+/// The exclusion is by **identifier**, not by value, so a future built-in
+/// genuinely called `execute_tool` would arrive as its own `EXECUTE_TOOL`
+/// constant and still be caught.
+///
 /// **An entry added here to silence a failure is this defect reopening in a new
 /// place.** Every one carries the reason it is not a tool.
-const NOT_A_TOOL_NAME: &[&str] = &["AT_BEFORE_TOOL"];
+const NOT_A_TOOL_NAME: &[&str] = &["AT_BEFORE_TOOL", "OPERATION_EXECUTE_TOOL"];
 
 /// Every `const <IDENT>_TOOL: &str = "<name>";` in the source it is given, ident
 /// to tool name, minus the constants that are not tool names.

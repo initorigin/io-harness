@@ -42,7 +42,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.77"
+io-harness = "0.78"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -151,8 +151,9 @@ layer.
 | **Configuration** | One `io.toml` over four scopes, projected onto the typed API, where a file inside the workspace may narrow and never widen | [configuration](docs/guide/configuration.md) |
 | **Hooks and bundles** | An audit log, notification, formatter or blocking check from config; a directory that contributes skills, agents, servers, the executables it ships and deny rules at once | [hooks](docs/guide/hooks.md), [bundles](docs/guide/plugins.md) |
 | **Extensibility** | The `Tool` trait in-process, MCP over stdio and streamable HTTP, and markdown skills that can open the references beside them and never anything outside | [tools and skills](docs/guide/tools-and-skills.md) |
+| **Serving MCP** | Behind `mcp-server`: another harness calls **these** tools on stdio, through this crate's policy, gate, journal and trace rather than its own | [MCP and network egress](docs/guide/mcp-and-network.md) |
 | **Accounting** | Input, output, cache-read, cache-write and reasoning tokens per call, with latency and TTFT; cost derived on read from a price table you own | [accounting](docs/guide/accounting.md) |
-| **Observability** | An observer called as the run happens, and a recorded provider that replays a case identically | [observability](docs/guide/observability.md) |
+| **Observability** | An observer called as the run happens, a recorded provider that replays a case identically, and — behind `otel` — the same run exported as OpenTelemetry spans to any OTLP collector | [observability](docs/guide/observability.md) |
 | **Retention** | What the store holds, deleting a session whole, sweeping to a date, archiving the words while keeping the numbers | [retention](docs/guide/retention.md) |
 | **Reach** | A browser under the policy, LSP navigation, provider-executed web search, documents, images and fixed-argv git | [browser](docs/guide/browser.md), [web](docs/guide/web.md) |
 
@@ -611,6 +612,15 @@ Register an observer and be called as the run happens — steps, tool calls, app
 refusals, spend draws, retries, fallbacks, outcomes — instead of polling the store. A
 recorded provider replays a case so it runs identically twice.
 
+Behind the `otel` feature that record also leaves the process. `OtelExporter` is an
+observer like any other, and exports a run as OpenTelemetry spans over OTLP/HTTP —
+a span for the run, one per step, one per tool call, and one per provider call
+carrying the model, the token split and the latency it cost — so an agent appears in
+the dashboard already watching the services it calls. It sends structure and numbers
+and never transcript content: the prompt, the replies, tool arguments and tool output
+are not implemented as attributes at all, so no flag can include them by accident. A
+collector that is down or slow cannot change what a run does.
+
 Nothing expires on its own: there is no background job, no default retention window,
 and how long an audit record survives is not a library's decision. What the store
 offers is the instrument. `store_size` and `session_size` answer what the file and one
@@ -824,6 +834,12 @@ dependency at all.
 | `pdf` | PDF generate, extract text, watermark, fill AcroForm fields |
 | `barcode` | Barcode and QR decoding from an image |
 | `browser` | Driving an already-installed browser over a pipe, under the run's own policy |
+| `otel` | Exporting a run as OpenTelemetry spans over OTLP/HTTP, following the GenAI semantic conventions |
+| `mcp-server` | Serving this crate's own tools over MCP on stdio, under this crate's policy, gate and trace |
+
+The last three add **no crate at all**. They are features because a build that did
+not ask for a browser, an outbound telemetry writer or a door onto its own tools
+should not compile one — not because anything is being pulled in.
 
 ## Platform support
 
