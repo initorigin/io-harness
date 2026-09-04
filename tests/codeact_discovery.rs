@@ -133,7 +133,10 @@ fn the_codeact_table_is_refused_at_project_scope() {
     let err = Config::from_toml("[codeact]\ninterpreter = \"/opt/not-python\"\n")
         .expect_err("a project-scoped file may not choose the interpreter");
     let text = err.to_string();
-    assert!(text.contains("codeact"), "the refusal names the table: {text}");
+    assert!(
+        text.contains("codeact"),
+        "the refusal names the table: {text}"
+    );
 
     // Two controls. A file that declares no `[codeact]` is accepted, so the
     // refusal above is the rule firing rather than the parser failing…

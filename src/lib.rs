@@ -542,9 +542,7 @@ pub use approve::{
 pub use browser::BrowserConfig;
 #[cfg(feature = "codeact")]
 #[cfg_attr(docsrs, doc(cfg(feature = "codeact")))]
-pub use codeact::{
-    CodeActConfig, CODEACT_CANDIDATES, CODEACT_MIN_PYTHON, CODEACT_UNCALLABLE,
-};
+pub use codeact::{CodeActConfig, CODEACT_CANDIDATES, CODEACT_MIN_PYTHON, CODEACT_UNCALLABLE};
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
 // `Origin` joins them in 0.77.0 for a reason the other three do not have:

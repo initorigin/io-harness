@@ -62,12 +62,42 @@ impl Provider for MockScript {
     }
 }
 
-/// Collects the `Program` events and the observation text of each step, which is
-/// what most of these tests read their evidence out of.
+/// One `Program` event, kept as a value rather than a tuple so the tests below
+/// read by name.
+#[derive(Clone)]
+struct Prog {
+    interpreter: Option<String>,
+    detail: String,
+    calls: u32,
+    outcome: String,
+}
+
+/// Collects the `Program` events and the name of every tool call, which is what
+/// most of these tests read their evidence out of.
 #[derive(Default)]
 struct Collect {
-    programs: Mutex<Vec<(Option<String>, String, u32, String)>>,
+    programs: Mutex<Vec<Prog>>,
     tool_calls: Mutex<Vec<String>>,
+}
+
+impl Collect {
+    fn outcomes(&self) -> Vec<String> {
+        self.programs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.outcome.clone())
+            .collect()
+    }
+
+    fn called(&self, name: &str) -> usize {
+        self.tool_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| *n == name)
+            .count()
+    }
 }
 
 impl Observer for Collect {
@@ -78,15 +108,13 @@ impl Observer for Collect {
                 detail,
                 calls,
                 outcome,
-            } => self.programs.lock().unwrap().push((
-                interpreter.clone(),
-                detail.clone(),
-                *calls,
-                outcome.clone(),
-            )),
-            EventKind::ToolCall { name, .. } => {
-                self.tool_calls.lock().unwrap().push(name.clone())
-            }
+            } => self.programs.lock().unwrap().push(Prog {
+                interpreter: interpreter.clone(),
+                detail: detail.clone(),
+                calls: *calls,
+                outcome: outcome.clone(),
+            }),
+            EventKind::ToolCall { name, .. } => self.tool_calls.lock().unwrap().push(name.clone()),
             _ => {}
         }
         Flow::Continue
@@ -264,8 +292,7 @@ async fn a_host_with_no_usable_interpreter_is_offered_no_program_and_runs_anyway
 
     let missing = dir.path().join("definitely-not-an-interpreter");
     let result = run_with_observed(
-        &contract(dir.path())
-            .with_codeact(CodeActConfig::default().with_interpreter(&missing)),
+        &contract(dir.path()).with_codeact(CodeActConfig::default().with_interpreter(&missing)),
         &provider,
         &store,
         &permissive(),
@@ -281,24 +308,28 @@ async fn a_host_with_no_usable_interpreter_is_offered_no_program_and_runs_anyway
     );
     // The run did its ordinary work regardless — the fallback is the turn running
     // as it always did, not a degraded one.
-    assert!(
-        seen.tool_calls.lock().unwrap().iter().any(|n| n == "read_file"),
+    assert_eq!(
+        seen.called("read_file"),
+        1,
         "the run should have gone on doing its work"
     );
     assert!(result.run_id > 0);
 
     // And the decision is readable rather than inferred.
-    let programs = seen.programs.lock().unwrap().clone();
-    let (interpreter, detail, calls, outcome) = programs
+    let first = seen
+        .programs
+        .lock()
+        .unwrap()
         .first()
         .cloned()
         .expect("discovery emits an event either way");
-    assert_eq!(outcome, "withheld");
-    assert_eq!(interpreter, None);
-    assert_eq!(calls, 0);
+    assert_eq!(first.outcome, "withheld");
+    assert_eq!(first.interpreter, None);
+    assert_eq!(first.calls, 0);
     assert!(
-        detail.contains("definitely-not-an-interpreter"),
-        "the event should name what was tried; it said {detail:?}"
+        first.detail.contains("definitely-not-an-interpreter"),
+        "the event should name what was tried; it said {:?}",
+        first.detail
     );
 }
 
@@ -327,13 +358,19 @@ async fn a_host_with_an_interpreter_is_offered_the_tool_and_says_which() {
     .unwrap();
 
     assert!(provider.spec("run_program").is_some());
-    let programs = seen.programs.lock().unwrap().clone();
-    let (interpreter, detail, _, outcome) = programs.first().cloned().expect("an event");
-    assert_eq!(outcome, "available");
-    assert!(interpreter.is_some(), "the resolved path is recorded");
+    let first = seen
+        .programs
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("an event");
+    assert_eq!(first.outcome, "available");
+    assert!(first.interpreter.is_some(), "the resolved path is recorded");
     assert!(
-        detail.contains("Python 3."),
-        "the probed version is recorded; it said {detail:?}"
+        first.detail.contains("Python 3."),
+        "the probed version is recorded; it said {:?}",
+        first.detail
     );
 }
 
@@ -366,25 +403,68 @@ async fn a_program_that_loops_is_stopped_at_the_callback_bound() {
     .await
     .unwrap();
 
-    let programs = seen.programs.lock().unwrap().clone();
-    let ran = programs
+    let ran = seen
+        .programs
+        .lock()
+        .unwrap()
         .iter()
-        .find(|(_, _, _, outcome)| outcome != "available" && outcome != "withheld")
+        .find(|p| p.outcome != "available" && p.outcome != "withheld")
         .cloned()
         .expect("the program that ran emits its own event");
-    assert_eq!(ran.3, "bound", "the run should end at the bound");
-    assert_eq!(ran.2, 3, "exactly the bound's worth of calls were made");
+    assert_eq!(ran.outcome, "bound", "the run should end at the bound");
+    assert_eq!(ran.calls, 3, "exactly the bound's worth of calls were made");
     // The control: the acts it did make really were made, so the bound stopped a
     // working program rather than a broken one.
     assert_eq!(
-        seen.tool_calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|n| *n == "read_file")
-            .count(),
+        seen.called("read_file"),
         3,
         "the calls under the bound reached dispatch"
+    );
+}
+
+/// F11's other half, and the one a callback bound cannot cover: a program that
+/// spins without ever calling back.
+///
+/// There is no frame to check a deadline between, and nothing underneath would
+/// stop it — `SandboxLimits` is `none()` on a default `TaskContract`, so a
+/// contained program has no wall cap and an uncontained one has no rlimits at
+/// all. The wait itself is therefore what is bounded. Without that this test
+/// hangs for ever rather than failing, which is why it is here.
+#[tokio::test]
+async fn a_program_that_never_calls_back_is_stopped_by_the_clock() {
+    if skip_without_python() {
+        return;
+    }
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![program("while True:\n    pass\n")]]);
+    let seen = Collect::default();
+
+    let ran = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        run_with_observed(
+            &contract(dir.path()).with_codeact(
+                CodeActConfig::default().with_timeout(std::time::Duration::from_secs(2)),
+            ),
+            &provider,
+            &store,
+            &permissive(),
+            &ApproveAll,
+            &seen,
+        ),
+    )
+    .await;
+
+    assert!(
+        ran.is_ok(),
+        "a program that never calls back must be stopped by its own deadline, not hang the run"
+    );
+    ran.unwrap().unwrap();
+
+    let outcomes = seen.outcomes();
+    assert!(
+        outcomes.contains(&"timeout".to_string()),
+        "the program should have ended on the clock; outcomes were {outcomes:?}"
     );
 }
 
@@ -402,8 +482,12 @@ async fn a_program_that_raises_can_be_corrected_on_the_next_step() {
     let dir = ws();
     let store = Store::memory().unwrap();
     let provider = MockScript::new(vec![
-        vec![program("raise ValueError(\"the first attempt is wrong\")\n")],
-        vec![program("r = read_file(path=\"one.txt\")\nprint(\"second attempt:\", str(r))\n")],
+        vec![program(
+            "raise ValueError(\"the first attempt is wrong\")\n",
+        )],
+        vec![program(
+            "r = read_file(path=\"one.txt\")\nprint(\"second attempt:\", str(r))\n",
+        )],
     ]);
     let seen = Collect::default();
 
@@ -418,13 +502,7 @@ async fn a_program_that_raises_can_be_corrected_on_the_next_step() {
     .await
     .unwrap();
 
-    let outcomes: Vec<String> = seen
-        .programs
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(_, _, _, o)| o.clone())
-        .collect();
+    let outcomes = seen.outcomes();
     assert!(
         outcomes.contains(&"failed".to_string()),
         "the first program raised; outcomes were {outcomes:?}"
@@ -434,8 +512,9 @@ async fn a_program_that_raises_can_be_corrected_on_the_next_step() {
         "the corrected program ran; outcomes were {outcomes:?}"
     );
     // The corrected program's act reached dispatch, so the run really did carry on.
-    assert!(
-        seen.tool_calls.lock().unwrap().iter().any(|n| n == "read_file"),
+    assert_eq!(
+        seen.called("read_file"),
+        1,
         "the second attempt's read should have happened"
     );
 }

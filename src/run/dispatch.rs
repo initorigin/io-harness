@@ -462,15 +462,20 @@ pub(crate) async fn dispatch(
                 // caps what the child spends; these cap what the child makes
                 // *this* process spend, which is what a tight callback loop
                 // exhausts and what no rlimit can see.
-                if started.elapsed() >= ready.timeout {
-                    break Finish::Timeout;
-                }
                 if session.at_bound() {
                     break Finish::Bound;
                 }
-                let frame = match session.next().await {
-                    Ok(frame) => frame,
-                    Err(err) => break Finish::Broken(err.to_string()),
+                // The wait is bounded rather than the loop, and that is the whole
+                // difference between a ceiling and a hang. A program that spins
+                // without ever calling back produces no frame to check a deadline
+                // between, and nothing else would stop it: `SandboxLimits` is
+                // `none()` on a default `TaskContract`, so there is no wall cap
+                // underneath this, and an uncontained run has no rlimits at all.
+                let remaining = ready.timeout.saturating_sub(started.elapsed());
+                let frame = match tokio::time::timeout(remaining, session.next()).await {
+                    Err(_) => break Finish::Timeout,
+                    Ok(Ok(frame)) => frame,
+                    Ok(Err(err)) => break Finish::Broken(err.to_string()),
                 };
                 let (name, args) = match frame {
                     crate::codeact::Frame::Done { output } => break Finish::Done(output),

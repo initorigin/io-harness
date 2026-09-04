@@ -36,9 +36,7 @@
 //! **The provider is OpenRouter, and the record says so.** `OPENROUTER_API_KEY`
 //! is the key this checkout carries; the Anthropic and OpenAI entries are empty.
 
-use io_harness::{
-    run_with, ApproveAll, CodeActConfig, OpenRouter, Policy, Store, TaskContract,
-};
+use io_harness::{run_with, ApproveAll, CodeActConfig, OpenRouter, Policy, Store, TaskContract};
 
 /// The two variables this example cannot run without. The operator sources the
 /// repository's `.env`; nothing here reads that file.

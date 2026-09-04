@@ -509,11 +509,15 @@ impl Session {
             interpreter.display().to_string(),
             dir.join("_io_shim.py").display().to_string(),
         ];
+        // Egress is denied and no proxy is named, whatever the run itself was
+        // granted. A program reaches the network only the way anything else does
+        // — through this crate's own network-governed tools, as callbacks checked
+        // under `Act::Net` — so a child that could open its own socket would be a
+        // second route out of a run whose first one is gated. Inheriting
+        // `c.config.allow_network` here would have given exactly that to any run
+        // whose policy names a host.
         let argv = match containment {
-            Some(c) => {
-                crate::sandbox::wrap_argv(&c.config, &dir, c.config.allow_network, &roots, &argv, c.proxy)
-                    .1
-            }
+            Some(c) => crate::sandbox::wrap_argv(&c.config, &dir, false, &roots, &argv, None).1,
             None => argv,
         };
 
@@ -528,11 +532,13 @@ impl Session {
         let mut contained = None;
         if let Some(c) = containment {
             crate::sandbox::apply_rlimits(&mut cmd, &c.config.limits);
+            // Same two arguments as `wrap_argv` above, and they have to agree:
+            // this installs the rungs an argv wrapper cannot express, so a
+            // permissive value here would reopen what the wrapper closed.
             contained =
-                crate::sandbox::contain_command(&mut cmd, &c.config, &dir, c.config.allow_network, &roots, c.proxy);
-            // The program is given no proxy at all. It reaches the network only
-            // through this crate's own network-governed tools, which are
-            // callbacks and are checked as `Act::Net` like any other.
+                crate::sandbox::contain_command(&mut cmd, &c.config, &dir, false, &roots, None);
+            // And no `proxy_env` is set, which is the other half of denying
+            // egress: a program is given no route out and no address to try.
         }
         // A program that spawns is a tree, and killing the leader has to reach
         // it. `kill_on_drop` covers the child; the group covers what the child
@@ -587,7 +593,9 @@ impl Session {
             });
         }
         let frame: WireFrame = serde_json::from_str(line.trim()).map_err(|err| {
-            Error::Config(format!("the program's shim wrote a frame this crate could not read ({err})"))
+            Error::Config(format!(
+                "the program's shim wrote a frame this crate could not read ({err})"
+            ))
         })?;
         Ok(match frame {
             WireFrame::Call { name, args } => {
@@ -901,7 +909,11 @@ print("real call returned", r.text)
             return;
         };
         // Exactly one call, and it is the one the program actually made.
-        assert_eq!(asked.len(), 1, "a printed frame was read as a call: {asked:?}");
+        assert_eq!(
+            asked.len(),
+            1,
+            "a printed frame was read as a call: {asked:?}"
+        );
         assert!(asked[0].starts_with("read_file "), "{asked:?}");
         let Frame::Done { output } = frame else {
             panic!("expected a finished program, got {frame:?}");
@@ -913,8 +925,8 @@ print("real call returned", r.text)
 
     #[tokio::test]
     async fn a_program_that_raises_comes_back_with_its_traceback() {
-        let Some((_, frame)) = drive("print(\"before\")\nraise ValueError(\"nope\")\n", &[], &[])
-            .await
+        let Some((_, frame)) =
+            drive("print(\"before\")\nraise ValueError(\"nope\")\n", &[], &[]).await
         else {
             return;
         };
@@ -950,8 +962,13 @@ print("real call returned", r.text)
     fn the_shim_takes_the_descriptors_before_the_program_runs() {
         let source = shim(&[]);
         let dup = source.find("os.dup(1)").expect("protocol fd is duplicated");
-        let exec = source.find("exec(compile(").expect("the program is executed");
-        assert!(dup < exec, "the shim must own stdout before the program runs");
+        let exec = source
+            .find("exec(compile(")
+            .expect("the program is executed");
+        assert!(
+            dup < exec,
+            "the shim must own stdout before the program runs"
+        );
         assert!(source.contains("os.dup2(_null, 1)"), "{source}");
         assert!(source.contains("sys.stdin = io.StringIO()"), "{source}");
     }
