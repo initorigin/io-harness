@@ -4279,3 +4279,61 @@ stdio MCP server, a language server and a `[[bin]]` the agent runs are separate
 processes; the harness decides whether each may start, and what it dials
 afterwards is between it and the network. See the
 [MCP and network egress guide](guide/mcp-and-network.md).
+
+## What the OTel exporter sends, and what it never sends (0.78.0)
+
+Behind the `otel` feature, a run can be exported as OpenTelemetry spans over
+OTLP/HTTP with a JSON body. The exporter is an `Observer` and nothing else: it
+attaches through the doors that already exist, and a run with none attached takes
+the same path it always did.
+
+**The attribute vocabulary follows the GenAI semantic conventions**, at the
+revision named in `GENAI_CONVENTIONS`. These are the keys this crate emits, and
+the list below is the one the implementation is checked against — the two are
+compared by a test rather than maintained side by side.
+
+| Attribute | On which span | What it carries |
+| --- | --- | --- |
+| `gen_ai.operation.name` | every span | `invoke_agent` for a run, `chat` for a provider call, `execute_tool` for a tool call |
+| `gen_ai.provider.name` | run, provider call | The convention's value where this crate talks to that vendor — `anthropic`, `openai` — and this crate's own provider id otherwise, never one of the enumerated values for a provider that is not it |
+| `gen_ai.request.model` | provider call | The model the call asked for, from `provider_calls.model` |
+| `gen_ai.response.model` | provider call | The model the vendor answered as, where the wire reports one |
+| `gen_ai.usage.input_tokens` | provider call | `provider_calls.prompt_tokens` |
+| `gen_ai.usage.output_tokens` | provider call | `provider_calls.completion_tokens` |
+| `gen_ai.tool.name` | tool call | The tool's own name, the one the policy gate was asked about |
+| `error.type` | any failed span | Set only when the span failed, alongside an error status |
+
+**What is not sent, and is not implementable by a flag.** The convention marks
+`gen_ai.input.messages`, `gen_ai.output.messages` and `gen_ai.system_instructions`
+opt-in. None of the three exists in this crate's exporter — not defaulted off, not
+gated behind a knob, absent. A prompt, a model's reply, a tool's arguments and a
+tool's output never leave the process through this door, and the way that is
+checked is a sentinel written into all four and searched for in the serialized
+payload.
+
+**Where a span's time comes from, and why not from the obvious column.** A run
+span and a step span are timed by the exporter's own clock, from the events that
+open and close them. A provider span's duration is `provider_calls.latency_ms`,
+which is exact per attempt. Its *position* is derived — the step span the exporter
+timed, bounded by that step's `provider_ms`, with a step's attempts laid end to end
+in `attempt` order. `provider_calls.at` is not used: it is one-second resolution
+and is stamped when the row is written, which is after the call rather than before
+it, so it is the wrong precision and the wrong instant. Two attempts inside one
+second are indistinguishable by it, which is exactly the ordering it appears to
+supply.
+
+**A step's attempts are therefore laid end to end rather than each independently
+timed.** No start instant per attempt is recorded anywhere in the store, so this is
+a limitation of the record and not of the exporter. The durations are real; the
+gaps between them are not claimed.
+
+**An export failure never changes a run.** `Observer::event` returns
+`Flow::Continue` on every path, the request does not run on the run's own task,
+and a collector that is down, slow or refusing leaves the run's outcome, step
+count and token total as they would have been. The only trace of the failure is a
+`tracing::warn!`.
+
+**The conventions are at Development stability** and their names have moved before
+— `gen_ai.system` became `gen_ai.provider.name`. A later revision that renames an
+attribute is followed in a release, with the change named in `CHANGELOG.md`, and
+never silently.
