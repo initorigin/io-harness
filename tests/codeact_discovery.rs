@@ -11,9 +11,18 @@
 
 use io_harness::{Config, CODEACT_CANDIDATES, CODEACT_MIN_PYTHON};
 
+/// One of this repository's own source files, with line endings normalised.
+///
+/// The `\r` strip is the whole reason this helper exists rather than a bare
+/// `read_to_string`. A Windows checkout has CRLF endings, so a multi-line needle
+/// written with `\n` matches on every developer machine here and on both unix CI
+/// legs, and fails only on `test (windows-latest, …)` — which is exactly where it
+/// did fail, after the local suite, three clippy polarities and two unix
+/// platforms were all green.
 fn source(relative: &str) -> String {
     std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative))
         .unwrap_or_else(|e| panic!("{relative} is readable: {e}"))
+        .replace("\r\n", "\n")
 }
 
 // ---------------------------------------------------------------------------
