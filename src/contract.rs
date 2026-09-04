@@ -295,6 +295,17 @@ pub struct TaskContract {
     /// 0.52.0. No process is started until an action needs one.
     #[cfg(feature = "browser")]
     pub browser: Option<crate::browser::BrowserConfig>,
+    /// Whether this run may write one contained program instead of a chain of
+    /// tool calls (0.79.0).
+    ///
+    /// `None` by default, and `None` means
+    /// [`RUN_PROGRAM_TOOL`](crate::tools::RUN_PROGRAM_TOOL) is absent from the catalogue
+    /// entirely: a run that asks for no program is byte-identical, in composed
+    /// prompt and in trace, to one on 0.78.0. `Some` is a request rather than a
+    /// guarantee — the tool is offered only if a usable host interpreter was also
+    /// found, and a host without one runs the turn exactly as it would have.
+    #[cfg(feature = "codeact")]
+    pub codeact: Option<crate::codeact::CodeActConfig>,
     /// Images handed to the agent alongside the goal, shown to the model on
     /// every step of the run.
     ///
@@ -754,6 +765,8 @@ impl TaskContract {
             lsp: Vec::new(),
             #[cfg(feature = "browser")]
             browser: None,
+            #[cfg(feature = "codeact")]
+            codeact: None,
             commit_identity: crate::tools::git::Identity::default(),
             #[cfg(feature = "media")]
             images: Vec::new(),
@@ -837,6 +850,8 @@ impl TaskContract {
             lsp: Vec::new(),
             #[cfg(feature = "browser")]
             browser: None,
+            #[cfg(feature = "codeact")]
+            codeact: None,
             commit_identity: crate::tools::git::Identity::default(),
             #[cfg(feature = "media")]
             images: Vec::new(),
@@ -1007,6 +1022,35 @@ impl TaskContract {
     #[must_use]
     pub fn with_browser(mut self, browser: crate::browser::BrowserConfig) -> Self {
         self.browser = Some(browser);
+        self
+    }
+
+    /// Let this run write one contained program instead of a chain of tool calls
+    /// (0.79.0).
+    ///
+    /// Asking for it does not grant anything. The program runs contained, in a
+    /// workdir of its own rather than in the workspace, and every act it takes
+    /// re-enters the same dispatch a model's own tool call takes — so the policy,
+    /// the gate, the journal and the observer see exactly what they would have
+    /// seen had the model asked for those tools one at a time.
+    ///
+    /// The interpreter is the host's and **nothing is downloaded**. A host with
+    /// no usable one is a supported host: the tool is not offered, and the run
+    /// proceeds as it would have without this call.
+    ///
+    /// ```
+    /// use io_harness::{CodeActConfig, TaskContract};
+    ///
+    /// let contract = TaskContract::workspace("summarise every TODO", "/repo")
+    ///     .with_codeact(CodeActConfig::default().with_max_callbacks(32));
+    ///
+    /// assert!(contract.codeact.is_some());
+    /// ```
+    #[cfg(feature = "codeact")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "codeact")))]
+    #[must_use]
+    pub fn with_codeact(mut self, codeact: crate::codeact::CodeActConfig) -> Self {
+        self.codeact = Some(codeact);
         self
     }
 

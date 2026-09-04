@@ -384,6 +384,72 @@ pub(super) fn report_containment(
     ));
 }
 
+/// Resolve, once per run, whether this run may write a program (0.79.0).
+///
+/// Beside [`report_containment`] and for the same reason: the interpreter on
+/// `PATH` does not move under a run, so a probe per step would be a spawn per
+/// step for an answer that cannot change.
+///
+/// The event is emitted whichever way it goes. **Withholding the tool is the
+/// fallback** — a host with no usable interpreter composes, sends and steps
+/// exactly as it would have with the feature off — and a fallback nobody can see
+/// is indistinguishable from a model that simply never chose the tool.
+#[cfg(feature = "codeact")]
+pub(super) async fn codeact_ready(
+    watch: &Watch<'_>,
+    run_id: i64,
+    contract: &TaskContract,
+    tools: &[ToolSpec],
+) -> Option<CodeActReady> {
+    let config = contract.codeact.clone()?;
+    let discovery = crate::codeact::discover(&config).await;
+    let interpreter = discovery.path().map(std::path::Path::to_path_buf);
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        0,
+        0,
+        EventKind::Program {
+            interpreter: interpreter.as_ref().map(|p| p.display().to_string()),
+            detail: discovery.describe(),
+            calls: 0,
+            outcome: match interpreter {
+                Some(_) => "available".to_string(),
+                None => "withheld".to_string(),
+            },
+        },
+    ));
+    let interpreter = interpreter?;
+    // Derived from the catalogue this run actually offers, so a registered tool
+    // and an MCP tool are callable on the same terms a built-in is — the toolbox
+    // is the operator's, not the model's. Two filters, and neither is cosmetic:
+    // the named exclusions, and names that are not Python identifiers, which an
+    // MCP server or a registered tool may perfectly well have.
+    let callable: Vec<String> = tools
+        .iter()
+        .map(|spec| spec.name.clone())
+        .filter(|name| !crate::codeact::CODEACT_UNCALLABLE.contains(&name.as_str()))
+        .filter(|name| crate::codeact::is_callable_name(name))
+        .collect();
+    Some(CodeActReady {
+        interpreter,
+        callable,
+        max_callbacks: config.max_callbacks(),
+        timeout: config.timeout(),
+    })
+}
+
+/// Without the feature there is no interpreter to find and no tool to offer, and
+/// the caller's shape stays the same rather than growing a `#[cfg]`.
+#[cfg(not(feature = "codeact"))]
+pub(super) async fn codeact_ready(
+    _watch: &Watch<'_>,
+    _run_id: i64,
+    _contract: &TaskContract,
+    _tools: &[ToolSpec],
+) -> Option<CodeActReady> {
+    None
+}
+
 /// Measure one boundary once, and record what was measured (0.74.0).
 ///
 /// **The one place the probe is taken**, and it is here rather than inside
@@ -923,6 +989,47 @@ pub(super) fn skill_tool(skills: &Skills) -> Option<ToolSpec> {
             "required": ["name"]
         }),
     })
+}
+
+/// [`RUN_PROGRAM_TOOL`](crate::tools::RUN_PROGRAM_TOOL), offered only when the
+/// contract asks for it *and* a usable host interpreter was found (0.79.0).
+///
+/// The callable names are written into the description rather than left for the
+/// model to guess, because the generated module is the whole of what a program
+/// may call and a program that reaches for a name that is not there costs a step
+/// to find out.
+#[cfg(feature = "codeact")]
+pub(super) fn run_program_spec(callable: &[String]) -> ToolSpec {
+    let names = callable.join(", ");
+    ToolSpec {
+        name: crate::tools::RUN_PROGRAM_TOOL.to_string(),
+        description: format!(
+            "Run ONE Python program instead of a chain of tool calls. Use it when the work is a \
+             loop, a branch on what a previous read returned, or several reads whose results you \
+             would only combine — one program is one step, where the same work as separate calls \
+             is one step each.\n\nInside the program these functions are already defined and take \
+             the same arguments the tools of the same name take, as keywords: {names}. Each \
+             returns an object with `.ok` and `.text`; `str()` of it is the text, and it is falsy \
+             when the act was refused, so a program can branch on a refusal instead of stopping. \
+             Every one of them is checked by the same permission rules that check your own tool \
+             calls, so a program cannot reach anything you could not.\n\nThe program runs in a \
+             scratch directory of its own, not in the workspace, with no network and only the \
+             standard library — there is no `pip` and an `import` of anything else will fail. \
+             Print what you want to read back; whatever it prints is the result, and a variable \
+             named `result` is appended if you set one. An exception comes back with its \
+             traceback, and you may then send a corrected program."
+        ),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "The complete Python program. It runs top to bottom exactly once; there is no `if __name__` guard to write and no argv to read."
+                }
+            },
+            "required": ["source"]
+        }),
+    }
 }
 
 /// Name the available skills in the system prompt: one line each, name and

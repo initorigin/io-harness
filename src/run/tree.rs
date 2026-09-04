@@ -1123,6 +1123,12 @@ where
                     // draws: the mask is a request about the operator's own turn,
                     // and a child's work is not that turn.
                     &contract.tool_mask,
+                    // 0.79.0 — a tree does not offer programs. `run_program` is
+                    // advertised by the workspace loop alone, so an agent in a
+                    // tree is never handed one; `None` puts that fact at the
+                    // boundary as well as in the catalogue, so a call that
+                    // arrived some other way is refused rather than served.
+                    None,
                 )
                 .await?
                 {

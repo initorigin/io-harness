@@ -98,6 +98,11 @@ use crate::tools::{
     READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_KILL_TOOL, SHELL_POLL_TOOL,
     SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
+// 0.79.0, and imported separately for the reason `VIEW_IMAGE_TOOL` is above:
+// without the feature nothing in this module names it, and an unconditional entry
+// in the list above would be an unused import in the default build.
+#[cfg(feature = "codeact")]
+use crate::tools::RUN_PROGRAM_TOOL;
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
 use crate::tools::{

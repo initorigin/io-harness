@@ -108,6 +108,148 @@ fn skill_target(path: &std::path::Path) -> std::io::Result<String> {
     Ok(format!("{} entries\n{}", names.len(), names.join("\n")))
 }
 
+/// What a run resolved about programs, once, before its first step (0.79.0).
+///
+/// Compiled in every build although only the `codeact` feature ever constructs
+/// one. A parameter that appeared and disappeared with a feature flag would put a
+/// `#[cfg]` on every argument of every call site of a twenty-nine-parameter
+/// function, three times over — and the type is four fields with no dependency on
+/// anything the feature gates.
+#[cfg_attr(not(feature = "codeact"), allow(dead_code))]
+pub(crate) struct CodeActReady {
+    /// The interpreter discovery resolved and version-probed.
+    pub(crate) interpreter: std::path::PathBuf,
+    /// The tools this run offers that a program may call, already filtered by
+    /// [`CODEACT_UNCALLABLE`](crate::codeact::CODEACT_UNCALLABLE) and by whether
+    /// the name can be a Python binding at all.
+    pub(crate) callable: Vec<String>,
+    /// How many callbacks one program may make.
+    pub(crate) max_callbacks: usize,
+    /// How long one program may run.
+    pub(crate) timeout: std::time::Duration,
+}
+
+/// How a program ended, and the only place the endings are worded (0.79.0).
+#[cfg(feature = "codeact")]
+enum Finish {
+    /// It ran to the end. The string is everything it printed.
+    Done(String),
+    /// It raised. The strings are the traceback and whatever it printed first.
+    Failed(String, String),
+    /// It made as many calls as it is allowed.
+    Bound,
+    /// It ran longer than it is allowed.
+    Timeout,
+    /// An approval, a question or a plan decision came back from an act it took.
+    Paused,
+    /// The shim stopped speaking, or said something this crate could not read.
+    Broken(String),
+}
+
+#[cfg(feature = "codeact")]
+impl Finish {
+    /// The stable label the observer event carries.
+    fn outcome(&self) -> &'static str {
+        match self {
+            Self::Done(_) => "finished",
+            Self::Failed(..) | Self::Broken(_) => "failed",
+            Self::Bound => "bound",
+            Self::Timeout => "timeout",
+            Self::Paused => "paused",
+        }
+    }
+
+    /// One line for the event, never the program's output: the observer channel
+    /// carries what happened, and what a program printed is a tool result that
+    /// belongs in the ledger.
+    fn detail(&self) -> String {
+        match self {
+            Self::Done(_) => "the program finished".to_string(),
+            Self::Failed(message, _) => message.lines().last().unwrap_or("raised").to_string(),
+            Self::Bound => "the callback bound was reached".to_string(),
+            Self::Timeout => "the program ran out of time".to_string(),
+            Self::Paused => "an act it took needs a decision this run has not taken".to_string(),
+            Self::Broken(why) => why.clone(),
+        }
+    }
+
+    /// What the model reads. Every ending says what happened and what to do next,
+    /// because "the program stopped" and "write a smaller program" are different
+    /// instructions and an outcome label alone is neither.
+    fn report(
+        self,
+        calls: u32,
+        cap: usize,
+        max_callbacks: usize,
+        timeout: std::time::Duration,
+    ) -> (String, String) {
+        match self {
+            Self::Done(output) if output.trim().is_empty() => (
+                format!("program finished, {calls} calls, no output"),
+                format!(
+                    "\n[program finished] It made {calls} tool calls and printed nothing. Print \
+                     what you need to read back, or set a variable named `result`.\n"
+                ),
+            ),
+            Self::Done(output) => (
+                format!("program finished, {calls} calls"),
+                crate::tools::cap_result(
+                    format!(
+                        "\n[program finished] {calls} tool calls. What it printed:\n{}\n",
+                        output.trim_end()
+                    ),
+                    cap,
+                )
+                .0,
+            ),
+            Self::Failed(message, output) => (
+                format!("program raised after {calls} calls"),
+                crate::tools::cap_result(
+                    format!(
+                        "\n[program raised] After {calls} tool calls. Anything it printed first \
+                         follows the traceback; you may send a corrected program.\n{}\n{}\n",
+                        message.trim_end(),
+                        output.trim_end()
+                    ),
+                    cap,
+                )
+                .0,
+            ),
+            Self::Bound => (
+                format!("program hit the {max_callbacks}-call bound"),
+                format!(
+                    "\n[program stopped] It reached the limit of {max_callbacks} tool calls this \
+                     run allows one program, after {calls}. Nothing it printed was captured. Do \
+                     less in one program, or call the tools directly.\n"
+                ),
+            ),
+            Self::Timeout => (
+                format!("program timed out after {}s", timeout.as_secs()),
+                format!(
+                    "\n[program stopped] It ran longer than the {}s this run allows one program \
+                     and was killed after {calls} tool calls. Nothing it printed was captured. \
+                     Write a narrower program.\n",
+                    timeout.as_secs()
+                ),
+            ),
+            // Never reported: the arm returns the pause itself rather than an
+            // observation. Worded anyway, because a `_` here would be an arm that
+            // silently starts covering the next ending added.
+            Self::Paused => (
+                "program paused".to_string(),
+                "\n[program stopped] An act it took needs a decision.\n".to_string(),
+            ),
+            Self::Broken(why) => (
+                "program ended unexpectedly".to_string(),
+                format!(
+                    "\n[program stopped] {why}. It made {calls} tool calls before that, and \
+                     anything those calls did has already happened.\n"
+                ),
+            ),
+        }
+    }
+}
+
 /// observations the agent can recover from rather than failing the run — only
 /// the model can decide what to do about them.
 #[allow(clippy::too_many_arguments)]
@@ -165,6 +307,9 @@ pub(crate) async fn dispatch(
     // 0.76.0 — the tools this turn withholds. Applied at the head, beside the
     // hook gate, because this is one of the two places a call can begin.
     mask: &crate::ToolMask,
+    // 0.79.0. `None` for every caller that is not the workspace loop, and `None`
+    // inside a program, which is how a program is kept from starting one.
+    codeact: Option<&CodeActReady>,
 ) -> Result<Dispatched> {
     // The browser session is threaded to every dispatch site unconditionally, so
     // the call sites need no `#[cfg]`; without the feature the arm that reads it
@@ -235,6 +380,8 @@ pub(crate) async fn dispatch(
             narrowed.as_ref()
         }
     };
+    #[cfg(not(feature = "codeact"))]
+    let _ = codeact;
     Ok(match name {
         // 0.41.0 — the three read-only built-ins go through the same two halves a
         // batched read does: the policy on this thread, then the read itself. One
@@ -257,6 +404,201 @@ pub(crate) async fn dispatch(
             {
                 Prepared::Work(work) => work.run(ws, cap, max_read, run_id, step).await,
                 Prepared::Done(done) | Prepared::Stop(done) => done,
+            }
+        }
+        // 0.79.0 — the one arm that calls this function again.
+        //
+        // Everything the program does arrives here as an ordinary `ToolCall` and
+        // goes back through `dispatch` with the arguments this arm already holds,
+        // so the policy, the gate, the `policy_events` row, the journal attempt
+        // and the observer see a program's act on exactly the terms they see a
+        // model's. There is deliberately no shorter path: a purpose-built one
+        // would compile more easily and pass every test in this release while
+        // bypassing the gate, which is the defect this shape exists to make
+        // impossible rather than to test for.
+        #[cfg(feature = "codeact")]
+        RUN_PROGRAM_TOOL => {
+            let Some(ready) = codeact else {
+                // Reachable only if a model asks for a tool it was never offered.
+                return Ok(Dispatched::go(
+                    "run_program unavailable",
+                    "\n[run_program unavailable] This run found no usable Python interpreter, so \
+                     it cannot run a program. Use the individual tools instead.\n",
+                ));
+            };
+            let Some(source) = a.get("source").and_then(|v| v.as_str()) else {
+                return Ok(Dispatched::go(
+                    "run_program missing source",
+                    "\n[run_program error] run_program needs a \"source\" string holding the whole \
+                     program\n",
+                ));
+            };
+            // `PlanPhase` is three borrows rather than a value, and the recursive
+            // call takes it by value — so it is taken apart once here and rebuilt
+            // per callback, which is cheaper and clearer than making the type
+            // `Copy` to hide that it is moved.
+            let PlanPhase {
+                gate: plan_gate,
+                agents: plan_agents,
+                active: plan_active,
+            } = plan;
+
+            let mut session = crate::codeact::Session::start(
+                &ready.interpreter,
+                source,
+                &ready.callable,
+                ready.max_callbacks,
+                exec_sandbox,
+            )
+            .await?;
+
+            let mut changed = false;
+            let mut remembered: Vec<Rule> = Vec::new();
+            let mut paused: Option<Dispatched> = None;
+            let started = std::time::Instant::now();
+
+            let finish = loop {
+                // Two ceilings, and they bound different resources. The sandbox
+                // caps what the child spends; these cap what the child makes
+                // *this* process spend, which is what a tight callback loop
+                // exhausts and what no rlimit can see.
+                if started.elapsed() >= ready.timeout {
+                    break Finish::Timeout;
+                }
+                if session.at_bound() {
+                    break Finish::Bound;
+                }
+                let frame = match session.next().await {
+                    Ok(frame) => frame,
+                    Err(err) => break Finish::Broken(err.to_string()),
+                };
+                let (name, args) = match frame {
+                    crate::codeact::Frame::Done { output } => break Finish::Done(output),
+                    crate::codeact::Frame::Failed { message, output } => {
+                        break Finish::Failed(message, output)
+                    }
+                    crate::codeact::Frame::Call { name, args } => (name, args),
+                };
+                // The exclusions are checked here as well as being absent from the
+                // generated module, because the module is a convenience and this
+                // is the boundary: a program that builds a call by hand must meet
+                // the same list.
+                if crate::codeact::CODEACT_UNCALLABLE.contains(&name.as_str()) {
+                    session
+                        .reply(
+                            false,
+                            &format!(
+                                "[not callable from a program] {name} is not available inside a \
+                                 program. Finish the program and call it directly."
+                            ),
+                        )
+                        .await?;
+                    continue;
+                }
+                let nested = ToolCall {
+                    name,
+                    arguments: args,
+                };
+                let dispatched = Box::pin(dispatch(
+                    ws,
+                    &nested,
+                    approver,
+                    responder,
+                    store,
+                    run_id,
+                    step,
+                    mcp,
+                    lsp,
+                    browser,
+                    custom,
+                    skills,
+                    cap,
+                    max_read,
+                    memory_key,
+                    memory_limits,
+                    watch,
+                    depth,
+                    pending_media,
+                    identity,
+                    exec_timeout,
+                    exec_sandbox,
+                    toolchain,
+                    handles,
+                    PlanPhase {
+                        gate: plan_gate,
+                        agents: plan_agents,
+                        active: plan_active,
+                    },
+                    goal,
+                    hooks,
+                    mask,
+                    // A program may not start a program. It is on the uncallable
+                    // list and refused above; `None` here is the second half of
+                    // that, so a path that reached this call some other way still
+                    // cannot recurse a level deeper.
+                    None,
+                ))
+                .await?;
+                match dispatched {
+                    Dispatched::Continue {
+                        obs,
+                        kind,
+                        changed: did,
+                        remember,
+                        ..
+                    } => {
+                        changed |= did;
+                        remembered.extend(remember);
+                        // `ObsKind::Error` is what `Dispatched::go` marks a
+                        // refusal and a tool's own failure with, and it is the
+                        // only structural signal either one carries. So `.ok` in
+                        // the program is that, rather than this crate reading its
+                        // own refusal text back out of a string it just wrote.
+                        let allowed = kind != ObsKind::Error;
+                        session.reply(allowed, obs.trim()).await?;
+                    }
+                    // An approval that defers past process exit, or a question, or
+                    // a plan decision: none of them can be answered while a
+                    // program is mid-flight, and inventing an answer here would be
+                    // this arm deciding something the caller's approver was asked.
+                    // The program is stopped and the run pauses exactly as it
+                    // would have had the model made the call itself; on resume the
+                    // model writes the program again, knowing the answer.
+                    other => {
+                        paused = Some(other);
+                        break Finish::Paused;
+                    }
+                }
+            };
+
+            let calls = session.calls() as u32;
+            session.stop().await;
+
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::Program {
+                    interpreter: Some(ready.interpreter.display().to_string()),
+                    detail: finish.detail(),
+                    calls,
+                    outcome: finish.outcome().to_string(),
+                },
+            ));
+
+            if let Some(pause) = paused {
+                return Ok(pause);
+            }
+
+            let (decision, obs) = finish.report(calls, cap, ready.max_callbacks, ready.timeout);
+            Dispatched::Continue {
+                decision,
+                obs,
+                kind: ObsKind::Tool,
+                target: None,
+                origin: crate::context::Origin::Tool,
+                changed,
+                remember: remembered,
             }
         }
         REMEMBER_TOOL => {
