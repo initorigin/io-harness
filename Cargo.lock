@@ -1485,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "io-harness"
-version = "0.78.0"
+version = "0.79.0"
 dependencies = [
  "base64 0.23.1",
  "calamine",

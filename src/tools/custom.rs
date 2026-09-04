@@ -636,6 +636,7 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     super::SHELL_START_TOOL,
     super::SHELL_POLL_TOOL,
     super::SHELL_KILL_TOOL,
+    super::RUN_PROGRAM_TOOL,
     super::GREP_TOOL,
     super::FIND_TOOL,
     super::LIST_DIR_TOOL,

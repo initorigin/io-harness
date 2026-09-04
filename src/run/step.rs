@@ -894,6 +894,20 @@ pub(super) async fn run_workspace_from<P: Provider>(
     if planning {
         tools.push(propose_plan_spec());
     }
+    // 0.79.0 — one discovery per run, here, beside the toolchain detection and for
+    // the same reason: the interpreter on `PATH` does not change under a run, and
+    // a probe per step would be a spawn per step for an answer that cannot move.
+    //
+    // Withholding the tool IS the fallback. A host with no usable interpreter is
+    // never offered `run_program`, so the turn is composed, sent and stepped
+    // exactly as it would have been with the feature off — and the event says
+    // which of the two happened, because a capability that quietly stops applying
+    // is worse than one that is absent.
+    let codeact = codeact_ready(watch, run_id, contract, &tools).await;
+    #[cfg(feature = "codeact")]
+    if let Some(ready) = &codeact {
+        tools.push(run_program_spec(&ready.callable));
+    }
     // Durable budget: restored from the store so a resume continues the same
     // token and wall-clock budget rather than restarting it at zero.
     let mut tokens_used: u64 = store.spent_tokens(run_id)?;
@@ -1668,6 +1682,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                         &contract.goal,
                         contract.tool_hooks.as_deref(),
                         &contract.tool_mask,
+                        codeact.as_ref(),
                     )
                     .await;
                     store.attribute_tool(run_id, step, dispatched_at.elapsed());

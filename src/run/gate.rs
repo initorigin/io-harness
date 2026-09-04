@@ -728,6 +728,12 @@ pub(super) fn tool_mode(name: &str, custom: &Toolbox) -> Option<crate::sandbox::
             Some(ExecMode::WorkspaceWrite)
         }
         EXEC_TOOL | SHELL_TOOL | SHELL_START_TOOL => None,
+        // 0.79.0 — declared rather than left to fall through to the registered-tool
+        // arm, which happens to answer the same thing today. A program is the
+        // widest thing this run grants, exactly as `exec` is, so narrowing it
+        // would be the contract disagreeing with itself in the same way.
+        #[cfg(feature = "codeact")]
+        crate::tools::RUN_PROGRAM_TOOL => None,
         _ => custom.get(name).and_then(|tool| tool.exec_mode()),
     }
 }

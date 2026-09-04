@@ -141,6 +141,14 @@ pub const MCP_SERVER_UNSERVED: &[&str] = &[
     crate::SEND_MESSAGE_TOOL,
     crate::READ_MESSAGES_TOOL,
     crate::tools::READ_SKILL_TOOL,
+    // 0.79.0. A program is a way of driving this crate's tools in a loop, and a
+    // served session is already a door onto those tools opened for somebody
+    // else's harness. Serving it would hand a remote caller a loop inside one
+    // call, bounded by this crate's callback limit rather than by anything the
+    // operator who started the server chose per call — and it would run under a
+    // session that has no plan gate either. The client can write its own loop
+    // and make its own calls; that loop is one the operator can watch.
+    crate::tools::RUN_PROGRAM_TOOL,
     // The three writes the policy deliberately does not see, and the reason
     // they cannot be served.
     //
@@ -475,6 +483,12 @@ impl<'a> Served<'a> {
             // Nothing withheld. What a session serves is decided once, by
             // `served_tools`, rather than per turn.
             &ToolMask::none(),
+            // 0.79.0 — a served session offers no programs. `run_program` is on
+            // `MCP_SERVER_UNSERVED`'s side of the same argument the three ungated
+            // writes are on: it is a door onto this crate's tools, and lending
+            // the boundary is not the same as lending a way to drive it in a
+            // loop nobody at the far end can watch.
+            None,
         )
         .await
     }

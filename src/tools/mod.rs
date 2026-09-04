@@ -312,6 +312,27 @@ pub const SHELL_POLL_TOOL: &str = "shell_poll";
 /// The name the model uses to end a started line and everything it spawned
 /// (0.25.0).
 pub const SHELL_KILL_TOOL: &str = "shell_kill";
+/// The name the model uses to run one Python program instead of a chain of tool
+/// calls (0.79.0).
+///
+/// The argument is source, not a command line: nothing about this tool spawns
+/// what the model typed. The interpreter is a host binary resolved before the
+/// run and the program is written to the contained workdir, so
+/// [`Act::Exec`](crate::Act::Exec) never sees model-authored argv here — which is
+/// the opposite of [`EXEC_TOOL`] and [`SHELL_TOOL`], where the argv *is* the
+/// model's text and the whole check.
+///
+/// **A program is not trusted more than a tool call.** Each act it takes comes
+/// back over a pipe, becomes a [`ToolCall`](crate::ToolCall), and re-enters the
+/// same dispatch a model's own call takes — same policy, same gate, same
+/// `policy_events` row, same journal attempt, same observer event. What collapses
+/// is the number of provider round trips, not the number of boundaries.
+///
+/// The tool is advertised only when the feature is compiled *and* a usable
+/// interpreter was found. A host without one is a supported host: the name is
+/// still reserved, the model is simply never offered it, and the turn proceeds as
+/// it would have with the feature off.
+pub const RUN_PROGRAM_TOOL: &str = "run_program";
 /// The name the model uses to search file contents by regex/substring.
 pub const GREP_TOOL: &str = "grep";
 /// The name the model uses to list files by name/path glob.
