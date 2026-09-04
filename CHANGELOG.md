@@ -14,6 +14,20 @@ notes are produced from it.
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.78.0] - 2026-09-04
+
 **The best trace in the field becomes readable by things that are not this crate,
 and the boundary becomes borrowable by other agents.** Two absences with one root:
 everything this crate knows about a run has been recorded with unusual precision
