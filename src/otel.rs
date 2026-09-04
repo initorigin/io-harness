@@ -50,6 +50,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
+
 use crate::observe::{EventKind, Flow, Observer, RunEvent};
 use crate::state::{ProviderCall, StepAttribution, Store};
 use crate::Result;
@@ -754,23 +756,274 @@ impl OtelExporter {
 
     /// Where a finished batch leaves the exporter.
     ///
-    /// The body is built here because building it is the exporter's job; posting
-    /// it is not, and the request is deliberately not made on the run's own task.
-    /// The transport fills this method in — it receives exactly what it has to
-    /// send, and nothing above it has to change to give it to it.
+    /// The body is built here, on the run's own task, because building it is
+    /// cheap and needs the spans. Posting it is neither, so it is handed to the
+    /// runtime and this returns.
     ///
-    /// Until then the encoded batch is retained, bounded, so the exporter's own
-    /// tests can read the tree it built as a collector would see it rather than
-    /// as a private type.
+    /// The encoded batch is also retained, bounded, so the exporter's own tests
+    /// can read the tree it built as a collector would see it rather than as a
+    /// private type. That retention is not the transport's storage: nothing reads
+    /// it back to send, and a batch already posted stays in it only until
+    /// [`RETAINED_BATCHES`] more have gone out.
     fn export_batch(&self, spans: Vec<wire::Span>) {
         let body = wire::encode(self.config.service_name(), &spans);
-        let mut exported = self.exported.lock().unwrap_or_else(PoisonError::into_inner);
-        if exported.len() >= RETAINED_BATCHES {
-            exported.remove(0);
+        {
+            let mut exported = self.exported.lock().unwrap_or_else(PoisonError::into_inner);
+            if exported.len() >= RETAINED_BATCHES {
+                exported.remove(0);
+            }
+            exported.push(body.clone());
         }
-        exported.push(body);
+        self.post(body);
+    }
+
+    /// Hand one encoded batch to the runtime, and return.
+    ///
+    /// **This is what keeps an export off the run's own task.**
+    /// [`Observer::event`] is synchronous and runs on it, so the request is
+    /// spawned rather than awaited and the run sees the cost of one `spawn`.
+    ///
+    /// [`Handle::try_current`] rather than [`tokio::spawn`], which *panics* when
+    /// there is no runtime on the thread. A run always has one — the loop is
+    /// `async` — but `Observer` is a public trait with a plain synchronous
+    /// method, so a caller's own unit test can reach this from a bare thread. A
+    /// batch that cannot be sent is a warning, not a panic, and a panic here
+    /// would be the observer ending the run it is watching.
+    ///
+    /// The spawned future owns everything it touches: the URL, the headers, the
+    /// deadline and the body are copied into it. So it borrows neither the
+    /// exporter nor the run — nothing here asks the exporter to be `'static` —
+    /// and it is bounded by the request deadline times
+    /// [`MAX_EXPORT_ATTEMPTS`] plus the backoff between them, rather than living
+    /// as long as the process. A runtime that shuts down before it finishes drops
+    /// it, which is the same non-event as a collector refusing it.
+    ///
+    /// [`Handle::try_current`]: tokio::runtime::Handle::try_current
+    fn post(&self, body: serde_json::Value) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                url = %self.config.traces_url(),
+                "no tokio runtime on this thread; the OTLP batch is not sent"
+            );
+            return;
+        };
+        runtime.spawn(
+            Export {
+                url: self.config.traces_url(),
+                headers: self.config.headers().clone(),
+                timeout: self.config.timeout(),
+                body,
+            }
+            .send(),
+        );
     }
 }
+
+/// One batch and everything sending it needs, owned rather than borrowed — see
+/// [`OtelExporter::post`].
+struct Export {
+    url: String,
+    headers: BTreeMap<String, String>,
+    timeout: Duration,
+    body: serde_json::Value,
+}
+
+/// What one request says about whether to make another.
+enum Next {
+    /// The collector took the batch, whole or in part. Either way it is done
+    /// with: a partial success is not repeated, because the spans it rejected it
+    /// would reject again and the ones it kept would arrive twice.
+    Done,
+    /// The collector refused on the batch's content — 400 above all. The same
+    /// bytes would be refused the same way, so a repeat is a second copy of one
+    /// failure.
+    Refused,
+    /// Worth repeating, after the wait the response asked for if it asked for
+    /// one.
+    Again(Option<Duration>),
+}
+
+impl Export {
+    /// POST the batch, repeating only what OTLP says may be repeated.
+    ///
+    /// Nothing is returned and no error is propagated: this runs on a task nobody
+    /// is awaiting, from an observer with no channel to report on, so a `warn` is
+    /// the only account a failure can give of itself. That is the whole of the
+    /// blast radius of a broken collector.
+    async fn send(self) {
+        let client = crate::net::http_client_with_timeout(self.timeout);
+        let headers = self.header_map();
+
+        let mut retry = 0u32;
+        loop {
+            let asked = match self.attempt(&client, &headers).await {
+                Next::Done | Next::Refused => return,
+                Next::Again(asked) => asked,
+            };
+            retry += 1;
+            if retry >= MAX_EXPORT_ATTEMPTS {
+                tracing::warn!(
+                    url = %self.url,
+                    attempts = MAX_EXPORT_ATTEMPTS,
+                    "the OTLP batch is dropped after every attempt failed"
+                );
+                return;
+            }
+            tokio::time::sleep(wait_before(retry, asked)).await;
+        }
+    }
+
+    /// One request, and what it says about making another.
+    async fn attempt(&self, client: &reqwest::Client, headers: &HeaderMap) -> Next {
+        let response = client
+            .post(&self.url)
+            .headers(headers.clone())
+            // After `headers`, so the content type it set survives: `json` fills
+            // the header in only when it is absent.
+            .json(&self.body)
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(response) => response,
+            // Refused, reset, or past the deadline. Retryable because it says
+            // nothing about the batch: the collector never read it.
+            Err(error) => {
+                tracing::warn!(
+                    url = %self.url,
+                    error = %error,
+                    "the OTLP export did not reach the collector"
+                );
+                return Next::Again(None);
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            self.warn_on_rejected(response).await;
+            return Next::Done;
+        }
+        if !retryable(status.as_u16()) {
+            tracing::warn!(
+                url = %self.url,
+                status = %status,
+                "the collector refused the OTLP batch; it is not retried"
+            );
+            return Next::Refused;
+        }
+        // The header is the server's own instruction about when to come back and
+        // outranks this client's guess, which is what `wait_before` encodes.
+        Next::Again(crate::net::retry_after(response.headers()))
+    }
+
+    /// The headers one request carries.
+    ///
+    /// **`Content-Type` is inserted last, and with [`HeaderMap::insert`], which
+    /// replaces every value already under that name.** So a configured
+    /// `with_header("content-type", ...)` cannot displace it: the body is JSON
+    /// whatever the configuration says, and a request that announced otherwise
+    /// would be rejected by the collector for a reason nobody chose on purpose.
+    /// `RequestBuilder::header` would not do here — it *appends*, so the same
+    /// call would put two content types on one request.
+    fn header_map(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in &self.headers {
+            // A name or a value the HTTP grammar does not admit is dropped rather
+            // than escalated: there is nobody on this task to report a
+            // configuration error to, and one bad header is not a reason to lose
+            // the batch. The value is never logged — it is where an API key is.
+            match (
+                HeaderName::try_from(name.as_str()),
+                HeaderValue::try_from(value.as_str()),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    headers.insert(name, value);
+                }
+                _ => tracing::warn!(
+                    header = %name,
+                    "the OTLP header is not a valid HTTP header and is dropped"
+                ),
+            }
+        }
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers
+    }
+
+    /// Say so when the collector kept only part of the batch.
+    ///
+    /// The body is read for this and for nothing else. A partial success is a
+    /// success on the wire, and the spans it dropped disappear silently unless
+    /// something says they did.
+    async fn warn_on_rejected(&self, response: reqwest::Response) {
+        let Ok(body) = response.json::<serde_json::Value>().await else {
+            return;
+        };
+        let rejected = rejected_spans(&body);
+        if rejected > 0 {
+            tracing::warn!(
+                url = %self.url,
+                rejected,
+                "the collector accepted the OTLP batch and rejected part of it"
+            );
+        }
+    }
+}
+
+/// The statuses OTLP/HTTP names as retryable.
+///
+/// Everything else is not, and 400 is the one that matters: it means the
+/// collector read the batch and would not have it, and this exporter cannot
+/// change the batch by sending it again. A reflex that retried every non-success
+/// would turn one rejected body into [`MAX_EXPORT_ATTEMPTS`] of them.
+const RETRYABLE_STATUSES: &[u16] = &[429, 502, 503, 504];
+
+fn retryable(status: u16) -> bool {
+    RETRYABLE_STATUSES.contains(&status)
+}
+
+/// How long to wait before retry number `retry`, counting from 1.
+///
+/// `asked` is what the response's `Retry-After` header said, and it wins
+/// outright when it is there: a collector that names a wait knows something
+/// about its own queue that a client's curve cannot. Otherwise the wait doubles
+/// per retry from [`EXPORT_BACKOFF_BASE`], which is what keeps a collector coming
+/// back from an outage from being hit at a fixed rate by every process that was
+/// exporting when it went down.
+fn wait_before(retry: u32, asked: Option<Duration>) -> Duration {
+    asked.unwrap_or_else(|| {
+        // Capped before the shift rather than after: `1 << 32` is undefined for a
+        // `u32` and a debug build panics on it, so a bound raised later must not
+        // be able to reach it.
+        let doubling = 1u32 << retry.saturating_sub(1).min(16);
+        EXPORT_BACKOFF_BASE.saturating_mul(doubling)
+    })
+}
+
+/// `partialSuccess.rejectedSpans` from a collector's response body.
+///
+/// Read as a string first and a number second, because it is an int64 field:
+/// protobuf's JSON mapping writes it as a decimal string, exactly as this
+/// crate's own encoder writes `intValue`. A collector that writes a number
+/// instead is also read, since the point is to notice a rejection rather than to
+/// grade the collector's JSON.
+fn rejected_spans(body: &serde_json::Value) -> u64 {
+    let field = &body["partialSuccess"]["rejectedSpans"];
+    field
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| field.as_u64())
+        .unwrap_or(0)
+}
+
+/// How many times one batch is sent before it is dropped.
+///
+/// Small on purpose. Telemetry has no reader waiting on it, the spans it carries
+/// are already in the store the exporter read them from, and a task that kept
+/// trying would outlive the run it describes.
+const MAX_EXPORT_ATTEMPTS: u32 = 3;
+
+/// The first wait between attempts, doubled per retry.
+const EXPORT_BACKOFF_BASE: Duration = Duration::from_secs(1);
 
 impl Observer for OtelExporter {
     fn event(&self, event: &RunEvent) -> Flow {
@@ -819,10 +1072,11 @@ impl Observer for OtelExporter {
 /// says so is what a dashboard filters on.
 const OUTCOME_SUCCESS: &str = "success";
 
-/// Encoded batches kept by the seam above.
+/// Encoded batches kept by the seam above, so a test can read what was sent.
 ///
 /// A bound rather than a `Vec` that grows for the life of a long-lived exporter.
-/// The transport replaces the retention entirely.
+/// Nothing reads it back to send: a batch is posted once, from `export_batch`,
+/// and this is a copy of what went out rather than a queue of what still has to.
 const RETAINED_BATCHES: usize = 16;
 
 /// Nanoseconds in a millisecond. Every duration the store records is in
@@ -892,10 +1146,7 @@ impl RunTrace {
             wire::OPERATION_INVOKE_AGENT.into(),
         )];
         if let Some(provider) = &self.provider {
-            attributes.push((
-                wire::ATTR_PROVIDER_NAME,
-                provider_attribute(provider).into(),
-            ));
+            attributes.extend(provider_attributes(provider));
         }
         attributes
     }
@@ -968,13 +1219,8 @@ impl OpenTool {
 /// retried twice is three calls whose costs a single aggregate cannot be split
 /// back into.
 fn chat_attributes(call: &ProviderCall) -> Vec<(&'static str, wire::AttrValue)> {
-    let mut attributes = vec![
-        (wire::ATTR_OPERATION_NAME, wire::OPERATION_CHAT.into()),
-        (
-            wire::ATTR_PROVIDER_NAME,
-            provider_attribute(&call.provider).into(),
-        ),
-    ];
+    let mut attributes = vec![(wire::ATTR_OPERATION_NAME, wire::OPERATION_CHAT.into())];
+    attributes.extend(provider_attributes(&call.provider));
     if let Some(model) = call.model.as_deref() {
         // The store keeps one model name per call — the one the provider
         // reported — and both keys carry it. The convention defines an inference
@@ -1018,6 +1264,81 @@ fn provider_attribute(provider: &str) -> &str {
 const CONVENTION_ANTHROPIC: &str = "anthropic";
 /// The convention's value for OpenAI, which is also this crate's.
 const CONVENTION_OPENAI: &str = "openai";
+
+/// `gen_ai.provider.name`, and the endpoint host beside it where this crate
+/// knows one.
+///
+/// The two travel together because they answer one question between them. A
+/// provider id like `groq` or `my-proxy` says which of this crate's providers
+/// served the call; the host says which service that provider dialled, which is
+/// the fact a gateway id does not carry and the one an operator reads a trace to
+/// find. Emitted wherever `gen_ai.provider.name` is, so a root span and the
+/// inference spans under it cannot disagree about where the run went.
+fn provider_attributes(provider: &str) -> Vec<(&'static str, wire::AttrValue)> {
+    let mut out = vec![(
+        wire::ATTR_PROVIDER_NAME,
+        provider_attribute(provider).into(),
+    )];
+    if let Some(host) = provider_endpoint_host(provider) {
+        out.push((wire::ATTR_ENDPOINT_HOST, host.into()));
+    }
+    out
+}
+
+/// The host a provider id of this crate's own making dials, where that endpoint
+/// is fixed by this crate rather than by the caller.
+///
+/// The store records a provider's **name** and never its URL, so this is a
+/// lookup and not a reading: it answers for the ids whose endpoint this crate
+/// itself supplies — every [`Compatible`](crate::Compatible) preset, and
+/// OpenRouter — and `None` for everything else. `None` is the honest answer for
+/// a bare `Compatible::new`, for a [`Fallback`](crate::provider::Fallback)'s
+/// combined label and for a custom [`Provider`](crate::Provider): this crate did
+/// not choose those endpoints and does not know them, and a guessed host is
+/// worse than an absent one.
+///
+/// The one way to make it wrong is to relabel a provider with another vendor's
+/// preset id — `Compatible::new(my_base).with_name("groq")`. That call has
+/// already made `gen_ai.provider.name` say `groq`, so the host follows a claim
+/// the caller made rather than making one of its own.
+fn provider_endpoint_host(provider: &str) -> Option<String> {
+    let base = if provider == OPENROUTER_PROVIDER {
+        OPENROUTER_ENDPOINT
+    } else {
+        crate::provider::compatible::PRESETS
+            .iter()
+            .find(|(name, _, _)| *name == provider)
+            .map(|(_, base, _)| *base)?
+    };
+    host_of(base)
+}
+
+/// The host of `url`, without the port.
+///
+/// [`crate::net::target`] does the reduction, because it is the authority parser
+/// this crate has already hardened — it drops userinfo, refuses a hostless URL
+/// and reads a backslash as a path separator the way a browser does, all of
+/// which a second parser written here would have to get right again. It answers
+/// `host:port` with the scheme's default port filled in, so the port comes back
+/// off: `443` on every `https` preset is a constant, not information, and an
+/// IPv6 literal keeps its brackets, which is what makes the split unambiguous.
+fn host_of(url: &str) -> Option<String> {
+    let target = crate::net::target(url)?;
+    let (host, _port) = target.rsplit_once(':')?;
+    Some(host.to_string())
+}
+
+/// This crate's provider id for OpenRouter, as
+/// [`Provider::name`](crate::Provider::name) reports it.
+const OPENROUTER_PROVIDER: &str = "openrouter";
+
+/// OpenRouter's endpoint.
+///
+/// Repeated here rather than read, because `src/provider/openrouter.rs` keeps it
+/// private to that module and this is the one endpoint in the crate that has no
+/// table to look it up in. `f6_the_openrouter_host_is_the_one_that_provider_dials`
+/// pins the copy against a real `OpenRouter`, so the two cannot drift silently.
+const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 // ---------------------------------------------------------------------------
 // Ids, derived rather than drawn
@@ -1118,6 +1439,21 @@ mod wire {
         ATTR_TOOL_NAME,
         ATTR_ERROR_TYPE,
     ];
+
+    /// The host this crate's provider dialled, where this crate knows it.
+    ///
+    /// **Crate-namespaced on purpose, and deliberately not a GenAI key.** The
+    /// convention has no attribute for the endpoint behind a provider id, and
+    /// inventing a `gen_ai.` one would put a key in that namespace that no
+    /// collector's schema knows and that a later revision could redefine. It is
+    /// therefore not in [`GENAI_ATTRIBUTES`] either: that slice is the GenAI
+    /// vocabulary specifically, and the F5 check compares it against the table in
+    /// `docs/CONTRACT.md`, which is a table of GenAI keys.
+    ///
+    /// It carries the *host*, not the URL: a path can hold a tenant id and a
+    /// query string can hold a key, and neither is a fact about which service
+    /// answered.
+    pub const ATTR_ENDPOINT_HOST: &str = "io_harness.provider.endpoint.host";
 
     /// `gen_ai.operation.name` for a model call.
     pub const OPERATION_CHAT: &str = "chat";
@@ -2460,6 +2796,102 @@ mod span_tests {
         assert_ne!(one.span_id(1, TAG_RUN, 0, 0), two.span_id(1, TAG_RUN, 0, 0));
     }
 
+    // -----------------------------------------------------------------------
+    // N6 — the payload is searched as bytes
+    // -----------------------------------------------------------------------
+
+    /// A string that appears in nothing this crate emits by accident, so finding
+    /// it anywhere in a payload is a leak and not a coincidence.
+    const SENTINEL: &str = "SENTINEL-4e07408562be";
+
+    fn read(path: &str) -> ToolCall {
+        ToolCall {
+            name: "read_file".into(),
+            arguments: json!({ "path": path }),
+        }
+    }
+
+    /// N6. A sentinel written into the run's goal, into a tool call's arguments
+    /// and into a tool's output appears nowhere in the bytes the exporter sends.
+    ///
+    /// The search is over the **whole serialized body** rather than over the
+    /// fields this file expects things to be in. The claim is that no path leaks
+    /// the transcript, and a field-by-field check only covers the paths somebody
+    /// thought of — the three opt-in content attributes are not implemented, so
+    /// what this has to catch is an accident, which is by definition somewhere
+    /// nobody looked.
+    #[tokio::test]
+    async fn nf6_no_transcript_content_reaches_the_serialized_payload() {
+        let bed = bed();
+        let exporter = exporter_for(&bed);
+        let recorder = Recorder::default();
+
+        // The goal, an argument and an output, in one run. The second step reads
+        // back what the first wrote, so the sentinel is in a tool's output as
+        // well as in the arguments that put it there.
+        let goal = format!("write {SENTINEL} to the notes");
+        let contract = TaskContract::workspace(goal, bed.workspace.path())
+            .with_verification(Verification::WorkspaceFileContains {
+                file: "NOTES.md".into(),
+                needle: "done".into(),
+            })
+            .with_max_steps(4)
+            .with_retry_policy(RetryPolicy {
+                base: Duration::ZERO,
+                max: Duration::ZERO,
+            });
+        let provider = Mock::new(vec![
+            Turn::Calls(vec![write("secret.txt", &format!("{SENTINEL}\n"))]),
+            Turn::Calls(vec![read("secret.txt"), write("NOTES.md", "done")]),
+        ]);
+        let result = run_with_observed(
+            &contract,
+            &provider,
+            &bed.store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &Both(&exporter, &recorder),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, RunOutcome::Success { steps: 2 });
+
+        // The sentinel really did travel through the run. Without this the test
+        // could pass on a run that never carried it.
+        let written = std::fs::read_to_string(bed.workspace.path().join("secret.txt")).unwrap();
+        assert!(
+            written.contains(SENTINEL),
+            "the tool call carried the sentinel"
+        );
+
+        let bodies = exporter
+            .exported
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert!(!bodies.is_empty(), "the run exported nothing to search");
+        for body in &bodies {
+            let bytes = serde_json::to_string(body).expect("an encoded batch serializes");
+            assert!(
+                !bytes.contains(SENTINEL),
+                "the exported payload carries transcript content: {bytes}"
+            );
+        }
+    }
+
+    /// The other half. A search that never fires proves nothing, so this puts the
+    /// sentinel inside a real encoded envelope and shows the same search finds it.
+    #[test]
+    fn control_the_payload_search_finds_a_sentinel_that_is_there() {
+        let leaked = wire::encode(SENTINEL, &[]);
+        let bytes = serde_json::to_string(&leaked).unwrap();
+
+        assert!(
+            bytes.contains(SENTINEL),
+            "the search must be able to find a sentinel in an encoded envelope"
+        );
+    }
+
     /// The provider attribute takes the convention's value only where this crate
     /// talks to that vendor, and never maps an unlisted provider onto a listed
     /// one.
@@ -2471,5 +2903,482 @@ mod span_tests {
         assert_eq!(provider_attribute("openrouter"), "openrouter");
         assert_eq!(provider_attribute("my-proxy"), "my-proxy");
         assert_eq!(provider_attribute("mock"), "mock");
+    }
+}
+
+/// F6, F7 and F8 of 0.78.0, on the half of the transport that is crate-private.
+///
+/// The provider mapping, the retry rule and the two locks are private items with
+/// no public door, so this is where they are asserted; `tests/otel_transport.rs`
+/// carries the arms a consumer can drive, which are the three failure modes of a
+/// real collector.
+///
+/// Each rule is a function over its input with a `control_` test that feeds the
+/// same function the wrong input and watches it say no.
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use crate::provider::compatible::PRESETS;
+    use crate::provider::{Compatible, OpenRouter};
+    use crate::Provider;
+
+    // -----------------------------------------------------------------------
+    // F6 — the provider mapping is total, and translates nothing
+    // -----------------------------------------------------------------------
+
+    /// Every provider id this crate can put on a span. `total` has to be a claim
+    /// over a corpus rather than over the two arms somebody remembered, so the
+    /// preset table is read rather than retyped.
+    fn every_provider_id() -> Vec<String> {
+        let mut ids = vec![
+            CONVENTION_ANTHROPIC.to_string(),
+            CONVENTION_OPENAI.to_string(),
+            OPENROUTER_PROVIDER.to_string(),
+            // `Compatible::new`'s default label, a `Fallback`'s combined one, a
+            // custom `Provider`, a case variant of a listed value, a near miss,
+            // and the empty name a `Provider` implementation is free to return.
+            "compatible".to_string(),
+            "anthropic+openai".to_string(),
+            "my-proxy".to_string(),
+            "OpenAI".to_string(),
+            "openai-compatible".to_string(),
+            "mock".to_string(),
+            String::new(),
+        ];
+        ids.extend(PRESETS.iter().map(|(name, _, _)| (*name).to_string()));
+        ids
+    }
+
+    /// The rule F6 states, as a function over a candidate mapping: a provider id
+    /// is reported verbatim.
+    ///
+    /// Verbatim is the strong form of "no unlisted provider is mapped onto a
+    /// listed value" — a mapping that never changes its input cannot land an id
+    /// on a value that is not it. The two convention arms survive because this
+    /// crate's own ids for those two vendors already *are* the convention's
+    /// values, which is an agreement between two vocabularies and not a
+    /// translation.
+    // `std::result::Result` written out: this crate's own `Result<T>` alias is in
+    // scope here and takes one parameter, so the two-parameter form would resolve
+    // to it and fail to compile.
+    fn translates_nothing(
+        map: impl Fn(&str) -> String,
+        ids: &[String],
+    ) -> std::result::Result<(), String> {
+        for id in ids {
+            let reported = map(id);
+            if reported != *id {
+                return Err(format!(
+                    "the provider id {id:?} is reported as {reported:?}: the exporter translated \
+                     a provider onto a name that is not its own"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn f6_the_provider_mapping_is_total_and_translates_nothing() {
+        let ids = every_provider_id();
+
+        if let Err(wrong) = translates_nothing(|id| provider_attribute(id).to_string(), &ids) {
+            panic!("{wrong}");
+        }
+
+        // And the consequence stated directly, because it is the sentence in the
+        // criterion: a value the convention enumerates appears only where it is
+        // this crate's own id for that provider.
+        for id in &ids {
+            let reported = provider_attribute(id);
+            for listed in [CONVENTION_ANTHROPIC, CONVENTION_OPENAI] {
+                assert!(
+                    reported != listed || id.as_str() == listed,
+                    "{id:?} is reported as the convention's {listed:?}, which it is not"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn control_a_mapping_that_translated_a_gateway_is_caught() {
+        let ids = every_provider_id();
+
+        // The mistake the criterion is about: a gateway reported as the vendor it
+        // might be proxying, which no consumer of the trace could detect.
+        let wrong = translates_nothing(
+            |id| match id {
+                "openrouter" => CONVENTION_OPENAI.to_string(),
+                other => other.to_string(),
+            },
+            &ids,
+        )
+        .expect_err("a gateway reported as OpenAI is a translation");
+        assert!(wrong.contains("openrouter"), "{wrong}");
+        assert!(wrong.contains("openai"), "{wrong}");
+
+        // The other half: the checker must pass the mapping that is correct.
+        assert!(translates_nothing(|id| id.to_string(), &ids).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // F6 — the endpoint host, on an attribute of this crate's own
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn f6_a_gateway_carries_its_endpoint_host_on_a_crate_namespaced_attribute() {
+        let attributes = provider_attributes(OPENROUTER_PROVIDER);
+
+        assert_eq!(
+            attributes,
+            vec![
+                (
+                    wire::ATTR_PROVIDER_NAME,
+                    wire::AttrValue::Str("openrouter".into())
+                ),
+                (
+                    wire::ATTR_ENDPOINT_HOST,
+                    wire::AttrValue::Str("openrouter.ai".into())
+                ),
+            ],
+            "the id says which provider served the call and the host says what it dialled"
+        );
+    }
+
+    /// The host rides an attribute of this crate's own namespace and is not one
+    /// of the GenAI keys.
+    ///
+    /// Both halves matter. `gen_ai.` is a namespace the convention owns, so an
+    /// invented key in it is a key a later revision could redefine underneath
+    /// this crate; and [`wire::GENAI_ATTRIBUTES`] is compared against the table in
+    /// `docs/CONTRACT.md` by F5, which is a table of GenAI keys.
+    #[test]
+    fn f6_the_endpoint_host_is_not_a_genai_attribute() {
+        assert!(
+            wire::ATTR_ENDPOINT_HOST.starts_with("io_harness."),
+            "the endpoint host is this crate's own attribute: {}",
+            wire::ATTR_ENDPOINT_HOST
+        );
+        assert!(
+            !wire::ATTR_ENDPOINT_HOST.starts_with("gen_ai."),
+            "the convention names no attribute for the endpoint behind a provider id"
+        );
+        assert!(
+            !wire::GENAI_ATTRIBUTES.contains(&wire::ATTR_ENDPOINT_HOST),
+            "GENAI_ATTRIBUTES is the GenAI vocabulary, and F5 checks it against a \
+             table of GenAI keys"
+        );
+    }
+
+    /// The copy of OpenRouter's endpoint in this file is the one that provider
+    /// really dials, and the id beside it is the one it really reports.
+    ///
+    /// `src/provider/openrouter.rs` keeps its endpoint private to that module, so
+    /// the constant here is a second copy and this is what stops the two drifting.
+    #[test]
+    fn f6_the_openrouter_host_is_the_one_that_provider_dials() {
+        let provider = OpenRouter::new("", "a-model");
+
+        assert_eq!(provider.name(), OPENROUTER_PROVIDER);
+        assert_eq!(provider.endpoint(), Some(OPENROUTER_ENDPOINT));
+        assert_eq!(
+            provider_endpoint_host(provider.name()),
+            host_of(provider.endpoint().unwrap())
+        );
+    }
+
+    /// Every preset, driven through the real constructor rather than read off the
+    /// table twice: the host this exporter reports for a preset id is the host a
+    /// provider built from that id opens a connection to.
+    #[test]
+    fn f6_every_compatible_preset_reports_the_host_it_dials() {
+        for (name, _, _) in PRESETS {
+            let provider = Compatible::preset(name, "", "a-model")
+                .expect("every preset name names a row in PRESETS");
+            let dialled = provider
+                .endpoint()
+                .expect("a compatible provider names the endpoint it dials");
+
+            assert_eq!(provider.name(), *name, "a preset labels itself");
+            assert_eq!(
+                provider_endpoint_host(name),
+                host_of(dialled),
+                "the reported host for {name:?} is not the host it dials ({dialled})"
+            );
+            assert!(
+                provider_endpoint_host(name).is_some(),
+                "{name:?} dials an endpoint this crate chose, so its host is known"
+            );
+        }
+    }
+
+    /// The other direction, and the one that keeps the attribute honest: a
+    /// provider whose endpoint this crate did not choose reports no host at all
+    /// rather than a guess.
+    #[test]
+    fn f6_a_provider_this_crate_did_not_point_reports_no_host() {
+        for id in [
+            CONVENTION_ANTHROPIC,
+            CONVENTION_OPENAI,
+            // `Compatible::new`'s default label, a `Fallback`'s combined one, a
+            // custom provider, and a mock.
+            "compatible",
+            "anthropic+openai",
+            "my-proxy",
+            "mock",
+            "",
+        ] {
+            assert_eq!(
+                provider_endpoint_host(id),
+                None,
+                "{id:?} has no endpoint this crate can name"
+            );
+            assert_eq!(
+                provider_attributes(id).len(),
+                1,
+                "{id:?} carries its provider name and nothing beside it"
+            );
+        }
+    }
+
+    #[test]
+    fn f6_a_host_is_the_authority_without_the_port_or_the_path() {
+        assert_eq!(
+            host_of("https://api.groq.com/openai/v1").as_deref(),
+            Some("api.groq.com")
+        );
+        // A local runtime keeps its host; which of the eight it is, is already in
+        // `gen_ai.provider.name`.
+        assert_eq!(
+            host_of("http://localhost:11434/v1").as_deref(),
+            Some("localhost")
+        );
+        // Credentials in a URL are not part of the host, and neither is a path
+        // that might carry a tenant.
+        assert_eq!(
+            host_of("https://key@api.example.com/tenants/acme/v1").as_deref(),
+            Some("api.example.com")
+        );
+        assert_eq!(host_of("[::1]").as_deref(), None);
+        assert_eq!(host_of("http://[::1]:8080/v1").as_deref(), Some("[::1]"));
+        // Not a URL this crate would ever dial, and not a host either.
+        assert_eq!(host_of("file:///etc/passwd"), None);
+        assert_eq!(host_of("not a url"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // F7 — an export failure never changes a run
+    // -----------------------------------------------------------------------
+
+    fn exporter() -> (tempfile::TempDir, OtelExporter) {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter =
+            OtelExporter::open(OtelConfig::default(), dir.path().join("runs.db")).unwrap();
+        (dir, exporter)
+    }
+
+    fn started(run_id: i64) -> RunEvent {
+        RunEvent::new(
+            run_id,
+            0,
+            EventKind::Started {
+                goal: "a goal".into(),
+                provider: "mock".into(),
+            },
+        )
+    }
+
+    fn finished(run_id: i64) -> RunEvent {
+        RunEvent::new(
+            run_id,
+            1,
+            EventKind::Finished {
+                outcome: OUTCOME_SUCCESS.into(),
+                steps: 1,
+                tokens: 0,
+            },
+        )
+    }
+
+    /// F7. `event` on a thread with no tokio runtime returns `Flow::Continue`
+    /// rather than panicking.
+    ///
+    /// `tokio::spawn` panics when there is no runtime, and `Observer` is a public
+    /// trait whose one method is synchronous — so a caller's own unit test can
+    /// reach the export path from a bare thread. This is a plain `#[test]` on
+    /// purpose: `#[tokio::test]` would install the runtime this asserts the
+    /// absence of.
+    #[test]
+    fn f7_an_event_with_no_runtime_continues_the_run() {
+        let (_dir, exporter) = exporter();
+
+        assert!(matches!(exporter.event(&started(1)), Flow::Continue));
+        assert!(matches!(exporter.event(&finished(1)), Flow::Continue));
+
+        // And the batch was still built: what is missing without a runtime is the
+        // sending, not the encoding, which is what makes the failure one line in
+        // a log rather than a hole in the tree.
+        assert_eq!(
+            exporter
+                .exported
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len(),
+            1
+        );
+    }
+
+    /// F7. A poisoned lock does not panic the run.
+    ///
+    /// This is the one place an observer can take a run down with it: `event`
+    /// runs on the run's own task, so a `lock().unwrap()` on a mutex some earlier
+    /// panic poisoned would end the run the exporter is only watching. The state
+    /// behind these locks is spans, so recovering it costs at worst one malformed
+    /// trace.
+    #[test]
+    fn f7_a_poisoned_lock_continues_the_run() {
+        let (_dir, exporter) = exporter();
+
+        poison(&exporter.pending);
+        poison(&exporter.exported);
+        assert!(exporter.pending.is_poisoned());
+        assert!(exporter.exported.is_poisoned());
+
+        assert!(matches!(exporter.event(&started(2)), Flow::Continue));
+        assert!(matches!(exporter.event(&finished(2)), Flow::Continue));
+    }
+
+    /// Poison a mutex the way a panicking observer poisons one: unwind with the
+    /// guard held.
+    ///
+    /// `AssertUnwindSafe` because the closure borrows a lock, which is exactly
+    /// the shape the compiler asks about — and the answer here is that poisoning
+    /// is what the caller wants.
+    fn poison<T>(lock: &Mutex<T>) {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = lock.lock().unwrap();
+            panic!("an earlier event panicked with this lock held");
+        }));
+        assert!(panicked.is_err(), "the closure must have unwound");
+    }
+
+    // -----------------------------------------------------------------------
+    // F8 — the retry rule is OTLP's, not a reflex
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn f8_a_four_hundred_and_every_other_refusal_is_never_retried() {
+        assert!(
+            !retryable(400),
+            "400 means the collector read the batch and would not have it"
+        );
+        for status in [401, 403, 404, 405, 409, 411, 413, 415, 422, 500, 501, 505] {
+            assert!(!retryable(status), "{status} is not a retryable status");
+        }
+    }
+
+    #[test]
+    fn f8_the_statuses_otlp_names_as_retryable_are_retried() {
+        for status in [429, 502, 503, 504] {
+            assert!(retryable(status), "{status} is retryable under OTLP/HTTP");
+        }
+    }
+
+    #[test]
+    fn f8_a_retry_after_header_outranks_the_backoff() {
+        assert_eq!(
+            wait_before(1, Some(Duration::from_secs(7))),
+            Duration::from_secs(7)
+        );
+        // Including when it asks for none. A collector saying "now" is still the
+        // collector's answer, and a client that applied its own floor to it would
+        // be ignoring the header while appearing to honour it.
+        assert_eq!(wait_before(3, Some(Duration::ZERO)), Duration::ZERO);
+    }
+
+    #[test]
+    fn f8_the_backoff_doubles_when_no_header_asks_for_a_wait() {
+        assert_eq!(wait_before(1, None), EXPORT_BACKOFF_BASE);
+        assert_eq!(wait_before(2, None), EXPORT_BACKOFF_BASE * 2);
+        assert_eq!(wait_before(3, None), EXPORT_BACKOFF_BASE * 4);
+        // Never an overflow, however many retries a future bound allows.
+        assert!(wait_before(u32::MAX, None) > EXPORT_BACKOFF_BASE);
+    }
+
+    #[test]
+    fn f8_a_partial_success_is_read_off_the_body() {
+        // The int64 shape, which is what a conforming collector sends.
+        let body = serde_json::json!({ "partialSuccess": { "rejectedSpans": "3" } });
+        assert_eq!(rejected_spans(&body), 3);
+
+        // And the number a collector that took protobuf JSON's rule less
+        // seriously would send, because the point is to notice the rejection.
+        let numeric = serde_json::json!({ "partialSuccess": { "rejectedSpans": 3 } });
+        assert_eq!(rejected_spans(&numeric), 3);
+    }
+
+    #[test]
+    fn control_a_body_with_nothing_rejected_reports_nothing() {
+        // The whole-success answer, which OTLP writes as an empty object.
+        assert_eq!(rejected_spans(&serde_json::json!({})), 0);
+        assert_eq!(
+            rejected_spans(&serde_json::json!({ "partialSuccess": {} })),
+            0
+        );
+        assert_eq!(
+            rejected_spans(&serde_json::json!({ "partialSuccess": { "rejectedSpans": "0" } })),
+            0
+        );
+        // A body that is not the shape at all is not a rejection.
+        assert_eq!(rejected_spans(&serde_json::json!("ok")), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // The request itself
+    // -----------------------------------------------------------------------
+
+    fn export_with(headers: BTreeMap<String, String>) -> Export {
+        Export {
+            url: "http://collector.invalid:4318/v1/traces".into(),
+            headers,
+            timeout: Duration::from_secs(1),
+            body: serde_json::json!({}),
+        }
+    }
+
+    /// A configured header cannot displace the content type, because the body
+    /// really is JSON and a request that said otherwise would be refused for a
+    /// reason nobody configured on purpose.
+    #[test]
+    fn f8_a_configured_content_type_cannot_displace_the_real_one() {
+        let mut headers = BTreeMap::new();
+        headers.insert("content-type".to_string(), "text/plain".to_string());
+        headers.insert("x-tenant".to_string(), "acme".to_string());
+
+        let map = export_with(headers).header_map();
+
+        assert_eq!(
+            map.get_all(CONTENT_TYPE).iter().count(),
+            1,
+            "one content type on the wire, not two"
+        );
+        assert_eq!(map[CONTENT_TYPE], "application/json");
+        assert_eq!(map["x-tenant"], "acme");
+    }
+
+    /// A header the HTTP grammar does not admit is dropped rather than escalated.
+    /// There is nobody on the export task to report a configuration error to, and
+    /// one bad header is not a reason to lose the batch.
+    #[test]
+    fn f8_an_unusable_header_is_dropped_and_the_rest_are_sent() {
+        let mut headers = BTreeMap::new();
+        headers.insert("a space".to_string(), "value".to_string());
+        headers.insert("x-newline".to_string(), "one\ntwo".to_string());
+        headers.insert("x-tenant".to_string(), "acme".to_string());
+
+        let map = export_with(headers).header_map();
+
+        assert_eq!(map["x-tenant"], "acme");
+        assert_eq!(map[CONTENT_TYPE], "application/json");
+        assert_eq!(map.len(), 2, "the two unusable headers are not on the wire");
     }
 }

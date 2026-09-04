@@ -4303,6 +4303,16 @@ compared by a test rather than maintained side by side.
 | `gen_ai.tool.name` | tool call | The tool's own name, the one the policy gate was asked about |
 | `error.type` | any failed span | Set only when the span failed, alongside an error status |
 
+**One attribute is this crate's own and is deliberately outside that table.** A
+provider span for a gateway also carries the host that gateway dials, under a
+crate-namespaced key beginning `io_harness.` rather than `gen_ai.`. It is not in
+the list above because the list is the *GenAI* vocabulary and this key is not part
+of it — inventing a `gen_ai.` name for a fact the convention does not define would
+be the same error as mapping an unlisted provider onto a listed one. The host is a
+lookup over the endpoint table this crate already owns, so a provider whose
+endpoint this crate did not choose — a bare `Compatible`, a custom `Provider` —
+carries no host at all rather than a guess.
+
 **What is not sent, and is not implementable by a flag.** The convention marks
 `gen_ai.input.messages`, `gen_ai.output.messages` and `gen_ai.system_instructions`
 opt-in. None of the three exists in this crate's exporter — not defaulted off, not
