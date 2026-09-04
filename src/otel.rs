@@ -436,7 +436,29 @@ impl OtelExporter {
     /// the exporter late — still produces a tree instead of dropping every event
     /// until a start it will never see.
     fn run_state<'a>(&self, pending: &'a mut Pending, run_id: i64, now: u64) -> &'a mut RunTrace {
-        let adopted = pending.adopted.remove(&run_id);
+        // Only consume the adoption when this run is genuinely new. Removing it
+        // unconditionally threw the entry away on every later event of a run
+        // that had already opened its own trace, which is silent: the tree is
+        // wrong and nothing says so.
+        let adopted = match pending.runs.contains_key(&run_id) {
+            true => None,
+            false => pending.adopted.remove(&run_id),
+        };
+        // Both maps are bounded, because neither empties on its own.
+        //
+        // `runs` loses an entry at `EventKind::Finished`, and a run whose future
+        // is *dropped* — a caller aborting, a `select!` losing, a cancelled task
+        // — never emits one. `adopted` loses an entry when the child's first
+        // event arrives, and a child that fails to spawn or is never resumed
+        // never sends one. A long-lived exporter is the documented shape
+        // (`Harness::with_observer` binds one for the life of the harness), so
+        // without a bound each is a slow leak of whole span trees.
+        //
+        // The oldest run goes first, which is the one least likely to still be
+        // running. Dropping a tracked run loses its spans; that is strictly
+        // better than holding every run a process ever abandoned, and it is
+        // reported rather than silent.
+        pending.evict_if_full();
         pending.runs.entry(run_id).or_insert_with(|| {
             let (trace_id, parent) = match adopted {
                 // A child agent announced by its parent: same trace, and a root
@@ -1180,6 +1202,52 @@ struct Pending {
     adopted: HashMap<i64, (wire::TraceId, wire::SpanId)>,
     /// Finished spans not yet handed to the transport.
     ready: Vec<wire::Span>,
+}
+
+/// How many runs and pending adoptions this exporter tracks at once.
+///
+/// A ceiling rather than a tuning knob. Neither map empties on its own for a run
+/// that never finishes, and an exporter is bound for the life of a harness, so
+/// the bound is what makes "long-lived" and "bounded memory" both true. Far above
+/// any plausible number of runs genuinely in flight through one exporter.
+const MAX_TRACKED_RUNS: usize = 1024;
+
+impl Pending {
+    /// Make room before a new run is tracked, and say so when it costs
+    /// something.
+    ///
+    /// The oldest open run is evicted first: it is the one least likely to still
+    /// be running, and a run that was abandoned is exactly what fills this map.
+    /// Its spans are lost, which is the honest cost of a bound and is reported
+    /// on the crate's own log channel rather than absorbed.
+    fn evict_if_full(&mut self) {
+        if self.runs.len() >= MAX_TRACKED_RUNS {
+            if let Some(oldest) = self
+                .runs
+                .iter()
+                .min_by_key(|(_, run)| run.started)
+                .map(|(id, _)| *id)
+            {
+                self.runs.remove(&oldest);
+                tracing::warn!(
+                    run_id = oldest,
+                    tracked = MAX_TRACKED_RUNS,
+                    "otel exporter is tracking its maximum number of runs; dropping the oldest \
+                     open one. A run whose future is dropped never reports that it finished."
+                );
+            }
+        }
+        if self.adopted.len() >= MAX_TRACKED_RUNS {
+            if let Some(any) = self.adopted.keys().next().copied() {
+                self.adopted.remove(&any);
+                tracing::warn!(
+                    child_run_id = any,
+                    "otel exporter is holding its maximum number of announced children; dropping \
+                     one. A child that never starts never claims its adoption."
+                );
+            }
+        }
+    }
 }
 
 /// A run this exporter has seen the start of and not the end.
@@ -3382,6 +3450,41 @@ mod transport_tests {
                 .len(),
             1
         );
+    }
+
+    /// A run that starts and never finishes does not grow the exporter forever.
+    ///
+    /// An adversarial-review finding. `runs` loses an entry at
+    /// `EventKind::Finished`, and a run whose future is *dropped* — a caller
+    /// aborting, a `select!` losing — never emits one. An exporter is bound for
+    /// the life of a harness, so without a bound each abandoned run holds its
+    /// whole span tree indefinitely.
+    ///
+    /// No test constructed such a run before this one, which is why the growth
+    /// was invisible: every other test drives a run to completion.
+    #[test]
+    fn f7_a_run_that_never_finishes_does_not_grow_the_exporter_forever() {
+        let (_dir, exporter) = exporter();
+
+        // Twice the bound, none of them ever finishing.
+        for run_id in 0..(MAX_TRACKED_RUNS as i64 * 2) {
+            assert!(matches!(exporter.event(&started(run_id)), Flow::Continue));
+        }
+
+        let tracked = exporter
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .runs
+            .len();
+        assert!(
+            tracked <= MAX_TRACKED_RUNS,
+            "the exporter tracks {tracked} runs, over its own bound of {MAX_TRACKED_RUNS}"
+        );
+
+        // And the bound is a ceiling rather than a reset: it is still tracking
+        // runs, so eviction has not thrown away the ability to export at all.
+        assert!(tracked > 0, "the exporter is tracking nothing at all");
     }
 
     /// F7. A poisoned lock does not panic the run.
