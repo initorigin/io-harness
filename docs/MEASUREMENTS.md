@@ -9,6 +9,83 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What one program costs against the chain of calls it replaces (0.79.0)
+
+**What is being measured.** The token cost of one task done three ways against a
+real provider — with `run_program` merely offered, with the model told to use it,
+and with ordinary tool calls — from this crate's own `provider_calls` rows rather
+than estimated.
+
+**Why it is measured here at all.** CodeAct is usually introduced with a figure of
+roughly 64% fewer tokens. That number was measured on a different harness, with a
+different context assembler and a different tool catalogue. The roadmap entry for
+this release said the capability must be argued from this crate's own evidence, so
+this is that evidence, and it does not agree.
+
+**The shape expected before it was measured.** Fewer provider round trips, because
+control flow the model would otherwise simulate across several completions runs
+inside the interpreter. Fewer prompt tokens, because a chain resends the whole
+growing transcript on every step. More completion tokens, because writing a
+program is more output than writing one tool call.
+
+**Method.** `examples/codeact_live.rs`. Three arms over the same six-file
+workspace, the same model and the same permissive policy, differing only in
+whether `with_codeact` was called and whether the goal names the tool:
+
+```text
+set -a; . ./.env; set +a
+cargo run --release --features codeact --example codeact_live
+```
+
+The task requires a loop with a branch and a write per iteration — append a line
+to every `.txt` file under three lines, leave the rest alone, then write how many
+were changed. Neither `exec`, which takes a fixed argv, nor `shell`, whose grammar
+refuses control flow by name, can express that; a program can. The example reads
+the `Program` events back and prints how many programs ran and how many callbacks
+they made, so an arm that did not use the capability says so.
+
+**Machine.** Apple M1, macOS 26.5.2, release profile, 2026-09-04, against
+OpenRouter with `deepseek/deepseek-v4-flash-0731`.
+
+**Numbers.**
+
+| arm | steps | prompt | completion | total | programs / callbacks | answer |
+| --- | --- | --- | --- | --- | --- | --- |
+| offered | 6 | 38,303 | 1,492 | 39,795 | none — never used | correct |
+| directed | 13 | 124,689 | 36,727 | 161,416 | 4 / 49, all finished | correct |
+| tool calls | 5 | 30,148 | 2,009 | 32,157 | — | correct |
+
+**Two results, and the second is not the one this capability is usually sold on.**
+
+**The model does not choose it.** Offered the tool on a task shaped for it, this
+model wrote no program — on this run and on the three before it. Once it wrote one
+that reached for the workspace with Python's own file reads, got nothing because a
+program runs in an empty scratch directory, and abandoned the approach; the other
+times it never called it. The tool description was corrected after the first, and
+the answer did not change.
+
+**Told to use it, it costs five times more here.** 161,416 tokens against 32,157.
+The direction of the completion term is what was predicted and its size is not:
+36,727 completion tokens against 2,009, because the model wrote **four** programs
+rather than one, iterating — 12, 10, 15 and 12 callbacks. Every one of them ran and
+finished, and the answer was right, so this is a cost result rather than a
+correctness one. The prompt term went the wrong way too: a program's output re-enters
+the transcript, and four programs' worth of output is more than a chain of reads.
+
+**What that does and does not settle.** It settles that on a small task, with this
+model, a program is not cheaper — and that a model iterating on programs is the
+expensive case rather than the happy one. It does not settle the capability's
+ceiling: one task, one model, one sample per arm. Four earlier runs of the offered
+arm produced ratios between 0.67x and 1.57x **while never using the capability at
+all**, which is a fair measure of how little a single sample of this comparison
+means.
+
+The release does not rest on this number. What it rests on is that a program's acts
+are gated exactly as a model's own calls are, which the suite proves and this run
+demonstrates live across 49 callbacks. The saving is a hypothesis this repository
+has now tested once and not found; it is recorded here rather than left as somebody
+else's figure repeated.
+
 ## What Context Collapse carries that a stub does not (0.76.0)
 
 **What is being measured.** How much of a turn's history survives into the

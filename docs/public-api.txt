@@ -51,6 +51,9 @@ const ASK_QUESTION_TOOL src/tools/mod.rs
 const ASK_QUESTIONS_TOOL src/tools/mod.rs
 const BUSY_TIMEOUT src/state.rs
 const CHECKPOINT_FORMAT src/state.rs
+const CODEACT_CANDIDATES src/codeact.rs
+const CODEACT_MIN_PYTHON src/codeact.rs
+const CODEACT_UNCALLABLE src/codeact.rs
 const DEFAULT_EXEC_TIMEOUT src/tools/exec.rs
 const DEFAULT_LEASE_TTL src/run.rs
 const DEFAULT_MAX_RETRIES src/contract.rs
@@ -149,6 +152,7 @@ struct Choice src/approve.rs
 struct BrowserConfig src/browser.rs
 struct CheckpointEvent src/state.rs
 struct Citation src/web.rs
+struct CodeActConfig src/codeact.rs
 struct Compatible src/provider/compatible.rs
 struct Collapse src/context.rs
 struct CompletionRequest src/provider/mod.rs
