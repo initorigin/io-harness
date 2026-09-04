@@ -113,7 +113,7 @@ fn skill_target(path: &std::path::Path) -> std::io::Result<String> {
 #[allow(clippy::too_many_arguments)]
 // `pending_media` is `()` without the feature, and nothing reads it there.
 #[cfg_attr(not(feature = "media"), allow(unused_variables))]
-pub(super) async fn dispatch(
+pub(crate) async fn dispatch(
     ws: &Workspace,
     call: &ToolCall,
     approver: &dyn Approver,

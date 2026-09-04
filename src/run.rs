@@ -3696,7 +3696,12 @@ pub(crate) struct Watch<'a> {
 }
 
 impl<'a> Watch<'a> {
-    fn new(observer: &'a dyn Observer) -> Self {
+    // `pub(crate)` since 0.78.0: a served MCP call is announced on the observer
+    // channel like any other tool call, and `dispatch` takes the `Watch` that
+    // does the announcing. The type was already `pub(crate)`; only its
+    // constructor was not, which made it nameable from a sibling module and not
+    // constructible there.
+    pub(crate) fn new(observer: &'a dyn Observer) -> Self {
         Self {
             observer,
             cancelled: Cell::new(false),
@@ -5304,10 +5309,33 @@ mod tests {
 // back, so a moved item is still reachable from here and from its siblings. A
 // private member is visible in its own module and its children but never in its
 // parent, so a moved type's fields and a moved impl's methods widen with it.
-mod dispatch;
-mod gate;
+// `pub(crate)` for the same reason `prompts` below is (0.78.0): a served MCP
+// call routes through `dispatch` rather than around it, so the policy gate, the
+// `policy_events` row and the journal attempt see it exactly as a model's call
+// is seen. `src/mcp_server.rs` is a sibling of this module rather than a
+// descendant, so a `pub(crate)` item inside a private module would still be out
+// of reach — the module has to move too.
+//
+// The alternative was a second, shorter execution path built to avoid
+// assembling this function's arguments. That path would have passed every
+// functional test and skipped the boundary, which is the one thing serving
+// tools over MCP must not do.
+//
+// `pub(crate)` and no wider. `mod run;` is private in `src/lib.rs`, so nothing
+// here reaches a consumer and `docs/public-api.txt` does not move.
+pub(crate) mod dispatch;
+// `gate` and `memory` are `pub(crate)` for the same reason `dispatch` is, and
+// only for what `dispatch`'s own signature and return type name: `PlanPhase` and
+// `Dispatched` live in `gate`, and `memory_key` in `memory`. Calling a function
+// from a sibling module means being able to spell its arguments.
+//
+// Opening the module does not open its contents. Everything in these two files
+// that is still `pub(super)` stays visible to `run` and to nothing else, so what
+// crossed the line is the handful of items promoted deliberately rather than
+// each file's whole interior.
+pub(crate) mod gate;
 mod mailbox;
-mod memory;
+pub(crate) mod memory;
 mod outcome;
 // `pub(crate)` for one reason (0.78.0): `src/mcp_server.rs` serves this crate's
 // own tool catalogue over MCP, and `prompts::workspace_tools` is where that
