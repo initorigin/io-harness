@@ -316,6 +316,15 @@ pub struct OtelExporter {
     /// Runs in flight, and the spans of finished ones waiting for the transport.
     pending: Mutex<Pending>,
     /// Every batch `export_batch` has been handed, encoded.
+    ///
+    /// `#[cfg(test)]`, and that is the point. This exists so the exporter's own
+    /// tests can read the tree it built as a collector would see it, and a
+    /// production build must not pay for it: at the default `max_queue` it would
+    /// hold up to `RETAINED_BATCHES` x 512 fully-encoded spans for the life of a
+    /// long-lived exporter, and clone every body on the run's own task at every
+    /// flush. `tests/otel_transport.rs` reads the socket instead, which is the
+    /// stronger evidence anyway.
+    #[cfg(test)]
     exported: Mutex<Vec<serde_json::Value>>,
 }
 
@@ -348,6 +357,7 @@ impl OtelExporter {
             store_path,
             store: Mutex::new(None),
             pending: Mutex::new(Pending::default()),
+            #[cfg(test)]
             exported: Mutex::new(Vec::new()),
         })
     }
@@ -767,6 +777,7 @@ impl OtelExporter {
     /// [`RETAINED_BATCHES`] more have gone out.
     fn export_batch(&self, spans: Vec<wire::Span>) {
         let body = wire::encode(self.config.service_name(), &spans);
+        #[cfg(test)]
         {
             let mut exported = self.exported.lock().unwrap_or_else(PoisonError::into_inner);
             if exported.len() >= RETAINED_BATCHES {
@@ -1128,6 +1139,7 @@ const OUTCOMES_WITHOUT_ERROR: &[&str] = &[crate::SUCCESS_OUTCOME, "finished", "c
 /// A bound rather than a `Vec` that grows for the life of a long-lived exporter.
 /// Nothing reads it back to send: a batch is posted once, from `export_batch`,
 /// and this is a copy of what went out rather than a queue of what still has to.
+#[cfg(test)]
 const RETAINED_BATCHES: usize = 16;
 
 /// Nanoseconds in a millisecond. Every duration the store records is in

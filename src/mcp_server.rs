@@ -499,6 +499,23 @@ pub async fn serve_mcp(config: McpServerConfig) -> Result<()> {
 
 /// Serve MCP on stdin and stdout, routing an asking rule to `approver`.
 ///
+/// # The approver must not touch stdin or stdout
+///
+/// Both are the protocol. An approver that writes a prompt to stdout puts a
+/// non-JSON line into the stream — the corruption this module keeps a single
+/// writer to prevent — and one that reads from stdin consumes the
+/// client's next request as its answer, while blocking the loop that was going to
+/// parse it.
+///
+/// This crate's own [`StdinApprover`](crate::StdinApprover) does both, so it is
+/// exactly the wrong thing to pass here. It is written for a person at a
+/// terminal, and a served session has neither. Nothing enforces this: the trait
+/// has no way to say "I use the console", so it is stated rather than checked.
+///
+/// An approver that fits here decides from the request alone, or reaches a human
+/// through some channel that is not this process's standard streams — a socket, a
+/// queue, a file. [`serve_mcp`] uses [`DenyAll`], which needs no channel at all.
+///
 /// ```no_run
 /// use io_harness::{serve_mcp_with, ApproveAll, McpServerConfig};
 ///
