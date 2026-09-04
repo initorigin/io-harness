@@ -4354,6 +4354,19 @@ run does. There is deliberately no second, shorter execution path: one would hav
 been easier to write and would have skipped the gate while passing every
 functional test.
 
+**A served session is not the agent loop, and the difference is worth stating.**
+This crate's standing claim is that every driving entry point reaches one of two
+engines — `run_with_extras` for a flat run, `run_tree_with_extras` for a tree —
+and `tests/one_runtime_path.rs` derives that from the source rather than trusting
+it. `serve_mcp` reaches neither, and it does not contradict the claim: it drives no
+agent, makes no completion and takes no step of its own. It is a caller of the tool
+dispatch primitive, under a run row, exactly as the loops are — which is what gets
+it the gate, the mask, the call-mode resolution and the journal without
+reimplementing any of them. What it is not is a third engine, and the reason it
+cannot become one quietly is that it holds no provider and never asks for a
+completion. Note that the derived test parses the run subsystem only, so this
+paragraph is a statement rather than something that file asserts.
+
 **An asking rule refuses.** There is no human at the far end of a pipe, so
 `serve_mcp` uses `DenyAll` and an `Effect::Ask` resolves as a refusal carrying this
 crate's own words rather than blocking on somebody who is not there. The default
