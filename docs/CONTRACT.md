@@ -128,8 +128,15 @@ enabling a feature only ever adds to the surface.
 | `pdf` | PDF generate, extract text, watermark, fill AcroForm fields | `lopdf`, `pdf-extract` |
 | `barcode` | Barcode and QR decoding from an image | `rxing`, `image` |
 | `browser` | Driving a real browser: `BrowserConfig`, the `[browser]` table, and the six `browser_*` built-ins | **No new crate.** Implies `media`, because a screenshot is only worth taking if the model looks at it |
+| `otel` | Exporting a run as OpenTelemetry spans over OTLP/HTTP: `OtelConfig`, `OtelExporter`, and the `[otel]` table | **No new crate.** OTLP with a JSON body is a published wire format and `reqwest` and `serde_json` are already in the default build |
+| `mcp-server` | Serving this crate's own tools over MCP on stdio: `serve_mcp`, `serve_mcp_with`, `McpServerConfig` | **No new crate.** The JSON-RPC framing is written here; `rmcp`'s server half would add nine |
 
 Nothing here binds a C or C++ library, so no runner needs a system package.
+
+The last two are the only features that add a capability without adding a
+dependency and are still features. `browser` set the precedent and the reason is
+the same: an outbound network capability and a door onto this process's tools are
+things a build that did not ask for them should not compile.
 
 ### What `browser` does and does not claim
 

@@ -246,6 +246,36 @@ media = ["dep:base64", "dep:image"]
 # written in this repository over `tokio` and `serde_json`, which the default
 # build already carries, so `cargo tree` does not move.
 browser = ["media"]
+# Exporting a run as OpenTelemetry spans (0.78.0), off by default. It adds no
+# crate for the same reason `browser` does not: OTLP over HTTP with a JSON body
+# is a published wire format, and `reqwest` and `serde_json` — both in the
+# default build — are the whole of what speaking it requires. The alternative
+# was `opentelemetry` plus `opentelemetry-otlp` plus `opentelemetry_sdk` as
+# optional dependencies, which is a batching, retry and shutdown model this
+# crate would then own the interaction with; the exporter needs one POST and one
+# backoff rule, both of which `src/net.rs` already has the pieces for.
+#
+# The feature exists even though it costs no dependency, because it is an
+# outbound network capability and a build that does not ask for one should not
+# compile one.
+otel = []
+# Serving this crate's own tools over MCP on stdio (0.78.0), off by default.
+#
+# `rmcp` is already a dependency and its `server` feature would have been the
+# obvious route. It was measured rather than assumed and it adds NINE packages —
+# `schemars`, `schemars_derive`, `serde_derive_internals`, `uuid`, `pastey`,
+# `dyn-clone`, `ref-cast`, `ref-cast-impl` and `getrandom` — because rmcp's
+# server half derives tool schemas at compile time from Rust types. This crate
+# does not need that: it already has `ToolSpec`, whose `parameters` is the JSON
+# Schema a `tools/call` input needs, written out by hand in `src/run/prompts.rs`
+# and sent to providers on every step. Deriving them a second way to serve them
+# would be two definitions of one thing.
+#
+# So the framing is written here, over `serde_json` and `tokio`, exactly as
+# `src/lsp.rs` writes the client half of a different JSON-RPC protocol. rmcp
+# stays a client-side dependency in the shipped crate and a dev-dependency for
+# its server half, which is what the note above the dev-dependency says.
+mcp-server = []
 documents = ["xlsx", "docx", "pptx", "pdf", "barcode"]
 docx = ["dep:docx-rs"]
 pptx = ["dep:zip", "dep:quick-xml"]

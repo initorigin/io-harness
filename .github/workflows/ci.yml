@@ -484,6 +484,12 @@ jobs:
       # enabled fails here, on a warm cache, in single-digit seconds.
       - run: cargo clippy --all-targets --features documents -- -D warnings
       - run: cargo clippy --all-targets --features media -- -D warnings
+      # 0.78.0's two, for the same isolation reason and for one more: neither
+      # adds a dependency, so neither is reached by the `--all-features` leg in
+      # any way the others are not — a `#[cfg]` that is wrong only when exactly
+      # one of them is on is invisible everywhere else in this file.
+      - run: cargo clippy --all-targets --features otel -- -D warnings
+      - run: cargo clippy --all-targets --features mcp-server -- -D warnings
 
   # 0.23.0 — the `links` wall, proven gone. This job exists because of a defect
   # no other job in this file could see, for the same reason the `docs` job
