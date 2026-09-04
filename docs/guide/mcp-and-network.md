@@ -265,6 +265,57 @@ A caller mapping errors on the refusal path wants `Error::Refused` — that is t
 one case the check exists for, and matching `Error::Mcp` for it catches a broken
 command instead of a boundary decision.
 
+## Serving this crate's own tools over MCP (0.78.0)
+
+Everything above is this crate as an MCP **client**. Behind the `mcp-server`
+feature it also serves: another harness spawns this one, speaks MCP to it on
+stdio, and calls `grep`, `read_file`, `edit_file`, `exec` and the rest — through
+this crate's policy rather than its own.
+
+That is the point of it, and it is worth saying plainly. A tool is a few lines of
+process spawning; a deny-first layered policy, an approval tier, a three-OS
+sandbox and a durable journal are not. What is being lent is the boundary, not the
+tool.
+
+```rust
+use io_harness::{serve_mcp, McpServerConfig, Policy};
+
+serve_mcp(
+    McpServerConfig::new(".", "runs.db")
+        .with_policy(Policy::default().allow_read("src/**")),
+).await?;
+```
+
+`serve_mcp_with` takes an `Approver` where `serve_mcp` uses `DenyAll`.
+
+### What a served call goes through
+
+The same dispatch a model's call goes through — so the policy gate decides it, a
+`policy_events` row records the decision, the journal opens and closes an attempt
+for it, and it is announced on the `Observer` channel. A served session opens a
+store and starts one run, so afterwards it is readable with `Attach` and
+`Store::events_since` exactly as any run is.
+
+### An asking rule refuses
+
+There is no human at the far end of a pipe. The default approver is `DenyAll`, so
+a rule whose effect is `Ask` comes back as a refusal carrying this crate's own
+words rather than blocking on somebody who is not there. Paired with the default
+`Policy::default()` — reads allowed, writes and execs asking, egress denied — that
+means reads work and every mutation refuses until an operator names it. An
+operator who wants a different answer supplies their own `Approver`; that is a
+decision they take, not one a client can take for them.
+
+### What is not served
+
+`ask_question`, `ask_questions`, `propose_plan`, `spawn`, `send_message`,
+`read_messages` and `read_skill`, named in `MCP_SERVER_UNSERVED`. Each needs
+something a served session has not got — a person to answer, a plan gate to
+decide, children to talk to, or a server-side document a remote caller should not
+be handed. Offering one and refusing every call to it would be a worse answer than
+not offering it. The served set and that list partition the catalogue, and a test
+asserts it, so a tool added later lands in one of them rather than in neither.
+
 ## The limit, stated plainly
 
 The harness governs the connections **it** opens. A stdio MCP server is a separate
@@ -273,6 +324,23 @@ called, but once running it dials whatever it likes. Isolating a server's own
 egress would need OS-level containment, which the harness does not build. The
 [execution sandbox](sandbox.md) contains the subprocesses a verification gate
 runs; it is not applied to a configured MCP server.
+
+**And the same sentence is true with the roles swapped.** When this crate is the
+server, it governs the calls it is asked to make and nothing about the process
+asking. The client is not authenticated — a stdio pipe has no identity — so
+whoever can spawn the server can call every tool the policy allows. The boundary
+being lent is the policy, not an access-control list, and the operator who starts
+the server is the one who decides what is inside it.
+
+**Stdio only.** There is no HTTP listener in this release: that would be a bind
+address, an auth story and a session manager, none of which this is arguing for.
+
+**Tools only.** No resources, no prompts, no sampling, no roots, no elicitation.
+The `initialize` handshake advertises the `tools` capability and nothing else.
+
+**Not a proxy.** This crate's own client can reach other people's MCP servers, and
+this server does not re-export them. Two policies in one path would make it
+unclear which one refused.
 
 ## See also
 

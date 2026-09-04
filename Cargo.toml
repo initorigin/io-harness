@@ -275,7 +275,12 @@ otel = []
 # `src/lsp.rs` writes the client half of a different JSON-RPC protocol. rmcp
 # stays a client-side dependency in the shipped crate and a dev-dependency for
 # its server half, which is what the note above the dev-dependency says.
-mcp-server = []
+#
+# The one feature it turns on is `tokio/io-std`, for `stdin()` and `stdout()`.
+# That is a feature of a crate already in the default build, not a crate: it
+# compiles two more types in tokio and moves `cargo tree` by nothing, which is
+# checked rather than asserted.
+mcp-server = ["tokio/io-std"]
 documents = ["xlsx", "docx", "pptx", "pdf", "barcode"]
 docx = ["dep:docx-rs"]
 pptx = ["dep:zip", "dep:quick-xml"]

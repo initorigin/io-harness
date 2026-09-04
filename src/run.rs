@@ -5309,7 +5309,18 @@ mod gate;
 mod mailbox;
 mod memory;
 mod outcome;
-mod prompts;
+// `pub(crate)` for one reason (0.78.0): `src/mcp_server.rs` serves this crate's
+// own tool catalogue over MCP, and `prompts::workspace_tools` is where that
+// catalogue is defined. `mcp_server` is a sibling of `run` rather than a
+// descendant, so promoting the function alone leaves it unreachable — a private
+// member is visible in its own module and its children, never in its parent's
+// siblings. Promoting the module is what makes one definition of the catalogue
+// serve both the provider request and the MCP client; a second list written in
+// `mcp_server.rs` would be exactly the drift the server exists to avoid.
+//
+// `pub(crate)` and no wider. `mod run;` is private in `src/lib.rs`, so nothing
+// here reaches a consumer and `docs/public-api.txt` does not move.
+pub(crate) mod prompts;
 mod read;
 mod record;
 mod step;
