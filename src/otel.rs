@@ -5,7 +5,7 @@
 //! service traces reads the OpenTelemetry GenAI semantic conventions, so an
 //! exporter is what makes an existing record legible rather than a new record.
 //!
-//! [`OtelExporter`] is an [`Observer`](crate::Observer) and nothing else. It
+//! [`OtelExporter`] is an [`Observer`] and nothing else. It
 //! attaches through the doors that already exist — [`Harness::with_observer`],
 //! the `*_observed` free functions, and [`Session`]'s observed turns — so the
 //! run loop is unchanged by its presence and a run with no exporter attached
@@ -15,14 +15,14 @@
 //!
 //! A span needs a start, an end and a parent. The observer channel carries
 //! point-in-time facts: there is no provider-call event at all,
-//! [`EventKind::ToolCall`](crate::EventKind::ToolCall) is emitted before its
+//! [`EventKind::ToolCall`] is emitted before its
 //! result is known and has no end, and [`RunEvent`] carries no timestamp. The
 //! per-call model, token split, latency and finish reason a GenAI trace is
 //! about live in the `provider_calls` table.
 //!
 //! So the exporter opens **its own** connection to the same store, behind a
 //! mutex, and reads what the channel does not carry. It never borrows the run's
-//! [`Store`](crate::state::Store): an observer is `Send + Sync` and a
+//! [`Store`]: an observer is `Send + Sync` and a
 //! `rusqlite::Connection` is `Send` and not `Sync`, so an observer holding one
 //! by reference could not exist. Two connections to one WAL file is the shape,
 //! and [`Broadcast`](crate::Broadcast) already writes to the store from inside

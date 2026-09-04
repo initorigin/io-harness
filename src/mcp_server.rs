@@ -12,15 +12,15 @@
 //! Every served call goes through the same dispatch a model's call goes
 //! through, so the policy gate sees it, a `policy_events` row records the
 //! decision, the journal opens and closes an attempt for it, and it is
-//! announced on the [`Observer`](crate::Observer) channel. A served session
+//! announced on the [`Observer`] channel. A served session
 //! owns a real run, so it is readable afterwards with
 //! [`Attach`](crate::Attach) and the rest, exactly as any run is.
 //!
 //! There is no human at the far end of a pipe. The default approver is
-//! [`DenyAll`](crate::DenyAll), so a rule whose effect is
+//! [`DenyAll`], so a rule whose effect is
 //! [`Ask`](crate::Effect::Ask) resolves as a refusal carrying this crate's own
 //! words rather than blocking on somebody who is not there. An operator who
-//! wants a different answer passes their own [`Approver`](crate::Approver) to
+//! wants a different answer passes their own [`Approver`] to
 //! [`serve_mcp_with`].
 //!
 //! [`MCP_SERVER_UNSERVED`] names the tools this server does not offer, each
