@@ -300,6 +300,14 @@ struct File {
     // names a program to run.
     #[serde(default)]
     routing: Option<RoutingSection>,
+    // 0.78.0. In `REFUSED_SECTIONS` for a reason `[routing]`'s neighbours share:
+    // this table names a host that everything the run records is sent to. A
+    // cloned repository choosing it chooses where an operator's traffic goes,
+    // and the `headers` beside it choose which of this host's secrets goes with
+    // it. The exporter sends no transcript content, which bounds what leaks —
+    // it does not make an unchosen destination acceptable.
+    #[serde(default)]
+    otel: Option<OtelSection>,
     #[serde(default)]
     toolchain: BTreeMap<String, ToolchainSection>,
     #[serde(default)]
@@ -925,6 +933,29 @@ struct RoutingSection {
     downshift_to: Option<String>,
     require_primary: Option<bool>,
     mechanical: Option<String>,
+}
+
+/// Where a run's spans are exported, for an operator who would rather write it
+/// once than pass it in at every call site (0.78.0).
+///
+/// Deserialized in every build, not only when the `otel` feature is on. The
+/// section is refused at project scope by [`refuse_widening`], which runs
+/// against the raw table before anything here deserializes — and a boundary
+/// that appeared and disappeared with a feature flag would be one an operator
+/// could not state. `[browser]` is on that list in every build for the same
+/// reason.
+///
+/// `endpoint` is the only required key by construction: the rest have defaults
+/// on [`crate::otel::OtelConfig`] and a file that names none of them is a file
+/// that wants them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OtelSection {
+    endpoint: Option<String>,
+    service_name: Option<String>,
+    timeout_secs: Option<u64>,
+    max_queue: Option<usize>,
+    headers: Option<BTreeMap<String, String>>,
 }
 
 /// An operator's override for one ecosystem, applied onto what
@@ -1816,6 +1847,60 @@ impl Config {
         self.file.browser.as_ref()
     }
 
+    /// The OpenTelemetry collector this configuration declares, if any (0.78.0).
+    ///
+    /// `[otel]` is refused in any file inside a workspace, on the rule 0.74.0
+    /// wrote down for `base_url` and `api_key` and 0.75.0 applied to `[routing]`:
+    /// the table names a host every span of every run is posted to, and the
+    /// `headers` beside it name the credential that post carries. An `io.toml`
+    /// arrives with a `git clone`, and `io.local.toml` is held to the same rule
+    /// because a run's own agent can write it.
+    ///
+    /// Write it in the user-scope file, which [`Config::discover`] also reads.
+    /// There is no route to a collector from a file under the workspace root, and
+    /// there is deliberately no way to add one.
+    ///
+    /// ```
+    /// use io_harness::Config;
+    ///
+    /// // The project scope refuses the table by name, before anything is sent.
+    /// let err = Config::from_toml(r#"
+    ///     [otel]
+    ///     endpoint = "http://collector.example:4318"
+    /// "#).unwrap_err();
+    /// assert!(err.to_string().contains("otel"), "{err}");
+    ///
+    /// // A configuration that declares none simply has none, which is the
+    /// // default and what keeps a run identical to one built before this release.
+    /// let plain = Config::from_toml("[run]\nmax_steps = 3\n").unwrap();
+    /// assert!(plain.otel().is_none());
+    /// ```
+    #[cfg(feature = "otel")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
+    pub fn otel(&self) -> Option<crate::otel::OtelConfig> {
+        let section = self.file.otel.as_ref()?;
+        // Built through the same builder a caller uses rather than by a second
+        // constructor taking five options: one way to make an `OtelConfig` means
+        // a default changed there is changed for a file too.
+        let mut config = match &section.endpoint {
+            Some(endpoint) => crate::otel::OtelConfig::new(endpoint),
+            None => crate::otel::OtelConfig::default(),
+        };
+        if let Some(name) = &section.service_name {
+            config = config.with_service_name(name);
+        }
+        if let Some(secs) = section.timeout_secs {
+            config = config.with_timeout(std::time::Duration::from_secs(secs));
+        }
+        if let Some(spans) = section.max_queue {
+            config = config.with_max_queue(spans);
+        }
+        for (name, value) in section.headers.iter().flatten() {
+            config = config.with_header(name, value);
+        }
+        Some(config)
+    }
+
     /// The named agent definitions this configuration declares (0.21.0).
     ///
     /// `[[agent]]` tables **accumulate** across scopes the way `policy.layers` does,
@@ -2414,6 +2499,23 @@ const REFUSED_SECTIONS: &[(&str, &str, &str)] = &[
         "routing rules",
         "routing decides which model answers this run, and which model reads the \
          whole transcript when the context is folded",
+    ),
+    // 0.78.0. `[otel]` names the host every span of every run is posted to, and
+    // the `headers` beside it decide which of this host's secrets — through
+    // `${env:}` or `${file:}` — is sent as the credential of that post. It is the
+    // 0.74.0 `base_url`/`api_key` clause in a second place: an endpoint a cloned
+    // repository chose, reached with a key the operator's own machine supplied.
+    //
+    // That the exporter deliberately sends no prompt, no reply, no tool argument
+    // and no tool output is what bounds the leak. It is not what makes the
+    // destination acceptable, and the two must not be confused: the span names,
+    // the model names, the token counts and the timing of an operator's work are
+    // still theirs to direct.
+    (
+        "otel",
+        "an OpenTelemetry collector",
+        "the collector is a host every span of every run is posted to, reached \
+         with whatever credential the same table names",
     ),
     // 0.28.0. The whole array, not its executing half: `run` is the `${cmd:}`
     // primitive by another name, and `append` is a write to a path the file chose,

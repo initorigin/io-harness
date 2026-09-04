@@ -1481,7 +1481,12 @@ fn choice_schema() -> serde_json::Value {
     })
 }
 
-pub(super) fn workspace_tools() -> Vec<ToolSpec> {
+// `pub(crate)` rather than `pub(super)` since 0.78.0: `src/mcp_server.rs` serves
+// this catalogue over MCP, and it is the one definition of what this crate's
+// tools are. A second list written there to be served would be the drift the
+// server exists to avoid. Crate-private and no wider — the catalogue is reached
+// through `tools/list`, not through this crate's public surface.
+pub(crate) fn workspace_tools() -> Vec<ToolSpec> {
     #[allow(unused_mut)]
     let mut v = vec![
         ToolSpec {

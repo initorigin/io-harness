@@ -128,8 +128,15 @@ enabling a feature only ever adds to the surface.
 | `pdf` | PDF generate, extract text, watermark, fill AcroForm fields | `lopdf`, `pdf-extract` |
 | `barcode` | Barcode and QR decoding from an image | `rxing`, `image` |
 | `browser` | Driving a real browser: `BrowserConfig`, the `[browser]` table, and the six `browser_*` built-ins | **No new crate.** Implies `media`, because a screenshot is only worth taking if the model looks at it |
+| `otel` | Exporting a run as OpenTelemetry spans over OTLP/HTTP: `OtelConfig`, `OtelExporter`, and the `[otel]` table | **No new crate.** OTLP with a JSON body is a published wire format and `reqwest` and `serde_json` are already in the default build |
+| `mcp-server` | Serving this crate's own tools over MCP on stdio: `serve_mcp`, `serve_mcp_with`, `McpServerConfig` | **No new crate.** The JSON-RPC framing is written here; `rmcp`'s server half would add nine |
 
 Nothing here binds a C or C++ library, so no runner needs a system package.
+
+The last two are the only features that add a capability without adding a
+dependency and are still features. `browser` set the precedent and the reason is
+the same: an outbound network capability and a door onto this process's tools are
+things a build that did not ask for them should not compile.
 
 ### What `browser` does and does not claim
 
@@ -4272,3 +4279,151 @@ stdio MCP server, a language server and a `[[bin]]` the agent runs are separate
 processes; the harness decides whether each may start, and what it dials
 afterwards is between it and the network. See the
 [MCP and network egress guide](guide/mcp-and-network.md).
+
+## What the OTel exporter sends, and what it never sends (0.78.0)
+
+Behind the `otel` feature, a run can be exported as OpenTelemetry spans over
+OTLP/HTTP with a JSON body. The exporter is an `Observer` and nothing else: it
+attaches through the doors that already exist, and a run with none attached takes
+the same path it always did.
+
+**The attribute vocabulary follows the GenAI semantic conventions**, at the
+revision named in `GENAI_CONVENTIONS`. These are the keys this crate emits, and
+the list below is the one the implementation is checked against — the two are
+compared by a test rather than maintained side by side.
+
+| Attribute | On which span | What it carries |
+| --- | --- | --- |
+| `gen_ai.operation.name` | every span | `invoke_agent` for a run, `chat` for a provider call, `execute_tool` for a tool call |
+| `gen_ai.provider.name` | run, provider call | The convention's value where this crate talks to that vendor — `anthropic`, `openai` — and this crate's own provider id otherwise, never one of the enumerated values for a provider that is not it |
+| `gen_ai.request.model` | provider call | The model the call asked for, from `provider_calls.model` |
+| `gen_ai.response.model` | provider call | The model the vendor answered as, where the wire reports one |
+| `gen_ai.usage.input_tokens` | provider call | `provider_calls.prompt_tokens` |
+| `gen_ai.usage.output_tokens` | provider call | `provider_calls.completion_tokens` |
+| `gen_ai.tool.name` | tool call | The tool's own name, the one the policy gate was asked about |
+| `error.type` | any failed span | Set only when the span failed, alongside an error status |
+
+**One attribute is this crate's own and is deliberately outside that table.** A
+provider span for a gateway also carries the host that gateway dials, under a
+crate-namespaced key beginning `io_harness.` rather than `gen_ai.`. It is not in
+the list above because the list is the *GenAI* vocabulary and this key is not part
+of it — inventing a `gen_ai.` name for a fact the convention does not define would
+be the same error as mapping an unlisted provider onto a listed one. The host is a
+lookup over the endpoint table this crate already owns, so a provider whose
+endpoint this crate did not choose — a bare `Compatible`, a custom `Provider` —
+carries no host at all rather than a guess.
+
+**What is not sent, and is not implementable by a flag.** The convention marks
+`gen_ai.input.messages`, `gen_ai.output.messages` and `gen_ai.system_instructions`
+opt-in. None of the three exists in this crate's exporter — not defaulted off, not
+gated behind a knob, absent. A prompt, a model's reply, a tool's arguments and a
+tool's output never leave the process through this door, and the way that is
+checked is a sentinel written into all four and searched for in the serialized
+payload.
+
+**Where a span's time comes from, and why not from the obvious column.** A run
+span and a step span are timed by the exporter's own clock, from the events that
+open and close them. A provider span's duration is `provider_calls.latency_ms`,
+which is exact per attempt. Its *position* is derived — the step span the exporter
+timed, bounded by that step's `provider_ms`, with a step's attempts laid end to end
+in `attempt` order. `provider_calls.at` is not used: it is one-second resolution
+and is stamped when the row is written, which is after the call rather than before
+it, so it is the wrong precision and the wrong instant. Two attempts inside one
+second are indistinguishable by it, which is exactly the ordering it appears to
+supply.
+
+**A step's attempts are therefore laid end to end rather than each independently
+timed.** No start instant per attempt is recorded anywhere in the store, so this is
+a limitation of the record and not of the exporter. The durations are real; the
+gaps between them are not claimed.
+
+**An export failure never changes a run.** `Observer::event` returns
+`Flow::Continue` on every path, the request does not run on the run's own task,
+and a collector that is down, slow or refusing leaves the run's outcome, step
+count and token total as they would have been. The only trace of the failure is a
+`tracing::warn!`.
+
+**The conventions are at Development stability** and their names have moved before
+— `gen_ai.system` became `gen_ai.provider.name`. A later revision that renames an
+attribute is followed in a release, with the change named in `CHANGELOG.md`, and
+never silently.
+
+## What serving over MCP grants, and what it does not (0.78.0)
+
+Behind the `mcp-server` feature this crate serves its own tools over MCP on stdio.
+The thing being lent is not the tool — a tool is a few lines of process spawning —
+it is the boundary around it: a deny-first layered policy, an approval tier, an
+execution sandbox and a durable journal.
+
+**Every served call takes the path a model's call takes.** It routes through
+`dispatch`, so the policy gate decides it, a `policy_events` row records the
+decision, the journal opens and closes an attempt for it, and it is announced on
+the `Observer` channel. A served session opens a store and starts one run, so
+afterwards it reads back through `Attach` and `Store::events_since` exactly as any
+run does. There is deliberately no second, shorter execution path: one would have
+been easier to write and would have skipped the gate while passing every
+functional test.
+
+**A served session is not the agent loop, and the difference is worth stating.**
+This crate's standing claim is that every driving entry point reaches one of two
+engines — `run_with_extras` for a flat run, `run_tree_with_extras` for a tree —
+and `tests/one_runtime_path.rs` derives that from the source rather than trusting
+it. `serve_mcp` reaches neither, and it does not contradict the claim: it drives no
+agent, makes no completion and takes no step of its own. It is a caller of the tool
+dispatch primitive, under a run row, exactly as the loops are — which is what gets
+it the gate, the mask, the call-mode resolution and the journal without
+reimplementing any of them. What it is not is a third engine, and the reason it
+cannot become one quietly is that it holds no provider and never asks for a
+completion. Note that the derived test parses the run subsystem only, so this
+paragraph is a statement rather than something that file asserts.
+
+**An asking rule refuses.** There is no human at the far end of a pipe, so
+`serve_mcp` uses `DenyAll` and an `Effect::Ask` resolves as a refusal carrying this
+crate's own words rather than blocking on somebody who is not there. The default
+policy is `Policy::default()` — reads allowed, writes and execs asking, egress
+denied — so out of the box reads work and every mutation refuses until an operator
+names it. `serve_mcp_with` takes an `Approver` for an operator who wants a
+different answer; that is their decision, and a client cannot make it for them.
+
+**A refusal is a result, not a transport error.** A denied `tools/call` comes back
+as a successful protocol exchange whose result carries `isError: true` and the
+crate's refusal text. A JSON-RPC error means the request could not be processed;
+a denial means it was processed and the answer is no.
+
+**What is not served**, named in `MCP_SERVER_UNSERVED`: `ask_question`,
+`ask_questions`, `propose_plan`, `spawn`, `send_message`, `read_messages`,
+`read_skill`, `remember`, `forget` and `todo_write`. Most need something a served
+session has not got — a person to answer, a plan gate to decide, children to talk
+to, or a server-side document a remote caller should not be handed.
+
+The last three are excluded for a different and sharper reason. `remember`,
+`forget` and `todo_write` are **ungated inside `dispatch` on purpose**: they land
+in the harness's own store rather than in the workspace, so there is no path for
+an `Act::Write` check to be about, and their only remaining boundary is the plan
+gate. A served session has no plan gate either — deliberately, so that a gate
+nobody can answer does not deny every write for the life of the session. Both
+boundaries off is not a boundary. Durable memory is recalled into a run's
+context, and a served session shares its memory key with any run over the same
+root, so serving these would let an unattended client with no policy grant plant
+text that reaches the context of every later run over that workspace, with
+nothing in `policy_events` to show for it. They are **not served** rather than
+newly gated, because gating them would change what the run loop does for every
+caller and this release does not do that. Offering one and refusing every call to it
+would be a worse answer than not offering it. The served set and that list
+partition the catalogue, asserted against the catalogue the code builds, so a tool
+added later lands in one of them rather than in neither.
+
+**What it does not grant, stated plainly.** A stdio pipe carries no identity, so
+the server does not authenticate its client and cannot: whoever can spawn the
+process can call whatever the policy allows. The boundary being lent is the
+policy, not an access-control list, and the operator who starts the server is the
+one who decides what is inside it. This is the same sentence the network guide
+states with the roles swapped — the harness governs the calls it is asked to make,
+and nothing about the process asking.
+
+**Stdio only, tools only, and not a proxy.** No HTTP listener, which would be a
+bind address, an auth story and a session manager. No resources, prompts, sampling,
+roots or elicitation — `initialize` advertises the `tools` capability and nothing
+else. And this crate's own MCP client reaches other people's servers, which this
+server does not re-export: two policies in one path would make it unclear which one
+refused.

@@ -503,8 +503,14 @@ mod harness;
 pub mod hooks;
 pub mod lsp;
 pub mod mcp;
+#[cfg(feature = "mcp-server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mcp-server")))]
+pub mod mcp_server;
 pub mod net;
 pub mod observe;
+#[cfg(feature = "otel")]
+#[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
+pub mod otel;
 pub mod plugin;
 pub mod policy;
 pub mod pricing;
@@ -547,6 +553,14 @@ pub use harness::Harness;
 pub use hooks::{Hook, Hooks, OnFailure};
 pub use lsp::LspServer;
 pub use mcp::{probe_mcp, McpProbe, McpServer, McpTransport, MCP_TOOL_PREFIX};
+#[cfg(feature = "mcp-server")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mcp-server")))]
+pub use mcp_server::{
+    serve_mcp, serve_mcp_with, McpServerConfig, MCP_SERVER_PROTOCOL_VERSION, MCP_SERVER_UNSERVED,
+};
+#[cfg(feature = "otel")]
+#[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
+pub use otel::{OtelConfig, OtelExporter, GENAI_CONVENTIONS, OTEL_DEFAULT_ENDPOINT};
 // The `net` module is public as of 0.71.0, but it exports exactly one function —
 // `target` — and the default request deadline keeps this crate-root re-export it
 // has always had. A caller overriding it with `with_timeout` should be able to

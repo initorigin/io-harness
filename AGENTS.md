@@ -26,11 +26,13 @@ cargo nextest run -E 'test(f3_)'
 cargo test --doc
 cargo test --all-features --doc
 
-# Lint gate (all four run in CI, all with -D warnings)
+# Lint gate (all six run in CI, all with -D warnings)
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features documents -- -D warnings
 cargo clippy --all-targets --features media -- -D warnings
+cargo clippy --all-targets --features otel -- -D warnings
+cargo clippy --all-targets --features mcp-server -- -D warnings
 
 # Examples compile-check (CI does not link them)
 cargo check --examples
@@ -92,9 +94,12 @@ provider/store/policy once and delegates; it adds no loop.
   `template.rs`, `toolchain.rs`, `diff.rs`, `web.rs`, `attach.rs`, `agent.rs`.
 
 **Feature flags.** `default = []`. `media`, `browser` (implies `media`), `documents` (umbrella
-over `xlsx`/`docx`/`pptx`/`pdf`/`barcode`). The canonical list lives in `docs/CONTRACT.md` and
-is drift-checked. Adding a dependency to the default tree is a deliberate, argued act — read the
-comments in `Cargo.toml` before you do.
+over `xlsx`/`docx`/`pptx`/`pdf`/`barcode`), `otel` (export a run as OpenTelemetry spans),
+`mcp-server` (serve this crate's tools over MCP on stdio). The last three add no crate at all —
+they are features because a build that did not ask for a browser, an outbound telemetry writer or
+a door onto its own tools should not compile one. The canonical list lives in `docs/CONTRACT.md`
+and is drift-checked. Adding a dependency to the default tree is a deliberate, argued act — read
+the comments in `Cargo.toml` before you do.
 
 ## The tests that gate documentation
 

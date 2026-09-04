@@ -454,6 +454,105 @@ traces differ for a reason that has nothing to do with the agent.
 Deterministic replay also requires the provider to answer identically — that is
 what `Replay` is for — and the same workspace state to start from.
 
+## Exporting a run to OpenTelemetry (0.78.0)
+
+Everything above is readable by this crate and by nothing else. Behind the `otel`
+feature, a run can also be exported as OpenTelemetry spans, over OTLP/HTTP with a
+JSON body, to any collector — which is how a run appears in the dashboard an
+operator already runs, beside the services it called.
+
+The exporter is an `Observer`. There is no new attachment mechanism and no change
+to the loop:
+
+```rust
+use io_harness::{run_with_observed, ApproveAll, OtelConfig, OtelExporter};
+
+let exporter = OtelExporter::open(
+    OtelConfig::new("http://otel-collector.internal:4318").with_service_name("billing-agent"),
+    "runs.db",
+)?;
+
+let result = run_with_observed(
+    &contract, &provider, &store, &policy, &ApproveAll, &exporter,
+).await?;
+```
+
+### The span tree
+
+One `invoke_agent` span per run, opened at `Started` and closed at `Finished`;
+one span per committed step beneath it; an `execute_tool <name>` span per tool
+call; and a `chat <model>` span per provider call, carrying the model, the token
+split and the latency that call actually cost. One trace id spans the run, and
+every span but the root names its parent.
+
+### Why it opens the store as well
+
+The event channel is not enough to build that tree, and the reason is worth
+knowing before writing an exporter of your own. There is no provider-call event
+at all; `ToolCall` is emitted before its result is known and has no matching end;
+and `RunEvent` carries no timestamp. The per-call model, token split, latency and
+finish reason live in `provider_calls`, and a step's phase breakdown lives in the
+five attribution columns on `steps`.
+
+So the exporter opens **its own** `Store` against the same path and reads through
+`Store::provider_calls` and `Store::step_attributions`. It never borrows the run's
+store: an `Observer` is `Send + Sync`, the connection underneath a `Store` is
+`Send` and not `Sync`, and an observer holding one by reference could not exist.
+`Broadcast` writes to the store from inside an observer for the same reason; this
+reads.
+
+### What is never sent
+
+The prompt, the model's replies, tool arguments and tool output. The GenAI
+conventions mark those attributes opt-in and this crate does not implement them at
+all — not defaulted off, absent — so there is no flag that could include them by
+accident. What crosses the wire is structure and numbers: span names, span kinds,
+ids, durations, model names, token counts and a tool's name.
+
+### Limits, stated plainly
+
+**A step's provider attempts are laid end to end, not independently timed.** Each
+attempt's duration is exact — `provider_calls.latency_ms` — but no start instant
+per attempt is recorded anywhere in the store. `provider_calls.at` is one-second
+resolution and is stamped after the call rather than before it, so it can neither
+place an attempt nor order two inside the same second. The exporter therefore
+places attempts inside the step window it timed itself, in `attempt` order. The
+durations are real; the gaps between them are not claimed.
+
+**A tool span's duration is bounded by its step, not measured per call.** There is
+no end event for a tool call, and a step that batched several reads ran them
+concurrently. Where a step made more than one call, the per-call split is not
+claimed.
+
+**A parent span is not always sent before its children.** Step and tool spans go
+out when the queue fills; the run's own root span is only built when the run ends,
+so on a long run the children reach the collector in an earlier batch than the
+parent they name. Stateless OTLP collectors accept this — a span carries its
+parent's id rather than a reference to it — but a tail-sampling or
+trace-completeness processor will see an orphan window until the run finishes.
+
+**A run that is abandoned rather than finished exports nothing, and is eventually
+dropped.** The root span closes on the run's end; a run whose future is dropped
+never reaches one. The exporter holds a bounded number of such runs and evicts the
+oldest, with a line on the log channel when it does.
+
+**A run is a root trace.** There is no context propagation from an incoming
+`traceparent` in this release, so a run started by an already-traced service
+appears as its own trace rather than as a child of that request.
+
+**Traces only.** No metrics signal and no logs signal. OTLP over gRPC is not
+implemented; JSON over HTTP is what every collector accepts and what this crate
+can already speak without a dependency.
+
+**The conventions are at Development stability.** Attribute names have moved
+before — `gen_ai.system` became `gen_ai.provider.name`. `GENAI_CONVENTIONS` names
+the revision this crate follows, and a later one is adopted in a release with the
+change in `CHANGELOG.md`, never silently.
+
+**An export failure is not a run failure.** A collector that is down, slow or
+returning 400 leaves the run's outcome, step count and token total exactly as they
+would have been, and says so only through a `tracing::warn!`.
+
 ## See also
 
 - [Durable runs](durable-runs.md) — the trace, checkpoints and resume the events report on

@@ -301,6 +301,44 @@ folded, is one a cloned repository must not write. It names no program and no
 endpoint, so the 0.74.0 clauses do not catch it; it is refused on the same
 principle. Write it in the user-scope file.
 
+## `[otel]` — where a run's spans are sent (0.78.0)
+
+```toml
+[otel]
+endpoint = "http://otel-collector.internal:4318"
+service_name = "billing-agent"
+timeout_secs = 10
+max_queue = 512
+
+[otel.headers]
+authorization = "${env:OTEL_TOKEN}"
+```
+
+Read only with the `otel` feature, and every key optional: absent, the endpoint is
+`http://localhost:4318`, the service is this crate's own name, and the rest take
+the defaults on `OtelConfig`. `Config::otel()` hands back the same `OtelConfig` a
+caller would build by hand, through the same builder, so a default changed in one
+place is changed in both.
+
+**`[otel]` is refused in a file inside the workspace**, `io.toml` and
+`io.local.toml` alike, and inside a `[profile]` body. The table names a host every
+span of every run is posted to, and the `headers` beside it name the credential
+that post carries — which is the 0.74.0 `base_url` and `api_key` clause reached by
+a second route. Write it in the user-scope file; there is no route to a collector
+from a file under the workspace root, and deliberately no way to add one.
+
+That the exporter sends no prompt, no reply, no tool argument and no tool output
+is what bounds the leak. It is not what makes an unchosen destination acceptable:
+the span names, the model names, the token counts and the timing of an operator's
+work are still theirs to direct.
+
+**The section is declared in every build, not only when the feature is on.** The
+refusal runs against the raw table before anything deserializes, so a workspace
+file naming a collector is refused whether or not the binary reading it could have
+exported anything. A boundary that appeared and disappeared with a feature flag
+would be one an operator could not state — `[browser]` is on the same list for the
+same reason.
+
 ## `[memory]` — what a workspace's durable notes may hold
 
 ```toml
