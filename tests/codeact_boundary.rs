@@ -77,21 +77,30 @@ fn contract(root: &std::path::Path) -> TaskContract {
     TaskContract::workspace("read both files and write a summary", root).with_max_steps(6)
 }
 
-/// Writes asked, execs refused, reads permitted.
+/// Writes asked except one that is refused outright, reads and execs permitted.
 ///
 /// Shaped by what actually leaves a row. A permitted-by-rule act writes no
-/// `policy_events` row — only a refusal and a decision an approver was consulted
-/// for do — and there is no `ask_read`, so a read is invisible to this comparison
-/// however it is made. Asking on writes and denying execs gives the two kinds of
-/// row that exist, which is what makes the equality below mean something rather
-/// than being two one-element lists agreeing. The length assertion in the test
-/// exists so this can never silently regress to the vacuous version.
+/// `policy_events` row — only a refusal, and a decision an approver was consulted
+/// for, do — and there is no `ask_read`, so a read is invisible to this
+/// comparison however it is made. Asking on writes and denying one write by name
+/// gives both kinds of row, which is what makes the equality below mean something
+/// rather than being two one-element lists agreeing. The length assertion in the
+/// test exists so this can never silently regress to the vacuous version.
+///
+/// **Exec is permitted rather than denied, and that is not a weakening of the
+/// test.** Starting the interpreter is itself an `Act::Exec` check, so a policy
+/// denying exec refuses the program before it runs — which is its own test,
+/// `a_run_that_denies_exec_will_not_start_a_program`, and would make this one
+/// compare a program that never started against a chain that did. Permitted by
+/// rule, the interpreter's own start leaves no row, so the two sides stay
+/// comparable act for act.
 fn asking() -> Policy {
     Policy::default()
         .layer("test")
         .allow_read("*")
+        .deny_write("secret.txt")
         .ask_write("*")
-        .deny_exec("*")
+        .allow_exec("*")
 }
 
 /// Reads permitted, writes refused outright. Used where the point is a refusal
@@ -157,14 +166,14 @@ async fn a_program_and_a_chain_of_tool_calls_leave_the_same_policy_rows() {
     let program_dir = ws();
     let program_store = Store::memory().unwrap();
     // Four acts, chosen to cover both kinds of row that exist: two writes an
-    // approver is consulted about, and one exec the policy refuses outright. The
-    // read is in there because it is what a program is for, even though a
-    // permitted read leaves no row for either side to compare.
+    // approver is consulted about, and one the policy refuses outright. The read
+    // is in there because it is what a program is for, even though a permitted
+    // read leaves no row for either side to compare.
     let source = "a = read_file(path=\"one.txt\")\n\
                   write_file(path=\"out.txt\", content=str(a))\n\
                   write_file(path=\"two.txt\", content=\"rewritten\")\n\
-                  e = exec(argv=[\"true\"])\n\
-                  print(\"exec allowed:\", e.ok)\n";
+                  s = write_file(path=\"secret.txt\", content=\"nope\")\n\
+                  print(\"secret allowed:\", s.ok)\n";
     let program = MockScript::new(vec![vec![ToolCall {
         name: "run_program".into(),
         arguments: json!({ "source": source }),
@@ -196,8 +205,8 @@ async fn a_program_and_a_chain_of_tool_calls_leave_the_same_policy_rows() {
             arguments: json!({ "path": "two.txt", "content": "rewritten" }),
         }],
         vec![ToolCall {
-            name: "exec".into(),
-            arguments: json!({ "argv": ["true"] }),
+            name: "write_file".into(),
+            arguments: json!({ "path": "secret.txt", "content": "nope" }),
         }],
     ]);
     let by_chain = run_with(
@@ -309,6 +318,81 @@ async fn a_denied_act_is_refused_to_the_program_and_leaves_a_row() {
         std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
         "before\n",
         "a refused write must not land"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F4 — starting the interpreter is itself an act
+// ---------------------------------------------------------------------------
+
+/// F4's other half, and the defect an adversarial review found behind a green
+/// suite: **starting the interpreter is an `Act::Exec` check.**
+///
+/// Every other test in this file asserts on what a *callback* reached, and all of
+/// them passed while the program's own spawn was ungated — so a run whose policy
+/// said `deny_exec("*")` still handed arbitrary model-authored source to a host
+/// interpreter. The control is a second run under a policy that allows exec, so
+/// "refused" is the policy deciding rather than the tool being broken.
+#[tokio::test]
+async fn a_run_that_denies_exec_will_not_start_a_program() {
+    if skip_without_python() {
+        return;
+    }
+    let source = "write_file(path=\"out.txt\", content=\"the program ran\")\n";
+
+    // Denied: nothing runs, and the file is untouched.
+    let denied_dir = ws();
+    let denied_store = Store::memory().unwrap();
+    let denied = MockScript::new(vec![vec![ToolCall {
+        name: "run_program".into(),
+        arguments: json!({ "source": source }),
+    }]]);
+    run_with(
+        &contract(denied_dir.path()).with_codeact(CodeActConfig::default()),
+        &denied,
+        &denied_store,
+        // Writes allowed outright, so a program that ran would certainly land its
+        // write. The only thing stopping it is the exec check on the interpreter.
+        &Policy::default()
+            .layer("test")
+            .allow_read("*")
+            .allow_write("*")
+            .deny_exec("*"),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(denied_dir.path().join("out.txt")).unwrap(),
+        "before\n",
+        "a run that denies execution must not start an interpreter"
+    );
+    let rows = shape(&denied_store.events(1).unwrap());
+    assert!(
+        rows.iter().any(|(act, _, _)| act == "exec"),
+        "the refused spawn leaves an exec row; rows were {rows:?}"
+    );
+
+    // The control: the same program under a policy that allows exec does run.
+    let allowed_dir = ws();
+    let allowed_store = Store::memory().unwrap();
+    let allowed = MockScript::new(vec![vec![ToolCall {
+        name: "run_program".into(),
+        arguments: json!({ "source": source }),
+    }]]);
+    run_with(
+        &contract(allowed_dir.path()).with_codeact(CodeActConfig::default()),
+        &allowed,
+        &allowed_store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(allowed_dir.path().join("out.txt")).unwrap(),
+        "the program ran",
+        "the identical program runs when the policy permits execution"
     );
 }
 

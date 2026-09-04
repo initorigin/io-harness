@@ -1010,14 +1010,17 @@ pub(super) fn run_program_spec(callable: &[String]) -> ToolSpec {
              is one step each.\n\nInside the program these functions are already defined and take \
              the same arguments the tools of the same name take, as keywords: {names}. Each \
              returns an object with `.ok` and `.text`; `str()` of it is the text, and it is falsy \
-             when the act was refused, so a program can branch on a refusal instead of stopping. \
-             Every one of them is checked by the same permission rules that check your own tool \
-             calls, so a program cannot reach anything you could not.\n\nThe program runs in a \
-             scratch directory of its own, not in the workspace, with no network and only the \
-             standard library — there is no `pip` and an `import` of anything else will fail. \
-             Print what you want to read back; whatever it prints is the result, and a variable \
-             named `result` is appended if you set one. An exception comes back with its \
-             traceback, and you may then send a corrected program."
+             when the act was refused OR failed, so a program can branch instead of stopping — \
+             read `.text` to tell a refusal from a command that ran and exited non-zero. Every \
+             one of them is checked by the same permission rules that check your own tool calls, \
+             so a program cannot reach anything you could not.\n\nThe program runs in a scratch \
+             directory of its own, not in the workspace, and it is given no route to the network \
+             — reach the network through the tools, which are checked, rather than by opening a \
+             socket. Nothing is installed for it: what it can `import` is whatever this machine's \
+             interpreter already carries, so prefer the standard library and check an import \
+             rather than assume it. Print what you want to read back; whatever it prints is the \
+             result, and a variable named `result` is appended if you set one. An exception comes \
+             back with its traceback, and you may then send a corrected program."
         ),
         parameters: json!({
             "type": "object",

@@ -204,9 +204,12 @@ fn a_program_sends_nothing_anywhere() {
         );
     }
     // And the program is handed no proxy, which is the other half: it reaches the
-    // network only through this crate's own network-governed tools.
+    // network only through this crate's own network-governed tools. The call form
+    // is what is checked, not the word — an earlier version of this assertion
+    // matched the comment that explains the absence and was red on every build,
+    // which is the same failure its sibling below already documents.
     assert!(
-        !module.contains("proxy_env"),
+        !module.contains("proxy_env("),
         "a program is given no proxy environment of its own"
     );
 }
