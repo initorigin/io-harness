@@ -496,12 +496,15 @@ fn argv(parts: &[&str]) -> String {
 /// A lock rather than a rewrite: the environment variable *is* the interface
 /// `Config::discover` reads, so the honest fix is to stop two tests using it at
 /// once, not to pretend a test can pass its own config in.
-fn hook_env() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // A poisoned lock here means a sibling hook test panicked while holding it,
-    // which is a failure being reported elsewhere — take the guard and let this
-    // test report its own result rather than turning it into a second panic.
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+///
+/// Tokio's mutex rather than the standard library's, because the guard is held
+/// across the `.await` on the run — which is the whole point, since the hook is
+/// read from the environment again while the run executes. A `std` guard there is
+/// what `clippy::await_holding_lock` refuses, and rightly: it would block a
+/// runtime worker rather than yield it.
+async fn hook_env() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
 }
 
 fn hooked(root: &Path, run: &[&str]) -> TaskContract {
@@ -547,7 +550,7 @@ fn the_three() -> Vec<ToolCall> {
 async fn m5_a_before_tool_hook_fires_for_spawn_agent_send_message_and_read_messages() {
     // Held for the whole test, not just across `hooked`: the hook is read from
     // the environment again while the run executes.
-    let _hook_env = hook_env();
+    let _hook_env = hook_env().await;
     empty_user_scope();
     let dir = ws();
     let store = Store::memory().unwrap();
@@ -587,7 +590,7 @@ async fn m5_a_before_tool_hook_fires_for_spawn_agent_send_message_and_read_messa
 #[tokio::test]
 async fn m5_the_same_three_calls_run_when_the_hook_allows() {
     // See the sibling above. This is the test that observed the race.
-    let _hook_env = hook_env();
+    let _hook_env = hook_env().await;
     empty_user_scope();
     let dir = ws();
     let store = Store::memory().unwrap();
