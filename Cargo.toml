@@ -326,3 +326,7 @@ required-features = ["browser"]
 [[example]]
 name = "mcp_server_stdio"
 required-features = ["mcp-server"]
+
+[[example]]
+name = "otel_live"
+required-features = ["otel"]

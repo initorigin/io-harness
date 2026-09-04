@@ -1,4 +1,4 @@
-//! F7 and F8 of 0.78.0, against a real socket.
+//! F7, F8 and O4 of 0.78.0, against a real socket.
 //!
 //! F7 is the criterion the release's safety claim rests on, so it gets three
 //! arms rather than one: a collector that refuses the connection, one that
@@ -13,6 +13,13 @@
 //! that are pure functions — which statuses may be repeated, how long to wait —
 //! are asserted in `src/otel.rs`'s own `mod transport_tests`, where they are
 //! reachable; what is out here is the part that needs a wire.
+//!
+//! O4 is the other half of what needs a wire, and the same collector serves it.
+//! `src/otel.rs`'s span tests read `OtelExporter::exported`, which is the right
+//! seam for the shape of a tree; what it cannot say is what left the process.
+//! The O4 arms below parse the **received body** — the bytes the socket
+//! delivered — and check the envelope, the span set, the trace, the GenAI
+//! attributes and the two shapes protobuf JSON fixes.
 //!
 //! **Nothing here asserts a wall-clock duration.** Where a test has to show that
 //! a run was not held up by a hung collector, it asserts that the run finished
@@ -32,7 +39,7 @@ use io_harness::{
     run_with_observed, ApproveAll, Ignore, Observer, OtelConfig, OtelExporter, Policy, Provider,
     RetryPolicy, RunOutcome, Store, TaskContract, Verification,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -43,6 +50,29 @@ use tokio::sync::mpsc;
 /// arm that never answers does not sit on the runtime for the rest of the file.
 /// It is configuration and not an assertion: no test here reads a clock.
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The model the scripted provider reports, and therefore the model half of
+/// every inference span's name and the value of `gen_ai.request.model`.
+const MODEL: &str = "model-a";
+
+/// The tool the scripted provider calls, and therefore the name half of every
+/// tool span.
+const TOOL: &str = "write_file";
+
+/// [`Provider::name`] for the scripted provider, and therefore
+/// `gen_ai.provider.name` — the convention enumerates no `mock`, so a span
+/// carries this crate's own id unchanged.
+const PROVIDER: &str = "mock";
+
+/// What one answered turn reports.
+///
+/// The three numbers are deliberately not interchangeable: the prompt and the
+/// completion are what a provider span carries, and the total is what the event
+/// channel carries. A fixture where the two agreed would let a span built from
+/// the wrong source pass.
+const PROMPT_TOKENS: u64 = 1_000;
+const COMPLETION_TOKENS: u64 = 100;
+const TOTAL_TOKENS: u64 = 1_400;
 
 // --------------------------------------------------------------------- F7 (1)
 
@@ -242,6 +272,341 @@ async fn f8_a_configured_header_cannot_replace_the_content_type_on_the_wire() {
     assert!(head.contains("x-tenant: acme"), "{request}");
 }
 
+// ------------------------------------------------------------------------- O4
+
+/// The service these runs are exported as.
+///
+/// Not the default, so the assertion is that the *operator's* value reached the
+/// resource rather than that some name did.
+const SERVICE: &str = "otel-transport-payload";
+
+/// `SPAN_KIND_INTERNAL` and `SPAN_KIND_CLIENT` as they arrive.
+///
+/// The constants themselves are crate-private, and a consumer reading a payload
+/// off a socket has only the numbers — which is the position this file is in.
+const KIND_INTERNAL: i64 = 1;
+const KIND_CLIENT: i64 = 3;
+
+/// O4. The tree a collector receives is the tree the encoder built.
+///
+/// Every fact checked below is read out of the bytes the socket delivered.
+/// `OtelExporter` retains the batches it encoded and `src/otel.rs`'s own span
+/// tests read that field, which is the right seam for the shape of a tree — but
+/// a value remembered by the process that built it says nothing about what left
+/// it, and between the two sit a serializer, an HTTP client and a socket.
+///
+/// One request carries the whole run: the queue is drained when the run ends and
+/// a two-step run's spans are far below [`OtelConfig::max_queue`]. A batch that
+/// arrived split would fail the span-set check rather than pass quietly.
+#[tokio::test]
+async fn o4_the_payload_a_collector_receives_carries_the_whole_tree() {
+    let body = payload_on_the_socket().await;
+
+    check_payload(&body).expect("the payload the collector received");
+}
+
+/// O4's control. The same checker, fed a body with the inference span removed
+/// and a body whose timestamp arrived as a JSON number, refuses both.
+///
+/// Without it a green O4 could come from a checker that matched nothing — a
+/// misspelled key, a search over an array that is empty, a comparison that is
+/// vacuously true. Both wrong bodies are made by editing one the collector
+/// really received, and the unedited body is checked first, so what the refusal
+/// is about is the edit and not some unrelated difference from the real shape.
+#[tokio::test]
+async fn control_the_payload_checker_refuses_a_missing_span_and_a_numeric_timestamp() {
+    let body = payload_on_the_socket().await;
+    check_payload(&body).expect("the unedited payload is one the checker accepts");
+
+    let mut missing = body.clone();
+    spans_mut(&mut missing).retain(|span| span["name"] != json!(format!("chat {MODEL}")));
+    assert!(
+        check_payload(&missing).is_err(),
+        "a payload carrying no inference span is refused"
+    );
+
+    // The trap the golden test pins against the encoder, reproduced on the wire:
+    // a uint64 field written as a JSON number is the shape a collector drops.
+    let mut numeric = body.clone();
+    spans_mut(&mut numeric)[0]["startTimeUnixNano"] = json!(1_700_000_000_000_000_000_u64);
+    assert!(
+        check_payload(&numeric).is_err(),
+        "a timestamp that arrived as a JSON number is refused"
+    );
+}
+
+/// Drive the deterministic run watched by an exporter pointed at a collector
+/// that accepts the batch, and hand back the body that collector read.
+///
+/// No network beyond loopback: the provider is the scripted mock, so the model,
+/// the tool and the token split are fixed and every assertion over them is about
+/// the wire rather than about a vendor.
+async fn payload_on_the_socket() -> Value {
+    let (url, mut requests) = collector(|_| Some(reply("200 OK", &[], "{}")));
+
+    let bed = Bed::new();
+    let config = OtelConfig::new(url.as_str())
+        .with_timeout(EXPORT_TIMEOUT)
+        .with_service_name(SERVICE);
+    let exporter = OtelExporter::open(config, &bed.db).unwrap();
+    let (outcome, _) = drive(&bed, &exporter).await;
+    assert_eq!(
+        outcome,
+        RunOutcome::Success { steps: 2 },
+        "the scripted run reaches the outcome every assertion below is written for"
+    );
+
+    let request = requests.recv().await.expect("the export arrives");
+    assert!(request.starts_with("POST /v1/traces "), "{request}");
+    serde_json::from_str(body_of(&request)).expect("the collector received JSON")
+}
+
+/// The span array of a received body, to edit.
+fn spans_mut(body: &mut Value) -> &mut Vec<Value> {
+    body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array_mut()
+        .expect("an encoded batch carries a span array")
+}
+
+/// Refuse the payload, naming what was wrong with it.
+macro_rules! require {
+    ($condition:expr, $($message:tt)*) => {
+        if !$condition {
+            return Err(format!($($message)*));
+        }
+    };
+}
+
+/// Everything O4 asserts about one received body, as a function over that body.
+///
+/// A `Result` and not a wall of `assert!`, because the criterion needs a checker
+/// that can be *watched* saying no: an assertion that panics cannot be handed a
+/// wrong value without ending the test that handed it one.
+fn check_payload(body: &Value) -> Result<(), String> {
+    // ---- the envelope -------------------------------------------------------
+    let resource_spans = array(body, "resourceSpans")?;
+    require!(
+        resource_spans.len() == 1,
+        "one resource per export, got {}: {body}",
+        resource_spans.len()
+    );
+    let resource = &resource_spans[0];
+    require!(
+        string_attribute(&resource["resource"], "service.name") == Some(SERVICE),
+        "the resource carries the configured service.name: {}",
+        resource["resource"]
+    );
+
+    let scope_spans = array(resource, "scopeSpans")?;
+    require!(
+        scope_spans.len() == 1,
+        "one scope per export, got {}: {resource}",
+        scope_spans.len()
+    );
+    // `env!` rather than a literal: the encoder's `SCOPE_NAME` and
+    // `SCOPE_VERSION` are compiled from the same two variables, so a version
+    // bump moves both sides together and neither is a number to remember.
+    let scope = &scope_spans[0]["scope"];
+    require!(
+        scope["name"] == json!(env!("CARGO_PKG_NAME")),
+        "the scope names this crate: {scope}"
+    );
+    require!(
+        scope["version"] == json!(env!("CARGO_PKG_VERSION")),
+        "the scope carries this crate's version: {scope}"
+    );
+
+    // ---- the span set, by name and by kind together -------------------------
+    //
+    // Both, because a name with the wrong kind is what a dashboard files under
+    // the wrong thing: a tool runs in this process and a provider call does not,
+    // and that is the difference between time spent working and time spent
+    // waiting.
+    let spans = array(&scope_spans[0], "spans")?;
+    let root = one_named(spans, "invoke_agent")?;
+    require!(
+        root["kind"] == json!(KIND_INTERNAL),
+        "the root span is INTERNAL: {root}"
+    );
+    require!(
+        root.get("parentSpanId").is_none(),
+        "the root span names no parent: {root}"
+    );
+
+    let step = one_named(spans, "step 1")?;
+    require!(
+        step["kind"] == json!(KIND_INTERNAL),
+        "a step span is INTERNAL: {step}"
+    );
+
+    let tools = named(spans, &format!("execute_tool {TOOL}"));
+    require!(!tools.is_empty(), "no tool span among {}", names(spans));
+    for span in &tools {
+        require!(
+            span["kind"] == json!(KIND_INTERNAL),
+            "a tool span is INTERNAL: {span}"
+        );
+    }
+
+    let chats = named(spans, &format!("chat {MODEL}"));
+    require!(
+        !chats.is_empty(),
+        "no inference span among {}",
+        names(spans)
+    );
+    for span in &chats {
+        require!(
+            span["kind"] == json!(KIND_CLIENT),
+            "an inference span is CLIENT: {span}"
+        );
+    }
+
+    // ---- one trace, and no parent naming a span that never arrived ----------
+    let trace = &spans[0]["traceId"];
+    require!(
+        trace.as_str().is_some_and(|id| id.len() == 32),
+        "a trace id is 32 hex characters: {trace}"
+    );
+    let mut ids = Vec::with_capacity(spans.len());
+    for span in spans {
+        require!(
+            span["traceId"] == *trace,
+            "one trace id spans the whole run: {span}"
+        );
+        ids.push(
+            span["spanId"]
+                .as_str()
+                .ok_or_else(|| format!("every span carries an id: {span}"))?,
+        );
+    }
+    let mut rootless = 0;
+    for span in spans {
+        match span.get("parentSpanId").and_then(Value::as_str) {
+            None => rootless += 1,
+            Some(parent) => require!(
+                ids.contains(&parent),
+                "{} names a parent nothing exported: {parent}",
+                span["name"]
+            ),
+        }
+    }
+    require!(
+        rootless == 1,
+        "exactly one span has no parent, got {rootless}"
+    );
+
+    // ---- the GenAI attributes, read out of what arrived ----------------------
+    for span in &chats {
+        require!(
+            string_attribute(span, "gen_ai.operation.name") == Some("chat"),
+            "an inference span says which operation it is: {span}"
+        );
+        // A gateway is not the vendor behind it, so a provider the convention
+        // does not enumerate keeps this crate's own id.
+        require!(
+            string_attribute(span, "gen_ai.provider.name") == Some(PROVIDER),
+            "an inference span names the provider that served it: {span}"
+        );
+        require!(
+            string_attribute(span, "gen_ai.request.model") == Some(MODEL),
+            "an inference span carries the model it asked for: {span}"
+        );
+        // `int_attribute` reads `intValue` as a decimal *string*, which is the
+        // protobuf JSON rule for an int64 field — so a count that arrived as a
+        // number is refused here rather than compared.
+        require!(
+            int_attribute(span, "gen_ai.usage.input_tokens") == Some(PROMPT_TOKENS),
+            "an inference span carries the row's prompt tokens: {span}"
+        );
+        require!(
+            int_attribute(span, "gen_ai.usage.output_tokens") == Some(COMPLETION_TOKENS),
+            "an inference span carries the row's completion tokens: {span}"
+        );
+        // The split is the store's per-call fact. A span built from the event
+        // channel's `Step { tokens }` would carry the total instead.
+        require!(
+            int_attribute(span, "gen_ai.usage.input_tokens") != Some(TOTAL_TOKENS),
+            "the token counts are the call's split and not the step's aggregate: {span}"
+        );
+    }
+
+    // ---- the shapes protobuf JSON fixes, on the wire ------------------------
+    //
+    // The golden test pins these against the encoder. What is asserted here is
+    // that nothing between the encoder and the socket changed them.
+    for span in spans {
+        for key in ["startTimeUnixNano", "endTimeUnixNano"] {
+            require!(
+                span[key].as_str().is_some_and(|t| t.parse::<u64>().is_ok()),
+                "{key} is a decimal string and not a JSON number: {span}"
+            );
+        }
+        require!(
+            span["kind"].is_number(),
+            "kind is the enum's integer and not its name: {span}"
+        );
+    }
+
+    Ok(())
+}
+
+// ------------------------------------------------- reading a received payload
+
+fn array<'a>(value: &'a Value, key: &str) -> Result<&'a [Value], String> {
+    value[key]
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("{key} is an array: {value}"))
+}
+
+fn named<'a>(spans: &'a [Value], name: &str) -> Vec<&'a Value> {
+    spans
+        .iter()
+        .filter(|span| span["name"] == json!(name))
+        .collect()
+}
+
+fn one_named<'a>(spans: &'a [Value], name: &str) -> Result<&'a Value, String> {
+    let found = named(spans, name);
+    if found.len() == 1 {
+        return Ok(found[0]);
+    }
+    Err(format!(
+        "expected exactly one span named {name:?}, got {}: {}",
+        found.len(),
+        names(spans)
+    ))
+}
+
+/// The names of every span in a batch, for a refusal message.
+fn names(spans: &[Value]) -> String {
+    let list: Vec<&str> = spans
+        .iter()
+        .filter_map(|span| span["name"].as_str())
+        .collect();
+    format!("{list:?}")
+}
+
+/// An attribute's value, from a span or from a resource — OTLP puts the same
+/// list of key/value pairs in both places.
+fn attribute<'a>(carrier: &'a Value, key: &str) -> Option<&'a Value> {
+    carrier["attributes"]
+        .as_array()?
+        .iter()
+        .find(|attr| attr["key"] == json!(key))
+        .map(|attr| &attr["value"])
+}
+
+fn string_attribute<'a>(carrier: &'a Value, key: &str) -> Option<&'a str> {
+    attribute(carrier, key)?["stringValue"].as_str()
+}
+
+/// An `intValue`, which is a decimal string on the wire because OTLP's field is
+/// an int64 — the same protobuf JSON rule as the timestamps.
+fn int_attribute(carrier: &Value, key: &str) -> Option<u64> {
+    attribute(carrier, key)?["intValue"].as_str()?.parse().ok()
+}
+
 // ------------------------------------------------------------------ collector
 
 /// Stand a collector on an ephemeral loopback port, and report every request it
@@ -412,25 +777,25 @@ impl Provider for Mock {
             }],
             text: Some("working".into()),
             usage: Some(Usage {
-                prompt_tokens: 1_000,
-                completion_tokens: 100,
-                total_tokens: 1_400,
+                prompt_tokens: PROMPT_TOKENS,
+                completion_tokens: COMPLETION_TOKENS,
+                total_tokens: TOTAL_TOKENS,
                 ..Default::default()
             }),
-            model: Some("model-a".into()),
+            model: Some(MODEL.into()),
             finish_reason: Some("stop".into()),
             ..Default::default()
         })
     }
 
     fn name(&self) -> &str {
-        "mock"
+        PROVIDER
     }
 }
 
 fn write(path: &str, content: &str) -> ToolCall {
     ToolCall {
-        name: "write_file".into(),
+        name: TOOL.into(),
         arguments: json!({ "path": path, "content": content }),
     }
 }
