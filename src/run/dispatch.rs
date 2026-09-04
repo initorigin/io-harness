@@ -140,8 +140,6 @@ enum Finish {
     Bound,
     /// It ran longer than it is allowed.
     Timeout,
-    /// An approval, a question or a plan decision came back from an act it took.
-    Paused,
     /// The shim stopped speaking, or said something this crate could not read.
     Broken(String),
 }
@@ -155,7 +153,6 @@ impl Finish {
             Self::Failed(..) | Self::Broken(_) => "failed",
             Self::Bound => "bound",
             Self::Timeout => "timeout",
-            Self::Paused => "paused",
         }
     }
 
@@ -168,7 +165,6 @@ impl Finish {
             Self::Failed(message, _) => message.lines().last().unwrap_or("raised").to_string(),
             Self::Bound => "the callback bound was reached".to_string(),
             Self::Timeout => "the program ran out of time".to_string(),
-            Self::Paused => "an act it took needs a decision this run has not taken".to_string(),
             Self::Broken(why) => why.clone(),
         }
     }
@@ -231,13 +227,6 @@ impl Finish {
                      Write a narrower program.\n",
                     timeout.as_secs()
                 ),
-            ),
-            // Never reported: the arm returns the pause itself rather than an
-            // observation. Worded anyway, because a `_` here would be an arm that
-            // silently starts covering the next ending added.
-            Self::Paused => (
-                "program paused".to_string(),
-                "\n[program stopped] An act it took needs a decision.\n".to_string(),
             ),
             Self::Broken(why) => (
                 "program ended unexpectedly".to_string(),
@@ -443,28 +432,105 @@ pub(crate) async fn dispatch(
                 active: plan_active,
             } = plan;
 
-            let mut session = crate::codeact::Session::start(
+            // The plan gate is a policy *layer* denying `Write` and `Exec`, and it
+            // works because every mutating path in this crate is one of those two
+            // checks. Starting an interpreter is a third, so a run held still
+            // waiting for an approved plan would have started programs while every
+            // act inside them was denied — the tool is refused here for the same
+            // reason `remember` is, rather than being filtered out of the
+            // catalogue, because this crate denies tools and never hides them.
+            if plan_active {
+                return Ok(Dispatched::go(
+                    "run_program refused: plan not approved",
+                    "\n[run_program refused] This run is waiting for its plan to be approved, so \
+                     it will not start a program. Propose a plan first.\n",
+                ));
+            }
+
+            // **The interpreter is a program on this machine, and starting it is
+            // an act.** Without this the tool was a second path around
+            // `Act::Exec`: a run whose policy said `deny_exec("*")` still handed
+            // arbitrary model-authored source to a host interpreter, and every
+            // test still passed because they all assert on what a *callback*
+            // reached. Both spellings are checked, exactly as `exec` checks them —
+            // the program alone is what `deny_exec("python3")` names, and the
+            // whole argv is what a narrower `allow_exec` names.
+            let interpreter = ready.interpreter.display().to_string();
+            let joined = format!("{interpreter} {}", crate::codeact::PROGRAM_FILE);
+            for target in [interpreter.clone(), joined.clone()] {
+                match gate(
+                    ws,
+                    approver,
+                    store,
+                    run_id,
+                    step,
+                    Act::Exec,
+                    &target,
+                    None,
+                    watch,
+                    depth,
+                    goal,
+                )
+                .await?
+                {
+                    Gated::Refused { decision, obs } => return Ok(Dispatched::go(decision, obs)),
+                    Gated::Paused { request_id } => return Ok(Dispatched::Pause { request_id }),
+                    Gated::Go { .. } => {}
+                }
+            }
+
+            // Refused rather than degraded where this host's seam cannot apply the
+            // containment the run asked for. 0.74.0's reasoning, and `shell_start`
+            // already refuses for the narrower case: a boundary named in the trace
+            // and not applied to the process is worse than no boundary at all.
+            if let Some(why) = crate::codeact::containment_refusal(exec_sandbox) {
+                return Ok(Dispatched::go(
+                    "run_program refused: cannot be contained here",
+                    format!("\n[run_program refused] {why}\n"),
+                ));
+            }
+
+            let mut session = match crate::codeact::Session::start(
                 &ready.interpreter,
                 source,
                 &ready.callable,
                 ready.max_callbacks,
                 exec_sandbox,
             )
-            .await?;
+            .await
+            {
+                Ok(session) => session,
+                // An environmental failure — the interpreter deleted between
+                // discovery and use, a temporary directory that cannot be made —
+                // is an observation the agent can carry on from, which is what
+                // this function's contract says it returns. Failing the whole run
+                // for it would be this arm deciding the run is over.
+                Err(err) => {
+                    return Ok(Dispatched::go(
+                        "run_program could not start",
+                        format!(
+                            "\n[run_program could not start] {err}. Nothing ran. Use the \
+                             individual tools instead.\n"
+                        ),
+                    ))
+                }
+            };
+
+            // Deferring is not available to an act inside a program, and the
+            // wrapper is where that is decided rather than in the loop below: a
+            // `Pause` returned mid-program would leave this arm before the
+            // `changed` and `remember` it has accumulated were reported, and a
+            // resumed run re-writes the program from scratch and re-executes the
+            // acts that already landed. The caller's approver is untouched for
+            // everything the model does itself.
+            let approver: &dyn Approver = &crate::codeact::NoDefer(approver);
 
             let mut changed = false;
             let mut remembered: Vec<Rule> = Vec::new();
-            let mut paused: Option<Dispatched> = None;
             let started = std::time::Instant::now();
 
+            let mut fatal: Option<Error> = None;
             let finish = loop {
-                // Two ceilings, and they bound different resources. The sandbox
-                // caps what the child spends; these cap what the child makes
-                // *this* process spend, which is what a tight callback loop
-                // exhausts and what no rlimit can see.
-                if session.at_bound() {
-                    break Finish::Bound;
-                }
                 // The wait is bounded rather than the loop, and that is the whole
                 // difference between a ceiling and a hang. A program that spins
                 // without ever calling back produces no frame to check a deadline
@@ -484,12 +550,21 @@ pub(crate) async fn dispatch(
                     }
                     crate::codeact::Frame::Call { name, args } => (name, args),
                 };
+                // Asked here rather than at the top of the loop, because the two
+                // readings differ for a program that makes exactly its allowance
+                // and then finishes: checking first meant its terminal frame was
+                // never read, its output was thrown away, and the model was told
+                // to do less by a run that had done exactly what it was allowed.
+                if session.at_bound() {
+                    break Finish::Bound;
+                }
+                session.count_call();
                 // The exclusions are checked here as well as being absent from the
                 // generated module, because the module is a convenience and this
                 // is the boundary: a program that builds a call by hand must meet
                 // the same list.
                 if crate::codeact::CODEACT_UNCALLABLE.contains(&name.as_str()) {
-                    session
+                    if let Err(err) = session
                         .reply(
                             false,
                             &format!(
@@ -497,7 +572,10 @@ pub(crate) async fn dispatch(
                                  program. Finish the program and call it directly."
                             ),
                         )
-                        .await?;
+                        .await
+                    {
+                        break Finish::Broken(err.to_string());
+                    }
                     continue;
                 }
                 let nested = ToolCall {
@@ -542,8 +620,19 @@ pub(crate) async fn dispatch(
                     // that, so a path that reached this call some other way still
                     // cannot recurse a level deeper.
                     None,
-                ))
-                .await?;
+                ));
+                // Not `?`. An early return here would leave the interpreter
+                // running with its tree unwalked, remove the workdir underneath
+                // it, and emit no `Program` event for a program that had already
+                // taken gated acts. The error is carried out of the loop instead,
+                // so the teardown below runs and the run still fails.
+                let dispatched = match dispatched.await {
+                    Ok(dispatched) => dispatched,
+                    Err(err) => {
+                        fatal = Some(err);
+                        break Finish::Broken("the run failed while the program was open".into());
+                    }
+                };
                 match dispatched {
                     Dispatched::Continue {
                         obs,
@@ -560,18 +649,30 @@ pub(crate) async fn dispatch(
                         // the program is that, rather than this crate reading its
                         // own refusal text back out of a string it just wrote.
                         let allowed = kind != ObsKind::Error;
-                        session.reply(allowed, obs.trim()).await?;
+                        if let Err(err) = session.reply(allowed, obs.trim()).await {
+                            break Finish::Broken(err.to_string());
+                        }
                     }
-                    // An approval that defers past process exit, or a question, or
-                    // a plan decision: none of them can be answered while a
-                    // program is mid-flight, and inventing an answer here would be
-                    // this arm deciding something the caller's approver was asked.
-                    // The program is stopped and the run pauses exactly as it
-                    // would have had the model made the call itself; on resume the
-                    // model writes the program again, knowing the answer.
-                    other => {
-                        paused = Some(other);
-                        break Finish::Paused;
+                    // Unreachable by construction, and handled rather than
+                    // asserted. `Pause` cannot arrive because the approver above
+                    // turns a deferral into a denial for a program's acts, and
+                    // `Ask` and `Plan` come only from tools on the uncallable
+                    // list. If one ever did, answering it here would be this arm
+                    // deciding something the caller was asked — so the program is
+                    // told the act needs a decision, and the loop carries on with
+                    // everything it has accumulated intact.
+                    _ => {
+                        if let Err(err) = session
+                            .reply(
+                                false,
+                                "[needs a decision] that act needs an approval that cannot be \
+                                 taken while a program is running. Finish the program and call it \
+                                 directly.",
+                            )
+                            .await
+                        {
+                            break Finish::Broken(err.to_string());
+                        }
                     }
                 }
             };
@@ -591,8 +692,11 @@ pub(crate) async fn dispatch(
                 },
             ));
 
-            if let Some(pause) = paused {
-                return Ok(pause);
+            // Raised only after the child is dead, the workdir is gone and the
+            // event is on the record, so a failing run still leaves a readable
+            // account of the program that was open when it failed.
+            if let Some(err) = fatal {
+                return Err(err);
             }
 
             let (decision, obs) = finish.report(calls, cap, ready.max_callbacks, ready.timeout);

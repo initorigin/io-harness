@@ -22,10 +22,26 @@
 //! backend selected is the same, chosen by the same rules, and the caps are the
 //! same `SandboxLimits`.
 //!
-//! That seam has no Windows AppContainer branch. A program on Windows is bounded
-//! by the Job Object's memory, CPU and process-count caps, which have no path rule
-//! and no socket rule — the same containment `shell_start` has there, stated here
-//! rather than left to be inferred.
+//! **Which by default are none, and that is why the two bounds here are not
+//! belt-and-braces.** [`TaskContract`](crate::TaskContract)'s `exec_sandbox`
+//! carries [`SandboxLimits::none()`](crate::SandboxLimits) unless a caller sets
+//! limits, so on a default contract nothing underneath a program bounds its CPU,
+//! its memory or its wall clock — and a run that never asked for contained exec
+//! has no rlimits at all. That is the bound `exec` already has and this module
+//! does not change it; it is the reason [`CodeActConfig::timeout`] is applied to
+//! the *wait for a frame* rather than to the loop around it. A program that spins
+//! without ever calling back produces no frame to check a deadline between, so
+//! that bound is the only thing that stops it.
+//!
+//! **That seam applies nothing at all on Windows, so a program that asked to be
+//! contained is refused there rather than degraded.** `wrap_argv` has only macOS
+//! and Linux branches, `apply_rlimits` is unix-only, `contain_command` answers
+//! `None` off Linux, and the Job Object is created by the `Sandbox` runner and by
+//! `shell_start`'s own suspended-spawn path — neither of which this is. A program
+//! started here on a Windows host would therefore have had the full filesystem
+//! and the full network while the run reported a backend granting neither, which
+//! is 0.74.0's rule exactly: a boundary named in the trace and not applied to the
+//! process is worse than no boundary at all. See [`containment_refusal`].
 //!
 //! # What the program can and cannot reach
 //!
@@ -33,8 +49,23 @@
 //! workspace access, because every effect it has on the workspace is a callback
 //! that goes through the policy. Under a backend that confines writes, a program
 //! that tries to edit a workspace file directly cannot; under the portable floor
-//! and the Windows Job Object, which have no path rule, the honest claim is only
-//! the ephemeral workdir and the proxy-environment strip.
+//! which has no path rule, the honest claim is only the ephemeral workdir; and
+//! under a contract whose [`ExecMode`](crate::ExecMode) is not a contained one
+//! there is no backend at all, so a program runs on the host with this process's
+//! privileges, exactly as an `exec` does on such a run.
+//!
+//! Egress is denied and no proxy is named whatever the run itself was granted,
+//! because a program that could open its own socket would be a second route out
+//! of a run whose first one is gated. **How much that denial is worth is the
+//! backend's answer, not this module's**: `Backend::denies_egress` is false for
+//! the portable floor, so there a program can still open a socket, and on a run
+//! with no containment at all there is nothing to deny it. The claim is exactly
+//! what the backend delivers and never more.
+//!
+//! Starting the interpreter is itself an [`Act::Exec`](crate::Act::Exec) check on
+//! the program and on the whole argv, taken before anything is spawned — so a run
+//! that denies execution denies programs too, and this tool is not a second path
+//! around that gate.
 //!
 //! The interpreter is the host's, resolved the way a browser is resolved.
 //! **Nothing is downloaded, ever.** A host with no usable interpreter is a
@@ -122,10 +153,13 @@ pub const CODEACT_UNCALLABLE: &[&str] = &[
 
 /// Words a generated binding may not take, because Python 3 parses them.
 ///
-/// `def import(**kwargs):` is a `SyntaxError`, and a `SyntaxError` in the
-/// generated module takes down the whole shim — every tool with it, including the
-/// ones the program was actually going to use. So a name that cannot be a `def`
-/// is left out rather than allowed to break the file.
+/// A name is not a `SyntaxError` risk any more — the shim carries its names as
+/// data and injects them into the program's namespace, so a keyword lands in a
+/// dictionary and breaks nothing. The reason is narrower and still real: the
+/// program calls a tool by writing `name(...)`, and a name that is a keyword or
+/// is not an identifier cannot be written that way at all. Such a name is left
+/// out of the surface rather than advertised as something the model can call and
+/// then cannot, and it stays reachable the ordinary way in the same turn.
 ///
 /// **`exec` and `print` are not on this list and must not be added.** Both are
 /// keywords in Python 2 and ordinary builtins in Python 3, and this crate probes
@@ -307,6 +341,121 @@ impl CodeActConfig {
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
+}
+
+/// The file the program's own source is written to inside the workdir.
+///
+/// Named rather than spelled twice, because it is half of the argv the
+/// `Act::Exec` check on starting an interpreter is made against.
+pub(crate) const PROGRAM_FILE: &str = "program.py";
+
+/// The largest single frame this crate will read from a program.
+///
+/// A program's captured output is unbounded on its own side — `SandboxLimits` is
+/// `none()` on a default contract, so there is no `RLIMIT_AS` under it — and a
+/// `print("x" * 10**9)` would otherwise arrive as one line this process buffers
+/// whole, three times over, before the result cap ever saw it. The shim truncates
+/// at [`SHIM_OUTPUT_CAP`] and this is the second half of the same bound: a shim
+/// that did not truncate, because somebody edited it or because the program
+/// reached past it, still cannot make the harness allocate without limit.
+const MAX_FRAME_BYTES: u64 = 4 * 1024 * 1024;
+
+/// What the shim truncates a program's captured output to before sending it.
+///
+/// Larger than any observation the result cap will keep, so the truncation a
+/// reader sees is the crate's ordinary one rather than this.
+const SHIM_OUTPUT_CAP: usize = 512 * 1024;
+
+/// An approver that answers for a program, and never defers on its behalf.
+///
+/// [`Decision::Defer`](crate::Decision) records a pending action and pauses the
+/// run so a human can answer after the process has exited. That is a coherent
+/// answer to a model's own tool call and an incoherent one to an act inside a
+/// program: the program is mid-flight with a pipe open, the acts it has already
+/// taken have already happened, and a resumed run re-writes the program from
+/// scratch — so it would re-execute them. Deferring inside a program also loses
+/// the run's own accounting of what the program changed, because the pause leaves
+/// the arm before the `changed` and `remember` it has accumulated are reported.
+///
+/// So a deferral becomes a denial *for the program only*, in this crate's own
+/// words, and the program branches on it like any other refusal. The caller's
+/// approver is untouched everywhere else, and an act the model makes itself can
+/// still be deferred exactly as before.
+pub(crate) struct NoDefer<'a>(pub(crate) &'a dyn crate::Approver);
+
+impl crate::Approver for NoDefer<'_> {
+    fn decide<'a>(&'a self, request: &'a crate::Request) -> crate::approve::DecisionFuture<'a> {
+        Box::pin(async move { undefer(self.0.decide(request).await) })
+    }
+
+    /// Overridden as well as [`Approver::decide`], because this is the one the run
+    /// loop actually calls — wrapping only the other would have let a deferral
+    /// through on every real path.
+    fn decide_in_context<'a>(
+        &'a self,
+        request: &'a crate::Request,
+        context: &'a crate::ApprovalContext,
+    ) -> crate::approve::DecisionFuture<'a> {
+        Box::pin(async move { undefer(self.0.decide_in_context(request, context).await) })
+    }
+
+    /// Both forwarded, so wrapping an approver does not quietly turn a model
+    /// approver into something the self-approval refusal cannot recognise.
+    fn model(&self) -> Option<&str> {
+        self.0.model()
+    }
+
+    fn self_approval_allowed(&self) -> bool {
+        self.0.self_approval_allowed()
+    }
+}
+
+fn undefer(decision: crate::Decision) -> crate::Decision {
+    match decision {
+        crate::Decision::Defer => crate::Decision::deny(
+            "this act was deferred for a decision later, and a program cannot wait for one. \
+             Finish the program and take this act directly, where a deferral can park the run \
+             until somebody answers it.",
+        ),
+        other => other,
+    }
+}
+
+/// Why this host cannot contain a program, when it cannot.
+///
+/// The living-child seam applies a backend on unix and applies **nothing** on
+/// Windows: `wrap_argv` has no Windows branch, `apply_rlimits` is unix-only,
+/// `contain_command` answers `None` off Linux, and the Job Object is created by
+/// the `Sandbox` runner and by `shell_start`'s own suspended-spawn path, neither
+/// of which this is. A program started here on a Windows host that asked to be
+/// contained would therefore run with the full filesystem and the full network
+/// while the run reported a backend that grants neither.
+///
+/// `shell_start` already refuses rather than degrades for the narrower case of
+/// the AppContainer, on 0.74.0's reasoning that a boundary asked for by name and
+/// not applied is worse than no boundary at all. This is that rule, applied to
+/// every Windows backend, because this seam applies none of them.
+///
+/// A run that asked for no containment is not refused: it is uncontained by the
+/// caller's own choice, exactly as `exec` is on such a run.
+pub(crate) fn containment_refusal(
+    containment: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
+) -> Option<String> {
+    let containment = containment?;
+    let _ = containment;
+    #[cfg(windows)]
+    {
+        return Some(format!(
+            "this run asked for `{}` containment and a program cannot be given it on this host. \
+             Nothing was started. The interpreter would have run with the full filesystem and the \
+             full network while the run reported a boundary it did not have, so it is refused \
+             rather than degraded. Use the individual tools, which are contained here, or run \
+             this on a host where a program can be confined.",
+            containment.backend().as_str()
+        ));
+    }
+    #[cfg(not(windows))]
+    None
 }
 
 /// What discovery found, kept whole so the run can say what it looked for.
@@ -493,7 +642,7 @@ impl Session {
     ) -> Result<Self> {
         let workdir = crate::sandbox::workdir()?;
         let dir = workdir.path().to_path_buf();
-        tokio::fs::write(dir.join("program.py"), source)
+        tokio::fs::write(dir.join(PROGRAM_FILE), source)
             .await
             .map_err(Error::Io)?;
         tokio::fs::write(dir.join("_io_shim.py"), shim(catalogue))
@@ -572,9 +721,25 @@ impl Session {
         self.calls
     }
 
-    /// Whether the next call would exceed the bound.
+    /// Whether serving one more call would exceed the bound.
+    ///
+    /// Asked **after** a frame has been read and only when that frame is a call,
+    /// never before reading. Asking first meant a program that made exactly its
+    /// allowance and then finished was reported as having hit the bound: the
+    /// terminal frame it had already written was never read, its output was
+    /// thrown away, and the model was told to do less by a run that had done
+    /// exactly what it was allowed.
     pub(crate) fn at_bound(&self) -> bool {
         self.calls >= self.max_callbacks
+    }
+
+    /// Count a call this crate is about to serve.
+    ///
+    /// Counted here rather than when the frame is read, so [`Session::calls`] is
+    /// the number of acts that actually reached dispatch. A call the bound
+    /// refused is not one the program got.
+    pub(crate) fn count_call(&mut self) {
+        self.calls += 1;
     }
 
     /// Read the next frame the program wrote.
@@ -585,10 +750,28 @@ impl Session {
     /// nothing must not read as one that finished.
     pub(crate) async fn next(&mut self) -> Result<Frame> {
         let mut line = String::new();
-        let read = self.stdout.read_line(&mut line).await.map_err(Error::Io)?;
+        // Bounded, because the writer is the untrusted end. A frame longer than
+        // this is a program that got past the shim's own truncation, and it is
+        // reported rather than buffered: an unbounded `read_line` would have this
+        // process hold the whole of it, and then hold it twice more while the
+        // report was built, before any result cap saw a byte.
+        let read = {
+            use tokio::io::AsyncReadExt;
+            let mut bounded = (&mut self.stdout).take(MAX_FRAME_BYTES);
+            bounded.read_line(&mut line).await.map_err(Error::Io)?
+        };
         if read == 0 {
             return Ok(Frame::Failed {
                 message: "the interpreter exited without finishing the program".to_string(),
+                output: String::new(),
+            });
+        }
+        if !line.ends_with('\n') {
+            return Ok(Frame::Failed {
+                message: format!(
+                    "the program wrote more than {MAX_FRAME_BYTES} bytes in one frame and was \
+                     stopped. Print less, or write what you need to a file and read it back."
+                ),
                 output: String::new(),
             });
         }
@@ -598,10 +781,7 @@ impl Session {
             ))
         })?;
         Ok(match frame {
-            WireFrame::Call { name, args } => {
-                self.calls += 1;
-                Frame::Call { name, args }
-            }
+            WireFrame::Call { name, args } => Frame::Call { name, args },
             WireFrame::Done { output } => Frame::Done { output },
             WireFrame::Failed { message, output } => Frame::Failed { message, output },
         })
@@ -624,21 +804,36 @@ impl Session {
     }
 
     /// End the program and everything it started.
+    ///
+    /// The tree is walked **before** the leader is signalled, which is the order
+    /// every other kill site in this crate uses and is not cosmetic: killing the
+    /// interpreter first orphans its children, and on Windows — where there is no
+    /// process group and the walk is a `taskkill /T` on a pid — the walk then has
+    /// nothing left to follow and the descendants survive.
     pub(crate) async fn stop(mut self) {
-        let pid = self.child.id();
+        crate::sandbox::kill_tree_and_group(self.child.id());
         let _ = self.child.start_kill();
-        crate::sandbox::kill_tree_and_group(pid);
+        // Awaited before the workdir drops with `self`, so the program is gone
+        // before the directory it was writing into is removed.
         let _ = self.child.wait().await;
     }
 }
 
 /// The shim the interpreter actually runs.
 ///
-/// It owns the protocol descriptors before the program has run one instruction,
-/// which is the whole of [F10]: the program is handed a captured `stdout`, a
-/// devnull file descriptor 1, and an empty `stdin`, so nothing it prints — not a
-/// plain line, not raw bytes through `os.write`, not a forged frame — can reach
-/// the pipe this crate is reading.
+/// It owns the protocol descriptors before the program has run one instruction:
+/// the program is handed a captured `stdout`, a devnull file descriptor 1, and an
+/// empty `stdin`, so nothing it **prints** — not a plain line, not raw bytes
+/// through `os.write`, not a line that is itself a well-formed frame — can reach
+/// or forge the pipe this crate is reading.
+///
+/// That is a claim about printing, and it is deliberately not a claim about
+/// isolation. The descriptors are closure variables rather than module globals,
+/// so the one-lookup route through `_act.__globals__` is closed, but a program
+/// that walks `__closure__` can still find them. It gains nothing: a forged
+/// `call` frame is dispatched under the same policy as an honest one, and a
+/// forged `done` only ends the program early. A program is untrusted code running
+/// under a boundary, not code this crate is trying to sandbox from itself.
 fn shim(catalogue: &[String]) -> String {
     // The names are DATA, not generated `def`s. An earlier version wrote one
     // module-level `def {name}` per tool, and `exec` — the widest capability this
@@ -647,7 +842,10 @@ fn shim(catalogue: &[String]) -> String {
     // program's namespace instead means a tool can be called anything without
     // reaching a single name the shim depends on.
     let names = serde_json::to_string(catalogue).unwrap_or_else(|_| "[]".to_string());
-    format!("{SHIM_PRELUDE}\n_TOOL_NAMES = {names}\n{SHIM_EPILOGUE}")
+    format!(
+        "{SHIM_PRELUDE}\n_TOOL_NAMES = {names}\n_OUTPUT_CAP = {SHIM_OUTPUT_CAP}\n\
+         _UNSET = object()\n{SHIM_EPILOGUE}"
+    )
 }
 
 const SHIM_PRELUDE: &str = r#"
@@ -694,21 +892,42 @@ class Obs(object):
     __nonzero__ = __bool__
 
 
-def _send(obj):
-    _proto_out.write(json.dumps(obj) + "\n")
-    _proto_out.flush()
+def _protocol(out, inp):
+    """Close the two descriptors into `_send` and `_act` and hand them back.
+
+    They are closure variables rather than module globals so that the names are
+    gone from `globals()` once this returns. A program is handed `_act`, and a
+    module-global `_proto_out` would have been one `_act.__globals__` lookup
+    away — the `dup2` of file descriptors 0, 1 and 2 does not protect a
+    descriptor the shim itself is holding a live Python object for.
+
+    This closes the reachable route, not every route: `__closure__` still exists
+    for a program that goes looking. It gains nothing by it — a forged `call`
+    frame is dispatched under the same policy as an honest one, and a forged
+    `done` only ends the program early — and the documentation says so rather
+    than claiming an isolation this cannot give.
+    """
+
+    def send(obj):
+        out.write(json.dumps(obj) + "\n")
+        out.flush()
+
+    def act(name, kwargs):
+        send({"t": "call", "name": name, "args": kwargs})
+        line = inp.readline()
+        if not line:
+            # The harness closed the pipe: a bound was hit or the run was
+            # cancelled. Leaving through SystemExit lets the program's own
+            # `finally` blocks run and cannot be caught by `except Exception`.
+            raise SystemExit("the harness stopped this program")
+        reply = json.loads(line)
+        return Obs(bool(reply.get("ok")), reply.get("text") or "")
+
+    return send, act
 
 
-def _act(name, kwargs):
-    _send({"t": "call", "name": name, "args": kwargs})
-    line = _proto_in.readline()
-    if not line:
-        # The harness closed the pipe: a bound was hit or the run was cancelled.
-        # Leaving through SystemExit lets the program's own `finally` blocks run
-        # and cannot be caught by a bare `except Exception`.
-        raise SystemExit("the harness stopped this program")
-    reply = json.loads(line)
-    return Obs(bool(reply.get("ok")), reply.get("text") or "")
+_send, _act = _protocol(_proto_out, _proto_in)
+del _proto_out, _proto_in
 
 
 def _binding(name):
@@ -736,24 +955,46 @@ def _main():
     for _name in _TOOL_NAMES:
         scope[_name] = _binding(_name)
     exec(compile(source, "program.py", "exec"), scope)
-    return scope.get("result")
+    # A sentinel rather than `is not None`, so a program that deliberately sets
+    # `result = None` gets that reported instead of silently nothing.
+    return scope["result"] if "result" in scope else _UNSET
+
+
+def _output(extra=None):
+    text = _captured.getvalue()
+    if extra is not None:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += extra
+    # Truncated here, at the source, so the harness never has to hold a frame
+    # this crate did not bound. The parent bounds it a second time.
+    if len(text) > _OUTPUT_CAP:
+        half = _OUTPUT_CAP // 2
+        text = text[:half] + "\n… output truncated …\n" + text[-half:]
+    return text
 
 
 try:
     _value = _main()
-    _text = _captured.getvalue()
-    if _value is not None:
-        if _text and not _text.endswith("\n"):
-            _text += "\n"
-        _text += repr(_value)
-    _send({"t": "done", "output": _text})
+    _send({"t": "done", "output": _output(None if _value is _UNSET else repr(_value))})
 except SystemExit as _exit:
-    _send({"t": "done", "output": _captured.getvalue()})
+    # An exit code is an outcome, not decoration. `sys.exit(1)` reported as a
+    # finish told the model its program had succeeded, and `sys.exit("boom")`
+    # swallowed the message entirely — stderr is captured, so nothing printed it.
+    _code = _exit.code
+    if _code is None or _code == 0:
+        _send({"t": "done", "output": _output()})
+    else:
+        _send({
+            "t": "failed",
+            "message": "the program exited with %r" % (_code,),
+            "output": _output(),
+        })
 except BaseException:
     _send({
         "t": "failed",
         "message": traceback.format_exc(),
-        "output": _captured.getvalue(),
+        "output": _output(),
     })
 "#;
 
@@ -921,6 +1162,67 @@ print("real call returned", r.text)
         assert!(output.contains("ordinary"), "{output:?}");
         assert!(output.contains("and stderr"), "{output:?}");
         assert!(output.contains("real call returned ok"), "{output:?}");
+    }
+
+    #[tokio::test]
+    async fn a_non_zero_exit_is_a_failure_and_a_zero_one_is_not() {
+        // Reported as a finish, this told the model a program that had failed had
+        // succeeded — and `sys.exit("boom")` lost its message entirely, because
+        // stderr is captured and nothing ever printed it.
+        let Some((_, frame)) = drive("print(\"before\")\nraise SystemExit(3)\n", &[], &[]).await
+        else {
+            return;
+        };
+        let Frame::Failed { message, output } = frame else {
+            panic!("a non-zero exit is a failure, got {frame:?}");
+        };
+        assert!(message.contains('3'), "{message:?}");
+        assert!(output.contains("before"), "{output:?}");
+
+        // The control: an exit that means success still reads as one, so the
+        // above is the code being read rather than every exit being failed.
+        let Some((_, frame)) = drive("print(\"clean\")\nraise SystemExit(0)\n", &[], &[]).await
+        else {
+            return;
+        };
+        let Frame::Done { output } = frame else {
+            panic!("a zero exit is a finish, got {frame:?}");
+        };
+        assert!(output.contains("clean"), "{output:?}");
+    }
+
+    #[tokio::test]
+    async fn a_program_that_prints_too_much_is_truncated_at_the_source() {
+        // Unbounded, this arrived as one line the harness buffered whole — and
+        // then twice more while the report was built — before any result cap saw
+        // a byte. The `SandboxLimits::none()` default means nothing on the child's
+        // side would have stopped it either.
+        let Some((_, frame)) = drive("print(\"x\" * 2_000_000)\n", &[], &[]).await else {
+            return;
+        };
+        let Frame::Done { output } = frame else {
+            panic!("expected a finished program, got {frame:?}");
+        };
+        assert!(
+            output.len() <= SHIM_OUTPUT_CAP + 128,
+            "output should be truncated at the source; it was {} bytes",
+            output.len()
+        );
+        assert!(output.contains("output truncated"), "the cut is named");
+    }
+
+    #[tokio::test]
+    async fn a_result_of_none_is_reported_rather_than_swallowed() {
+        let Some((_, frame)) = drive("result = None\n", &[], &[]).await else {
+            return;
+        };
+        let Frame::Done { output } = frame else {
+            panic!("expected a finished program, got {frame:?}");
+        };
+        assert!(
+            output.contains("None"),
+            "a deliberate `result = None` is an answer, not an absence: {output:?}"
+        );
     }
 
     #[tokio::test]
