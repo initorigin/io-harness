@@ -137,6 +137,7 @@ layer.
 | **Command execution** | The project's own build, test, lint and package-manager commands, checked on the whole argv, never a shell string | [command execution](docs/guide/command-execution.md) |
 | **Containment** | Commands run inside the sandbox backend the host offers, writing to the workspace and nowhere else, with per-host egress | [sandbox](docs/guide/sandbox.md) |
 | **Execution sandbox** | Model-produced code in an ephemeral workdir with caps that kill rather than throttle, network denied by default | [sandbox](docs/guide/sandbox.md) |
+| **Programs instead of call chains** | Behind `codeact`: one contained Python program in place of six round trips, where every act it takes re-enters the same dispatch, policy, gate and trace a tool call does | [CodeAct](docs/guide/codeact.md) |
 | **Verification** | Any language's own test command, a second model against a rubric, or no gate at all | [verification](docs/guide/verification.md) |
 | **Budgets** | Steps, wall-clock and token spend, from one ledger a whole tree of agents shares and no child can raise | [composition](docs/guide/composition.md) |
 | **Durable runs** | Trace, budget draw and checkpoint commit together after every completed step; a crash resumes the whole tree | [durable runs](docs/guide/durable-runs.md) |
@@ -647,6 +648,7 @@ limits that capability actually has.
 | [Verification](docs/guide/verification.md) | The criteria, execution-based gates, and exactly what a pass proves |
 | [Agent composition](docs/guide/composition.md) | Sub-agents, inherit-and-narrow containment, the shared ledger |
 | [Execution sandbox](docs/guide/sandbox.md) | Backends per platform, resource caps, the portable floor |
+| [CodeAct](docs/guide/codeact.md) | One contained Python program instead of a chain of calls, how the interpreter is found, what a program may not call, and the two bounds beyond the sandbox's |
 | [Durable runs](docs/guide/durable-runs.md) | Checkpoints, resume, approvals that survive a restart |
 | [MCP and network egress](docs/guide/mcp-and-network.md) | Stdio and HTTP servers, `Act::Net`, what the policy does not govern |
 | [Tools and skills](docs/guide/tools-and-skills.md) | The `Tool` trait, the toolbox, skill discovery and its boundary |
@@ -836,10 +838,12 @@ dependency at all.
 | `browser` | Driving an already-installed browser over a pipe, under the run's own policy |
 | `otel` | Exporting a run as OpenTelemetry spans over OTLP/HTTP, following the GenAI semantic conventions |
 | `mcp-server` | Serving this crate's own tools over MCP on stdio, under this crate's policy, gate and trace |
+| `codeact` | One contained Python program in place of a chain of tool calls, run by a host interpreter that is found rather than downloaded |
 
-The last three add **no crate at all**. They are features because a build that did
-not ask for a browser, an outbound telemetry writer or a door onto its own tools
-should not compile one — not because anything is being pulled in.
+The last four add **no crate at all**. They are features because a build that did
+not ask for a browser, an outbound telemetry writer, a door onto its own tools or
+a program driving them should not compile one — not because anything is being
+pulled in.
 
 ## Platform support
 

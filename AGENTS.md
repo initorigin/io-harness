@@ -33,6 +33,7 @@ cargo clippy --all-targets --features documents -- -D warnings
 cargo clippy --all-targets --features media -- -D warnings
 cargo clippy --all-targets --features otel -- -D warnings
 cargo clippy --all-targets --features mcp-server -- -D warnings
+cargo clippy --all-targets --features codeact -- -D warnings
 
 # Examples compile-check (CI does not link them)
 cargo check --examples
@@ -89,15 +90,19 @@ provider/store/policy once and delegates; it adds no loop.
   `custom.rs` (the `Tool` trait), `diagnostics.rs`, `browser.rs`, `documents/`.
 - `config.rs` — one `io.toml` over four scopes projected onto the typed API; a project scope may
   narrow and never widen.
+- `codeact.rs` — the contained Python child and the callback protocol behind `run_program`. It
+  knows nothing about tools: every callback goes back through `run/dispatch.rs`, which is what
+  keeps a program's acts on exactly the terms a model's own calls are on.
 - Others: `context.rs` (per-turn assembly, compaction), `verify.rs`, `contract.rs`, `mcp.rs`,
   `lsp.rs`, `skills.rs`, `plugin.rs`, `hooks.rs`, `observe.rs`, `pricing.rs`, `resilience.rs`,
   `template.rs`, `toolchain.rs`, `diff.rs`, `web.rs`, `attach.rs`, `agent.rs`.
 
 **Feature flags.** `default = []`. `media`, `browser` (implies `media`), `documents` (umbrella
 over `xlsx`/`docx`/`pptx`/`pdf`/`barcode`), `otel` (export a run as OpenTelemetry spans),
-`mcp-server` (serve this crate's tools over MCP on stdio). The last three add no crate at all —
-they are features because a build that did not ask for a browser, an outbound telemetry writer or
-a door onto its own tools should not compile one. The canonical list lives in `docs/CONTRACT.md`
+`mcp-server` (serve this crate's tools over MCP on stdio), `codeact` (write one contained Python
+program instead of a chain of tool calls). The last four add no crate at all — they are features
+because a build that did not ask for a browser, an outbound telemetry writer, a door onto its own
+tools, or a program running against them should not compile one. The canonical list lives in `docs/CONTRACT.md`
 and is drift-checked. Adding a dependency to the default tree is a deliberate, argued act — read
 the comments in `Cargo.toml` before you do.
 

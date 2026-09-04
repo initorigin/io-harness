@@ -499,6 +499,12 @@ jobs:
       # one of them is on is invisible everywhere else in this file.
       - run: cargo clippy --all-targets --features otel -- -D warnings
       - run: cargo clippy --all-targets --features mcp-server -- -D warnings
+      # 0.79.0's, on the same argument, plus one this feature has on its own: the
+      # `run_program` dispatch arm and the `CodeActReady` parameter are compiled
+      # in different combinations here and in the default build, and the parameter
+      # is deliberately ungated while the arm is not — so the leg that reads a
+      # `#[cfg]` wrong is the one where exactly this feature is on.
+      - run: cargo clippy --all-targets --features codeact -- -D warnings
 
   # 0.23.0 — the `links` wall, proven gone. This job exists because of a defect
   # no other job in this file could see, for the same reason the `docs` job

@@ -130,10 +130,11 @@ enabling a feature only ever adds to the surface.
 | `browser` | Driving a real browser: `BrowserConfig`, the `[browser]` table, and the six `browser_*` built-ins | **No new crate.** Implies `media`, because a screenshot is only worth taking if the model looks at it |
 | `otel` | Exporting a run as OpenTelemetry spans over OTLP/HTTP: `OtelConfig`, `OtelExporter`, and the `[otel]` table | **No new crate.** OTLP with a JSON body is a published wire format and `reqwest` and `serde_json` are already in the default build |
 | `mcp-server` | Serving this crate's own tools over MCP on stdio: `serve_mcp`, `serve_mcp_with`, `McpServerConfig` | **No new crate.** The JSON-RPC framing is written here; `rmcp`'s server half would add nine |
+| `codeact` | Running one contained Python program instead of a chain of tool calls: `CodeActConfig`, the `[codeact]` table, and the `run_program` built-in | **No new crate**, and it turns nothing on either: `tokio`'s `process` and `io-util` are already in the default build. The interpreter is a host binary, not a dependency |
 
 Nothing here binds a C or C++ library, so no runner needs a system package.
 
-The last two are the only features that add a capability without adding a
+The last three are the only features that add a capability without adding a
 dependency and are still features. `browser` set the precedent and the reason is
 the same: an outbound network capability and a door onto this process's tools are
 things a build that did not ask for them should not compile.
@@ -4427,3 +4428,111 @@ roots or elicitation — `initialize` advertises the `tools` capability and noth
 else. And this crate's own MCP client reaches other people's servers, which this
 server does not re-export: two policies in one path would make it unclear which one
 refused.
+
+## What a program reaches, and what bounds it (0.79.0)
+
+Behind the `codeact` flag a run can be given one more built-in, `run_program`,
+whose single argument `source` is a complete Python program. It is offered only
+when the contract asked for it with `TaskContract::with_codeact` **and** a usable
+host interpreter was found. `None` — the default — means the tool is absent from
+the catalogue entirely and the run is the one 0.78.0 composed. The
+[guide](guide/codeact.md) carries the detail.
+
+**A program is a tool call inside one ordinary step.** The shape of a step does
+not change, so transcript pairing, the step cap, the attribution columns,
+`ToolMask` and `before_tool` hooks all keep working exactly as they did.
+
+**Every act a program takes re-enters `dispatch`.** The same function, the same
+policy, the same gate, the same `policy_events` row, the same journal attempt and
+the same `Observer` event — so a program reaches exactly what a tool call reaches
+and nothing more, and each act arrives on the observer channel as its own
+`EventKind::ToolCall` rather than folded into the program's. There is deliberately
+no shorter path: a purpose-built one would compile more easily and pass every
+functional test while bypassing the gate.
+
+**A refusal is a value, not an exception.** Inside the program each callable tool
+is a function taking that tool's arguments as keywords and returning an object
+with `.ok` and `.text`; `str()` of it is the text, and it is falsy when the act
+was refused. `.ok` is false exactly when the observation came back as
+`ObsKind::Error`, which is what `Dispatched::go` marks both a policy refusal and a
+tool's own failure with.
+
+**What a program may not call**, named in `CODEACT_UNCALLABLE`: `remember`,
+`forget` and `todo_write`, which are ungated inside `dispatch` because they land
+in the harness's own store and whose only boundary is the plan gate — a property
+of the turn rather than of the program; `ask_question`, `ask_questions`,
+`propose_plan`, `spawn_agent`, `send_message` and `read_messages`, which need a
+conversation or a tree that one step does not have; `read_skill`; and
+`run_program` itself. The list is a literal rather than the catalogue minus the
+exclusions, so a built-in added later is not callable until somebody classifies
+it, and it is checked at the boundary as well as being absent from the generated
+module. A registered or MCP tool whose name is not a Python identifier, or is a
+Python keyword, is left out of that module and stays callable the ordinary way in
+the same turn.
+
+**The interpreter is the host's and nothing is downloaded, ever.** `[codeact]
+interpreter` names one; otherwise `CODEACT_CANDIDATES` — `python3`, then `python`
+— are resolved on `PATH`. Every candidate is version-probed, including one named
+in configuration, and one below `CODEACT_MIN_PYTHON` — `(3, 8)` — is rejected, so
+a `python` answering 2.7 is rejected by number rather than trusted by name. A
+named interpreter that fails its probe is **not** replaced by one off `PATH`.
+`[codeact]` is refused at project scope, in `REFUSED_SECTIONS`, because
+`interpreter` names a program on this machine that every model-written program is
+handed to; write it in the user-scope file.
+
+**No usable interpreter is a supported state, not an error.** The tool is not
+advertised and the turn is composed, sent and stepped exactly as it would have
+been with the flag off. Which of the two happened is on the record: one
+`EventKind::Program` before the first step, `outcome` `available` or `withheld`,
+whose `detail` names every candidate and what each one answered.
+
+**Containment is composed rather than delegated to `Sandbox`.** `Sandbox::run`
+closes stdin and runs to completion, which a program that asks questions while it
+runs cannot use. A program is contained the way `shell_start` contains a living
+child — `wrap_argv`, `contain_command`, `apply_rlimits` and `own_process_group` —
+which selects the same backend by the same rules and applies the same
+`SandboxLimits`. **That seam has no Windows AppContainer branch**: on Windows a
+program is bounded by the Job Object's memory, CPU and process-count caps, which
+have no path rule and no socket rule.
+
+**The program runs in an ephemeral workdir of its own, never the workspace**, and
+that workdir is the only writable root. It needs no workspace access because every
+effect it has on the workspace is a callback the policy sees. Under a backend that
+confines writes it cannot edit a workspace file directly; under the portable floor
+and the Windows Job Object, which have no path rule, the claim is only the
+ephemeral workdir and the proxy-environment strip. It is given no proxy
+environment of its own, and reaches the network only through this crate's own
+network-governed tools, as callbacks checked under `Act::Net`.
+
+**The shim owns the protocol descriptors before the program runs one
+instruction.** It dups descriptor 1, then points 0, 1 and 2 at devnull and
+replaces `sys.stdout` and `sys.stderr` with a buffer and `sys.stdin` with an empty
+one — so a program that prints ordinary text, writes raw bytes with `os.write`, or
+prints a well-formed callback frame cannot reach or forge anything on the pipe.
+What it printed comes back attached to the step's result, plus the `repr` of a
+global named `result` if it set one.
+
+**Two bounds beyond the sandbox's**, because they bound a different resource:
+`max_callbacks` (default 64) and `timeout` (default 120 seconds), both settable on
+`CodeActConfig` and in `[codeact]`. They bound what the program makes *this*
+process spend, which is what a tight callback loop exhausts and what no rlimit can
+see. A breach is a typed ending that reaches the model as feedback naming the
+bound — never a hang, and never a bare kill with no explanation.
+
+**A raise is recoverable and a decision is a pause.** A program that raises comes
+back with its traceback, and the model may send a corrected program; that retry
+counts against the step cap like any other attempt. If an act a program takes
+returns an approval request, a question or a plan decision, the program is stopped
+and the run pauses exactly as it would have had the model made that call itself —
+on resume the model writes the program again. Interpreter state does not outlive a
+step: there is no session between programs.
+
+**Where it is not offered.** `run_program` is on `MCP_SERVER_UNSERVED`, so a
+served MCP session does not offer it, and it is advertised by the workspace loop
+only, so a sub-agent in a tree does not either.
+
+**What is not claimed here.** The saving is fewer provider round trips for the
+same work, and the size of it is a measurement rather than a contract: this
+repository measures the comparison itself and records what it finds in
+[MEASUREMENTS.md](MEASUREMENTS.md), with the machine named. A figure measured on
+another harness is not a number this crate reports as its own.

@@ -26,6 +26,91 @@ notes are produced from it.
 
 ### Security
 
+## [0.79.0] - 2026-09-04
+
+**A sequence of tool calls collapses into one contained program.** A step that
+would have been six round trips — grep, read, read, read, edit, exec — is one
+Python program the model writes once, and control flow it currently has to
+simulate across six completions becomes control flow an interpreter runs.
+
+The program is a tool call, not a new kind of step, so the transcript pairing,
+the step cap, the attribution columns, the tool mask and the `before_tool` hooks
+all keep working. It runs inside the containment a backgrounded command line
+already gets, in a scratch directory of its own rather than in the workspace, and
+every act it takes re-enters the same dispatch a model's own call takes — same
+policy, same gate, same `policy_events` row, same journal attempt, same observer
+event. A program is a shorter way of asking, not a wider door.
+
+The interpreter is the host's, found the way a browser is found, and **nothing is
+downloaded, ever**. A machine without a usable one is a supported machine: the
+tool is not offered, the turn runs exactly as it did at 0.78.0, and the decision
+is on the record rather than left to be inferred.
+
+### Added
+
+- `codeact`, an off-by-default feature letting a run write one contained Python
+  program instead of a chain of tool calls. It adds **no crate**: the interpreter
+  is a host binary, not a dependency, and a build that does not ask for the
+  feature resolves the same dependency graph it did at 0.78.0.
+- The `run_program` built-in, whose one argument is a complete Python program —
+  source, not a command line. Inside it, the tools the run already has are
+  ordinary functions taking the same arguments by keyword; each returns an object
+  that is falsy when the act was refused, so a program branches on a refusal
+  instead of stopping. A step that would have been six round trips — grep, read,
+  read, read, edit, exec — is one program written once.
+- Every act a program takes re-enters the same dispatch a model's own tool call
+  enters, so the policy, the gate, the `policy_events` row, the journal attempt
+  and the observer see a program's act on exactly the terms they see a model's. A
+  program is a shorter way of asking, not a wider door: it reaches nothing the
+  model could not have reached by asking one call at a time. What collapses is
+  the number of provider round trips, not the number of boundaries.
+- `TaskContract::with_codeact` and `CodeActConfig`, naming the interpreter to use
+  and the two bounds on how far one program may reach: `max_callbacks`, 64 by
+  default, and `timeout`, 120 seconds by default. Both bound what a program makes
+  *this* process spend, which is what a tight callback loop exhausts and what no
+  sandbox rlimit can see. Asking is a request rather than a guarantee — the tool
+  is offered only if a usable interpreter was also found.
+- Host-interpreter discovery, once per run. `CODEACT_CANDIDATES` names what is
+  looked for and in what order — `python3`, then `python` — and every candidate is
+  version-probed against `CODEACT_MIN_PYTHON`, `(3, 8)`, so a `python` that
+  answers 2.7 is rejected by what it reports rather than trusted by its name.
+  **Nothing is downloaded, ever.** A host with no usable interpreter is a
+  supported host: `run_program` is simply not advertised, and the turn is
+  composed, sent and stepped exactly as it would have been with the feature off.
+- The `[codeact]` configuration section — `interpreter`, `max_callbacks` and
+  `timeout_secs` — read from the user-scope file. It is refused at project scope,
+  and in `io.local.toml` too: the table names a program on this machine that every
+  program the model writes is handed to, and a project-scope file arrives with a
+  clone.
+- `EventKind::Program`, emitted once before the first step with outcome
+  `available` or `withheld` and what each candidate answered, and once per program
+  afterwards with the callback count and the outcome — `finished`, `failed`,
+  `bound` or `timeout`. The acts a program took are not on this event; each
+  arrives as its own `ToolCall`, where every other request is observed.
+- `CODEACT_UNCALLABLE`, naming the built-ins a program may not call: `remember`,
+  `forget`, `todo_write`, `ask_question`, `ask_questions`, `propose_plan`,
+  `read_skill`, `run_program`, `spawn_agent`, `send_message` and `read_messages`.
+  It is a literal rather than a derivation, pinned by a test, so a built-in added
+  later fails that test until somebody classifies it instead of becoming callable
+  silently.
+
+### Changed
+
+- `run_program` is a reserved built-in name, so a registered tool may no longer
+  claim it. The name is reserved whether or not `codeact` is compiled, so the set
+  of names a custom tool can take does not depend on a feature flag.
+- `MCP_SERVER_UNSERVED` names `run_program`. A served session lends the boundary,
+  not a way to drive it in a loop the operator at the far end cannot watch — the
+  client writes its own loop and makes its own calls.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.78.0] - 2026-09-04
 
 **The best trace in the field becomes readable by things that are not this crate,
