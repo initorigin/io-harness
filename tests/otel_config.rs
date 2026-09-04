@@ -123,6 +123,73 @@ fn f9_the_refusal_is_not_a_side_effect_of_an_unknown_key() {
 mod reader {
     use super::*;
 
+    use io_harness::{OtelConfig, OtelExporter};
+
+    /// A value that must never appear in anything printed. Distinctive enough
+    /// that a substring search cannot match it by accident.
+    const SECRET: &str = "Bearer sk-live-otel-must-not-print-this";
+
+    /// One arm per holder, because a leak fixed on the inner type comes back
+    /// through any outer type that derives `Debug` over it — which is how the
+    /// same class reached four provider types in 0.70.0 and their config types
+    /// in 0.71.0.
+    fn carries_the_secret(rendered: &str) -> bool {
+        rendered.contains(SECRET) || rendered.contains("sk-live")
+    }
+
+    #[test]
+    fn nf6_a_collector_credential_is_not_printed_by_the_configs_debug() {
+        let config = OtelConfig::default().with_header("authorization", SECRET);
+
+        let rendered = format!("{config:?}");
+        assert!(
+            !carries_the_secret(&rendered),
+            "OtelConfig's Debug must not print a header value: {rendered}"
+        );
+        // The whole header map is withheld — not the values alone. A header
+        // name is often the vendor and a count narrows which gateway is in
+        // front of the collector, so neither is printed either.
+        assert!(
+            !rendered.contains("authorization"),
+            "a header name is not printed either: {rendered}"
+        );
+        assert!(
+            rendered.contains("localhost:4318"),
+            "what a misconfiguration is diagnosed from is still printed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn nf6_a_collector_credential_is_not_printed_by_the_exporters_debug() {
+        // The second holder. `OtelExporter` owns an `OtelConfig`, so a derived
+        // `Debug` on the outer type would reprint whatever the inner one does —
+        // which is why fixing one and not the other leaves the leak open and
+        // the suite green.
+        let exporter = OtelExporter::open(
+            OtelConfig::default().with_header("authorization", SECRET),
+            std::env::temp_dir().join("io-harness-otel-debug-arm.db"),
+        )
+        .expect("an exporter opens without touching the store");
+
+        let rendered = format!("{exporter:?}");
+        assert!(
+            !carries_the_secret(&rendered),
+            "OtelExporter's Debug must not print a header value: {rendered}"
+        );
+    }
+
+    #[test]
+    fn control_the_secret_checker_finds_a_secret_that_is_present() {
+        // Without this, both arms above would pass against a checker that
+        // matched nothing at all.
+        assert!(carries_the_secret(&format!(
+            "headers: {{authorization: {SECRET}}}"
+        )));
+        assert!(!carries_the_secret(
+            "OtelConfig { endpoint: \"http://localhost:4318\" }"
+        ));
+    }
+
     #[test]
     fn f9_a_user_scoped_collector_is_read_back_through_the_builder() {
         // The same document, accepted at user scope. `Config::from_toml` is the

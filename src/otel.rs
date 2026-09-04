@@ -45,11 +45,13 @@
 //! [`Session`]: crate::session::Session
 //! [`Observer::event`]: crate::Observer::event
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime};
 
-use crate::observe::{Flow, Observer, RunEvent};
+use crate::observe::{EventKind, Flow, Observer, RunEvent};
+use crate::state::{ProviderCall, StepAttribution, Store};
 use crate::Result;
 
 /// The default OTLP/HTTP endpoint, and the port the specification names.
@@ -102,13 +104,34 @@ const TRACES_PATH: &str = "/v1/traces";
 /// assert_eq!(config.traces_url(), "http://otel-collector.internal:4318/v1/traces");
 /// assert_eq!(config.service_name(), "billing-agent");
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OtelConfig {
     endpoint: String,
     headers: BTreeMap<String, String>,
     service_name: String,
     timeout: Duration,
     max_queue: usize,
+}
+
+impl std::fmt::Debug for OtelConfig {
+    /// Hand-written for the reason [`Compatible`](crate::Compatible) is: a
+    /// collector behind a gateway is addressed by a header, so `headers` is
+    /// where an operator's API key lives, and a derived `Debug` would print it
+    /// verbatim — through this type and through anything holding one that
+    /// derives in turn.
+    ///
+    /// The endpoint, the service and the two bounds are what a misconfiguration
+    /// is diagnosed from. The headers are not printed at all: not their values,
+    /// not their names, and not how many there are. A count narrows which
+    /// gateway is in front of the collector, and a name is often the vendor.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OtelConfig")
+            .field("endpoint", &self.endpoint)
+            .field("service_name", &self.service_name)
+            .field("timeout", &self.timeout)
+            .field("max_queue", &self.max_queue)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for OtelConfig {
@@ -269,10 +292,43 @@ const DEFAULT_MAX_QUEUE: usize = 512;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
 pub struct OtelExporter {
     config: OtelConfig,
     store_path: PathBuf,
+    /// The value every id this exporter derives is mixed with. See `id_salt`.
+    salt: u64,
+    /// The exporter's **own** store, opened on the first read rather than in
+    /// [`OtelExporter::open`].
+    ///
+    /// Lazy for a reason a caller can hit on the first line they write: an
+    /// exporter is usually built before the run that creates the database, and
+    /// [`Store::open`] creates the file it is given. Opening eagerly would
+    /// therefore leave an empty database on disk for every exporter that was
+    /// configured and never used, and would open a file that is not yet the one
+    /// the run will write. Opening at the first read — which happens once, when
+    /// a run ends — means the file opened is the one the run made.
+    ///
+    /// Behind a [`Mutex`] because [`Store`] holds a `rusqlite::Connection`,
+    /// which is `Send` and not `Sync`, and an [`Observer`] must be both.
+    store: Mutex<Option<Store>>,
+    /// Runs in flight, and the spans of finished ones waiting for the transport.
+    pending: Mutex<Pending>,
+    /// Every batch `export_batch` has been handed, encoded.
+    exported: Mutex<Vec<serde_json::Value>>,
+}
+
+/// Hand-written rather than derived, for two reasons. [`Store`] is not
+/// [`Debug`], and a derived implementation would print [`OtelConfig`]'s headers
+/// — which is where a collector's API key is, and a key in a log line is a key
+/// that has left the process.
+impl std::fmt::Debug for OtelExporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OtelExporter")
+            .field("endpoint", &self.config.endpoint())
+            .field("service_name", &self.config.service_name())
+            .field("store_path", &self.store_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OtelExporter {
@@ -281,11 +337,16 @@ impl OtelExporter {
     /// The path is the same one [`Store::open`](crate::state::Store::open) was
     /// given. The exporter opens its own connection to it rather than sharing
     /// the run's, because an observer is `Send + Sync` and a connection is not
-    /// `Sync`.
+    /// `Sync`. Nothing is opened here — see the `store` field for why.
     pub fn open(config: OtelConfig, store_path: impl AsRef<Path>) -> Result<Self> {
+        let store_path = store_path.as_ref().to_path_buf();
         Ok(Self {
+            salt: id_salt(&store_path),
             config,
-            store_path: store_path.as_ref().to_path_buf(),
+            store_path,
+            store: Mutex::new(None),
+            pending: Mutex::new(Pending::default()),
+            exported: Mutex::new(Vec::new()),
         })
     }
 
@@ -298,20 +359,717 @@ impl OtelExporter {
     pub fn store_path(&self) -> &Path {
         &self.store_path
     }
+
+    // -----------------------------------------------------------------------
+    // Locking
+    // -----------------------------------------------------------------------
+
+    /// The pending state, recovering a poisoned lock rather than unwrapping it.
+    ///
+    /// [`Observer::event`] runs on the run's own task, so a panic here would end
+    /// the run — which is the one thing this module promises never to do. A
+    /// poisoned mutex means some earlier `event` call panicked; the state behind
+    /// it is a map of spans, so the worst a recovery costs is one malformed
+    /// trace.
+    fn lock_pending(&self) -> MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // -----------------------------------------------------------------------
+    // Ids
+    // -----------------------------------------------------------------------
+
+    /// The trace every span of `run_id` belongs to.
+    fn trace_id(&self, run_id: i64) -> wire::TraceId {
+        let low = fnv1a(self.salt, &run_id.to_le_bytes());
+        // A second pass over the same input under a different seed and a
+        // different byte order, because two halves derived identically would be
+        // one 64-bit id written twice.
+        let high = fnv1a(low ^ FNV_OFFSET_BASIS, &run_id.to_be_bytes());
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&high.to_be_bytes());
+        out[8..].copy_from_slice(&low.to_be_bytes());
+        // An all-zero trace id is the specification's "invalid" and a collector
+        // drops the span carrying it. Vanishingly unlikely, one line to rule out.
+        if out == [0u8; 16] {
+            out[15] = 1;
+        }
+        out
+    }
+
+    /// The id of one span of `run_id`, from what the span is *about*.
+    ///
+    /// `tag` separates the four kinds so a run span and a step span of the same
+    /// run cannot land on one id; `step` and `ordinal` separate spans of a kind.
+    fn span_id(&self, run_id: i64, tag: u8, step: u32, ordinal: u32) -> wire::SpanId {
+        let mut hash = fnv1a(self.salt, &run_id.to_le_bytes());
+        hash = fnv1a(hash, &[tag]);
+        hash = fnv1a(hash, &step.to_le_bytes());
+        hash = fnv1a(hash, &ordinal.to_le_bytes());
+        let mut out = hash.to_be_bytes();
+        if out == [0u8; 8] {
+            out[7] = 1;
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // The event handlers. Each does the cheap thing and returns.
+    // -----------------------------------------------------------------------
+
+    /// The run's state, created if this is the first event of it.
+    ///
+    /// Created here rather than only at [`EventKind::Started`], so an exporter
+    /// attached to a run already under way — a resume, or a caller that built
+    /// the exporter late — still produces a tree instead of dropping every event
+    /// until a start it will never see.
+    fn run_state<'a>(&self, pending: &'a mut Pending, run_id: i64, now: u64) -> &'a mut RunTrace {
+        let adopted = pending.adopted.remove(&run_id);
+        pending.runs.entry(run_id).or_insert_with(|| {
+            let (trace_id, parent) = match adopted {
+                // A child agent announced by its parent: same trace, and a root
+                // that hangs from the parent's.
+                Some((trace_id, parent)) => (trace_id, Some(parent)),
+                None => (self.trace_id(run_id), None),
+            };
+            RunTrace {
+                trace_id,
+                root: self.span_id(run_id, TAG_RUN, 0, 0),
+                parent,
+                provider: None,
+                started: now,
+                step_started: now,
+                steps: Vec::new(),
+                open_tools: Vec::new(),
+            }
+        })
+    }
+
+    /// [`EventKind::Started`]: the run's root span opens.
+    fn open_run(&self, run_id: i64, provider: &str, now: u64) {
+        let mut pending = self.lock_pending();
+        let run = self.run_state(&mut pending, run_id, now);
+        run.provider = Some(provider.to_string());
+        // A start that arrives for a run this exporter had already inferred from
+        // a later event re-bases the clock: the run began now, whatever the event
+        // that created the entry implied.
+        run.started = now;
+        run.step_started = now;
+    }
+
+    /// [`EventKind::Spawned`]: a child agent joins its parent's trace.
+    ///
+    /// `RunEvent::run_id` is the emitting agent's own id, so a child's events
+    /// arrive under an id this exporter has never seen. This is the one event
+    /// that says which parent it belongs to, and it arrives before the child's
+    /// own [`EventKind::Started`] — the spawn is announced from the parent's
+    /// task, and the child's events start arriving after it.
+    fn adopt(&self, parent_run_id: i64, child_run_id: i64, now: u64) {
+        let mut pending = self.lock_pending();
+        let (trace_id, root) = {
+            let parent = self.run_state(&mut pending, parent_run_id, now);
+            (parent.trace_id, parent.root)
+        };
+        // The child's root hangs from the parent's ROOT and not from the step
+        // span that spawned it. A spawning step is not always committed — a step
+        // that pauses on a deferred child is left uncommitted on purpose so a
+        // resume replays it — so that step span may never be built, and a
+        // `parentSpanId` naming a span nothing exports is a broken trace rather
+        // than a more detailed one. A root always exists.
+        pending.adopted.insert(child_run_id, (trace_id, root));
+    }
+
+    /// [`EventKind::ToolCall`]: a tool span opens.
+    fn announce_tool(&self, run_id: i64, step: u32, name: &str, now: u64) {
+        let mut pending = self.lock_pending();
+        let run = self.run_state(&mut pending, run_id, now);
+        let ordinal = u32::try_from(run.open_tools.len()).unwrap_or(u32::MAX);
+        run.open_tools.push(OpenTool {
+            step,
+            ordinal,
+            name: name.to_string(),
+            started: now,
+        });
+    }
+
+    /// [`EventKind::Step`]: the step span closes, and with it every tool span the
+    /// step opened.
+    fn close_step(&self, run_id: i64, step: u32, now: u64) {
+        {
+            let mut pending = self.lock_pending();
+            let run = self.run_state(&mut pending, run_id, now);
+            let trace_id = run.trace_id;
+            let root = run.root;
+            let start = run.step_started;
+            let tools = std::mem::take(&mut run.open_tools);
+            run.steps.push(StepWindow {
+                step,
+                start,
+                end: now,
+            });
+            // The next step begins where this one ended. There is no step-start
+            // event, and this is the only instant the channel offers for it.
+            run.step_started = now;
+
+            let step_span = self.span_id(run_id, TAG_STEP, step, 0);
+            let mut spans = Vec::with_capacity(tools.len() + 1);
+            spans.push(wire::Span {
+                trace_id,
+                span_id: step_span,
+                parent_span_id: Some(root),
+                name: step_span_name(step),
+                kind: wire::SPAN_KIND_INTERNAL,
+                start_unix_nano: start,
+                end_unix_nano: now,
+                // The convention names no span for one turn of an agent loop.
+                // The operation is still the agent's own — a step is a slice of
+                // the invocation the root span covers — so it carries
+                // `invoke_agent` rather than a fourth value nothing enumerates.
+                attributes: vec![(
+                    wire::ATTR_OPERATION_NAME,
+                    wire::OPERATION_INVOKE_AGENT.into(),
+                )],
+                error: None,
+            });
+            for tool in tools {
+                let span_id = self.span_id(run_id, TAG_TOOL, tool.step, tool.ordinal);
+                spans.push(tool.into_span(trace_id, span_id, step_span, now));
+            }
+            pending.ready.extend(spans);
+        }
+        self.drain(false);
+    }
+
+    /// [`EventKind::Finished`]: the root closes, the store is read, and the run's
+    /// spans go to the transport.
+    fn close_run(&self, run_id: i64, outcome: &str, now: u64) {
+        let run = {
+            let mut pending = self.lock_pending();
+            self.run_state(&mut pending, run_id, now);
+            pending.runs.remove(&run_id)
+        };
+        let Some(run) = run else {
+            return;
+        };
+
+        let mut spans = vec![wire::Span {
+            trace_id: run.trace_id,
+            span_id: run.root,
+            parent_span_id: run.parent,
+            // The convention names an agent span `invoke_agent {agent name}`.
+            // This crate has no agent name to put there — the goal is a prompt,
+            // and a prompt is one of the three things this exporter never sends
+            // — so the name is the operation alone, which is what the convention
+            // says to do when the name is not known.
+            name: wire::OPERATION_INVOKE_AGENT.to_string(),
+            kind: wire::SPAN_KIND_INTERNAL,
+            start_unix_nano: run.started,
+            end_unix_nano: now,
+            attributes: run.root_attributes(),
+            // `then` and not `then_some`: the argument allocates.
+            error: (outcome != OUTCOME_SUCCESS).then(|| outcome.to_string()),
+        }];
+
+        // Everything the channel cannot carry. A failed read exports the spans
+        // built so far rather than nothing: a tree missing its provider calls is
+        // worth more than no tree, and there is nobody to report the failure to
+        // from inside an observer.
+        if let Some((calls, attributions)) = self.read_run(run_id) {
+            spans.extend(self.chat_spans(run_id, &run, &calls, &attributions, now));
+        }
+
+        // A tool announced by a step that never committed. Its step span does not
+        // exist, so it hangs from the root for the same reason a child agent's
+        // root does.
+        for tool in run.open_tools {
+            let span_id = self.span_id(run_id, TAG_TOOL, tool.step, tool.ordinal);
+            spans.push(tool.into_span(run.trace_id, span_id, run.root, now));
+        }
+
+        self.lock_pending().ready.extend(spans);
+        self.drain(true);
+    }
+
+    // -----------------------------------------------------------------------
+    // What the channel cannot carry
+    // -----------------------------------------------------------------------
+
+    /// The two facts a provider span is made of, read through the store's own
+    /// accessors.
+    ///
+    /// No SQL is written here. [`Store::provider_calls`] and
+    /// [`Store::step_attributions`] are public and already carry every column
+    /// this file needs, so there is one query per fact in this crate rather than
+    /// two that can drift — and no public item of this module names `rusqlite`,
+    /// by construction rather than by remembering.
+    ///
+    /// Every failure is swallowed into `None`. An observer has no channel to
+    /// report on and no return value that means anything, and a run whose
+    /// telemetry could fail it would not be telemetry.
+    fn read_run(&self, run_id: i64) -> Option<(Vec<ProviderCall>, Vec<StepAttribution>)> {
+        let mut slot = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            // Checked rather than attempted: `Store::open` creates the file it is
+            // given, and an exporter pointed at a path no run ever wrote must not
+            // leave an empty database behind as the trace of having looked.
+            if !self.store_path.exists() {
+                return None;
+            }
+            *slot = Store::open(&self.store_path).ok();
+        }
+        let store = slot.as_ref()?;
+        Some((
+            store.provider_calls(run_id).ok()?,
+            store.step_attributions(run_id).ok()?,
+        ))
+    }
+
+    /// One `chat {model}` span per `provider_calls` row, placed inside the step
+    /// that made the call.
+    ///
+    /// **Where the time comes from.** The duration is the row's `latency_ms`,
+    /// which is exact per attempt. The position is derived: the step span this
+    /// exporter timed with its own clock, bounded by that step's `provider_ms`,
+    /// with the step's attempts laid end to end in `attempt` order from the start
+    /// of the step — the provider call is the first thing a step does, before any
+    /// tool is dispatched.
+    ///
+    /// **`provider_calls.at` is not used, and not by oversight.** It is
+    /// `datetime('now')`, so one-second resolution, and it is stamped when the
+    /// row is written — after the call rather than before it. Two attempts inside
+    /// one second are indistinguishable by it, which is exactly the ordering it
+    /// appears to offer. It is the wrong precision and the wrong instant.
+    ///
+    /// The consequence, stated rather than hidden: a step's attempts are laid end
+    /// to end rather than each independently placed, because no start instant per
+    /// attempt is recorded anywhere. The durations are real; the gaps are not
+    /// claimed.
+    fn chat_spans(
+        &self,
+        run_id: i64,
+        run: &RunTrace,
+        calls: &[ProviderCall],
+        attributions: &[StepAttribution],
+        run_end: u64,
+    ) -> Vec<wire::Span> {
+        let mut by_step: BTreeMap<u32, Vec<&ProviderCall>> = BTreeMap::new();
+        for call in calls {
+            by_step.entry(call.step).or_default().push(call);
+        }
+
+        let mut out = Vec::with_capacity(calls.len());
+        for (step, mut rows) in by_step {
+            rows.sort_by_key(|call| call.attempt);
+            let (parent, window_start, window_end) = self.step_window(run_id, run, step, run_end);
+            let bound = attributions
+                .iter()
+                .find(|a| a.step == step)
+                .and_then(|a| a.provider_ms)
+                .map_or(window_end, |ms| {
+                    window_start
+                        .saturating_add(millis_to_nanos(ms))
+                        .min(window_end)
+                });
+
+            let mut cursor = window_start;
+            for call in rows {
+                // Clamped so a child span never leaves its parent. The clamp is a
+                // guard rather than a rule: `provider_ms` is measured by the loop
+                // around every attempt of the step, backoff included, so it
+                // covers the sum of their latencies by construction.
+                let end = cursor
+                    .saturating_add(millis_to_nanos(call.latency_ms))
+                    .min(bound.max(cursor));
+                out.push(wire::Span {
+                    trace_id: run.trace_id,
+                    span_id: self.span_id(run_id, TAG_CHAT, step, call.attempt),
+                    parent_span_id: Some(parent),
+                    name: match call.model.as_deref() {
+                        Some(model) => wire::inference_span_name(wire::OPERATION_CHAT, model),
+                        // A provider that did not name a model leaves the span
+                        // named for the operation alone. The alternative is a
+                        // name with a trailing space where the model belongs.
+                        None => wire::OPERATION_CHAT.to_string(),
+                    },
+                    kind: wire::SPAN_KIND_CLIENT,
+                    start_unix_nano: cursor,
+                    end_unix_nano: end,
+                    attributes: chat_attributes(call),
+                    error: call.failure.clone(),
+                });
+                cursor = end;
+            }
+        }
+        out
+    }
+
+    /// Where a step's provider calls hang, and the window they are placed in.
+    ///
+    /// A step with calls and no committed row is the step a run ended on — it
+    /// failed, ran out of budget, or was cancelled — so there is no step span to
+    /// parent to. Those calls hang from the root and occupy the tail of the run,
+    /// which is where they happened.
+    fn step_window(
+        &self,
+        run_id: i64,
+        run: &RunTrace,
+        step: u32,
+        run_end: u64,
+    ) -> (wire::SpanId, u64, u64) {
+        match run.steps.iter().find(|window| window.step == step) {
+            Some(window) => (
+                self.span_id(run_id, TAG_STEP, step, 0),
+                window.start,
+                window.end,
+            ),
+            None => (
+                run.root,
+                run.steps.last().map_or(run.started, |window| window.end),
+                run_end,
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The transport seam
+    // -----------------------------------------------------------------------
+
+    /// Hand finished spans on, when the run ended or the queue filled.
+    ///
+    /// `force` is the run-ended path. The size cap is
+    /// [`OtelConfig::max_queue`], and both are the same handoff — a long run
+    /// does not hold every span it produced, and a finished one does not wait for
+    /// a cap it will never reach.
+    fn drain(&self, force: bool) {
+        let batch = {
+            let mut pending = self.lock_pending();
+            if pending.ready.is_empty() || (!force && pending.ready.len() < self.config.max_queue())
+            {
+                return;
+            }
+            std::mem::take(&mut pending.ready)
+        };
+        self.export_batch(batch);
+    }
+
+    /// Where a finished batch leaves the exporter.
+    ///
+    /// The body is built here because building it is the exporter's job; posting
+    /// it is not, and the request is deliberately not made on the run's own task.
+    /// The transport fills this method in — it receives exactly what it has to
+    /// send, and nothing above it has to change to give it to it.
+    ///
+    /// Until then the encoded batch is retained, bounded, so the exporter's own
+    /// tests can read the tree it built as a collector would see it rather than
+    /// as a private type.
+    fn export_batch(&self, spans: Vec<wire::Span>) {
+        let body = wire::encode(self.config.service_name(), &spans);
+        let mut exported = self.exported.lock().unwrap_or_else(PoisonError::into_inner);
+        if exported.len() >= RETAINED_BATCHES {
+            exported.remove(0);
+        }
+        exported.push(body);
+    }
 }
 
 impl Observer for OtelExporter {
-    fn event(&self, _event: &RunEvent) -> Flow {
+    fn event(&self, event: &RunEvent) -> Flow {
+        // `RunEvent` carries no timestamp, so this is the clock every span here
+        // is timed by, and it is the right one: it is read on the run's own task
+        // at the moment the run says the thing happened. Read once per event
+        // rather than once per span, so a step's close and the next step's open
+        // are the same instant and consecutive step spans abut instead of
+        // overlapping by the cost of a second syscall.
+        let now = wire::unix_nanos(SystemTime::now());
+
+        // Everything below is bookkeeping and a `Vec` push. The one read of the
+        // store happens on `Finished`, once per run, and the request that sends
+        // any of this is not made here at all.
+        match &event.kind {
+            EventKind::Started { provider, .. } => self.open_run(event.run_id, provider, now),
+            EventKind::Spawned { child_run_id, .. } => {
+                self.adopt(event.run_id, *child_run_id, now);
+            }
+            EventKind::ToolCall { name, .. } => {
+                self.announce_tool(event.run_id, event.step, name, now);
+            }
+            EventKind::Step { .. } => self.close_step(event.run_id, event.step, now),
+            EventKind::Finished { outcome, .. } => self.close_run(event.run_id, outcome, now),
+            // `EventKind` is `#[non_exhaustive]`, so an arm like this is
+            // required — and it is also the shape that is wanted: a variant added
+            // in a later release must not need an arm here to leave the run
+            // alone.
+            _ => {}
+        }
+
+        // Always. A watcher does not steer, and an exporter that could cancel a
+        // run would be a telemetry fault with a business consequence.
         Flow::Continue
     }
 }
 
-// The encoding layer. `dead_code` is allowed for the whole module because the
-// exporter's behaviour and its transport land in later tasks of this release:
-// until they do, nothing outside `mod tests` calls any of this, and a warning
-// for that would be a warning about the order the work was done in rather than
-// about the code. The allow comes off when the exporter builds spans.
-#[allow(dead_code)]
+// ---------------------------------------------------------------------------
+// The exporter's own state
+// ---------------------------------------------------------------------------
+
+/// The outcome string that is not an error.
+///
+/// Everything else `runs.outcome` can hold — `failed`, `cancelled`, `stalled`,
+/// `budget` — is a run that did not do what it was asked, and a root span that
+/// says so is what a dashboard filters on.
+const OUTCOME_SUCCESS: &str = "success";
+
+/// Encoded batches kept by the seam above.
+///
+/// A bound rather than a `Vec` that grows for the life of a long-lived exporter.
+/// The transport replaces the retention entirely.
+const RETAINED_BATCHES: usize = 16;
+
+/// Nanoseconds in a millisecond. Every duration the store records is in
+/// milliseconds and every timestamp OTLP carries is in nanoseconds.
+const NANOS_PER_MILLI: u64 = 1_000_000;
+
+fn millis_to_nanos(ms: u64) -> u64 {
+    ms.saturating_mul(NANOS_PER_MILLI)
+}
+
+/// A step span's name.
+///
+/// The convention names inference and tool spans and nothing else, so this one
+/// is this crate's own. It is the step number because that is what a reader
+/// correlates with `steps.step` in the trace the store keeps.
+fn step_span_name(step: u32) -> String {
+    format!("step {step}")
+}
+
+/// What a span id is derived from beside the run, the step and an ordinal. One
+/// byte each, so a run span and a step span of one run cannot land on one id.
+const TAG_RUN: u8 = b'r';
+const TAG_STEP: u8 = b's';
+const TAG_TOOL: u8 = b't';
+const TAG_CHAT: u8 = b'c';
+
+/// Runs in flight and spans waiting to be sent, under one lock.
+///
+/// One lock rather than three, because every handler touches more than one of
+/// these and a handler that took two locks would be a handler with an order to
+/// get wrong.
+#[derive(Debug, Default)]
+struct Pending {
+    /// Runs whose root span is open, by the run's own id.
+    runs: HashMap<i64, RunTrace>,
+    /// A child agent a parent has announced and whose own events have not
+    /// arrived yet: the trace it joins, and the span its root hangs from.
+    adopted: HashMap<i64, (wire::TraceId, wire::SpanId)>,
+    /// Finished spans not yet handed to the transport.
+    ready: Vec<wire::Span>,
+}
+
+/// A run this exporter has seen the start of and not the end.
+#[derive(Debug)]
+struct RunTrace {
+    trace_id: wire::TraceId,
+    root: wire::SpanId,
+    /// The span the root hangs from: a child agent's parent run, or nothing.
+    parent: Option<wire::SpanId>,
+    /// The provider [`EventKind::Started`] named, or `None` for a run this
+    /// exporter joined after it had begun.
+    provider: Option<String>,
+    started: u64,
+    /// When the step now running began: the run's start for the first step, and
+    /// the close of the previous step after that.
+    step_started: u64,
+    /// Every committed step, in the order it closed.
+    steps: Vec<StepWindow>,
+    /// Tools announced during the step now running.
+    open_tools: Vec<OpenTool>,
+}
+
+impl RunTrace {
+    fn root_attributes(&self) -> Vec<(&'static str, wire::AttrValue)> {
+        let mut attributes = vec![(
+            wire::ATTR_OPERATION_NAME,
+            wire::OPERATION_INVOKE_AGENT.into(),
+        )];
+        if let Some(provider) = &self.provider {
+            attributes.push((
+                wire::ATTR_PROVIDER_NAME,
+                provider_attribute(provider).into(),
+            ));
+        }
+        attributes
+    }
+}
+
+/// A committed step's span, as this exporter's clock measured it.
+#[derive(Debug, Clone, Copy)]
+struct StepWindow {
+    step: u32,
+    start: u64,
+    end: u64,
+}
+
+/// A tool announced and not yet closed.
+#[derive(Debug)]
+struct OpenTool {
+    step: u32,
+    ordinal: u32,
+    name: String,
+    started: u64,
+}
+
+impl OpenTool {
+    /// Close this tool at `end`, under `parent`.
+    ///
+    /// **A tool span ends when the step that dispatched it closes**, because
+    /// there is no tool-result event to end it at: [`EventKind::ToolCall`] is
+    /// emitted before the result is known, carries no call id, and has no twin.
+    /// That over-states a tool that finished early, and it is the truthful shape
+    /// for a step that dispatched several at once — which this crate does. The
+    /// tidier alternative, ending each tool where the next one was announced,
+    /// invents a serial order a parallel read does not have.
+    ///
+    /// For the same reason a tool span never carries an error: nothing on the
+    /// channel says whether the call succeeded.
+    fn into_span(
+        self,
+        trace_id: wire::TraceId,
+        span_id: wire::SpanId,
+        parent: wire::SpanId,
+        end: u64,
+    ) -> wire::Span {
+        let name = wire::tool_span_name(&self.name);
+        wire::Span {
+            trace_id,
+            span_id,
+            parent_span_id: Some(parent),
+            name,
+            kind: wire::SPAN_KIND_INTERNAL,
+            start_unix_nano: self.started,
+            end_unix_nano: end,
+            attributes: vec![
+                (
+                    wire::ATTR_OPERATION_NAME,
+                    wire::OPERATION_EXECUTE_TOOL.into(),
+                ),
+                (wire::ATTR_TOOL_NAME, self.name.into()),
+            ],
+            error: None,
+        }
+    }
+}
+
+/// `gen_ai.usage.*`, `gen_ai.request.model` and the rest, from one
+/// `provider_calls` row.
+///
+/// The numbers come from the row and not from
+/// [`EventKind::Step`](crate::EventKind::Step)'s `tokens`, which is the step's
+/// total across every attempt it made. A span is one call, and a step that
+/// retried twice is three calls whose costs a single aggregate cannot be split
+/// back into.
+fn chat_attributes(call: &ProviderCall) -> Vec<(&'static str, wire::AttrValue)> {
+    let mut attributes = vec![
+        (wire::ATTR_OPERATION_NAME, wire::OPERATION_CHAT.into()),
+        (
+            wire::ATTR_PROVIDER_NAME,
+            provider_attribute(&call.provider).into(),
+        ),
+    ];
+    if let Some(model) = call.model.as_deref() {
+        // The store keeps one model name per call — the one the provider
+        // reported — and both keys carry it. The convention defines an inference
+        // span's *name* over `gen_ai.request.model`, and this crate records no
+        // second, requested name to put there; a span named `chat` with no model
+        // would lose the fact the name exists to carry.
+        attributes.push((wire::ATTR_REQUEST_MODEL, model.into()));
+        attributes.push((wire::ATTR_RESPONSE_MODEL, model.into()));
+    }
+    if let Some(usage) = call.usage {
+        attributes.push((wire::ATTR_INPUT_TOKENS, usage.prompt_tokens.into()));
+        attributes.push((wire::ATTR_OUTPUT_TOKENS, usage.completion_tokens.into()));
+    }
+    attributes
+}
+
+/// `gen_ai.provider.name` for a provider recorded by
+/// [`Provider::name`](crate::Provider::name).
+///
+/// The convention enumerates a fixed list of vendors and a value from it is a
+/// claim about *whose* API answered. This crate calls Anthropic and OpenAI
+/// directly, and its own name for each already spells the convention's value, so
+/// those two arms are an agreement between two vocabularies rather than a
+/// translation — written out so that the day either side is renamed is a line
+/// changed here rather than a wrong value found on a dashboard.
+///
+/// Everything else carries this crate's own provider id: OpenRouter, every
+/// `Compatible` endpoint, a `Fallback`'s combined label. A gateway is not the
+/// vendor behind it, and reporting `openai` for a proxy that may or may not be
+/// serving an OpenAI model is a false attribution no consumer of the trace can
+/// detect. No unlisted provider is ever mapped onto a listed value.
+fn provider_attribute(provider: &str) -> &str {
+    match provider {
+        CONVENTION_ANTHROPIC => CONVENTION_ANTHROPIC,
+        CONVENTION_OPENAI => CONVENTION_OPENAI,
+        this_crates_own => this_crates_own,
+    }
+}
+
+/// The convention's value for Anthropic, which is also this crate's.
+const CONVENTION_ANTHROPIC: &str = "anthropic";
+/// The convention's value for OpenAI, which is also this crate's.
+const CONVENTION_OPENAI: &str = "openai";
+
+// ---------------------------------------------------------------------------
+// Ids, derived rather than drawn
+// ---------------------------------------------------------------------------
+
+/// FNV-1a's 64-bit offset basis.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a's 64-bit prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a over `bytes`, continuing from `seed`.
+///
+/// Eight lines rather than a dependency, and hand-written rather than
+/// `std::hash::DefaultHasher`: that hasher is documented as unstable across Rust
+/// releases, so ids built from it would move when the toolchain moved and two
+/// builds of this crate would disagree about which trace a run belongs to.
+/// FNV-1a is a fixed function of its input for ever.
+///
+/// It is not a cryptographic hash and nothing here wants one. An id is an
+/// identifier, not a secret; the property required is that two different facts
+/// of one run rarely land on the same 64 bits.
+fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
+    let mut hash = seed;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// The value every id from one exporter is mixed with.
+///
+/// **Determinism is the feature here, not the compromise.** An id is a pure
+/// function of the run, the kind of span, the step and an ordinal — so a tool
+/// span built at one event names the parent step span that does not exist yet
+/// without the exporter keeping a table of ids, a span flushed in one batch and
+/// referenced from another agree, and a test can predict the tree instead of
+/// reading it back. Random ids would need every one of those to become a lookup.
+///
+/// What determinism must not mean is that two different runs share a trace, so
+/// the salt carries three things a second run cannot repeat: the store's path,
+/// which separates two runs both numbered 1 in two databases; this process's id;
+/// and the instant the exporter was built, which separates two processes a pid
+/// was recycled between and two exporters inside one process.
+fn id_salt(store_path: &Path) -> u64 {
+    let salt = fnv1a(FNV_OFFSET_BASIS, store_path.to_string_lossy().as_bytes());
+    let salt = fnv1a(salt, &std::process::id().to_le_bytes());
+    fnv1a(salt, &wire::unix_nanos(SystemTime::now()).to_le_bytes())
+}
+
+// The encoding layer. Everything here has a caller above: the exporter builds
+// spans out of these types and hands the encoded envelope to its transport seam.
 mod wire {
     use std::fmt::Write as _;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -344,6 +1102,12 @@ mod wire {
     /// The documentation and the implementation are checked against **this**
     /// slice rather than against a second list typed into a test, because two
     /// lists written twice agree until the day somebody edits one of them.
+    ///
+    /// Its one consumer is that check. Each of the eight keys has a caller in
+    /// the exporter or the encoder above; the *list* of them has nothing to do
+    /// at run time, so it is compiled where it is used rather than shipped with
+    /// an `allow` explaining why nothing calls it.
+    #[cfg(test)]
     pub const GENAI_ATTRIBUTES: &[&str] = &[
         ATTR_OPERATION_NAME,
         ATTR_PROVIDER_NAME,
@@ -1079,5 +1843,633 @@ conventions. The prompt is not sent.
 
         // The other half: the matcher must not report a list that agrees.
         assert!(attribute_lists_match(&implemented, &implemented).is_ok());
+    }
+}
+
+/// F2 and F3 of 0.78.0: the span tree a run produces, and where its numbers come
+/// from.
+///
+/// These live inside the crate because the tree is only readable from inside it.
+/// The exporter's finished spans leave through a crate-private seam, and making
+/// that seam public to test it would put a transport detail in
+/// `docs/public-api.txt` — so the assertions are made where the seam is, on the
+/// **encoded** batch, which is the shape a collector receives rather than a
+/// private type's fields. `tests/otel_spans.rs` carries the arms that are
+/// reachable from outside: that the exporter is an `Observer`, that it is `Send +
+/// Sync`, that it writes no SQL, and that a run is the same run with it attached.
+///
+/// Every run below is driven through the real loop against a file-backed store,
+/// so nothing here mocks the harness to itself and the exporter reads the
+/// database the run really wrote.
+#[cfg(test)]
+mod span_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::{json, Value};
+
+    use super::*;
+    use crate::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
+    use crate::{
+        run_with_observed, ApproveAll, Error, Policy, Provider, RetryPolicy, RunOutcome,
+        TaskContract, Verification,
+    };
+
+    // -----------------------------------------------------------------------
+    // Scaffolding
+    // -----------------------------------------------------------------------
+
+    /// What the mock does on one turn.
+    enum Turn {
+        /// Answer with these tool calls.
+        Calls(Vec<ToolCall>),
+        /// Fail with a retryable 503, so the loop retries and the next turn
+        /// serves the retry. This is how a step with two `provider_calls` rows is
+        /// reached without a socket.
+        Failure,
+    }
+
+    /// Every answered turn reports this, so a token assertion is a fact about the
+    /// wiring rather than about arithmetic.
+    ///
+    /// The three numbers are deliberately not interchangeable: the prompt and the
+    /// completion are what a provider span carries, and the total is what the
+    /// event channel carries. A fixture where `prompt + completion` also equalled
+    /// something the channel reports would let a span built from the wrong source
+    /// pass.
+    const PROMPT_TOKENS: u64 = 1_000;
+    const COMPLETION_TOKENS: u64 = 100;
+    const TOTAL_TOKENS: u64 = 1_400;
+
+    /// The model every answered turn reports, and therefore the model half of
+    /// every inference span's name.
+    const MODEL: &str = "model-a";
+
+    /// Long enough that `provider_calls.latency_ms` is a number rather than a
+    /// rounding of zero, short enough that a suite does not notice.
+    const CALL_MS: u64 = 15;
+
+    struct Mock {
+        script: Vec<Turn>,
+        at: AtomicUsize,
+    }
+
+    impl Mock {
+        fn new(script: Vec<Turn>) -> Self {
+            Self {
+                script,
+                at: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Provider for Mock {
+        async fn complete(&self, _req: CompletionRequest) -> crate::Result<CompletionResponse> {
+            let i = self.at.fetch_add(1, Ordering::SeqCst);
+            // Before the branch, so a failed attempt is measured too: its row
+            // carries a latency the exporter has to place like any other.
+            tokio::time::sleep(Duration::from_millis(CALL_MS)).await;
+            match self.script.get(i) {
+                Some(Turn::Failure) => Err(Error::provider_status(503, None, "unavailable")),
+                other => Ok(CompletionResponse {
+                    tool_calls: match other {
+                        Some(Turn::Calls(calls)) => calls.clone(),
+                        _ => Vec::new(),
+                    },
+                    text: Some("working".into()),
+                    usage: Some(Usage {
+                        prompt_tokens: PROMPT_TOKENS,
+                        completion_tokens: COMPLETION_TOKENS,
+                        total_tokens: TOTAL_TOKENS,
+                        ..Default::default()
+                    }),
+                    model: Some(MODEL.into()),
+                    finish_reason: Some("stop".into()),
+                    ..Default::default()
+                }),
+            }
+        }
+
+        fn name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// The channel's own account of what a step spent, so a provider span's
+    /// numbers can be compared against the thing they must *not* have come from.
+    #[derive(Default)]
+    struct Recorder {
+        step_tokens: Mutex<Vec<u64>>,
+    }
+
+    impl Observer for Recorder {
+        fn event(&self, event: &RunEvent) -> Flow {
+            if let EventKind::Step { tokens, .. } = &event.kind {
+                self.step_tokens.lock().unwrap().push(*tokens);
+            }
+            Flow::Continue
+        }
+    }
+
+    /// One run, two watchers. `run_with_observed` takes one observer, and this
+    /// test needs the exporter's spans and the channel's numbers from the same
+    /// run — two runs would be two sets of ids and two sets of timings.
+    struct Both<'a>(&'a OtelExporter, &'a Recorder);
+
+    impl Observer for Both<'_> {
+        fn event(&self, event: &RunEvent) -> Flow {
+            self.0.event(event);
+            self.1.event(event)
+        }
+    }
+
+    fn write(path: &str, content: &str) -> ToolCall {
+        ToolCall {
+            name: "write_file".into(),
+            arguments: json!({ "path": path, "content": content }),
+        }
+    }
+
+    /// A workspace whose gate is satisfied by writing `NOTES.md`.
+    fn contract(root: &Path) -> TaskContract {
+        TaskContract::workspace("write the notes", root)
+            .with_verification(Verification::WorkspaceFileContains {
+                file: "NOTES.md".into(),
+                needle: "done".into(),
+            })
+            .with_max_steps(4)
+            .with_retry_policy(RetryPolicy {
+                base: Duration::ZERO,
+                max: Duration::ZERO,
+            })
+    }
+
+    /// The store's own directory, kept out of the workspace so the agent cannot
+    /// see the database it is being recorded in.
+    struct Bed {
+        workspace: tempfile::TempDir,
+        /// Held only so the directory outlives the store file inside it.
+        _db_dir: tempfile::TempDir,
+        store: Store,
+        path: PathBuf,
+    }
+
+    fn bed() -> Bed {
+        let workspace = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let path = db_dir.path().join("runs.db");
+        let store = Store::open(&path).unwrap();
+        Bed {
+            workspace,
+            _db_dir: db_dir,
+            store,
+            path,
+        }
+    }
+
+    /// Drive `script` to a successful two-step run, with `exporter` and
+    /// `recorder` both watching.
+    async fn drive(
+        bed: &Bed,
+        script: Vec<Turn>,
+        exporter: &OtelExporter,
+        recorder: &Recorder,
+    ) -> i64 {
+        let provider = Mock::new(script);
+        let result = run_with_observed(
+            &contract(bed.workspace.path()),
+            &provider,
+            &bed.store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &Both(exporter, recorder),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, RunOutcome::Success { steps: 2 });
+        result.run_id
+    }
+
+    /// The two turns that satisfy the gate: one step that edits, one that writes
+    /// the file the verification reads.
+    fn two_steps() -> Vec<Turn> {
+        vec![
+            Turn::Calls(vec![write("src.txt", "one\n")]),
+            Turn::Calls(vec![write("NOTES.md", "done")]),
+        ]
+    }
+
+    fn exporter_for(bed: &Bed) -> OtelExporter {
+        OtelExporter::open(OtelConfig::default(), &bed.path).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Reading the exported batches the way a collector would
+    // -----------------------------------------------------------------------
+
+    /// Every span the exporter handed its transport seam, flattened out of the
+    /// envelopes it built.
+    fn exported_spans(exporter: &OtelExporter) -> Vec<Value> {
+        exporter
+            .exported
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|body| {
+                body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn named<'a>(spans: &'a [Value], name: &str) -> Vec<&'a Value> {
+        spans
+            .iter()
+            .filter(|span| span["name"] == json!(name))
+            .collect()
+    }
+
+    fn one_named<'a>(spans: &'a [Value], name: &str) -> &'a Value {
+        let found = named(spans, name);
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one span named {name:?}, got {}: {:?}",
+            found.len(),
+            spans.iter().map(|s| &s["name"]).collect::<Vec<_>>()
+        );
+        found[0]
+    }
+
+    fn id(span: &Value) -> &str {
+        span["spanId"].as_str().expect("every span carries an id")
+    }
+
+    fn parent(span: &Value) -> Option<&str> {
+        span.get("parentSpanId").and_then(Value::as_str)
+    }
+
+    /// A timestamp field, as the number the decimal string carries.
+    fn nanos(span: &Value, key: &str) -> u64 {
+        span[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("{key} is a decimal string: {span}"))
+            .parse()
+            .expect("a decimal string parses")
+    }
+
+    /// An attribute's value, whichever of the two shapes it takes.
+    fn attribute<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
+        span["attributes"]
+            .as_array()?
+            .iter()
+            .find(|attr| attr["key"] == json!(key))
+            .map(|attr| &attr["value"])
+    }
+
+    fn int_attribute(span: &Value, key: &str) -> Option<u64> {
+        attribute(span, key)?["intValue"].as_str()?.parse().ok()
+    }
+
+    // -----------------------------------------------------------------------
+    // F2 — the tree
+    // -----------------------------------------------------------------------
+
+    /// F2. One root, one span per committed step, one per tool call, and the
+    /// names the convention fixes.
+    #[tokio::test]
+    async fn f2_a_run_produces_a_root_span_a_span_per_step_and_a_span_per_tool_call() {
+        let bed = bed();
+        let exporter = exporter_for(&bed);
+        let recorder = Recorder::default();
+        drive(&bed, two_steps(), &exporter, &recorder).await;
+
+        let spans = exported_spans(&exporter);
+        assert!(!spans.is_empty(), "the run exported nothing");
+
+        // The root. Named for the operation alone — this crate has no agent name
+        // to put after it, and the goal is a prompt, which never leaves.
+        let root = one_named(&spans, "invoke_agent");
+        assert_eq!(root["kind"], json!(1));
+        assert_eq!(parent(root), None, "the root span has no parent");
+
+        // One per committed step, each under the root.
+        for step in ["step 1", "step 2"] {
+            let span = one_named(&spans, step);
+            assert_eq!(span["kind"], json!(1));
+            assert_eq!(parent(span), Some(id(root)), "{step} hangs from the root");
+        }
+        assert!(
+            named(&spans, "step 3").is_empty(),
+            "a run of two steps produces two step spans"
+        );
+
+        // One per `ToolCall`, INTERNAL because the tool runs in this process,
+        // each under the step that dispatched it.
+        let tools = named(&spans, "execute_tool write_file");
+        assert_eq!(tools.len(), 2, "one tool span per announced call");
+        let steps: Vec<&str> = ["step 1", "step 2"]
+            .iter()
+            .map(|name| id(one_named(&spans, name)))
+            .collect();
+        for tool in &tools {
+            assert_eq!(tool["kind"], json!(1));
+            let parent = parent(tool).expect("a tool span names its step");
+            assert!(
+                steps.contains(&parent),
+                "a tool span hangs from a step span, got {parent}"
+            );
+        }
+    }
+
+    /// F2. One `chat {model}` span of kind CLIENT per `provider_calls` row — the
+    /// count and the name are the store's, not the channel's.
+    #[tokio::test]
+    async fn f2_one_client_span_per_provider_call_row_named_for_its_model() {
+        let bed = bed();
+        let exporter = exporter_for(&bed);
+        let recorder = Recorder::default();
+        let run_id = drive(&bed, two_steps(), &exporter, &recorder).await;
+
+        let rows = bed.store.provider_calls(run_id).unwrap();
+        assert_eq!(rows.len(), 2, "two steps, one call each: {rows:?}");
+
+        let spans = exported_spans(&exporter);
+        let inference: Vec<&Value> = spans
+            .iter()
+            .filter(|span| span["kind"] == json!(3))
+            .collect();
+        assert_eq!(
+            inference.len(),
+            rows.len(),
+            "one CLIENT span per recorded call"
+        );
+        for span in &inference {
+            assert_eq!(
+                span["name"],
+                json!(format!("chat {MODEL}")),
+                "an inference span is named operation then requested model"
+            );
+            assert_eq!(
+                attribute(span, "gen_ai.request.model"),
+                Some(&json!({ "stringValue": MODEL })),
+            );
+        }
+
+        // And the tool spans are not CLIENT: a tool runs here, a provider call
+        // does not, and that difference is what lets a dashboard separate time
+        // spent waiting from time spent working.
+        for tool in named(&spans, "execute_tool write_file") {
+            assert_eq!(tool["kind"], json!(1));
+        }
+    }
+
+    /// F2. One trace over the whole run, and every span but the root names a
+    /// parent that is in the same export.
+    #[tokio::test]
+    async fn f2_one_trace_id_covers_the_run_and_every_span_but_the_root_names_its_parent() {
+        let bed = bed();
+        let exporter = exporter_for(&bed);
+        let recorder = Recorder::default();
+        drive(&bed, two_steps(), &exporter, &recorder).await;
+
+        let spans = exported_spans(&exporter);
+        assert!(!spans.is_empty(), "the run exported nothing");
+        let trace = spans[0]["traceId"].clone();
+        assert!(trace.as_str().is_some_and(|t| t.len() == 32));
+        for span in &spans {
+            assert_eq!(span["traceId"], trace, "one trace id spans the whole run");
+        }
+
+        let ids: Vec<&str> = spans.iter().map(id).collect();
+        let rootless: Vec<&Value> = spans.iter().filter(|span| parent(span).is_none()).collect();
+        assert_eq!(rootless.len(), 1, "exactly one span has no parent");
+        assert_eq!(rootless[0]["name"], json!("invoke_agent"));
+
+        for span in &spans {
+            if let Some(parent) = parent(span) {
+                assert!(
+                    ids.contains(&parent),
+                    "{} names a parent nothing exported: {parent}",
+                    span["name"]
+                );
+            }
+        }
+    }
+
+    /// F2. A step's attempts lie inside that step's span, in `attempt` order,
+    /// end to end, and each lasts its own row's `latency_ms`.
+    ///
+    /// The one assertion here that looks like a duration is arithmetic over a
+    /// number the store already holds, not a measurement of the machine this
+    /// runs on: the span is *defined* as `latency_ms` long, and a run on a slow
+    /// CI box moves where it sits rather than how long it is.
+    #[tokio::test]
+    async fn f2_the_attempts_of_a_step_lie_inside_it_end_to_end_in_attempt_order() {
+        let bed = bed();
+        let exporter = exporter_for(&bed);
+        let recorder = Recorder::default();
+        // One failed attempt first, so step 1 has two rows and the ordering rule
+        // has something to order. The retry is served by the next scripted turn.
+        let mut script = vec![Turn::Failure];
+        script.extend(two_steps());
+        let run_id = drive(&bed, script, &exporter, &recorder).await;
+
+        let rows = bed.store.provider_calls(run_id).unwrap();
+        let first_step: Vec<_> = rows.iter().filter(|row| row.step == 1).collect();
+        assert_eq!(
+            first_step.len(),
+            2,
+            "the failed attempt is recorded too: {rows:?}"
+        );
+
+        let spans = exported_spans(&exporter);
+        let step_one = one_named(&spans, "step 1");
+        let (step_start, step_end) = (
+            nanos(step_one, "startTimeUnixNano"),
+            nanos(step_one, "endTimeUnixNano"),
+        );
+
+        // The attempts of step 1, in the order the exporter placed them.
+        let mut placed: Vec<&Value> = spans
+            .iter()
+            .filter(|span| span["kind"] == json!(3) && parent(span) == Some(id(step_one)))
+            .collect();
+        placed.sort_by_key(|span| nanos(span, "startTimeUnixNano"));
+        assert_eq!(placed.len(), 2, "both attempts hang from their step");
+
+        // The failed attempt is first, and it says so: no model on the wire, and
+        // an error type beside an error status.
+        assert_eq!(placed[0]["name"], json!("chat"));
+        assert_eq!(placed[0]["status"]["code"], json!(2));
+        assert!(attribute(placed[0], "error.type").is_some());
+        assert_eq!(placed[1]["name"], json!(format!("chat {MODEL}")));
+        assert!(placed[1].get("status").is_none());
+
+        let mut previous_end = step_start;
+        for (span, row) in placed.iter().zip(first_step.iter()) {
+            let start = nanos(span, "startTimeUnixNano");
+            let end = nanos(span, "endTimeUnixNano");
+            assert!(
+                start >= previous_end,
+                "attempts are laid end to end and do not overlap: {start} < {previous_end}"
+            );
+            assert!(
+                start >= step_start && end <= step_end,
+                "an attempt lies inside the step span it was made in"
+            );
+            assert_eq!(
+                end - start,
+                row.latency_ms * 1_000_000,
+                "an attempt's span is exactly that row's latency_ms"
+            );
+            previous_end = end;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // F3 — the numbers come from the store
+    // -----------------------------------------------------------------------
+
+    /// F3. A provider span's token counts are the row's prompt and completion
+    /// split, which is a fact the event channel cannot carry: `Step { tokens }`
+    /// is one number for the whole step.
+    #[tokio::test]
+    async fn f3_a_provider_spans_tokens_are_the_rows_split_not_the_steps_aggregate() {
+        let bed = bed();
+        let exporter = exporter_for(&bed);
+        let recorder = Recorder::default();
+        let run_id = drive(&bed, two_steps(), &exporter, &recorder).await;
+
+        let rows = bed.store.provider_calls(run_id).unwrap();
+        let usage = rows[0].usage.expect("the mock reported usage");
+        let channel = recorder.step_tokens.lock().unwrap().clone();
+        assert_eq!(channel, vec![TOTAL_TOKENS, TOTAL_TOKENS]);
+
+        let spans = exported_spans(&exporter);
+        let inference: Vec<&Value> = spans
+            .iter()
+            .filter(|span| span["kind"] == json!(3))
+            .collect();
+        assert!(!inference.is_empty());
+
+        for span in inference {
+            assert_eq!(
+                int_attribute(span, "gen_ai.usage.input_tokens"),
+                Some(usage.prompt_tokens),
+            );
+            assert_eq!(
+                int_attribute(span, "gen_ai.usage.output_tokens"),
+                Some(usage.completion_tokens),
+            );
+            // The point of reading the store at all: neither number is the one
+            // the channel announced, and a span built from `Step { tokens }`
+            // would carry that instead.
+            assert_ne!(
+                int_attribute(span, "gen_ai.usage.input_tokens"),
+                Some(TOTAL_TOKENS),
+            );
+        }
+    }
+
+    /// F3. The exporter holds its own store and never the run's, so it reads a
+    /// run written by a handle it has no reference to — including one it never
+    /// watched.
+    #[tokio::test]
+    async fn f3_the_exporter_reads_the_store_through_a_connection_of_its_own() {
+        let bed = bed();
+        let exporter = exporter_for(&bed);
+        let recorder = Recorder::default();
+        let run_id = drive(&bed, two_steps(), &exporter, &recorder).await;
+
+        // Two handles over one file, both live: the run's and the exporter's.
+        // `read_run` is what the exporter used, and it works while `bed.store` is
+        // still open because a second `Store` on a WAL file is a reader, not a
+        // borrow of the writer.
+        let (calls, attributions) = exporter
+            .read_run(run_id)
+            .expect("the exporter's own store reads the run's rows");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(attributions.len(), 2);
+        assert!(attributions.iter().all(|a| a.provider_ms.is_some()));
+        assert_eq!(bed.store.provider_calls(run_id).unwrap(), calls);
+    }
+
+    /// F3's other half, and the reason `open` does not touch the file: an
+    /// exporter built against a path no run has written yet reads nothing and
+    /// leaves nothing behind.
+    #[test]
+    fn f3_an_exporter_opened_before_the_store_exists_creates_no_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-yet.db");
+
+        let exporter = OtelExporter::open(OtelConfig::default(), &path).unwrap();
+        assert_eq!(exporter.store_path(), path);
+        assert!(exporter.read_run(1).is_none());
+        assert!(
+            !path.exists(),
+            "opening an exporter must not create the run's database"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ids
+    // -----------------------------------------------------------------------
+
+    /// Determinism is the property the exporter leans on: a tool span names the
+    /// step span that does not exist yet, so the same fact must always yield the
+    /// same id.
+    #[test]
+    fn f2_an_id_is_a_function_of_the_fact_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter =
+            OtelExporter::open(OtelConfig::default(), dir.path().join("runs.db")).unwrap();
+
+        assert_eq!(exporter.trace_id(7), exporter.trace_id(7));
+        assert_ne!(exporter.trace_id(7), exporter.trace_id(8));
+        assert_eq!(
+            exporter.span_id(7, TAG_STEP, 2, 0),
+            exporter.span_id(7, TAG_STEP, 2, 0)
+        );
+        // The tag is what keeps a run's four kinds of span apart, and the step
+        // and the ordinal keep spans of one kind apart.
+        assert_ne!(
+            exporter.span_id(7, TAG_STEP, 2, 0),
+            exporter.span_id(7, TAG_TOOL, 2, 0)
+        );
+        assert_ne!(
+            exporter.span_id(7, TAG_CHAT, 2, 0),
+            exporter.span_id(7, TAG_CHAT, 2, 1)
+        );
+        assert_ne!(
+            exporter.span_id(7, TAG_RUN, 0, 0),
+            exporter.span_id(8, TAG_RUN, 0, 0)
+        );
+    }
+
+    /// And determinism must not reach across exporters: two runs numbered the
+    /// same in two stores are two traces.
+    #[test]
+    fn f2_two_exporters_do_not_agree_on_a_run_ids_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = OtelExporter::open(OtelConfig::default(), dir.path().join("a.db")).unwrap();
+        let two = OtelExporter::open(OtelConfig::default(), dir.path().join("b.db")).unwrap();
+
+        assert_ne!(one.trace_id(1), two.trace_id(1));
+        assert_ne!(one.span_id(1, TAG_RUN, 0, 0), two.span_id(1, TAG_RUN, 0, 0));
+    }
+
+    /// The provider attribute takes the convention's value only where this crate
+    /// talks to that vendor, and never maps an unlisted provider onto a listed
+    /// one.
+    #[test]
+    fn f2_a_provider_attribute_is_the_conventions_value_or_this_crates_own() {
+        assert_eq!(provider_attribute("anthropic"), "anthropic");
+        assert_eq!(provider_attribute("openai"), "openai");
+        // A gateway is not the vendor behind it.
+        assert_eq!(provider_attribute("openrouter"), "openrouter");
+        assert_eq!(provider_attribute("my-proxy"), "my-proxy");
+        assert_eq!(provider_attribute("mock"), "mock");
     }
 }
