@@ -53,11 +53,11 @@ build with either feature on, with both on, and unchanged at 327 with
   over MCP on stdio. `serve_mcp` is the unattended door and uses `DenyAll`;
   `serve_mcp_with` takes an `Approver`. `McpServerConfig` names the workspace root,
   the store, the policy and any registered tools the operator chooses to include.
-- `MCP_SERVER_UNSERVED`, naming the tools a served session cannot honour —
+- `MCP_SERVER_UNSERVED`, naming the tools a served session does not offer —
   `ask_question`, `ask_questions`, `propose_plan`, `spawn`, `send_message`,
-  `read_messages` and `read_skill`. The served set and that list partition the
-  catalogue, and a test asserts it, so a tool added later lands in one of them
-  rather than in neither.
+  `read_messages`, `read_skill`, `remember`, `forget` and `todo_write`. The
+  served set is written out by name and pinned by a test, so a tool added in a
+  later release fails that test until somebody decides which side it belongs on.
 - `GENAI_CONVENTIONS` and `OTEL_DEFAULT_ENDPOINT`, naming the convention revision
   this crate follows and the port the specification names.
 - Two clippy polarities in CI, `--features otel` and `--features mcp-server`,
@@ -85,6 +85,12 @@ build with either feature on, with both on, and unchanged at 327 with
   instead, because there is no human at the far end of a pipe. A stdio pipe carries
   no identity, so whoever can spawn the server can call whatever the policy allows;
   the operator who starts it is the one who decides what that is.
+- The three tools the policy deliberately does not see — `remember`, `forget` and
+  `todo_write`, which write to the harness's own store rather than to the
+  workspace — are **not served**. Their only boundary is the plan gate, and a
+  served session has none, so serving them would have put two disabled boundaries
+  behind a write that reaches the durable memory recalled into every later run
+  over the same workspace.
 - The exporter sends no transcript content. `gen_ai.input.messages`,
   `gen_ai.output.messages` and `gen_ai.system_instructions` are opt-in in the
   convention and are not implemented here at all — absent rather than defaulted

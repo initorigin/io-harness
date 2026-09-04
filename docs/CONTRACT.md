@@ -4391,10 +4391,24 @@ crate's refusal text. A JSON-RPC error means the request could not be processed;
 a denial means it was processed and the answer is no.
 
 **What is not served**, named in `MCP_SERVER_UNSERVED`: `ask_question`,
-`ask_questions`, `propose_plan`, `spawn`, `send_message`, `read_messages` and
-`read_skill`. Each needs something a served session has not got — a person to
-answer, a plan gate to decide, children to talk to, or a server-side document a
-remote caller should not be handed. Offering one and refusing every call to it
+`ask_questions`, `propose_plan`, `spawn`, `send_message`, `read_messages`,
+`read_skill`, `remember`, `forget` and `todo_write`. Most need something a served
+session has not got — a person to answer, a plan gate to decide, children to talk
+to, or a server-side document a remote caller should not be handed.
+
+The last three are excluded for a different and sharper reason. `remember`,
+`forget` and `todo_write` are **ungated inside `dispatch` on purpose**: they land
+in the harness's own store rather than in the workspace, so there is no path for
+an `Act::Write` check to be about, and their only remaining boundary is the plan
+gate. A served session has no plan gate either — deliberately, so that a gate
+nobody can answer does not deny every write for the life of the session. Both
+boundaries off is not a boundary. Durable memory is recalled into a run's
+context, and a served session shares its memory key with any run over the same
+root, so serving these would let an unattended client with no policy grant plant
+text that reaches the context of every later run over that workspace, with
+nothing in `policy_events` to show for it. They are **not served** rather than
+newly gated, because gating them would change what the run loop does for every
+caller and this release does not do that. Offering one and refusing every call to it
 would be a worse answer than not offering it. The served set and that list
 partition the catalogue, asserted against the catalogue the code builds, so a tool
 added later lands in one of them rather than in neither.

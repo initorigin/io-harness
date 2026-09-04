@@ -569,7 +569,7 @@ impl OtelExporter {
             end_unix_nano: now,
             attributes: run.root_attributes(),
             // `then` and not `then_some`: the argument allocates.
-            error: (outcome != OUTCOME_SUCCESS).then(|| outcome.to_string()),
+            error: (!OUTCOMES_WITHOUT_ERROR.contains(&outcome)).then(|| outcome.to_string()),
         }];
 
         // Everything the channel cannot carry. A failed read exports the spans
@@ -697,7 +697,7 @@ impl OtelExporter {
                     start_unix_nano: cursor,
                     end_unix_nano: end,
                     attributes: chat_attributes(call),
-                    error: call.failure.clone(),
+                    error: call.failure.as_deref().map(error_type_of),
                 });
                 cursor = end;
             }
@@ -1065,12 +1065,63 @@ impl Observer for OtelExporter {
 // The exporter's own state
 // ---------------------------------------------------------------------------
 
-/// The outcome string that is not an error.
+/// What `error.type` carries when a provider call is recorded as failed.
 ///
-/// Everything else `runs.outcome` can hold — `failed`, `cancelled`, `stalled`,
-/// `budget` — is a run that did not do what it was asked, and a root span that
-/// says so is what a dashboard filters on.
-const OUTCOME_SUCCESS: &str = "success";
+/// The convention defines `error.type` as a **low-cardinality type**, and
+/// `provider_calls.failure` is not one. Its producer takes a short branch for
+/// `Error::Provider` — `"Server (HTTP 529)"` — and falls through to the whole
+/// `Display` for everything else, so a transport failure arrives carrying the
+/// URL it was dialling and a refused egress arrives carrying the denied host.
+/// Sending either would put an operator's endpoints on a third party's
+/// dashboard and give a cardinality-sensitive key an unbounded value.
+///
+/// So the type is the leading identifier and nothing else: alphabetic, at most
+/// `MAX_ERROR_TYPE` bytes, lowercased. Anything that does not look like one —
+/// a message beginning with a path, a quote or a number — becomes
+/// [`ERROR_TYPE_FALLBACK`], which says a call failed without saying anything a
+/// message could carry.
+fn error_type_of(failure: &str) -> String {
+    let head = failure
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ':')
+        .find(|token| !token.is_empty())
+        .unwrap_or_default();
+    let usable = !head.is_empty()
+        && head.len() <= MAX_ERROR_TYPE
+        && head.chars().all(|c| c.is_ascii_alphabetic() || c == '_');
+    match usable {
+        true => head.to_ascii_lowercase(),
+        false => ERROR_TYPE_FALLBACK.to_string(),
+    }
+}
+
+/// The longest leading identifier accepted as an error type.
+const MAX_ERROR_TYPE: usize = 32;
+
+/// What a failure whose text is not an identifier is reported as.
+const ERROR_TYPE_FALLBACK: &str = "provider_error";
+
+/// The outcome strings that are not errors.
+///
+/// **Three, not one.** `"success"` is written by exactly one path — a
+/// `Verification` criterion passing — so a run that simply ends cleanly does
+/// not carry it. `RunOutcome::Finished` writes `"finished"` and is documented
+/// as "the agent is done; nothing verified it", which is the ordinary end of
+/// every run with `Verification::None` and of every `Session` turn.
+/// `"cancelled"` is a caller asking for a stop, and the observability guide
+/// calls such a run finished rather than abandoned.
+///
+/// Treating any of the three as an error would paint every unverified run red
+/// on a dashboard and give it `error.type: "finished"`, which is not an error
+/// type under any reading. The rest of what `runs.outcome` can hold —
+/// `denied`, `refused`, `stalled`, `plan_rejected`, `budget_ceiling_reached`,
+/// the two `escalated_*`, `verification_failed`, `step_cap_reached`,
+/// `schema_unsatisfied` and the two budget strings — is a run that did not do
+/// what it was asked, and a root span that says so is what a dashboard filters
+/// on.
+///
+/// `crate::SUCCESS_OUTCOME` rather than a second spelling of `"success"`.
+const OUTCOMES_WITHOUT_ERROR: &[&str] = &[crate::SUCCESS_OUTCOME, "finished", "cancelled"];
 
 /// Encoded batches kept by the seam above, so a test can read what was sent.
 ///
@@ -1713,6 +1764,9 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::wire::*;
+    // The exporter's own items, for the two arms below that are about the
+    // exporter rather than the encoder.
+    use super::{error_type_of, ERROR_TYPE_FALLBACK, MAX_ERROR_TYPE, OUTCOMES_WITHOUT_ERROR};
 
     // -----------------------------------------------------------------------
     // Fixtures — fixed ids and fixed instants, so the envelope is deterministic
@@ -1859,6 +1913,89 @@ mod tests {
             spans[0]
         );
         assert_eq!(spans[1]["status"]["code"], json!(2));
+    }
+
+    /// A run that ended cleanly is not an error, and `"success"` is not the only
+    /// way a run ends cleanly.
+    ///
+    /// Found by an adversarial review of this release rather than by a test.
+    /// `"success"` is written by exactly one path — a `Verification` criterion
+    /// passing — so an ordinary run with no criterion writes `"finished"`, and a
+    /// caller who asked for a stop writes `"cancelled"`. Comparing against
+    /// `"success"` alone painted every unverified run red and gave it
+    /// `error.type: "finished"`, which is not an error type under any reading.
+    ///
+    /// Every span test in this file attaches a `Verification`, which is why the
+    /// suite exercised only the branch that worked.
+    #[test]
+    fn f2_an_unverified_run_that_ends_cleanly_is_not_an_error() {
+        for clean in OUTCOMES_WITHOUT_ERROR {
+            assert!(
+                OUTCOMES_WITHOUT_ERROR.contains(clean),
+                "{clean} is one of the clean outcomes"
+            );
+        }
+        assert!(OUTCOMES_WITHOUT_ERROR.contains(&"finished"));
+        assert!(OUTCOMES_WITHOUT_ERROR.contains(&"cancelled"));
+        assert!(OUTCOMES_WITHOUT_ERROR.contains(&crate::SUCCESS_OUTCOME));
+
+        // And the other side, so the set is not simply everything: a run that
+        // did not do what it was asked still reports an error.
+        for failed in [
+            "denied",
+            "refused",
+            "stalled",
+            "plan_rejected",
+            "budget_ceiling_reached",
+            "verification_failed",
+            "step_cap_reached",
+            "escalated_terminal",
+        ] {
+            assert!(
+                !OUTCOMES_WITHOUT_ERROR.contains(&failed),
+                "{failed} is a run that did not do what it was asked"
+            );
+        }
+    }
+
+    /// `error.type` is a type, not a message.
+    ///
+    /// Also an adversarial-review finding. `provider_calls.failure` takes a
+    /// short branch for `Error::Provider` and falls through to the whole
+    /// `Display` for everything else, so a transport failure arrives carrying
+    /// the URL it dialled and a refused egress arrives carrying the denied host.
+    #[test]
+    fn f5_an_error_type_is_an_identifier_and_never_a_message() {
+        assert_eq!(error_type_of("Server (HTTP 529)"), "server");
+        assert_eq!(error_type_of("Transport"), "transport");
+        assert_eq!(error_type_of("  RateLimited (HTTP 429)"), "ratelimited");
+
+        // The cases the fall-through produces, and the reason this exists.
+        for message in [
+            "error sending request for url (https://api.internal.example/v1/chat)",
+            "\"127.0.0.1:11434\" is denied by the network policy",
+            "404 Not Found",
+            "",
+        ] {
+            let reported = error_type_of(message);
+            assert!(
+                !reported.contains("example")
+                    && !reported.contains("127.0.0.1")
+                    && !reported.contains(' '),
+                "an endpoint must not reach a collector through error.type: {reported}"
+            );
+        }
+        assert_eq!(
+            error_type_of("error sending request for url (https://api.internal.example/v1)"),
+            "error",
+            "a leading identifier is kept; the rest of the message is not"
+        );
+        assert_eq!(error_type_of("\"host\" is denied"), ERROR_TYPE_FALLBACK);
+        assert_eq!(error_type_of("404 Not Found"), ERROR_TYPE_FALLBACK);
+        assert!(
+            error_type_of(&"A".repeat(MAX_ERROR_TYPE + 1)) == ERROR_TYPE_FALLBACK,
+            "an unbounded token is not a low-cardinality type"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3187,12 +3324,20 @@ mod transport_tests {
         )
     }
 
+    /// A run that ended the ordinary way.
+    ///
+    /// `"finished"` and not `crate::SUCCESS_OUTCOME`, deliberately. `"success"`
+    /// is written only when a `Verification` criterion passes, so a helper that
+    /// used it would drive every transport arm down the one branch a run with no
+    /// criterion never takes — and would be comparing the production code
+    /// against the same constant it reads, which is a test that passes whatever
+    /// that constant says.
     fn finished(run_id: i64) -> RunEvent {
         RunEvent::new(
             run_id,
             1,
             EventKind::Finished {
-                outcome: OUTCOME_SUCCESS.into(),
+                outcome: "finished".into(),
                 steps: 1,
                 tokens: 0,
             },

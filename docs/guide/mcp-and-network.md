@@ -309,12 +309,25 @@ decision they take, not one a client can take for them.
 ### What is not served
 
 `ask_question`, `ask_questions`, `propose_plan`, `spawn`, `send_message`,
-`read_messages` and `read_skill`, named in `MCP_SERVER_UNSERVED`. Each needs
-something a served session has not got — a person to answer, a plan gate to
-decide, children to talk to, or a server-side document a remote caller should not
-be handed. Offering one and refusing every call to it would be a worse answer than
-not offering it. The served set and that list partition the catalogue, and a test
-asserts it, so a tool added later lands in one of them rather than in neither.
+`read_messages`, `read_skill`, `remember`, `forget` and `todo_write`, named in
+`MCP_SERVER_UNSERVED`. Most need something a served session has not got — a
+person to answer, a plan gate to decide, children to talk to, or a server-side
+document a remote caller should not be handed. Offering one and refusing every
+call to it would be a worse answer than not offering it.
+
+**The last three are excluded because they are ungated, not because they are
+useless.** `remember`, `forget` and `todo_write` write to the harness's own store
+rather than to the workspace, so the policy has no path to check and deliberately
+does not see them; their only boundary is the plan gate, which a served session
+also does not have. Durable memory is recalled into a run's context and a served
+session shares its memory key with any run over the same root, so serving them
+would let a client with no policy grant plant text that reaches every later run
+over that workspace.
+
+The served set is written out by name and a test pins it, so a tool added in a
+later release fails that test until somebody decides which side it belongs on.
+Deriving it as "the catalogue minus the unserved list" would have made a new
+built-in servable silently, which is the opposite of the guarantee.
 
 ## The limit, stated plainly
 

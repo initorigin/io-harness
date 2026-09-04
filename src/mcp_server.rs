@@ -141,6 +141,28 @@ pub const MCP_SERVER_UNSERVED: &[&str] = &[
     crate::SEND_MESSAGE_TOOL,
     crate::READ_MESSAGES_TOOL,
     crate::tools::READ_SKILL_TOOL,
+    // The three writes the policy deliberately does not see, and the reason
+    // they cannot be served.
+    //
+    // `remember`, `forget` and `todo_write` are ungated inside `dispatch` on
+    // purpose: they land in the harness's own store rather than in the
+    // workspace, so there is no path for `Act::Write` to be about. Their only
+    // remaining boundary is the plan gate — and a served session has none, by
+    // the same deliberate choice that keeps `PlanPhase::active` false so a
+    // gate nobody can answer does not deny every write for the life of the
+    // session.
+    //
+    // Both boundaries off is not a boundary. Durable memory is recalled into a
+    // run's context, and a served session shares its `memory_key` with any run
+    // over the same root, so serving these would let an unattended client with
+    // no policy grant plant text that reaches the context of every later run
+    // over that workspace, leaving nothing in `policy_events` behind it.
+    //
+    // Not served, rather than gated: gating them would change what the run
+    // loop does for every caller, which this release does not do.
+    crate::tools::REMEMBER_TOOL,
+    crate::tools::FORGET_TOOL,
+    crate::tools::TODO_WRITE_TOOL,
 ];
 
 /// What a served session may reach, and what it is called.
@@ -1159,9 +1181,6 @@ mod tests {
             crate::tools::GIT_COMMIT_TOOL,
             crate::tools::GIT_BRANCH_TOOL,
             crate::tools::GIT_WORKTREE_TOOL,
-            crate::tools::REMEMBER_TOOL,
-            crate::tools::FORGET_TOOL,
-            crate::tools::TODO_WRITE_TOOL,
             crate::tools::WRITE_FILE_TOOL,
             crate::tools::EDIT_FILE_TOOL,
             crate::tools::PATCH_FILE_TOOL,
