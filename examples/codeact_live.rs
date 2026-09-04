@@ -69,14 +69,23 @@ impl Observer for Programs {
 /// repository's `.env`; nothing here reads that file.
 const REQUIRED: [&str; 2] = ["OPENROUTER_API_KEY", "OPENROUTER_MODEL"];
 
-/// A task that is a chain by nature: several files to read, one answer that
-/// depends on all of them. A single-read task would collapse the difference the
-/// example exists to show, and a task needing no reads would show nothing at all.
-const GOAL: &str = "Count the total number of lines across every .txt file in the workspace root, \
-                    and write that number, alone, into TOTAL.txt.";
+/// A task a single command cannot do, which is what makes it a test of this
+/// capability rather than of the toolchain.
+///
+/// An earlier version of this example asked for a line count. Given `exec`, the
+/// model did the whole job with one command and never wrote a program — a true
+/// and useful answer about when a program is worth reaching for, and useless as
+/// evidence that programs work. This task needs a **loop with a branch and a
+/// write per iteration**: `exec` takes a fixed argv and never a shell string, and
+/// the `shell` tool's grammar refuses control flow by name, so neither can
+/// express it. A program can.
+const GOAL: &str = "Every .txt file in the workspace root that has fewer than three lines must \
+                    have the single line SHORT appended to it. Files with three or more lines are \
+                    left exactly as they are. Then write the number of files you changed, alone, \
+                    into COUNT.txt.";
 
-/// One file per read the naive chain would need. Six is enough for the shapes to
-/// differ and small enough that a model does not need a strategy.
+/// Six files, four of them under the threshold, so the branch is exercised in
+/// both directions and the answer is not the file count.
 const FILES: [(&str, &str); 6] = [
     ("alpha.txt", "one\ntwo\nthree\n"),
     ("beta.txt", "one\n"),
@@ -85,6 +94,10 @@ const FILES: [(&str, &str); 6] = [
     ("epsilon.txt", "one\ntwo\n"),
     ("zeta.txt", "one\n"),
 ];
+
+/// What a correct run writes into `COUNT.txt`: `beta`, `gamma`, `epsilon` and
+/// `zeta` are the four under three lines.
+const EXPECTED: &str = "4";
 
 #[tokio::main]
 async fn main() -> io_harness::Result<()> {
@@ -102,13 +115,22 @@ async fn main() -> io_harness::Result<()> {
     let model = std::env::var("OPENROUTER_MODEL").unwrap_or_default();
     println!("model: {model}");
 
-    let with_program = measure(true).await?;
-    let with_calls = measure(false).await?;
+    // Three arms, because two were not enough to tell two different things
+    // apart: whether a model *chooses* a program, and whether what it writes
+    // when it does actually works. The offered arm answers the first and has
+    // said no three times running; the directed one answers the second.
+    let offered = measure(Arm0::Offered).await?;
+    let directed = measure(Arm0::Directed).await?;
+    let chain = measure(Arm0::Chain).await?;
 
     println!("\n  arm            steps  prompt  completion   total");
     println!("  ------------------------------------------------");
-    report("run_program", &with_program);
-    report("tool calls", &with_calls);
+    report("offered", &offered);
+    report("directed", &directed);
+    report("tool calls", &chain);
+
+    let with_program = &directed;
+    let with_calls = &chain;
 
     // Printed as a ratio because that is the shape of the claim, and printed
     // without a verdict because the example asserts nothing.
@@ -134,7 +156,7 @@ struct Arm {
 
 fn report(label: &str, arm: &Arm) {
     println!(
-        "  {label:<13}  {:>4}  {:>6}  {:>10}  {:>6}   -> TOTAL.txt {}",
+        "  {label:<13}  {:>4}  {:>6}  {:>10}  {:>6}   -> COUNT.txt {} {}",
         arm.steps,
         arm.prompt,
         arm.completion,
@@ -142,14 +164,39 @@ fn report(label: &str, arm: &Arm) {
         match &arm.answer {
             Some(text) => format!("{:?}", text.trim()),
             None => "(not written)".to_string(),
+        },
+        // Whether the arm got the task right at all. A cheap wrong answer is not
+        // a cheaper way of doing the work, and a ratio beside one would be
+        // comparing a shortcut to a solution.
+        match arm.answer.as_deref().map(str::trim) {
+            Some(EXPECTED) => "correct",
+            _ => "WRONG",
         }
     );
 }
 
-/// Run the task once, with or without a program available, and read the cost off
-/// the run's own accounting rows.
-async fn measure(program: bool) -> io_harness::Result<Arm> {
-    let label = if program { "program" } else { "calls" };
+/// Which of the three arms this is.
+///
+/// `Offered` is the honest question — the tool is there, nothing points at it,
+/// and what the model does is the answer. `Directed` asks the model to use it, so
+/// that the surface itself is exercised live even when the model would not have
+/// chosen it; without that arm a release could ship a generated module no model
+/// had ever actually called. `Chain` is the baseline.
+#[derive(Clone, Copy, PartialEq)]
+enum Arm0 {
+    Offered,
+    Directed,
+    Chain,
+}
+
+/// Run the task once and read the cost off the run's own accounting rows.
+async fn measure(arm: Arm0) -> io_harness::Result<Arm> {
+    let program = arm != Arm0::Chain;
+    let label = match arm {
+        Arm0::Offered => "offered",
+        Arm0::Directed => "directed",
+        Arm0::Chain => "calls",
+    };
     let root = std::env::temp_dir().join(format!("io-harness-codeact-live-{label}"));
     std::fs::remove_dir_all(&root).ok();
     std::fs::create_dir_all(&root)?;
@@ -157,7 +204,16 @@ async fn measure(program: bool) -> io_harness::Result<Arm> {
         std::fs::write(root.join(name), body)?;
     }
 
-    let mut contract = TaskContract::workspace(GOAL, &root).with_max_steps(14);
+    let goal = match arm {
+        // The nudge is one sentence and it is deliberately explicit. An arm that
+        // hinted would measure how well the hint was worded.
+        Arm0::Directed => format!(
+            "{GOAL} Do all of it inside a single run_program call rather than as separate tool \
+             calls."
+        ),
+        _ => GOAL.to_string(),
+    };
+    let mut contract = TaskContract::workspace(&goal, &root).with_max_steps(14);
     if program {
         contract = contract.with_codeact(CodeActConfig::default());
     }
@@ -218,7 +274,7 @@ async fn measure(program: bool) -> io_harness::Result<Arm> {
         prompt: 0,
         completion: 0,
         total: 0,
-        answer: std::fs::read_to_string(root.join("TOTAL.txt")).ok(),
+        answer: std::fs::read_to_string(root.join("COUNT.txt")).ok(),
     };
     for call in &calls {
         // A provider that reported nothing leaves `usage` as `None`, and an

@@ -49,6 +49,17 @@ downloaded, ever**. A machine without a usable one is a supported machine: the
 tool is not offered, the turn runs exactly as it did at 0.78.0, and the decision
 is on the record rather than left to be inferred.
 
+**Reach for a program when the work is a loop with a branch the tools cannot
+express — not to save tokens.** CodeAct is usually introduced with a figure of
+roughly 64% fewer tokens, measured on another harness. This release measured the
+comparison here instead and did not find a saving: offered the tool on a task
+shaped for it, the model wrote no program at all; told to use one, it wrote four
+and spent five times the tokens the same work took as ordinary calls. Every
+program ran and every answer was right, so that is a cost result rather than a
+correctness one. One task, one model, one sample per arm — the numbers, the
+method and the machine are in `docs/MEASUREMENTS.md`, and they are recorded
+rather than replaced with somebody else's.
+
 ### Added
 
 - `codeact`, an off-by-default feature letting a run write one contained Python

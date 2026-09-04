@@ -327,11 +327,24 @@ See [durable runs](durable-runs.md).
 ## What the saving actually is, measured here
 
 The claim is fewer provider round trips for the same work, and this repository
-measures the comparison itself rather than repeating a figure from another
-harness: a number measured on a different runtime, with different tools and a
-different prompt, is not a result this crate can report as its own. What is found
-is recorded in [MEASUREMENTS.md](../MEASUREMENTS.md), with the machine named and
-the method stated, like every other number this repository publishes.
+measured the comparison itself rather than repeating a figure from another
+harness. **It did not find a saving.**
+
+On a task shaped for a loop, with `deepseek/deepseek-v4-flash-0731`: offered the
+tool, the model wrote no program at all and did the work as ordinary calls. Told
+to use one, it wrote four — iterating — for 161,416 tokens against the chain's
+32,157. Every program ran, every one finished, and the answer was right each time,
+so this is a cost result rather than a correctness one. A program's output
+re-enters the transcript, and writing programs is expensive output.
+
+One task, one model, one sample per arm — it settles that a program is not
+automatically cheaper and that a model iterating on programs is the expensive
+case, not that the capability cannot pay on larger work. The numbers, the method
+and the machine are in [MEASUREMENTS.md](../MEASUREMENTS.md).
+
+**So reach for a program when the work is a loop with a branch that the tools
+cannot express, not to save tokens.** That is what it is for, and it is what the
+release rests on: a program's acts are gated exactly as a model's own calls are.
 
 ## The limits, stated plainly
 
