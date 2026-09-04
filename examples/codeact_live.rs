@@ -36,7 +36,34 @@
 //! **The provider is OpenRouter, and the record says so.** `OPENROUTER_API_KEY`
 //! is the key this checkout carries; the Anthropic and OpenAI entries are empty.
 
-use io_harness::{run_with, ApproveAll, CodeActConfig, OpenRouter, Policy, Store, TaskContract};
+use std::sync::Mutex;
+
+use io_harness::{
+    run_with_observed, ApproveAll, CodeActConfig, EventKind, Flow, Observer, OpenRouter, Policy,
+    RunEvent, Store, TaskContract,
+};
+
+/// Counts the programs that ran and the callbacks they made.
+///
+/// The arm is not evidence unless a program was actually written *and used*. The
+/// first live run of this release finished with the right answer having never
+/// used the capability — the model wrote a program that reached for the workspace
+/// with Python's own file reads, got nothing, and did the task as ordinary tool
+/// calls in the steps that followed — and the second was refused outright because
+/// this example's own policy denied exec, which starting an interpreter now is.
+/// Both looked like successes from the outside. So the run reports what happened
+/// rather than leaving it to be inferred from the total.
+#[derive(Default)]
+struct Programs(Mutex<Vec<(String, u32)>>);
+
+impl Observer for Programs {
+    fn event(&self, event: &RunEvent) -> Flow {
+        if let EventKind::Program { calls, outcome, .. } = &event.kind {
+            self.0.lock().unwrap().push((outcome.clone(), *calls));
+        }
+        Flow::Continue
+    }
+}
 
 /// The two variables this example cannot run without. The operator sources the
 /// repository's `.env`; nothing here reads that file.
@@ -137,17 +164,53 @@ async fn measure(program: bool) -> io_harness::Result<Arm> {
 
     let provider = OpenRouter::from_env()?;
     let store = Store::open(root.join("runs.db"))?;
-    // Reads and writes allowed, execs denied: the difference between the arms
-    // must be how the work is expressed, not what either arm was permitted.
+    // Both arms get the same permissions, including exec — which starting a
+    // program now needs, since the interpreter is checked like any other binary.
+    // Denying exec here refused the program outright and made the comparison
+    // meaningless while still printing a number, which is the trap this line
+    // exists to have already fallen into once.
+    //
+    // It does mean the chain arm may shell out to `wc` and win on this task
+    // without a program. That is a real answer rather than a flaw in the test:
+    // where one command does the whole job, a program is not what to reach for,
+    // and the run below says which arm did what.
     let policy = Policy::default()
         .layer("app")
         .allow_read("*")
         .allow_write("*")
-        .deny_exec("*");
+        .allow_exec("*");
 
     println!("\n[{label}] running…");
-    let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
+    let seen = Programs::default();
+    let result =
+        run_with_observed(&contract, &provider, &store, &policy, &ApproveAll, &seen).await?;
     println!("[{label}] outcome: {:?}", result.outcome);
+    let programs = seen.0.lock().unwrap().clone();
+    let ran: Vec<&(String, u32)> = programs
+        .iter()
+        .filter(|(outcome, _)| outcome != "available" && outcome != "withheld")
+        .collect();
+    if program {
+        match ran.as_slice() {
+            [] => println!("[{label}] NO PROGRAM RAN — this arm is not evidence"),
+            got => {
+                let calls: u32 = got.iter().map(|(_, c)| c).sum();
+                println!(
+                    "[{label}] {} program(s), {calls} callback(s): {}",
+                    got.len(),
+                    got.iter()
+                        .map(|(o, c)| format!("{o}/{c}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                if calls == 0 {
+                    println!(
+                        "[{label}] a program ran and called nothing — this arm is not evidence"
+                    );
+                }
+            }
+        }
+    }
 
     let calls = store.provider_calls(result.run_id)?;
     let mut arm = Arm {

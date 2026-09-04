@@ -4450,12 +4450,24 @@ and nothing more, and each act arrives on the observer channel as its own
 no shorter path: a purpose-built one would compile more easily and pass every
 functional test while bypassing the gate.
 
+**Starting a program is itself gated.** Starting the interpreter is an `Act::Exec`
+check taken before anything is spawned, on the interpreter's own path and on
+`"<interpreter> program.py"` — both spellings, exactly as `exec` checks them — so
+a run that denies execution denies programs and this tool is not a second path
+around that gate. `run_program` is also refused while the plan gate is active, for
+the reason `remember` is: the plan gate is a policy layer denying `Write` and
+`Exec`, it works because every mutating path in this crate is one of those two
+checks, and starting an interpreter is a third. It is denied rather than filtered
+out of the catalogue, because this crate denies tools and never hides them.
+
 **A refusal is a value, not an exception.** Inside the program each callable tool
 is a function taking that tool's arguments as keywords and returning an object
 with `.ok` and `.text`; `str()` of it is the text, and it is falsy when the act
-was refused. `.ok` is false exactly when the observation came back as
-`ObsKind::Error`, which is what `Dispatched::go` marks both a policy refusal and a
-tool's own failure with.
+was refused **or failed**. `.ok` is false exactly when the observation came back
+as `ObsKind::Error`, which is what `Dispatched::go` marks both a policy refusal
+and a tool's own failure — a non-zero `exec`, a file that is not there — with. So
+a false `.ok` says the act did not land rather than that the policy said no, and
+`.text` is where the two are told apart.
 
 **What a program may not call**, named in `CODEACT_UNCALLABLE`: `remember`,
 `forget` and `todo_write`, which are ungated inside `dispatch` because they land
@@ -4466,9 +4478,12 @@ conversation or a tree that one step does not have; `read_skill`; and
 `run_program` itself. The list is a literal rather than the catalogue minus the
 exclusions, so a built-in added later is not callable until somebody classifies
 it, and it is checked at the boundary as well as being absent from the generated
-module. A registered or MCP tool whose name is not a Python identifier, or is a
-Python keyword, is left out of that module and stays callable the ordinary way in
-the same turn.
+bindings. A registered or MCP tool whose name is not a Python identifier, or is a
+Python keyword, is left out of those bindings — not because it would fail to
+parse, since the shim carries the names as data and injects them into the
+program's namespace, but because the model calls a tool by writing `name(...)`
+and such a name cannot be written that way at all. It stays callable the ordinary
+way in the same turn.
 
 **The interpreter is the host's and nothing is downloaded, ever.** `[codeact]
 interpreter` names one; otherwise `CODEACT_CANDIDATES` — `python3`, then `python`
@@ -4491,41 +4506,64 @@ closes stdin and runs to completion, which a program that asks questions while i
 runs cannot use. A program is contained the way `shell_start` contains a living
 child — `wrap_argv`, `contain_command`, `apply_rlimits` and `own_process_group` —
 which selects the same backend by the same rules and applies the same
-`SandboxLimits`. **That seam has no Windows AppContainer branch**: on Windows a
-program is bounded by the Job Object's memory, CPU and process-count caps, which
-have no path rule and no socket rule.
+`SandboxLimits`. **That seam applies nothing at all on Windows**, where
+`wrap_argv` has no branch, `apply_rlimits` is unix-only, `contain_command` answers
+`None` and the Job Object is created only by the `Sandbox` runner and by
+`shell_start`'s own suspended-spawn path — so a program on a Windows host that
+asked to be contained is refused, naming the backend the run resolved, rather than
+started with the full filesystem and the full network under a boundary the trace
+claims. That is 0.74.0's rule. A Windows run that asked for no containment is not
+refused: it runs uncontained, exactly as `exec` does on such a run.
 
 **The program runs in an ephemeral workdir of its own, never the workspace**, and
 that workdir is the only writable root. It needs no workspace access because every
 effect it has on the workspace is a callback the policy sees. Under a backend that
-confines writes it cannot edit a workspace file directly; under the portable floor
-and the Windows Job Object, which have no path rule, the claim is only the
-ephemeral workdir and the proxy-environment strip. It is given no proxy
-environment of its own, and reaches the network only through this crate's own
-network-governed tools, as callbacks checked under `Act::Net`.
+confines writes it cannot edit a workspace file directly; under the portable floor,
+which has no path rule, the claim is only the ephemeral workdir; and under a
+contract whose `ExecMode` is not a contained one there is no backend at all, so a
+program runs on the host with this process's privileges, exactly as an `exec` does
+on such a run. It is given no proxy environment of its own and egress is denied
+whatever the run was granted, and it reaches the network only through this crate's
+own network-governed tools, as callbacks checked under `Act::Net`. **What that
+denial is worth is the backend's answer**: `Backend::denies_egress` is false for
+the portable floor, so under it a program can still open a socket, and a run with
+no containment has nothing to deny it with.
 
 **The shim owns the protocol descriptors before the program runs one
 instruction.** It dups descriptor 1, then points 0, 1 and 2 at devnull and
 replaces `sys.stdout` and `sys.stderr` with a buffer and `sys.stdin` with an empty
-one — so a program that prints ordinary text, writes raw bytes with `os.write`, or
-prints a well-formed callback frame cannot reach or forge anything on the pipe.
-What it printed comes back attached to the step's result, plus the `repr` of a
-global named `result` if it set one.
+one — so nothing a program *prints*, whether ordinary text, raw bytes through
+`os.write`, or a well-formed callback frame, can reach or forge the pipe. That is
+a claim about printing and not about isolation: the descriptors are closure
+variables, which closes the `_act.__globals__` route, and a program that walks
+`__closure__` still finds them and gains nothing — a forged `call` is dispatched
+under the same policy as an honest one, and a forged `done` only ends the program
+early. What the program printed comes back attached to the step's result, plus the
+`repr` of a global named `result` if it set one; the shim truncates that output at
+the source, and a frame larger than 4 MiB is refused by the reader rather than
+buffered, so a program cannot make this process allocate without limit.
 
 **Two bounds beyond the sandbox's**, because they bound a different resource:
 `max_callbacks` (default 64) and `timeout` (default 120 seconds), both settable on
 `CodeActConfig` and in `[codeact]`. They bound what the program makes *this*
 process spend, which is what a tight callback loop exhausts and what no rlimit can
 see. A breach is a typed ending that reaches the model as feedback naming the
-bound — never a hang, and never a bare kill with no explanation.
+bound — never a hang, and never a bare kill with no explanation. `max_callbacks`
+counts the calls actually served and is asked when a call arrives rather than
+before a frame is read, so a program that makes exactly its allowance and then
+finishes completes normally and keeps its output.
 
-**A raise is recoverable and a decision is a pause.** A program that raises comes
+**A raise is recoverable and a deferral is a denial.** A program that raises comes
 back with its traceback, and the model may send a corrected program; that retry
-counts against the step cap like any other attempt. If an act a program takes
-returns an approval request, a question or a plan decision, the program is stopped
-and the run pauses exactly as it would have had the model made that call itself —
-on resume the model writes the program again. Interpreter state does not outlive a
-step: there is no session between programs.
+counts against the step cap like any other attempt. A `sys.exit` is read by its
+code: `None` or zero is a finish, and any other code is a failure carrying that
+code. `Decision::Defer` parks a run so somebody can answer after the process has
+exited, which an act inside a live program cannot use — the acts it already took
+have happened, and a resumed run writes the program from scratch and would
+re-execute them — so a deferral becomes a denial *for a program's acts only*, and
+the program branches on it like any other refusal. The caller's `Approver` is
+untouched everywhere else and an act the model makes itself can still be deferred.
+Interpreter state does not outlive a step: there is no session between programs.
 
 **Where it is not offered.** `run_program` is on `MCP_SERVER_UNSERVED`, so a
 served MCP session does not offer it, and it is advertised by the workspace loop

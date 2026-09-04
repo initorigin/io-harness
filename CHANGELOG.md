@@ -39,7 +39,10 @@ all keep working. It runs inside the containment a backgrounded command line
 already gets, in a scratch directory of its own rather than in the workspace, and
 every act it takes re-enters the same dispatch a model's own call takes — same
 policy, same gate, same `policy_events` row, same journal attempt, same observer
-event. A program is a shorter way of asking, not a wider door.
+event. Starting the interpreter is itself one of those checks, and on a host where
+the containment the run asked for cannot be applied the program is refused rather
+than started under a boundary it does not have. A program is a shorter way of
+asking, not a wider door.
 
 The interpreter is the host's, found the way a browser is found, and **nothing is
 downloaded, ever**. A machine without a usable one is a supported machine: the
@@ -55,26 +58,63 @@ is on the record rather than left to be inferred.
 - The `run_program` built-in, whose one argument is a complete Python program —
   source, not a command line. Inside it, the tools the run already has are
   ordinary functions taking the same arguments by keyword; each returns an object
-  that is falsy when the act was refused, so a program branches on a refusal
-  instead of stopping. A step that would have been six round trips — grep, read,
-  read, read, edit, exec — is one program written once.
+  that is falsy when the act was refused **or failed** — a non-zero `exec` and a
+  file that is not there are both `.ok` false — so a program branches instead of
+  stopping, and reads `.text` to tell a refusal from a command that ran and
+  failed. A step that would have been six round trips — grep, read, read, read,
+  edit, exec — is one program written once.
 - Every act a program takes re-enters the same dispatch a model's own tool call
   enters, so the policy, the gate, the `policy_events` row, the journal attempt
   and the observer see a program's act on exactly the terms they see a model's. A
   program is a shorter way of asking, not a wider door: it reaches nothing the
   model could not have reached by asking one call at a time. What collapses is
   the number of provider round trips, not the number of boundaries.
+- Starting the interpreter is an `Act::Exec` check in its own right, taken before
+  anything is spawned, against the interpreter's path and against the whole argv —
+  both spellings, exactly as `exec` checks them. A run whose policy denies
+  execution denies programs too. `run_program` is refused while the plan gate is
+  active for the same reason `remember` is: the gate is a layer denying `Write`
+  and `Exec`, and starting an interpreter is a third check that layer cannot see.
+- A program that asked to be contained is **refused on Windows**, naming the
+  backend the run resolved, because the living-child seam applies no backend
+  there — `wrap_argv` has no Windows branch, `apply_rlimits` is unix-only,
+  `contain_command` answers `None`, and the Job Object belongs to the `Sandbox`
+  runner and to `shell_start`'s own suspended spawn. Started anyway it would have
+  had the full filesystem and the full network while the trace reported a boundary
+  granting neither, which is 0.74.0's rule. A Windows run that asked for no
+  containment is unaffected and runs uncontained, exactly as its `exec` does.
+- Egress is denied and no proxy is named whatever the run itself was granted, and
+  the claim is exactly what the backend delivers: `Backend::denies_egress` is
+  false for the portable floor, so under it a program can still open a socket, and
+  a run with no containment at all has nothing to deny it with.
+- A deferral inside a program is a **denial for that program's acts only**. A
+  pause is coherent for a model's own call and not for an act inside a live
+  program — the acts already taken have happened, and a resumed run writes the
+  program from scratch and would re-execute them — so `Decision::Defer` becomes a
+  denial the program branches on, in this crate's own words. The caller's
+  `Approver` is untouched everywhere else and the model's own calls can still be
+  deferred.
+- A program's output is bounded at the source: the shim truncates what was printed
+  before sending it, and a frame larger than 4 MiB is refused by the reader rather
+  than buffered, so a program cannot make the harness allocate without limit. A
+  `sys.exit` is read by its code — `None` or zero is a finish, any other code is a
+  failure carrying that code.
 - `TaskContract::with_codeact` and `CodeActConfig`, naming the interpreter to use
   and the two bounds on how far one program may reach: `max_callbacks`, 64 by
   default, and `timeout`, 120 seconds by default. Both bound what a program makes
   *this* process spend, which is what a tight callback loop exhausts and what no
-  sandbox rlimit can see. Asking is a request rather than a guarantee — the tool
-  is offered only if a usable interpreter was also found.
+  sandbox rlimit can see. `max_callbacks` counts the calls actually served, so a
+  program that makes exactly its allowance and then finishes completes normally
+  and keeps its output; the call past the bound is the one that stops it. Asking
+  is a request rather than a guarantee — the tool is offered only if a usable
+  interpreter was also found.
 - Host-interpreter discovery, once per run. `CODEACT_CANDIDATES` names what is
   looked for and in what order — `python3`, then `python` — and every candidate is
   version-probed against `CODEACT_MIN_PYTHON`, `(3, 8)`, so a `python` that
   answers 2.7 is rejected by what it reports rather than trusted by its name.
-  **Nothing is downloaded, ever.** A host with no usable interpreter is a
+  **Nothing is downloaded, ever**, and nothing is installed for a program either —
+  the interpreter is spawned as itself, so what a program can `import` is whatever
+  that host interpreter already carries. A host with no usable interpreter is a
   supported host: `run_program` is simply not advertised, and the turn is
   composed, sent and stepped exactly as it would have been with the feature off.
 - The `[codeact]` configuration section — `interpreter`, `max_callbacks` and
