@@ -475,6 +475,35 @@ fn argv(parts: &[&str]) -> String {
 /// The tempdir is dropped as soon as `discover` has read it: nothing after that
 /// point reads the file, only the parsed hooks. Setting the environment without
 /// a lock is safe here because nextest gives every test its own process.
+/// Serialises the two tests that configure a hook (0.77.0).
+///
+/// [`hooked`] sets `IO_CONFIG_HOME` — a **process-global** — and then immediately
+/// reads it back through `Config::discover`. Under `cargo test` the tests in a
+/// file are threads in one process, so two of them doing that concurrently race:
+/// the second can set its own directory, be descheduled while the first sets
+/// *its* directory, and then discover the other test's hook. The symptom is the
+/// allowing test reporting that hook `sh` refused something, when its own hook is
+/// `true` — a message that sends a reader looking for a product defect that is
+/// not there.
+///
+/// It stayed invisible because `ci.yml` runs `cargo nextest`, which gives every
+/// test its own process and no shared environment at all. `release.yml` runs
+/// `cargo test`, which does not — so this race could only ever fire in the one
+/// workflow that has no other job to catch it, and it did, on 0.77.0's release
+/// run. The release before it passed by winning the race rather than by being
+/// immune to it.
+///
+/// A lock rather than a rewrite: the environment variable *is* the interface
+/// `Config::discover` reads, so the honest fix is to stop two tests using it at
+/// once, not to pretend a test can pass its own config in.
+fn hook_env() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A poisoned lock here means a sibling hook test panicked while holding it,
+    // which is a failure being reported elsewhere — take the guard and let this
+    // test report its own result rather than turning it into a second panic.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn hooked(root: &Path, run: &[&str]) -> TaskContract {
     let user = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -516,6 +545,9 @@ fn the_three() -> Vec<ToolCall> {
 /// file writes — reached the model.
 #[tokio::test]
 async fn m5_a_before_tool_hook_fires_for_spawn_agent_send_message_and_read_messages() {
+    // Held for the whole test, not just across `hooked`: the hook is read from
+    // the environment again while the run executes.
+    let _hook_env = hook_env();
     empty_user_scope();
     let dir = ws();
     let store = Store::memory().unwrap();
@@ -554,6 +586,8 @@ async fn m5_a_before_tool_hook_fires_for_spawn_agent_send_message_and_read_messa
 /// test above passes against a tree that refuses these three tools outright.
 #[tokio::test]
 async fn m5_the_same_three_calls_run_when_the_hook_allows() {
+    // See the sibling above. This is the test that observed the race.
+    let _hook_env = hook_env();
     empty_user_scope();
     let dir = ws();
     let store = Store::memory().unwrap();
