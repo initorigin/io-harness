@@ -14,9 +14,61 @@ notes are produced from it.
 
 ## [Unreleased]
 
+**The best trace in the field becomes readable by things that are not this crate,
+and the boundary becomes borrowable by other agents.** Two absences with one root:
+everything this crate knows about a run has been recorded with unusual precision
+and has been legible only to this crate.
+
+A run can now be exported as OpenTelemetry spans, following the GenAI semantic
+conventions, to any OTLP/HTTP collector — so an agent appears in the dashboard an
+operator already runs, beside the services it called. The exporter is an
+`Observer`, the door that already existed, so the run loop does not move.
+
+And this crate's own tools can be served over MCP on stdio, so another harness
+can call `grep`, `read_file`, `edit_file` and `exec` through **this** crate's
+policy rather than through its own. Every served call goes through the same
+dispatch a model's call goes through, so the gate decides it, a `policy_events`
+row records the decision and the journal keeps it. What is being lent is the
+boundary, not the tool.
+
+Both halves are off unless asked for, and **neither adds a dependency**. A caller
+who enables neither feature compiles the same code and resolves the same
+dependency graph as at 0.77.0 — the unique package count is 154 on the default
+build with either feature on, with both on, and unchanged at 327 with
+`--all-features`.
+
 ### Added
 
+- `otel`, an off-by-default feature exporting a run as OpenTelemetry spans over
+  OTLP/HTTP with a JSON body. `OtelExporter` implements `Observer`, so it attaches
+  through `Harness::with_observer`, any `*_observed` entry point, or an observed
+  session turn. `OtelConfig` names the collector, the service, the headers, the
+  per-request deadline and the queue bound.
+- The GenAI span tree: an `invoke_agent` span per run, a span per committed step,
+  an `execute_tool <name>` span per tool call, and a `chat <model>` span per
+  provider call carrying the model, the token split and the latency that call
+  actually cost. The per-call facts come from the store, because the event channel
+  carries no provider-call event, no end for a tool call and no timestamp.
+- `mcp-server`, an off-by-default feature serving this crate's own tool catalogue
+  over MCP on stdio. `serve_mcp` is the unattended door and uses `DenyAll`;
+  `serve_mcp_with` takes an `Approver`. `McpServerConfig` names the workspace root,
+  the store, the policy and any registered tools the operator chooses to include.
+- `MCP_SERVER_UNSERVED`, naming the tools a served session cannot honour —
+  `ask_question`, `ask_questions`, `propose_plan`, `spawn`, `send_message`,
+  `read_messages` and `read_skill`. The served set and that list partition the
+  catalogue, and a test asserts it, so a tool added later lands in one of them
+  rather than in neither.
+- `GENAI_CONVENTIONS` and `OTEL_DEFAULT_ENDPOINT`, naming the convention revision
+  this crate follows and the port the specification names.
+- Two clippy polarities in CI, `--features otel` and `--features mcp-server`,
+  beside the existing `documents` and `media` runs.
+
 ### Changed
+
+- Nothing in the run loop. The only edits under `src/run/` are `pub(super)` to
+  `pub(crate)` visibility promotions, so `src/mcp_server.rs` can reach the tool
+  catalogue and the dispatch a served call routes through. No public item moved
+  and `docs/public-api.txt` gained lines without losing any.
 
 ### Deprecated
 
@@ -25,6 +77,20 @@ notes are produced from it.
 ### Fixed
 
 ### Security
+
+- A served MCP session grants access deliberately and under an explicit boundary:
+  the feature is off by default, the policy defaults to the tiered
+  `Policy::default()` where a write or an exec is an `Ask` and egress is denied,
+  and the default approver is `DenyAll` — so a rule that would ask a human refuses
+  instead, because there is no human at the far end of a pipe. A stdio pipe carries
+  no identity, so whoever can spawn the server can call whatever the policy allows;
+  the operator who starts it is the one who decides what that is.
+- The exporter sends no transcript content. `gen_ai.input.messages`,
+  `gen_ai.output.messages` and `gen_ai.system_instructions` are opt-in in the
+  convention and are not implemented here at all — absent rather than defaulted
+  off, so no flag can include them by accident. The `[otel]` configuration section
+  is refused at project scope for the same reason `[routing]` is: a cloned
+  repository must not choose where a run's metadata is sent.
 
 ## [0.77.0] - 2026-09-03
 
