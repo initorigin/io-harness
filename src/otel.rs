@@ -1383,17 +1383,37 @@ fn chat_attributes(call: &ProviderCall) -> Vec<(&'static str, wire::AttrValue)> 
 /// vendor behind it, and reporting `openai` for a proxy that may or may not be
 /// serving an OpenAI model is a false attribution no consumer of the trace can
 /// detect. No unlisted provider is ever mapped onto a listed value.
+/// **The body is the identity function, and that is the claim rather than an
+/// oversight.** It was written as a three-armed match naming the two convention
+/// values explicitly, which reads better and is the same function: clippy 1.98's
+/// `needless_match` says so, and F6's own test says so in the other direction by
+/// asserting the mapping returns its input verbatim for every provider id this
+/// crate can produce. A mapping that never changes its input cannot land an id on
+/// a value that is not it, which is the strong form of "no unlisted provider is
+/// mapped onto a listed value".
+///
+/// The two constants below are what keep that true rather than accidental: if
+/// either side renames, the assertion in
+/// `f6_the_provider_mapping_is_total_and_translates_nothing` fails and this
+/// function grows a real arm.
 fn provider_attribute(provider: &str) -> &str {
-    match provider {
-        CONVENTION_ANTHROPIC => CONVENTION_ANTHROPIC,
-        CONVENTION_OPENAI => CONVENTION_OPENAI,
-        this_crates_own => this_crates_own,
-    }
+    provider
 }
 
 /// The convention's value for Anthropic, which is also this crate's.
+///
+/// `#[cfg(test)]` because the agreement between the two vocabularies is what
+/// makes [`provider_attribute`] able to be the identity function, and a
+/// production build therefore has nothing to compare against: there is no
+/// mapping left to hold the constant. The tests still name both values, so a
+/// rename on either side fails
+/// `f6_the_provider_mapping_is_total_and_translates_nothing` and this pair
+/// becomes a real mapping again.
+#[cfg(test)]
 const CONVENTION_ANTHROPIC: &str = "anthropic";
-/// The convention's value for OpenAI, which is also this crate's.
+/// The convention's value for OpenAI, which is also this crate's. `#[cfg(test)]`
+/// for the reason above.
+#[cfg(test)]
 const CONVENTION_OPENAI: &str = "openai";
 
 /// `gen_ai.provider.name`, and the endpoint host beside it where this crate
