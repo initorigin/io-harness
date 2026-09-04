@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.78.0"
+version = "0.79.0"
 edition = "2021"
 # `libsqlite3-sys` 0.38.1 sets the floor from 0.23.0 on: its build script — and
 # `rusqlite` 0.40's own source — call the std `cfg_select!` macro, stabilised in
@@ -281,6 +281,28 @@ otel = []
 # compiles two more types in tokio and moves `cargo tree` by nothing, which is
 # checked rather than asserted.
 mcp-server = ["tokio/io-std"]
+# Writing one contained Python program instead of a chain of tool calls (0.79.0),
+# off by default.
+#
+# No crate is added, and the interpreter is not a dependency of this crate: it is
+# a host binary, resolved from `[codeact]` or from an ordered candidate list, the
+# way `browser` resolves a browser. Nothing is downloaded, ever, and a host
+# without one is a supported host — the tool is simply not advertised and the
+# turn runs the way it did at 0.78.0.
+#
+# The alternative was an embedded interpreter — `rustpython` or `mlua` behind an
+# optional dependency — which would have reversed the standing no-new-runtime-
+# dependency rule to buy an interpreter that is already on every machine this
+# crate's tests run on and on all three runner images.
+#
+# `tokio`'s `process` and `io-util` are already in the default build, which is
+# what a living child with piped stdio needs, so unlike `mcp-server` this feature
+# turns nothing on at all.
+#
+# It exists even though it costs no dependency because it is a door onto this
+# process's tools with a program on the other side of it, and a build that did
+# not ask for one should not compile one.
+codeact = []
 documents = ["xlsx", "docx", "pptx", "pdf", "barcode"]
 docx = ["dep:docx-rs"]
 pptx = ["dep:zip", "dep:quick-xml"]
@@ -330,3 +352,7 @@ required-features = ["mcp-server"]
 [[example]]
 name = "otel_live"
 required-features = ["otel"]
+
+[[example]]
+name = "codeact_live"
+required-features = ["codeact"]
