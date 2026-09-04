@@ -308,6 +308,12 @@ struct File {
     // it does not make an unchosen destination acceptable.
     #[serde(default)]
     otel: Option<OtelSection>,
+    // 0.79.0. In `REFUSED_SECTIONS` on the 0.74.0 clause in its plainest form:
+    // `interpreter` names a program on this machine to run. A cloned repository
+    // choosing it chooses what executes every program the model writes, and the
+    // two bounds beside it decide how far one of those programs may reach.
+    #[serde(default)]
+    codeact: Option<CodeactSection>,
     #[serde(default)]
     toolchain: BTreeMap<String, ToolchainSection>,
     #[serde(default)]
@@ -956,6 +962,25 @@ struct OtelSection {
     timeout_secs: Option<u64>,
     max_queue: Option<usize>,
     headers: Option<BTreeMap<String, String>>,
+}
+
+/// Which interpreter runs a program, and how far one program may reach (0.79.0).
+///
+/// Deserialized in every build, for the reason [`OtelSection`] records: the
+/// section is refused at project scope by [`refuse_widening`], which runs against
+/// the raw table before anything here deserializes, and a boundary that appeared
+/// and disappeared with a feature flag would be one an operator could not state.
+///
+/// Every key is optional. A file that names none of them still turns nothing on —
+/// discovery, the probed minimum and the callback bound all have defaults, and
+/// the tool is advertised or withheld on what discovery found rather than on
+/// whether this table exists.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodeactSection {
+    interpreter: Option<String>,
+    max_callbacks: Option<usize>,
+    timeout_secs: Option<u64>,
 }
 
 /// An operator's override for one ecosystem, applied onto what
@@ -1901,6 +1926,51 @@ impl Config {
         Some(config)
     }
 
+    /// Which interpreter runs a program, and how far one may reach (0.79.0).
+    ///
+    /// `[codeact]` is refused in any file inside a workspace, on the 0.74.0 rule
+    /// in its plainest form: `interpreter` names a program on this machine, and
+    /// every program the model writes is handed to it. An `io.toml` arrives with a
+    /// `git clone`, and `io.local.toml` is held to the same rule because a run's
+    /// own agent can write it.
+    ///
+    /// Write it in the user-scope file, which [`Config::discover`] also reads.
+    ///
+    /// ```
+    /// use io_harness::Config;
+    ///
+    /// // The project scope refuses the table by name, before anything is spawned.
+    /// let err = Config::from_toml(r#"
+    ///     [codeact]
+    ///     interpreter = "/opt/not-python"
+    /// "#).unwrap_err();
+    /// assert!(err.to_string().contains("codeact"), "{err}");
+    ///
+    /// // A configuration that declares none simply has none, which is the
+    /// // default and what keeps a run identical to one built before this release.
+    /// let plain = Config::from_toml("[run]\nmax_steps = 3\n").unwrap();
+    /// assert!(plain.codeact().is_none());
+    /// ```
+    #[cfg(feature = "codeact")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "codeact")))]
+    pub fn codeact(&self) -> Option<crate::codeact::CodeActConfig> {
+        let section = self.file.codeact.as_ref()?;
+        // Built through the same builder a caller uses, for the reason `otel()`
+        // records: one way to make the value means a default changed there is
+        // changed for a file too.
+        let mut config = crate::codeact::CodeActConfig::default();
+        if let Some(path) = &section.interpreter {
+            config = config.with_interpreter(path);
+        }
+        if let Some(calls) = section.max_callbacks {
+            config = config.with_max_callbacks(calls);
+        }
+        if let Some(secs) = section.timeout_secs {
+            config = config.with_timeout(std::time::Duration::from_secs(secs));
+        }
+        Some(config)
+    }
+
     /// The named agent definitions this configuration declares (0.21.0).
     ///
     /// `[[agent]]` tables **accumulate** across scopes the way `policy.layers` does,
@@ -2516,6 +2586,22 @@ const REFUSED_SECTIONS: &[(&str, &str, &str)] = &[
         "an OpenTelemetry collector",
         "the collector is a host every span of every run is posted to, reached \
          with whatever credential the same table names",
+    ),
+    // 0.79.0. `[codeact]` is the 0.74.0 clause at its plainest: `interpreter`
+    // names a program on this machine, and every program the model writes is
+    // handed to it. A cloned repository choosing it chooses what executes that
+    // source — and the name need not resolve to an interpreter at all, since
+    // nothing downstream re-checks what the operator's own file said to trust.
+    //
+    // The two bounds beside it are refused with it rather than separately, on the
+    // rule this list's own header states: a rule that permits half a table is one
+    // a reader holds two halves of, and the next key added lands on the permitted
+    // side by default.
+    (
+        "codeact",
+        "the interpreter that runs a program",
+        "the table names a program on this machine that every program the model \
+         writes is handed to, and the bounds on how far one may reach",
     ),
     // 0.28.0. The whole array, not its executing half: `run` is the `${cmd:}`
     // primitive by another name, and `append` is a write to a path the file chose,
