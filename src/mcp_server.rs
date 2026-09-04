@@ -325,8 +325,8 @@ impl<'a> Served<'a> {
         let run_id = store.start_run(SERVED_GOAL, &config.root().to_string_lossy())?;
         let watch = Watch::new(observer);
         let mcp = McpSession::connect(&[], config.policy(), &store, run_id, &watch).await?;
-        let lsp =
-            LspSession::connect(&[], config.policy(), config.root(), &store, run_id, &watch).await?;
+        let lsp = LspSession::connect(&[], config.policy(), config.root(), &store, run_id, &watch)
+            .await?;
         Ok(Self {
             memory_key: memory_key(config.root()),
             run_id,
@@ -1087,7 +1087,12 @@ mod tests {
         // sends one.
         let h = Harness::unattended();
         let s = h.session().await;
-        let response = handle(&h.config, &s, &request(Value::Null, "tools/list", json!({}))).await;
+        let response = handle(
+            &h.config,
+            &s,
+            &request(Value::Null, "tools/list", json!({})),
+        )
+        .await;
         assert!(response.is_some());
     }
 
