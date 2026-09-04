@@ -1285,6 +1285,32 @@ pub enum EventKind {
         /// the ones that do not exist on this host were dropped.
         roots: u32,
     },
+    /// A program was offered, withheld, or has finished running (0.79.0).
+    ///
+    /// Emitted once before the first step with `outcome` `available` or
+    /// `withheld`, and once per program afterwards. The first of those is the one
+    /// that matters most: a capability that quietly stops applying is worse than
+    /// one that is absent, so which path a run took is on the record rather than
+    /// inferred from the tools a transcript happens to show.
+    ///
+    /// The acts a program took are **not** here. Each one re-enters dispatch and
+    /// arrives as its own [`ToolCall`](EventKind::ToolCall), which is the point:
+    /// a program is a shorter way of asking, so what it asked for is observed
+    /// where every other request is observed.
+    Program {
+        /// The interpreter, when one was found, as the path that was resolved.
+        /// `None` when discovery found nothing usable.
+        interpreter: Option<String>,
+        /// What discovery found, or why it found nothing — every candidate and
+        /// what it answered, so `no interpreter` and `a python that reported 2.7`
+        /// are different facts an operator can read.
+        detail: String,
+        /// How many callbacks the program made. Zero on a discovery event.
+        calls: u32,
+        /// `available` or `withheld` for discovery; `finished`, `failed`,
+        /// `bound` or `timeout` for a program that ran.
+        outcome: String,
+    },
     /// A contained command's outbound connection was decided (0.48.0).
     ///
     /// One per dial, permitted or refused, from the loopback proxy the run owns.
@@ -1388,6 +1414,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "cache_marked",
     "prompt_composed",
     "contained",
+    "program",
     "finished",
 ];
 
@@ -2106,6 +2133,12 @@ mod tests {
                 backend: "macos-sandbox-exec".into(),
                 roots: 2,
             },
+            EventKind::Program {
+                interpreter: Some("/usr/bin/python3".into()),
+                detail: "/usr/bin/python3 (Python 3.11)".into(),
+                calls: 4,
+                outcome: "finished".into(),
+            },
             EventKind::Token {
                 text: "hello".into(),
             },
@@ -2259,6 +2292,8 @@ mod tests {
                 | EventKind::PromptComposed { .. }
                 // 0.46.0 — how this run's own commands are contained.
                 | EventKind::Contained { .. }
+                // 0.79.0 — whether a program was offered, and what one did.
+                | EventKind::Program { .. }
                 // 0.50.0 — a parent stopped waiting for a child, and later read it.
                 | EventKind::ChildDetached { .. }
                 | EventKind::ChildCollected { .. }
