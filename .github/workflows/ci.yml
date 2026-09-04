@@ -184,6 +184,15 @@ jobs:
       # runner.
       - if: matrix.features == 'all'
         run: cargo build --all-features --example browser_fixture
+      # 0.78.0: the served MCP example is in exactly the position browser_fixture
+      # is. Its `required-features = ["mcp-server"]` are off on the default
+      # polarity, so naming it on the line above fails outright — cargo refuses a
+      # `--example` whose required features are not enabled. It is built on the
+      # all-features leg only, which is the leg whose test spawns it:
+      # `tests/mcp_server_interop.rs` is `#![cfg(feature = "mcp-server")]` and
+      # compiles to nothing without the feature.
+      - if: matrix.features == 'all'
+        run: cargo build --all-features --example mcp_server_stdio
       # 0.15.0: the git built-ins are in the default build but need the binary.
       # Git is preinstalled on all three runners — asserted rather than
       # installed, because "no system package on any runner" is the constraint
