@@ -1122,33 +1122,96 @@ mod tests {
     }
 
     #[test]
-    fn f12_the_served_and_unserved_sets_partition_the_catalogue() {
-        let config = config();
-        let catalogue: Vec<String> = catalogue(&config)
-            .into_iter()
-            .map(|spec| spec.name)
-            .collect();
-        let served = served_names();
-        for name in &catalogue {
-            let is_served = served.contains(name);
-            let is_unserved = MCP_SERVER_UNSERVED.contains(&name.as_str());
-            assert!(
-                is_served != is_unserved,
-                "`{name}` is in exactly one of the served and unserved sets, not {}",
-                match is_served {
-                    true => "both",
-                    false => "neither",
-                }
-            );
-        }
+    fn f12_the_served_set_is_the_one_named_here_and_nothing_else() {
+        // Pinned by name, and that is the whole point of the test.
+        //
+        // The obvious form — assert every catalogue entry is in exactly one of
+        // the served and unserved sets — is a **tautology**, because
+        // `served_tools` is *defined* as the catalogue minus
+        // `MCP_SERVER_UNSERVED`. It cannot fail, and a sabotage arm proved it:
+        // deleting `ask_question` from the unserved list left that assertion
+        // green while quietly making a tool that needs a human answerable over a
+        // pipe.
+        //
+        // What the criterion actually promises is that a tool added later "lands
+        // in one of them rather than in neither" — which the derived form cannot
+        // deliver, since a new built-in joins the served set silently. A list
+        // written out here fails until somebody classifies the new tool, which
+        // is the decision the criterion wants made deliberately.
+        //
+        // The constants rather than string literals, so a rename is a compile
+        // error rather than a stale expectation.
+        // Built by `extend` rather than by `vec![]` so the binding is mutated on
+        // every polarity. With `vec![]` the feature-gated pushes below are the
+        // only mutation, and a build with all of them off fails `unused_mut` —
+        // right in one polarity and wrong in another, which is the class the
+        // lint matrix exists to catch.
+        let mut expected: Vec<&str> = Vec::new();
+        expected.extend([
+            crate::tools::GREP_TOOL,
+            crate::tools::FIND_TOOL,
+            crate::tools::LIST_DIR_TOOL,
+            crate::tools::READ_FILE_TOOL,
+            crate::tools::GIT_STATUS_TOOL,
+            crate::tools::GIT_DIFF_TOOL,
+            crate::tools::GIT_LOG_TOOL,
+            crate::tools::GIT_ADD_TOOL,
+            crate::tools::GIT_COMMIT_TOOL,
+            crate::tools::GIT_BRANCH_TOOL,
+            crate::tools::GIT_WORKTREE_TOOL,
+            crate::tools::REMEMBER_TOOL,
+            crate::tools::FORGET_TOOL,
+            crate::tools::TODO_WRITE_TOOL,
+            crate::tools::WRITE_FILE_TOOL,
+            crate::tools::EDIT_FILE_TOOL,
+            crate::tools::PATCH_FILE_TOOL,
+            crate::tools::CHECK_TOOL,
+            crate::tools::EXEC_TOOL,
+            crate::tools::SHELL_TOOL,
+            crate::tools::SHELL_START_TOOL,
+            crate::tools::SHELL_POLL_TOOL,
+            crate::tools::SHELL_KILL_TOOL,
+        ]);
+        // The feature-gated half of the catalogue, each arm exactly as
+        // `workspace_tools` gates it — so this test is right on every polarity
+        // rather than on the one it happened to be written under.
+        #[cfg(feature = "media")]
+        expected.push(crate::tools::VIEW_IMAGE_TOOL);
+        #[cfg(feature = "xlsx")]
+        expected.extend([
+            crate::tools::XLSX_SHEETS_TOOL,
+            crate::tools::XLSX_READ_TOOL,
+            crate::tools::XLSX_WRITE_TOOL,
+            crate::tools::XLSX_SET_CELL_TOOL,
+        ]);
+        #[cfg(feature = "docx")]
+        expected.extend([crate::tools::DOCX_READ_TOOL, crate::tools::DOCX_WRITE_TOOL]);
+        #[cfg(feature = "pptx")]
+        expected.push(crate::tools::PPTX_READ_TOOL);
+        #[cfg(feature = "pdf")]
+        expected.extend([
+            crate::tools::PDF_READ_TOOL,
+            crate::tools::PDF_WRITE_TOOL,
+            crate::tools::PDF_WATERMARK_TOOL,
+            crate::tools::PDF_FILL_FORM_TOOL,
+        ]);
+        #[cfg(feature = "barcode")]
+        expected.push(crate::tools::BARCODE_DECODE_TOOL);
+
+        let mut expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+        expected.sort();
+        let mut served: Vec<String> = served_names().into_iter().collect();
+        served.sort();
+
         assert_eq!(
-            served.len()
-                + catalogue
-                    .iter()
-                    .filter(|name| MCP_SERVER_UNSERVED.contains(&name.as_str()))
-                    .count(),
-            catalogue.len(),
-            "nothing is dropped between the catalogue and the served set"
+            served, expected,
+            "the served set moved. A tool added to the catalogue is served unless \
+             `MCP_SERVER_UNSERVED` names it, so this list is where that decision is \
+             made rather than inherited"
+        );
+        assert!(
+            !served.is_empty(),
+            "the served set is empty, so every assertion above it is vacuous"
         );
     }
 
