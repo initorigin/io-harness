@@ -346,9 +346,34 @@ impl<'a> Served<'a> {
         // thing there is to write: a session has no one file it is about.
         let run_id = store.start_run(SERVED_GOAL, &config.root().to_string_lossy())?;
         let watch = Watch::new(observer);
-        let mcp = McpSession::connect(&[], config.policy(), &store, run_id, &watch).await?;
-        let lsp = LspSession::connect(&[], config.policy(), config.root(), &store, run_id, &watch)
-            .await?;
+        // Everything after `start_run` closes the run on the way out. The row
+        // exists from here on, and a setup that fails between opening it and
+        // handing back a session would otherwise leave it `running` for ever —
+        // indistinguishable, to every reader of the store, from a session still
+        // in progress.
+        let sessions = async {
+            let mcp = McpSession::connect(&[], config.policy(), &store, run_id, &watch).await?;
+            let lsp =
+                LspSession::connect(&[], config.policy(), config.root(), &store, run_id, &watch)
+                    .await?;
+            Ok::<_, crate::Error>((mcp, lsp))
+        }
+        .await;
+        let (mcp, lsp) = match sessions {
+            Ok(pair) => pair,
+            Err(e) => {
+                // The setup's error is what the caller gets. A failure to close
+                // the row is worth a line in the log and must not replace it.
+                if let Err(closing) = store.finish_run(run_id, SERVED_FAILED) {
+                    tracing::warn!(
+                        run_id,
+                        error = %closing,
+                        "an MCP session that failed to start could not close its own run row"
+                    );
+                }
+                return Err(e);
+            }
+        };
         Ok(Self {
             memory_key: memory_key(config.root()),
             run_id,
