@@ -524,6 +524,18 @@ no end event for a tool call, and a step that batched several reads ran them
 concurrently. Where a step made more than one call, the per-call split is not
 claimed.
 
+**A parent span is not always sent before its children.** Step and tool spans go
+out when the queue fills; the run's own root span is only built when the run ends,
+so on a long run the children reach the collector in an earlier batch than the
+parent they name. Stateless OTLP collectors accept this — a span carries its
+parent's id rather than a reference to it — but a tail-sampling or
+trace-completeness processor will see an orphan window until the run finishes.
+
+**A run that is abandoned rather than finished exports nothing, and is eventually
+dropped.** The root span closes on the run's end; a run whose future is dropped
+never reaches one. The exporter holds a bounded number of such runs and evicts the
+oldest, with a line on the log channel when it does.
+
 **A run is a root trace.** There is no context propagation from an incoming
 `traceparent` in this release, so a run started by an already-traced service
 appears as its own trace rather than as a child of that request.
