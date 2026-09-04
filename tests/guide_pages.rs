@@ -33,6 +33,11 @@ const GUIDES: &[(&str, bool)] = &[
     ("language-support.md", true),
     ("composition.md", false),
     ("sandbox.md", true),
+    // 0.79.0. A limits block, because the bound is the interesting part twice
+    // over: what a program may call is narrower than what the model may, and what
+    // contains it is what contains a backgrounded command line — which on Windows
+    // is a resource boundary with no path rule and no socket rule.
+    ("codeact.md", true),
     ("durable-runs.md", false),
     ("mcp-and-network.md", true),
     ("tools-and-skills.md", true),
