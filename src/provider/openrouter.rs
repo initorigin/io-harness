@@ -41,7 +41,7 @@ const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// Swapping vendors is this line and nothing else — the contract, the policy, the
 /// store, and the tools are unchanged, because no vendor type reaches them.
 pub struct OpenRouter {
-    client: reqwest::Client,
+    client: crate::net::PinnedClient,
     api_key: String,
     model: String,
     endpoint: String,
@@ -51,7 +51,7 @@ impl OpenRouter {
     /// Build from an explicit key and model slug (e.g. `anthropic/claude-sonnet-4`).
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: crate::net::http_client(),
+            client: crate::net::PinnedClient::new(ENDPOINT),
             api_key: api_key.into(),
             model: model.into(),
             endpoint: ENDPOINT.to_string(),
@@ -65,7 +65,7 @@ impl OpenRouter {
     /// abandon a hung socket sooner than the default does. Rebuilds the client, so
     /// call it before handing the provider to a run.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.client = crate::net::http_client_with_timeout(timeout);
+        self.client.set_timeout(timeout);
         self
     }
 
@@ -74,11 +74,12 @@ impl OpenRouter {
     /// socket. Test-only: the endpoint is not configurable in the public API.
     #[cfg(test)]
     pub(crate) fn at(endpoint: impl Into<String>, timeout: std::time::Duration) -> Self {
+        let endpoint = endpoint.into();
         Self {
-            client: crate::net::http_client_with_timeout(timeout),
+            client: crate::net::PinnedClient::with_timeout(endpoint.as_str(), timeout),
             api_key: "test-key".into(),
             model: "test-model".into(),
-            endpoint: endpoint.into(),
+            endpoint,
         }
     }
 
@@ -171,8 +172,13 @@ impl OpenRouter {
         // The TTFT clock starts before the socket is opened, so it measures the
         // wait a caller actually experiences rather than only the model's part.
         let sent = std::time::Instant::now();
+        // `ready` resolves and grades the endpoint on the first call and pins the
+        // client to what it graded, so the addresses the run authorised and the
+        // addresses this request reaches cannot be two different answers.
         let resp = self
             .client
+            .ready()
+            .await?
             .post(&self.endpoint)
             .bearer_auth(&self.api_key)
             .json(&openai_wire::body(

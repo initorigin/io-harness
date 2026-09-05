@@ -209,7 +209,10 @@ pub(crate) fn preset_list() -> String {
 /// file, and has done since 0.19.0.
 #[derive(Clone)]
 pub struct Compatible {
-    client: reqwest::Client,
+    /// Pinned to `base`'s host, which is the host both `/chat/completions` and
+    /// `/models` are appended to — one endpoint, so one pin. A `reference`
+    /// catalogue is a *different* host and carries its own.
+    client: crate::net::PinnedClient,
     api_key: String,
     model: String,
     /// The whole prefix the vendor documents, with no trailing slash. Paths are
@@ -252,11 +255,12 @@ impl Compatible {
         api_key: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let base = base.into().trim_end_matches('/').to_string();
         Self {
-            client: crate::net::http_client(),
+            client: crate::net::PinnedClient::new(base.as_str()),
             api_key: api_key.into(),
             model: model.into(),
-            base: base.into().trim_end_matches('/').to_string(),
+            base,
             name: "compatible".into(),
             auth,
             reference: None,
@@ -305,7 +309,7 @@ impl Compatible {
     /// run.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.client = crate::net::http_client_with_timeout(timeout);
+        self.client.set_timeout(timeout);
         self
     }
 
@@ -423,7 +427,14 @@ impl Compatible {
         openai_wire::ensure_web_supported(self.name(), WebFlavor::OpenAi, &request)?;
         self.refuse_cleartext_bearer()?;
         let sent = std::time::Instant::now();
-        let mut req = self.client.post(self.chat_url());
+        // After the cleartext refusal, not before: a `http://` base pointed at a
+        // remote host is a configuration mistake with a specific message, and the
+        // pin resolving it first would answer with the floor's refusal instead.
+        //
+        // `ready` resolves and grades `base`'s host on the first call and pins the
+        // client to what it graded, so the addresses the run authorised and the
+        // addresses this request reaches cannot be two different answers.
+        let mut req = self.client.ready().await?.post(self.chat_url());
         // The one place the auth style reaches the wire. `Auth::None` sends no
         // header at all rather than an empty bearer, which some local runtimes
         // reject outright.
@@ -506,7 +517,8 @@ impl Provider for Compatible {
             return Ok(hit.clone());
         }
         let url = format!("{}/models", self.base);
-        let mut models = catalog::fetch(&self.client, &url, &PriceSource::Vendor).await?;
+        let mut models =
+            catalog::fetch(self.client.ready().await?, &url, &PriceSource::Vendor).await?;
         if let Some(reference) = &self.reference {
             // A failure here is the caller's to see. Swallowing it would leave a
             // run silently unpriced after the operator asked for prices — and if

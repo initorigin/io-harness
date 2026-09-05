@@ -99,13 +99,19 @@ pub(super) async fn authorize_provider<P: Provider>(
         // M10 — the guard resolves the endpoint here and grades what came back, so
         // a `base_url` pointed at a name that resolves onto loopback, cloud
         // metadata or the internal network is refused before the run's first step.
-        // The addresses are dropped rather than dialled, and that is the honest
-        // limit of this site: a `Provider` owns its own HTTP client and resolves
-        // the name again when it dials, so what is closed here is a name that
-        // *always* answers with a local address, not a name that answers
-        // differently the second time it is asked. Pinning the dial as well would
-        // mean every `Provider` taking a client it did not build, which is an API
-        // change and not this release's.
+        //
+        // **0.80.0 closed M10's residual, and the note that used to sit here said
+        // it could not be.** It read that the addresses are dropped rather than
+        // dialled because a `Provider` owns its own HTTP client and resolves the
+        // name again, so what this site closed was a name that *always* answers
+        // locally and not one that answers differently the second time — and that
+        // pinning the dial would mean every `Provider` taking a client it did not
+        // build, an API change. The pin went in below the public surface instead:
+        // each built-in provider holds a `net::PinnedClient`, which resolves and
+        // grades its own endpoint once and dials only those addresses. No
+        // signature moved. The addresses are still dropped *here*, and that is now
+        // a duplication of work rather than a hole — this site refuses the run
+        // before it starts, and the client refuses the dial.
         let (verdict, _) = NetGuard::new(&effective)
             .tracing(store, run_id, 0)
             .watching(watch, 0)

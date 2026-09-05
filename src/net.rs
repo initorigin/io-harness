@@ -7,8 +7,9 @@
 //!
 //! Four pieces live here, and they are deliberately the *only* way out:
 //!
-//! - `http_client` is the one `reqwest::Client` constructor in the crate, so
-//!   redirect behaviour is decided once rather than per call site.
+//! - `http_client_with_timeout` is the one `reqwest::Client` constructor in the
+//!   crate, so redirect behaviour is decided once rather than per call site, and
+//!   `PinnedClient` is the endpoint-owning wrapper every provider holds.
 //! - [`target`] turns a URL into the `host:port` string the policy sees, so
 //!   every act sees a target in the same shape. It is the one piece of this
 //!   module a caller outside the crate can reach, because it is the one piece a
@@ -39,12 +40,17 @@
 //!   client through `pinned_client`, the egress proxy through
 //!   `TcpStream::connect(&addrs[..])`. Check and dial are the same answer, so
 //!   there is no rebinding window between them.
-//! - **Resolved, not pinned.** A provider endpoint is graded by the same guard,
-//!   but the [`Provider`](crate::Provider) owns its own client and resolves the
-//!   name again when it dials. A name that resolves to a local address is refused
-//!   before the run's first step; a name whose *second* answer differs from its
-//!   first is not, and closing that would mean every provider taking a pinned
-//!   client, which is an API change and not this release's.
+//! - **Resolved and pinned, a second time.** A provider endpoint is graded by the
+//!   same guard before the run's first step, and the [`Provider`](crate::Provider)
+//!   still owns its own client — but that client is a `PinnedClient` (private to
+//!   this module, so it is named here rather than linked), which
+//!   resolves and grades the endpoint once more on its first request and dials
+//!   only what *that* grading returned. The addresses the run graded and the
+//!   addresses the provider dials are two answers rather than one, so this is not
+//!   the same closure `NetGuard::check` gets; what it removes is the window that
+//!   mattered, because the second answer is now graded rather than trusted. A
+//!   name whose reply flips to loopback, link-local or cloud metadata between the
+//!   two is refused at the provider instead of dialled.
 //! - **Not resolved.** The browser navigation gate (`browser::NavGate`) grades by
 //!   name only. Chrome resolves every URL itself and a navigation cannot be
 //!   pinned to an address without breaking SNI and certificate validation, so
@@ -103,16 +109,13 @@ use crate::state::{PolicyEvent, Store};
 /// ```
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// The one `reqwest::Client` constructor in the crate.
-///
-/// Uses [`REQUEST_TIMEOUT`]; see [`http_client_with_timeout`] for the rest.
-pub(crate) fn http_client() -> reqwest::Client {
-    http_client_with_timeout(REQUEST_TIMEOUT)
-}
-
-/// As [`http_client`], with an explicit deadline — for a caller whose model is
-/// slower than [`REQUEST_TIMEOUT`] allows, and for tests that need a deadline
+/// The one `reqwest::Client` constructor in the crate — for a caller whose model
+/// is slower than [`REQUEST_TIMEOUT`] allows, and for tests that need a deadline
 /// they can reach in a second rather than ten minutes.
+///
+/// Every caller states a deadline. [`PinnedClient`] is what carries
+/// [`REQUEST_TIMEOUT`] for the one that has no opinion, so there is no second
+/// constructor whose only job is to supply the default.
 ///
 /// This function is crate-private; the caller reaches it through the
 /// `with_timeout` builder method on each provider, which is what makes the
@@ -166,20 +169,164 @@ fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
 /// pinning to nothing would break a request the guard has already refused or
 /// allowed on other grounds.
 pub(crate) fn pinned_client(url: &str, addrs: &[SocketAddr]) -> reqwest::Client {
+    pinned_client_with_timeout(url, addrs, REQUEST_TIMEOUT)
+}
+
+/// As [`pinned_client`], with an explicit deadline.
+///
+/// Split out for the providers, every one of which has a `with_timeout` builder
+/// and would otherwise have had to choose between the caller's deadline and the
+/// pin. The two are the same function so the pin cannot acquire a second set of
+/// client settings by being built somewhere else.
+pub(crate) fn pinned_client_with_timeout(
+    url: &str,
+    addrs: &[SocketAddr],
+    timeout: Duration,
+) -> reqwest::Client {
     let host = target(url)
         .as_deref()
         .and_then(split_target)
         .map(|(host, _)| unbracket(host).to_string());
     let Some(host) = host else {
-        return http_client();
+        return http_client_with_timeout(timeout);
     };
     if addrs.is_empty() || host.parse::<IpAddr>().is_ok() {
-        return http_client();
+        return http_client_with_timeout(timeout);
     }
-    client_builder(REQUEST_TIMEOUT)
+    client_builder(timeout)
         .resolve_to_addrs(&host, addrs)
         .build()
-        .unwrap_or_else(|_| http_client())
+        .unwrap_or_else(|_| http_client_with_timeout(timeout))
+}
+
+/// One endpoint's HTTP client, pinned on first use to the addresses that
+/// endpoint's host graded as.
+///
+/// This is the provider half of the pin, and the reason it is a type rather than
+/// a call is that a `Provider` is built synchronously and dials asynchronously.
+/// Resolving in the constructor would mean a DNS lookup in `OpenAi::new`, and
+/// resolving per request would mean a fresh `reqwest::Client` — and therefore a
+/// cold connection pool and a new TLS handshake — on every model call. The cell
+/// is what makes "resolve once, dial the graded set, keep the pool" the same
+/// thing.
+///
+/// **A name is graded and pinned; an IP literal is neither.** A literal is its
+/// own resolution: there is no second answer to differ from the first, so there
+/// is no window to close and nothing for [`pinned_client`] to override. Grading
+/// it here would only add a *decision* at the dial that the caller's gate has
+/// already made at the check — and would refuse, for instance, a provider
+/// pointed at `http://127.0.0.1:8080` by a caller driving it directly. What the
+/// floor refuses at the decision site is unchanged; this site only refuses what
+/// the decision site could not see.
+///
+/// ponytail: the pin is taken once and lives as long as the provider. A process
+/// that outlives its endpoint's DNS record — a daemon holding one `Harness` for
+/// days across a vendor's failover — keeps dialling addresses that stopped
+/// answering, and the symptom is a connect error rather than a wrong host, so it
+/// fails closed. No TTL is invented for it here because the right ceiling is the
+/// record's own TTL, which `tokio::net::lookup_host` does not report; the
+/// upgrade path is a resolver that does (`hickory-resolver`, already reqwest's
+/// optional one) rebuilding the cell when the record expires, or — cheaper —
+/// rebuilding it on a connect error and retrying once.
+pub(crate) struct PinnedClient {
+    /// The URL the pin is taken for. Held rather than passed at request time so
+    /// the cached client and the host it was pinned to cannot come apart: a
+    /// second URL on a second host would silently reuse a client pinned to the
+    /// first one's addresses.
+    endpoint: String,
+    timeout: Duration,
+    cell: tokio::sync::OnceCell<reqwest::Client>,
+}
+
+impl PinnedClient {
+    /// A client for `endpoint` on the [`REQUEST_TIMEOUT`] default.
+    pub(crate) fn new(endpoint: impl Into<String>) -> Self {
+        Self::with_timeout(endpoint, REQUEST_TIMEOUT)
+    }
+
+    /// A client for `endpoint` on `timeout`.
+    pub(crate) fn with_timeout(endpoint: impl Into<String>, timeout: Duration) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            timeout,
+            cell: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Replace the deadline, discarding any client already built.
+    ///
+    /// The discard is the point: `with_timeout` on a provider is documented as
+    /// rebuilding its client, and a cell that kept the old one would keep the old
+    /// deadline with it. Nothing has been resolved yet in the ordinary case —
+    /// `with_timeout` is called on a fresh provider — so this costs nothing.
+    pub(crate) fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+        self.cell = tokio::sync::OnceCell::new();
+    }
+
+    /// The client, built and pinned on the first call and reused on every one
+    /// after.
+    ///
+    /// The error is the floor's own [`Error::Refused`], carrying the address that
+    /// decided and the key that would restore it, so a provider that refuses here
+    /// refuses for a reason the operator can read.
+    pub(crate) async fn ready(&self) -> Result<&reqwest::Client> {
+        self.cell.get_or_try_init(|| self.build()).await
+    }
+
+    /// Resolve, grade, and pin — or fall back to an unpinned client for the two
+    /// shapes that need no pin.
+    async fn build(&self) -> Result<reqwest::Client> {
+        let reduced = target(&self.endpoint);
+        // A URL `target` cannot reduce has no host to grade, and the caller's own
+        // parse is what refused it. `Compatible::refuse_cleartext_bearer` is the
+        // one that says so today; answering with a client keeps that refusal the
+        // one the caller sees.
+        let Some((host, port)) = reduced.as_deref().and_then(split_target) else {
+            return Ok(http_client_with_timeout(self.timeout));
+        };
+        if unbracket(host).parse::<IpAddr>().is_ok() {
+            return Ok(http_client_with_timeout(self.timeout));
+        }
+        let addrs = dialable_async(host, port, LocalNet::configured()).await?;
+        Ok(pinned_client_with_timeout(
+            &self.endpoint,
+            &addrs,
+            self.timeout,
+        ))
+    }
+}
+
+impl Clone for PinnedClient {
+    /// Carries the built client over rather than starting cold.
+    ///
+    /// A `reqwest::Client` is a handle onto a shared connection pool, so cloning
+    /// it keeps the pool *and* the pin — the endpoint is the same endpoint, and
+    /// the addresses it graded as are the same addresses. Starting the clone
+    /// unpinned would be equally safe and would throw away every open connection
+    /// the original had, which is the cost this type exists to avoid.
+    fn clone(&self) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            timeout: self.timeout,
+            cell: tokio::sync::OnceCell::new_with(self.cell.get().cloned()),
+        }
+    }
+}
+
+impl std::fmt::Debug for PinnedClient {
+    /// Says whether the pin has been taken and nothing else.
+    ///
+    /// Hand-written rather than derived because the endpoint can carry a
+    /// credential — a gateway URL with userinfo, an `?api-key=` query — and this
+    /// type is a field of types that *derive* `Debug`. Printing the URL here
+    /// would put that key in whatever log the `{:?}` reached, which is the leak
+    /// `provider::redacted_endpoint` exists to close everywhere else.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedClient")
+            .field("pinned", &self.cell.initialized())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The wait a response asks for in its `Retry-After` header, if it asks for one.
@@ -744,9 +891,13 @@ pub(crate) fn floor_by_name(host: &str, port: u16, local: LocalNet) -> Result<()
 /// address that decided and the key that would restore it.
 ///
 /// An IP literal is its own resolution and consults no resolver at all, which is
-/// what keeps a check of `127.0.0.1` offline — and is why this crate's own test
-/// suite, whose endpoints are all literals or loopback names, issues no DNS query
-/// even though every decision now runs through here.
+/// what keeps a check of `127.0.0.1` offline — and is why almost every endpoint in
+/// this crate's own test suite, being a literal or a loopback name, issues no DNS
+/// query even though every decision runs through here. The exception is
+/// `tests/deadline.rs`, which points the three vendor-pinned providers at their
+/// real hostnames and diverts the connection with a proxy: since 0.80.0 those
+/// providers resolve their endpoint through [`PinnedClient`] before the proxy sees
+/// the request, so that file needs a resolver where the rest of the suite does not.
 ///
 /// A *short-form* literal is not a literal to `IpAddr::from_str`, which wants a
 /// dotted quad: `2130706433` and `127.1` both parse as `127.0.0.1` in
@@ -1629,6 +1780,228 @@ mod tests {
                 .await
                 .is_err(),
             "the widening is for local runtimes, not for metadata"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M10 residual — the provider half of the pin
+    //
+    // These live here rather than in `tests/` because the property is about a
+    // crate-private type: an integration test can see that a local endpoint is
+    // refused (`tests/security_provider_pinning.rs` asserts exactly that through
+    // the published API), but it cannot see *which addresses* a client will dial,
+    // and it cannot count how many clients one provider built. Both are the claim.
+    // -----------------------------------------------------------------------
+
+    /// Whether this process is behind an HTTP proxy.
+    ///
+    /// A proxy is what decides the dial instead of the pin, so the two tests that
+    /// assert on where a connection went have nothing to assert under one.
+    /// Corporate machines set these; CI runners do not.
+    fn proxied() -> bool {
+        ["http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"]
+            .iter()
+            .any(|k| std::env::var_os(k).is_some())
+    }
+
+    /// A local listener answering every request with a bodyless 204, holding each
+    /// connection open for as many requests as the client sends down it.
+    ///
+    /// Returns the port and the number of connections it has *accepted*. The
+    /// count is the pooling assertion: one client reuses a connection, and a
+    /// client rebuilt per request cannot, because a fresh `reqwest::Client` starts
+    /// with an empty pool.
+    ///
+    /// The port rather than a URL, because one of these tests points a *name* at
+    /// it rather than the address it is bound to.
+    fn answering_port() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    // One read per request head: these requests carry no body, and
+                    // nothing here pipelines.
+                    while stream.read(&mut buf).unwrap_or(0) > 0 {
+                        let head = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+                        if stream.write_all(head).is_err() {
+                            break;
+                        }
+                        let _ = stream.flush();
+                    }
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    /// M10 — a pinned client dials the address it was pinned to, and nothing it
+    /// could have resolved instead.
+    ///
+    /// The host is under `.invalid`, which RFC 6761 reserves as never-resolvable,
+    /// so a client that consulted the resolver at connect time cannot reach the
+    /// listener at all. Reaching it is therefore proof that the pin — not a second
+    /// lookup — decided where the bytes went. No DNS query is issued either way.
+    ///
+    /// This one asserts the *mechanism* and passes on `develop` as well:
+    /// `pinned_client` already worked, and what was missing was a provider that
+    /// used it. The tests below are the ones that fail without this change.
+    #[tokio::test]
+    async fn m10_a_pinned_client_dials_the_address_it_was_pinned_to() {
+        if proxied() {
+            return;
+        }
+        let (port, _) = answering_port();
+        let url = format!("http://pinned.invalid:{port}/");
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let pinned = pinned_client_with_timeout(&url, &[addr], Duration::from_secs(5));
+        let status = pinned.get(url.as_str()).send().await.unwrap().status();
+        assert_eq!(status, 204, "the pin is what decided the dial");
+
+        // The negative control: the same request without the pin cannot resolve
+        // the name, so a passing assertion above is not the resolver's doing.
+        let unpinned = http_client_with_timeout(Duration::from_secs(5));
+        assert!(
+            unpinned.get(url.as_str()).send().await.is_err(),
+            "`.invalid` must not resolve, or the test above proves nothing"
+        );
+    }
+
+    /// M10 — one provider instance builds one client, however many requests it
+    /// makes, and the connection pool survives between them.
+    ///
+    /// This is the whole reason the pin lives in a cell. A client rebuilt per
+    /// request would re-resolve, re-handshake TLS and start with an empty pool on
+    /// every model call — a cost the fix must not bring with it. The server counts
+    /// *accepts* rather than requests, because that is the difference: two
+    /// requests down one connection is one accept, and two clients cannot share
+    /// one connection however they are built.
+    ///
+    /// Against `develop` there is no `PinnedClient`, so this measures the shape
+    /// the change introduces rather than a regression it repairs.
+    #[tokio::test]
+    async fn m10_one_provider_instance_builds_one_client() {
+        if proxied() {
+            return;
+        }
+        // An IP literal, so this is about the cell rather than about a resolver
+        // that might answer differently twice.
+        let (port, accepted) = answering_port();
+        let url = format!("http://127.0.0.1:{port}/v1");
+        let client = PinnedClient::with_timeout(url.as_str(), Duration::from_secs(5));
+        for _ in 0..2 {
+            let resp = client
+                .ready()
+                .await
+                .unwrap()
+                .get(url.as_str())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 204);
+        }
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a second connection means a second client, and a cold pool per request"
+        );
+    }
+
+    /// M10 — a new deadline discards the client the old one built.
+    ///
+    /// `with_timeout` is documented on every provider as rebuilding the client, so
+    /// a cell that survived the change would hand back a client still carrying the
+    /// default ten minutes. Read off `Debug`, which is where "has this been
+    /// pinned yet" is observable at all.
+    #[tokio::test]
+    async fn m10_a_new_deadline_discards_the_client_it_replaces() {
+        let mut client = PinnedClient::new("http://127.0.0.1:9/v1");
+        assert!(format!("{client:?}").contains("pinned: false"));
+        client.ready().await.unwrap();
+        assert!(format!("{client:?}").contains("pinned: true"));
+        client.set_timeout(Duration::from_secs(1));
+        assert!(
+            format!("{client:?}").contains("pinned: false"),
+            "the deadline is a rebuild, not a setting on a client already built"
+        );
+    }
+
+    /// M10 — an endpoint whose host is on this machine is refused at the client
+    /// rather than dialled, and the refusal says what would lift it.
+    ///
+    /// Against `develop` this is not a refusal at all: the provider held a plain
+    /// `reqwest::Client` and dialled whatever the name answered with.
+    #[tokio::test]
+    async fn m10_a_local_endpoint_is_refused_when_the_client_is_asked_for() {
+        let err = PinnedClient::new("http://localhost:9/v1")
+            .ready()
+            .await
+            .unwrap_err();
+        let Error::Refused { rule, layer, .. } = &err else {
+            panic!("a local endpoint must be refused by the floor, got {err:?}");
+        };
+        assert_eq!(layer.as_deref(), Some(FLOOR_LAYER));
+        assert!(
+            rule.as_deref().unwrap().contains(ALLOW_LOCAL_ENV),
+            "a refusal that does not name the key is one nobody can act on: {rule:?}"
+        );
+    }
+
+    /// M10 — an IP literal is dialled as written, with no second decision.
+    ///
+    /// The positive control for the refusal above: a floor applied at the dial
+    /// rather than at the check would refuse this too, and every one of this
+    /// crate's own socket fixtures with it.
+    #[tokio::test]
+    async fn m10_a_literal_endpoint_is_not_regraded_at_the_dial() {
+        assert!(PinnedClient::new("http://127.0.0.1:9/v1")
+            .ready()
+            .await
+            .is_ok());
+        assert!(PinnedClient::new("http://[::1]:9/v1").ready().await.is_ok());
+    }
+
+    /// M10 — a URL with no host to grade answers with a client, not a refusal.
+    ///
+    /// The caller's own parse is what refuses these — `Compatible` answers an
+    /// unreducible base with `Error::Config` naming it — and a second refusal here
+    /// would replace that message with a less useful one.
+    #[tokio::test]
+    async fn m10_an_endpoint_with_no_host_falls_back_rather_than_refusing() {
+        for url in ["not a url", "file:///etc/passwd", "https://"] {
+            assert!(
+                PinnedClient::new(url).ready().await.is_ok(),
+                "{url} has no host to grade, so it has no pin to take"
+            );
+        }
+    }
+
+    /// M10 — a clone carries the client, and therefore the pool, it was cloned
+    /// from.
+    ///
+    /// `Compatible` derives `Clone`, and a clone that started cold would take a
+    /// fresh resolution and a fresh TLS handshake for a provider pointed at the
+    /// same endpoint as the one it was copied from.
+    #[tokio::test]
+    async fn m10_a_clone_carries_the_client_it_was_cloned_from() {
+        let client = PinnedClient::new("http://127.0.0.1:9/v1");
+        // A clone taken before the first request has nothing to carry.
+        assert!(format!("{:?}", client.clone()).contains("pinned: false"));
+
+        client.ready().await.unwrap();
+        assert!(
+            format!("{:?}", client.clone()).contains("pinned: true"),
+            "a clone of a provider that has already dialled starts warm"
         );
     }
 

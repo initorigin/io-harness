@@ -79,7 +79,10 @@ pub const DEFAULT_REFERENCE_URL: &str = "https://openrouter.ai/api/v1/models";
 #[derive(Debug, Clone)]
 pub struct Reference {
     url: String,
-    client: reqwest::Client,
+    /// Pinned to `url`'s host on the first fetch, for the reason every provider's
+    /// is: the run authorises this host before the first step, and a client that
+    /// resolved the name a second time at connect could reach a different one.
+    client: crate::net::PinnedClient,
     /// One fetch per instance. Deliberately here rather than in the store:
     /// [`Provider::models`](super::Provider::models) takes `&self` and nothing
     /// else, so reaching a [`Store`](crate::Store) from it would mean putting
@@ -105,9 +108,10 @@ impl Reference {
 
     /// A catalogue at `url`, for a mirror or an offline copy.
     pub fn at(url: impl Into<String>) -> Self {
+        let url = url.into();
         Self {
-            url: url.into(),
-            client: crate::net::http_client(),
+            client: crate::net::PinnedClient::new(url.as_str()),
+            url,
             cached: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -115,7 +119,7 @@ impl Reference {
     /// Replace the request deadline, as each provider's own `with_timeout` does.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.client = crate::net::http_client_with_timeout(timeout);
+        self.client.set_timeout(timeout);
         self
     }
 
@@ -143,7 +147,12 @@ impl Reference {
             return Ok(hit.clone());
         }
         let host = self.host().unwrap_or(&self.url).to_string();
-        let models = fetch(&self.client, &self.url, &PriceSource::Reference(host)).await?;
+        let models = fetch(
+            self.client.ready().await?,
+            &self.url,
+            &PriceSource::Reference(host),
+        )
+        .await?;
         // A race between two callers costs a second request and the first result
         // wins, which is cheaper than holding a lock across an await.
         let _ = self.cached.set(models.clone());
