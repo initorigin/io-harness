@@ -743,15 +743,25 @@ impl Workspace {
     ///
     /// The policy gate runs before any byte is read, so nothing here can be used
     /// to learn what a file the policy denies contains — or whether it exists.
+    ///
+    /// **A file over [`MAX_DOCUMENT_BYTES`] is refused rather than read
+    /// (0.80.0),** in the same words [`Workspace::read_bytes`] refuses it. The
+    /// ceiling arrived on the byte read alone and this is the same allocation
+    /// reached through the door an agent uses first: every [`Workspace::read_file`]
+    /// is a `read_typed`. An extension the crate classifies without decoding —
+    /// an image, a document — is answered before the limit applies, because
+    /// naming a format costs no bytes.
     pub fn read_typed(&self, rel: &str) -> Result<FileContent> {
+        use std::io::Read as _;
+
         let abs = self.resolve(rel)?;
         self.enforce(Act::Read, rel)?;
 
         // Existence first, and only then the extension: a `.png` that is not
         // there is a file to create, not an image. That ordering is what keeps
         // 0.1.0's empty-on-missing behaviour exactly as it was for every path.
-        match std::fs::metadata(&abs) {
-            Ok(_) => {}
+        let len = match std::fs::metadata(&abs) {
+            Ok(meta) => meta.len(),
             // The one case where nothing is an answer: reading a file that is not
             // there yet is how an agent decides to create it.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -761,7 +771,7 @@ impl Workspace {
                 })
             }
             Err(e) => return Err(Error::Io(e)),
-        }
+        };
 
         let ext = Path::new(rel)
             .extension()
@@ -774,7 +784,32 @@ impl Workspace {
             return Ok(FileContent::Document { format, tool });
         }
 
-        let bytes = std::fs::read(&abs).map_err(Error::Io)?;
+        // The same ceiling `read_bytes` holds, on the same limit and with the
+        // same refusal. M15 put it on the byte read alone, and this is the second
+        // door into the same allocation: every `read_file` is a call to this
+        // method, so an oversized file exhausted memory through an ordinary text
+        // read while the byte read beside it refused — and the text read is the
+        // one an agent reaches for first. All three entry points answer alike.
+        //
+        // The size is the `metadata` above rather than a second `stat`, and the
+        // read is capped as well for the reason `read_bytes` caps its own: a path
+        // that reports zero bytes can still stream without end, which is what a
+        // character device or a `/proc` entry inside the root does. Refusing is
+        // the whole answer — handing the model the front of a file it believes it
+        // has read is the confident wrong reading 0.55.0 removed the empty string
+        // to prevent.
+        if len > MAX_DOCUMENT_BYTES {
+            return Err(too_large(rel, &format!("{len} bytes")));
+        }
+        let mut bytes = Vec::new();
+        std::fs::File::open(&abs)
+            .map_err(|e| read_error(rel, e))?
+            .take(MAX_DOCUMENT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| read_error(rel, e))?;
+        if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+            return Err(too_large(rel, "longer than the size it reports"));
+        }
 
         let text = |text: String, encoding| Ok(FileContent::Text { text, encoding });
         match bytes.as_slice() {
@@ -857,31 +892,24 @@ impl Workspace {
     /// `SeCreateSymbolicLinkPrivilege` or developer mode — not something an
     /// unprivileged agent has.
     fn write_leaf(&self, abs: &Path, content: &[u8]) -> Result<()> {
+        #[cfg(not(unix))]
         if let Some(parent) = abs.parent() {
-            // ponytail: the parent chain is checked, not held open. A directory
-            // swapped for a link between `contain_under_root` and here is still
-            // followed; closing that needs an `openat` walk from a root
-            // descriptor, which is the upgrade path if it ever matters.
             std::fs::create_dir_all(parent)?;
         }
         #[cfg(unix)]
         {
             use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
 
-            let open = |p: &Path| {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(p)
-            };
-            let mut file = match open(abs) {
+            // 0.80.0 — [`walk_open`] creates every intermediate directory and
+            // opens the leaf, each step from a descriptor rather than from a
+            // path, so the directories are not created here and no component is
+            // resolved twice.
+            let mut file = match walk_open(&self.root, abs) {
                 Ok(f) => f,
-                // `ELOOP` here means the leaf is a symlink and nothing else: the
-                // flag is the only reason this open can report it.
-                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                // The leaf is a symbolic link, which is a different path from
+                // its destination and gets its own verdict — the re-decision
+                // this arm exists for.
+                Err(NoFollow::LeafIsLink) => {
                     let dest = std::fs::read_link(abs).map_err(Error::Io)?;
                     let dest = match abs.parent() {
                         Some(parent) if dest.is_relative() => parent.join(dest),
@@ -889,9 +917,22 @@ impl Workspace {
                     };
                     let dest = contain_under_root(&self.root, &dest)?;
                     self.enforce_contained(Act::Write, &dest)?;
-                    open(&dest).map_err(Error::Io)?
+                    match walk_open(&self.root, &dest) {
+                        Ok(f) => f,
+                        // A link to a link, or a link whose destination sits
+                        // under a swapped component. One re-decision is the
+                        // claim this arm makes; a chain of them is a walk with
+                        // no fixed point, so it is refused.
+                        Err(NoFollow::LeafIsLink | NoFollow::ComponentIsLink { .. }) => {
+                            return Err(link_chain(abs, &dest))
+                        }
+                        Err(NoFollow::Io(e)) => return Err(Error::Io(e)),
+                    }
                 }
-                Err(e) => return Err(Error::Io(e)),
+                Err(NoFollow::ComponentIsLink { component }) => {
+                    return Err(swapped_component(abs, &component))
+                }
+                Err(NoFollow::Io(e)) => return Err(Error::Io(e)),
             };
             file.write_all(content).map_err(Error::Io)
         }
@@ -1109,6 +1150,185 @@ fn escape(rel: &str) -> Error {
 
 /// The refusal a path that leaves the root gets: what it was, why, and the one
 /// thing that would work instead.
+/// What stopped [`walk_open`], told apart because the three answers are three
+/// different things to do (0.80.0).
+#[cfg(unix)]
+enum NoFollow {
+    /// The final component is a symbolic link. Not a refusal: the caller reads
+    /// where it points and re-decides containment against that path, which is
+    /// the behaviour `write_file` has documented since 0.74.0.
+    LeafIsLink,
+    /// A *directory* component is a symbolic link, or is not a directory at all.
+    /// Always a refusal — nothing above the leaf is ever re-decided, because a
+    /// component that changed under the walk is the race itself.
+    ComponentIsLink {
+        component: std::ffi::OsString,
+    },
+    Io(std::io::Error),
+}
+
+/// Open `abs` for writing without ever resolving a component by path.
+///
+/// **The parent-directory race, closed (0.80.0.)** Until this release the parent
+/// chain was checked by [`contain_under_root`] and then handed to
+/// `create_dir_all` and an `O_NOFOLLOW` open, both of which resolve the whole
+/// path again — and `O_NOFOLLOW` covers the final component only. A directory
+/// swapped for a symbolic link in the window between the check and the write was
+/// followed by both: `root/a/b/x` with `a` replaced by a link to `/etc` created
+/// `/etc/b` and wrote `/etc/b/x`, past a gate that had graded a path inside the
+/// root. Every writing entry point in this file routes through `write_leaf`, so
+/// that was the whole write surface. Winning the window needs a second writer —
+/// a live `shell_start` handle, or a process the run spawned — which is exactly
+/// what this crate's threat model gives an agent.
+///
+/// So each component is opened from the descriptor of the one above it, with
+/// `O_DIRECTORY | O_NOFOLLOW`, and the descriptor is what the next step names.
+/// A component swapped after it was opened is a component the walk is no longer
+/// looking at: the descriptor refers to the directory that was there, not to the
+/// name. There is no window left to win.
+///
+/// **The root itself is opened by path and its own links are followed**, which is
+/// deliberate rather than an omission. It is the operator's own directory,
+/// resolved before the run started and not reachable by anything the run does —
+/// and on macOS every temporary workspace is reached through `/tmp`, which is a
+/// link to `/private/tmp`. Refusing links there would refuse the ordinary case
+/// while closing nothing.
+///
+/// The `unsafe` is three `libc` calls, and it is the first in `src/tools/`. There
+/// is no safe `openat` in `std` and no way to hold a directory descriptor across
+/// a resolution without one; the alternative is a dependency, which this crate's
+/// contract does not allow for something this small.
+#[cfg(unix)]
+fn walk_open(root: &Path, abs: &Path) -> std::result::Result<std::fs::File, NoFollow> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let bad_input = || NoFollow::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+
+    // Two callers reach here with paths built two ways, and both have to work:
+    // [`Workspace::resolve`] joins onto the root as the operator wrote it, while
+    // [`contain_under_root`] answers with the canonicalised form. Whichever the
+    // path is relative to is the directory the walk starts from — the base is
+    // the descriptor everything below is opened from, so the two only have to
+    // name the same directory, not the same string.
+    let (base, rel) = match abs.strip_prefix(root) {
+        Ok(rel) => (root.to_path_buf(), rel.to_path_buf()),
+        Err(_) => {
+            let real = deepest_existing(root).map_err(|_| bad_input())?;
+            let rel = abs
+                .strip_prefix(&real)
+                .map_err(|_| bad_input())?
+                .to_path_buf();
+            (real, rel)
+        }
+    };
+
+    let mut names: Vec<&std::ffi::OsStr> = Vec::new();
+    for c in rel.components() {
+        match c {
+            std::path::Component::Normal(name) => names.push(name),
+            // `contain_under_root` resolved every `.`, `..` and link before this,
+            // so anything else here is a caller that skipped it.
+            _ => return Err(bad_input()),
+        }
+    }
+    let Some((leaf, dirs)) = names.split_last() else {
+        return Err(bad_input());
+    };
+
+    let mut dir: OwnedFd = std::fs::File::open(&base).map_err(NoFollow::Io)?.into();
+    for name in dirs {
+        let c = CString::new(name.as_bytes()).map_err(|_| bad_input())?;
+        // SAFETY: `dir` is an open directory descriptor owned by this function
+        // and `c` is a NUL-terminated component name. Neither call retains a
+        // pointer, and the mode is masked by the process umask as it is for
+        // `create_dir_all`.
+        unsafe {
+            if libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o777) != 0 {
+                let e = std::io::Error::last_os_error();
+                // An existing directory is the ordinary case. An existing
+                // *link* is caught by the open below, not here, because
+                // `mkdirat` answers `EEXIST` for both.
+                if e.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(NoFollow::Io(e));
+                }
+            }
+        }
+        // SAFETY: as above. The descriptor returned is fresh and unowned until
+        // `OwnedFd` takes it on the next line.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(match e.raw_os_error() {
+                // `ELOOP` is a link; `EMLINK` is the same answer on FreeBSD,
+                // NetBSD and DragonFly, which chose the other errno where POSIX
+                // left it unspecified; `ENOTDIR` is a component replaced by a
+                // file. All three mean the path is no longer the one that was
+                // graded.
+                Some(libc::ELOOP | libc::EMLINK | libc::ENOTDIR) => NoFollow::ComponentIsLink {
+                    component: name.to_os_string(),
+                },
+                _ => NoFollow::Io(e),
+            });
+        }
+        // SAFETY: `fd` is a descriptor this function has just been given and
+        // nothing else holds. The previous `dir` is closed by the assignment.
+        dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+
+    let c = CString::new(leaf.as_bytes()).map_err(|_| bad_input())?;
+    // SAFETY: as above. `openat` is variadic and takes the mode when `O_CREAT`
+    // is set; it is masked by the umask, matching `File::create`.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(match e.raw_os_error() {
+            Some(libc::ELOOP | libc::EMLINK) => NoFollow::LeafIsLink,
+            _ => NoFollow::Io(e),
+        });
+    }
+    // SAFETY: `fd` is a fresh descriptor nothing else holds.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// The refusal for a directory component that is a link, or is not a directory.
+#[cfg(unix)]
+fn swapped_component(path: &Path, component: &std::ffi::OsStr) -> Error {
+    Error::Config(format!(
+        "{} was not written: the directory {} on the way to it is a symbolic link or is not a \
+         directory, so the path no longer names what it named when it was allowed. Nothing was \
+         created and nothing was written",
+        path.display(),
+        component.to_string_lossy()
+    ))
+}
+
+/// The refusal for a link whose destination is itself a link, or sits under a
+/// component that is one.
+#[cfg(unix)]
+fn link_chain(path: &Path, dest: &Path) -> Error {
+    Error::Config(format!(
+        "{} is a symbolic link to {}, which is itself a link or lies under one. One redirection is \
+         re-decided against the policy; a chain is refused. Name the file you mean",
+        path.display(),
+        dest.display()
+    ))
+}
+
 fn outside_root(path: &Path, root: &Path) -> Error {
     Error::Config(format!(
         "{} is outside the workspace root {}, so nothing was opened — a `..` or a symbolic link \
@@ -1737,5 +1957,83 @@ mod tests {
         let ws = Workspace::new(dir.path());
         assert!(ws.read_bytes("../outside.bin").is_err());
         assert!(ws.write_bytes("../outside.bin", b"x").is_err());
+    }
+
+    /// 0.80.0 — the parent-directory race, asserted at the only layer that can
+    /// see it.
+    ///
+    /// The race is a directory swapped for a symbolic link *after*
+    /// `contain_under_root` graded the path and *before* the write. A test
+    /// cannot win a real race deterministically, so it does the equivalent: it
+    /// grades the path while the directory is real, plants the link, and then
+    /// calls the writing half with the graded path — which is exactly the state
+    /// the second writer leaves behind. Against 0.79.1 this wrote through the
+    /// link and created a file outside the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_link_after_the_check_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let ws = Workspace::new(root);
+
+        // Graded while `a` is an ordinary directory, as the gate would.
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        let abs = contain_under_root(root, Path::new("a/b/x")).unwrap();
+
+        // The window: `a` becomes a link out of the workspace.
+        std::fs::remove_dir(root.join("a")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("a")).unwrap();
+
+        let err = ws
+            .write_leaf(&abs, b"escaped")
+            .expect_err("a swapped component must refuse the write");
+        assert!(
+            err.to_string().contains("symbolic link"),
+            "the refusal says why: {err}"
+        );
+        assert!(
+            !outside.path().join("b").exists(),
+            "and nothing is created on the far side of the link"
+        );
+    }
+
+    /// The control. Without it the test above passes against a build whose
+    /// writes are broken outright, which is the failure mode a one-armed
+    /// containment test always has.
+    #[cfg(unix)]
+    #[test]
+    fn an_ordinary_nested_write_still_creates_its_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path());
+
+        ws.write_file("a/b/x.txt", "kept").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/b/x.txt")).unwrap(),
+            "kept"
+        );
+    }
+
+    /// And a link *inside* the root still gets its re-decision rather than a
+    /// refusal — the behaviour `write_file` has documented since 0.74.0, which
+    /// the walk must not have taken away.
+    #[cfg(unix)]
+    #[test]
+    fn a_leaf_link_inside_the_root_is_still_followed_after_re_deciding() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let ws = Workspace::new(root);
+
+        std::fs::write(root.join("real.txt"), "before").unwrap();
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+
+        ws.write_file("link.txt", "after").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("real.txt")).unwrap(),
+            "after",
+            "the write lands on the destination, which is what was re-decided"
+        );
     }
 }
