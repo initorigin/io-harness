@@ -13,6 +13,12 @@ default build compiles no optional dependency at all.
 
 ```bash
 # What CI's test matrix runs, both feature polarities (it uses cargo-nextest).
+# Build the examples FIRST: `--lib --tests` does not build `examples/`, and the lsp,
+# mcp, attach, fleet and checkpoint suites spawn example binaries as fixtures — 58
+# tests fail with "fixture server not built" if you skip this. CI has its own build
+# step for them, which is why the matrix never sees it.
+cargo build --examples
+cargo build --examples --all-features
 cargo nextest run --lib --tests --no-fail-fast
 cargo nextest run --all-features --lib --tests --no-fail-fast
 cargo test --lib --tests            # nextest is not required; cargo test works
