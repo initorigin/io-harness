@@ -2083,7 +2083,13 @@ pub(crate) fn contain_command(
             return None;
         }
         let abi = landlock::abi()?;
-        let tmp = std::env::temp_dir();
+        // 0.80.0 — the run's own directory, resolved by the same function
+        // `linux::landlock_run` uses. Two Landlock spawn paths granting
+        // different temporary directories while both report `linux-landlock` is
+        // the failure this pair of changes exists to stop, so the resolution
+        // lives in one place and both callers ask it.
+        let tmp = linux::tmp_target(workdir, config.mode);
+        cmd.env("TMPDIR", &tmp);
         let plan = landlock::plan(
             abi,
             config.mode,

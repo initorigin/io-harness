@@ -1906,4 +1906,48 @@ mod tests {
         assert_eq!(commas(49_220), "49,220");
         assert_eq!(commas(1_234_567), "1,234,567");
     }
+
+    /// 0.80.0 (issue #246) — what takes a call's position and what does not.
+    ///
+    /// Both entries below are the harness's own words about the run, both carry
+    /// `Origin::Prose`, and they must classify differently: gate feedback
+    /// answers nothing and a refusal answers the call it declined. The kind is
+    /// the only thing that separates them, which is why the origin cannot be
+    /// what decides — `Dispatched::go` marks roughly a hundred refusal sites
+    /// `Origin::Prose`, and deriving the piece from it would orphan the tool
+    /// call every one of them answers.
+    ///
+    /// Against 0.79.1 the first of these was `Piece::Result`: on a step with N
+    /// calls it took ordinal N, the transcript's bounds check failed for that
+    /// step's whole run of results, and the step went out as flat prose with no
+    /// assistant turn and no tool-call blocks.
+    #[test]
+    fn harness_narration_takes_no_calls_position_and_a_refusal_still_does() {
+        let feedback = Observation::new(
+            3,
+            ObsKind::Message,
+            None,
+            "step 3 gate failure".to_string(),
+            Origin::Prose,
+        );
+        assert_eq!(
+            Piece::of(&feedback),
+            Piece::Prose,
+            "gate feedback answers no call, so it may not hold one's position"
+        );
+
+        let refusal = Observation::new(
+            3,
+            ObsKind::Error,
+            None,
+            "\n[read refused] secrets/key\n".to_string(),
+            Origin::Prose,
+        );
+        assert_eq!(
+            Piece::of(&refusal),
+            Piece::Result,
+            "a refusal answers the call it declined, and every `Dispatched::go` \
+             site is shaped exactly like this one"
+        );
+    }
 }

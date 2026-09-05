@@ -253,7 +253,7 @@ fn bwrap_works() -> bool {
 /// because both need it to exist on the host already: `bwrap --bind` fails on a
 /// source that is not there, and the script's `rw` runs after every mount has
 /// been made read-only.
-fn tmp_target(workdir: &Path, mode: ExecMode) -> PathBuf {
+pub(crate) fn tmp_target(workdir: &Path, mode: ExecMode) -> PathBuf {
     if mode != ExecMode::ReadOnly {
         return workdir.to_path_buf();
     }
@@ -419,7 +419,11 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
     use std::os::fd::RawFd;
 
     let abi = super::landlock::abi()?;
-    let tmp = std::env::temp_dir();
+    // 0.80.0 — the run's own directory, not the system temporary directory. The
+    // child's `TMPDIR` is pointed at the same path below, because a grant on one
+    // directory and a toolchain reaching for another is a rung that confines
+    // nothing and breaks everything.
+    let tmp = tmp_target(spec.workdir, spec.mode);
     let plan = super::landlock::plan(
         abi,
         spec.mode,
@@ -457,6 +461,12 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
     // nothing. What runs between fork and exec is two syscalls with no
     // allocation, which is why the rule set was built above rather than here.
     let outcome = run_capped(Backend::LinuxLandlock, wspec, move |cmd| {
+        // 0.80.0 — the same directory the rule set granted, so the toolchain's
+        // temporary files land where this rung actually permits writes. The
+        // mount rungs have exported this since 0.74.0; this one granted the
+        // system temporary directory and left `TMPDIR` alone, which is why the
+        // grant had to be that wide to work at all.
+        cmd.env("TMPDIR", &tmp);
         // SAFETY: the closure runs in the forked child before `exec`. It
         // allocates nothing, takes no lock and calls only `prctl` and one
         // `landlock_restrict_self`, both async-signal-safe. `fd` is owned by
@@ -1702,6 +1712,38 @@ mod tests {
             "under a mode that grants the workdir there is no second directory to \
              create or clean up — the shape `super::macos` has used since 0.6.0"
         );
+    }
+
+    /// 0.80.0 (audit residual 1, H10, L11) — the Landlock rung stops granting
+    /// the system temporary directory.
+    ///
+    /// It granted `std::env::temp_dir()` until this release, and
+    /// `crate::sandbox::workdir` puts every run's ephemeral workspace inside it,
+    /// so two concurrent runs could read and rewrite each other's workspace from
+    /// inside their own sandboxes. The mount rungs were narrowed in 0.74.0 and
+    /// this one was not, because the grant and the child's `TMPDIR` have to move
+    /// together.
+    ///
+    /// Asserted against `tmp_target` rather than against a spawn, because the
+    /// property is that no mode resolves to the shared directory — which is what
+    /// both Landlock spawn paths now ask, and what neither asked before.
+    #[test]
+    fn no_mode_grants_the_system_temporary_directory() {
+        let workdir = Path::new("/w");
+        for mode in ExecMode::ALL {
+            let target = tmp_target(workdir, mode);
+            assert_ne!(
+                target,
+                std::env::temp_dir(),
+                "{mode:?}: the shared directory is what this rung stopped granting"
+            );
+            assert!(
+                target == workdir || target.starts_with(std::env::temp_dir()),
+                "{mode:?}: and what replaces it is the workdir, or a directory \
+                 named for this process inside the shared one: {}",
+                target.display()
+            );
+        }
     }
 
     #[test]

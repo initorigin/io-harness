@@ -1192,6 +1192,37 @@ pub(super) fn transcript(
         let known = turns
             .get(&step)
             .filter(|turn| results.iter().all(|r| r.call < turn.calls.len()));
+        // 0.80.0 (issue #246) — the invariant, asserted where it is decided.
+        //
+        // This filter is the run's last line of defence and it fails *silently*:
+        // the `else` below pushes every one of the step's results into flat
+        // prose and continues, so the step loses its assistant turn and its
+        // native tool-call blocks and the request goes out as a different prompt
+        // from the one the run intended. Nothing reported it, and the two
+        // defects that caused it — gate feedback taking an ordinal it does not
+        // answer, and the plan-revise arm answering a call without taking one —
+        // both survived a release each because of that.
+        //
+        // A warning rather than a refusal or a debug assertion, and the choice
+        // matters. The fallback is correct for a step whose turn this process
+        // never saw — a resumed run, a step folded away — so it stays, and a
+        // debug assertion would fire on the test that proves it stays while
+        // saying nothing in the release builds where both defects actually ran.
+        // What must never happen is a step whose turn IS known and whose results
+        // do not fit it, and that is what this reports.
+        if known.is_none() {
+            if let Some(turn) = turns.get(&step) {
+                tracing::warn!(
+                    step,
+                    results = results.len(),
+                    calls = turn.calls.len(),
+                    "transcript: this step's results do not fit the calls its turn made, so the \
+                     step is being sent as prose without its assistant turn — an entry that \
+                     answers no call has taken a call's position, or one that answers a call has \
+                     given its position up"
+                );
+            }
+        }
         let Some(turn) = known else {
             for result in &results {
                 pending.push_str(&result.content);

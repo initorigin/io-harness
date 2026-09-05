@@ -1344,21 +1344,28 @@ pub(crate) async fn dispatch(
                 // A correction is text the model reads and re-plans from. The run
                 // stays in its planning phase and still writes nothing, so this is an
                 // ordinary observation rather than a control-flow event.
-                Some(PlanVerdict::Revise { correction }) => Dispatched::seen(
+                // 0.80.0 (issue #246) — `go`, not `seen`, because this answers
+                // the `propose_plan` call that produced it.
+                //
+                // It was `ObsKind::Message` with no target, which `Piece::of`
+                // reads as `Piece::Prose` — so the step emitted a `tool_use` for
+                // `propose_plan` with no `tool_result` to match it. A step
+                // carrying `propose_plan` beside any refused call therefore went
+                // out malformed: `provider/anthropic.rs` drops an uncorrelated
+                // `tool_result` and has nothing that drops an orphaned
+                // `tool_use`.
+                //
+                // A plan sent back for revision *is* a refusal of that call, and
+                // `Dispatched::go` is how every other refusal in this file
+                // answers one — same kind, same absent target, same origin, and
+                // `Piece::Result` because of the kind rather than the origin.
+                Some(PlanVerdict::Revise { correction }) => Dispatched::go(
                     "plan sent back",
                     format!(
                         "\n[plan not approved] {correction}\n(Propose a different plan with \
                          `{PROPOSE_PLAN_TOOL}`. Nothing has been done yet and nothing will be \
                          until a plan is approved.)\n"
                     ),
-                    ObsKind::Message,
-                    None,
-                    // The gate's own framing of a verdict, which is this crate
-                    // talking about the run — and already narration rather than a
-                    // result before this release, since `ObsKind::Message` with no
-                    // target is what 0.76.0's derivation read as `Piece::Prose`.
-                    // Stating `Prose` records what was already true here.
-                    Origin::Prose,
                 ),
                 other => Dispatched::Plan {
                     plan_id,

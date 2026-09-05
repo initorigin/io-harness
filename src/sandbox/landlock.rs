@@ -287,16 +287,18 @@ pub(crate) fn plan(
     // `/private/var/folders`, and without somewhere to open a temporary file
     // most toolchains fail immediately.
     //
-    // Both callers still resolve it as `std::env::temp_dir()`, so on this rung
-    // that grant is the whole system temporary directory — and
+    // **0.80.0 — both callers now resolve it as `super::linux::tmp_target`,
+    // which is the run's own directory, and both point the child's `TMPDIR` at
+    // the same path.** Until this release both passed `std::env::temp_dir()`, so
+    // this rung granted the whole system temporary directory — and
     // `crate::sandbox::workdir` puts every run's ephemeral workspace inside it,
-    // so two concurrent runs can read and rewrite each other's workspace from
-    // inside their own sandboxes. 0.74.0 narrowed the two mount rungs to a
-    // directory the run owns (`super::linux::tmp_target`, with `TMPDIR` pointed
-    // at it) and left this one as it was: narrowing it means changing what both
-    // `super::linux::landlock_run` and `crate::sandbox::contain_command` pass
-    // here, and pointing the child's `TMPDIR` at the result, or the grant and
-    // the directory a toolchain reaches for stop being the same place.
+    // so two concurrent runs could read and rewrite each other's workspace from
+    // inside their own sandboxes. 0.74.0 narrowed the two mount rungs and left
+    // this one, because narrowing it in halves is worse than not at all: the
+    // grant and the directory a toolchain reaches for have to move together, and
+    // the two Landlock spawn paths have to move together with them or one
+    // backend name covers two different confinements. All four moved in one
+    // change (audit residual 1, H10 and L11).
     write_roots.push(tmp.to_path_buf());
 
     for root in write_roots {
