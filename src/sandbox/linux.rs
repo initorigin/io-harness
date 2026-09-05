@@ -253,6 +253,37 @@ fn bwrap_works() -> bool {
 /// because both need it to exist on the host already: `bwrap --bind` fails on a
 /// source that is not there, and the script's `rw` runs after every mount has
 /// been made read-only.
+/// The temporary directory the **Landlock** rung grants and exports (0.80.0).
+///
+/// A sibling of [`tmp_target`] rather than a call to it, and the difference is
+/// the whole reason this function exists. `tmp_target` answers with the *workdir*
+/// under a mode that grants it, which is right for the mount rungs — they bind a
+/// private tree, so the workdir is already private to that command. This rung
+/// shares the caller's filesystem, so pointing `TMPDIR` at the workdir puts every
+/// temporary file a toolchain writes into the workspace the model reads, and
+/// gives two sub-agents working under one workdir the same scratch directory.
+///
+/// So the grant is a subdirectory of the workdir instead: inside a root the plan
+/// already grants, so it costs no second rule; private to this workdir, so
+/// siblings with their own workdirs cannot collide; and removed with the
+/// ephemeral workdir, so nothing outlives the run. Under `ReadOnly` the workdir
+/// is not writable at all and [`tmp_target`]'s per-process directory is the only
+/// answer available, so that is the one taken.
+pub(crate) fn landlock_tmp(workdir: &Path, mode: ExecMode) -> PathBuf {
+    if mode == ExecMode::ReadOnly {
+        return tmp_target(workdir, mode);
+    }
+    let dir = workdir.join(".io-harness-tmp");
+    // A directory this process cannot create is one the payload cannot write
+    // either; the grant below covers the workdir regardless, so the command
+    // still has somewhere to write and the honest outcome is the workdir rather
+    // than a failure here.
+    if std::fs::create_dir_all(&dir).is_err() {
+        return workdir.to_path_buf();
+    }
+    dir
+}
+
 pub(crate) fn tmp_target(workdir: &Path, mode: ExecMode) -> PathBuf {
     if mode != ExecMode::ReadOnly {
         return workdir.to_path_buf();
@@ -423,7 +454,7 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
     // child's `TMPDIR` is pointed at the same path below, because a grant on one
     // directory and a toolchain reaching for another is a rung that confines
     // nothing and breaks everything.
-    let tmp = tmp_target(spec.workdir, spec.mode);
+    let tmp = landlock_tmp(spec.workdir, spec.mode);
     let plan = super::landlock::plan(
         abi,
         spec.mode,

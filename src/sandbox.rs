@@ -2088,7 +2088,7 @@ pub(crate) fn contain_command(
         // different temporary directories while both report `linux-landlock` is
         // the failure this pair of changes exists to stop, so the resolution
         // lives in one place and both callers ask it.
-        let tmp = linux::tmp_target(workdir, config.mode);
+        let tmp = linux::landlock_tmp(workdir, config.mode);
         cmd.env("TMPDIR", &tmp);
         let plan = landlock::plan(
             abi,

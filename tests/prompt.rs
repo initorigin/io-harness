@@ -1243,9 +1243,20 @@ async fn a_run_that_names_no_host_is_not_told_about_a_proxy() {
         !line.contains("proxy") && !line.contains("advisory"),
         "no proxy is started and none is described: {line}"
     );
+    // Which of the two honest sentences depends on the backend this host gave,
+    // and the test asserts the one that is true here rather than the one it
+    // would like. A Job Object and the portable floor confine no route out, so
+    // "no network at all" would be a claim no machine is enforcing — which is
+    // the 0.40.0 defect, in the direction that matters most.
+    let expected =
+        if line.contains("backend: windows-job-object") || line.contains("portable-floor") {
+            "not confined for the commands you run on this host"
+        } else {
+            "reach no network at all"
+        };
     assert!(
-        line.contains("reach no network at all"),
-        "an unproxied run whose sandbox denies egress is told so plainly: {line}"
+        line.contains(expected),
+        "an unproxied run is told what its commands actually have; expected {expected:?} in: {line}"
     );
     assert!(
         !line.contains("only where this run's policy permits it"),

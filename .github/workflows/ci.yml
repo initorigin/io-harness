@@ -398,6 +398,16 @@ jobs:
           key: mount-rungs
       - name: report the host's Landlock state, before anything hides it
         run: cat /sys/kernel/security/lsm || true
+      # The namespace rung is what the chain must reach once Landlock is gone,
+      # and it needs an unprivileged user namespace. Ubuntu 24.04 ships
+      # `kernel.apparmor_restrict_unprivileged_userns=1`, which denies one — and
+      # a container inherits that from the host, so without this the chain fell
+      # all the way to the portable floor and the leg's own guard said so on its
+      # first run. The `test` matrix leg permits it for the same reason;
+      # `contained-linux` deliberately does not, because *that* leg's subject is
+      # the restricted host.
+      - name: permit unprivileged user namespaces so the namespace rung is real
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       # Built on the host and run in the container, so the container needs no
       # toolchain and no crate build of its own. The binary is glibc and the
       # image is the same Ubuntu the runner is.
@@ -426,12 +436,21 @@ jobs:
           # `apparmor=unconfined` because the namespace rung unshares a user and a
           # mount namespace, which the runner's default profile refuses; the
           # seccomp profile above is what this job is actually varying.
+          # `util-linux` for `unshare` and `setpriv`, which the namespace rung
+          # runs and which the base image does not carry. Installed inside the
+          # container rather than baked into a Dockerfile so this leg stays one
+          # file.
           docker run --rm \
             --security-opt seccomp=seccomp.json \
             --security-opt apparmor=unconfined \
             -v "$PWD:$PWD" -w "$PWD" \
             -e IO_HARNESS_REQUIRE_MOUNT_RUNG=1 \
-            ubuntu:24.04 "$bin" --nocapture
+            ubuntu:24.04 sh -c '
+              set -e
+              apt-get update -qq >/dev/null
+              apt-get install -y -qq util-linux >/dev/null
+              exec "$0" --nocapture
+            ' "$bin"
 
   # 0.36.1 — the doctests, as a job of their own, per operating system.
   #

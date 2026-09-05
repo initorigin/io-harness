@@ -1297,7 +1297,25 @@ mod tests {
     /// A policy that allows every act outright, so the only thing that can
     /// refuse a target in these tests is the containment check.
     fn ws() -> Workspace {
-        Workspace::with_policy("/workspace", crate::policy::Policy::permissive())
+        Workspace::with_policy(root(), crate::policy::Policy::permissive())
+    }
+
+    /// An absolute path, spelled the way this platform spells one.
+    ///
+    /// `Path::is_absolute` is what `policy_verdict` branches on, and on Windows a
+    /// leading separator is *not* absolute — it needs a drive prefix. A test
+    /// written with one spelling passes on two platforms and asserts nothing on
+    /// the third, which is worse than not having it.
+    fn absolute(tail: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\{}", tail.replace('/', "\\"))
+        } else {
+            format!("/{tail}")
+        }
+    }
+
+    fn root() -> String {
+        absolute("workspace")
     }
 
     /// 0.80.0 F7 — the relaxation the audit left open, closed.
@@ -1310,7 +1328,7 @@ mod tests {
     #[test]
     fn an_absolute_target_is_containment_checked_like_every_other() {
         for act in [Act::Read, Act::Write] {
-            let verdict = policy_verdict(&ws(), act, "/etc/passwd");
+            let verdict = policy_verdict(&ws(), act, &absolute("etc/passwd"));
             assert_eq!(
                 verdict.effect,
                 Effect::Deny,
@@ -1326,7 +1344,7 @@ mod tests {
     #[test]
     fn a_declared_absolute_target_is_still_the_policys_to_decide() {
         for act in [Act::Read, Act::Write] {
-            let verdict = policy_verdict_declared(&ws(), act, "/bundles/skills/SKILL.md");
+            let verdict = policy_verdict_declared(&ws(), act, &absolute("bundles/skills/SKILL.md"));
             assert_eq!(
                 verdict.effect,
                 Effect::Allow,
