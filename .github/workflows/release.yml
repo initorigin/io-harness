@@ -256,6 +256,24 @@ jobs:
           path: target/package/io-harness-${{ needs.checks.outputs.version }}.crate
           retention-days: 7
           if-no-files-found: error
+      # `cargo package` leaves an *extracted* copy of the crate beside the
+      # tarball — `target/package/io-harness-<version>/`, a complete crate root
+      # with its own `Cargo.toml` and `tests/`. `Swatinem/rust-cache`'s post-job
+      # cleanup walks `target/` and treats that nested root as a package to
+      # clean, then reports `ENOENT` for `tests/target` and `tests/trybuild`,
+      # which a packaged copy has never had:
+      #
+      #   Error: ENOENT: no such file or directory, opendir
+      #     '.../target/package/io-harness-0.79.1/tests/target'
+      #
+      # Harmless — the cleanup carries on and the cache is saved — but it prints
+      # four lines beginning `Error:` on every release, and a workflow that cries
+      # error on every green run is one whose real errors get scrolled past. The
+      # tarball is what the artifact step above took and what `cargo publish`
+      # uploads; the extracted copy is scratch.
+      - name: remove the extracted copy cargo package leaves in target/
+        if: always()
+        run: rm -rf target/package/io-harness-*/ target/package/tmp-crate
 
   # Every gate is named here. This list is the ordering the split had to keep:
   # a Release is cut only when all five have passed.
