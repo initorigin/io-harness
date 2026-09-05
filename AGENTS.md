@@ -13,6 +13,12 @@ default build compiles no optional dependency at all.
 
 ```bash
 # What CI's test matrix runs, both feature polarities (it uses cargo-nextest).
+# Build the examples FIRST: `--lib --tests` does not build `examples/`, and the lsp,
+# mcp, attach, fleet and checkpoint suites spawn example binaries as fixtures — 58
+# tests fail with "fixture server not built" if you skip this. CI has its own build
+# step for them, which is why the matrix never sees it.
+cargo build --examples
+cargo build --examples --all-features
 cargo nextest run --lib --tests --no-fail-fast
 cargo nextest run --all-features --lib --tests --no-fail-fast
 cargo test --lib --tests            # nextest is not required; cargo test works
@@ -118,7 +124,12 @@ drift, and each carries a negative control so it cannot pass by matching nothing
 - `tests/changelog.rs` — every entry starting with `**BREAKING` must contain a literal
   `Migration:` saying what to write instead. See `docs/CHANGELOG_STRUCTURE.md`.
 - `tests/docs_drift.rs` — the MSRV, the feature list, relative links and the README's
-  `io-harness = "X.Y"` snippet must agree with `Cargo.toml`.
+  `io-harness = "X.Y"` snippet must agree with `Cargo.toml`. It also catches the drift the
+  others cannot: every release row in `docs/CAPABILITIES.md`'s register at or after 0.73.0 must
+  be represented in the README by a name a reader can search for, or be listed in
+  `README_NAMES_NOTHING` with its reason — a capability that was never documented is invisible
+  to every checker that reads a claim. The comparison tables' stated date is bounded at 180 days
+  behind the newest release the register records.
 - `tests/readme.rs` — a runnable code fence and the MSRV inside the first 60 README lines; no
   heading named after the release that introduced it.
 - `tests/guide_pages.rs` — every named capability keeps its `docs/guide/*.md` page, and the six
