@@ -2059,9 +2059,11 @@ fn names_whole(text: &str, needle: &str) -> bool {
 fn readme_covers_the_register(index: &str, readme: &str) -> Result<(), String> {
     let rows = register_rows(index);
     if rows.is_empty() {
-        return Err("records no release rows at all, so this check is vacuous and the \
+        return Err(
+            "records no release rows at all, so this check is vacuous and the \
                     parser is wrong"
-            .to_string());
+                .to_string(),
+        );
     }
 
     let mut unclassified: Vec<String> = Vec::new();
@@ -2237,8 +2239,14 @@ fn readme_coverage_checker_is_not_satisfied_by_a_longer_word() {
     // text and its copyright line both carry it, and a substring match would
     // have reported 0.77.0's provenance marking as named by the licence.
     assert!(!names_whole("Copyright 2026 (InitOrigin)", "Origin"));
-    assert!(names_whole("`Origin` records where the bytes came from", "Origin"));
-    assert!(names_whole("behind `mcp-server`, this crate serves", "mcp-server"));
+    assert!(names_whole(
+        "`Origin` records where the bytes came from",
+        "Origin"
+    ));
+    assert!(names_whole(
+        "behind `mcp-server`, this crate serves",
+        "mcp-server"
+    ));
 }
 
 #[test]
@@ -2250,7 +2258,10 @@ fn comparison_table_staleness_checker_reports_a_rewound_date() {
 
     let stale = current.replace("2026-09-05", "2026-01-01");
     let err = comparison_table_is_current(&stale, index).expect_err("must be reported");
-    assert!(err.contains("2026-01-01"), "must quote the stated date: {err}");
+    assert!(
+        err.contains("2026-01-01"),
+        "must quote the stated date: {err}"
+    );
     assert!(err.contains("246 days"), "must state the age: {err}");
 
     // A README that lost the date entirely is a failure, not a pass.
