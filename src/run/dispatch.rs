@@ -45,6 +45,36 @@ async fn gate(
     out
 }
 
+/// [`gate_declared`](super::gate::gate_declared), timed the same way (0.80.0).
+///
+/// A sibling of [`gate`] above rather than a flag on it, for the reason that one
+/// gives: the timing wrapper exists so no call site can be added untimed, and a
+/// second entry point that skipped it would be exactly that. One caller — the
+/// `read_skill` arm, whose target is a path the operator's configuration named
+/// and not one the model chose.
+#[allow(clippy::too_many_arguments)]
+async fn gate_declared(
+    ws: &Workspace,
+    approver: &dyn Approver,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    act: Act,
+    target: &str,
+    content: Option<&str>,
+    watch: &Watch<'_>,
+    depth: u32,
+    goal: &str,
+) -> Result<Gated> {
+    let gated_at = std::time::Instant::now();
+    let out = super::gate::gate_declared(
+        ws, approver, store, run_id, step, act, target, content, watch, depth, goal,
+    )
+    .await;
+    store.attribute_gate(run_id, step, gated_at.elapsed());
+    out
+}
+
 /// Record one sandbox lifecycle row for a contained tool call, and tell the
 /// observer.
 ///
@@ -2987,7 +3017,15 @@ pub(crate) async fn dispatch(
                 Some(rel) => format!("{name} {rel}"),
                 None => name.to_string(),
             };
-            match gate(
+            // 0.80.0 — `gate_declared`, and this is the only call site in the
+            // crate that takes it. A skill bundle lives outside the workspace
+            // root by design, so the path here is absolute and `check_path`
+            // would refuse it for leaving a root it was never inside. Until
+            // 0.80.0 `gate` relaxed that for *every* absolute read and write,
+            // which is the residual the audit left open at `policy_verdict`;
+            // asking for the allowance here means one consumer holds it rather
+            // than all of them inheriting it.
+            match gate_declared(
                 ws,
                 approver,
                 store,
@@ -4045,7 +4083,38 @@ pub(super) async fn check_shell_line(
                 Gated::Paused { request_id } => {
                     return Ok(ShellCheck::Stop(Dispatched::Pause { request_id }))
                 }
-                Gated::Go { remember, .. } => remembered.extend(remember),
+                // 0.80.0 — the rewrite is refused rather than discarded, which is
+                // M4's decision for `Act::Exec` reaching the one read/write site
+                // that has an exec's shape. `gate` honours a rewritten read or
+                // write target because the two tool paths take their target off
+                // the gate's own answer; a redirect does not — the command line
+                // was parsed before this gate ran and the shell runs the
+                // redirect it parsed. Discarding it meant an approver narrowing
+                // `> secrets/key` to something harmless was overruled in silence
+                // and the original still ran.
+                Gated::Go {
+                    target: performed,
+                    remember,
+                    ..
+                } => {
+                    if performed != rel {
+                        let ev = PolicyEvent::refusal(step, act_word(act), &rel)
+                            .with_performed(&performed);
+                        store.record_event(run_id, &ev)?;
+                        crate::run::refused(watch, run_id, depth, &ev);
+                        return Ok(ShellCheck::Stop(Dispatched::go(
+                            format!("{} rewrite refused", act_word(act)),
+                            format!(
+                                "\n[{} refused] {rel} — the approver rewrote it to {performed}, \
+                                 and a rewritten redirect is not something this path can run: the \
+                                 command line was parsed before the approval. Nothing ran. \
+                                 Approve {rel} as asked, deny it, or narrow it with a rule.\n",
+                                act_word(act)
+                            ),
+                        )));
+                    }
+                    remembered.extend(remember);
+                }
             }
             record_shell_authorisation(ws, store, run_id, step, act, &rel)?;
         }

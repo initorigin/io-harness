@@ -157,6 +157,40 @@ pub(super) async fn authorize_provider<P: Provider>(
         Some(Decision::Deny { reason }) => reason.clone(),
         _ => "answered by an attached process".to_string(),
     };
+    // 0.80.0 — M4's decision for `Act::Exec`, applied to the one `Act::Net` site
+    // that has the same shape and was missed by it.
+    //
+    // A provider dials the endpoint it was built with. That endpoint was chosen
+    // before this authorization ran and there is nowhere for a rewritten host to
+    // take effect, exactly as an argv parsed before its gate leaves nowhere for a
+    // rewritten command — so this site *discarded* the rewrite and granted the
+    // original host in silence, which is the direction M4 called the worse one:
+    // an approver narrowing a host is overruled without being told.
+    // [`Decision::Approve::modified`] already documents the refusal for a pending
+    // `net`; this is the same refusal at the site that authorizes the run.
+    if let Some(rewrite) = match &raced {
+        Some(Decision::Approve {
+            modified: Some(m), ..
+        }) if m.target != target => Some(m.target.clone()),
+        _ => None,
+    } {
+        let ev = PolicyEvent::refusal(0, "net", &target).with_performed(&rewrite);
+        store.record_event(run_id, &ev)?;
+        refused(watch, run_id, 0, &ev);
+        finish(store, watch, run_id, 0, 0, "refused")?;
+        return Err(crate::error::Error::Refused {
+            act: "net".into(),
+            target: format!(
+                "{target} — the approver rewrote it to {rewrite}, and a provider dials the \
+                 endpoint it was built with, so a rewritten host is not something this path can \
+                 reach. Nothing ran. Approve {target} as asked, deny it, or narrow it with a net \
+                 rule."
+            ),
+            rule: None,
+            layer: None,
+        });
+    }
+
     let mine = match &raced {
         Some(Decision::Approve { .. }) => store.resolve_pending(request_id, "approve")?,
         Some(Decision::Deny { .. }) => store.resolve_pending(request_id, "deny")?,
@@ -903,13 +937,14 @@ pub(super) fn approval_context(goal: &str, verdict: &crate::policy::Verdict) -> 
 /// against the root, or a file that happens to share a tool's name would change
 /// what the policy said about calling it.
 ///
-/// An ABSOLUTE read/write target is not a workspace path at all — a skill file
-/// normally lives outside the root — so it is decided by the policy directly.
-/// `check_path` would resolve it against the root and deny it unconditionally,
-/// which would make `read_skill` refusable only by accident. This relaxes what
-/// the *gate* says, not what the workspace does: `Workspace::resolve` rejects
-/// absolute paths outright and both `read_file` and `write_file` go through it,
-/// so an absolute path still cannot leave the root (asserted in tests/skills.rs).
+/// An absolute read or write target is asked of `check_path` like every other,
+/// **since 0.80.0**. Until then it went straight to the policy with the
+/// containment check skipped entirely, and that relaxation existed for one
+/// consumer — `read_skill`, whose bundle legitimately lives outside the root —
+/// while every consumer of an absolute target inherited it. H3 closed one
+/// instance by having `git_worktree` ask `check_path` itself; this closes the
+/// shape, and the one legitimate consumer asks for its allowance by name through
+/// [`policy_verdict_declared`].
 ///
 /// **A free function rather than a closure inside [`gate`] since 0.54.0**, because
 /// speculation asks this same question without answering it — a call the policy
@@ -919,8 +954,33 @@ pub(super) fn approval_context(goal: &str, verdict: &crate::policy::Verdict) -> 
 pub(super) fn policy_verdict(ws: &Workspace, act: Act, target: &str) -> crate::policy::Verdict {
     match act {
         Act::Exec | Act::Net => ws.policy().check(act, target),
-        Act::Read | Act::Write if Path::new(target).is_absolute() => ws.policy().check(act, target),
         Act::Read | Act::Write => ws.check_path(act, target),
+    }
+}
+
+/// [`policy_verdict`] for a target the *run* named rather than the model — a
+/// skill bundle's own file, which lives outside the workspace root by design.
+///
+/// The one allowance the strict form above withholds, granted where it is
+/// asked for rather than inherited by everything that happens to hold an
+/// absolute path. What makes it payable is that the path is not the model's to
+/// choose: `Skills::discover` confined the declared roots (audit L13) and
+/// `skills::resolve_companion` refuses an absolute path, a `..` and a symlink
+/// that canonicalises out of the skill's own directory before this is ever
+/// reached, so what arrives here is a file the operator's own configuration
+/// pointed at. The policy still decides — an allowance is not a grant.
+///
+/// A relative target is not special-cased and goes to `check_path` exactly as
+/// it would anywhere else, so this is narrower than the old relaxation in both
+/// directions rather than a rename of it.
+pub(super) fn policy_verdict_declared(
+    ws: &Workspace,
+    act: Act,
+    target: &str,
+) -> crate::policy::Verdict {
+    match act {
+        Act::Read | Act::Write if Path::new(target).is_absolute() => ws.policy().check(act, target),
+        _ => policy_verdict(ws, act, target),
     }
 }
 
@@ -988,8 +1048,69 @@ pub(super) async fn gate(
     depth: u32,
     goal: &str,
 ) -> Result<Gated> {
+    gate_with(
+        ws, approver, store, run_id, step, act, target, content, watch, depth, goal, false,
+    )
+    .await
+}
+
+/// [`gate`] for a target the run's own configuration named rather than the
+/// model — today, `read_skill` reaching a bundle outside the workspace root
+/// (0.80.0).
+///
+/// It differs from [`gate`] in one thing: the verdict comes from
+/// [`policy_verdict_declared`], so an absolute path is decided by the policy
+/// instead of being refused by `check_path` for leaving a root it was never
+/// inside. Everything else — the approval loop, the rows, the recheck after a
+/// rewrite — is the same code, because a second copy of the gate is how the two
+/// would drift.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn gate_declared(
+    ws: &Workspace,
+    approver: &dyn Approver,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    act: Act,
+    target: &str,
+    content: Option<&str>,
+    watch: &Watch<'_>,
+    depth: u32,
+    goal: &str,
+) -> Result<Gated> {
+    gate_with(
+        ws, approver, store, run_id, step, act, target, content, watch, depth, goal, true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn gate_with(
+    ws: &Workspace,
+    approver: &dyn Approver,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    act: Act,
+    target: &str,
+    content: Option<&str>,
+    watch: &Watch<'_>,
+    depth: u32,
+    goal: &str,
+    declared: bool,
+) -> Result<Gated> {
+    // One expression, used for the first verdict and for the recheck after an
+    // approver's rewrite, so a declared target cannot be graded by one rule going
+    // in and another coming out.
+    let verdict_of = |t: &str| {
+        if declared {
+            policy_verdict_declared(ws, act, t)
+        } else {
+            policy_verdict(ws, act, t)
+        }
+    };
     let kind = act_word(act);
-    let verdict = policy_verdict(ws, act, target);
+    let verdict = verdict_of(target);
 
     match verdict.effect {
         Effect::Deny => {
@@ -1131,7 +1252,7 @@ pub(super) async fn gate(
 
             let performed = modified.unwrap_or_else(|| request.clone());
             // The rewritten action gets the same scrutiny as the original.
-            let recheck = policy_verdict(ws, act, &performed.target);
+            let recheck = verdict_of(&performed.target);
             if recheck.effect == Effect::Deny {
                 let mut ev = PolicyEvent::refusal(step, kind, &performed.target);
                 ev.rule = recheck.rule.clone();
@@ -1160,5 +1281,64 @@ pub(super) async fn gate(
                 remember,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A policy that allows every act outright, so the only thing that can
+    /// refuse a target in these tests is the containment check.
+    fn ws() -> Workspace {
+        Workspace::with_policy("/workspace", crate::policy::Policy::permissive())
+    }
+
+    /// 0.80.0 F7 — the relaxation the audit left open, closed.
+    ///
+    /// Until 0.80.0 an absolute read or write target went straight to the policy
+    /// with `check_path` skipped entirely, so a permissive policy answered
+    /// `Allow` for a path that had never been asked to be inside the workspace.
+    /// The one consumer that needed it asks for it by name now; everything else
+    /// is checked like every relative path.
+    #[test]
+    fn an_absolute_target_is_containment_checked_like_every_other() {
+        for act in [Act::Read, Act::Write] {
+            let verdict = policy_verdict(&ws(), act, "/etc/passwd");
+            assert_eq!(
+                verdict.effect,
+                Effect::Deny,
+                "an absolute {act:?} target left the root and the policy is not \
+                 what decides that: {verdict:?}"
+            );
+        }
+    }
+
+    /// And the allowance the one legitimate consumer asks for still works,
+    /// without which the test above would pass against a build that had simply
+    /// broken `read_skill`.
+    #[test]
+    fn a_declared_absolute_target_is_still_the_policys_to_decide() {
+        for act in [Act::Read, Act::Write] {
+            let verdict = policy_verdict_declared(&ws(), act, "/bundles/skills/SKILL.md");
+            assert_eq!(
+                verdict.effect,
+                Effect::Allow,
+                "a path the run's own configuration named is decided by the \
+                 policy, and this policy allows it: {verdict:?}"
+            );
+        }
+    }
+
+    /// The allowance is for absolute paths and nothing else: a relative target
+    /// handed to the declared form is checked exactly as it would be anywhere,
+    /// so the two functions cannot drift into two boundaries.
+    #[test]
+    fn the_declared_form_relaxes_nothing_for_a_relative_target() {
+        let escaping = "../outside/secret";
+        assert_eq!(
+            policy_verdict_declared(&ws(), Act::Read, escaping).effect,
+            policy_verdict(&ws(), Act::Read, escaping).effect,
+        );
     }
 }
