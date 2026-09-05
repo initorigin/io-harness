@@ -1168,6 +1168,53 @@ blocks lead, the images follow, and the boundary is honoured. Same request, two
 vendors, two different answers, and the difference is a property of the orderings
 rather than a policy this crate chose.
 
+## What an output schema guarantees, and what it cannot (0.77.0)
+
+**The subset is closed and stated, and it is checked when you declare it.**
+`OutputSchema::new` walks the whole document once and refuses any keyword outside
+the list below, naming the keyword and its JSON pointer — so a schema whose real
+constraint lived in a `oneOf` is rejected while you are writing it rather than
+silently unchecked three steps into a run. `TaskContract::with_output_schema`
+takes the validated wrapper, and an `output_schema` key in `io.toml`'s `[run]`
+table deserializes through the same fallible constructor, so an operator's own
+file is refused the same way and for the same reason.
+
+Validated: `type` (`object`, `array`, `string`, `number`, `integer`, `boolean`,
+`null`), `properties`, `required`, `additionalProperties` in its `false` form,
+`items` in its single-subschema form, `minItems`, `maxItems`, `enum`, `minimum`,
+`maximum`, `minLength`, `maxLength`. Accepted and ignored, because they describe
+the schema rather than constrain the instance: `$schema`, `title`, `description`.
+Anything else is an error at declaration time.
+
+**The wire is not the guarantee.** On the OpenAI-shaped wire the document is sent
+as `response_format` with `strict: false` — deliberately, because OpenAI's strict
+mode is a *narrower* subset than this one and would reject six keywords this crate
+validates in full, so asking for strict would mean either dropping those bounds or
+being refused. The Anthropic Messages API has no `response_format` at all and is
+sent none; its native route to a shape is a forced tool call, which is a different
+mechanism rather than a different spelling, and it is not what this does. **The
+check that decides the run is local either way**, so what the vendor did with the
+declaration — honoured it, ignored it, never saw it — does not change the outcome.
+
+**A failure is a re-prompt, not an error, and it is bounded by the run's own
+budgets.** The reply is validated before the run may finish: a schema exists to
+stop a malformed answer being reported as a finished one, and it is checked ahead
+of the finish for exactly that reason. A non-conforming answer becomes an ordinary
+`ObsKind::Message` observation naming what was wrong, and the loop takes another
+step — an ordinary step, counted against `max_steps` and against the token budget,
+so a run whose step budget is smaller than its attempt cap stops on the step
+budget. The attempt cap is `max_retries`, the field that already means "how many
+times may this run re-ask the same question", rather than a second knob. When it
+is exhausted the run ends `RunOutcome::SchemaUnsatisfied { steps }` rather than
+finishing over an answer that does not fit.
+
+**What it does not claim.** A schema says an answer is well formed; it never says
+it is right. A `Verification` gate is unaffected by one and the two compose — on
+`Verification::None` the schema is the only judge, and on a gated path the gate
+still decides whether the work is correct. Only the reply's text is validated: a
+run whose answer arrives as something other than text is not made to conform by
+declaring a shape.
+
 ## What a tool mask changes, and what it leaves exactly as it was (0.76.0)
 
 **A mask withholds availability, never membership.** `TaskContract::tool_mask`

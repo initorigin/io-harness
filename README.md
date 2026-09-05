@@ -139,6 +139,8 @@ layer.
 | **Execution sandbox** | Model-produced code in an ephemeral workdir with caps that kill rather than throttle, network denied by default | [sandbox](docs/guide/sandbox.md) |
 | **Programs instead of call chains** | Behind `codeact`: one contained Python program in place of six round trips, where every act it takes re-enters the same dispatch, policy, gate and trace a tool call does | [CodeAct](docs/guide/codeact.md) |
 | **Verification** | Any language's own test command, a second model against a rubric, or no gate at all | [verification](docs/guide/verification.md) |
+| **Structured output** | `OutputSchema` demands a shape of a run's final answer — a closed, stated JSON Schema subset, validated here whatever the vendor did with it | [what you may depend on](docs/CONTRACT.md) |
+| **Withholding a tool for a turn** | `ToolMask` names the tools one turn may not call, without moving the catalogue the vendor has already cached | [tools and skills](docs/guide/tools-and-skills.md) |
 | **Budgets** | Steps, wall-clock and token spend, from one ledger a whole tree of agents shares and no child can raise | [composition](docs/guide/composition.md) |
 | **Durable runs** | Trace, budget draw and checkpoint commit together after every completed step; a crash resumes the whole tree | [durable runs](docs/guide/durable-runs.md) |
 | **Indeterminate effects pause** | A run killed mid-call to something the harness cannot inspect — a charge, a deployment, an MCP server — resumes to an operator's decision instead of making the call again | [durable runs](docs/guide/durable-runs.md) |
@@ -151,7 +153,7 @@ layer.
 | **Sessions** | Durable, branchable conversations with token streaming, mid-turn steering and interruption | [sessions](docs/guide/sessions.md) |
 | **Configuration** | One `io.toml` over four scopes, projected onto the typed API, where a file inside the workspace may narrow and never widen | [configuration](docs/guide/configuration.md) |
 | **Hooks and bundles** | An audit log, notification, formatter or blocking check from config; a directory that contributes skills, agents, servers, the executables it ships and deny rules at once | [hooks](docs/guide/hooks.md), [bundles](docs/guide/plugins.md) |
-| **Extensibility** | The `Tool` trait in-process, MCP over stdio and streamable HTTP, and markdown skills that can open the references beside them and never anything outside | [tools and skills](docs/guide/tools-and-skills.md) |
+| **Extensibility** | The `Tool` trait in-process, MCP over stdio and streamable HTTP, and markdown skills whose `read_skill` opens the references beside them under the same policy and never anything outside | [tools and skills](docs/guide/tools-and-skills.md) |
 | **Serving MCP** | Behind `mcp-server`: another harness calls **these** tools on stdio, through this crate's policy, gate, journal and trace rather than its own | [MCP and network egress](docs/guide/mcp-and-network.md) |
 | **Accounting** | Input, output, cache-read, cache-write and reasoning tokens per call, with latency and TTFT; cost derived on read from a price table you own | [accounting](docs/guide/accounting.md) |
 | **Observability** | An observer called as the run happens, a recorded provider that replays a case identically, and — behind `otel` — the same run exported as OpenTelemetry spans to any OTLP collector | [observability](docs/guide/observability.md) |
@@ -161,7 +163,7 @@ layer.
 ## How it compares
 
 Two different questions, so two tables. Every cell was read from that project's
-own current documentation or repository on **2026-08-16**, and a cell reads *not
+own current documentation or repository on **2026-09-05**, and a cell reads *not
 documented* when the project does not state the property — which is not the same
 as the property being absent. Check the sources; they move.
 
@@ -172,11 +174,11 @@ gives an operator, not about what an embedder can build on.
 | | Traced permission boundary | Durable per-step resume | Execution sandbox | Tree-wide spend ceiling |
 | --- | --- | --- | --- | --- |
 | **io-harness** | Deny-first layered rules; every decision and refusal recorded, attributed to the rule and layer that produced it | Trace, budget and checkpoint commit in one transaction after each completed step; a crashed tree resumes without re-running steps or double-charging | macOS, Linux and Windows backends over a portable floor; what actually applied is recorded | One ledger shared by the whole tree, which a spawned contract cannot raise |
-| [Claude Code](https://code.claude.com/docs/en/permission-modes) | Modes and rules in layered settings files; a refusal audit record is not documented | Per **user prompt**, over files and conversation — [not per step, and bash-made changes are not tracked](https://code.claude.com/docs/en/checkpointing) | [Yes — Seatbelt on macOS, packages on Linux/WSL2, writes confined to cwd and temp, egress through a proxy with an allow-list](https://code.claude.com/docs/en/sandboxing); not available on native Windows, and falls back to unsandboxed unless `failIfUnavailable` | not documented |
-| [Codex CLI](https://learn.chatgpt.com/docs/sandboxing) | `approval_policy` of `untrusted`, `on-request` or `never`, separate from the sandbox mode; refusal audit not documented | not documented | Yes — Seatbelt on macOS, `bubblewrap` on Linux/WSL2, Windows Sandbox or WSL2; `sandbox_mode` is `read-only`, `workspace-write` or `danger-full-access` | not documented |
+| [Claude Code](https://code.claude.com/docs/en/permission-modes) | Modes and rules in layered settings files, plus a classifier gate in auto mode; denials are recorded in `/permissions` under *Recently denied* and reach a `PermissionDenied` hook | Per **user prompt**, over files and conversation — [not per step, and bash-made changes are not tracked](https://code.claude.com/docs/en/checkpointing) | [Yes — Seatbelt on macOS, packages on Linux/WSL2, writes confined to cwd and temp, egress through a proxy with an allow-list](https://code.claude.com/docs/en/sandboxing); not available on native Windows, and falls back to unsandboxed unless `failIfUnavailable` | [For headless runs — `--max-budget-usd` caps spend in print mode and a subagent's spend counts against it; whether a child may raise it is not documented](https://code.claude.com/docs/en/costs) |
+| [Codex CLI](https://learn.chatgpt.com/docs/sandboxing) | `approval_policy` of `untrusted`, `on-request`, `never`, or a `granular` table of per-surface rules, separate from the sandbox mode; refusal audit not documented | not documented — session resume and fork are, and `sqlite_home` names a SQLite database for "resumable runtime state", but nothing states per-step or crash durability | Yes — Seatbelt on macOS, `bubblewrap` on Linux/WSL2, Windows Sandbox or WSL2; `sandbox_mode` is `read-only`, `workspace-write` or `danger-full-access` | not documented |
 | [opencode](https://opencode.ai/docs/permissions/) | Per-tool wildcard patterns; auditing of denials not addressed | not documented — [sub-agents and a max-step control, with no persistence between steps described](https://opencode.ai/docs/agents/) | not documented | not documented |
-| [Goose](https://goose-docs.ai/docs/guides/managing-tools/tool-permissions) | Four modes with per-tool overrides, decisions persisted; Smart Approval is an LLM classifier rather than a rule | not documented | [Optional, macOS Desktop only, via seatbelt — the server process "is not sandboxed at the OS level"](https://goose-docs.ai/blog/2026/02/23/goose-v1-25-0/) | not documented |
-| [pi](https://pi.dev/docs/) | None by design — the documented answer is to run pi inside a container | not documented | External: the container you run it in | not documented |
+| [Goose](https://goose-docs.ai/docs/guides/managing-tools/tool-permissions/) | Four modes with per-tool overrides, decisions persisted; Smart Approval is an LLM classifier rather than a rule | not documented | [None — the macOS seatbelt sandbox was removed, and the server process that executes tools "runs with the same permissions as your user account and is not sandboxed at the OS level"](https://goose-docs.ai/blog/2026/02/23/goose-v1-25-0/) | not documented |
+| [pi](https://pi.dev/docs/latest) | None by design — "Pi does not include a built-in sandbox", and the documented answer is to run pi inside a contained environment | not documented | External: the container you run it in | not documented |
 
 **Against the Rust libraries you would otherwise embed.** This is the closer
 comparison, because it is about what arrives with the crate rather than what you
@@ -185,14 +187,19 @@ write yourself.
 | | Agent loop | Policy boundary over tool calls | OS sandbox | Durable crash-resume | Per-call token and cost accounting |
 | --- | --- | --- | --- | --- | --- |
 | **io-harness** | Yes | Yes | Yes | Yes | Yes, stored as raw counts |
-| [rig](https://github.com/0xPlaygrounds/rig) | Yes | not documented | not documented | not documented — a serializable run state machine, without persistence or recovery | not documented |
-| [swiftide](https://github.com/bosun-ai/swiftide) | Yes | not documented | not documented; a docker executor is a separate integration | Partial — pause, resume and reset, with no durability across crashes stated | not documented |
-| [langchain-rust](https://github.com/Abraxas-365/langchain-rust) | Yes | not documented | not documented | not documented | not documented |
+| [rig](https://github.com/0xPlaygrounds/rig) | Yes | not documented | not documented | Partial — a serializable step machine a run "can be suspended between steps and resumed in another process"; no storage layer or crash recovery | Partial — `Usage` per request, with the cache and reasoning splits; no cost |
+| [swiftide](https://github.com/bosun-ai/swiftide) | Yes | not documented | not documented; a docker executor is a separate integration | Partial — pause, resume and reset, for human approval, external callbacks or persisted state; no durability across crashes stated | Partial — `Usage` on each chat-completion response; no cost |
+| [langchain-rust](https://github.com/Abraxas-365/langchain-rust) | Yes | not documented | not documented | not documented | Partial — `TokenUsage` per call; no cost |
 
-The property nothing else in that audit documents is the last column of the first
-table: a spend ceiling one tree of agents shares and a child cannot raise. The
-rest is a matter of degree — several of these have real sandboxes and real
+The last column of the first table is where this crate is still alone, and it is
+narrower than it was: one of these now caps spend for a headless run and counts a
+subagent's spend against that cap, which is most of the property. What is still
+unmatched is the shape — a ledger the whole tree draws from at every step, that a
+spawned contract cannot raise, on an interactive run as much as an unattended one.
+The rest is a matter of degree — several of these have real sandboxes and real
 permission systems, and saying otherwise would be worth less than saying nothing.
+The degree moves in both directions: one of them removed its sandbox between this
+table's last two readings.
 
 ## Measured cost
 
@@ -224,6 +231,20 @@ the range of lines it asked for, or a refusal saying why — never a shortened f
 wearing the shape of a whole one, and never an empty string for a binary.
 Single-file mode edits one file.
 
+A contract can also demand the *shape* of what the run ends with.
+`TaskContract::with_output_schema` takes an `OutputSchema` — a JSON Schema over a
+closed, stated keyword subset, walked once at declaration time so a keyword this
+crate does not implement is refused by name and by pointer rather than passed
+through and silently unchecked. An `output_schema` key in `io.toml` is the same
+declaration made by an operator, refused the same way while they are still reading
+their own file. On the OpenAI-shaped wire it is sent as `response_format`; the
+Anthropic Messages API has no counterpart and is deliberately sent none. Either
+way the check happens here: a final answer that does not validate is re-prompted
+with the validation error as an ordinary observation, bounded by the run's
+retries, and exhausting them ends the run as `SchemaUnsatisfied` rather than as a
+finish over malformed output. What the subset holds and what it refuses by name is
+in [docs/CONTRACT.md](docs/CONTRACT.md).
+
 A change touching four places in one file is one `patch_file` call taking a
 unified diff — applied as a unit or not at all, so a patch that no longer fits is
 refused with the hunk named rather than half written. In a project whose ecosystem
@@ -245,6 +266,17 @@ connect to. Anything marked *ask* goes to an approver that can approve, deny, or
 defer past the end of the process and resume on a human decision later. Every
 refusal and decision is in the trace, attributed to the rule and the layer that
 produced it.
+
+A turn can also withhold a tool without changing what the model is shown it has.
+`TaskContract::with_tool_mask` takes a `ToolMask` naming the tools that turn may
+not call: the definitions sent are byte-identical to an unmasked run's, because
+the tool array sits ahead of the cache breakpoint at the end of the system block
+and any byte changed in it invalidates that entry and everything after it. The
+withheld names are stated past both breakpoints instead, so a mask that changes
+between turns costs no cache entry, and a call to a masked tool is refused at both
+places a call can begin — a batched read-only call does not route through the
+dispatch path the others take. See
+[tools and skills](docs/guide/tools-and-skills.md).
 
 `TaskContract::with_plan_gate` opens a run in a planning phase: the agent reads,
 writes nothing, and the only exit is an ordered plan — each step optionally naming
@@ -269,6 +301,19 @@ that started it.
 
 The harness ships a table of what each ecosystem's commands conventionally are, so
 the agent does not spend turns discovering that this is a pnpm workspace.
+
+Behind the `codeact` feature, off unless you ask for it, a chain of calls can be
+one program instead. `run_program` takes a complete Python program as its
+argument — source, not a command line — and the tools the run already has are
+ordinary functions inside it, so a loop over twelve files is control flow the
+interpreter runs rather than twelve round trips the model has to stay coherent
+across. Every act the program takes re-enters the same `dispatch` a model's own
+call takes, so the policy gate decides it, the trace records it and the journal
+pairs it: a program is a shorter way of asking, not a wider door. The interpreter
+is the host's — named in `[codeact]` or resolved from a documented list and
+version-probed — and nothing is downloaded, ever; a host without a usable one runs
+the turn exactly as it did before, with the fallback recorded as an event rather
+than left to be inferred. See [CodeAct](docs/guide/codeact.md).
 
 ### Containment
 
@@ -470,6 +515,15 @@ and what was discarded, because unlike ordinary concurrency this trade can lose.
 Each turn is assembled to fit a stated share of the token budget: superseded
 observations are compacted, and an observation a later write invalidated is re-read
 rather than trusted.
+
+Beneath a fold there is a gentler rung. `TaskContract::with_collapse` takes a
+`Collapse`, and an entry that will not fit the turn's budget is then carried
+shortened rather than replaced by a one-line stub — at no provider call and no
+stored summary, leaving the ledger exactly as long as it was, so turning it off
+assembles those entries whole again, which a fold cannot do. A shortened entry
+keeps its kind and its target, so the stale-read rules still see it. It is off
+unless configured, and `fold` stays the last rung and the default trigger; the
+[context and memory guide](docs/guide/context-and-memory.md) has the ordering.
 
 Durable memory survives between runs — as a fact or a decision, pinnable so a run
 cannot overwrite a correction, with a per-run record of which entries it actually
