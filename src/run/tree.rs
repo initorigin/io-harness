@@ -1043,6 +1043,41 @@ where
                 // and reordering them would let a sibling read a finding about a
                 // file that had not been written yet.
                 if call.name == SEND_MESSAGE_TOOL || call.name == READ_MESSAGES_TOOL {
+                    // 0.80.0 — refused while the plan is unreviewed, for exactly
+                    // the reason `spawn_agent` is above. H5 named the spawn and
+                    // stopped there, and these two were left unreachable by
+                    // *accident* rather than by rule: with the spawn refused
+                    // there are no siblings at depth 0 to talk to, so nothing
+                    // happens — until a release gives a run siblings it did not
+                    // start, and then a plan-phase agent is reading and writing
+                    // a shared mailbox with no phase over it. Unreachable by
+                    // accident is a boundary that holds until somebody changes
+                    // something unrelated.
+                    if planning {
+                        let refused = if call.name == SEND_MESSAGE_TOOL {
+                            SEND_MESSAGE_TOOL
+                        } else {
+                            READ_MESSAGES_TOOL
+                        };
+                        ledger.push(Observation::new(
+                            step,
+                            ObsKind::Error,
+                            None,
+                            bound(
+                                &format!(
+                                    "\n[{refused} refused] the plan has not been approved yet, \
+                                     so this run has no siblings and no mailbox — the phase is \
+                                     what decides that, not the absence of anyone to talk to. \
+                                     Call `{PROPOSE_PLAN_TOOL}` first.\n"
+                                ),
+                                entry_cap,
+                                ObsKind::Error,
+                            ),
+                            Origin::Tool,
+                        ));
+                        decisions.push(format!("{refused} refused (planning)"));
+                        continue;
+                    }
                     // 0.60.0 — DRIVEN, for the reason the provider call is, and
                     // this is the release's sharpest lesson. A detached child is
                     // a future in this agent's own `inflight` set: nothing else
@@ -1605,13 +1640,16 @@ where
                     )?;
                     ledger.push(Observation::new(
                         step,
-                        ObsKind::Error,
+                        // 0.80.0 (issue #246) — `Message`, the flat loop's kind
+                        // and the thing that actually makes this narration. The
+                        // origin beside it never did: `Piece::of` reads the kind
+                        // and the target, so this entry was `Piece::Result` and
+                        // took a position in the step's ordinal count for a call
+                        // that does not exist. See `step.rs` for what that cost
+                        // on the wire.
+                        ObsKind::Message,
                         None,
-                        bound(&section, entry_cap, ObsKind::Error),
-                        // The flat loop's origin, and the same correction: gate
-                        // feedback is narration about the run, so it no longer
-                        // takes a position in this step's ordinal count for a
-                        // call that does not exist. See `step.rs`.
+                        bound(&section, entry_cap, ObsKind::Message),
                         Origin::Prose,
                     ));
                     last_gate_feedback = Some(key);

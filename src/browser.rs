@@ -446,6 +446,33 @@ impl NavGate {
     /// resolve at all. Today that proxy exists only for a *contained* run whose
     /// policy names hosts, which `Policy::permissive()` does not.
     pub(crate) fn permits(&self, url: &str) -> bool {
+        self.decide(url, true)
+    }
+
+    /// The same decision for a request the *page* made rather than the model
+    /// (0.80.0) — an image, a stylesheet, a script, a `fetch` from inside the
+    /// document.
+    ///
+    /// Until this release `Fetch.enable` intercepted documents only, so H6's
+    /// exfiltration half was closed by construction for a `data:` document and
+    /// left open for every permitted `https://` page: an uncontained run under a
+    /// narrow `allow_net` still let `<img src="https://attacker/">` leave, and
+    /// nothing recorded that it had. The interception is now every resource
+    /// type, and the policy answers for all of them.
+    ///
+    /// **What differs is the recording, and that is the whole reason this is a
+    /// second method.** Widening the interception was considered and rejected
+    /// once already, because recording every subresource would emit one row per
+    /// image against a contract that says one row per document. So a permitted
+    /// subresource is decided and not recorded, while a *refused* one is
+    /// recorded like any other refusal — the row count stays proportional to
+    /// documents and to refusals, which is what an auditor reads, rather than to
+    /// bytes.
+    pub(crate) fn permits_subresource(&self, url: &str) -> bool {
+        self.decide(url, false)
+    }
+
+    fn decide(&self, url: &str, record_permitted: bool) -> bool {
         // 0.74.0, audit H6 — a URL with no host used to return `true` here and
         // record nothing, on the reasoning that a URL reaching no network is not
         // a network decision. Two of those URLs reach something worse than a
@@ -485,15 +512,17 @@ impl NavGate {
             Some(crate::error::Error::Refused { rule, layer, .. }) => (rule, layer),
             _ => (verdict.rule, verdict.layer),
         };
-        self.decisions
-            .lock()
-            .expect("navigation decisions are not poisoned")
-            .push(Decision {
-                target,
-                permitted,
-                rule,
-                layer,
-            });
+        if record_permitted || !permitted {
+            self.decisions
+                .lock()
+                .expect("navigation decisions are not poisoned")
+                .push(Decision {
+                    target,
+                    permitted,
+                    rule,
+                    layer,
+                });
+        }
         permitted
     }
 
@@ -862,7 +891,21 @@ async fn route_event(
                 .and_then(|r| r.get("url"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let permitted = gate.permits(url);
+            // 0.80.0 — every resource type is intercepted now, so the decision
+            // depends on which one this is. A document is the model's navigation
+            // and is recorded; a subresource is the page's own request, decided
+            // the same way and recorded only when it is refused. An absent
+            // `resourceType` is treated as a document, which is the fail-closed
+            // reading: it records more, never less.
+            let subresource = params
+                .get("resourceType")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "Document");
+            let permitted = if subresource {
+                gate.permits_subresource(url)
+            } else {
+                gate.permits(url)
+            };
             let id = next_id.fetch_add(1, Ordering::Relaxed);
             let mut body = if permitted {
                 json!({"id": id, "method": "Fetch.continueRequest",
@@ -1036,6 +1079,13 @@ pub(crate) fn launch_args(
     // second one beside it.
     if let Some(proxy) = proxy {
         args.push(format!("--proxy-server={proxy}"));
+        // 0.80.0 — a contained browser writes only inside its own profile
+        // directory, and `/dev/shm` is not in that grant. Chrome falls back to
+        // temporary files under the profile when told to, and hangs on start
+        // when it is not told and cannot write there. Added beside the proxy
+        // flag rather than unconditionally, because an uncontained run has
+        // `/dev/shm` and the shared-memory path is faster.
+        args.push("--disable-dev-shm-usage".to_string());
     }
     args.extend(config.args.iter().cloned());
     args
@@ -1389,10 +1439,49 @@ pub(crate) async fn launch(
         });
     }
 
+    // 0.80.0 (audit residual 5) — the browser child is contained like every
+    // other child this crate spawns, on the runs that asked for containment.
+    //
+    // It was spawned with nothing at all until this release: named in H6's
+    // *What* and in no acceptance criterion, so a browser under a contained run
+    // could read and write anywhere the embedding process could, while every
+    // other child of that run could not.
+    //
+    // **Only on a run that owns an egress proxy**, which is this layer's signal
+    // that the run asked to be contained — an uncontained run's browser is
+    // uncontained by the caller's own choice, exactly as its `exec` is, and
+    // containing it here would confine a run that never asked. **And only where
+    // the containment is real**: `contain_command` answers `None` off the
+    // Landlock rung, so macOS and the mount rungs are unchanged and the guide
+    // says so rather than leaving a reader to infer parity that is not there.
+    //
+    // The writable root is the profile directory and nothing else. Reads are not
+    // confined on any unix rung, which is what lets the browser find its own
+    // installation and the system libraries it links.
+    // Held to the end of this function rather than dropped explicitly after the
+    // spawn: it owns the rule set's descriptor, the child needs it only until
+    // `exec`, and `Option<Contained>` does not itself implement `Drop`, so an
+    // explicit `drop` here would extend a lifetime rather than end one.
+    let _contained = if proxy.is_some() {
+        let sandbox = crate::sandbox::SandboxConfig {
+            allow_network: true,
+            ..crate::sandbox::SandboxConfig::new()
+        };
+        crate::sandbox::contain_command(
+            &mut command,
+            &sandbox,
+            profile.path(),
+            true,
+            &[profile.path().to_path_buf()],
+            None,
+        )
+    } else {
+        None
+    };
+
     let child = command
         .spawn()
         .map_err(|e| fail(format!("could not start `{binary_name}`: {e}")))?;
-
     // The child's ends belong to the child now. Holding them open here would mean
     // this process never sees the browser close its output.
     drop(to_child_read);
@@ -1506,12 +1595,20 @@ async fn attach(client: &Client, config: &BrowserConfig) -> Result<String> {
     for (method, params) in [
         ("Page.enable", json!({})),
         ("Runtime.enable", json!({})),
-        // Document requests only, held at the request stage so the decision is
-        // made before anything leaves the process.
+        // Every resource type, held at the request stage so the decision is made
+        // before anything leaves the process (0.80.0).
+        //
+        // Documents only until this release, which closed H6's exfiltration half
+        // for a `data:` document — it never loads — and left it open for a
+        // permitted `https://` one: an uncontained run under a narrow
+        // `allow_net` still let a subresource carry bytes to a host the policy
+        // never allowed. Under containment the egress proxy covers this; an
+        // uncontained run has no proxy, and that is the run this widening is
+        // for. The row contract is unchanged — see `NavGate::permits_subresource`
+        // for why one row per document survives one decision per request.
         (
             "Fetch.enable",
-            json!({"patterns": [{"urlPattern": "*", "requestStage": "Request",
-                                 "resourceType": "Document"}]}),
+            json!({"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}),
         ),
         (
             "Emulation.setDeviceMetricsOverride",

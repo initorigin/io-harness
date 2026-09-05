@@ -616,7 +616,11 @@ pub(super) fn boundary_section(
             lines.push(boundary_line(policy, act, label, defaults));
         }
     }
-    lines.push(containment_line(sandbox, proxied, probe));
+    // 0.80.0 — the same combination every spawn site makes. Composed here rather
+    // than read off `sandbox` so the sentence describes the containment the next
+    // command is actually given.
+    let egress_open = sandbox.allow_network || policy.permits_any_egress();
+    lines.push(containment_line(sandbox, proxied, probe, egress_open));
     Some(format!(
         "Your boundary. These are enforced before a call runs, so a call outside them is refused \
          rather than attempted — plan around them rather than finding them one refusal at a \
@@ -715,10 +719,18 @@ pub(super) fn effect_label(effect: Effect) -> &'static str {
 /// worded as what this run could not establish rather than as an absence of
 /// confinement, because those are different sentences and only the first is known
 /// to be true.
+/// `egress_open` is the answer
+/// [`ExecContainment::with_egress`](crate::sandbox) will give for this run — the
+/// operator's `[sandbox]` section or the policy's default, whichever grants
+/// (0.80.0). It is passed in rather than read off `config` because `config` is
+/// the contract's raw section and the two are not the same value: every spawn
+/// site combines them, and until 0.80.0 this line described a containment no
+/// command was ever given.
 pub(super) fn containment_line(
     config: &SandboxConfig,
     proxied: bool,
     probe: &crate::sandbox::BoundaryProbe,
+    egress_open: bool,
 ) -> String {
     if !config.mode.is_contained() {
         return "- Commands you run are not contained (mode: full-access): they run at this \
@@ -789,8 +801,28 @@ pub(super) fn containment_line(
         " Outbound network on this host is all or nothing: this run's commands either hold the \
          capability to reach the network or hold none, so the per-host rules above are not \
          enforced for them."
+    } else if !backend.denies_egress() {
+        // A resource-only backend. The child reaches the network whatever either
+        // answer says, so claiming the per-host rules bound it would be the
+        // 0.40.0 defect once more.
+        " Outbound network is not confined for the commands you run on this host, so the per-host \
+         rules above bound what this harness dials on your behalf and not what a command you run \
+         may reach."
+    } else if egress_open {
+        // 0.80.0 — the sentence this line gave until now, "permitted only where
+        // this run's policy permits it", was wrong in both directions and wrong
+        // in the direction that matters here: a contained command's network is
+        // all or nothing at the sandbox layer, so a run whose sandbox grants it
+        // reaches every host, not the ones the rules above name. The io-cli field
+        // test of 2026-09-05 read the old sentence as the product telling it that
+        // only the provider was reachable while the operator had opened the
+        // sandbox, and refused a `curl` it could have run.
+        " Outbound network is open to the commands you run: this run's sandbox grants it \
+         wholesale rather than per host, so the per-host rules above bound what this harness \
+         dials on your behalf and not what a command you run may reach."
     } else {
-        " Outbound network is permitted only where this run's policy permits it."
+        " Commands you run reach no network at all: this run's sandbox denies it to them \
+         wholesale, so the per-host rules above bound what this harness dials on your behalf."
     };
     match probe.write_refused {
         Some(true) => format!(
@@ -1160,6 +1192,37 @@ pub(super) fn transcript(
         let known = turns
             .get(&step)
             .filter(|turn| results.iter().all(|r| r.call < turn.calls.len()));
+        // 0.80.0 (issue #246) — the invariant, asserted where it is decided.
+        //
+        // This filter is the run's last line of defence and it fails *silently*:
+        // the `else` below pushes every one of the step's results into flat
+        // prose and continues, so the step loses its assistant turn and its
+        // native tool-call blocks and the request goes out as a different prompt
+        // from the one the run intended. Nothing reported it, and the two
+        // defects that caused it — gate feedback taking an ordinal it does not
+        // answer, and the plan-revise arm answering a call without taking one —
+        // both survived a release each because of that.
+        //
+        // A warning rather than a refusal or a debug assertion, and the choice
+        // matters. The fallback is correct for a step whose turn this process
+        // never saw — a resumed run, a step folded away — so it stays, and a
+        // debug assertion would fire on the test that proves it stays while
+        // saying nothing in the release builds where both defects actually ran.
+        // What must never happen is a step whose turn IS known and whose results
+        // do not fit it, and that is what this reports.
+        if known.is_none() {
+            if let Some(turn) = turns.get(&step) {
+                tracing::warn!(
+                    step,
+                    results = results.len(),
+                    calls = turn.calls.len(),
+                    "transcript: this step's results do not fit the calls its turn made, so the \
+                     step is being sent as prose without its assistant turn — an entry that \
+                     answers no call has taken a call's position, or one that answers a call has \
+                     given its position up"
+                );
+            }
+        }
         let Some(turn) = known else {
             for result in &results {
                 pending.push_str(&result.content);
@@ -2286,7 +2349,7 @@ mod boundary_sentence {
             assert!(backend.confines_writes() && backend.denies_egress());
             for write in [Some(false), None] {
                 for dial in [Some(false), None] {
-                    let line = containment_line(&config, true, &probe(backend, write, dial));
+                    let line = containment_line(&config, true, &probe(backend, write, dial), true);
                     assert!(
                         !line.contains("are contained"),
                         "{} claimed confinement from a probe that measured {write:?}: {line}",
@@ -2318,12 +2381,53 @@ mod boundary_sentence {
         let config = SandboxConfig::new();
         for backend in CLAIMANTS {
             let held = probe(backend, Some(true), Some(true));
-            let line = containment_line(&config, true, &held);
+            let line = containment_line(&config, true, &held, true);
             assert!(line.contains("are contained"), "{line}");
             assert!(line.contains("confined to the workspace"), "{line}");
             assert!(line.contains("only the hosts"), "{line}");
             assert!(!line.contains("advisory"), "{line}");
         }
+    }
+
+    /// 0.80.0 F3 — an unproxied contained run is told which of the two states
+    /// its commands are in, and the sentence moves when the state does.
+    ///
+    /// Until 0.80.0 this arm said "outbound network is permitted only where this
+    /// run's policy permits it" for both states, which is wrong in both: a
+    /// contained command's network is all or nothing at the sandbox layer, so a
+    /// widened run reaches every host and a denied one reaches none, and neither
+    /// is bounded by the per-host rules the sentence pointed at. The io-cli field
+    /// test of 2026-09-05 read the old sentence with the sandbox open and
+    /// declined a `curl` it could have run.
+    #[test]
+    fn an_unproxied_run_is_told_whether_its_commands_have_a_network_at_all() {
+        // Denies egress and can reach a loopback proxy, so an unproxied run on it
+        // falls to the two arms under test rather than to the all-or-nothing one.
+        let backend = Backend::MacosSandboxExec;
+        assert!(backend.denies_egress() && backend.reaches_loopback_proxy());
+        let held = probe(backend, Some(true), Some(true));
+        let config = SandboxConfig::new();
+
+        let open = containment_line(&config, false, &held, true);
+        assert!(
+            open.contains("open to the commands you run"),
+            "a widened sandbox is stated as widened: {open}"
+        );
+        assert!(
+            !open.contains("permitted only where this run's policy permits it"),
+            "and never as scoped by rules that do not bind a command: {open}"
+        );
+
+        let shut = containment_line(&config, false, &held, false);
+        assert!(
+            shut.contains("reach no network at all"),
+            "and a denied sandbox is stated as denied: {shut}"
+        );
+        assert_ne!(
+            open, shut,
+            "the two states must not produce the same sentence — that identity \
+             is the whole of the defect"
+        );
     }
 
     /// The one arm still asked of the backend, and the reason it must be.
@@ -2342,6 +2446,7 @@ mod boundary_sentence {
             &SandboxConfig::new(),
             false,
             &probe(Backend::WindowsAppContainer, Some(true), None),
+            true,
         );
         assert!(line.contains("all or nothing"), "{line}");
     }
@@ -2352,7 +2457,7 @@ mod boundary_sentence {
     fn a_full_access_run_is_told_it_has_no_boundary() {
         let config = SandboxConfig::new().with_mode(crate::sandbox::ExecMode::FullAccess);
         let none = probe(Backend::PortableFloor, Some(false), Some(false));
-        let line = containment_line(&config, false, &none);
+        let line = containment_line(&config, false, &none, false);
         assert!(line.contains("not contained"), "{line}");
         assert!(line.contains("full-access"), "{line}");
     }

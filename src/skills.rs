@@ -222,6 +222,48 @@ pub(crate) fn resolve_companion(skill: &Skill, rel: &str) -> SkillFile {
     resolve_under(&skill.root, rel)
 }
 
+/// Whether an entry sitting in a skills directory leads out of it (0.80.0).
+///
+/// L13 confined the paths a workspace *declares* — `run.skills`,
+/// `run.templates`, a plugin's `path` — and stopped at the declaration. The walk
+/// *under* an accepted root was never confined, so a subdirectory that is a
+/// symbolic link to somewhere else was descended, and the `SKILL.md` it holds
+/// became a name and a description in the system prompt on every turn of every
+/// run. That is the whole of what a skill has to reach to be worth planting:
+/// the catalogue is prompt text, and it is sent before the model has done
+/// anything a policy could refuse.
+///
+/// A top-level `*.md` entry is refused on the same test, because it is the same
+/// hole with one character changed — `evil.md -> /elsewhere/notes.md` — and it
+/// is the worse half: [`Skills::discover`] canonicalises what it finds, so such
+/// a skill's [`Skill::root`] would be a directory *outside* the accepted one,
+/// and every companion file it then names resolves under that root rather than
+/// under the operator's. The cost is that a skill symlinked in from a dotfiles
+/// checkout no longer loads; it is named in the warning, and pointing
+/// `with_skills` at the directory the links come from loads it.
+///
+/// Only a symbolic link pays for a `canonicalize` — an ordinary file or
+/// directory is answered by the `symlink_metadata` alone, so a full directory
+/// costs one `lstat` per entry and nothing else. A link whose target will not
+/// canonicalise — dangling, or unreadable — counts as leaving: there is nothing
+/// to read through it either way, and one boolean is the whole answer the caller
+/// wants.
+fn escapes_root(root: &Path, entry: &Path) -> bool {
+    if !entry
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return false;
+    }
+    // The root is canonicalised too, or a skills directory reached through a
+    // link — `/tmp` on macOS, a bind-mounted checkout — would make every entry
+    // under it look like an escape.
+    let (Ok(root), Ok(target)) = (root.canonicalize(), entry.canonicalize()) else {
+        return true;
+    };
+    !target.starts_with(&root)
+}
+
 /// The skills discovered for one run.
 ///
 /// Both layout conventions in common use are discovered, so a directory
@@ -303,6 +345,15 @@ impl Skills {
     /// same name — an ambiguous catalogue is a configuration mistake, and
     /// resolving it by picking one silently is how an operator ends up debugging
     /// why their agent read the wrong instructions.
+    ///
+    /// **The walk stays inside `dir` (0.80.0).** An entry that is a symbolic
+    /// link whose target sits outside the directory is skipped and warned about
+    /// through `tracing`, file and subdirectory alike. Confining the *declared*
+    /// path is not enough on its own: a `skills/notes -> ../../elsewhere` inside
+    /// an accepted directory put a stranger's `SKILL.md` into the system prompt,
+    /// which is prompt text sent before the model has done anything a policy
+    /// could refuse. Skipped rather than fatal, so one stray link does not cost
+    /// the operator every other skill in the directory.
     pub fn discover(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
         if !dir.exists() {
@@ -329,6 +380,23 @@ impl Skills {
 
         let mut skills: Vec<Skill> = Vec::new();
         for path in entries {
+            // The walk stays inside the directory the caller accepted. Skipped
+            // rather than an error: a stray link in a skills directory is an
+            // operator's own layout far more often than an attack, and failing
+            // the run would take the other sixty-three skills down with it. The
+            // trace names the link's own path and never its target — the same
+            // rule `SkillFile::Outside` holds, for the same reason.
+            if escapes_root(dir, &path) {
+                tracing::warn!(
+                    "skills directory {}: {} leads outside it and was skipped. Every skill's \
+                     name and description is sent on every turn, so discovery does not follow a \
+                     link out of the directory it was pointed at — point `with_skills` at the \
+                     directory the link comes from instead",
+                    dir.display(),
+                    path.display()
+                );
+                continue;
+            }
             let file = if path.is_dir() {
                 let candidate = path.join("SKILL.md");
                 if !candidate.is_file() {

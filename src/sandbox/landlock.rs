@@ -292,11 +292,22 @@ pub(crate) fn plan(
     // `crate::sandbox::workdir` puts every run's ephemeral workspace inside it,
     // so two concurrent runs can read and rewrite each other's workspace from
     // inside their own sandboxes. 0.74.0 narrowed the two mount rungs to a
-    // directory the run owns (`super::linux::tmp_target`, with `TMPDIR` pointed
-    // at it) and left this one as it was: narrowing it means changing what both
-    // `super::linux::landlock_run` and `crate::sandbox::contain_command` pass
-    // here, and pointing the child's `TMPDIR` at the result, or the grant and
-    // the directory a toolchain reaches for stop being the same place.
+    // directory the run owns and left this one.
+    //
+    // **0.80.0 narrowed it, found what it costs, and put it back.** The narrowing
+    // itself worked — one resolver for both spawn paths, the run's own directory,
+    // `TMPDIR` pointed at what was granted. What it broke is a shipped capability:
+    // a `git worktree` child's object store lives in the parent repository, which
+    // is *outside* its workdir, so a contained child wrote its file and could not
+    // commit it. `tests/worktree.rs` catches exactly that, and it is not a test
+    // artifact — it is what a user's run does.
+    //
+    // Closing this needs an affordance that does not exist yet: a way for a run
+    // to declare a writable root beyond the workdir and the toolchain caches, so
+    // the worktree feature can name the repository's common git directory and
+    // nothing else. That is 0.81.0's, and it is written down as such rather than
+    // left as a comment saying the grant is wide. See
+    // `US-IO-HARNESS-0.80.0-I04`.
     write_roots.push(tmp.to_path_buf());
 
     for root in write_roots {

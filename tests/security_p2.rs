@@ -7,6 +7,11 @@
 //! (H3, H4, M6) plus the missing ceiling on the one read every document parser
 //! starts at (M15), each named for the finding it closes.
 //!
+//! M15 covers three entry points rather than one as of 0.80.0: the ceiling went
+//! on `read_bytes`, and `read_file` and `read_typed` reached an uncapped
+//! `fs::read` of their own — the same allocation through the door an agent uses
+//! first.
+//!
 //! F2a is the one the same shape survived into: `canonicalize` fails with
 //! `NotFound` for a *dangling* symbolic link as well as for an absent file, so the
 //! containment walk stopped on the link and graded the link's own name while every
@@ -318,6 +323,64 @@ fn m15_a_document_read_under_the_cap_is_unchanged() {
 
     assert_eq!(ws.read_bytes("small.bin").unwrap(), vec![0u8, 1, 2, 3]);
     assert!(ws.read_bytes("absent.bin").is_err());
+}
+
+/// The ceiling was on `read_bytes` alone, and `read_bytes` is not the door an
+/// agent reaches for first. `read_file` and `read_typed` share one `fs::read` of
+/// their own, uncapped, so the file the byte read refused was pulled into memory
+/// whole by an ordinary text read of the same path — the same allocation, one
+/// tool call away. All three entry points refuse alike, in the same words.
+#[test]
+fn m15_a_text_read_over_the_size_cap_is_refused_in_the_same_words() {
+    let (root, _outside) = fixture();
+    // Sparse: this costs a length, not the bytes — and the refusal is decided on
+    // that length, so nothing here allocates 64 MiB either.
+    std::fs::File::create(root.path().join("huge.txt"))
+        .unwrap()
+        .set_len(MAX_DOCUMENT_BYTES + 1)
+        .unwrap();
+    let ws = Workspace::new(root.path());
+
+    for said in [
+        ws.read_file("huge.txt").unwrap_err().to_string(),
+        ws.read_typed("huge.txt").unwrap_err().to_string(),
+        ws.read_bytes("huge.txt").unwrap_err().to_string(),
+    ] {
+        assert!(
+            said.contains("huge.txt"),
+            "the refusal names the path: {said}"
+        );
+        assert!(
+            said.contains(&MAX_DOCUMENT_BYTES.to_string()),
+            "the refusal names the limit: {said}"
+        );
+    }
+}
+
+/// What the ceiling must not take away. A text file under the cap still reads,
+/// a file that is not there still reads empty — 0.1.0's deliberate behaviour,
+/// and the one the size check runs in front of — and an extension the crate
+/// classifies without decoding is still answered without reading a byte, which
+/// is why a large image is not refused here.
+#[test]
+fn a_text_read_under_the_cap_and_a_classified_extension_are_unaffected() {
+    let (root, _outside) = fixture();
+    std::fs::File::create(root.path().join("huge.png"))
+        .unwrap()
+        .set_len(MAX_DOCUMENT_BYTES + 1)
+        .unwrap();
+    let ws = Workspace::new(root.path());
+
+    assert_eq!(ws.read_file("src/a.rs").unwrap(), "pub fn alpha() {}\n");
+    assert_eq!(
+        ws.read_file("src/absent.rs").unwrap(),
+        "",
+        "a file that is not there is still one to create"
+    );
+    assert!(
+        ws.read_typed("huge.png").is_ok(),
+        "naming a format costs no bytes, so the size limit is not in front of it"
+    );
 }
 
 // ---------------------------------------------------------------------------

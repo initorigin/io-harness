@@ -1692,7 +1692,16 @@ fn open_leaf(path: &Path, root: &Path, opts: &mut std::fs::OpenOptions) -> Resul
         match opts.open(path) {
             // `ELOOP` here means the leaf is a symlink and nothing else: the flag
             // is the only reason this open can report it.
-            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            //
+            // `EMLINK` is the same answer spelled differently (0.80.0). FreeBSD,
+            // NetBSD and DragonFly report it for an `O_NOFOLLOW` open of a link,
+            // because POSIX left the errno unspecified. Naming only `ELOOP` sent
+            // a redirect through a link inside the root down the error arm: the
+            // write failed closed, so nothing escaped, but the re-decision this
+            // arm exists to make never happened. The twin of this arm is in
+            // `tools/workspace.rs`; both were corrected together, because one of
+            // the two carrying the fix is how they drift.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::EMLINK)) => {
                 let dest = std::fs::read_link(path).map_err(Error::Io)?;
                 let dest = match path.parent() {
                     Some(parent) if dest.is_relative() => parent.join(dest),

@@ -2005,10 +2005,17 @@ const README_MUST_NAME: &[(&str, &str)] = &[
 /// only way past the check, which is the point: a documentation or remediation
 /// release says so out loud, and a capability release cannot reach the same
 /// exemption by nobody noticing.
-const README_NAMES_NOTHING: &[(&str, &str)] = &[(
-    "0.79.1",
-    "documentation only — it named what 0.76.0 through 0.79.0 had already shipped",
-)];
+const README_NAMES_NOTHING: &[(&str, &str)] = &[
+    (
+        "0.79.1",
+        "documentation only — it named what 0.76.0 through 0.79.0 had already shipped",
+    ),
+    (
+        "0.80.0",
+        "corrections only — every item fixes behaviour this crate had already published, \
+         so there is no new name for the README to carry",
+    ),
+];
 
 /// How far behind the newest release the comparison tables' stated date may fall.
 ///

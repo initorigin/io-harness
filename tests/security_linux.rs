@@ -39,6 +39,25 @@ fn mount_rung(what: &str) -> Option<Selected> {
     let selected = select(&SandboxConfig::new());
     match selected.backend() {
         Backend::LinuxBubblewrap | Backend::LinuxNamespaces => Some(selected),
+        // 0.80.0, O1 — a skip reads as a pass, and every one of these skipped on
+        // every machine this crate has ever run on: `MOUNT_SETUP` carries H8's
+        // fix, H10's and L11's, and the shell had never executed anywhere.
+        //
+        // The `mount-rungs` CI job makes Landlock unavailable **at the syscall**
+        // — a seccomp profile answering `ENOSYS`, which is what a kernel built
+        // without it answers — and sets this variable so that a chain landing
+        // anywhere but a mount rung fails the job instead of printing a line
+        // nobody reads. It is a test-only assertion in the shape of
+        // `IO_HARNESS_EXPECT_BACKEND`: it cannot select a rung and cannot
+        // weaken one, so it is not a downgrade an attacker could reach for —
+        // which is the reason the job varies the kernel's answer rather than
+        // this crate's configuration.
+        other if std::env::var_os("IO_HARNESS_REQUIRE_MOUNT_RUNG").is_some() => panic!(
+            "({what}): IO_HARNESS_REQUIRE_MOUNT_RUNG is set, so this leg exists to run the \
+             mount rungs — and the chain selected {other:?}. Either Landlock is still \
+             available to this process or another rung came first; skipping here would \
+             report a pass for a suite that ran nothing."
+        ),
         other => {
             eprintln!(
                 "skipped ({what}): this host's chain selected {other:?}, which is not a \
