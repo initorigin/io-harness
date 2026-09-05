@@ -420,6 +420,28 @@ jobs:
                        | select(.target.name=="security_linux")
                        | .executable | select(. != null)' build.json | tail -1)
           test -n "$bin"
+          # On the runner itself, under a systemd syscall filter — not in a
+          # container. The first three rounds of this leg used a privileged
+          # container with a seccomp profile, and `--privileged` was needed for
+          # the namespace rung to work at all, which put a confound in exactly
+          # the place this leg is measuring: H10 is about what `/proc` shows a
+          # contained process, and a container's `/proc` is not the host's.
+          #
+          # `SystemCallFilter` with a leading `~` is a blocklist and
+          # `SystemCallErrorNumber=ENOSYS` makes the three Landlock calls answer
+          # the way a kernel built without Landlock answers. Same mechanism as
+          # before — the kernel says no, the crate is not reconfigured — with the
+          # real filesystem underneath.
+          sudo systemd-run --pipe --wait --collect \
+            --property=SystemCallFilter='~landlock_create_ruleset landlock_add_rule landlock_restrict_self' \
+            --property=SystemCallErrorNumber=ENOSYS \
+            --setenv=IO_HARNESS_REQUIRE_MOUNT_RUNG=1 \
+            --setenv=RUST_BACKTRACE=1 \
+            "$bin" --nocapture
+          exit $?
+          # Unreached. The container path below is kept for one release as the
+          # fallback if the property above is rejected by the runner's systemd,
+          # and is removed once this leg has a green history.
           # `errnoRet: 38` is ENOSYS — what a kernel with no Landlock answers.
           cat > seccomp.json <<'JSON'
           {
