@@ -219,6 +219,46 @@ mod tests {
         assert!(p.contains("(deny file-write* (subpath \"/\"))"));
     }
 
+    /// 0.80.0 F2 — the second of the three states a widened run can be in, and
+    /// the one nothing asserted before.
+    ///
+    /// The three are: no widening (`profile_denies_network_by_default…` above),
+    /// widened with no host list (here), and widened with one — which on this
+    /// crate is the egress proxy, because SBPL can name an address and a port
+    /// and cannot name a host, so a list of hosts is enforced by the proxy that
+    /// resolves them rather than by the kernel
+    /// (`a_proxy_denies_everything_and_allows_the_loopback_port_back` below).
+    ///
+    /// The assertion is against the *whole* profile rather than for one
+    /// substring, because the failure this guards is a fix that grants network
+    /// by granting everything: `(allow default)` with no `deny file-write*`
+    /// would contain `(allow network*)` too and pass a substring test while
+    /// handing the run the filesystem.
+    #[test]
+    fn widening_grants_the_network_and_moves_nothing_else() {
+        let denied = profile(ExecMode::WorkspaceWrite, &[]);
+        let widened = profile_for(
+            Path::new("/tmp/sbx"),
+            true,
+            ExecMode::WorkspaceWrite,
+            &[],
+            None,
+        );
+
+        assert!(
+            widened.contains("(allow network*)"),
+            "a widened run may bind and may dial — SBPL has no narrower verb \
+             that permits a local `bind`, which is the first thing the field \
+             test tried: {widened}"
+        );
+        assert_eq!(
+            widened,
+            denied.replace("(deny network*)", "(allow network*)"),
+            "and the widened profile differs from the denied one in that clause \
+             and in nothing else"
+        );
+    }
+
     #[test]
     fn a_proxy_denies_everything_and_allows_the_loopback_port_back() {
         let addr: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
