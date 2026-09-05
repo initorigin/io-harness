@@ -1237,6 +1237,14 @@ fn walk_open(root: &Path, abs: &Path) -> std::result::Result<std::fs::File, NoFo
         return Err(bad_input());
     };
 
+    // The root may not exist yet, and creating it is this function's job now that
+    // nothing else walks the path: the `create_dir_all(parent)` this replaced
+    // created the whole chain including the root, and a workspace pointed at a
+    // directory that has not been made is an ordinary first write rather than an
+    // error. By path and not from a descriptor, for the same reason the open
+    // below is by path — the root is the operator's own directory and the walk
+    // starts *at* it, so there is nothing above it for this function to hold.
+    std::fs::create_dir_all(&base).map_err(NoFollow::Io)?;
     let mut dir: OwnedFd = std::fs::File::open(&base).map_err(NoFollow::Io)?.into();
     for name in dirs {
         let c = CString::new(name.as_bytes()).map_err(|_| bad_input())?;

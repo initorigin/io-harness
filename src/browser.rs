@@ -1458,7 +1458,11 @@ pub(crate) async fn launch(
     // The writable root is the profile directory and nothing else. Reads are not
     // confined on any unix rung, which is what lets the browser find its own
     // installation and the system libraries it links.
-    let contained = if proxy.is_some() {
+    // Held to the end of this function rather than dropped explicitly after the
+    // spawn: it owns the rule set's descriptor, the child needs it only until
+    // `exec`, and `Option<Contained>` does not itself implement `Drop`, so an
+    // explicit `drop` here would extend a lifetime rather than end one.
+    let _contained = if proxy.is_some() {
         let sandbox = crate::sandbox::SandboxConfig {
             allow_network: true,
             ..crate::sandbox::SandboxConfig::new()
@@ -1478,10 +1482,6 @@ pub(crate) async fn launch(
     let child = command
         .spawn()
         .map_err(|e| fail(format!("could not start `{binary_name}`: {e}")))?;
-    // The rule set is applied; the guard owns the descriptor the child used and
-    // has no further job. Dropping it before the spawn would have closed it.
-    drop(contained);
-
     // The child's ends belong to the child now. Holding them open here would mean
     // this process never sees the browser close its output.
     drop(to_child_read);

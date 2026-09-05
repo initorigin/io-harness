@@ -297,9 +297,17 @@ async fn h7_an_absolute_path_discards_the_root_and_is_refused() {
         !transcript.contains(SECRET),
         "an absolute path reached outside the root: {transcript}"
     );
+    // 0.80.0 — the refusal moved and got more specific, which is F7 working.
+    // An absolute read used to reach `policy().check()` with the containment
+    // check skipped, so it was refused by whatever rule the policy happened to
+    // carry and the message said only "refused by policy". `policy_verdict` asks
+    // `check_path` for every read now, so the refusal names the reason: the path
+    // escaped the workspace root. The property under test is unchanged — the
+    // model is told, and the secret never reaches the transcript, which the
+    // assertion above still checks.
     assert!(
-        transcript.contains("refused by policy"),
-        "and the refusal is named: {transcript}"
+        transcript.contains("read refused") && transcript.contains("escapes workspace root"),
+        "and the refusal is named, with the reason it was refused: {transcript}"
     );
 }
 
