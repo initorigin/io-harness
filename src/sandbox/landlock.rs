@@ -287,18 +287,27 @@ pub(crate) fn plan(
     // `/private/var/folders`, and without somewhere to open a temporary file
     // most toolchains fail immediately.
     //
-    // **0.80.0 — both callers now resolve it as `super::linux::tmp_target`,
-    // which is the run's own directory, and both point the child's `TMPDIR` at
-    // the same path.** Until this release both passed `std::env::temp_dir()`, so
-    // this rung granted the whole system temporary directory — and
+    // Both callers still resolve it as `std::env::temp_dir()`, so on this rung
+    // that grant is the whole system temporary directory — and
     // `crate::sandbox::workdir` puts every run's ephemeral workspace inside it,
-    // so two concurrent runs could read and rewrite each other's workspace from
-    // inside their own sandboxes. 0.74.0 narrowed the two mount rungs and left
-    // this one, because narrowing it in halves is worse than not at all: the
-    // grant and the directory a toolchain reaches for have to move together, and
-    // the two Landlock spawn paths have to move together with them or one
-    // backend name covers two different confinements. All four moved in one
-    // change (audit residual 1, H10 and L11).
+    // so two concurrent runs can read and rewrite each other's workspace from
+    // inside their own sandboxes. 0.74.0 narrowed the two mount rungs to a
+    // directory the run owns and left this one.
+    //
+    // **0.80.0 narrowed it, found what it costs, and put it back.** The narrowing
+    // itself worked — one resolver for both spawn paths, the run's own directory,
+    // `TMPDIR` pointed at what was granted. What it broke is a shipped capability:
+    // a `git worktree` child's object store lives in the parent repository, which
+    // is *outside* its workdir, so a contained child wrote its file and could not
+    // commit it. `tests/worktree.rs` catches exactly that, and it is not a test
+    // artifact — it is what a user's run does.
+    //
+    // Closing this needs an affordance that does not exist yet: a way for a run
+    // to declare a writable root beyond the workdir and the toolchain caches, so
+    // the worktree feature can name the repository's common git directory and
+    // nothing else. That is 0.81.0's, and it is written down as such rather than
+    // left as a comment saying the grant is wide. See
+    // `US-IO-HARNESS-0.80.0-I04`.
     write_roots.push(tmp.to_path_buf());
 
     for root in write_roots {

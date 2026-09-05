@@ -64,10 +64,14 @@ run executes is bounded by `Act::Exec` on the command rather than by a read rule
 on what that command then opens. If a run must not be able to read something, it
 belongs outside the machine the run is on.
 
-What the temporary directory grants was narrowed in 0.80.0: a contained run gets
-its own directory rather than the system one, on every rung, with `TMPDIR`
-pointed at it. Before that, two concurrent runs could read and rewrite each
-other's workspace from inside their own sandboxes.
+The two mount rungs grant a temporary directory the run owns; **the Landlock rung
+still grants the system one**, and since `sandbox::workdir` puts every run's
+ephemeral workspace inside it, two concurrent runs on that rung can read and
+rewrite each other's workspace from inside their own sandboxes. 0.80.0
+implemented the narrowing and withdrew it: a `git worktree` child's object store
+lives in the parent repository, outside its workdir, so the narrowed grant let
+the child write its file and refused its commit. Closing it needs a run to be
+able to declare a writable root of its own.
 
 **Windows, stated plainly.** Since 0.24.0 a Windows run is contained by a real
 Job Object and reports `Backend::WindowsJobObject`. Memory, CPU and the active

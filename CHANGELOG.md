@@ -35,9 +35,16 @@ fixing the fifty-one it did close, two filed correctness defects, and the
 security advisory that release still owed. Every item is a correction of
 behaviour this crate has already published.
 
-**Four of these corrections narrow what a run may reach.** If you rely on any of
+**Three of these corrections narrow what a run may reach.** If you rely on any of
 them, widen deliberately — each is named under *Security* with the versions it
 was wrong in.
+
+**One residual is carried rather than closed.** The Landlock rung still grants
+the whole system temporary directory. Narrowing it was implemented and withdrawn
+in this release: a `git worktree` child's object store lives in the parent
+repository, outside its workdir, so a narrowed grant let the child write its file
+and refused its commit. Closing it needs a way for a run to declare a writable
+root of its own, which is 0.81.0's work.
 
 ### Added
 
@@ -107,12 +114,6 @@ was wrong in.
 
 ### Security
 
-- **The Landlock rung no longer grants the whole system temporary directory.**
-  Every run's ephemeral workspace lives inside it, so two concurrent runs could
-  read and rewrite each other's workspace from inside their own sandboxes. The
-  mount rungs were narrowed in 0.74.0 and this one was not, because the grant,
-  the child's `TMPDIR` and both Landlock spawn paths have to move together.
-  *A contained Linux run now sees fewer paths than it did.*
 - **An absolute read or write target is containment-checked.** It went straight
   to the policy with the containment check skipped, for one consumer's benefit —
   `read_skill`, whose bundle lives outside the root by design — and every

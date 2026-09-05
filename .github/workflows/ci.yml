@@ -440,7 +440,14 @@ jobs:
           # runs and which the base image does not carry. Installed inside the
           # container rather than baked into a Dockerfile so this leg stays one
           # file.
-          docker run --rm \
+          # `--privileged` because the namespace rung creates a user namespace
+          # and then a mount namespace inside it, and an unprivileged container
+          # can do neither — the first two rounds of this leg both reached the
+          # portable floor and the leg's own guard said so. It is a grant to a
+          # throwaway CI container, not to anything the crate does: the *subject*
+          # of this leg is still the seccomp profile above, which is what makes
+          # Landlock unavailable.
+          docker run --rm --privileged \
             --security-opt seccomp=seccomp.json \
             --security-opt apparmor=unconfined \
             -v "$PWD:$PWD" -w "$PWD" \
