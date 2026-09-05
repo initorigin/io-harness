@@ -1953,3 +1953,306 @@ fn the_contracts_resume_claim_matches_the_source() {
          mention(s) — the CONTRACT claims both loops restore the turn"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Omission, which every other checker in this file is blind to
+// ---------------------------------------------------------------------------
+//
+// Every checker above catches a claim that became false. None of them catches a
+// capability that was never claimed, and the asymmetry is not academic: four
+// capabilities shipped across 0.76.0 to 0.79.0 — structured output, `ToolMask`,
+// `Collapse` and `run_program` — were named nowhere in the README while every
+// sentence that *was* there stayed true, release after release, with the suite
+// green throughout.
+//
+// So the register is the source and the README is what it is checked against.
+// `docs/CAPABILITIES.md`'s "What shipped when" table already carries one row per
+// release, dated and linked, because `the_capabilities_release_table_covers_
+// every_released_version` above makes it. This check reads those rows and demands
+// that each release at or after the floor is either represented in the README by
+// a name a reader could search for, or listed as having introduced none. A
+// release cannot pass by silence, and the failure names the version.
+
+/// Where README coverage starts being enforced.
+///
+/// Not 0.1.0: the README states the present rather than the history, and the
+/// early releases' names are long since absorbed into prose that does not spell
+/// them. 0.73.0 is the oldest release whose capability the README can still be
+/// asked to name without rewriting the page as a changelog.
+const README_COVERAGE_FLOOR: (u64, u64, u64) = (0, 73, 0);
+
+/// The public name each release since the floor put in front of a reader, which
+/// the README must therefore name.
+///
+/// One entry is enough for a release; two are here where a release shipped two
+/// separately reachable things. The name is what a reader would search for — a
+/// type, a tool, a feature or an environment variable — not a paraphrase, so
+/// that the check is a string match and not a judgement.
+const README_MUST_NAME: &[(&str, &str)] = &[
+    ("0.73.0", "read_skill"),
+    ("0.74.0", "IO_HARNESS_ALLOW_LOCAL_ADDRESSES"),
+    ("0.75.0", "Routing"),
+    ("0.76.0", "ToolMask"),
+    ("0.76.0", "Collapse"),
+    ("0.77.0", "OutputSchema"),
+    ("0.78.0", "mcp-server"),
+    ("0.79.0", "run_program"),
+];
+
+/// Releases since the floor that introduced no public name of their own.
+///
+/// A release lands here by decision and with its reason written down. It is the
+/// only way past the check, which is the point: a documentation or remediation
+/// release says so out loud, and a capability release cannot reach the same
+/// exemption by nobody noticing.
+const README_NAMES_NOTHING: &[(&str, &str)] = &[(
+    "0.79.1",
+    "documentation only — it named what 0.76.0 through 0.79.0 had already shipped",
+)];
+
+/// How far behind the newest release the comparison tables' stated date may fall.
+///
+/// The tables say every cell was read from that project's own documentation on
+/// the date they print, which makes the date a claim about work done rather than
+/// a disclaimer. It sat at 2026-08-16 for nineteen releases. A bound rather than
+/// a per-release tax: re-reading eight projects' documentation is a release's
+/// worth of work, and demanding it every patch would buy churn.
+const COMPARISON_TABLE_MAX_AGE_DAYS: i64 = 180;
+
+/// `major.minor.patch`, or `None` for anything else.
+fn semver_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let mut next = || parts.next()?.parse::<u64>().ok();
+    let triple = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(triple)
+}
+
+/// Every release row of the register, as `(version, the date the row carries)`.
+///
+/// The date is the last `[YYYY-MM-DD]` on the row, which is the changelog link
+/// every row ends with; a date-shaped string inside the prose cannot displace it.
+fn register_rows(index: &str) -> Vec<(String, String)> {
+    let row = Regex::new(r"^\|\s*\[?(\d+\.\d+\.\d+)\]?.*\[(\d{4}-\d{2}-\d{2})\]").unwrap();
+    index
+        .lines()
+        .filter_map(|line| {
+            row.captures(line.trim())
+                .map(|c| (c[1].to_string(), c[2].to_string()))
+        })
+        .collect()
+}
+
+/// Does `text` name `needle` as a whole word?
+///
+/// `Origin` must not be satisfied by `InitOrigin`, and `Collapse` must not be
+/// satisfied by a longer identifier that happens to contain it.
+fn names_whole(text: &str, needle: &str) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(needle).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + needle.len()..].chars().next();
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
+    })
+}
+
+/// Is every release the register records since the floor findable in the README?
+fn readme_covers_the_register(index: &str, readme: &str) -> Result<(), String> {
+    let rows = register_rows(index);
+    if rows.is_empty() {
+        return Err("records no release rows at all, so this check is vacuous and the \
+                    parser is wrong"
+            .to_string());
+    }
+
+    let mut unclassified: Vec<String> = Vec::new();
+    let mut unnamed: Vec<String> = Vec::new();
+
+    for (version, _) in &rows {
+        let Some(triple) = semver_triple(version) else {
+            continue;
+        };
+        if triple < README_COVERAGE_FLOOR {
+            continue;
+        }
+
+        let required: Vec<&str> = README_MUST_NAME
+            .iter()
+            .filter(|(release, _)| release == version)
+            .map(|(_, name)| *name)
+            .collect();
+
+        if required.is_empty() {
+            if !README_NAMES_NOTHING
+                .iter()
+                .any(|(release, _)| release == version)
+            {
+                unclassified.push(version.clone());
+            }
+            continue;
+        }
+
+        for name in required {
+            if !names_whole(readme, name) {
+                unnamed.push(format!("{version} → {name}"));
+            }
+        }
+    }
+
+    if unclassified.is_empty() && unnamed.is_empty() {
+        return Ok(());
+    }
+
+    let mut report = String::new();
+    if !unnamed.is_empty() {
+        report.push_str(&format!("the README does not name {unnamed:?}. "));
+    }
+    if !unclassified.is_empty() {
+        report.push_str(&format!(
+            "{unclassified:?} shipped and are in neither README_MUST_NAME nor \
+             README_NAMES_NOTHING. "
+        ));
+    }
+    Err(report)
+}
+
+/// The date the comparison tables say their cells were read on.
+fn comparison_table_date(readme: &str) -> Result<String, String> {
+    let stated =
+        Regex::new(r"own current documentation or repository on \*\*(\d{4}-\d{2}-\d{2})\*\*")
+            .unwrap();
+    stated
+        .captures(readme)
+        .map(|c| c[1].to_string())
+        .ok_or_else(|| {
+            "states no date over its comparison tables. The tables' whole standing is that \
+             every cell was read on a stated day; without the date they are undated claims \
+             about other people's products"
+                .to_string()
+        })
+}
+
+/// Days from the civil epoch, so two `YYYY-MM-DD` strings can be subtracted.
+fn days_from_civil(date: &str) -> Option<i64> {
+    let mut parts = date.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let d: i64 = parts.next()?.parse().ok()?;
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// Have the comparison tables been re-read recently enough to still be a claim?
+fn comparison_table_is_current(readme: &str, index: &str) -> Result<(), String> {
+    let stated = comparison_table_date(readme)?;
+    let stated_day =
+        days_from_civil(&stated).ok_or_else(|| format!("states an unreadable date {stated:?}"))?;
+
+    let newest = register_rows(index)
+        .into_iter()
+        .filter_map(|(_, date)| days_from_civil(&date).map(|day| (day, date)))
+        .max()
+        .ok_or_else(|| {
+            "the register carries no dated release rows, so there is nothing to measure \
+             staleness against"
+                .to_string()
+        })?;
+
+    let age = newest.0 - stated_day;
+    if age <= COMPARISON_TABLE_MAX_AGE_DAYS {
+        Ok(())
+    } else {
+        Err(format!(
+            "says its comparison cells were read on {stated}, which is {age} days before the \
+             newest release the register records ({}). The bound is \
+             {COMPARISON_TABLE_MAX_AGE_DAYS} days: re-read the cells against each project's \
+             own current documentation and restate the date, or drop the tables. Restating \
+             the date over cells nobody opened is the one repair that is worse than the drift",
+            newest.1
+        ))
+    }
+}
+
+#[test]
+fn the_readme_names_every_capability_the_register_records() {
+    if let Err(e) = readme_covers_the_register(&read("docs/CAPABILITIES.md"), &read("README.md")) {
+        panic!(
+            "README.md {e}\n\n\
+             Every other checker in this file catches a sentence that became false. This one \
+             catches a capability that was never claimed, which is what nineteen releases of \
+             green suites did not: structured output, `ToolMask`, `Collapse` and `run_program` \
+             all shipped and none of them reached the page a reader actually opens.\n\n\
+             Name it in the section that already covers its area — not a new section — and \
+             link the guide that carries its depth. A release that genuinely introduced no \
+             public name goes in README_NAMES_NOTHING with its reason.\n"
+        );
+    }
+}
+
+#[test]
+fn the_comparison_tables_were_read_recently_enough() {
+    if let Err(e) = comparison_table_is_current(&read("README.md"), &read("docs/CAPABILITIES.md")) {
+        panic!(
+            "README.md {e}\n\n\
+             The tables state that every cell was read from that project's own documentation \
+             on the date they carry. That is a claim about work done, and it decays: between \
+             two readings one of the compared projects removed its sandbox outright.\n"
+        );
+    }
+}
+
+#[test]
+fn readme_coverage_checker_reports_a_capability_the_readme_dropped() {
+    let index = "| Version | What | When |\n| --- | --- | --- |\n\
+                 | 0.79.0 | CodeAct | [2026-09-04](../CHANGELOG.md#0790---2026-09-04) |\n";
+    let named = "The agent can call `run_program` with a Python program.\n";
+    assert_eq!(readme_covers_the_register(index, named), Ok(()));
+
+    let dropped = "The agent can write a program instead of a chain of calls.\n";
+    let err = readme_covers_the_register(index, dropped).expect_err("must be reported");
+    assert!(err.contains("0.79.0"), "must name the release: {err}");
+    assert!(err.contains("run_program"), "must name the name: {err}");
+}
+
+#[test]
+fn readme_coverage_checker_reports_a_release_nobody_classified() {
+    // The shape that lets omission back in: a release ships, the register gains
+    // its row, and no one decides whether the README owes it a name.
+    let index = "| 0.99.0 | Something | [2026-12-01](../CHANGELOG.md#0990---2026-12-01) |\n";
+    let err = readme_covers_the_register(index, "prose").expect_err("must be reported");
+    assert!(err.contains("0.99.0"), "must name the release: {err}");
+
+    // And a release below the floor is not the check's business.
+    let old = "| 0.72.0 | Something | [2026-08-30](../CHANGELOG.md#0720---2026-08-30) |\n";
+    assert_eq!(readme_covers_the_register(old, "prose"), Ok(()));
+}
+
+#[test]
+fn readme_coverage_checker_is_not_satisfied_by_a_longer_word() {
+    // `Origin` inside `InitOrigin` is the real instance: the README's logo alt
+    // text and its copyright line both carry it, and a substring match would
+    // have reported 0.77.0's provenance marking as named by the licence.
+    assert!(!names_whole("Copyright 2026 (InitOrigin)", "Origin"));
+    assert!(names_whole("`Origin` records where the bytes came from", "Origin"));
+    assert!(names_whole("behind `mcp-server`, this crate serves", "mcp-server"));
+}
+
+#[test]
+fn comparison_table_staleness_checker_reports_a_rewound_date() {
+    let index = "| 0.79.0 | CodeAct | [2026-09-04](../CHANGELOG.md#0790---2026-09-04) |\n";
+    let current = "Every cell was read from that project's\n\
+                   own current documentation or repository on **2026-09-05**, and a cell reads\n";
+    assert_eq!(comparison_table_is_current(current, index), Ok(()));
+
+    let stale = current.replace("2026-09-05", "2026-01-01");
+    let err = comparison_table_is_current(&stale, index).expect_err("must be reported");
+    assert!(err.contains("2026-01-01"), "must quote the stated date: {err}");
+    assert!(err.contains("246 days"), "must state the age: {err}");
+
+    // A README that lost the date entirely is a failure, not a pass.
+    assert!(comparison_table_is_current("no date here", index).is_err());
+}
