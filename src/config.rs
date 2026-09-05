@@ -1378,25 +1378,86 @@ impl Config {
 
     /// Does this configuration set anything at all?
     ///
+    /// Every section the file format carries is counted, `[[hook]]`, `[[lsp]]`,
+    /// `[[plugin]]`, `[browser]`, `[memory]`, `[routing]`, `[otel]` and
+    /// `[codeact]` included — until 0.80.0 those eight were missing and a file
+    /// that declared nothing else reported itself empty.
+    ///
     /// ```
     /// use io_harness::Config;
     ///
     /// assert!(Config::from_toml("").unwrap().is_empty());
     /// assert!(!Config::from_toml("[run]\nmax_steps = 3\n").unwrap().is_empty());
     /// ```
+    ///
+    /// The doctest above cannot catch a forgotten section and no doctest here
+    /// can: it names one section that is already counted, and half the sections
+    /// a file can carry are refused in the project scope and so cannot be
+    /// written through [`Config::from_toml`] at all. The guards are the exhaustive
+    /// destructuring below, which makes a new field a compile error, and the
+    /// table in `tests/config_sections.rs`, which reads the field list out of
+    /// this file and asserts one file per section.
     pub fn is_empty(&self) -> bool {
-        self.file.policy.is_none()
-            && self.file.sandbox.is_none()
-            && self.file.run.is_none()
-            && self.file.toolchain.is_empty()
-            && self.file.prices.is_none()
-            && self.file.mcp.is_empty()
-            && self.file.agent.is_empty()
-            && self.file.web.is_none()
-            && self.file.provider.is_empty()
-            && self.file.app.is_none()
-            && self.file.profile.is_empty()
-            && self.file.instructions.is_none()
+        // Destructured exhaustively rather than read field by field. `File`
+        // gains a section every few releases — eight since this method was
+        // written — and an accessor that names the sections it knows about
+        // answers "this file sets nothing" for the one it does not, which is a
+        // wrong answer about whether an operator configured anything at all.
+        // With no `..` in the pattern, the next section added to `File` is a
+        // compile error here rather than a silent omission.
+        //
+        // `browser` is the one field behind a `cfg`, so the pattern carries the
+        // same `cfg`: on a build without the feature there is no field to
+        // account for.
+        let File {
+            policy,
+            sandbox,
+            run,
+            memory,
+            routing,
+            otel,
+            codeact,
+            toolchain,
+            prices,
+            mcp,
+            lsp,
+            #[cfg(feature = "browser")]
+            browser,
+            agent,
+            web,
+            provider,
+            app,
+            profile,
+            instructions,
+            hook,
+            plugin,
+        } = &self.file;
+
+        #[cfg(feature = "browser")]
+        let browser_empty = browser.is_none();
+        #[cfg(not(feature = "browser"))]
+        let browser_empty = true;
+
+        policy.is_none()
+            && sandbox.is_none()
+            && run.is_none()
+            && memory.is_none()
+            && routing.is_none()
+            && otel.is_none()
+            && codeact.is_none()
+            && toolchain.is_empty()
+            && prices.is_none()
+            && mcp.is_empty()
+            && lsp.is_empty()
+            && browser_empty
+            && agent.is_empty()
+            && web.is_none()
+            && provider.is_empty()
+            && app.is_none()
+            && profile.is_empty()
+            && instructions.is_none()
+            && hook.is_empty()
+            && plugin.is_empty()
     }
 
     /// The provider this configuration says to run, or `None` where it declares no
