@@ -547,9 +547,24 @@ pub(crate) fn applied_only_by_sandbox_run(backend: Backend) -> bool {
 /// `io-harness-` is the prefix that identifies one. Thirty-one characters, well
 /// under the sixty-four a profile name may have.
 #[allow(dead_code)]
+/// **The creating process id is appended (0.80.0)**, and it is what makes an
+/// orphan reapable. `Drop` deletes a profile on a return, an error and a panic
+/// and cannot run on `SIGKILL` or `TerminateProcess`, so a hard-killed run left
+/// one behind for ever — inert for access, since the sixty-four random bits are
+/// still unguessable, but each one adds about seven ACEs to a workspace DACL
+/// that caps at sixty-four kilobytes. Sweeping by prefix alone was rejected in
+/// 0.74.0 and stays rejected: it would delete the profile a concurrently running
+/// agent is spawning into. With the owner in the name,
+/// `appcontainer::win::reap_orphans` can delete exactly the profiles whose
+/// creator is gone and leave every live run's alone.
+///
+/// The unpredictable half keeps all sixty-four of its bits; the process id is
+/// appended rather than mixed in, because a local process can read every running
+/// pid and mixing it in would have spent entropy on something already public.
 pub(crate) fn run_profile_name(allow_network: bool, unique: u64) -> String {
     let caps = if allow_network { "net" } else { "iso" };
-    format!("io-harness-{caps}-{unique:016x}")
+    let pid = std::process::id();
+    format!("io-harness-{caps}-{unique:016x}-{pid:08x}")
 }
 
 /// A value for [`run_profile_name`]'s `unique` that a local adversary cannot
@@ -2179,7 +2194,15 @@ mod tests {
         for net in [false, true] {
             let caps = if net { "net" } else { "iso" };
             let name = run_profile_name(net, 0x0123_4567_89ab_cdef);
-            assert_eq!(name, format!("io-harness-{caps}-0123456789abcdef"));
+            assert_eq!(
+                name,
+                format!(
+                    "io-harness-{caps}-0123456789abcdef-{:08x}",
+                    std::process::id()
+                ),
+                "the creating process is in the name since 0.80.0, which is what \
+                 lets an orphan be told from a live run's profile"
+            );
             // Sixty-four is the documented ceiling for a profile name, and the
             // prefix is what an operator cleaning up after a crashed run reads.
             assert!(
