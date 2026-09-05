@@ -253,7 +253,7 @@ fn bwrap_works() -> bool {
 /// because both need it to exist on the host already: `bwrap --bind` fails on a
 /// source that is not there, and the script's `rw` runs after every mount has
 /// been made read-only.
-fn tmp_target(workdir: &Path, mode: ExecMode) -> PathBuf {
+pub(crate) fn tmp_target(workdir: &Path, mode: ExecMode) -> PathBuf {
     if mode != ExecMode::ReadOnly {
         return workdir.to_path_buf();
     }
@@ -419,6 +419,8 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
     use std::os::fd::RawFd;
 
     let abi = super::landlock::abi()?;
+    // The system temporary directory, still — see `landlock::plan`, which
+    // carries what 0.80.0 tried here and why it came back out.
     let tmp = std::env::temp_dir();
     let plan = super::landlock::plan(
         abi,
@@ -1702,6 +1704,37 @@ mod tests {
             "under a mode that grants the workdir there is no second directory to \
              create or clean up — the shape `super::macos` has used since 0.6.0"
         );
+    }
+
+    /// The mount rungs' temporary directory is the run's own, on every mode —
+    /// which is what 0.74.0 gave them and what the Landlock rung still does not
+    /// have.
+    ///
+    /// 0.80.0 tried to give it the same answer and put it back: a `git worktree`
+    /// child's object store lives in the parent repository, outside its workdir,
+    /// so a narrowed grant let the child write its file and refused its commit.
+    /// The affordance that would close it — a run declaring a writable root of
+    /// its own — is 0.81.0's. `US-IO-HARNESS-0.80.0-I04`.
+    ///
+    /// This assertion is about `tmp_target`, so it holds for the rungs that ask
+    /// it, and it is what a future attempt at the Landlock rung has to satisfy.
+    #[test]
+    fn the_mount_rungs_temporary_directory_is_never_the_shared_one() {
+        let workdir = Path::new("/w");
+        for mode in ExecMode::ALL {
+            let target = tmp_target(workdir, mode);
+            assert_ne!(
+                target,
+                std::env::temp_dir(),
+                "{mode:?}: the shared directory is what a mount rung does not grant"
+            );
+            assert!(
+                target == workdir || target.starts_with(std::env::temp_dir()),
+                "{mode:?}: and what replaces it is the workdir, or a directory \
+                 named for this process inside the shared one: {}",
+                target.display()
+            );
+        }
     }
 
     #[test]

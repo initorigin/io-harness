@@ -555,14 +555,21 @@ async fn gone_within(pid: u32, tries: u32) -> bool {
 #[tokio::test]
 async fn killing_a_handle_kills_a_grandchild_whose_parent_already_exited() {
     let orphan = example_binary("orphan");
-    // Outside the workspace on purpose: the fixture writes this file itself,
-    // and putting it in the run's own directory would make the test also a test
-    // of what a payload may write where.
-    let scratch = tempfile::tempdir().unwrap();
-    let pidfile = scratch.path().join("leaf.pid");
+    // **Inside the workspace since 0.80.0.** It was a directory of its own,
+    // outside the run, so that this test would be about the kill and not about
+    // what a payload may write where — and that only worked because the Landlock
+    // rung granted writes over the whole system temporary directory, which is
+    // the residual 0.80.0 closed. A contained payload cannot write outside its
+    // own roots on Linux any more, so a scratch file outside them is a test of
+    // the boundary whether it means to be or not.
+    //
+    // The intent survives the move: the fixture writes this file itself, the
+    // path is somewhere the payload is unambiguously allowed to write, and what
+    // the assertions read is still only the pid and the process tree.
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("leaf.pid");
     let line = format!("{} {}", word(&orphan), word(&pidfile));
 
-    let dir = tempfile::tempdir().unwrap();
     let store = Store::memory().unwrap();
     // Start, then kill. The mock's pause between turns is far longer than the
     // fixture needs to build its chain, so the kill lands on a tree that has

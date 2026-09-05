@@ -2052,18 +2052,30 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 )?;
                 ledger.push(Observation::new(
                     step,
-                    ObsKind::Error,
+                    // 0.80.0 (issue #246) — `Message`, which is what makes this
+                    // `Piece::Prose`. It was `ObsKind::Error` with no target,
+                    // which `Piece::of` reads as `Piece::Result` — so a feedback
+                    // block carrying this step's number took ordinal N on a step
+                    // with N calls, `transcript`'s bounds check failed for that
+                    // step's whole run of results, and its fallback pushed every
+                    // one of them into flat prose. The step's
+                    // `Message::Assistant` and its native tool-call blocks were
+                    // never emitted, so on the Anthropic wire the step became
+                    // plain user text instead of an assistant turn with a
+                    // matching result batch — a different prompt from the one the
+                    // run intended, with nothing reporting it.
+                    //
+                    // The origin could not carry this, and the comment that used
+                    // to sit here said it could. `Dispatched::go` marks roughly a
+                    // hundred refusal sites `Origin::Prose` as well, and those
+                    // *do* answer a call, so deriving the piece from the origin
+                    // would orphan every one of them. The kind is what separates
+                    // narration from an answer, and every other piece of harness
+                    // narration in this loop is already `Message`.
+                    ObsKind::Message,
                     None,
-                    bound(&section, entry_cap, ObsKind::Error),
-                    // The gate's report, composed here — and this is the one site
-                    // in the flat loop where stating the origin CHANGES what the
-                    // transcript sends. `ObsKind::Error` used to derive to
-                    // `Piece::Result`, so a feedback block carrying this step's
-                    // number took a position in that step's positional ordinal
-                    // count for a call that does not exist, which pushed the
-                    // whole step past `turns`' bounds check and dropped it back
-                    // to prose. It is narration about the run, it says so now,
-                    // and the step it rides keeps its structure.
+                    bound(&section, entry_cap, ObsKind::Message),
+                    // The gate's report, composed here.
                     Origin::Prose,
                 ));
                 last_gate_feedback = Some(key);

@@ -64,7 +64,7 @@ const MAX_TOKENS: u64 = 8192;
 /// a deny-by-default network policy still reaches this model and the trace records
 /// why it was allowed.
 pub struct Anthropic {
-    client: reqwest::Client,
+    client: crate::net::PinnedClient,
     api_key: String,
     model: String,
     endpoint: String,
@@ -74,7 +74,7 @@ impl Anthropic {
     /// Build from an explicit key and model slug (e.g. `claude-sonnet-4`).
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: crate::net::http_client(),
+            client: crate::net::PinnedClient::new(ENDPOINT),
             api_key: api_key.into(),
             model: model.into(),
             endpoint: ENDPOINT.to_string(),
@@ -88,7 +88,7 @@ impl Anthropic {
     /// abandon a hung socket sooner than the default does. Rebuilds the client, so
     /// call it before handing the provider to a run.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.client = crate::net::http_client_with_timeout(timeout);
+        self.client.set_timeout(timeout);
         self
     }
 
@@ -97,11 +97,12 @@ impl Anthropic {
     /// socket. Test-only: the endpoint is not configurable in the public API.
     #[cfg(test)]
     pub(crate) fn at(endpoint: impl Into<String>, timeout: std::time::Duration) -> Self {
+        let endpoint = endpoint.into();
         Self {
-            client: crate::net::http_client_with_timeout(timeout),
+            client: crate::net::PinnedClient::with_timeout(endpoint.as_str(), timeout),
             api_key: "test-key".into(),
             model: "test-model".into(),
-            endpoint: endpoint.into(),
+            endpoint,
         }
     }
 
@@ -494,8 +495,13 @@ impl Anthropic {
         // therefore includes connection setup, which `CONTRACT.md` states rather
         // than quietly excluding to produce a flattering number.
         let sent = Instant::now();
+        // `ready` resolves and grades the endpoint on the first call and pins the
+        // client to what it graded, so the addresses the run authorised and the
+        // addresses this request reaches cannot be two different answers.
         let mut post = self
             .client
+            .ready()
+            .await?
             .post(&self.endpoint)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION);

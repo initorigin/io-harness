@@ -197,7 +197,7 @@ is worth depends on what dials afterwards:
 | Call site | What it does | What that leaves open |
 | --- | --- | --- |
 | the HTTP MCP transport, the egress proxy | resolve once, grade, dial exactly the graded addresses | nothing — check and dial are the same answer |
-| a provider endpoint | graded before the run's first step; the `Provider` owns its own client and resolves the name again to dial | a name that answers with a local address only the *second* time. Closing it means every provider taking a pinned client, which is an API change this release did not make |
+| a provider endpoint | resolve once, grade, dial exactly the graded addresses (0.80.0) | nothing for a name. Until 0.80.0 the `Provider` owned its own client and resolved the name a second time to dial, so a name that answered with a local address only on the second ask reached it. Each built-in provider now holds a client pinned to the addresses its endpoint graded at, built once and reused, so the check and the dial are one answer. A **named** local endpoint — `http://localhost:11434/v1` for a local model — is refused unless `IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1` is set, which is what a run already required and what direct use of a `Provider` did not |
 | `browser_navigate` | graded by name only | a *name* that resolves onto a local address. Chrome resolves each URL itself, and pinning a navigation to an address breaks SNI and certificate validation. `browser_navigate("http://169.254.169.254.nip.io/")` under a policy that allows every host reaches cloud metadata |
 
 The way to close the browser row is to route it through the run's egress proxy,

@@ -45,6 +45,34 @@ everywhere — so a task isolates the same way on mac, linux, and windows:
 | **Windows AppContainer** (0.59.0, opt-in) | the **access** boundary that job has no facility for: a low-box token that is default-deny on every securable object and reaches only the paths this run resolved, with no capability granting it a socket unless the policy permits egress. Selected by `SandboxConfig::with_access_confinement()`, and it refuses rather than degrading |
 | **Portable floor** | the guaranteed minimum on every OS: fresh subprocess, ephemeral workdir, resource caps, network env stripped. Deliberately the **weakest** backend — filesystem-scoped and resource-capped, *not* a full syscall jail |
 
+**Reads, stated plainly (0.80.0).** Every unix rung confines **writes** and does
+not confine **reads**. Landlock grants read and execute over the whole
+filesystem; the two mount rungs bind the whole tree read-only and then bind the
+writable roots back over it, which grants the same thing in a different
+vocabulary. So a contained command on macOS or Linux can read anything the
+embedding process can read — the operator's home directory, their shell history,
+their SSH keys — and cannot write outside the roots the run declared.
+
+That is a deliberate ceiling and not an oversight. A read set narrow enough to be
+worth having would have to name every path a process needs to start — the loader,
+the shared libraries, the interpreter, the certificate store, the toolchain's own
+installation — on every distribution this crate supports, and a list like that is
+wrong on the first host it has not seen and fails as an unreadable loader rather
+than as a refusal anyone can act on. **What bounds reads is the policy, not the
+sandbox**: `Act::Read` is checked for every path a tool opens, and a command a
+run executes is bounded by `Act::Exec` on the command rather than by a read rule
+on what that command then opens. If a run must not be able to read something, it
+belongs outside the machine the run is on.
+
+The two mount rungs grant a temporary directory the run owns; **the Landlock rung
+still grants the system one**, and since `sandbox::workdir` puts every run's
+ephemeral workspace inside it, two concurrent runs on that rung can read and
+rewrite each other's workspace from inside their own sandboxes. 0.80.0
+implemented the narrowing and withdrew it: a `git worktree` child's object store
+lives in the parent repository, outside its workdir, so the narrowed grant let
+the child write its file and refused its commit. Closing it needs a run to be
+able to declare a writable root of its own.
+
 **Windows, stated plainly.** Since 0.24.0 a Windows run is contained by a real
 Job Object and reports `Backend::WindowsJobObject`. Memory, CPU and the active
 process count are real bounds there, and closing the job handle kills the whole

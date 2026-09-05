@@ -1821,16 +1821,40 @@ impl ExecContainment {
         }
     }
 
-    /// The same containment with egress decided by the run's own policy.
+    /// The same containment with egress decided by the run's own policy **and**
+    /// by the operator's `[sandbox]` section, whichever grants.
     ///
     /// Egress is the one part that cannot be resolved once at run start: a plan
-    /// gate narrows the effective policy mid-run, so the answer is the policy's at
-    /// the moment of the call. The roots and the mode do not move, which is why
-    /// they are resolved once and this is not.
+    /// gate narrows the effective policy mid-run, so the policy's answer is the
+    /// one it gives at the moment of the call. The roots and the mode do not
+    /// move, which is why they are resolved once and this is not.
+    ///
+    /// **The two answers are combined rather than one replacing the other, and
+    /// until 0.80.0 the policy's replaced the operator's outright.** That made
+    /// `sandbox.allow_network = true` a key with no effect at any scope: every
+    /// spawn site calls this with `Policy::permits_any_egress`, so the value the
+    /// operator wrote was overwritten before the command was wrapped. The
+    /// io-cli field test of 2026-09-05 found it the way a user finds it — a dev
+    /// server that cannot bind a port, a package install that cannot resolve a
+    /// host, and a documented lever that changes nothing but a posture label.
+    ///
+    /// **Combining does not re-open the door 0.74.0 closed.** That release put
+    /// `sandbox.allow_network = true` on `PROJECT_WIDENING`, so a file inside
+    /// the workspace — an `io.toml` arriving with a `git clone`, or an
+    /// `io.local.toml` the run's own agent can write — cannot set it at all. It
+    /// is the user scope's to write, which is the scope whose whole purpose is
+    /// to say what this operator's runs may reach. What 0.74.0 found was the
+    /// reverse direction: a `[[policy.layers]]` allow rule in a cloned file
+    /// re-opened the sandbox through `permits_any_egress`, and that is closed by
+    /// [`refuse_granting_layers`](crate::Config), not by discarding `[sandbox]`.
+    ///
+    /// A run that owns an egress proxy is unaffected either way: the backends
+    /// deny everything and allow the proxy's own address back, so `proxy` beats
+    /// both answers.
     pub(crate) fn with_egress(&self, allow_network: bool) -> Self {
         Self {
             config: SandboxConfig {
-                allow_network,
+                allow_network: allow_network || self.config.allow_network,
                 ..self.config.clone()
             },
             roots: self.roots.clone(),
@@ -2059,6 +2083,8 @@ pub(crate) fn contain_command(
             return None;
         }
         let abi = landlock::abi()?;
+        // The system temporary directory, still — see `landlock::plan`, which
+        // carries what 0.80.0 tried here and why it came back out.
         let tmp = std::env::temp_dir();
         let plan = landlock::plan(
             abi,
@@ -3269,5 +3295,55 @@ mod tests {
         );
 
         BoundaryProbe::proven().lock().unwrap().remove(&key);
+    }
+
+    // -----------------------------------------------------------------------
+    // 0.80.0 F1 — the two answers about egress combine, and neither is lost
+    // -----------------------------------------------------------------------
+
+    /// The io-cli field test of 2026-09-05, reduced to the function that lost it.
+    ///
+    /// Every spawn site calls [`ExecContainment::with_egress`] with the policy's
+    /// answer, so before 0.80.0 an operator's `sandbox.allow_network = true` was
+    /// overwritten on the way to the backend and the key changed nothing at any
+    /// scope. This is the smallest thing that fails if that regresses; the
+    /// per-backend assertions in `macos.rs` and `linux.rs` check what the flag
+    /// then produces.
+    #[test]
+    fn an_operators_allow_network_survives_a_policy_that_denies_egress() {
+        let config = SandboxConfig {
+            allow_network: true,
+            ..SandboxConfig::new()
+        };
+        let contained = ExecContainment::resolve(&config, None);
+
+        assert!(
+            contained.with_egress(false).config.allow_network,
+            "the operator wrote `sandbox.allow_network = true`; a policy that \
+             denies egress narrows what the harness will dial, not what the \
+             operator's own sandbox section grants"
+        );
+    }
+
+    /// The other direction, which 0.74.0 depends on and which must not be
+    /// traded away for the one above.
+    ///
+    /// A policy granting egress still reaches the backend when the `[sandbox]`
+    /// section says nothing — that is how a `[[policy.layers]]` allow rule
+    /// re-opened the sandbox before `refuse_granting_layers` closed the door on
+    /// untrusted scopes. Combining keeps it; replacing kept it too, which is why
+    /// only the first test above would have caught the defect.
+    #[test]
+    fn a_policy_that_grants_egress_still_reaches_a_silent_sandbox_section() {
+        let contained = ExecContainment::resolve(&SandboxConfig::new(), None);
+
+        assert!(
+            contained.with_egress(true).config.allow_network,
+            "the policy permits egress and the sandbox section says nothing"
+        );
+        assert!(
+            !contained.with_egress(false).config.allow_network,
+            "and when neither says so, nothing grants it"
+        );
     }
 }

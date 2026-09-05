@@ -1222,8 +1222,18 @@ async fn the_floor_is_told_its_proxy_is_advisory() {
     );
 }
 
-/// The negative control: a run whose policy names no host is not proxied, and its
-/// wording is what it was before this release.
+/// The negative control: a run whose policy names no host is not proxied, and is
+/// told what its commands actually have.
+///
+/// **0.80.0 replaced the sentence this asserted.** It read "outbound network is
+/// permitted only where this run's policy permits it" for an unproxied contained
+/// run, and that was wrong in both directions: a contained command's network is
+/// all or nothing at the sandbox layer, so a widened run reaches every host and a
+/// denied one reaches none, and neither is bounded by the per-host rules the
+/// sentence pointed at. The io-cli field test of 2026-09-05 read the old wording
+/// with the sandbox open and declined a `curl` it could have run. This policy
+/// denies egress and this sandbox does not widen it, so the honest sentence is
+/// that these commands have no network at all.
 #[tokio::test]
 async fn a_run_that_names_no_host_is_not_told_about_a_proxy() {
     let dir = workspace();
@@ -1233,9 +1243,25 @@ async fn a_run_that_names_no_host_is_not_told_about_a_proxy() {
         !line.contains("proxy") && !line.contains("advisory"),
         "no proxy is started and none is described: {line}"
     );
+    // Which of the two honest sentences depends on the backend this host gave,
+    // and the test asserts the one that is true here rather than the one it
+    // would like. A Job Object and the portable floor confine no route out, so
+    // "no network at all" would be a claim no machine is enforcing — which is
+    // the 0.40.0 defect, in the direction that matters most.
+    let expected =
+        if line.contains("backend: windows-job-object") || line.contains("portable-floor") {
+            "not confined for the commands you run on this host"
+        } else {
+            "reach no network at all"
+        };
     assert!(
-        line.contains("only where this run's policy permits it"),
-        "0.47.0's wording survives for an unproxied run: {line}"
+        line.contains(expected),
+        "an unproxied run is told what its commands actually have; expected {expected:?} in: {line}"
+    );
+    assert!(
+        !line.contains("only where this run's policy permits it"),
+        "and never with the sentence that pointed at rules which do not bind a \
+         contained command: {line}"
     );
 }
 

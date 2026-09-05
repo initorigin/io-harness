@@ -100,10 +100,10 @@ pub(crate) mod win {
     };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-        InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
+        InitializeProcThreadAttributeList, OpenProcess, ResumeThread, TerminateProcess,
         UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
         CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
-        PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
         STARTUPINFOW,
     };
@@ -367,6 +367,12 @@ pub(crate) mod win {
                 caps.as_mut_ptr()
             };
 
+            // 0.80.0 — once per process, before the first profile is created.
+            // A hard-killed run cannot clean up after itself, so the next run on
+            // this machine does it, and it can tell an orphan from a live run's
+            // profile because the creator's pid is in the name.
+            reap_orphans();
+
             // SAFETY: `name` and `display` are live NUL-terminated UTF-16 buffers
             // owned by this frame and outliving the call. The capability array is
             // null with a count of zero, which is the documented way to ask for
@@ -431,6 +437,108 @@ pub(crate) mod win {
                 .map(|b| b.0.as_ptr().cast_mut().cast::<core::ffi::c_void>())
         }
     }
+
+    /// Delete the AppContainer profiles of runs that are gone (0.80.0).
+    ///
+    /// [`Drop`] covers a return, an error and a panic. It cannot cover `SIGKILL`
+    /// or `TerminateProcess`, so every hard-killed run left a profile behind for
+    /// ever. Each is inert for *access* — the SID carries sixty-four
+    /// unpredictable bits, so nothing can spawn into it — but each adds about
+    /// seven ACEs to a workspace DACL, and a DACL caps at sixty-four kilobytes.
+    /// The failure is eventual and loud rather than never.
+    ///
+    /// **Sweeping by prefix alone was rejected in 0.74.0 and stays rejected**:
+    /// it would delete the profile a concurrently running agent is spawning
+    /// into. What makes this safe is that
+    /// `super::super::windows::run_profile_name` now ends in the creating
+    /// process id, so a profile is deleted only when the process that made it is
+    /// gone — and a pid that has been *reused* by anything at all reads as alive
+    /// and is left alone, which is the conservative side of that ambiguity.
+    ///
+    /// Best effort throughout. Every failure is ignored: a profile that cannot be
+    /// read or cannot be deleted is a profile that stays, which is the state this
+    /// function exists to improve on rather than a state it must reach.
+    pub(crate) fn reap_orphans() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+                return;
+            };
+            let dir = std::path::Path::new(&local).join("Packages");
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                let Some(pid) = owning_pid(&name) else {
+                    continue;
+                };
+                if pid == std::process::id() || process_is_alive(pid) {
+                    continue;
+                }
+                let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+                // SAFETY: `wide` is a live NUL-terminated UTF-16 buffer owned by
+                // this frame. The call reads it and returns a status this
+                // deliberately ignores — a profile that will not delete is one
+                // that stays.
+                unsafe {
+                    DeleteAppContainerProfile(wide.as_ptr());
+                }
+            }
+        });
+    }
+
+    /// The process id `run_profile_name` appended, or `None` for any name this
+    /// crate did not write.
+    ///
+    /// Strict on every part rather than on the prefix alone. A directory called
+    /// `io-harness-anything` is not one of ours, and this function is the only
+    /// thing standing between [`reap_orphans`] and somebody else's data.
+    pub(crate) fn owning_pid(name: &str) -> Option<u32> {
+        let rest = name.strip_prefix("io-harness-")?;
+        let (caps, rest) = rest.split_once('-')?;
+        if caps != "net" && caps != "iso" {
+            return None;
+        }
+        let (unique, pid) = rest.split_once('-')?;
+        if unique.len() != 16 || !unique.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        if pid.len() != 8 || !pid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        u32::from_str_radix(pid, 16).ok()
+    }
+
+    /// Whether a process id belongs to something still running.
+    ///
+    /// Fails **towards alive**: a handle this process may not open, or an exit
+    /// code that cannot be read, both answer `true`, so the profile is kept. The
+    /// cost of a wrong `true` is one leftover directory; the cost of a wrong
+    /// `false` is deleting a running agent's container.
+    fn process_is_alive(pid: u32) -> bool {
+        // SAFETY: a pid and two flags; the call allocates nothing and either
+        // returns a handle this frame owns or null.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        // SAFETY: `handle` is live and owned here, and `code` is a live
+        // out-parameter.
+        let running = unsafe { GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE };
+        // SAFETY: `handle` came from `OpenProcess` and is closed exactly once.
+        unsafe {
+            CloseHandle(handle);
+        }
+        running
+    }
+
+    /// `STILL_ACTIVE`, which the SDK spells as `STATUS_PENDING` and which
+    /// `windows-sys` exposes under neither name in the features this crate takes.
+    const STILL_ACTIVE: u32 = 259;
 
     impl Drop for Profile {
         fn drop(&mut self) {
@@ -1445,7 +1553,7 @@ pub(crate) mod win {
 /// quietly recording the denial as evidence.
 #[cfg(all(test, windows))]
 mod tests {
-    use super::win::{grant, granted_mask, Access, Profile, Reach, Spawned};
+    use super::win::{grant, granted_mask, owning_pid, Access, Profile, Reach, Spawned};
     use std::io::Read;
     use std::os::windows::process::CommandExt;
 
@@ -1908,5 +2016,52 @@ mod tests {
             Some(7),
             "a payload that finishes inside the ceiling must report its own exit code, not a cap"
         );
+    }
+
+    /// 0.80.0 — what the reaper will and will not touch.
+    ///
+    /// `owning_pid` is the only thing between `reap_orphans` and somebody else's
+    /// data, so it is asserted on the names it must accept **and** on the ones it
+    /// must refuse. A prefix match alone would accept every entry below.
+    #[test]
+    fn only_a_name_this_crate_wrote_names_an_owner() {
+        // Spelled here rather than taken from `windows::run_profile_name`: this
+        // module is compiled against a stub by `scripts/cross-check.sh`, which
+        // has no `crate::sandbox`. `windows.rs`'s own test asserts that the
+        // function produces this shape, so the two meet in the middle.
+        let real = format!("io-harness-net-0123456789abcdef-{:08x}", std::process::id());
+        assert_eq!(
+            owning_pid(&real),
+            Some(std::process::id()),
+            "a name this crate just wrote must name the process that wrote it: {real}"
+        );
+        assert_eq!(
+            owning_pid("io-harness-iso-0123456789abcdef-0000002a"),
+            Some(42)
+        );
+
+        for foreign in [
+            // Another vendor's package, and the prefix is the only thing this
+            // sweep ever sees before deciding.
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe",
+            "io-harness",
+            // 0.73.0's two constant names, which carry no owner and must not be
+            // deleted out from under a run of that version.
+            "io-harness-sandbox",
+            "io-harness-sandbox-net",
+            // Shaped like ours and wrong in one part each.
+            "io-harness-xxx-0123456789abcdef-0000002a",
+            "io-harness-net-0123456789abcde-0000002a",
+            "io-harness-net-0123456789abcdefg-0000002a",
+            "io-harness-net-0123456789abcdef-002a",
+            "io-harness-net-0123456789abcdef-zzzzzzzz",
+            "io-harness-net-0123456789abcdef",
+        ] {
+            assert_eq!(
+                owning_pid(foreign),
+                None,
+                "{foreign} is not a name this crate wrote, so nothing may delete it"
+            );
+        }
     }
 }

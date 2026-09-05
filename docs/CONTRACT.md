@@ -275,6 +275,16 @@ network namespaces; the Windows default does neither. So "sandboxed" on Windows
 means resource-capped and does not by itself mean access-confined, and the two
 must not be read as the same claim.
 
+**Writes, and not reads, on every unix rung.** A contained command on macOS or
+Linux can read anything the embedding process can read; what it cannot do is
+write outside the roots the run declared. Landlock grants read and execute over
+the whole filesystem, and the two mount rungs bind the whole tree read-only —
+the same grant in a different vocabulary. So this is the model rather than one
+rung's gap, and narrowing a single rung would leave the confinement weaker on
+worse kernels than on better ones. What bounds reads is the policy: `Act::Read`
+is checked for every path a tool opens. `docs/guide/sandbox.md` states the
+ceiling and why a narrow read set is not shippable.
+
 **The access half is `AppContainer`, 0.26.0 built it, and since 0.59.0
 `SandboxConfig::with_access_confinement()` selects it.**
 `io_harness::sandbox::appcontainer` creates a container profile, derives
@@ -1663,9 +1673,19 @@ Both checker spawns now take the run's own containment and are asked of the
 policy first, which matters because a checker is a compiler and a compiler runs
 the workspace's own `build.rs`, its proc macros and any `rustc-wrapper` — code
 chosen by whoever wrote the files in the tree, which under this crate's threat
-model is not the operator. A language server and the browser child are still not
-wrapped by the backend `select` chose, so on those two paths the filesystem
-boundary is the policy's alone. What each passes through is stated where it is
+model is not the operator. A language server is still not wrapped by the
+backend `select` chose, so on that path the filesystem boundary is the policy's
+alone.
+
+**The browser child is wrapped since 0.80.0, on the runs that asked to be
+contained.** A run that owns an egress proxy is one whose policy names hosts and
+whose commands are contained, and that is the signal this layer has; the child
+goes through the same `contain_command` every other child goes through, with its
+own profile directory as the one writable root. An uncontained run's browser
+stays uncontained, by the caller's own choice, exactly as its `exec` is. **And it
+is wrapped only where the wrapping is real**: `contain_command` answers nothing
+off the Landlock rung, so macOS, the mount rungs and Windows are unchanged here
+and this paragraph claims nothing for them. What each passes through is stated where it is
 specified: starting a language server is an `Act::Exec` check, both the `check`
 tool and the post-edit reflex are `Act::Exec` checks on the program and on the
 whole argv, and every navigation the browser makes is an `Act::Net` check whose
