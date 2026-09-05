@@ -26,6 +26,135 @@ notes are produced from it.
 
 ### Security
 
+## [0.80.0] - 2026-09-05
+
+**Nothing new ships. Everything known to be wrong is fixed.** Two defects an
+io-cli field test found in its first hour of ordinary use, the seven security
+residuals 0.74.0 named and did not close, the seven more it recorded while
+fixing the fifty-one it did close, two filed correctness defects, and the
+security advisory that release still owed. Every item is a correction of
+behaviour this crate has already published.
+
+**Four of these corrections narrow what a run may reach.** If you rely on any of
+them, widen deliberately — each is named under *Security* with the versions it
+was wrong in.
+
+### Added
+
+- A CI leg that runs the Linux mount rungs. `MOUNT_SETUP` carries three shipped
+  fixes and **the shell had never executed on any machine**: the security suite
+  returns early unless the chain picks a mount rung, and neither Linux leg does.
+  The new leg makes Landlock unavailable *at the syscall* — a seccomp profile
+  answering `ENOSYS`, which is what a kernel built without it answers — so the
+  rung is not selected, it is made unavailable. An environment variable pinning
+  the rung would be a downgrade reachable by anything that can set one.
+- A draft security advisory for the four critical issues 0.74.0 closed, at
+  `docs/advisory-0.74.0-draft.md`, with each issue's mechanism, how it is
+  reached, and a workaround for an operator who cannot upgrade.
+
+### Changed
+
+- **`sandbox.allow_network` and `policy.defaults.net` now widen the sandbox, as
+  documented.** They did not. `ExecContainment::with_egress` replaced the
+  operator's `[sandbox]` answer with the policy's instead of combining them, and
+  every spawn site calls it — so the key was overwritten before a command was
+  wrapped and changed nothing at any scope. No dev server could bind a port and
+  no package install could resolve a host. The two answers combine now. This
+  does not re-open what 0.74.0 closed: the key is refused in any file inside the
+  workspace, so it is the user scope's to write.
+- **The prompt describes the containment each command actually gets.** It was
+  built from the raw `[sandbox]` section with the egress answer never applied,
+  and its network sentence said outbound was "permitted only where this run's
+  policy permits it" whether the sandbox granted the network or denied it
+  outright — wrong in both directions, because a contained command's network is
+  all or nothing at that layer. Three sentences now, one per state.
+- **A `reasoning` event is emitted before the tokens it produced.** It was
+  emitted after the completion resolved while tokens came from the streaming
+  loop, so a consumer drawing the stream in arrival order drew the thought below
+  the answer.
+- A **named** local provider endpoint — `http://localhost:11434/v1` for a local
+  model — is refused unless `IO_HARNESS_ALLOW_LOCAL_ADDRESSES=1` is set. A run
+  already required that; driving a `Provider` directly did not, and now the two
+  agree. An IP literal is unaffected.
+- Windows AppContainer profile names carry the creating process id. The
+  unpredictable half keeps all sixty-four of its bits.
+
+### Fixed
+
+- **A step carrying gate feedback kept its assistant turn.** Feedback was
+  classified as a tool result, so on a step with N calls it took ordinal N, the
+  transcript's pairing check failed for that step's whole run of results, and
+  every one of them was flattened into prose — the step's assistant turn and its
+  native tool-call blocks were never emitted, and on the Anthropic wire the step
+  became plain user text. Nothing reported it; a warning does now. (#246)
+- **A step carrying `propose_plan` beside a refused call no longer goes out
+  malformed.** The plan-revise arm answered that call without taking its
+  position, leaving a `tool_use` with no `tool_result`. (#246)
+- `Config::is_empty()` accounted for twelve of the twenty sections the file
+  format carries, so a configuration holding only `[[hook]]`, `[[lsp]]`,
+  `[[plugin]]`, `[browser]`, `[memory]`, `[routing]`, `[otel]` or `[codeact]`
+  reported empty — and an empty configuration is one that needs no review.
+- `read_file` and `read_typed` are capped like `read_bytes`. All three refuse a
+  file over the limit in the same words.
+- A write through a symbolic link inside the workspace root gets its
+  re-decision on FreeBSD, NetBSD and DragonFly, which report `EMLINK` where
+  Linux and macOS report `ELOOP`. The write already failed closed there; what
+  was lost was a documented capability.
+- `scripts/cross-check.sh` compiles again. It has not since 0.74.0, so the local
+  Linux gate has been silently unavailable for five releases — and a run that
+  skipped every target printed its skips and exited 0. Nothing checked is a
+  failure now. (#255)
+
+### Security
+
+- **The Landlock rung no longer grants the whole system temporary directory.**
+  Every run's ephemeral workspace lives inside it, so two concurrent runs could
+  read and rewrite each other's workspace from inside their own sandboxes. The
+  mount rungs were narrowed in 0.74.0 and this one was not, because the grant,
+  the child's `TMPDIR` and both Landlock spawn paths have to move together.
+  *A contained Linux run now sees fewer paths than it did.*
+- **An absolute read or write target is containment-checked.** It went straight
+  to the policy with the containment check skipped, for one consumer's benefit —
+  `read_skill`, whose bundle lives outside the root by design — and every
+  consumer of an absolute target inherited it. That consumer asks for its
+  allowance by name now. *An absolute target outside the root is now refused.*
+- **A provider endpoint is dialled at the address it was graded at.** The
+  endpoint was graded before the run's first step and then resolved again by the
+  provider's own client, so a name that answered with a local address only the
+  second time reached it.
+- **`Skills::discover` does not follow a symbolic link out of the root it was
+  given.** A link inside a legitimate skills directory yielded a `SKILL.md`
+  whose frontmatter reached the system prompt. *A skill symlinked in from
+  elsewhere no longer loads, and says so.*
+- **A permitted page's subresources are gated.** Request interception covered
+  documents only, so an uncontained run under a narrow `allow_net` still let an
+  `<img>` element carry bytes to a host the policy never allowed. One row per
+  document is unchanged: a permitted subresource is decided and not recorded, a
+  refused one is recorded like any other refusal.
+- **The browser child is contained** on runs that own an egress proxy, which is
+  the signal that the run asked for containment. It was spawned with nothing at
+  all while every other child of the same run was contained.
+- **An approver's rewritten target is refused rather than discarded.** Both a
+  provider authorization and a shell redirect threw the rewrite away and
+  performed the original, so an approver *narrowing* a host or a path was
+  overruled in silence. That is audit M4's decision for `Act::Exec` reaching the
+  two sites shaped like it.
+- **`write_leaf` no longer follows a directory swapped for a symbolic link.**
+  The parent chain was checked and then resolved again by the write, with
+  `O_NOFOLLOW` covering the final component only — so `root/a/b/x` with `a`
+  replaced by a link to `/etc` created `/etc/b` and wrote `/etc/b/x` past a gate
+  that had allowed a path inside the root. Every writing entry point routes
+  through it. Each component is now opened from the descriptor of the one above
+  it.
+- `send_message` and `read_messages` are refused during the plan phase by rule.
+  They were unreachable only because a refused `spawn_agent` leaves no siblings
+  to talk to — unreachable by accident rather than by rule.
+- A hard-killed run's Windows AppContainer profile is reaped by the next run.
+  `Drop` cannot run on `TerminateProcess`, and each leftover adds ACEs to a
+  workspace DACL that caps at sixty-four kilobytes. Only profiles whose creating
+  process is gone are deleted; a pid that has been reused reads as alive and is
+  left alone.
+
 ## [0.79.1] - 2026-09-05
 
 **The README names what the crate actually ships.** Four capabilities that
