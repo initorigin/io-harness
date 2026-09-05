@@ -360,6 +360,79 @@ jobs:
           --success-output immediate
           -E 'test(n5_)'
 
+  # 0.80.0, O1 — the leg where the mount rungs run.
+  #
+  # `MOUNT_SETUP` carries three shipped fixes — H8's, H10's and L11's — and until
+  # this release **the shell it is written in had never executed on any machine**.
+  # `tests/security_linux.rs` returns early unless the chain picks a mount rung,
+  # and neither Linux leg does: the `test` matrix permits unprivileged user
+  # namespaces and takes Landlock, and `contained-linux` pins Landlock by name.
+  # The unit tests assert the constructed argv and the mount plan, which catches a
+  # missing flag and cannot catch a script that does not run.
+  #
+  # **The kernel has to be the one that says no, and that is the whole design of
+  # this job.** An environment variable pinning the rung would be a downgrade
+  # reachable by anything that can set an environment variable, which is the
+  # threat model three of the findings in this release live in — so the rung is
+  # not selected, it is made unavailable. The container runs under a seccomp
+  # profile that answers `ENOSYS` for the three Landlock syscalls, which is
+  # exactly what `landlock::abi()` reads on a kernel built without it. Nothing in
+  # the crate is configured differently; the probe asks and the answer is no.
+  #
+  # bubblewrap is the next rung and is not installed on this image, so the chain
+  # reaches the namespace rung, and that is asserted rather than assumed:
+  # `IO_HARNESS_EXPECT_BACKEND` fails the run if the chain answers with anything
+  # else, so a day when the profile stops working is a red job rather than a
+  # green one that proved nothing.
+  mount-rungs:
+    name: contained (ubuntu, landlock unavailable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: mount-rungs
+      - name: report the host's Landlock state, before anything hides it
+        run: cat /sys/kernel/security/lsm || true
+      # Built on the host and run in the container, so the container needs no
+      # toolchain and no crate build of its own. The binary is glibc and the
+      # image is the same Ubuntu the runner is.
+      - name: build the Linux security tests
+        run: cargo test --test security_linux --no-run --message-format=json > build.json
+      - name: refuse Landlock at the syscall, then run the mount rungs
+        run: |
+          set -euo pipefail
+          bin=$(jq -r 'select(.reason=="compiler-artifact")
+                       | select(.target.name=="security_linux")
+                       | .executable | select(. != null)' build.json | tail -1)
+          test -n "$bin"
+          # `errnoRet: 38` is ENOSYS — what a kernel with no Landlock answers.
+          cat > seccomp.json <<'JSON'
+          {
+            "defaultAction": "SCMP_ACT_ALLOW",
+            "syscalls": [
+              {
+                "names": ["landlock_create_ruleset", "landlock_add_rule", "landlock_restrict_self"],
+                "action": "SCMP_ACT_ERRNO",
+                "errnoRet": 38
+              }
+            ]
+          }
+          JSON
+          # `apparmor=unconfined` because the namespace rung unshares a user and a
+          # mount namespace, which the runner's default profile refuses; the
+          # seccomp profile above is what this job is actually varying.
+          docker run --rm \
+            --security-opt seccomp=seccomp.json \
+            --security-opt apparmor=unconfined \
+            -v "$PWD:$PWD" -w "$PWD" \
+            -e IO_HARNESS_REQUIRE_MOUNT_RUNG=1 \
+            ubuntu:24.04 "$bin" --nocapture
+
   # 0.36.1 — the doctests, as a job of their own, per operating system.
   #
   # They were 172s of the Windows `cargo test` step's 295s and they are not test
