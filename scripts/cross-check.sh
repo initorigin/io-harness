@@ -115,6 +115,22 @@ TOML
 }
 
 fail=0
+# How many of the checks below actually ran. Every `skip` in this script is a
+# check that did not happen, and a run where nothing happened printed a page of
+# skips and exited 0 — which is how this script sat broken for five releases
+# (issue #255). Nothing checked is a failure, and it says so at the end.
+checked=0
+
+# Copy a module for the shim with its `#[cfg(test)]` block removed.
+#
+# The shim exists to type-check the PRODUCTION code against a target the
+# development host cannot build for. A test module reaches for the rest of the
+# crate — `crate::Backend`, `crate::sandbox::linux::rung` — which the shim does
+# not have and should not grow a second copy of, because a second copy is the
+# drift this script was written to catch.
+strip_tests() {
+    awk '/^#\[cfg\(test\)\]$/ { exit } { print }' "$1"
+}
 
 # --- Linux: landlock + seccomp ----------------------------------------------
 cat >"$WORK/linux_shim.rs" <<'RS'
@@ -137,15 +153,25 @@ fn consumer(fd: std::os::fd::RawFd, w: &std::path::Path) -> std::io::Result<()> 
     let p = landlock::plan(abi, ExecMode::WorkspaceWrite, true, w, &[], w, None);
     let r = landlock::Ruleset::build(&p)?;
     let _ = r.raw();
+    // Every item `sandbox/linux.rs` and `sandbox.rs` reach on the plan. Clippy
+    // runs with `-D warnings` here, so an item this consumer stops naming fails
+    // the run as dead code — which is the shape of "the shim drifted from the
+    // caller" and is exactly what should fail.
+    let _ = p.restricts_network();
     unsafe { landlock::restrict_self(fd)?; }
-    unsafe { seccomp::install()?; }
+    // `true` is the arm a run that denies egress takes, and the parameter this
+    // shim did not pass until 0.80.0 — `install` gained it in 0.74.0 and the
+    // script has not compiled since.
+    unsafe { seccomp::install(true)?; }
     Ok(())
 }
 fn main() {}
 RS
-sed 's|use super::ExecMode;|use crate::ExecMode;|; s|super::linux::LANDLOCK_NET_ABI|crate::linux::LANDLOCK_NET_ABI|g' \
-    "$ROOT/src/sandbox/landlock.rs" >"$WORK/landlock.rs"
-elide_tracing "$ROOT/src/sandbox/seccomp.rs" "$WORK/seccomp.rs"
+strip_tests "$ROOT/src/sandbox/landlock.rs" |
+    sed 's|use super::ExecMode;|use crate::ExecMode;|; s|super::linux::LANDLOCK_NET_ABI|crate::linux::LANDLOCK_NET_ABI|g' \
+        >"$WORK/landlock.rs"
+elide_tracing "$ROOT/src/sandbox/seccomp.rs" "$WORK/seccomp.rs.full"
+strip_tests "$WORK/seccomp.rs.full" >"$WORK/seccomp.rs"
 
 for target in "${LINUX_TARGETS[@]}"; do
     if ! have_target "$target"; then
@@ -159,9 +185,12 @@ for target in "${LINUX_TARGETS[@]}"; do
     fi
     deps="$(dirname "$rmeta")"
     note "rustc  $target"
-    rustc --edition 2021 --target "$target" --emit=metadata --crate-type bin --test -A warnings \
+    # No `--test`: `strip_tests` removed the module, because a test module
+    # reaches for the rest of the crate and the shim is a stub of one file.
+    rustc --edition 2021 --target "$target" --emit=metadata --crate-type bin -A warnings \
         --extern libc="$rmeta" -L "$deps" \
         -o "$WORK/out-$target.rmeta" "$WORK/linux_shim.rs" || fail=1
+    checked=$((checked + 1))
     note "clippy $target"
     clippy-driver --edition 2021 --target "$target" --emit=metadata --crate-type bin -D warnings \
         --extern libc="$rmeta" -L "$deps" \
@@ -182,6 +211,16 @@ pub mod shim {
     pub struct TempDir(std::path::PathBuf);
     impl TempDir { pub fn path(&self) -> &std::path::Path { &self.0 } }
     pub fn tempdir() -> std::io::Result<TempDir> { Ok(TempDir(std::path::PathBuf::new())) }
+    // The one item `appcontainer.rs` reaches back out of its own module for.
+    // Stubbed with the real signature rather than the real body: what this shim
+    // checks is that the call site still type-checks, and a second copy of the
+    // body would be the drift the script exists to catch (0.80.0, issue #255).
+    pub fn inheritable_handles<H: Copy>(capture: H, inherited: &[H]) -> Vec<H> {
+        let mut out = Vec::with_capacity(1 + inherited.len());
+        out.push(capture);
+        out.extend_from_slice(inherited);
+        out
+    }
 }
 #[path = "appcontainer.rs"] pub mod appcontainer;
 fn main() {}
@@ -190,6 +229,7 @@ RS
         # a `cfg(windows)` test is one of the three defects this script exists for.
         sed -e 's|crate::sandbox::windows::Grant|crate::shim::Grant|g' \
             -e 's|crate::sandbox::windows::Reach|crate::shim::Reach|g' \
+            -e 's|crate::sandbox::windows::inheritable_handles|crate::shim::inheritable_handles|g' \
             -e 's|tempfile::tempdir()|crate::shim::tempdir()|g' \
             "$ROOT/src/sandbox/appcontainer.rs" >"$WORK/ac_raw.rs"
         elide_tracing "$WORK/ac_raw.rs" "$WORK/appcontainer.rs"
@@ -224,4 +264,13 @@ if [ "$fail" -ne 0 ]; then
     note "cross-check FAILED — fix these before pushing, they are matrix rounds"
     exit 1
 fi
-note "cross-check clean"
+# 0.80.0, issue #255 — a run that checked nothing is not a clean run. Every
+# `skip` above is a check that did not happen, and this script printed them and
+# exited 0 while it had not compiled at all since 0.74.0. A silent gate is worse
+# than an absent one, because an absent one is not in anybody's habits.
+if [ "$checked" -eq 0 ]; then
+    note "cross-check checked NOTHING — every target was skipped, so this run proves nothing"
+    note "  rustup target add ${LINUX_TARGETS[*]}"
+    exit 1
+fi
+note "cross-check clean ($checked linux target(s) compiled)"
