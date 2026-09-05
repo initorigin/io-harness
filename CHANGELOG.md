@@ -26,6 +26,52 @@ notes are produced from it.
 
 ### Security
 
+## [0.79.1] - 2026-09-05
+
+**The README names what the crate actually ships.** Four capabilities that
+shipped between 0.76.0 and 0.79.0 were named nowhere on the landing page a reader
+opens: structured output and `OutputSchema`, `run_program`, `ToolMask` and
+`Collapse`. Every drift checker in this repository catches a documented sentence
+that became false, and none of them catches a capability that was never
+documented — so this release closes that asymmetry with a gate as well as with
+prose, and re-reads the comparison tables, whose stated date had not moved in
+nineteen releases.
+
+No behaviour changed. The only lines this release adds under `src/` are doc
+comments, and `docs/public-api.txt` is unchanged.
+
+### Added
+
+- A drift gate over omission: every release row in `docs/CAPABILITIES.md`'s
+  register at or after 0.73.0 must either be represented in the README by a name a
+  reader can search for, or be listed as having introduced none, with its reason.
+  A release can no longer pass by silence, and the failure names the version.
+- A staleness bound on the README's comparison tables — 180 days behind the newest
+  release the register records — because the date those tables carry is a claim
+  about work done rather than a disclaimer.
+
+### Changed
+
+- The README names `OutputSchema` and the `output_schema` key, `run_program`,
+  `ToolMask`, `Collapse` and `read_skill`, each in the section that already covers
+  its area and each linked to the guide carrying its depth.
+- Both comparison tables were re-read against each project's own current
+  documentation on 2026-09-05 and the stated date restated. Five cells moved:
+  Claude Code documents a denial record (`/permissions` → *Recently denied*, and a
+  `PermissionDenied` hook) and a headless spend cap (`--max-budget-usd`, which a
+  subagent's spend counts against); Codex CLI's `approval_policy` gained a
+  `granular` table and `sqlite_home` names a database for resumable runtime state;
+  Goose removed its macOS seatbelt sandbox outright; and rig, swiftide and
+  langchain-rust all document per-call token accounting the table reported as
+  absent. Three links that had died or moved were corrected.
+- The paragraph beneath the tables no longer claims that nothing else documents a
+  tree-wide spend ceiling; it says what is still unmatched instead.
+- `docs/CONTRACT.md` states what an output schema guarantees and what it cannot —
+  the closed keyword subset checked at declaration, `response_format` with
+  `strict: false` on the OpenAI-shaped wire against nothing at all on the Anthropic
+  Messages API, the local check that decides either way, and the bounded re-prompt
+  that ends in `RunOutcome::SchemaUnsatisfied`.
+
 ## [0.79.0] - 2026-09-04
 
 **A sequence of tool calls collapses into one contained program.** A step that
