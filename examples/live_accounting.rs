@@ -150,6 +150,19 @@ async fn main() -> io_harness::Result<()> {
             "\nby model: {} — {} call(s), {} tokens, {} micro-units, {} unpriced",
             row.key, row.calls, row.usage.total_tokens, row.cost_micros, row.unpriced_calls
         );
+        // 0.83.0 — `Spend::cache_hit_rate` has existed since 0.75.0 and no page
+        // has ever printed a number from it, because the only way to get one is a
+        // multi-turn run against a vendor that caches. This is that run, and the
+        // number it prints is what `docs/MEASUREMENTS.md` records.
+        //
+        // `None` is a real answer and not a gap: it means the vendor reported no
+        // cached tokens at all, which on a single short turn is the expected
+        // shape — the prefix is cached on the way out and read on the way back in
+        // on the *next* turn.
+        println!(
+            "           cache read {} / prompt {} tokens, hit rate {:?}",
+            row.usage.cache_read_tokens, row.usage.prompt_tokens, row.cache_hit_rate()
+        );
     }
     Ok(())
 }
