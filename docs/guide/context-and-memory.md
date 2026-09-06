@@ -58,7 +58,9 @@ sources answer for it, in this order:
    `ContextBudget::for_window(window, max_output)` derives the ceiling from them,
    reserving the model's answer and about 8,192 tokens of request floor out of the
    window, floored at 2,000.
-3. **The constant**, `FALLBACK_MAX_TOKENS`, as the fallback.
+3. **The assumption** — `Provider::assumed_window`, sized through the same
+   `ContextBudget::for_window`, so a guessed window reserves the answer and the
+   request floor exactly as a read one does.
 
 Which of the three answered is on the event stream: `EventKind::ContextCeiling`
 carries the ceiling and a `source` of `"contract"`, `"model"` or `"fallback"`.
@@ -70,9 +72,54 @@ carried, so every consumer that wrote no `[run.context]` assembled under 24,000
 tokens whatever the model held — on a 128,000-token model that threw most of the
 window away and bought re-reads of observations that would have fit.
 
-`Provider::context_window` is synchronous and must never dial. `Compatible`
-answers from a catalogue it has already fetched and `None` until then, so the same
-run is sized differently depending on whether the embedder asked for prices.
+### The providers answer for themselves (0.82.0)
+
+0.81.0 built the whole of the path above and shipped it inert: of the four
+providers this crate ships, only `Compatible` implemented `context_window`, and
+only from a catalogue the embedder had to know to fetch first. Every run on
+`OpenRouter`, `Anthropic` and `OpenAi` took the fallback.
+
+`Provider::warm_sizing` is the async half the two synchronous methods were waiting
+on. A run calls it once, before its first step, and only when a warm could change
+something: a contract that stated its own budget skips it, and a provider that
+already answers `context_window` skips it. Its default makes no request at all, so
+an out-of-tree provider and every test mock dial nothing. A failure is swallowed —
+an unreachable catalogue is a guessed ceiling, not a dead run.
+
+| Provider | Where the window comes from | Opt-in |
+|---|---|---|
+| `OpenRouter` | its own `/models`, the same document as `DEFAULT_REFERENCE_URL`, on the host it already dials | no |
+| `Anthropic` | `with_reference_catalogue(Reference)` | yes |
+| `OpenAi` | `with_reference_catalogue(Reference)` | yes |
+| `Compatible` | the vendor catalogue it already fetches for prices | no |
+
+**Anthropic and OpenAI publish identifiers and no context window**, so the only
+way to learn one is a third-party catalogue — a host neither provider would
+otherwise reach. That is why it is opt-in and off by default: `Provider::endpoints`
+is what the run authorises against the policy's network rules before its first
+step, and adding a reference host unconditionally would end every run under a
+tight egress policy. When one is set, its host joins `endpoints()` and is
+authorised with the rest, so **a policy that denies it refuses the run rather than
+silently skipping the lookup**. The warm happens after that authorisation, never
+before it.
+
+When nothing can size the model, the assumption depends on where it is served
+from. `FALLBACK_WINDOW` is 128,000 — the floor of the 2026 hosted field, and
+therefore the safe reading of an unindexed slug, because overshooting is already
+recoverable through `ProviderErrorKind::ContextOverflow`. `FALLBACK_WINDOW_LOCAL`
+is 24,000, which `Compatible` returns for a loopback base: a local runtime's
+default is an order of magnitude smaller — Ollama's is 4,096 — and there
+overshooting refuses the turn rather than trimming it.
+
+The escape hatch is unchanged. `[run.context] max_tokens` and
+`TaskContract::with_context_budget` still win over everything, for an air-gapped
+box or a proxy that reports a window it does not honour. Note the sharp edge
+`ContextBudget` documents: a budget byte-equal to the default is indistinguishable
+from one nobody wrote, so a caller who means exactly 24,000 whatever the model
+holds should say so with a `share` of their own.
+
+`Provider::context_window` is still synchronous and must still never dial. That
+rule did not move; `warm_sizing` exists so that it did not have to.
 
 ## Durable memory
 

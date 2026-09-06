@@ -4657,3 +4657,76 @@ same work, and the size of it is a measurement rather than a contract: this
 repository measures the comparison itself and records what it finds in
 [MEASUREMENTS.md](MEASUREMENTS.md), with the machine named. A figure measured on
 another harness is not a number this crate reports as its own.
+
+## Where a run's ceiling comes from, and what it assumes when nothing knows (0.82.0)
+
+**Three rungs, in this order, and the run says which one answered.**
+
+1. **`contract`** — the caller wrote a budget, through `[run.context] max_tokens`
+   or `TaskContract::with_context_budget`. It wins over everything. It is not
+   deprecated, not narrowed, and not replaced by anything below; what changed in
+   0.82.0 is only that it stopped being the sole way to get a ceiling that fits
+   the model.
+2. **`model`** — `Provider::context_window` answered. The ceiling is
+   `ContextBudget::for_window(window, max_output)`, which reserves the model's own
+   answer limit and the request floor out of the window.
+3. **`fallback`** — nothing knew. `Provider::assumed_window` is sized through the
+   same `for_window`, so an assumed window reserves exactly what a read one does.
+
+`EventKind::ContextCeiling` carries the ceiling and the source word, on step 0, so
+an operator reads which rung answered rather than inferring it. **`"fallback"` no
+longer means 24,000.** It means the number was assumed rather than read.
+
+**The two constants, and why those values.** `context::FALLBACK_WINDOW` is
+128,000: the floor of the hosted field this release was cut against, which makes
+it the largest number that is still a *safe* reading of a slug nothing has
+indexed. Assuming high is affordable because overshoot is recoverable —
+`ProviderErrorKind::ContextOverflow` folds the history and retries, shipped in
+0.43.0 and enabled by `Compaction::default` — while undershooting silently
+discards most of a window and says nothing. `context::FALLBACK_WINDOW_LOCAL` is
+24,000, returned by `Compatible` for a loopback base, because a local runtime's
+default context is an order of magnitude smaller — Ollama's is 4,096, and its own
+documentation gives three different answers for that default — and there an
+overshoot refuses the turn instead of trimming it, on every step, until the
+operator finds the knob.
+
+**The one configuration this is a regression for**, stated rather than buried: a
+run that has deliberately disabled compaction and is pointed at a hosted model
+smaller than 128,000 that no catalogue carries now gets a refused turn where it
+used to get a trimmed one. `[run.context] max_tokens` is the answer, and it is why
+the `contract` rung is untouched.
+
+**The reference catalogue is opt-in for `Anthropic` and `OpenAi`, and opt-in means
+off reaches nothing.** Neither vendor publishes a context window, so the only way
+to learn one is a third-party catalogue — a host neither provider would otherwise
+dial. `with_reference_catalogue(Reference)` is what asks for it. When it is set,
+the reference host joins `Provider::endpoints`, which is the list the run
+authorises against the policy's network rules before its first step, so **a policy
+that denies that host refuses the run — it does not skip the lookup and continue.**
+That is the whole safety argument for the shape, and the warm is performed after
+the authorisation rather than before it, so a denied host is never dialled.
+`OpenRouter` needs no opt-in because its catalogue is `/models` on the host it
+already dials for completions.
+
+**What a window is trusted to be.** Whatever the catalogue said. An
+OpenAI-shaped gateway can report any `context_length` it likes and this crate will
+believe it, exactly as it believes a reported price. The recovery is the same
+overflow path, and `[run.context]` is the escape hatch that exists for it.
+
+**What `warm_sizing` promises an out-of-tree implementer.** It is called at most
+once per run, before the first step, and only when the answer could matter — a
+declared contract budget or an already-known window skips it. Its default makes no
+request, so implementing nothing costs nothing. An implementation **must not reach
+a host `endpoints()` does not declare**; that list is the egress boundary, and a
+lookup outside it walks a connection past a deny-by-default policy. A failure is
+swallowed by the caller and reported as `"fallback"`, so a warm may fail but must
+not panic.
+
+**The public surface this added.** Six names, and the snapshot in
+[public-api.txt](public-api.txt) shows none of them — it enumerates the crate
+root's re-exports, so it descends into neither a trait nor `pub mod context`:
+`Provider::warm_sizing`, `Provider::assumed_window`, `context::FALLBACK_WINDOW`,
+`context::FALLBACK_WINDOW_LOCAL`, `Anthropic::with_reference_catalogue` and
+`OpenAi::with_reference_catalogue`. Nothing was removed, renamed or deprecated;
+`FALLBACK_MAX_TOKENS` keeps its value and its meaning as `ContextBudget::default`'s
+ceiling.

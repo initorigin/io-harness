@@ -26,6 +26,92 @@ notes are produced from it.
 
 ### Security
 
+## [0.82.0] - 2026-09-06
+
+**A run assembles under the window of the model it is actually asking, on every
+provider this crate ships.** 0.81.0 built the whole of that path and shipped it
+inert: `resolve_budget`, `ContextBudget::for_window` and
+`EventKind::ContextCeiling` were all there and all correct, and nothing answered
+`Provider::context_window`. Of the four providers, only `Compatible` implemented
+it, and only from a catalogue the embedder had to know to fetch by calling
+`models()` first — a requirement discoverable by reading the method body. So every
+run on `OpenRouter`, `Anthropic` and `OpenAi` took the fallback rung, and the
+release's headline behaviour was unreachable from the common case.
+
+### Added
+
+- **`Provider::warm_sizing`**, an async method with a do-nothing default, called
+  once before a run's first step. It is the async half `context_window` and
+  `max_output_tokens` were always waiting on; those two stay synchronous and still
+  never dial. It runs only when the answer could matter — a contract that stated
+  its own budget skips it, and a provider that already knows its window skips it —
+  and its default makes no request at all, so every existing implementation and
+  every test mock reaches nothing without opting out of anything. A failure is
+  swallowed: an unreachable catalogue is a guessed ceiling, not a dead run.
+- **`Provider::assumed_window`**, synchronous, defaulting to `FALLBACK_WINDOW`.
+  Read only on the `fallback` rung, because the honest assumption depends on
+  something only the provider knows — whether the model is served from a datacentre
+  or from this machine.
+- **`OpenRouter` reads its own catalogue.** `models`, `warm_sizing`,
+  `context_window` and `max_output_tokens` come from its `/models` endpoint, which
+  is the same document as `catalog::DEFAULT_REFERENCE_URL` and sits on the host it
+  already dials for completions. No opt-in, because no new host is reached; the
+  catalogue URL is derived from the completions endpoint so the two cannot diverge.
+- **`Anthropic::with_reference_catalogue` and `OpenAi::with_reference_catalogue`.**
+  Neither vendor publishes a context window, so the only way to learn one is a
+  third-party catalogue — a host neither provider would otherwise reach. It is
+  therefore **off by default, and off dials nothing**. When set, the reference host
+  joins `Provider::endpoints`, which the run authorises against the policy's network
+  rules before its first step, so a policy denying it refuses the run rather than
+  silently skipping the lookup.
+- **`io_harness::context::FALLBACK_WINDOW` (128,000) and `FALLBACK_WINDOW_LOCAL`
+  (24,000)**, both documented with the evidence for their value. 128,000 is the
+  floor of the hosted field this release was cut against, which makes it the
+  largest number that is still a safe reading of a slug nothing has indexed;
+  24,000 is what `Compatible` assumes for a loopback base, because a local
+  runtime's default is an order of magnitude smaller — Ollama's is 4,096.
+
+### Changed
+
+- **A run that used to trim at 24,000 tokens now sends what the model can hold.
+  That is this release's purpose and it is also a spend change.** Prompts are
+  larger, so a step costs more, against fewer re-reads and less history thrown
+  away. On a 128,000-token model the ceiling moves from 24,000 to 111,616. Nothing
+  needs configuring for this and it applies to runs that never wrote
+  `[run.context]`, which is most of them. An operator who wants the old ceiling
+  writes `[run.context] max_tokens = 24000` — with a `share` of their own, because
+  a budget byte-equal to the default is indistinguishable from an absent one.
+- **The `fallback` rung is no longer one flat number.** It was
+  `FALLBACK_MAX_TOKENS` for every model, remote or local, which was defensible
+  while it was the only answer anything gave. It is now `assumed_window` sized
+  through `ContextBudget::for_window`, so an assumed window reserves the answer and
+  the request floor exactly as a read one does. `source: "fallback"` on
+  `EventKind::ContextCeiling` still means "nothing knew the window"; it no longer
+  means 24,000.
+- **`FALLBACK_MAX_TOKENS` keeps its value and its meaning** as
+  `ContextBudget::default`'s ceiling, which is what makes "the caller stated a
+  budget" decidable. It is simply no longer what the fallback rung returns.
+- **The overshoot risk, stated rather than implied.** A hosted model smaller than
+  128,000 that no catalogue carries is now assumed larger than it is. That is
+  already recoverable — `ProviderErrorKind::ContextOverflow` folds the history and
+  retries, shipped in 0.43.0 and enabled by `Compaction::default` — but a run that
+  has deliberately disabled compaction gets a failed turn where it used to get a
+  trimmed one. `[run.context]` is the escape hatch, and it is why the `contract`
+  rung is untouched.
+
+### Fixed
+
+- **The provider's hosts are authorised before its sizing is warmed.**
+  `size_context` ran ahead of `authorize_provider`, so a catalogue lookup would
+  have dialled before the deny-by-default egress boundary was consulted — which
+  would have made a declared reference host read as governed while being reached
+  ungoverned. The sizing now sits below the authorisation at every entry point that
+  authorises. Found by the acceptance test written to assert the refusal, not after
+  it shipped.
+- **initorigin/io-harness#266** — `Provider::context_window` had no implementation
+  on any of the three vendor providers, so io-cli 0.38.2 read `source: "fallback"`
+  on every configuration it could build.
+
 ## [0.81.0] - 2026-09-06
 
 **The harness measures itself, and then spends the measurement.** Context Collapse,

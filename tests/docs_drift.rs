@@ -2004,6 +2004,12 @@ const README_MUST_NAME: &[(&str, &str)] = &[
     ("0.81.0", "eval"),
     ("0.81.0", "Ladder"),
     ("0.81.0", "writable_roots"),
+    // 0.82.0. One name, and it is the opt-in rather than either constant: an
+    // operator arrives at this release either because their runs got bigger on
+    // their own — which needs no name, and is in the changelog as a behaviour
+    // change — or because they want a window read for a vendor that publishes
+    // none, which is a thing they have to call.
+    ("0.82.0", "with_reference_catalogue"),
 ];
 
 /// Releases since the floor that introduced no public name of their own.
