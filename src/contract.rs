@@ -444,6 +444,28 @@ pub struct TaskContract {
     ///
     /// Set it with [`TaskContract::with_collapse`].
     pub collapse: crate::context::Collapse,
+    /// Directories beyond the workspace this run's commands may write to (0.81.0).
+    ///
+    /// A contained run may write inside its workspace and inside the toolchain
+    /// caches the host was found to have, and nowhere else. That is right for most
+    /// runs and wrong for the ones that are not self-contained: a `git worktree`
+    /// child's object store is in the *parent* repository, outside the child's
+    /// workdir, so a run doing work in a worktree writes outside its own root by
+    /// construction.
+    ///
+    /// Declaring the root here is what makes that legal without widening the
+    /// boundary for everything else — and it is what lets the Linux backend stop
+    /// granting the whole system temporary directory to every run, which it did
+    /// through 0.80.0 because there was no way to say what a run actually needed.
+    ///
+    /// Each path must be absolute and must exist when the run starts; one that is
+    /// neither is dropped rather than granted, because a bind of a path that is
+    /// not there fails the Linux mount setup and degrades the whole backend.
+    /// Nothing is granted at all under
+    /// [`ExecMode::ReadOnly`](crate::ExecMode::ReadOnly).
+    ///
+    /// Set it with [`TaskContract::with_writable_roots`].
+    pub writable_roots: Vec<PathBuf>,
     /// The compaction rungs between Collapse and a fold (0.81.0).
     ///
     /// Every rung off by default, which assembles exactly what 0.80.0 assembled.
@@ -786,6 +808,7 @@ impl TaskContract {
             tool_mask: crate::ToolMask::none(),
             collapse: crate::context::Collapse::default(),
             ladder: crate::context::Ladder::default(),
+            writable_roots: Vec::new(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -872,6 +895,7 @@ impl TaskContract {
             tool_mask: crate::ToolMask::none(),
             collapse: crate::context::Collapse::default(),
             ladder: crate::context::Ladder::default(),
+            writable_roots: Vec::new(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -1967,6 +1991,34 @@ impl TaskContract {
     #[must_use]
     pub fn with_ladder(mut self, ladder: crate::context::Ladder) -> Self {
         self.ladder = ladder;
+        self
+    }
+
+    /// Declare directories beyond the workspace this run's commands may write to
+    /// (0.81.0).
+    ///
+    /// ```
+    /// use io_harness::TaskContract;
+    ///
+    /// // A run whose children work in worktrees writes to the parent repository's
+    /// // object store, which is outside every child's own workdir.
+    /// let contract = TaskContract::workspace("fan out", "/repo/.worktrees/scout")
+    ///     .with_writable_roots(["/repo/.git"]);
+    /// assert_eq!(contract.writable_roots.len(), 1);
+    ///
+    /// // Declaring nothing is the default and grants nothing beyond the
+    /// // workspace and the toolchain caches, which is 0.80.0's behaviour.
+    /// assert!(TaskContract::workspace("plain", "/repo")
+    ///     .writable_roots
+    ///     .is_empty());
+    /// ```
+    #[must_use]
+    pub fn with_writable_roots<I, P>(mut self, roots: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.writable_roots = roots.into_iter().map(Into::into).collect();
         self
     }
 

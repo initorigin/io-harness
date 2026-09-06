@@ -899,6 +899,11 @@ struct RunSection {
     compaction: Option<Compaction>,
     collapse: Option<Collapse>,
     ladder: Option<Ladder>,
+    // 0.81.0 — directories beyond the workspace this run's commands may write to.
+    // In `[run]` rather than `[sandbox]` because it is a property of the work, not
+    // of the backend: the same declaration has to mean the same thing on three
+    // hosts whose confinement mechanisms have nothing in common.
+    writable_roots: Option<Vec<PathBuf>>,
     // 0.55.0 — the ceiling a read is refused against, in characters. Beside the
     // other budgets because it is one: what a run may spend, what one request may
     // carry, and what one read may be.
@@ -2365,6 +2370,9 @@ impl Config {
         }
         if let Some(v) = run.ladder {
             out = out.with_ladder(v);
+        }
+        if let Some(v) = &run.writable_roots {
+            out = out.with_writable_roots(v.clone());
         }
         if let Some(v) = run.max_read_chars {
             out = out.with_max_read_chars(v);

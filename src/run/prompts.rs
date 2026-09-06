@@ -337,11 +337,13 @@ pub(super) const MAX_BOUNDARY_PATTERNS: usize = 24;
 pub(super) fn exec_containment(
     config: &SandboxConfig,
     toolchain: Option<&Toolchain>,
+    declared: &[std::path::PathBuf],
 ) -> Option<std::sync::Arc<crate::sandbox::ExecContainment>> {
-    config
-        .mode
-        .is_contained()
-        .then(|| std::sync::Arc::new(crate::sandbox::ExecContainment::resolve(config, toolchain)))
+    config.mode.is_contained().then(|| {
+        std::sync::Arc::new(crate::sandbox::ExecContainment::resolve(
+            config, toolchain, declared,
+        ))
+    })
 }
 
 /// The writable roots the verification gate gets (0.46.0).
@@ -589,7 +591,7 @@ pub(super) async fn probe_tree_boundary(
         return probe;
     }
     let toolchain = crate::toolchain::detect(root);
-    let containment = exec_containment(config, toolchain.as_ref());
+    let containment = exec_containment(config, toolchain.as_ref(), &[]);
     // Depth 0: the tree's boundary is measured before the root agent runs, and it
     // is the root's row.
     probe_boundary(store, watch, 0, run_id, config, containment.as_deref()).await

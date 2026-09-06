@@ -343,7 +343,11 @@ where
         // Children share their parent's workspace, so they share its detection too.
         let toolchain = crate::toolchain::detect(&tree.root);
         // Children share their parent's workspace, so they share its containment.
-        let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
+        let containment = exec_containment(
+            &contract.exec_sandbox,
+            toolchain.as_ref(),
+            &contract.writable_roots,
+        );
         // 0.48.0 — the same rule as the flat loop. A contained tree run whose
         // policy names hosts must not silently take the boolean while the flat
         // loop scopes its egress.
@@ -1959,6 +1963,20 @@ pub(super) async fn spawn_child<'f, P: Provider>(
     // spawn arguments are never read for this, so "give the sub-agent web access"
     // is unwritable in the JSON the model controls.
     child_contract.web = tree.web.clone();
+    // 0.81.0 — a child working in its own worktree writes outside that worktree by
+    // construction: `git commit` there writes objects and refs into the *parent*
+    // repository's `.git`, which is not under the child's root. Through 0.80.0 that
+    // worked only because the Landlock rung granted the whole system temporary
+    // directory to everything; with the grant narrowed to the run's own directory,
+    // the child has to name what it needs.
+    //
+    // The parent's own root, not a path the model chose: the spawn arguments are
+    // never read for this, exactly as they are not read for `web` above, so
+    // "give the sub-agent another writable root" is unwritable in the JSON the
+    // model controls.
+    if child_root != tree.root {
+        child_contract = child_contract.with_writable_roots([tree.root.join(".git")]);
+    }
     if let Some(n) = a.get("max_steps").and_then(|v| v.as_u64()) {
         child_contract = child_contract.with_max_steps(n as u32);
     }

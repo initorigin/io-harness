@@ -1797,12 +1797,32 @@ impl ExecContainment {
     /// native backends already grant it unconditionally (`/private/var/folders` in
     /// the macOS profile, `${TMPDIR:-/tmp}` in the Linux mount setup), and a
     /// second grant saying what the first already said is a line that can drift.
+    /// `declared` are the roots the run itself asked for beyond its workdir
+    /// (0.81.0) — [`TaskContract::writable_roots`](crate::TaskContract::writable_roots).
+    ///
+    /// They ride the same list as the toolchain caches and are filtered the same
+    /// way, for the same reason: the Linux mount setup binds every root it is
+    /// given, a bind of a path that is not there fails the setup, and a failed
+    /// setup degrades the whole backend to the portable floor. A root granted for
+    /// a directory that does not exist would silently unwind the confinement it
+    /// was added to preserve.
+    ///
+    /// A read-only run gets none of them. `ReadOnly` withholding the workspace and
+    /// then granting a root beside it would hand back through the side door
+    /// exactly what the mode exists to withhold.
     pub(crate) fn resolve(
         config: &SandboxConfig,
         toolchain: Option<&crate::toolchain::Toolchain>,
+        declared: &[PathBuf],
     ) -> Self {
         let roots = if config.mode == ExecMode::WorkspaceWrite {
-            writable_cache_roots(toolchain)
+            let mut roots = writable_cache_roots(toolchain);
+            for root in declared {
+                if root.is_absolute() && root.exists() && !roots.contains(root) {
+                    roots.push(root.clone());
+                }
+            }
+            roots
         } else {
             Vec::new()
         };
@@ -3315,7 +3335,7 @@ mod tests {
             allow_network: true,
             ..SandboxConfig::new()
         };
-        let contained = ExecContainment::resolve(&config, None);
+        let contained = ExecContainment::resolve(&config, None, &[]);
 
         assert!(
             contained.with_egress(false).config.allow_network,
@@ -3335,7 +3355,7 @@ mod tests {
     /// only the first test above would have caught the defect.
     #[test]
     fn a_policy_that_grants_egress_still_reaches_a_silent_sandbox_section() {
-        let contained = ExecContainment::resolve(&SandboxConfig::new(), None);
+        let contained = ExecContainment::resolve(&SandboxConfig::new(), None, &[]);
 
         assert!(
             contained.with_egress(true).config.allow_network,

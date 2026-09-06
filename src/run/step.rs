@@ -806,7 +806,11 @@ pub(super) async fn run_workspace_from<P: Provider>(
     // 0.46.0 — resolved once per run, beside the detection it reads. The writable
     // roots depend on the toolchain, and `select` probes the host, so neither
     // belongs on a per-call path.
-    let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
+    let containment = exec_containment(
+        &contract.exec_sandbox,
+        toolchain.as_ref(),
+        &contract.writable_roots,
+    );
     // 0.48.0 — the run owns its proxy, and the containment carries the address so
     // every spawn site scopes the sandbox to it without asking a second question.
     let egress = start_egress_proxy(policy, containment.as_ref()).await;

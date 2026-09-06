@@ -31,6 +31,15 @@ notes are produced from it.
 - **`io_harness::context::FALLBACK_MAX_TOKENS`**, the 24,000-token constant, now
   named and documented as the fallback rather than sitting unlabelled inside
   `ContextBudget::default`.
+- **A run can declare writable roots beyond its workdir**, as
+  `TaskContract::writable_roots` / `with_writable_roots` and `[run] writable_roots`
+  in `io.toml`. A contained run could write inside its workspace and the host's
+  toolchain caches and nowhere else, which is wrong for work that is not
+  self-contained: a `git worktree` child commits into the parent repository's
+  object store, outside its own root by construction. Each path must be absolute
+  and must exist; one that is neither is dropped rather than granted, because a
+  bind of an absent path fails the Linux mount setup and would degrade the whole
+  backend. Nothing is granted under `ExecMode::ReadOnly`.
 - **Three compaction rungs between Context Collapse and a fold**, as
   `io_harness::context::Ladder`, with every rung off by default. *Reduction* is
   lossless: the memory block's quarter of the ceiling is trimmed towards a floor so
@@ -112,6 +121,18 @@ notes are produced from it.
   names were made deterministic back in 0.76.0. Closes #232.
 
 ### Security
+
+- **BREAKING (behaviour): the Landlock rung no longer grants the whole system
+  temporary directory.** Every run's ephemeral workspace lives inside it, so two
+  concurrent runs on that rung could read and rewrite each other's workspace from
+  inside their own sandboxes — a residual 0.74.0 named, 0.80.0 attempted and
+  withdrew, and this release closes. The grant is now the run's own directory, the
+  same one the two mount rungs have used since 0.74.0, and the child's `TMPDIR`
+  points at it. **Migration:** a contained run that wrote somewhere outside its
+  workdir and relied on that grant declares it with
+  `TaskContract::with_writable_roots` or `[run] writable_roots`; a run that only
+  used a temporary file needs no change. A `worktree = true` child declares its
+  parent repository's `.git` for itself.
 
 ## [0.80.0] - 2026-09-05
 
