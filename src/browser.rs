@@ -1455,9 +1455,22 @@ pub(crate) async fn launch(
     // Landlock rung, so macOS and the mount rungs are unchanged and the guide
     // says so rather than leaving a reader to infer parity that is not there.
     //
-    // The writable root is the profile directory and nothing else. Reads are not
-    // confined on any unix rung, which is what lets the browser find its own
-    // installation and the system libraries it links.
+    // The writable roots are the profile directory and the system temporary
+    // directory. Reads are not confined on any unix rung, which is what lets the
+    // browser find its own installation and the system libraries it links.
+    //
+    // **The temporary directory is declared here in 0.81.0 rather than granted to
+    // everything.** Until this release the Landlock rung handed the whole system
+    // temporary directory to every contained command, so this child never had to
+    // ask; narrowing that grant broke the browser, because a browser writes there
+    // whatever its profile directory is — singleton locks, shared memory segments,
+    // crash dumps. Seven tests said so on the Linux all-features leg with "the
+    // fixture recorded no argv", which is what a child that could not start looks
+    // like from outside.
+    //
+    // So the grant did not disappear; it moved to the one child that needs it and
+    // is now visible in the argv the trace records, rather than being a line in a
+    // rung that every other run also paid for.
     // Held to the end of this function rather than dropped explicitly after the
     // spawn: it owns the rule set's descriptor, the child needs it only until
     // `exec`, and `Option<Contained>` does not itself implement `Drop`, so an
@@ -1472,7 +1485,7 @@ pub(crate) async fn launch(
             &sandbox,
             profile.path(),
             true,
-            &[profile.path().to_path_buf()],
+            &[profile.path().to_path_buf(), std::env::temp_dir()],
             None,
         )
     } else {
