@@ -371,10 +371,14 @@ pub trait Tool: Send + Sync {
     ///
     /// **Defaulted to "read-only tools may, and nothing else does"**, which is
     /// exactly what the loop did before this method existed, so every toolbox
-    /// written against an earlier release behaves identically. Override it to
-    /// `true` on a [`ToolEffect::Mutating`] tool only when the tool is *also*
-    /// [`ToolRecovery::Replayable`] — the loop checks both, and declaring this
-    /// alone changes nothing.
+    /// written against an earlier release behaves identically.
+    ///
+    /// Override it to `true` on a [`ToolEffect::Mutating`] tool only when the
+    /// tool is *also* [`ToolRecovery::Replayable`] — the loop checks both, and
+    /// declaring this alone changes nothing. One further condition is the run's,
+    /// not the tool's: a speculated registered call is put to the policy as
+    /// `Act::Exec` on its own name before it starts, exactly as a dispatched one
+    /// is, so a tool the policy would refuse is not started early either.
     ///
     /// ```
     /// # use io_harness::tools::{Tool, ToolEffect, ToolFuture, ToolRecovery, ToolSpec};

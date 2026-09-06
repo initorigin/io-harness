@@ -870,6 +870,17 @@ impl<'a> Git<'a> {
         for (k, v) in FIXED_ENV {
             c.env(k, v);
         }
+        // 0.83.0 — a git built-in owns its own `Child` and never reaches
+        // `run_capped_hooked`, so the scrub is installed here too. `git` runs a
+        // repository's own configuration, and a repository is the untrusted thing
+        // in this crate's threat model.
+        crate::sandbox::scrub_env(
+            &mut c,
+            self.sandbox
+                .as_ref()
+                .map(|s| s.inherited_env.as_slice())
+                .unwrap_or(&[]),
+        );
         c
     }
 }
@@ -910,6 +921,42 @@ mod tests {
 
     fn git<'a>(policy: &'a Policy, dir: &std::path::Path) -> Git<'a> {
         Git::new(policy, dir, CAP)
+    }
+
+    /// 0.83.0 — a git built-in's child does not carry the harness's credentials.
+    ///
+    /// `Git::run` owns its own `Child` and never reaches `run_capped_hooked`,
+    /// which is where the scrub lives for a `Sandbox::run`. Asserted on the
+    /// assembled `Command` rather than by spawning: `env_remove` is visible in
+    /// the environment overrides as a `None` value, and this way the test needs
+    /// no `git` on the machine — which is the same reason `Git::command` exists
+    /// as a separate function at all.
+    ///
+    /// Sabotage: drop the `scrub_env` call in `Git::command` and this fails while
+    /// every other test in this file stays green, because nothing else looks at
+    /// the child's environment.
+    #[test]
+    fn a_git_builtin_does_not_carry_the_harness_credentials() {
+        let policy = Policy::permissive();
+        let dir = std::path::Path::new("/w");
+        let cmd = git(&policy, dir).command(&["git".to_string(), "status".to_string()]);
+        let removed: Vec<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+
+        for name in crate::sandbox::PROVIDER_KEY_VARS {
+            assert!(
+                removed.iter().any(|r| r == name),
+                "{name} is still readable from a git built-in's child: {removed:?}"
+            );
+        }
+        assert!(
+            !removed.iter().any(|r| r == "PATH"),
+            "and PATH is not removed, or git cannot find its own subcommands: {removed:?}"
+        );
     }
 
     /// Every shape, with one benign path each, for the sweeps below.

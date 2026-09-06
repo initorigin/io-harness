@@ -2036,24 +2036,73 @@ pub(crate) const PROVIDER_KEY_VARS: [&str; 3] = [
     "OPENAI_API_KEY",
 ];
 
+/// What a contained child is never deprived of, whatever anything else says
+/// (0.83.0).
+///
+/// **This list is a hard floor and not a default.** The scrub's second source is
+/// the set of variable names a `${env:}` substitution resolved, and that is text
+/// from a configuration file — so without this list a file containing
+/// `command = "${env:HOME}/bin/serve"` would take `HOME` away from every contained
+/// child in the process, and `"${env:PATH}"` would leave every contained command
+/// unable to resolve its own program. Both are denial of service by a string, and
+/// the second is reachable from a file that arrives with a `git clone`.
+///
+/// A credential is never one of these. If a caller genuinely keeps a key in
+/// `PATH`, the scrub is not what will save them.
+const NEVER_SCRUBBED: [&str; 14] = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+];
+
 /// Which environment variables a contained child must not inherit (0.83.0).
 ///
-/// The union of [`PROVIDER_KEY_VARS`] and every name a `${env:}` substitution
-/// resolved in this process, minus the names `declared` opts back in. Sorted and
-/// deduplicated so two calls in one run produce the same list, which is what lets
-/// a replayed run stay byte-identical.
+/// [`PROVIDER_KEY_VARS`] plus every name a `${env:}` substitution resolved in a
+/// file this operator owns, minus [`NEVER_SCRUBBED`], minus the names `declared`
+/// opts back in. Sorted and deduplicated so two calls in one run produce the same
+/// list, which is what lets a replayed run stay byte-identical.
 ///
-/// Written as a function over its two inputs rather than inline at the spawn site
-/// so it can be asserted directly: a test over the assembled list can say "this
-/// name is removed and this one is not" without spawning anything, and the
-/// integration arms then prove the list reaches a real child.
+/// Written as a function over its inputs rather than inline at the spawn sites so
+/// it can be asserted directly: a test over the assembled list can say "this name
+/// is removed and this one is not" without spawning anything, and the integration
+/// arms then prove the list reaches a real child.
 pub(crate) fn scrubbed_env(declared: &[String]) -> Vec<String> {
     let mut names: Vec<String> = PROVIDER_KEY_VARS.iter().map(|s| (*s).to_string()).collect();
     names.extend(crate::config::interpolated_env_names());
-    names.retain(|name| !declared.iter().any(|d| d == name));
+    names.retain(|name| {
+        !NEVER_SCRUBBED.contains(&name.as_str()) && !declared.iter().any(|d| d == name)
+    });
     names.sort();
     names.dedup();
     names
+}
+
+/// Remove the harness's own credentials from a child's environment (0.83.0).
+///
+/// **Every site that builds a `Command` for a contained child calls this**, and
+/// that is the whole of the fix: `run_capped_hooked` is where a `Sandbox::run`
+/// converges, and it is not the only place this crate spawns. The `shell` tool's
+/// stages, a `shell_start` handle's stages, the git built-ins, a CodeAct program
+/// and the browser each build their own `Command` and apply containment
+/// out-of-band — `apply_rlimits`, `contain_command` and `proxy_env` are already
+/// hand-copied into each of them, and a fourth item added to only one copy is a
+/// scrub that covers the path no model reaches for and misses the path it reaches
+/// for first.
+pub(crate) fn scrub_env(cmd: &mut tokio::process::Command, declared: &[String]) {
+    for name in scrubbed_env(declared) {
+        cmd.env_remove(name);
+    }
 }
 
 /// The toolchain cache directories this host actually has, as writable roots.
@@ -2391,9 +2440,7 @@ async fn run_capped_hooked(
     //
     // The contract's declaration is the way back, and it is checked
     // case-sensitively because environment variable names are.
-    for name in scrubbed_env(spec.inherited_env) {
-        cmd.env_remove(name);
-    }
+    scrub_env(&mut cmd, spec.inherited_env);
     // 0.48.0 — and where the run has a proxy, the command is told to use it. This
     // is the one place every backend's spawn converges, so setting it here is what
     // stops `exec` and a `shell` stage from disagreeing about whether a command

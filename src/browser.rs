@@ -1517,8 +1517,12 @@ pub(crate) async fn launch(
     let own_tmp = browser_tmp_dir(profile.path());
     std::fs::create_dir_all(&own_tmp)
         .map_err(|e| fail(format!("could not make the browser's temporary directory: {e}")))?;
-    command.env("TMPDIR", &own_tmp);
     let browser_roots = browser_writable_roots(profile.path());
+    // 0.83.0 — a browser is a child of this process like any other, and it does
+    // not need the harness's provider credentials to render a page. `&[]`: the
+    // contract's declaration is for a command the *model* asked to run, not for
+    // this one, so the browser is scrubbed unconditionally.
+    crate::sandbox::scrub_env(&mut command, &[]);
     let _contained = if proxy.is_some() {
         let sandbox = crate::sandbox::SandboxConfig {
             allow_network: true,
@@ -1535,6 +1539,13 @@ pub(crate) async fn launch(
     } else {
         None
     };
+    // **After `contain_command`, deliberately.** That function sets `TMPDIR` to
+    // the target its own rung grants — for this call, the profile root — and the
+    // last write wins, so setting it above would have been silently overwritten on
+    // the one rung that contains the browser and honoured on every rung that does
+    // not. The child's temporary directory would then differ by rung for no
+    // reason anyone chose.
+    command.env("TMPDIR", &own_tmp);
 
     let child = command
         .spawn()

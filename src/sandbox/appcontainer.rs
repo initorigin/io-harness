@@ -1052,9 +1052,22 @@ pub(crate) mod win {
     /// `TMP` would go looking in the directory it may walk through and not write
     /// to. Every toolchain opens a temporary file, so that is not a corner.
     ///
-    /// Nothing else is filtered. What the harness's own environment exposes to a
-    /// contained child is the same question on every platform and is not this
-    /// function's to answer differently.
+    /// **0.83.0 — and the harness's own credentials are removed, which is the
+    /// question this comment used to defer.** It said that what this process's
+    /// environment exposes to a contained child is the same question on every
+    /// platform and not this function's to answer differently. That is still
+    /// right, and the answer now exists: `sandbox::scrubbed_env`. It has to be
+    /// applied *here* rather than inherited from the common spawn path, because
+    /// an AppContainer is entered at `CreateProcessW` with an environment block
+    /// this function builds — the child never passes through
+    /// `run_capped_hooked`, and AppContainer is the only Windows rung that
+    /// confines anything, so a scrub that missed it would cover nothing on this
+    /// platform that had asked for access confinement.
+    ///
+    /// `&[]` for the declaration: this block is built from the process
+    /// environment with no contract in scope, which is the fail-closed direction.
+    /// An embedder on Windows who needs a variable in a contained child declares
+    /// it on the contract and reaches it through the common path.
     ///
     /// The block is `NAME=VALUE\0` repeated and terminated by one more `\0`.
     /// Sorted case-insensitively by name, which is the order the documentation
@@ -1067,6 +1080,9 @@ pub(crate) mod win {
         let mut vars: BTreeMap<String, (OsString, OsString)> = std::env::vars_os()
             .map(|(k, v)| (k.to_string_lossy().to_uppercase(), (k, v)))
             .collect();
+        for name in crate::sandbox::scrubbed_env(&[]) {
+            vars.remove(&name.to_uppercase());
+        }
         for name in ["TMP", "TEMP"] {
             vars.insert(
                 name.to_string(),

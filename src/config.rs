@@ -3272,7 +3272,19 @@ fn expand(scope: Scope, raw: &str, dir: &Path, key: &[String], path: &Path) -> R
                 // Recorded even when the lookup fails: an unset name is still a
                 // name this configuration reaches for, and removing something that
                 // is not there costs nothing.
-                record_interpolated_env(arg);
+                //
+                // **Only from a file this operator owns.** `${env:}` is the one
+                // substitution permitted in every scope — `${file:}` and `${cmd:}`
+                // are refused inside the workspace — so a project `io.toml` that
+                // arrives with a `git clone` can name any variable it likes. If
+                // that named a name into the scrub, a cloned repository would
+                // decide what this harness removes from its own children, which is
+                // the trust rule this crate applies everywhere else read
+                // backwards. `sandbox::NEVER_SCRUBBED` is the second half of the
+                // same guard and covers the operator's own foot as well.
+                if scope == Scope::User {
+                    record_interpolated_env(arg);
+                }
                 std::env::var(arg).map_err(|_| {
                     bad_key(
                         path,

@@ -191,6 +191,7 @@ fn try_profile_for(
             "(deny network*)\n\
              (allow network-outbound (remote ip \"localhost:{}\"))\n\
              (allow network-bind)\n\
+             (allow network-inbound)\n\
              (allow network-outbound)",
             addr.port()
         ),
@@ -353,6 +354,15 @@ mod tests {
             widened.contains("(allow network-bind)"),
             "a widened proxied run may serve a port: {widened}"
         );
+        // Binding is not serving. `network-bind` gets a listening socket onto a
+        // port and `network-inbound` is what lets it accept a connection, and the
+        // widened *unproxied* arm has both because `(allow network*)` covers
+        // them — so without this the two widened arms would disagree about what
+        // widening means and the dev-server case would half-work.
+        assert!(
+            widened.contains("(allow network-inbound)"),
+            "and may accept the connection it is listening for: {widened}"
+        );
         assert!(
             widened.contains("(allow network-outbound)"),
             "and may dial without the proxy scoping it, which is what widening \
@@ -372,6 +382,7 @@ mod tests {
                 "(allow network-outbound (remote ip \"localhost:54321\"))",
                 "(allow network-outbound (remote ip \"localhost:54321\"))\n\
                  (allow network-bind)\n\
+                 (allow network-inbound)\n\
                  (allow network-outbound)"
             ),
             "the widened proxied profile differs from the narrow one in the two \

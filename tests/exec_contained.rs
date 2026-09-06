@@ -1485,6 +1485,42 @@ async fn a_contained_command_cannot_read_the_harness_provider_key() {
         "PATH must survive the scrub or no toolchain command can run"
     );
 
+    // **The `shell` tool, in the same test, because it is a different spawn
+    // path.** `run_pipeline` builds its own `Command` and hand-copies the
+    // pre-spawn work — rlimits, containment, proxy variables — from
+    // `run_capped_hooked`. A scrub added to only one of those two copies covers
+    // `exec` and misses every shell stage, foreground and detached, which is the
+    // path a model reaches for first. An adversarial review of this release found
+    // exactly that, against a fully green suite, because nothing here exercised
+    // it.
+    let dir = workspace();
+    std::env::set_var("OPENROUTER_API_KEY", "io-harness-0-83-0-loop-marker");
+    let provider = MockScript::new(vec![vec![shell_call(
+        "printenv OPENROUTER_API_KEY > shell-key.txt; printenv PATH > shell-path.txt",
+    )]]);
+
+    run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    std::env::remove_var("OPENROUTER_API_KEY");
+
+    let shell_key = std::fs::read_to_string(dir.path().join("shell-key.txt")).unwrap_or_default();
+    assert!(
+        shell_key.trim().is_empty(),
+        "the harness's provider key reached a shell stage: {shell_key:?}"
+    );
+    let shell_path = std::fs::read_to_string(dir.path().join("shell-path.txt")).unwrap_or_default();
+    assert!(
+        !shell_path.trim().is_empty(),
+        "and a shell stage still has a PATH"
+    );
+
     // The other half, in the same test rather than beside it: both arms mutate
     // this process's environment, and `cargo test` runs the file's tests
     // concurrently in one process, so two functions setting the same variable
