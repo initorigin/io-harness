@@ -25,7 +25,7 @@ use io_harness::policy::{Act, Effect};
 use io_harness::provider::Fallback;
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::sandbox::ExecMode;
-use io_harness::tools::{Tool, ToolEffect, ToolFuture, Toolbox};
+use io_harness::tools::{Tool, ToolEffect, ToolFuture, ToolRecovery, Toolbox};
 use io_harness::{
     ApproveAll, Approver, Decision, Error, EventKind, Flow, Observer, Policy, Provider,
     ProviderErrorKind, Request, RetryPolicy, RunEvent, Session, Store, TaskContract, ToolSpec,
@@ -577,6 +577,153 @@ async fn speculation_stops_at_the_first_call_that_is_not_read_only() {
         reads[1].contains("OMEGA"),
         "the read AFTER the write must see what the write wrote, not the bytes from before it: {}",
         reads[1]
+    );
+}
+
+// ------------------------------------------------------- 0.83.0 F9
+
+/// A `Mutating` tool whose write is idempotent, and which says whether it may
+/// run beside its siblings.
+///
+/// Two properties, declared separately, because they are separate: writing the
+/// same bytes twice is safe (`Replayable`) and starting the write beside a
+/// sibling that reads the same place is not. Until 0.83.0 the loop had a name
+/// for neither and read `ToolEffect` instead.
+struct Replayable {
+    name: String,
+    runs: Arc<AtomicUsize>,
+    concurrent: bool,
+}
+
+impl Tool for Replayable {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.clone(),
+            description: "Writes the same bytes however many times it is called.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    fn invoke<'a>(&'a self, _arguments: &'a serde_json::Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("{} ran", self.name))
+        })
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Mutating
+    }
+
+    fn recovery(&self) -> ToolRecovery {
+        ToolRecovery::Replayable
+    }
+
+    fn concurrent(&self) -> bool {
+        self.concurrent
+    }
+}
+
+/// F9 — "this may happen twice" is not "this may run beside its siblings".
+///
+/// The tool declares `Replayable` and leaves `concurrent` at its default, and the
+/// streamed completion is abandoned: the settled one calls something else
+/// entirely. If the loop speculated on replayability alone, the side effect of a
+/// call the model never made would have landed anyway.
+///
+/// Sabotage: make `speculable_call` ask `ToolRecovery` without asking
+/// `Tool::concurrent`, and `runs` becomes 1 against a settled completion that
+/// never names the tool.
+#[tokio::test]
+async fn a_replayable_tool_that_may_not_run_beside_its_siblings_is_not_speculated() {
+    let ws = workspace();
+    let store = Store::memory().unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let tools = Toolbox::new().with(Replayable {
+        name: "warm".into(),
+        runs: Arc::clone(&runs),
+        concurrent: false,
+    });
+
+    let provider = Script::new(vec![
+        Turn::calls(vec![tool("warm")]).settling_on(vec![read("a.txt")]),
+        Turn::done(),
+    ]);
+    let listener = Listener::default();
+    let mut session = Session::open(&store, ws.path()).unwrap();
+
+    tokio::time::timeout(
+        MUST_FINISH,
+        session.turn_bounded_observed(
+            &contract(ws.path(), tools),
+            &provider,
+            &store,
+            &policy(),
+            &ApproveAll,
+            &listener,
+        ),
+    )
+    .await
+    .expect("the turn should finish")
+    .unwrap();
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "the side effect of a call the settled completion abandoned landed anyway"
+    );
+    assert_eq!(
+        listener.counts(),
+        None,
+        "and nothing was speculated at all, so no event may claim otherwise"
+    );
+}
+
+/// The control, and the reason the method exists rather than a blanket refusal:
+/// a tool declaring **both** properties is speculated, and its result is used
+/// when the settled completion carries the call byte-identical.
+#[tokio::test]
+async fn a_replayable_concurrent_tool_is_speculated_and_its_result_is_used() {
+    let ws = workspace();
+    let store = Store::memory().unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let tools = Toolbox::new().with(Replayable {
+        name: "warm".into(),
+        runs: Arc::clone(&runs),
+        concurrent: true,
+    });
+
+    let provider = Script::new(vec![Turn::calls(vec![tool("warm")]), Turn::done()]);
+    let listener = Listener::default();
+    let mut session = Session::open(&store, ws.path()).unwrap();
+
+    tokio::time::timeout(
+        MUST_FINISH,
+        session.turn_bounded_observed(
+            &contract(ws.path(), tools),
+            &provider,
+            &store,
+            &policy(),
+            &ApproveAll,
+            &listener,
+        ),
+    )
+    .await
+    .expect("the turn should finish")
+    .unwrap();
+
+    assert_eq!(
+        listener.counts(),
+        Some((1, 1, 0)),
+        "a tool that declared both properties must be started early and its \
+         result used"
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "and used means used: the settled call must not run it a second time"
     );
 }
 

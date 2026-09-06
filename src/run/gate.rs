@@ -741,6 +741,39 @@ pub(super) fn tool_effect(name: &str, custom: &Toolbox) -> ToolEffect {
     }
 }
 
+/// May this call be started before the completion asking for it has settled
+/// (0.83.0)?
+///
+/// **Two questions, and the loop only ever asked one.** Speculation needs a call
+/// that may happen twice — the settled completion may abandon the position — and
+/// a call that may run beside whatever else the step is doing. Until this release
+/// the predicate was `tool_effect(..) == ReadOnly`, which answers the second by
+/// accident and the first not at all, and which has been the wrong question since
+/// [`ToolRecovery`](crate::tools::ToolRecovery) was added: it left no way for a tool to say either thing for
+/// itself, so an idempotent, concurrency-safe registered tool could not be
+/// speculated and a `Mutating` one could not explain why it must not be.
+///
+/// The predicate is now the conjunction of both, each asked of the tool.
+/// [`Tool::recovery`](crate::Tool) is defaulted from the effect and
+/// [`Tool::concurrent`](crate::Tool) is defaulted to "read-only tools may", so
+/// every toolbox written against an earlier release resolves to exactly what it
+/// resolved to before.
+pub(super) fn speculable_call(name: &str, custom: &Toolbox) -> bool {
+    let (recovery, concurrent) = match custom.get(name) {
+        Some(tool) => (tool.recovery(), tool.concurrent()),
+        // A built-in. The four readers and the three git readers are replayable
+        // and may overlap — `tool_effect` is the one table that says which those
+        // are, asked here rather than listed a second time. Everything else this
+        // crate ships mutates something: a file, the turn's pending media, a
+        // handle registry, or a repository.
+        None => match tool_effect(name, custom) {
+            ToolEffect::ReadOnly => (crate::tools::ToolRecovery::Replayable, true),
+            ToolEffect::Mutating => (crate::tools::ToolRecovery::Indeterminate, false),
+        },
+    };
+    recovery == crate::tools::ToolRecovery::Replayable && concurrent
+}
+
 /// The mode a call needs, before anything is spawned for it (0.48.0).
 ///
 /// `None` means *whatever this run was granted*, which is the answer for `exec`,
