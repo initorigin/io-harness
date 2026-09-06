@@ -843,6 +843,7 @@ pub(super) fn size_context<P: Provider>(
         contract.context,
         provider.context_window(),
         provider.max_output_tokens(),
+        provider.assumed_window(),
     );
     watch.emit(RunEvent::new(
         run_id,

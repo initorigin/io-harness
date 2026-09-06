@@ -1984,6 +1984,52 @@ pub trait Provider {
         async { Ok(Vec::new()) }
     }
 
+    /// Learn how big the model this provider will ask is, once, before the run's
+    /// first step (0.82.0).
+    ///
+    /// This is the async half [`context_window`](Provider::context_window) and
+    /// [`max_output_tokens`](Provider::max_output_tokens) were always waiting on.
+    /// Those two stay synchronous and still must never dial; this is where the
+    /// dialling is allowed to happen, exactly once, at a point in the run where a
+    /// round trip is affordable because nothing has been assembled yet.
+    ///
+    /// **The default makes no request at all**, which is what keeps every mock the
+    /// run loop is tested with — and every out-of-tree implementer — dialling
+    /// nothing. A provider that already answers `context_window` is never asked.
+    ///
+    /// **An implementer must not reach a host that
+    /// [`endpoints`](Provider::endpoints) does not declare.** That list is what the
+    /// run authorises against the policy's network rules before the first step, so
+    /// a lookup against an undeclared host would walk a connection through a
+    /// deny-by-default boundary. If the lookup is opt-in, the host joins
+    /// `endpoints()` when the option is taken and not before.
+    ///
+    /// A failure is not a run failure. The caller swallows it and the ceiling
+    /// resolves on the `fallback` rung, which is what
+    /// [`EventKind::ContextCeiling`](crate::EventKind::ContextCeiling) reports —
+    /// a run must not end because a catalogue was unreachable.
+    ///
+    /// ```
+    /// use io_harness::provider::{CompletionRequest, CompletionResponse, Provider};
+    /// use io_harness::Result;
+    ///
+    /// struct Sized;
+    /// impl Provider for Sized {
+    ///     async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse> {
+    ///         Ok(CompletionResponse::default())
+    ///     }
+    /// }
+    ///
+    /// # async fn demo() -> Result<()> {
+    /// // The default warms nothing and reaches nothing, so it cannot fail.
+    /// Sized.warm_sizing().await?;
+    /// assert_eq!(Sized.context_window(), None, "and it teaches the provider nothing");
+    /// # Ok(()) }
+    /// ```
+    fn warm_sizing(&self) -> impl std::future::Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+
     /// Whether this provider is answering, asked once before a run starts
     /// (0.34.0).
     ///
@@ -2108,6 +2154,40 @@ pub trait Provider {
     /// documents. The same "never dial" rule applies.
     fn max_output_tokens(&self) -> Option<u64> {
         None
+    }
+
+    /// How big to assume the model is when nothing could size it (0.82.0).
+    ///
+    /// Read only on the `fallback` rung — a provider that answers
+    /// [`context_window`](Provider::context_window) never reaches this — and sized
+    /// through [`ContextBudget::for_window`](crate::ContextBudget::for_window) like
+    /// a read window, so an assumption reserves the answer and the request floor
+    /// rather than becoming a raw ceiling.
+    ///
+    /// **It is a provider method rather than a constant because the honest
+    /// assumption depends on something only the provider knows: whether the model
+    /// is served from a datacentre or from this machine.** Every remote vendor was
+    /// serving at least [`FALLBACK_WINDOW`](crate::context::FALLBACK_WINDOW) when
+    /// this release was cut, so that is the default; a local runtime's default is
+    /// an order of magnitude smaller, which is why
+    /// [`Compatible`](crate::provider::Compatible) overrides this to
+    /// [`FALLBACK_WINDOW_LOCAL`](crate::context::FALLBACK_WINDOW_LOCAL) for a
+    /// loopback base.
+    ///
+    /// ```
+    /// use io_harness::provider::{CompletionRequest, CompletionResponse, Provider};
+    /// use io_harness::context::FALLBACK_WINDOW;
+    ///
+    /// struct Hosted;
+    /// impl Provider for Hosted {
+    ///     async fn complete(&self, _r: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+    ///         Ok(CompletionResponse::default())
+    ///     }
+    /// }
+    /// assert_eq!(Hosted.assumed_window(), FALLBACK_WINDOW);
+    /// ```
+    fn assumed_window(&self) -> u64 {
+        crate::context::FALLBACK_WINDOW
     }
 
     /// A short label recorded in the run's trace so an audit shows which
