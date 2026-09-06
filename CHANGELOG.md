@@ -31,6 +31,20 @@ notes are produced from it.
 - **`io_harness::context::FALLBACK_MAX_TOKENS`**, the 24,000-token constant, now
   named and documented as the fallback rather than sitting unlabelled inside
   `ContextBudget::default`.
+- **An in-crate evaluation suite, `io_harness::eval`.** A `Case` is a task contract
+  plus the outcome that decides it; a `Scorer` turns a finished run into one number;
+  a `Suite` runs the cases over a `Replay` and reports both. Four scorers ship:
+  `PromptTokens` (what a request costs, whole, including the tool array),
+  `Retention` (whether the facts a case declared it needs survived into the prompt),
+  `CatalogueCost` (what the tool array alone costs, re-sent every step) and
+  `ApproverCatchRate`. It needs no API key and opens no socket, and the suite
+  reports its own network count so that claim has a witness rather than a promise.
+  Deterministic replay has shipped since 0.12.0 with nothing on top of it; this is
+  the layer that lets a default change be argued from this crate's own numbers.
+- **`Store::run_goal` and `Store::run_created_at`.** `runs.goal` has been written
+  since 0.1.0 and published by nothing, and a run had no timestamp accessor at all,
+  so a listing of parked runs showed thirteen rows differing only by a number with
+  nothing to choose on. Closes #258.
 - **`EventKind::StepUsage`**, emitted beside `EventKind::Step` from the same place,
   splitting a step's tokens into `fresh_prompt_tokens`, `cache_read_tokens`,
   `cache_write_tokens` and `completion_tokens`. `Usage::cache_read_tokens` has been
@@ -56,6 +70,15 @@ notes are produced from it.
 ### Removed
 
 ### Fixed
+
+- **Two children of a `worktree = true` definition no longer race each other's
+  checkout.** `git worktree add` walks `.git/worktrees/*` while it prepares, so a
+  sibling that has created its directory but not yet written its `commondir` file is
+  a half-written entry the walk reads: the loser exits 128 naming a directory it was
+  not creating, and the spawn fails. Worktree creation is now serialised. Reproduced
+  at roughly one run in four hundred under load — it was a real defect in the crate,
+  not a test that could not tell slow from broken, and the two sites issue #232
+  names were made deterministic back in 0.76.0. Closes #232.
 
 ### Security
 
