@@ -151,7 +151,16 @@ notes are produced from it.
   workdir and relied on that grant declares it with
   `TaskContract::with_writable_roots` or `[run] writable_roots`; a run that only
   used a temporary file needs no change. A `worktree = true` child declares its
-  parent repository's `.git` for itself.
+  parent repository's `.git` for itself, and the browser child declares the
+  temporary directory it needs — a browser writes singleton locks, shared memory
+  and crash dumps there whatever its profile directory is, so the grant moved to
+  the one child that needs it rather than being paid for by every run.
+- **A declared writable root must be a directory.** One that exists and is a file
+  is dropped rather than granted: Landlock refuses directory-only rights on a
+  non-directory, which fails the whole rule set, and a failed rule set is a command
+  that runs unwrapped while the trace still records `LinuxLandlock`. A rule set that
+  cannot be built now warns and says the command runs unwrapped instead of failing
+  silently.
 
 ## [0.80.0] - 2026-09-05
 
