@@ -413,23 +413,84 @@ async fn f8_a_warm_that_errors_still_starts_the_run_on_the_fallback_rung() {
     );
 }
 
-/// F8 against a socket that refuses the connection, through a real provider.
+// ---------------------------------------------------------------------- O3
+
+/// O3 — a denied reference host refuses the run at preflight, naming the host.
 ///
-/// The mock above proves the arithmetic; this proves the path. `Compatible`
-/// pointed at a closed port warms by fetching a catalogue that is not there, and
-/// the run still starts — on the *local* assumption, because the base is
-/// loopback, which is `assumed_window` doing its job in the same breath.
+/// Asserted rather than described. The opt-in shape is what keeps a catalogue
+/// lookup inside the egress boundary, and `endpoints()` is the mechanism —
+/// but a mechanism nothing exercises is a claim. This test exists to fail if
+/// this release ever routes the lookup around the boundary, for instance by
+/// warming from a host it did not declare.
 #[tokio::test]
-async fn f8_a_refused_catalogue_socket_still_starts_the_run() {
+async fn o3_a_denied_reference_host_refuses_the_run_before_its_first_step() {
+    use io_harness::provider::catalog::Reference;
+    use io_harness::OpenAi;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("trace.db")).unwrap();
+    let seen = Recorder::default();
+
+    // The vendor's own host is allowed; the reference host is not. Net is
+    // deny-by-default, so allowing one names the other by omission.
+    let policy = Policy::default()
+        .layer("app")
+        .allow_read("*")
+        .allow_write("*")
+        .allow_exec("*")
+        .allow_net("api.openai.com");
+
+    let provider = OpenAi::new("unused-key", "gpt-4o")
+        .with_reference_catalogue(Reference::at("https://catalogue.example.test/models"));
+
+    let failed = run_with_observed(
+        &one_step(dir.path()),
+        &provider,
+        &store,
+        &policy,
+        &ApproveAll,
+        &seen,
+    )
+    .await
+    .expect_err("a denied endpoint must refuse the run, not warn about it");
+
+    let text = failed.to_string();
+    assert!(
+        text.contains("catalogue.example.test"),
+        "the refusal names the host that was denied: {text}"
+    );
+    assert!(
+        seen.0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| !matches!(e.kind, EventKind::ContextCeiling { .. })),
+        "refused before the ceiling was ever resolved, which is before step 1"
+    );
+}
+
+/// F8 against a real provider whose catalogue host does not answer.
+///
+/// The mock above proves the arithmetic; this proves the path through a real
+/// `Provider` implementation, real HTTP and a real failure.
+///
+/// **The base is `192.0.2.1` — TEST-NET-1 — and not a loopback socket, which is
+/// what this criterion originally named.** A loopback provider base never reaches
+/// the sizing at all: 0.80.0's M10 grading refuses a provider endpoint that
+/// resolves onto loopback at preflight, before the ceiling is resolved, so a
+/// closed port on `127.0.0.1` tests the SSRF guard rather than the warm. TEST-NET-1
+/// is routable as far as the grader is concerned and answers nothing as far as the
+/// socket is concerned, which is exactly the state the criterion wanted. See
+/// `iterations/US-IO-HARNESS-0.82.0-I02`.
+#[tokio::test]
+async fn f8_a_catalogue_host_that_does_not_answer_still_starts_the_run() {
     use io_harness::provider::{Auth, Compatible};
 
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("trace.db")).unwrap();
     let seen = Recorder::default();
-    // Port 9 is discard: nothing is listening, so the catalogue fetch is a
-    // refused connection rather than a slow one.
-    let provider = Compatible::new("http://127.0.0.1:9/v1", Auth::None, "", "test-model")
-        .with_timeout(std::time::Duration::from_millis(500));
+    let provider = Compatible::new("http://192.0.2.1:9/v1", Auth::None, "", "test-model")
+        .with_timeout(std::time::Duration::from_millis(300));
     let _ = run_with_observed(
         &one_step(dir.path()),
         &provider,
@@ -441,10 +502,13 @@ async fn f8_a_refused_catalogue_socket_still_starts_the_run() {
     .await;
 
     let (max_tokens, source) = seen.ceiling();
-    assert_eq!(source, "fallback");
+    assert_eq!(
+        source, "fallback",
+        "an unreachable catalogue is a guessed ceiling, not a dead run"
+    );
     assert_eq!(
         max_tokens,
-        ContextBudget::for_window(io_harness::context::FALLBACK_WINDOW_LOCAL, None).max_tokens,
-        "a loopback base assumes the local window even when its catalogue is down",
+        ContextBudget::for_window(io_harness::context::FALLBACK_WINDOW, None).max_tokens,
+        "and the base is not loopback, so the assumption is the remote one",
     );
 }

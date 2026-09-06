@@ -1414,7 +1414,14 @@ pub(crate) async fn run_with_extras<P: Provider>(
     // is about to ask and reported once. It shadows the parameter deliberately, so
     // every read of `contract.context` below this line is the resolved value and
     // there is no second rule for a resumed run to disagree with.
-    let contract = &size_context(watch, run_id, contract, provider).await;
+    //
+    // 0.82.0 — **it sits below `authorize_provider` wherever that runs**, because
+    // sizing may now dial. `Provider::warm_sizing` reads a catalogue, and a
+    // catalogue host is declared by `endpoints()` precisely so the policy decides
+    // it; warming first would walk that connection through a deny-by-default
+    // boundary before the boundary was consulted. Sized here, the run is refused
+    // before the lookup rather than after it.
+    //
     // Decided against the *caller's* policy, before the provider layer is merged
     // in: the harness adding a network layer of its own must not turn a
     // permissive caller into a policy-bearing one and push it off the
@@ -1442,6 +1449,7 @@ pub(crate) async fn run_with_extras<P: Provider>(
             ))
         }
     };
+    let contract = &size_context(watch, run_id, contract, provider).await;
     match contract.root.clone() {
         Some(root) => {
             let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
@@ -2424,35 +2432,49 @@ pub async fn resume_with_observed<P: Provider>(
     // is about to ask and reported once. It shadows the parameter deliberately, so
     // every read of `contract.context` below this line is the resolved value and
     // there is no second rule for a resumed run to disagree with.
+    //
+    // 0.82.0 — **it sits below `authorize_provider` wherever that runs**, because
+    // sizing may now dial. `Provider::warm_sizing` reads a catalogue, and a
+    // catalogue host is declared by `endpoints()` precisely so the policy decides
+    // it; warming first would walk that connection through a deny-by-default
+    // boundary before the boundary was consulted. Sized here, the run is refused
+    // before the lookup rather than after it.
+    //
+    // Re-authorized on resume rather than trusted from the interrupted run, for
+    // the reason [`resume_tree_observed`] gives: the policy handed to the resume
+    // is the one that governs it, and a host allowed before a crash may not be
+    // allowed after.
+    //
+    // 0.82.0 — hoisted out of the `Some(root)` arm to sit above the sizing, which
+    // is the shape [`run_with_extras`] already had. Inside the arm it would have
+    // left the single-file path sizing without an authorization, and moving the
+    // sizing into the arm instead would have left that path with no ceiling event
+    // at all.
+    let policy = &match authorize_provider(
+        provider,
+        policy,
+        store,
+        run_id,
+        approver,
+        watch,
+        &contract.goal,
+    )
+    .await?
+    {
+        ProviderAccess::Granted(p) => p,
+        ProviderAccess::Pending(request_id) => {
+            return Ok(RunResult::new(
+                RunOutcome::AwaitingApproval {
+                    request_id,
+                    steps: start_step.saturating_sub(1),
+                },
+                run_id,
+            ))
+        }
+    };
     let contract = &size_context(watch, run_id, contract, provider).await;
     match contract.root.clone() {
         Some(root) => {
-            // Re-authorized on resume rather than trusted from the interrupted
-            // run, for the reason [`resume_tree_observed`] gives: the policy
-            // handed to the resume is the one that governs it, and a host allowed
-            // before a crash may not be allowed after.
-            let policy = &match authorize_provider(
-                provider,
-                policy,
-                store,
-                run_id,
-                approver,
-                watch,
-                &contract.goal,
-            )
-            .await?
-            {
-                ProviderAccess::Granted(p) => p,
-                ProviderAccess::Pending(request_id) => {
-                    return Ok(RunResult::new(
-                        RunOutcome::AwaitingApproval {
-                            request_id,
-                            steps: start_step.saturating_sub(1),
-                        },
-                        run_id,
-                    ))
-                }
-            };
             let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
             let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
             let browser = browser_for(contract, policy);
@@ -2964,6 +2986,13 @@ pub async fn resume_with_decision_observed<P: Provider>(
     // is about to ask and reported once. It shadows the parameter deliberately, so
     // every read of `contract.context` below this line is the resolved value and
     // there is no second rule for a resumed run to disagree with.
+    //
+    // 0.82.0 — **it sits below `authorize_provider` wherever that runs**, because
+    // sizing may now dial. `Provider::warm_sizing` reads a catalogue, and a
+    // catalogue host is declared by `endpoints()` precisely so the policy decides
+    // it; warming first would walk that connection through a deny-by-default
+    // boundary before the boundary was consulted. Sized here, the run is refused
+    // before the lookup rather than after it.
     let contract = &size_context(watch, run_id, contract, provider).await;
 
     match decision {
@@ -3347,6 +3376,13 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
     // is about to ask and reported once. It shadows the parameter deliberately, so
     // every read of `contract.context` below this line is the resolved value and
     // there is no second rule for a resumed run to disagree with.
+    //
+    // 0.82.0 — **it sits below `authorize_provider` wherever that runs**, because
+    // sizing may now dial. `Provider::warm_sizing` reads a catalogue, and a
+    // catalogue host is declared by `endpoints()` precisely so the policy decides
+    // it; warming first would walk that connection through a deny-by-default
+    // boundary before the boundary was consulted. Sized here, the run is refused
+    // before the lookup rather than after it.
     let contract = &size_context(watch, run_id, contract, provider).await;
 
     match decision {
@@ -4272,7 +4308,14 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
     // is about to ask and reported once. It shadows the parameter deliberately, so
     // every read of `contract.context` below this line is the resolved value and
     // there is no second rule for a resumed run to disagree with.
-    let contract = &size_context(watch, run_id, contract, provider).await;
+    //
+    // 0.82.0 — **it sits below `authorize_provider` wherever that runs**, because
+    // sizing may now dial. `Provider::warm_sizing` reads a catalogue, and a
+    // catalogue host is declared by `endpoints()` precisely so the policy decides
+    // it; warming first would walk that connection through a deny-by-default
+    // boundary before the boundary was consulted. Sized here, the run is refused
+    // before the lookup rather than after it.
+    //
     // Authorized once at the root. Children inherit the root's policy through
     // `Policy::contain`, so the provider layer flows down the tree and no child
     // needs (or gets) its own chance to widen network access.
@@ -4303,6 +4346,7 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
             ))
         }
     };
+    let contract = &size_context(watch, run_id, contract, provider).await;
     let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
     let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
     let browser = browser_for(contract, policy);
@@ -4515,7 +4559,14 @@ pub async fn resume_tree_observed<P: Provider>(
     // is about to ask and reported once. It shadows the parameter deliberately, so
     // every read of `contract.context` below this line is the resolved value and
     // there is no second rule for a resumed run to disagree with.
-    let contract = &size_context(watch, run_id, contract, provider).await;
+    //
+    // 0.82.0 — **it sits below `authorize_provider` wherever that runs**, because
+    // sizing may now dial. `Provider::warm_sizing` reads a catalogue, and a
+    // catalogue host is declared by `endpoints()` precisely so the policy decides
+    // it; warming first would walk that connection through a deny-by-default
+    // boundary before the boundary was consulted. Sized here, the run is refused
+    // before the lookup rather than after it.
+    //
     emit_backlog(
         watch,
         run_id,
@@ -4548,6 +4599,7 @@ pub async fn resume_tree_observed<P: Provider>(
             ))
         }
     };
+    let contract = &size_context(watch, run_id, contract, provider).await;
     let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
     let lsp = lsp_for(contract, policy, store, run_id, watch).await?;
     let browser = browser_for(contract, policy);
