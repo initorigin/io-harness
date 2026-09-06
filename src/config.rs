@@ -3210,6 +3210,36 @@ fn run_command(argv: &str) -> std::result::Result<String, String> {
 /// Every failure is an error naming the key. None of them is an empty string: a
 /// config that silently disarms itself is the worst outcome this feature can
 /// produce.
+/// Every environment variable name a `${env:}` substitution has resolved in this
+/// process (0.83.0).
+///
+/// Names only, never values, and it only ever grows. It is process-wide rather
+/// than carried on [`Config`] because the consumer is
+/// `sandbox::run_capped_hooked`, which every backend's spawn converges on and
+/// which has no configuration in scope — and because the fact it records is
+/// process-wide too: a name interpolated into any configuration this process
+/// loaded is a name this process holds a secret under, whichever run is spawning.
+static INTERPOLATED_ENV: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn interpolated_env() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
+    INTERPOLATED_ENV.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+}
+
+fn record_interpolated_env(name: &str) {
+    if let Ok(mut set) = interpolated_env().lock() {
+        set.insert(name.to_string());
+    }
+}
+
+/// The names recorded by [`record_interpolated_env`], for the scrub.
+pub(crate) fn interpolated_env_names() -> Vec<String> {
+    interpolated_env()
+        .lock()
+        .map(|set| set.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
 fn expand(scope: Scope, raw: &str, dir: &Path, key: &[String], path: &Path) -> Result<String> {
     let mut out = String::new();
     let mut rest = raw;
@@ -3228,13 +3258,40 @@ fn expand(scope: Scope, raw: &str, dir: &Path, key: &[String], path: &Path) -> R
             ));
         };
         let value = match kind {
-            "env" => std::env::var(arg).map_err(|_| {
-                bad_key(
-                    path,
-                    key,
-                    format!("environment variable `{arg}` is not set"),
-                )
-            })?,
+            "env" => {
+                // 0.83.0 — the *name* is recorded before the value is read. A
+                // variable an operator interpolated into their configuration is a
+                // variable this process treats as a secret, so it is one of the
+                // things a contained child must not be able to read out of its own
+                // environment. Until now this function resolved the value and
+                // discarded every trace of where it came from, so the scrub in
+                // `sandbox::run_capped_hooked` could only know the three fixed
+                // provider variables and nothing an operator had named.
+                //
+                // Recorded even when the lookup fails: an unset name is still a
+                // name this configuration reaches for, and removing something that
+                // is not there costs nothing.
+                //
+                // **Only from a file this operator owns.** `${env:}` is the one
+                // substitution permitted in every scope — `${file:}` and `${cmd:}`
+                // are refused inside the workspace — so a project `io.toml` that
+                // arrives with a `git clone` can name any variable it likes. If
+                // that named a name into the scrub, a cloned repository would
+                // decide what this harness removes from its own children, which is
+                // the trust rule this crate applies everywhere else read
+                // backwards. `sandbox::NEVER_SCRUBBED` is the second half of the
+                // same guard and covers the operator's own foot as well.
+                if scope == Scope::User {
+                    record_interpolated_env(arg);
+                }
+                std::env::var(arg).map_err(|_| {
+                    bad_key(
+                        path,
+                        key,
+                        format!("environment variable `{arg}` is not set"),
+                    )
+                })?
+            }
             // 0.74.0. Refused in the project scope for the reason `${cmd:}` is,
             // one step short of running a program: the argument is joined onto the
             // file's own directory, and `Path::join` lets an absolute argument
@@ -3460,6 +3517,74 @@ mod tests {
             Some(60),
             "a sibling key the later scope never named is not disturbed"
         );
+    }
+
+    /// 0.83.0 — a `${env:}` name reaches the scrub, and the keep-list survives it.
+    ///
+    /// **A sabotage that failed nothing found this test's absence.** The scrub's
+    /// own unit tests live in `src/sandbox.rs` and assert that `PATH` is not
+    /// removed — and they passed with `NEVER_SCRUBBED` deleted, because nothing
+    /// had put `PATH` into the recorded set in that process, so the assertion was
+    /// true for the wrong reason and could never have observed the guard it names.
+    /// This is the arm that can: it records the name the way a configuration file
+    /// does, then asks the scrub.
+    ///
+    /// The hazard is not hypothetical. `${env:}` is the one substitution permitted
+    /// in every scope, so `command = "${env:PATH}"` in a file that arrives with a
+    /// `git clone` would otherwise leave every contained command in this process
+    /// unable to resolve its own program — denial of service by a string.
+    #[test]
+    fn an_interpolated_name_reaches_the_scrub_and_the_keep_list_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("io.toml");
+        let key = vec!["api_key".to_string()];
+
+        // A name the keep-list protects, and one it does not.
+        std::env::set_var("IO_HARNESS_SCRUB_PROBE", "x");
+        expand(Scope::User, "${env:PATH}", dir.path(), &key, &path).unwrap();
+        expand(
+            Scope::User,
+            "${env:IO_HARNESS_SCRUB_PROBE}",
+            dir.path(),
+            &key,
+            &path,
+        )
+        .unwrap();
+
+        let recorded = interpolated_env_names();
+        assert!(
+            recorded.iter().any(|n| n == "PATH"),
+            "the name is recorded — the guard is the scrub's, not the recorder's: {recorded:?}"
+        );
+
+        let scrubbed = crate::sandbox::scrubbed_env(&[]);
+        assert!(
+            !scrubbed.iter().any(|n| n == "PATH"),
+            "PATH must never be taken from a contained child: {scrubbed:?}"
+        );
+        assert!(
+            scrubbed.iter().any(|n| n == "IO_HARNESS_SCRUB_PROBE"),
+            "and an ordinary interpolated name must be: {scrubbed:?}"
+        );
+
+        // A file inside the workspace does not get to decide what the harness
+        // removes from its own children.
+        expand(
+            Scope::Project,
+            "${env:IO_HARNESS_SCRUB_PROJECT}",
+            dir.path(),
+            &key,
+            &path,
+        )
+        .ok();
+        assert!(
+            !interpolated_env_names()
+                .iter()
+                .any(|n| n == "IO_HARNESS_SCRUB_PROJECT"),
+            "a project-scope substitution must not name anything into the scrub"
+        );
+
+        std::env::remove_var("IO_HARNESS_SCRUB_PROBE");
     }
 
     #[test]

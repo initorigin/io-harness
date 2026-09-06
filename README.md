@@ -42,7 +42,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.82"
+io-harness = "0.83"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -346,6 +346,21 @@ nothing is discarded — so an incremental build survives between commands, and 
 toolchain's own cache being writable is what lets a default-contained `cargo` or
 `npm` run at all. Backgrounded `shell_start` handles and the git built-ins are
 contained like everything else.
+
+A run that needs the network says so, and gets it: `sandbox.allow_network = true`
+grants `network-bind` as well as outbound, so a dev server can serve a port from
+inside the boundary. That holds on a run with an egress proxy too — which is every
+run whose policy names a host — and there the two answers stay separate on
+purpose: the operator's `[sandbox]` section widens the sandbox, while the policy's
+per-host rules are enforced by the proxy rather than by opening it.
+
+A contained command starts **without the harness's own provider credentials**: the
+variables the shipped providers read, and every variable a `${env:}` substitution
+resolved in your configuration, are removed from the child. `PATH`, `HOME`, `LANG`
+and `TMPDIR` are not. A run that genuinely needs one — an agent shelling out to
+another model's CLI — declares it with
+`TaskContract::with_inherited_env(["THE_VARIABLE"])`, and that variable alone
+survives.
 
 What each platform actually enforces differs, and the difference is not cosmetic —
 see [platform support](#platform-support). A host that can deliver none of it

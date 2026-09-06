@@ -898,6 +898,20 @@ pub struct RunSpec<'a> {
     /// duplicate would be a second `(allow …)` line saying what the first already
     /// said.
     pub writable_roots: &'a [PathBuf],
+    /// Environment variables this command may inherit from the harness (0.83.0).
+    ///
+    /// The harness's own provider credentials are removed from every contained
+    /// child by default — the three variables the shipped providers read, plus
+    /// every name a `${env:}` substitution resolved while loading this process's
+    /// configuration. A name listed here survives that removal.
+    ///
+    /// It is a list of names rather than a boolean because the two failure modes
+    /// are not symmetric: inheriting everything leaks a key into a child that
+    /// reads files and runs commands on the operator's behalf, while inheriting
+    /// nothing breaks a run that shells out to a tool holding a key of its own.
+    /// Naming the one variable that must survive is the only answer that is
+    /// neither.
+    pub inherited_env: &'a [String],
 }
 
 impl<'a> RunSpec<'a> {
@@ -912,7 +926,19 @@ impl<'a> RunSpec<'a> {
             proxy: None,
             mode: ExecMode::WorkspaceWrite,
             writable_roots: &[],
+            inherited_env: &[],
         }
+    }
+
+    /// Let this command inherit these variables through the scrub (0.83.0).
+    ///
+    /// See [`RunSpec::inherited_env`]. The default is none, which is the
+    /// fail-closed direction: a backend used directly by an embedder gets the
+    /// scrub without having to ask for it.
+    #[must_use]
+    pub fn with_inherited_env(mut self, names: &'a [String]) -> Self {
+        self.inherited_env = names;
+        self
     }
 
     /// Permit or deny outbound network for this command.
@@ -1788,6 +1814,11 @@ pub(crate) struct ExecContainment {
     /// containment, because a run has at most one proxy and every command it
     /// contains goes through the same one.
     pub(crate) proxy: Option<std::net::SocketAddr>,
+    /// Environment variables this run's contract declared its commands may
+    /// inherit (0.83.0), which is the opt-out from the scrub every contained
+    /// child now gets. Resolved once with the containment for the same reason the
+    /// proxy is: it is a property of the run, not of the call.
+    pub(crate) inherited_env: Vec<String>,
 }
 
 impl ExecContainment {
@@ -1846,6 +1877,18 @@ impl ExecContainment {
             config: config.clone(),
             roots,
             proxy: None,
+            inherited_env: Vec::new(),
+        }
+    }
+
+    /// The same containment, letting these variables through the scrub (0.83.0).
+    ///
+    /// Set once at run start from [`TaskContract::inherited_env`], beside the
+    /// proxy and for the same reason.
+    pub(crate) fn with_inherited_env(&self, names: Vec<String>) -> Self {
+        Self {
+            inherited_env: names,
+            ..self.clone()
         }
     }
 
@@ -1884,17 +1927,32 @@ impl ExecContainment {
     /// re-opened the sandbox through `permits_any_egress`, and that is closed by
     /// [`refuse_granting_layers`](crate::Config), not by discarding `[sandbox]`.
     ///
-    /// A run that owns an egress proxy is unaffected either way: the backends
-    /// deny everything and allow the proxy's own address back, so `proxy` beats
-    /// both answers.
+    /// **A proxied run takes the operator's answer and not the policy's, and
+    /// 0.83.0 is where that stopped being academic.** Until this release the
+    /// sentence here read that a proxied run was unaffected either way, because
+    /// the backends denied everything and allowed the proxy's address back
+    /// whatever this returned — the macOS profile matched `(Some(addr), _)` and
+    /// discarded the flag. Now that the flag reaches the backend, the two inputs
+    /// have to be told apart: `Policy::permits_any_egress` answers true for *any*
+    /// allow rule naming *any* host, so a policy that permits one host would
+    /// otherwise widen the whole sandbox and hand back the direct dial the proxy
+    /// exists to prevent. The per-host rules on a proxied run are the proxy's to
+    /// enforce; `[sandbox] allow_network` is the operator saying they want more
+    /// than that, and it is the only thing that widens here.
     pub(crate) fn with_egress(&self, allow_network: bool) -> Self {
+        let granted = if self.proxy.is_some() {
+            self.config.allow_network
+        } else {
+            allow_network || self.config.allow_network
+        };
         Self {
             config: SandboxConfig {
-                allow_network: allow_network || self.config.allow_network,
+                allow_network: granted,
                 ..self.config.clone()
             },
             roots: self.roots.clone(),
             proxy: self.proxy,
+            inherited_env: self.inherited_env.clone(),
         }
     }
 
@@ -1919,6 +1977,10 @@ impl ExecContainment {
                 Vec::new()
             },
             proxy: self.proxy,
+            // Carried, not recomputed: the declaration is a property of the run,
+            // and a narrower mode narrows what a command may write rather than
+            // what it may read of its own environment.
+            inherited_env: self.inherited_env.clone(),
         }
     }
 
@@ -1956,6 +2018,87 @@ impl ExecContainment {
             .with_mode(self.config.mode)
             .with_writable_roots(&self.roots)
             .with_proxy(self.proxy)
+            .with_inherited_env(&self.inherited_env)
+    }
+}
+
+/// The environment variables the shipped providers read a credential from
+/// (0.83.0).
+///
+/// Fixed, because these three are compiled in: `Anthropic::from_env`,
+/// `OpenRouter::from_env` and `OpenAi::from_env` each name one. `Compatible` is
+/// deliberately absent — it takes its key as an argument and its examples read
+/// whatever variable the caller chose, which is exactly the case
+/// `${env:}` provenance answers and a hard-coded list cannot.
+pub(crate) const PROVIDER_KEY_VARS: [&str; 3] =
+    ["ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"];
+
+/// What a contained child is never deprived of, whatever anything else says
+/// (0.83.0).
+///
+/// **This list is a hard floor and not a default.** The scrub's second source is
+/// the set of variable names a `${env:}` substitution resolved, and that is text
+/// from a configuration file — so without this list a file containing
+/// `command = "${env:HOME}/bin/serve"` would take `HOME` away from every contained
+/// child in the process, and `"${env:PATH}"` would leave every contained command
+/// unable to resolve its own program. Both are denial of service by a string, and
+/// the second is reachable from a file that arrives with a `git clone`.
+///
+/// A credential is never one of these. If a caller genuinely keeps a key in
+/// `PATH`, the scrub is not what will save them.
+const NEVER_SCRUBBED: [&str; 14] = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+];
+
+/// Which environment variables a contained child must not inherit (0.83.0).
+///
+/// [`PROVIDER_KEY_VARS`] plus every name a `${env:}` substitution resolved in a
+/// file this operator owns, minus [`NEVER_SCRUBBED`], minus the names `declared`
+/// opts back in. Sorted and deduplicated so two calls in one run produce the same
+/// list, which is what lets a replayed run stay byte-identical.
+///
+/// Written as a function over its inputs rather than inline at the spawn sites so
+/// it can be asserted directly: a test over the assembled list can say "this name
+/// is removed and this one is not" without spawning anything, and the integration
+/// arms then prove the list reaches a real child.
+pub(crate) fn scrubbed_env(declared: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = PROVIDER_KEY_VARS.iter().map(|s| (*s).to_string()).collect();
+    names.extend(crate::config::interpolated_env_names());
+    names.retain(|name| {
+        !NEVER_SCRUBBED.contains(&name.as_str()) && !declared.iter().any(|d| d == name)
+    });
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Remove the harness's own credentials from a child's environment (0.83.0).
+///
+/// **Every site that builds a `Command` for a contained child calls this**, and
+/// that is the whole of the fix: `run_capped_hooked` is where a `Sandbox::run`
+/// converges, and it is not the only place this crate spawns. The `shell` tool's
+/// stages, a `shell_start` handle's stages, the git built-ins, a CodeAct program
+/// and the browser each build their own `Command` and apply containment
+/// out-of-band — `apply_rlimits`, `contain_command` and `proxy_env` are already
+/// hand-copied into each of them, and a fourth item added to only one copy is a
+/// scrub that covers the path no model reaches for and misses the path it reaches
+/// for first.
+pub(crate) fn scrub_env(cmd: &mut tokio::process::Command, declared: &[String]) {
+    for name in scrubbed_env(declared) {
+        cmd.env_remove(name);
     }
 }
 
@@ -2270,6 +2413,31 @@ async fn run_capped_hooked(
             cmd.env_remove(k);
         }
     }
+    // 0.83.0 — the harness's own credentials are removed from every contained
+    // child, on every rung.
+    //
+    // This is H10, which 0.74.0 named and 0.81.0 closed only where a pid namespace
+    // and its own `/proc` exist — the mount rungs. `linux::rung` returns Landlock
+    // first on every ordinary Linux host, so on the rung a real run actually takes,
+    // a provider key the operator exported has been readable from inside a
+    // contained run in every release to date: out of the child's own `environ`,
+    // and out of `/proc/<harness-pid>/environ`, which the Landlock rung does not
+    // and cannot hide. The site is this one because every backend's spawn
+    // converges here — the crate's own comment in `tests/security_linux.rs` says
+    // so — and a fix installed per rung is a fix the next rung will not have.
+    //
+    // **Not `env_clear`.** A contained command is a toolchain command: `PATH`,
+    // `HOME`, `LANG` and `TMPDIR` are what make one work, and a child that cannot
+    // find `cc` is not a safer child, it is a broken one. What is removed is
+    // named: the three variables the shipped providers read, and every variable
+    // name a `${env:}` substitution resolved while this process loaded its
+    // configuration — an operator who wrote `api_key = "${env:MY_KEY}"` has told
+    // this crate that `MY_KEY` holds a credential, and that is the only way this
+    // crate can know.
+    //
+    // The contract's declaration is the way back, and it is checked
+    // case-sensitively because environment variable names are.
+    scrub_env(&mut cmd, spec.inherited_env);
     // 0.48.0 — and where the run has a proxy, the command is told to use it. This
     // is the one place every backend's spawn converges, so setting it here is what
     // stops `exec` and a `shell` stage from disagreeing about whether a command
@@ -3405,6 +3573,99 @@ mod tests {
         assert!(
             !contained.with_egress(false).config.allow_network,
             "and when neither says so, nothing grants it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 0.83.0 — and a proxied run takes the operator's answer alone
+    // -----------------------------------------------------------------------
+
+    /// The invariant 0.48.0's F7 rests on, which only became load-bearing here.
+    ///
+    /// `Policy::permits_any_egress` is true for *any* allow rule naming *any*
+    /// host, and a proxied run has at least one by construction — that is what
+    /// made it proxied. Before the macOS profile read the flag, widening from
+    /// the policy was harmless because the proxied arm discarded it; now it
+    /// would mean "the policy permits one host" silently granting an unfiltered
+    /// direct dial, and the proxy would become advice.
+    #[test]
+    fn a_proxied_run_is_not_widened_by_its_own_policy() {
+        let addr: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let proxied =
+            ExecContainment::resolve(&SandboxConfig::new(), None, &[]).with_proxy(Some(addr));
+
+        assert!(
+            !proxied.with_egress(true).config.allow_network,
+            "a policy that permits a host is enforced by the proxy, not by \
+             opening the sandbox to everything"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 0.83.0 F6 — the scrub's list, over its two inputs
+    // -----------------------------------------------------------------------
+
+    /// What a contained child is not allowed to inherit, with nothing spawned.
+    ///
+    /// The integration arms in `tests/security_linux.rs` prove this list reaches
+    /// a real child on the rung a real Linux host takes; this proves the list is
+    /// the right one, which a test that only reads a child's `env` cannot say —
+    /// a scrub that removed the wrong three names would look identical there.
+    #[test]
+    fn the_scrub_removes_every_provider_key_by_default() {
+        let scrubbed = scrubbed_env(&[]);
+        for name in PROVIDER_KEY_VARS {
+            assert!(
+                scrubbed.iter().any(|s| s == name),
+                "{name} must not reach a contained child by default: {scrubbed:?}"
+            );
+        }
+    }
+
+    /// The opt-out, and the half of it that matters: declaring one name is not
+    /// declaring the others.
+    #[test]
+    fn a_declared_variable_survives_and_its_neighbours_do_not() {
+        let scrubbed = scrubbed_env(&["OPENAI_API_KEY".to_string()]);
+        assert!(
+            !scrubbed.iter().any(|s| s == "OPENAI_API_KEY"),
+            "a declared name is not scrubbed: {scrubbed:?}"
+        );
+        assert!(
+            scrubbed.iter().any(|s| s == "ANTHROPIC_API_KEY"),
+            "and declaring one says nothing about the rest: {scrubbed:?}"
+        );
+    }
+
+    /// Not an `env_clear`. A contained command is a toolchain command, and the
+    /// four variables below are what make one work — this is the assertion that
+    /// fails if somebody "simplifies" the named list into clearing everything.
+    #[test]
+    fn the_scrub_names_what_it_removes_and_takes_nothing_else() {
+        let scrubbed = scrubbed_env(&[]);
+        for kept in ["PATH", "HOME", "LANG", "TMPDIR"] {
+            assert!(
+                !scrubbed.iter().any(|s| s == kept),
+                "{kept} is what makes a toolchain work and is never removed: {scrubbed:?}"
+            );
+        }
+    }
+
+    /// And the other half: the operator's own section still reaches the backend
+    /// through a proxy, which is the whole point of this release.
+    #[test]
+    fn a_proxied_run_is_widened_by_the_operators_own_section() {
+        let addr: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let config = SandboxConfig {
+            allow_network: true,
+            ..SandboxConfig::new()
+        };
+        let proxied = ExecContainment::resolve(&config, None, &[]).with_proxy(Some(addr));
+
+        assert!(
+            proxied.with_egress(false).config.allow_network,
+            "`sandbox.allow_network = true` is the operator asking for more than \
+             the proxy's host list, and it survives to the backend"
         );
     }
 }

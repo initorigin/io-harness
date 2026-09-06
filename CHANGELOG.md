@@ -26,6 +26,125 @@ notes are produced from it.
 
 ### Security
 
+## [0.83.0] - 2026-09-07
+
+**The boundary a run reports is the boundary it got, and a widened one widens.**
+Three passes over this crate in ten days found the same shape in four places: the
+run reported one boundary and enforced another. `sandbox.allow_network = true`
+reached the macOS backend on no real run, because the profile's proxied arm
+matched `(Some(addr), _)` and discarded the flag — and every real run is proxied.
+0.80.0 shipped the fix for exactly the report io-cli's field test filed, and that
+fix had never executed once. The prompt had the same shape one layer up: it
+computed whether egress was open and then rendered a sentence that ignored the
+answer.
+
+Neither could be caught, because no test in the crate had ever run a provider
+that names an endpoint, so no test run had ever been proxied. Every widening test
+ran unproxied and every proxy test built its proxy by hand; the two halves had
+never met. **That test blindness is the finding — the two code defects are what
+it hid.**
+
+Alongside them, the two security residuals 0.74.0 named rather than closed, both
+live on the common path rather than on a fallback.
+
+### Added
+
+- **`TaskContract::inherited_env` and `with_inherited_env`**, the declaration that
+  lets a named environment variable survive the scrub below. One list, the shape
+  `writable_roots` already has. A child inherits no declaration it did not make,
+  on the same monotone rule `Policy::contain` already enforces.
+- **`RunSpec::inherited_env` and `RunSpec::with_inherited_env`**, the same list at
+  the backend seam, defaulting to none — so a backend driven directly by an
+  embedder gets the scrub without having to ask for it.
+- **`Tool::concurrent`**, a defaulted trait method saying whether a tool may run
+  *beside its siblings*, before the completion that asked for it has settled.
+  `ToolRecovery::Replayable` already said "this may happen twice"; the second
+  property had no way to be said, and speculation needs both. Defaulted to
+  "read-only tools may", which is exactly what the loop did before the method
+  existed.
+
+### Changed
+
+- **A widened proxied run may bind a port.** On macOS the profile now grants
+  `network-bind` and unfiltered outbound on top of the proxy's own address when
+  `sandbox.allow_network` is set. `network-bind` appears nowhere in this crate
+  before this release — not in a profile, not in a test, not in a document — so
+  this is the first release in which listening inside the boundary is a decided
+  behaviour rather than an unconsidered one. A narrow proxied run's profile is
+  byte-identical to 0.82.0's.
+- **On a proxied run, only `[sandbox] allow_network` widens the sandbox.**
+  `Policy::permits_any_egress` answers true for *any* allow rule naming *any*
+  host, and a proxied run has one by construction — that is what made it proxied.
+  Combining the two answers, as 0.80.0 does for an unproxied run, would have let a
+  policy permitting one host hand back the direct dial the proxy exists to
+  prevent. The per-host rules stay the proxy's to enforce, which is what makes
+  them per-host at all.
+- **The boundary sentence the model reads follows the sandbox the run got.**
+  `containment_line`'s proxied branch now selects on the same input the spawn
+  sites do. A proxied run whose sandbox was widened is told its commands' network
+  is open; one that was not is told the proxy permits only the hosts the policy
+  names.
+- **Speculation asks two questions instead of reading `ToolEffect`.** The
+  predicate is now `ToolRecovery::Replayable` **and** `Tool::concurrent`, each
+  asked of the tool. Every toolbox written against an earlier release resolves to
+  what it resolved to before; what is new is that a `Mutating` tool that is
+  genuinely idempotent and concurrency-safe can now say so and be speculated.
+- **`git_log` on a repository with no commits answers in its own words.** git
+  exits 128 with "does not have any commits yet", which is also what it exits for
+  "not a git repository" and for a bad revision — so the model met an error it had
+  to classify on the first call `/commit`'s own prompt invites. Only that message,
+  and only for `git_log`.
+
+### Fixed
+
+- **`sandbox.allow_network = true` reaches the macOS backend on a proxied run.**
+  See above. This is io-cli's field-test finding 1, filed against 0.38.0 and still
+  reproducing on 0.39.0, which pins 0.82.0 — a version containing the 0.80.0 fix.
+- **The prompt no longer computes `egress_open` and then ignores it.** The
+  corrected sentence 0.80.0 wrote was unreachable for every proxied run.
+- **A test run can be proxied.** `MockScript` in `tests/exec_contained.rs` names a
+  TEST-NET-1 endpoint, so `authorize_provider` merges a provider layer, the run's
+  policy names a host, and the egress proxy starts — the way it does for a real
+  run. Without it the two fixes above are unfalsifiable.
+
+### Security
+
+- **The harness's provider credentials are removed from every contained child, on
+  every rung.** H10's fix — a pid namespace with its own `/proc` — exists only on
+  the two mount rungs, and `linux::rung` returns Landlock first on every ordinary
+  Linux host, so a provider key an operator exported has been readable from inside
+  a contained run in every release to date. The scrub lands at
+  `run_capped_hooked`, where every backend's spawn converges. What is removed is
+  named rather than cleared: the three variables the shipped providers read, and
+  every variable name a `${env:}` substitution resolved while this process loaded
+  its configuration. `PATH`, `HOME`, `LANG` and `TMPDIR` are untouched.
+- **A browser child can no longer reach another run's workspace.** It declared the
+  whole system temporary directory as a writable root, and `sandbox::workdir()`
+  puts every run's ephemeral workspace inside it — so a browser under one
+  contained run could read and rewrite every concurrently running run's workspace.
+  That is L11, handed back on the one path 0.81.0's narrowing does not cover. The
+  child now gets a directory inside the profile it owns, with `TMPDIR` pointed at
+  it.
+- **The four issues rated critical in 0.74.0 are disclosed.** Advisory
+  [GHSA-p4qf-q7x8-68m8](https://github.com/initorigin/io-harness/security/advisories/GHSA-p4qf-q7x8-68m8),
+  filed against every version before 0.74.0, and linked from the 0.74.0 section of
+  this file.
+- **`SECURITY.md` names a reporting channel that exists.** It told reporters to
+  email the literal string `<project-contact-email>` for eight releases. Reports
+  now go through GitHub private vulnerability reporting, which is enabled on the
+  repository, and a gate fails the build on any unfilled placeholder in that file.
+
+### Migration
+
+- **An embedder whose contained run reads a provider key from its own environment
+  must declare it.** `TaskContract::with_inherited_env(["THE_VARIABLE"])`, or the
+  child stops seeing it. This is the release's one break and it is deliberate; the
+  failure surfaces inside the child as an authentication error rather than as a
+  refusal from this crate, which is why it is stated here rather than left to be
+  discovered.
+- A recording made before 0.83.0 replays unchanged: nothing here alters the
+  request bytes.
+
 ## [0.82.0] - 2026-09-06
 
 **A run assembles under the window of the model it is actually asking, on every
@@ -1413,6 +1532,14 @@ half a fix.
   tree walk of `%SystemRoot%` to remove an ACE it had never written.
 
 ### Security
+
+- **Advisory [GHSA-p4qf-q7x8-68m8](https://github.com/initorigin/io-harness/security/advisories/GHSA-p4qf-q7x8-68m8)**
+  covers the four issues rated critical in this release — the macOS profile
+  injection, the ungated post-write checker, the project-scope `[[provider]]`
+  redirect, and the project-scope `[[mcp]]`/`[[lsp]]` spawn. It was published in
+  0.83.0 rather than alongside this release, which was the gap: the fixes shipped
+  here on 2026-09-01 and were described below, and no advisory was filed at the
+  time. Every version before 0.74.0 is affected.
 
 - **The gate is on the post-edit path.** The reflex that runs a project's own
   checker after every successful write called `Exec::new` directly, with no

@@ -351,6 +351,73 @@ pub trait Tool: Send + Sync {
         }
     }
 
+    /// May this tool run *beside its siblings*, before the completion asking for
+    /// it has settled (0.83.0)?
+    ///
+    /// Speculation starts a call while the provider is still streaming the step
+    /// that asked for it, which asks two separate things of a tool, and until this
+    /// release the loop only had a name for one of them.
+    /// [`ToolRecovery::Replayable`] says *this may happen twice* — the settled
+    /// completion may abandon the position, and the work started for it is
+    /// discarded. This says *this may run alongside whatever else this step is
+    /// doing*, which is a different property: an idempotent write to one row is
+    /// replayable and is still not something to start beside a sibling that reads
+    /// the same table.
+    ///
+    /// Speculation now needs both, and this is the half that had no way to be
+    /// said. `false` is not a refusal to speculate one call — a call that cannot
+    /// be speculated closes speculation for the rest of the step, because the
+    /// positions after it depend on a completion that has not settled.
+    ///
+    /// **Defaulted to "read-only tools may, and nothing else does"**, which is
+    /// exactly what the loop did before this method existed, so every toolbox
+    /// written against an earlier release behaves identically.
+    ///
+    /// Override it to `true` on a [`ToolEffect::Mutating`] tool only when the
+    /// tool is *also* [`ToolRecovery::Replayable`] — the loop checks both, and
+    /// declaring this alone changes nothing. One further condition is the run's,
+    /// not the tool's: a speculated registered call is put to the policy as
+    /// `Act::Exec` on its own name before it starts, exactly as a dispatched one
+    /// is, so a tool the policy would refuse is not started early either.
+    ///
+    /// ```
+    /// # use io_harness::tools::{Tool, ToolEffect, ToolFuture, ToolRecovery};
+    /// # use io_harness::ToolSpec;
+    /// # use serde_json::{json, Value};
+    ///
+    /// struct Warm;
+    ///
+    /// impl Tool for Warm {
+    ///     # fn spec(&self) -> ToolSpec {
+    ///     #     ToolSpec { name: "warm_cache".into(),
+    ///     #                description: "Fill a cache entry; twice writes the same bytes.".into(),
+    ///     #                parameters: json!({"type": "object"}) }
+    ///     # }
+    ///     # fn invoke<'a>(&'a self, _a: &'a Value) -> ToolFuture<'a> {
+    ///     #     Box::pin(async { Ok("warm".to_string()) })
+    ///     # }
+    ///     fn effect(&self) -> ToolEffect {
+    ///         ToolEffect::Mutating
+    ///     }
+    ///     // Writing the entry twice writes the same bytes …
+    ///     fn recovery(&self) -> ToolRecovery {
+    ///         ToolRecovery::Replayable
+    ///     }
+    ///     // … and it touches nothing another call in this step reads.
+    ///     fn concurrent(&self) -> bool {
+    ///         true
+    ///     }
+    /// }
+    ///
+    /// assert!(Warm.concurrent());
+    /// ```
+    ///
+    /// Read before the call is made, so — as with [`Tool::effect`] and
+    /// [`Tool::recovery`] — it must answer the same way every time.
+    fn concurrent(&self) -> bool {
+        matches!(self.effect(), ToolEffect::ReadOnly)
+    }
+
     /// The containment mode this tool needs (0.48.0).
     ///
     /// Defaulted to `None`, which means *whatever this run was granted* — so a

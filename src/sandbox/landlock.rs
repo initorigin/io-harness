@@ -260,7 +260,22 @@ pub(crate) fn plan(
     // A proxy means the same thing to this rung as a denial does — take control
     // of outbound TCP — and then hands one port back. Without the first half the
     // second would be a rule on an access nothing was restricting.
-    let handled_net = net_rights_for(abi, deny_egress || proxy_port.is_some());
+    //
+    // **0.83.0 — unless the operator widened the sandbox.** `deny_egress` is
+    // `!allow_network`, so `deny_egress || proxy.is_some()` meant a widened run
+    // still had TCP taken over the moment its policy named a host — which is
+    // every real run — and `net_ports` holds only the proxy's port, with no bind
+    // rule anywhere. A dev server could not listen and a command could not dial
+    // anything but the proxy, on the rung `linux::rung` returns first on every
+    // ordinary Linux host. That is the same defect this release fixes in the
+    // macOS profile, in the same release, on the other platform: fixing one and
+    // not the other is the halves failure 0.81.0 paid for.
+    //
+    // Widened now means widened here too: no handled network access, so bind and
+    // connect are both unrestricted. Narrow is unchanged in both of its
+    // shapes — proxied, where the one port comes back, and unproxied, where
+    // nothing does.
+    let handled_net = net_rights_for(abi, deny_egress);
     let net_ports: Vec<u16> = if handled_net == 0 {
         Vec::new()
     } else {
@@ -769,10 +784,14 @@ mod tests {
         );
         assert!(denied.restricts_network(), "a run that denied egress");
 
+        // 0.83.0 — `true`, because this arm is about a run whose TCP *is* scoped,
+        // and that is the narrow proxied one. It passed `false` — a widened run —
+        // and still asserted the narrow answer, because until this release the
+        // widened flag was discarded the moment a proxy existed.
         let proxied = plan(
             4,
             ExecMode::WorkspaceWrite,
-            false,
+            true,
             Path::new("/w"),
             &[],
             Path::new("/tmp"),
@@ -780,7 +799,7 @@ mod tests {
         );
         assert!(
             proxied.restricts_network(),
-            "a proxied run's UDP must not walk past the port its TCP is scoped to"
+            "a narrow proxied run's UDP must not walk past the port its TCP is scoped to"
         );
 
         let open = plan(
@@ -795,6 +814,25 @@ mod tests {
         assert!(
             !open.restricts_network(),
             "a run that may reach the network keeps every socket it had"
+        );
+
+        // 0.83.0 — and a widened run keeps them whether or not it owns a proxy.
+        // The filter exists so UDP cannot walk past a TCP scoping; where there is
+        // no scoping there is nothing to walk past, and refusing datagrams to a
+        // run whose operator opened the network would be a boundary nobody asked
+        // for. The proxy still carries this harness's own requests.
+        let widened_proxied = plan(
+            4,
+            ExecMode::WorkspaceWrite,
+            false,
+            Path::new("/w"),
+            &[],
+            Path::new("/tmp"),
+            Some(54321),
+        );
+        assert!(
+            !widened_proxied.restricts_network(),
+            "a widened run keeps every socket it had, proxy or no proxy"
         );
     }
 
@@ -950,13 +988,22 @@ mod tests {
     /// back. Port-scoped, never address-scoped: that is the ceiling of the
     /// kernel interface and it is asserted here so nobody reads the rung as
     /// per-host enforcement.
+    ///
+    /// **0.83.0 — the first arm asked for the widened case and asserted the
+    /// narrow answer.** It passed `deny_egress: false`, which is
+    /// `allow_network = true`, and required the network to be handled anyway,
+    /// because the condition was `deny_egress || proxy.is_some()`. That is the
+    /// macOS `(Some(addr), _)` defect on the other platform: a widened run whose
+    /// policy names a host — every real widened run — could not bind and could
+    /// dial nothing but the proxy. The arm now asks the narrow question it was
+    /// always about, and the widened one is beside it.
     #[test]
-    fn a_proxy_handles_the_network_and_allows_only_its_port() {
+    fn a_narrow_proxied_run_handles_the_network_and_allows_only_its_port() {
         // ABI 4 is where the network rules arrive.
         let with = plan(
             4,
             ExecMode::WorkspaceWrite,
-            false,
+            true,
             Path::new("/w"),
             &[],
             Path::new("/tmp"),
@@ -964,11 +1011,11 @@ mod tests {
         );
         assert_ne!(
             with.handled_net, 0,
-            "a proxied run restricts outbound TCP even though its policy permits egress"
+            "a narrow proxied run restricts outbound TCP to the proxy"
         );
         assert_eq!(with.net_ports, vec![54321]);
 
-        // Without one, nothing changes from 0.47.0: a run permitting egress
+        // Without a proxy, nothing changes from 0.47.0: a run permitting egress
         // handles no network access at all.
         let without = plan(
             4,
@@ -987,7 +1034,7 @@ mod tests {
         let old = plan(
             3,
             ExecMode::WorkspaceWrite,
-            false,
+            true,
             Path::new("/w"),
             &[],
             Path::new("/tmp"),
@@ -995,6 +1042,40 @@ mod tests {
         );
         assert_eq!(old.handled_net, 0);
         assert!(old.net_ports.is_empty());
+    }
+
+    /// 0.83.0 — a widened run may bind and dial on this rung too.
+    ///
+    /// The Linux half of the release's first claim, and the half that was
+    /// missing. Landlock's `NET_BIND_TCP` is expressed as a list of permitted
+    /// ports, so "may listen on any port" is only sayable by handling no network
+    /// access at all — which is also what "may dial anything" means here. A
+    /// widened proxied run is therefore the same shape as a widened unproxied
+    /// one, and the proxy remains what the harness's *own* requests go through.
+    ///
+    /// Sabotage: restore `deny_egress || proxy_port.is_some()` and the first
+    /// assertion fails while the narrow arms above stay green.
+    #[test]
+    fn a_widened_run_handles_no_network_access_with_or_without_a_proxy() {
+        for proxy in [Some(54321_u16), None] {
+            let widened = plan(
+                4,
+                ExecMode::WorkspaceWrite,
+                false,
+                Path::new("/w"),
+                &[],
+                Path::new("/tmp"),
+                proxy,
+            );
+            assert_eq!(
+                widened.handled_net, 0,
+                "a widened run must be able to bind a port and dial: {proxy:?}"
+            );
+            assert!(
+                widened.net_ports.is_empty(),
+                "and a port list on an unhandled access is a rule on nothing: {proxy:?}"
+            );
+        }
     }
 
     /// Every right named in a rule must be one the rule set said it handles, or

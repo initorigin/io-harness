@@ -45,7 +45,12 @@ impl Sandbox for MacosSandbox {
             .with_network(spec.allow_network)
             .with_mode(spec.mode)
             .with_writable_roots(spec.writable_roots)
-            .with_proxy(spec.proxy);
+            .with_proxy(spec.proxy)
+            // 0.83.0 — forwarded, like every other field. A rung that rebuilds the
+            // spec and drops this would silently un-declare what the contract
+            // declared, and the scrub would then remove a variable the embedder
+            // said their run needs. Every rung that wraps must forward every field.
+            .with_inherited_env(spec.inherited_env);
         run_capped(Backend::MacosSandboxExec, wspec, move |cmd| {
             // Keep rustc's temp writes inside the confined workdir — except under
             // `ReadOnly`, where the workdir is exactly what may not be written to
@@ -167,8 +172,30 @@ fn try_profile_for(
     // exactly, so on this platform "the proxy is the only route out" is a kernel
     // decision rather than a convention a payload could ignore. The deny comes
     // first because the last matching rule wins.
+    // 0.83.0 — the arm above was `(Some(addr), _)`, and the `_` was the defect.
+    // An operator who wrote `sandbox.allow_network = true` got the narrow proxied
+    // profile on every real run, because every real run is proxied: the flag
+    // reached this function and this match discarded it. 0.80.0's fix — the one
+    // that made `ExecContainment::with_egress` combine rather than replace — has
+    // therefore never executed once.
+    //
+    // A widened proxied run keeps the proxy allowance and adds two grants:
+    // `network-bind`, so a command inside the boundary can serve a port (a dev
+    // server is the case the io-cli field test named), and unfiltered
+    // `network-outbound`, because an operator who widened the sandbox meant the
+    // network and not the proxy's host list. That is wider than the proxy, and it
+    // is what widening means; the narrow arm below is unchanged and is what a run
+    // that asked for nothing still gets.
     let net = match (proxy, allow_network) {
-        (Some(addr), _) => format!(
+        (Some(addr), true) => format!(
+            "(deny network*)\n\
+             (allow network-outbound (remote ip \"localhost:{}\"))\n\
+             (allow network-bind)\n\
+             (allow network-inbound)\n\
+             (allow network-outbound)",
+            addr.port()
+        ),
+        (Some(addr), false) => format!(
             "(deny network*)\n(allow network-outbound (remote ip \"localhost:{}\"))",
             addr.port()
         ),
@@ -262,9 +289,15 @@ mod tests {
     #[test]
     fn a_proxy_denies_everything_and_allows_the_loopback_port_back() {
         let addr: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        // 0.83.0 — this call passed `true` until now, and the profile it got back
+        // was the narrow one, because the arm it took ignored the flag. The
+        // narrow proxied run is what this test is about, so it now asks for it:
+        // the widened proxied run is `a_widened_proxied_run_may_bind_and_dial`
+        // below, and until that test existed there was nothing to notice that
+        // this one was passing a value the code discarded.
         let p = profile_for(
             Path::new("/tmp/sbx"),
-            true,
+            false,
             ExecMode::WorkspaceWrite,
             &[],
             Some(addr),
@@ -274,11 +307,86 @@ mod tests {
             p.contains("(allow network-outbound (remote ip \"localhost:54321\"))"),
             "and exactly the proxy is allowed back: {p}"
         );
-        // Even though the run permits egress: with a proxy, permission is the
-        // proxy's decision to make per host, not the profile's to grant wholesale.
+        // A run that widened nothing gets no blanket allow: with a proxy and no
+        // widening, permission is the proxy's decision to make per host.
         assert!(
             !p.contains("(allow network*)"),
             "no blanket allow survives: {p}"
+        );
+        assert!(
+            !p.contains("(allow network-bind)"),
+            "and nothing may listen: {p}"
+        );
+    }
+
+    /// 0.83.0 F1 — a widened sandbox reaches this backend on a proxied run.
+    ///
+    /// The defect this replaces: the proxied arm matched `(Some(addr), _)`, so
+    /// `sandbox.allow_network = true` produced the narrow profile on every run
+    /// that had a proxy — which is every real run, because a run whose policy
+    /// names hosts is proxied and a run with a provider names one. The io-cli
+    /// field test of 2026-09-05 reproduced it three ways and read it as the
+    /// sandbox being unwidenable from any setting.
+    ///
+    /// Both arms, because a criterion that only asserts the grant cannot tell a
+    /// widened boundary from an absent one, and the control is byte-level rather
+    /// than a substring: the failure to guard against is a fix that widens by
+    /// widening everything.
+    #[test]
+    fn a_widened_proxied_run_may_bind_and_dial() {
+        let addr: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let narrow = profile_for(
+            Path::new("/tmp/sbx"),
+            false,
+            ExecMode::WorkspaceWrite,
+            &[],
+            Some(addr),
+        );
+        let widened = profile_for(
+            Path::new("/tmp/sbx"),
+            true,
+            ExecMode::WorkspaceWrite,
+            &[],
+            Some(addr),
+        );
+
+        assert!(
+            widened.contains("(allow network-bind)"),
+            "a widened proxied run may serve a port: {widened}"
+        );
+        // Binding is not serving. `network-bind` gets a listening socket onto a
+        // port and `network-inbound` is what lets it accept a connection, and the
+        // widened *unproxied* arm has both because `(allow network*)` covers
+        // them — so without this the two widened arms would disagree about what
+        // widening means and the dev-server case would half-work.
+        assert!(
+            widened.contains("(allow network-inbound)"),
+            "and may accept the connection it is listening for: {widened}"
+        );
+        assert!(
+            widened.contains("(allow network-outbound)"),
+            "and may dial without the proxy scoping it, which is what widening \
+             means: {widened}"
+        );
+        assert!(
+            widened.contains("(allow network-outbound (remote ip \"localhost:54321\"))"),
+            "and the proxy this run owns is still reachable: {widened}"
+        );
+
+        // The control. Everything the widening adds is those two lines and
+        // nothing else moves — same workdir clause, same write denials, same
+        // proxy allowance, in the same order.
+        assert_eq!(
+            widened,
+            narrow.replace(
+                "(allow network-outbound (remote ip \"localhost:54321\"))",
+                "(allow network-outbound (remote ip \"localhost:54321\"))\n\
+                 (allow network-bind)\n\
+                 (allow network-inbound)\n\
+                 (allow network-outbound)"
+            ),
+            "the widened proxied profile differs from the narrow one in the two \
+             grants and in nothing else"
         );
     }
 

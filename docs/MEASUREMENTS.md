@@ -9,6 +9,60 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What a run's cache hit rate actually is (0.83.0)
+
+**What is being measured.** `Spend::cache_hit_rate` over a whole live run —
+cache-read tokens as a fraction of prompt tokens, across every call the run made.
+The accounting layer has recorded the number since 0.75.0 and no page had ever
+printed one, because the only way to get it is a multi-turn run against a vendor
+that caches, which is a cost this file's own standing rule says to pay rather
+than to guess around.
+
+**Why it is measured here at all.** The entry two sections below records that a
+tool mask's benefit "is a cache hit rate on a live run over several turns, and
+this release did not take it". This is that number. It does not settle the mask
+question on its own — that needs the same run with the mask off — but it settles
+the denominator, which was the part nobody knew.
+
+**Method.** `cargo run --example live_accounting` with `OPENROUTER_API_KEY` set
+and `OPENROUTER_MODEL=anthropic/claude-sonnet-4`. An Anthropic slug on purpose:
+an OpenAI-family model caches a repeated prefix by itself, which would report
+cached tokens that owe nothing to this crate's marker. A six-step workspace run
+over three small source files, ending in one edit. Measured 2026-09-07 on an
+Apple silicon laptop against OpenRouter; the vendor's cache clock is theirs, not
+ours, so a re-run minutes later is the same measurement and a re-run hours later
+may not be.
+
+**The numbers.**
+
+| | |
+| --- | --- |
+| Provider calls | 6 |
+| Prompt tokens across the run | 40,076 |
+| Cache-read tokens across the run | 27,150 |
+| `Spend::cache_hit_rate` | **0.677** |
+| Cache-write tokens reported | none — OpenRouter reports no write counter for this route |
+
+**The shape is more interesting than the ratio, and it was not what was
+expected.** Cache-read tokens were **5,430 on every step after the first, exactly
+and unchangingly**, while the prompt grew from 6,035 to 8,168 tokens as the run
+accumulated observations. The cached prefix is the system block 0.38.0 marks and
+nothing else: everything a step adds is new tokens at full price. So the hit rate
+a longer run reports *falls*, not because caching degrades but because the
+denominator grows against a fixed numerator — 0.677 is a six-step number and a
+twenty-step run of the same shape would report less.
+
+**What that means for the mask question.** It bounds the prize. A tool mask
+protects the cacheable prefix, and the prefix here is worth 5,430 tokens a step;
+whatever a mask saves, it cannot save more than the prefix is worth, and it costs
+nothing to keep. It also says where the real spend is — the growing history, which
+is what the compaction ladder addresses and what `[run.context] max_tokens`
+bounds.
+
+**What it does not measure.** One vendor, one route, one model, one moment, and
+one prompt shape. It says nothing about a provider that reports a write counter,
+about a longer horizon, or about what the same run costs with the mask off.
+
 ## What each compaction rung costs and keeps (0.81.0)
 
 **What is being measured.** The first thing this crate's own evaluation suite was

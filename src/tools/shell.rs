@@ -1439,6 +1439,13 @@ impl Shell {
                 for (k, v) in crate::sandbox::proxy_env(sb.containment.proxy) {
                     cmd.env(k, v);
                 }
+                // 0.83.0 — and it does not carry the harness's own credentials.
+                // This block is a hand-copy of `run_capped_hooked`'s pre-spawn
+                // work, and the scrub is the fourth item in it; a stage is the
+                // first thing a model reaches for, so a scrub installed only at
+                // the `Sandbox::run` path would have covered the path nothing
+                // takes and missed this one.
+                crate::sandbox::scrub_env(&mut cmd, &sb.containment.inherited_env);
             }
 
             // A detached line's stages go into containment of their own, and a

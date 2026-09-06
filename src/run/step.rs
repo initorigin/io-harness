@@ -810,6 +810,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
         &contract.exec_sandbox,
         toolchain.as_ref(),
         &contract.writable_roots,
+        &contract.inherited_env,
     );
     // 0.48.0 — the run owns its proxy, and the containment carries the address so
     // every spawn site scopes the sandbox to it without asking a second question.
@@ -2393,7 +2394,10 @@ pub(super) async fn lsp_for(
 /// configures one and never browses pays for no process at all.
 #[cfg(feature = "browser")]
 pub(super) fn browser_for(contract: &TaskContract, _policy: &Policy) -> BrowserSession {
-    BrowserSession::new(contract.browser.clone())
+    // 0.83.0 — the run's declared roots travel with the session. The browser child
+    // is confined to a profile it owns, and a browser doing work that is not
+    // self-contained declares the directory the same way any other child does.
+    BrowserSession::new(contract.browser.clone(), contract.writable_roots.clone())
 }
 
 #[cfg(not(feature = "browser"))]

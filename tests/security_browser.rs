@@ -128,12 +128,18 @@ fn permitted() -> Policy {
         .allow_exec("*")
 }
 
+/// 0.83.0 — the fixture's record file is declared, for the reason
+/// `tests/browser.rs`'s own `contract` states: the browser child is no longer
+/// granted the whole system temporary directory, which is where this test's
+/// `tempdir` lives, and the fixture writes its record beside the test that
+/// started it.
 fn contract(root: &Path) -> TaskContract {
     TaskContract::workspace("look at the page", root)
         .with_verification(Verification::WorkspaceFileContains {
             file: "done.txt".into(),
             needle: "ok".into(),
         })
+        .with_writable_roots([root])
         .with_max_steps(6)
 }
 

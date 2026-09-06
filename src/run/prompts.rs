@@ -334,15 +334,22 @@ pub(super) const MAX_BOUNDARY_PATTERNS: usize = 24;
 /// rather than per call keeps `select`'s host probe and the toolchain's cache
 /// derivation off the dispatch path, and — the reason that matters — stops the
 /// flat loop and the tree loop from ever disagreeing about what a mode grants.
+///
+/// 0.83.0 — `inherited_env` is a parameter rather than something a caller
+/// remembers to attach afterwards, so adding it was a compile error at both
+/// loops rather than a grep. `tool_tiers` reached the flat loop and not the tree
+/// loop in 0.81.0 for exactly the want of that.
 pub(super) fn exec_containment(
     config: &SandboxConfig,
     toolchain: Option<&Toolchain>,
     declared: &[std::path::PathBuf],
+    inherited_env: &[String],
 ) -> Option<std::sync::Arc<crate::sandbox::ExecContainment>> {
     config.mode.is_contained().then(|| {
-        std::sync::Arc::new(crate::sandbox::ExecContainment::resolve(
-            config, toolchain, declared,
-        ))
+        std::sync::Arc::new(
+            crate::sandbox::ExecContainment::resolve(config, toolchain, declared)
+                .with_inherited_env(inherited_env.to_vec()),
+        )
     })
 }
 
@@ -660,7 +667,10 @@ pub(super) async fn probe_tree_boundary(
         return probe;
     }
     let toolchain = crate::toolchain::detect(root);
-    let containment = exec_containment(config, toolchain.as_ref(), &[]);
+    // No contract in scope here, and `&[]` is the right answer rather than a
+    // placeholder: the probe's own children are the harness's, not the operator's
+    // run, and nothing they do needs a provider key.
+    let containment = exec_containment(config, toolchain.as_ref(), &[], &[]);
     // Depth 0: the tree's boundary is measured before the root agent runs, and it
     // is the root's row.
     probe_boundary(store, watch, 0, run_id, config, containment.as_deref()).await
@@ -837,7 +847,34 @@ pub(super) fn containment_line(
     // watched leave without the proxy scoping it. `None` is an attempt that could
     // not be made, and an attempt that could not be made is evidence of nothing —
     // so it gets its own sentence rather than borrowing either of the others.
-    let egress = if proxied {
+    // 0.83.0 — the proxied branch is asked about `egress_open` before it is asked
+    // about the probe, and until now it was never asked at all. `egress_open` is
+    // computed at the call site and handed in, and the three arms below all
+    // describe a run whose only route out is the proxy — so a proxied run whose
+    // sandbox was widened got a sentence naming the provider's host as the only
+    // reachable one while the operator had opened the network. That is the exact
+    // reading the io-cli field test made of the *unproxied* sentence 0.80.0
+    // corrected, on the branch 0.80.0's correction could not reach: every real
+    // run is proxied, so the corrected sentence has never been rendered.
+    //
+    // The proxy is still named, because it is still there and still scopes what
+    // *this harness* dials. What changed is which of the two the sentence says
+    // bounds the commands.
+    //
+    // **`config.allow_network` and not `egress_open`, and the difference is the
+    // whole sentence.** `egress_open` is `sandbox.allow_network ||
+    // policy.permits_any_egress()`, and the second half is true for any allow
+    // rule naming any host — which a proxied run has by construction, because
+    // that is what made it proxied. Reading it here would tell every proxied run
+    // that its commands' network is open while `ExecContainment::with_egress`
+    // gives them the narrow profile, which is this release's own defect pointed
+    // the other way. The two sites answer the same question and must answer it
+    // from the same input.
+    let egress = if proxied && config.allow_network {
+        " Outbound network is open to the commands you run: this run's sandbox grants it \
+         wholesale rather than per host, so the proxy this run owns bounds what this harness \
+         dials on your behalf and not what a command you run may reach."
+    } else if proxied {
         match probe.dial_refused {
             Some(true) => {
                 " Outbound network goes through a proxy this run owns, which permits only the \

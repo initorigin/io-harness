@@ -4,6 +4,29 @@ Start a long task and walk away: a run survives a crash or a full process
 restart, so the harness can run unattended for a long horizon (24h+) with no
 user input and pick up exactly where it stopped.
 
+## The category, for a reader arriving from somewhere else
+
+This is **durable execution** applied to an agent loop, and the words are worth
+writing down once because they are what a reader coming from Temporal, Restate or
+LangGraph is looking for and this guide had never said.
+
+The primitives that category names are here, in this crate's own vocabulary:
+
+| The usual name | What it is called here |
+| --- | --- |
+| Durable state / event history | The rusqlite trace, committed per step in one transaction |
+| Deterministic replay | A completed step is *skipped*, not re-run; an applied edit is re-observed |
+| Activity / side-effect boundary | [`ToolEffect`](https://docs.rs/io-harness/latest/io_harness/tools/enum.ToolEffect.html) and [`ToolRecovery`](https://docs.rs/io-harness/latest/io_harness/tools/enum.ToolRecovery.html) — an indeterminate effect pauses a resume rather than guessing |
+| Worker lease / fencing token | The run lease and its generation, which is what stops two processes resuming one run |
+| Signal / human-in-the-loop await | An approval that outlives the process, delivered by `resume_tree_with_decision` |
+
+Two differences are worth stating in the same breath, because they are the
+reasons to choose this and the reasons not to. There is **no workflow server**:
+durability is a file, the process is yours, and nothing is scheduled for you
+across a fleet. And the unit of durability is a **step of an agent loop** rather
+than an arbitrary function, so what resumes is a conversation with a budget, a
+policy and a boundary — not a general-purpose workflow.
+
 - **Checkpoint after every step, transactionally** — each completed step's trace
   row, its budget draw, and a checkpoint marker are committed in one rusqlite
   transaction. The committed checkpoint *is* the step's completion marker: a crash

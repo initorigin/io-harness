@@ -675,6 +675,17 @@ impl Session {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        // 0.83.0 — a program builds its own `Command` and never reaches
+        // `run_capped_hooked`, so the scrub is installed here as well. It is the
+        // same argument the block above makes about `allow_network`: a program
+        // reaches the network only through this crate's own gated tools, and it
+        // reaches a provider key through nothing at all.
+        crate::sandbox::scrub_env(
+            &mut cmd,
+            containment
+                .map(|c| c.inherited_env.as_slice())
+                .unwrap_or(&[]),
+        );
 
         let mut contained = None;
         if let Some(c) = containment {

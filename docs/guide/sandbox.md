@@ -26,6 +26,30 @@ every such execution through a boundary:
   and each teardown land in the rusqlite trace, so an operator can audit *where*
   each piece of code ran and *how* it was isolated.
 
+### Binding a port inside the boundary, and what a proxy does to it
+
+A widened run — `sandbox.allow_network = true` — may **listen**, so a dev server
+inside the boundary can serve a port. That is the answer as of 0.83.0, and it is
+worth stating because through 0.82.0 it was not: a run whose policy names any
+host owns an egress proxy, and the macOS profile's proxied arm discarded
+`allow_network` outright, so on every real run the flag reached the backend and
+changed nothing.
+
+The ceiling under a proxy is now this, and the two halves are separate on
+purpose:
+
+- **`[sandbox] allow_network` widens the sandbox.** On a widened proxied run the
+  profile grants `network-bind` and unfiltered outbound, on top of the proxy's own
+  address. An operator who widened deliberately gets the network, not the proxy's
+  host list.
+- **The policy's per-host rules do not.** They are enforced *by the proxy*, which
+  is what makes them per-host at all; a `net` allow rule naming one host does not
+  open the sandbox, and a command that dials past the proxy is refused by the
+  kernel whatever the policy says about that host.
+
+On a run with no proxy the two collapse into one boolean, which is every release
+before 0.48.0 and every run whose policy names no host.
+
 The default caps are sized so an ordinary `rustc`/`cargo` verification passes
 out of the box — a default that failed real compiles would push callers to
 disable the sandbox entirely: 60 CPU seconds, 120 wall-clock seconds, 2 GiB
