@@ -194,6 +194,37 @@ async fn fan_out(dir: &tempfile::TempDir, worktree: bool) -> (Store, i64) {
     (store, result.run_id)
 }
 
+/// What the run itself said about a spawn that did not get its checkout (0.81.0).
+///
+/// Issue #232's complaint, applied to a third site: a test that cannot tell "slow"
+/// from "broken" reports both the same way, and an assertion that only counts
+/// directories points its reader at the count. A `git worktree add` that failed is
+/// reported to the parent as an observation, so the reason is in the store — it was
+/// simply never read.
+///
+/// Empty means the spawns did not report a failure, which is itself the useful
+/// half: a missing checkout with nothing said about it is a different defect from
+/// one git refused.
+fn spawn_failures(store: &Store, run_id: i64) -> String {
+    let lines: Vec<String> = store
+        .steps(run_id)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|s| {
+            s.result
+                .lines()
+                .filter(|l| l.contains("worktree") || l.contains("could not spawn"))
+                .map(|l| format!("  step {}: {}", s.step, l.trim()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if lines.is_empty() {
+        "  (the run reported no spawn failure)".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 /// Every `.worktrees/*` directory that exists under the root.
 fn worktrees(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let dir = root.join(".worktrees");
@@ -215,11 +246,17 @@ async fn two_concurrent_children_with_their_own_worktrees_do_not_collide() {
         return;
     }
     let dir = repo();
-    let (_store, _root) = fan_out(&dir, true).await;
+    let (store, root) = fan_out(&dir, true).await;
 
     // Two worktrees, one per child, at derived paths under `.worktrees/`.
     let trees = worktrees(dir.path());
-    assert_eq!(trees.len(), 2, "one worktree per child: {trees:?}");
+    assert_eq!(
+        trees.len(),
+        2,
+        "one worktree per child, and a missing one is a spawn that failed rather \
+         than a count that is wrong.\ngot: {trees:?}\nwhat the run said:\n{}",
+        spawn_failures(&store, root)
+    );
 
     // Each holds its own content, and the two differ. This is the whole claim:
     // both writes survived.
