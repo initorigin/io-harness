@@ -31,6 +31,23 @@ notes are produced from it.
 - **`io_harness::context::FALLBACK_MAX_TOKENS`**, the 24,000-token constant, now
   named and documented as the fallback rather than sitting unlabelled inside
   `ContextBudget::default`.
+- **Three compaction rungs between Context Collapse and a fold**, as
+  `io_harness::context::Ladder`, with every rung off by default. *Reduction* is
+  lossless: the memory block's quarter of the ceiling is trimmed towards a floor so
+  the observations get the room, and only when the ledger will not fit. *Snip*
+  drops old lookups by kind — a `find` from thirty steps ago is not load-bearing,
+  and a read, a command's output or a skill body is a finding rather than a lookup
+  and is kept. *Microcompact* replaces a contiguous run of one step's results with
+  a counted line, mechanically and with no model call, which is what keeps
+  `assemble` a pure function and keeps the rung deterministic enough for the
+  evaluation suite to score. The fold stays the last rung and stays the default
+  trigger.
+- **`[run] compaction`, `[run] collapse` and `[run] ladder` in `io.toml`.**
+  `Compaction` and `Collapse` have been serde-ready since they were written and no
+  config key deserialized them, so an operator could choose a fold threshold or a
+  projection only in Rust — and writing one in a config file was a hard parse
+  error. The assembly trace names every rung that ran, so a reader can tell a
+  reduction from a snip from a fold.
 - **An in-crate evaluation suite, `io_harness::eval`.** A `Case` is a task contract
   plus the outcome that decides it; a `Scorer` turns a finished run into one number;
   a `Suite` runs the cases over a `Replay` and reports both. Four scorers ship:

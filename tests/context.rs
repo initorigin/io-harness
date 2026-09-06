@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use io_harness::context::{
     assemble, entry_cap_chars, estimate_tokens, Assembled, Assembly, Collapse, Compaction,
-    ContextBudget, Ledger, ObsKind, Observation, Origin, Piece,
+    ContextBudget, Ladder, Ledger, ObsKind, Observation, Origin, Piece,
 };
 use io_harness::provider::{CompletionRequest, CompletionResponse, Message, ToolCall};
 use io_harness::tools::{Tool, ToolFuture, Toolbox, Workspace};
@@ -436,6 +436,7 @@ async fn a_policy_refused_reread_is_a_stub_naming_the_invalidating_step_and_the_
         &[],
         Assembly {
             collapse: Collapse::default(),
+            ladder: Ladder::default(),
             ws: Some(&ws),
             policy: &policy,
             store: &store,
@@ -693,6 +694,7 @@ async fn assembling_one_turn_costs_a_bounded_amount_of_time() {
             &[],
             Assembly {
                 collapse: Collapse::default(),
+                ladder: Ladder::default(),
                 ws: Some(&workspace),
                 policy: &policy,
                 store: &store,
@@ -792,6 +794,7 @@ async fn two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_colla
         &[],
         Assembly {
             collapse: Collapse::default(),
+            ladder: Ladder::default(),
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -860,6 +863,7 @@ async fn a_re_read_cannot_escape_the_workspace_root() {
         &[],
         Assembly {
             collapse: Collapse::default(),
+            ladder: Ladder::default(),
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -939,6 +943,7 @@ async fn the_rendered_note_block_is_byte_identical_whatever_run_id_the_notes_car
                 &[],
                 Assembly {
                     collapse: Collapse::default(),
+                    ladder: Ladder::default(),
                     ws: None,
                     policy,
                     store,
@@ -1095,6 +1100,7 @@ async fn a_long_runs_stubs_collapse_so_the_ceiling_still_holds() {
         &[],
         Assembly {
             collapse: Collapse::default(),
+            ladder: Ladder::default(),
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -1370,6 +1376,7 @@ async fn a_surviving_result_keeps_the_position_of_the_call_it_answers() {
         &[],
         Assembly {
             collapse: Collapse::default(),
+            ladder: Ladder::default(),
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -1645,6 +1652,7 @@ async fn emitted_for(ledger: &Ledger, budget: u64) -> Assembled {
         &[],
         Assembly {
             collapse: Collapse::default(),
+            ladder: Ladder::default(),
             ws: Some(&ws),
             policy: &policy,
             store: &store,
@@ -1985,6 +1993,7 @@ async fn a_read_that_no_longer_fits_is_a_stub_and_not_a_tail() {
         &[],
         Assembly {
             collapse: Collapse::default(),
+            ladder: Ladder::default(),
             ws: None,
             policy: &policy,
             store: &store,

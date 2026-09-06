@@ -444,6 +444,12 @@ pub struct TaskContract {
     ///
     /// Set it with [`TaskContract::with_collapse`].
     pub collapse: crate::context::Collapse,
+    /// The compaction rungs between Collapse and a fold (0.81.0).
+    ///
+    /// Every rung off by default, which assembles exactly what 0.80.0 assembled.
+    /// See [`Ladder`](crate::context::Ladder) for what each one costs and what it
+    /// keeps, and set it with [`TaskContract::with_ladder`].
+    pub ladder: crate::context::Ladder,
     /// How long a command the agent runs with the `exec` tool may take before it
     /// is killed and reported as a timeout.
     ///
@@ -779,6 +785,7 @@ impl TaskContract {
             fold_now: false,
             tool_mask: crate::ToolMask::none(),
             collapse: crate::context::Collapse::default(),
+            ladder: crate::context::Ladder::default(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -864,6 +871,7 @@ impl TaskContract {
             fold_now: false,
             tool_mask: crate::ToolMask::none(),
             collapse: crate::context::Collapse::default(),
+            ladder: crate::context::Ladder::default(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -1934,6 +1942,31 @@ impl TaskContract {
     #[must_use]
     pub fn with_collapse(mut self, collapse: crate::context::Collapse) -> Self {
         self.collapse = collapse;
+        self
+    }
+
+    /// Choose the compaction rungs between Collapse and a fold (0.81.0).
+    ///
+    /// ```
+    /// use io_harness::context::{Ladder, Snip};
+    /// use io_harness::TaskContract;
+    ///
+    /// let contract = TaskContract::workspace("audit", "/repo").with_ladder(Ladder {
+    ///     reduce: true,
+    ///     snip: Some(Snip { older_than_steps: 30 }),
+    ///     microcompact: false,
+    /// });
+    /// assert!(contract.ladder.reduce);
+    ///
+    /// // Unset is every rung off, which assembles what 0.80.0 assembled.
+    /// assert_eq!(
+    ///     TaskContract::workspace("audit", "/repo").ladder,
+    ///     Ladder::default()
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_ladder(mut self, ladder: crate::context::Ladder) -> Self {
+        self.ladder = ladder;
         self
     }
 

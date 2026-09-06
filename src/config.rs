@@ -155,7 +155,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::context::ContextBudget;
+use crate::context::{Collapse, Compaction, ContextBudget, Ladder};
 use crate::error::{Error, Result};
 use crate::mcp::McpServer;
 use crate::policy::{Defaults, Effect, Layer, Policy};
@@ -890,6 +890,15 @@ struct RunSection {
     retry: Option<RetryPolicy>,
     stall: Option<StallPolicy>,
     context: Option<ContextBudget>,
+    // 0.81.0 — the compaction rungs, reachable from a config file for the first
+    // time. `Compaction` and `Collapse` have carried `Serialize`/`Deserialize`
+    // since they were written and no key deserialized them, so an operator could
+    // choose a fold threshold or a projection only in Rust. Three keys rather than
+    // one nested table because they are three independent knobs: when to fold, how
+    // to shorten, and which rungs run before either.
+    compaction: Option<Compaction>,
+    collapse: Option<Collapse>,
+    ladder: Option<Ladder>,
     // 0.55.0 — the ceiling a read is refused against, in characters. Beside the
     // other budgets because it is one: what a run may spend, what one request may
     // carry, and what one read may be.
@@ -2347,6 +2356,15 @@ impl Config {
         }
         if let Some(v) = run.context {
             out = out.with_context_budget(v);
+        }
+        if let Some(v) = run.compaction {
+            out = out.with_compaction(v);
+        }
+        if let Some(v) = run.collapse {
+            out = out.with_collapse(v);
+        }
+        if let Some(v) = run.ladder {
+            out = out.with_ladder(v);
         }
         if let Some(v) = run.max_read_chars {
             out = out.with_max_read_chars(v);

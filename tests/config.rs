@@ -2818,6 +2818,51 @@ fn max_read_chars_reaches_the_contract_through_the_ordinary_projection() {
     );
 }
 
+/// F9 — the compaction rungs are choosable from a config file (0.81.0).
+///
+/// `Compaction` and `Collapse` have carried `Serialize`/`Deserialize` since they
+/// were written and no key deserialized them, so an operator could pick a fold
+/// threshold or a projection only in Rust. Writing `compaction = …` in `io.toml`
+/// was a hard parse error, because `RunSection` is `deny_unknown_fields` — which
+/// is the right refusal for a key that does not exist and the wrong outcome for a
+/// setting the crate has.
+#[test]
+fn the_compaction_ladder_reaches_the_contract_through_the_ordinary_projection() {
+    let config = Config::from_toml(
+        "[run]\n\
+         compaction = { at_share = 0.6, keep_recent = 4 }\n\
+         collapse = { keep_chars = 400 }\n\
+         ladder = { reduce = true, microcompact = true, snip = { older_than_steps = 30 } }\n",
+    )
+    .unwrap();
+    let contract = config.apply_to(TaskContract::workspace("assemble things", "/repo"));
+
+    assert_eq!(contract.compaction.keep_recent, 4);
+    assert!(contract.collapse.enabled());
+    assert!(contract.ladder.reduce && contract.ladder.microcompact);
+    assert_eq!(contract.ladder.snip.unwrap().older_than_steps, 30);
+
+    // Unset is 0.80.0's behaviour exactly: every rung off, and the two older
+    // knobs at the values a caller who wrote nothing has always had.
+    let plain = Config::from_toml("")
+        .unwrap()
+        .apply_to(TaskContract::workspace("assemble things", "/repo"));
+    assert_eq!(plain.ladder, io_harness::context::Ladder::default());
+    assert!(!plain.collapse.enabled());
+}
+
+/// A misspelled rung is refused by name rather than silently ignored.
+#[test]
+fn a_misspelled_ladder_key_is_refused_by_name() {
+    let err = Config::from_toml("[run]\nladder = { reduse = true }\n")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("reduse"),
+        "the refusal must name the key an operator typed: {err}"
+    );
+}
+
 #[test]
 fn a_key_misspelled_beside_it_is_still_refused_by_name() {
     // The guard that makes the section worth trusting: `deny_unknown_fields` is

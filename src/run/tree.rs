@@ -687,6 +687,7 @@ where
                         // default, which is off — the same boundary `compaction`
                         // and `fold_now` already draw at a spawn.
                         collapse: contract.collapse,
+                        ladder: contract.ladder,
                     },
                 )
                 .await?;
