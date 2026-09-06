@@ -700,6 +700,24 @@ impl<'a> Git<'a> {
         Ok(argv)
     }
 
+    /// Does this `git log` failure mean "the repository has no commits yet"
+    /// (0.83.0)?
+    ///
+    /// Two markers because git has used two. A repository on a named branch with
+    /// no commits says *"your current branch 'main' does not have any commits
+    /// yet"*; one with a detached or unborn `HEAD` and no branch name to quote
+    /// says *"bad default revision 'HEAD'"*.
+    ///
+    /// It is a substring match on git's English, which is the honest limitation:
+    /// under a translating locale neither marker is present and the model gets
+    /// git's own message, which is what it got in every release before this one.
+    /// Matching on the exit code alone is not available — 128 is also "not a git
+    /// repository" and "bad revision", and answering "no commits yet" for those
+    /// would be worse than saying nothing.
+    fn no_commits_yet(stderr: &str) -> bool {
+        stderr.contains("does not have any commits yet") || stderr.contains("bad default revision")
+    }
+
     /// Check the policy and run `cmd`, capturing a bounded result.
     pub(crate) async fn run(&self, cmd: &GitCmd) -> Result<GitOutcome> {
         // Build first: a refusable argument is refused before the policy is even
@@ -792,11 +810,45 @@ impl<'a> Git<'a> {
             None => None,
         };
         match child.output().await {
-            Ok(out) => Ok(GitOutcome::Ran {
-                code: out.status.code(),
-                stdout: cap_result(String::from_utf8_lossy(&out.stdout).into_owned(), self.cap).0,
-                stderr: cap_result(String::from_utf8_lossy(&out.stderr).into_owned(), self.cap).0,
-            }),
+            Ok(out) => {
+                let code = out.status.code();
+                let stdout =
+                    cap_result(String::from_utf8_lossy(&out.stdout).into_owned(), self.cap).0;
+                let stderr =
+                    cap_result(String::from_utf8_lossy(&out.stderr).into_owned(), self.cap).0;
+                // 0.83.0 — a repository with no commits answers in this crate's
+                // words rather than in git's.
+                //
+                // `git log` in a fresh repository exits **128** with
+                // `fatal: your current branch 'main' does not have any commits
+                // yet` — the same exit code it uses for "not a git repository"
+                // and for a bad revision, so a model meeting it spends a step
+                // deciding whether the tool failed, the repository is missing, or
+                // git is not installed. It is the *common* case for a new
+                // project, and it is the first call `/commit`'s own prompt
+                // invites.
+                //
+                // Only for `Log`, and only on that message. Everything else git
+                // says still reaches the model verbatim, which is the property
+                // that makes these built-ins worth having.
+                if matches!(cmd, GitCmd::Log { .. })
+                    && code == Some(128)
+                    && Self::no_commits_yet(&stderr)
+                {
+                    return Ok(GitOutcome::Ran {
+                        code: Some(0),
+                        stdout: "This repository has no commits yet, so there is no history to \
+                                 show. Nothing failed."
+                            .to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(GitOutcome::Ran {
+                    code,
+                    stdout,
+                    stderr,
+                })
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(GitOutcome::Unavailable {
                 reason: format!("no `{}` on PATH", self.program),
             }),
