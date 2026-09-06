@@ -31,6 +31,14 @@ notes are produced from it.
 - **`io_harness::context::FALLBACK_MAX_TOKENS`**, the 24,000-token constant, now
   named and documented as the fallback rather than sitting unlabelled inside
   `ContextBudget::default`.
+- **`EventKind::StepUsage`**, emitted beside `EventKind::Step` from the same place,
+  splitting a step's tokens into `fresh_prompt_tokens`, `cache_read_tokens`,
+  `cache_write_tokens` and `completion_tokens`. `Usage::cache_read_tokens` has been
+  parsed and priced since 0.44.0 and reached no event, so a consumer adding up
+  `Step`'s flat `tokens` reported every re-sent tool catalogue as paid at full
+  price. The two prompt figures are disjoint and sum back to the prompt. A step no
+  provider answered emits nothing rather than four zeros — an absent report is not a
+  report of zero.
 
 ### Changed
 

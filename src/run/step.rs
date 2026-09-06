@@ -70,6 +70,15 @@ pub(super) fn decided(watch: &Watch<'_>, run_id: i64, depth: u32, ev: &PolicyEve
 /// [`EventKind::Step`] is emitted, because there is no committed step to report:
 /// what the caller hears about is the pause, through
 /// [`RunOutcome::AwaitingApproval`].
+/// `usage` is what the provider reported for this step's completion, carried in
+/// rather than read back out of `provider_calls` (0.81.0). The read would be a
+/// query per step on the emit path of every observed run, which is the same cost
+/// [`EventKind::StepAttributed`] refuses to pay for time-to-first-token — and the
+/// caller already has the value in hand. `None` is a step no provider answered.
+// Eight, as of 0.81.0's usage split. Grouping them into a struct would name the
+// group after this call site and nothing else, which is a type that exists to
+// satisfy a lint.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn commit_step(
     store: &Store,
     watch: &Watch<'_>,
@@ -78,6 +87,7 @@ pub(super) fn commit_step(
     record: StepRecord,
     changed: bool,
     commit: bool,
+    usage: Option<crate::Usage>,
 ) -> Result<()> {
     if !commit {
         info!(
@@ -92,6 +102,9 @@ pub(super) fn commit_step(
     // succeeds: an event for a write that then failed would be a step an observer
     // saw and the store never held.
     let attribution = store.staged_attribution(run_id, record.step);
+    // Kept before the record's fields are moved into the event below, so the two
+    // events beside it can still say which step they are about.
+    let record_step = record.step;
     store.checkpoint_step(run_id, &record)?;
     info!(
         run_id,
@@ -116,6 +129,27 @@ pub(super) fn commit_step(
             changed,
         },
     ));
+    // 0.81.0 — beside the step for the same reason the attribution is, and from the
+    // value the caller already holds rather than from a row read back. A step no
+    // provider answered says nothing here; reporting four zeros would be a claim
+    // that a completion happened and cost nothing.
+    if let Some(usage) = usage {
+        watch.emit(RunEvent::at_depth(
+            run_id,
+            record_step,
+            depth,
+            EventKind::StepUsage {
+                // Disjoint by construction, so a consumer can add the pair and get
+                // the prompt back. `saturating_sub` because the two numbers come
+                // from the vendor and a cache read larger than the prompt it was
+                // read into is a vendor bug, not a negative quantity.
+                fresh_prompt_tokens: usage.prompt_tokens.saturating_sub(usage.cache_read_tokens),
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                completion_tokens: usage.completion_tokens,
+            },
+        ));
+    }
     // Beside the step rather than instead of it, so nothing an observer already
     // matches on moves. A step whose span was never closed — the tree's paused
     // path, and any commit outside the loop — announces nothing, exactly as it
@@ -619,6 +653,7 @@ pub(super) async fn run_from<P: Provider>(
             ),
             write.is_some(),
             true,
+            response.usage,
         )?;
 
         // Cost budget: checked after this step's tokens are counted.
@@ -1806,6 +1841,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
             ),
             step_changed,
             true,
+            response.usage,
         )?;
         // The step is committed, so the observations behind it are safe to make
         // durable. After the commit rather than before: a ledger that ran ahead of

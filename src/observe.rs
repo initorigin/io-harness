@@ -421,6 +421,68 @@ pub enum EventKind {
         /// The durable write that ended the previous step.
         store_ms: Option<u64>,
     },
+    /// What a committed step's tokens were actually spent on (0.81.0).
+    ///
+    /// Emitted beside [`EventKind::Step`], from the same place, for the reason
+    /// [`StepAttributed`](EventKind::StepAttributed) is: nothing an observer already
+    /// matches on moves, and a step that is not committed announces nothing.
+    ///
+    /// [`Step`](EventKind::Step) carries one flat `tokens`, and a consumer adding
+    /// those up reports a run as though every re-sent tool catalogue were paid
+    /// fresh. It is not: `cache_read_tokens` has been parsed from the vendor's
+    /// `prompt_tokens_details.cached_tokens` and priced since 0.44.0, and reached no
+    /// event. An io-cli field test on 2026-09-05 watched a running figure move from
+    /// 8.1k to 52k over four one-word turns that cost a hundredth of a cent each —
+    /// the tokens were real, and almost all of them were cache reads.
+    ///
+    /// The two prompt figures are disjoint and sum to the prompt: `fresh_prompt
+    /// _tokens` is what the vendor charged full price for, `cache_read_tokens` is
+    /// what it served from a cache. `cache_write_tokens` is `None` from a vendor
+    /// that does not report one, which is not a claim that nothing was written.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent};
+    ///
+    /// #[derive(Default)]
+    /// struct Footer;
+    ///
+    /// impl Observer for Footer {
+    ///     fn event(&self, event: &RunEvent) -> Flow {
+    ///         if let EventKind::StepUsage { fresh_prompt_tokens, cache_read_tokens, .. } =
+    ///             &event.kind
+    ///         {
+    ///             println!("{fresh_prompt_tokens} fresh, {cache_read_tokens} cached");
+    ///         }
+    ///         Flow::Continue
+    ///     }
+    /// }
+    ///
+    /// let flow = Footer.event(&RunEvent::new(
+    ///     7,
+    ///     3,
+    ///     EventKind::StepUsage {
+    ///         fresh_prompt_tokens: 1_400,
+    ///         cache_read_tokens: 5_900,
+    ///         cache_write_tokens: None,
+    ///         completion_tokens: 62,
+    ///     },
+    /// ));
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    StepUsage {
+        /// Prompt tokens the vendor charged full price for — the prompt minus what
+        /// it served from a cache.
+        fresh_prompt_tokens: u64,
+        /// Prompt tokens served from a vendor cache, as
+        /// [`Usage::cache_read_tokens`](crate::Usage::cache_read_tokens) reports
+        /// them.
+        cache_read_tokens: u64,
+        /// Tokens written into a vendor cache, where the vendor reports it. `None`
+        /// is "not reported", never "none written".
+        cache_write_tokens: Option<u64>,
+        /// Tokens the model produced.
+        completion_tokens: u64,
+    },
     /// A tool was invoked, before its result is known.
     ToolCall {
         /// The tool's name.
@@ -1418,6 +1480,8 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "recovery_paused",
     "step",
     "step_attributed",
+    // 0.81.0
+    "step_usage",
     "tool_call",
     "refused",
     "approval_requested",
@@ -2275,6 +2339,12 @@ mod tests {
                 max_tokens: 24_000,
                 source: "fallback".into(),
             },
+            EventKind::StepUsage {
+                fresh_prompt_tokens: 1_400,
+                cache_read_tokens: 5_900,
+                cache_write_tokens: None,
+                completion_tokens: 62,
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
@@ -2285,6 +2355,7 @@ mod tests {
                 | EventKind::RecoveryPaused { .. }
                 | EventKind::Step { .. }
                 | EventKind::StepAttributed { .. }
+                | EventKind::StepUsage { .. }
                 | EventKind::ToolCall { .. }
                 | EventKind::Refused { .. }
                 | EventKind::ApprovalRequested { .. }

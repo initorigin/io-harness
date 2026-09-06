@@ -48,7 +48,10 @@ impl Sized {
 }
 
 impl Provider for Sized {
-    async fn complete(&self, _request: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+    async fn complete(
+        &self,
+        _request: CompletionRequest,
+    ) -> io_harness::Result<CompletionResponse> {
         Ok(CompletionResponse {
             text: Some("done".into()),
             ..Default::default()
@@ -128,10 +131,16 @@ async fn f1_a_model_that_names_its_window_sets_the_ceiling() {
     let seen = drive(&one_step(dir.path()), &Sized::window(128_000)).await;
 
     let (max_tokens, source) = seen.ceiling();
-    assert_eq!(source, "model", "the provider named a window, so it decided");
+    assert_eq!(
+        source, "model",
+        "the provider named a window, so it decided"
+    );
     // The whole window is never available to the assembled section: the answer has
     // to fit, and so do the system block and the tool catalogue.
-    assert_eq!(max_tokens, ContextBudget::for_window(128_000, None).max_tokens);
+    assert_eq!(
+        max_tokens,
+        ContextBudget::for_window(128_000, None).max_tokens
+    );
     assert!(
         max_tokens > ContextBudget::default().max_tokens,
         "a 128k model must assemble under more than the 24k constant, which is the \
@@ -167,7 +176,10 @@ async fn f1_a_stated_budget_beats_the_model_window() {
     let seen = drive(&contract, &Sized::window(1_000_000)).await;
 
     let (max_tokens, source) = seen.ceiling();
-    assert_eq!(source, "contract", "an operator who states a ceiling keeps it");
+    assert_eq!(
+        source, "contract",
+        "an operator who states a ceiling keeps it"
+    );
     assert_eq!(max_tokens, 6_000);
 }
 
