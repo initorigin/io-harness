@@ -16,6 +16,28 @@ notes are produced from it.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.81.0] - 2026-09-06
+
+**The harness measures itself, and then spends the measurement.** Context Collapse,
+the tool mask and CodeAct all shipped ahead of the layer that was supposed to gate
+them, so every argument about changing a default has been an argument from someone
+else's published numbers. This release builds the layer, takes the numbers, and
+**changes no default** — because on the case set measured, only one rung moved the
+figure and it moved it 1.4%. The case set is named as the limit rather than left to
+be inferred.
+
+### Added
+
 - **A run's context ceiling is sized to the model it is running.** `Provider` gains
   `context_window` and `max_output_tokens`, both defaulting to `None` — "this
   provider is not saying" — so every implementation written before this release
