@@ -161,7 +161,9 @@ async fn main() -> io_harness::Result<()> {
         // on the *next* turn.
         println!(
             "           cache read {} / prompt {} tokens, hit rate {:?}",
-            row.usage.cache_read_tokens, row.usage.prompt_tokens, row.cache_hit_rate()
+            row.usage.cache_read_tokens,
+            row.usage.prompt_tokens,
+            row.cache_hit_rate()
         );
     }
     Ok(())

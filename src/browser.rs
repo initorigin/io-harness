@@ -1515,8 +1515,11 @@ pub(crate) async fn launch(
     // `exec`, and `Option<Contained>` does not itself implement `Drop`, so an
     // explicit `drop` here would extend a lifetime rather than end one.
     let own_tmp = browser_tmp_dir(profile.path());
-    std::fs::create_dir_all(&own_tmp)
-        .map_err(|e| fail(format!("could not make the browser's temporary directory: {e}")))?;
+    std::fs::create_dir_all(&own_tmp).map_err(|e| {
+        fail(format!(
+            "could not make the browser's temporary directory: {e}"
+        ))
+    })?;
     let browser_roots = browser_writable_roots(profile.path());
     // 0.83.0 — a browser is a child of this process like any other, and it does
     // not need the harness's provider credentials to render a page. `&[]`: the

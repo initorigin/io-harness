@@ -299,12 +299,7 @@ async fn a_declared_variable_survives_the_scrub_and_its_neighbours_do_not() {
     std::env::set_var("OPENAI_API_KEY", declared);
     std::env::set_var("ANTHROPIC_API_KEY", undeclared);
 
-    let out = run_selected(
-        &sh("env"),
-        dir.path(),
-        &["OPENAI_API_KEY".to_string()],
-    )
-    .await;
+    let out = run_selected(&sh("env"), dir.path(), &["OPENAI_API_KEY".to_string()]).await;
     assert!(out.success(), "the child must still run: {out:?}");
     assert!(
         out.stdout.contains(declared),

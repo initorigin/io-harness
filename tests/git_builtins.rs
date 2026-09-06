@@ -136,7 +136,10 @@ async fn git_log_on_a_repository_with_commits_is_unchanged() {
     std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
     git(dir.path(), &["init", "--initial-branch=main"]);
     git(dir.path(), &["add", "README.md"]);
-    git(dir.path(), &["commit", "-m", "a commit with a findable subject"]);
+    git(
+        dir.path(),
+        &["commit", "-m", "a commit with a findable subject"],
+    );
 
     let seen = log_result(&dir).await;
     assert!(

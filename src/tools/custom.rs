@@ -381,7 +381,8 @@ pub trait Tool: Send + Sync {
     /// is, so a tool the policy would refuse is not started early either.
     ///
     /// ```
-    /// # use io_harness::tools::{Tool, ToolEffect, ToolFuture, ToolRecovery, ToolSpec};
+    /// # use io_harness::tools::{Tool, ToolEffect, ToolFuture, ToolRecovery};
+    /// # use io_harness::ToolSpec;
     /// # use serde_json::{json, Value};
     ///
     /// struct Warm;

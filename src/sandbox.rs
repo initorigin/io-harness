@@ -2030,11 +2030,8 @@ impl ExecContainment {
 /// deliberately absent — it takes its key as an argument and its examples read
 /// whatever variable the caller chose, which is exactly the case
 /// `${env:}` provenance answers and a hard-coded list cannot.
-pub(crate) const PROVIDER_KEY_VARS: [&str; 3] = [
-    "ANTHROPIC_API_KEY",
-    "OPENROUTER_API_KEY",
-    "OPENAI_API_KEY",
-];
+pub(crate) const PROVIDER_KEY_VARS: [&str; 3] =
+    ["ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"];
 
 /// What a contained child is never deprived of, whatever anything else says
 /// (0.83.0).
@@ -3594,8 +3591,8 @@ mod tests {
     #[test]
     fn a_proxied_run_is_not_widened_by_its_own_policy() {
         let addr: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
-        let proxied = ExecContainment::resolve(&SandboxConfig::new(), None, &[])
-            .with_proxy(Some(addr));
+        let proxied =
+            ExecContainment::resolve(&SandboxConfig::new(), None, &[]).with_proxy(Some(addr));
 
         assert!(
             !proxied.with_egress(true).config.allow_network,

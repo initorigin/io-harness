@@ -3219,9 +3219,8 @@ fn run_command(argv: &str) -> std::result::Result<String, String> {
 /// which has no configuration in scope — and because the fact it records is
 /// process-wide too: a name interpolated into any configuration this process
 /// loaded is a name this process holds a secret under, whichever run is spawning.
-static INTERPOLATED_ENV: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::BTreeSet<String>>,
-> = std::sync::OnceLock::new();
+static INTERPOLATED_ENV: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+    std::sync::OnceLock::new();
 
 fn interpolated_env() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
     INTERPOLATED_ENV.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
