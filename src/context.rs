@@ -554,14 +554,25 @@ const BUDGET_FLOOR: u64 = 2_000;
 /// Three rungs fill it, and they run in this order because it is the order of
 /// increasing loss:
 ///
-/// 1. **Reduction** ([`Ladder::reduce`]) — lossless. The memory block's quarter of
-///    the ceiling is trimmed towards a floor so the observations get the room,
-///    before anything is dropped. Nothing leaves the prompt.
+/// 1. **Reduction** ([`Ladder::reduce`]) — the cheapest, and lossless *for
+///    observations*, which is the whole of what it is for. The memory block's
+///    quarter of the ceiling is trimmed towards a sixteenth so the observations get
+///    the room. **It is not lossless overall**: `render_notes` fits the block to
+///    whatever ceiling it is given and drops the notes that no longer fit, so a run
+///    with many notes trades some of them for the observations of the turn it is
+///    taking. That is the trade the rung exists to make — a note is durable and can
+///    be recalled again, where an observation dropped from this turn is gone from
+///    this turn — and it is stated here rather than discovered from a prompt that
+///    quietly stopped mentioning something.
 /// 2. **Snip** ([`Ladder::snip`]) — drops old results whose kind is a lookup rather
 ///    than a finding. A `find` from thirty steps ago is not load-bearing; a file
 ///    the agent read, a command it ran, or a skill it opened is.
 /// 3. **Microcompact** ([`Ladder::microcompact`]) — replaces a contiguous run of
-///    results from one step with a single counted line.
+///    one step's results with elisions, the first of which counts them. Not one
+///    line: a stub occupies its call's position, so a run of ten results becomes
+///    ten short lines rather than one. It fires only where that is smaller than
+///    what it replaces, measured rather than assumed — a run of four one-line reads
+///    is one this rung would otherwise make bigger.
 ///
 /// The fold stays the last rung and stays the default trigger. Every rung here is
 /// **off by default**, so a caller who changes nothing assembles exactly what
@@ -590,11 +601,17 @@ const BUDGET_FLOOR: u64 = 2_000;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Ladder {
-    /// Trim per-source shares before anything is dropped.
+    /// Trim the memory block's share so the observations get the room.
+    ///
+    /// Fires only when the ledger will not fit, and costs whichever notes no longer
+    /// fit the smaller block. See the ordering note above: it is the cheapest rung
+    /// and it is not free.
     pub reduce: bool,
     /// Drop old lookup results, or `None` to drop nothing.
     pub snip: Option<Snip>,
-    /// Replace a contiguous run of one step's results with a counted line.
+    /// Elide a contiguous run of one step's results, counting them in the first.
+    ///
+    /// Applied only where the elisions are smaller than the results they replace.
     pub microcompact: bool,
     /// Fold a skill's body out of the conversation after the step that used it
     /// (0.81.0).
@@ -1131,14 +1148,23 @@ pub struct Assembled {
     /// Estimated tokens for `text` — see [`estimate_tokens`].
     pub est_tokens: u64,
     /// (0.81.0) Whether [`Ladder::reduce`] trimmed the memory block's share to
-    /// make room for observations. The cheapest rung, and the only lossless one:
-    /// nothing left the prompt, it was re-divided.
-    pub reduced: bool,
-    /// (0.81.0) Observations [`Ladder::snip`] dropped for being old lookups.
+    /// make room for observations.
     ///
-    /// Counted separately from `stubbed`, which is what a *budget* dropped: a
-    /// reader distinguishing "the ceiling was reached" from "this was judged not
-    /// worth carrying" is distinguishing two different reasons to widen something.
+    /// Read it beside [`recalled`](Assembled::recalled), which is how many notes
+    /// the smaller block still carried: the rung buys observation room with note
+    /// room, so the pair is the trade it made and either number alone is half of it.
+    pub reduced: bool,
+    /// (0.81.0) Observations a *rung* dropped rather than the budget: old lookups
+    /// under [`Ladder::snip`], and skill bodies under
+    /// [`Ladder::skill_bodies_leave`].
+    ///
+    /// **`stubbed` is a superset, not a sibling.** Every entry counted here is also
+    /// counted there, because the emission counts everything that was not carried
+    /// whole. So the budget's own share is `stubbed - snipped - microcompacted`,
+    /// and a reader wanting "how much did the ceiling cost me" has to do that
+    /// subtraction rather than read `stubbed` directly. Stated because the obvious
+    /// reading of two counters side by side is that they partition, and these
+    /// do not.
     pub snipped: usize,
     /// (0.81.0) Contiguous runs of one step's results that
     /// [`Ladder::microcompact`] replaced with a counted line.
@@ -1438,6 +1464,9 @@ pub async fn assemble(
             {
                 continue;
             }
+            // Counted in `snipped` with the lookups: both are "a rung decided this
+            // was not worth carrying", which is the distinction the field draws
+            // against the budget's own drops. `Assembled::snipped` says so.
             out.snipped += 1;
             shapes[i] = Some(Shape::Stub(
                 "the body has been folded out; read the skill again if you need it".to_string(),
@@ -1471,17 +1500,46 @@ pub async fn assemble(
             // Never the step being assembled for: the agent has just made those
             // calls and is about to read their results.
             if j - i >= MICROCOMPACT_MIN && at_step < step {
-                out.microcompacted += 1;
-                for (n_kept, k) in (i..j).enumerate() {
-                    shapes[k] = Some(Shape::Stub(if n_kept == 0 {
-                        format!(
-                            "step {at_step} made {} calls; their results were compacted into this \
-                             line",
-                            j - i
-                        )
-                    } else {
-                        format!("compacted into the first result of step {at_step}")
-                    }));
+                // The replacement is built and measured before it is installed,
+                // because it is **not** one line: a stub still occupies its call's
+                // position, so the emission renders an elision line per entry and a
+                // run of ten results becomes ten lines. Each is short, but a run of
+                // *short* results — four one-line reads — is one this rung would
+                // otherwise make bigger, which is the opposite of the job.
+                //
+                // So the rung fires only where it pays. Measured against the same
+                // estimator the fit loop uses, over the same strings the emission
+                // will render, rather than against a length heuristic that would be
+                // right on average and wrong on the case in front of it.
+                let replacement: Vec<String> = (i..j)
+                    .enumerate()
+                    .map(|(n_kept, _)| {
+                        if n_kept == 0 {
+                            format!(
+                                "step {at_step} made {} calls; their results are compacted here",
+                                j - i
+                            )
+                        } else {
+                            format!("compacted into the first result of step {at_step}")
+                        }
+                    })
+                    .collect();
+                let before: u64 = (i..j).map(|k| estimate_tokens(&entries[k].text)).sum();
+                let after: u64 = (i..j)
+                    .zip(replacement.iter())
+                    .map(|(k, why)| {
+                        let subject = match &entries[k].target {
+                            Some(t) => format!("{} {t}", entries[k].kind.label()),
+                            None => entries[k].kind.label().to_string(),
+                        };
+                        estimate_tokens(&format!("\n[{subject}] (elided: {why})\n"))
+                    })
+                    .sum();
+                if after < before {
+                    out.microcompacted += 1;
+                    for (k, why) in (i..j).zip(replacement) {
+                        shapes[k] = Some(Shape::Stub(why));
+                    }
                 }
             }
             i = j.max(i + 1);

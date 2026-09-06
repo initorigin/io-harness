@@ -356,6 +356,47 @@ async fn f14_every_tool_description_fits_the_budget_or_is_a_named_exception() {
     println!("description tokens: {full} full catalogue, {core} tiered");
 }
 
+/// Tiering applies to the tree loop too.
+///
+/// The regression this exists for: `collapse`, `ladder` and `writable_roots` were
+/// all threaded into the tree loop when they were added and `tool_tiers` was not,
+/// so it worked for a flat run and silently did nothing for every sub-agent. A
+/// configuration key that quietly applies to half the product is worse than one
+/// that does not exist, because nothing reports it.
+#[tokio::test]
+async fn f13_tiering_applies_to_the_tree_loop_as_well_as_the_flat_one() {
+    use io_harness::{run_tree, Containment};
+
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Offered::new(vec![vec![]]);
+    let store = Store::memory().unwrap();
+    let contract = TaskContract::workspace("do some work", dir.path())
+        .with_verification(Verification::None)
+        .with_max_steps(2)
+        .with_tool_tiers(Vec::<String>::new());
+
+    let _ = run_tree(
+        &contract,
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &Containment::new(4, 2, 2, 1_000_000),
+    )
+    .await
+    .unwrap();
+
+    let catalogue = provider.catalogue(0);
+    assert!(
+        catalogue.iter().any(|t| t == EXPAND_TOOLS_TOOL),
+        "a tiered tree run must be offered the way out: {catalogue:?}"
+    );
+    assert!(
+        !catalogue.iter().any(|t| t == "shell_start"),
+        "a withheld family must be withheld in the tree loop too: {catalogue:?}"
+    );
+}
+
 /// The declaration reaches the contract from a config file.
 #[test]
 fn f13_the_tiers_reach_the_contract_from_a_config_file() {

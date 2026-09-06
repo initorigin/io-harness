@@ -852,11 +852,15 @@ pub(super) fn size_context<P: Provider>(
             source: source.to_string(),
         },
     ));
-    // 0.81.0 — the contract's own images, announced once here rather than once per
-    // step. They are the task's subject and ride every request, so a per-step event
-    // would repeat one fact for the length of the run to say nothing new; a reader
-    // wants to know a run started carrying two images, not that step forty still
-    // was.
+    // 0.81.0 — the contract's own images, announced here rather than once per step.
+    // They are the task's subject and ride every request, so a per-step event would
+    // repeat one fact for the length of the run to say nothing new; a reader wants
+    // to know a run started carrying two images, not that step forty still was.
+    //
+    // Once per *attempt*, which means a resumed run announces them again — this
+    // function is called from all six entry points, four of which are resumes. A
+    // consumer building a gallery deduplicates on the digest, which is carried for
+    // exactly this kind of reason.
     #[cfg(feature = "media")]
     for media in contract.images.iter() {
         watch.image(run_id, 0, 0, media, "caller");

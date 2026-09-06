@@ -2381,6 +2381,12 @@ impl Config {
         if let Some(v) = &run.tool_tiers {
             out = out.with_tool_tiers(v.clone());
         }
+        // 0.81.0 — a family name is validated at load, where the operator is still
+        // reading their own file. An unrecognised one matches nothing, withholds
+        // everything and says nothing, which is the shape of setting that gets
+        // written once and misread for a year. The hook loader validates its `on:`
+        // names against `EVENT_NAMES` for the same reason; this is that rule
+        // applied to the key added here.
         if let Some(v) = run.max_read_chars {
             out = out.with_max_read_chars(v);
         }
@@ -2823,7 +2829,30 @@ fn check_providers(providers: &[ProviderSpec]) -> Result<()> {
 /// path and be dropped just as silently. Every sibling validator in this module
 /// recurses the same way; a check that did not would be absent on the one path it
 /// does not cover.
+/// Every `[run] tool_tiers` name is a family this crate has (0.81.0).
+///
+/// Checked while the operator is still reading their own file. An unrecognised
+/// family matches nothing, withholds every optional tool and reports nothing,
+/// which is a setting that gets written once and misread for a year. The hook
+/// loader validates its `on:` names against `EVENT_NAMES` for exactly this reason.
+fn check_tool_tiers(file: &File) -> Result<()> {
+    let sections = std::iter::once(&file.run).chain(file.profile.values().map(|p| &p.run));
+    for run in sections.flatten() {
+        for name in run.tool_tiers.iter().flatten() {
+            if !crate::tools::TOOL_FAMILIES.contains(&name.as_str()) {
+                return Err(Error::Config(format!(
+                    "[run] tool_tiers names {name:?}, which is not a tool family. \
+                     The families are {}.",
+                    crate::tools::TOOL_FAMILIES.join(", ")
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check_routing(file: &File) -> Result<()> {
+    check_tool_tiers(file)?;
     check_routing_section(&file.routing)?;
     for profile in file.profile.values() {
         check_routing_section(&profile.routing)?;

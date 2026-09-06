@@ -478,10 +478,12 @@ impl Scorer for Retention {
 
 /// What the tool catalogue alone costs, in estimated tokens, per request.
 ///
-/// Measured on the first request, because the catalogue is built once per run and
-/// re-sent unchanged — that is the guarantee the vendor cache breakpoint rests on,
-/// and a catalogue that differs between requests would be a defect this number
-/// makes visible.
+/// The **largest** request's catalogue, and the detail says whether it moved. A
+/// catalogue is normally built once per run and re-sent unchanged — that is the
+/// guarantee the vendor cache breakpoint rests on — but a tiered run rebuilds it
+/// when the model calls `expand_tools`, by design. Scoring the first request would
+/// report a tiered run's saving and never its cost, which is the one number this
+/// scorer must not get wrong.
 ///
 /// ```
 /// use io_harness::eval::{Case, CatalogueCost, Scorer, Transcript};
@@ -513,20 +515,40 @@ impl Scorer for CatalogueCost {
     }
 
     fn score(&self, case: &Case, transcript: &Transcript) -> Score {
-        let (tokens, count) = match transcript.requests.first() {
-            Some(r) => (
-                // Serialised, because that is the shape the vendor is charged for
-                // — a description is not the whole of what a tool costs.
-                estimate_tokens(&serde_json::to_string(&r.tools).unwrap_or_default()),
-                r.tools.len(),
-            ),
-            None => (0, 0),
-        };
+        // Every request, not the first. The catalogue is built once per run and
+        // re-sent unchanged — except by a tiered run, where one `expand_tools` call
+        // rebuilds it mid-turn by design. Scoring `requests[0]` would read the
+        // pre-expansion catalogue and report the saving without its cost, in
+        // exactly the feature this scorer exists to measure.
+        let per_request: Vec<u64> = transcript
+            .requests
+            .iter()
+            // Serialised, because that is the shape the vendor is charged for — a
+            // description is not the whole of what a tool costs.
+            .map(|r| estimate_tokens(&serde_json::to_string(&r.tools).unwrap_or_default()))
+            .collect();
+        let first = per_request.first().copied().unwrap_or(0);
+        let largest = per_request.iter().copied().max().unwrap_or(0);
+        let count = transcript
+            .requests
+            .first()
+            .map(|r| r.tools.len())
+            .unwrap_or(0);
         Score {
             scorer: self.name().into(),
             case: case.name.clone(),
-            value: tokens as f64,
-            detail: format!("{count} tool(s), {tokens} estimated tokens, re-sent every step"),
+            // The largest, because that is what the run actually pays once it has
+            // expanded, and because a number that hides a mid-run change is worse
+            // than one that is slightly pessimistic about a run that never expands.
+            value: largest as f64,
+            detail: if largest == first {
+                format!("{count} tool(s), {first} estimated tokens, unchanged across the run")
+            } else {
+                format!(
+                    "{count} tool(s) to start at {first} estimated tokens, growing to {largest} — \
+                     the catalogue changed mid-run, so the vendor's cached prefix was rewritten"
+                )
+            },
         }
     }
 }

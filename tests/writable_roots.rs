@@ -164,6 +164,43 @@ fn f17_the_declaration_reaches_the_contract_from_a_config_file() {
         .is_empty());
 }
 
+/// A root that exists and is a FILE is dropped, and containment survives it.
+///
+/// The dangerous case, and the one the first version of this filter missed: it
+/// admitted anything that `exists()`. Landlock refuses directory-only rights on a
+/// non-directory with `EINVAL`, so the rule set fails to build, and
+/// `contain_command` then installs no rule set and no seccomp filter while the
+/// trace still records `LinuxLandlock` — one bad entry turning containment off for
+/// every shell stage, backgrounded child, git built-in and browser spawn.
+///
+/// It is reachable without a caller doing anything unusual: a child working in a
+/// linked worktree or a submodule declares its parent's `.git`, and `.git` is a
+/// **file** there rather than a directory. `tests/worktree.rs` cannot catch it
+/// because it builds a plain repository, where `.git` is always a directory.
+#[tokio::test]
+async fn f17_a_root_that_exists_but_is_a_file_does_not_disable_containment() {
+    let dir = tempfile::tempdir().unwrap();
+    let refused = Outside::new("file-root");
+
+    // Exactly the shape a linked worktree presents: a `.git` that is a file.
+    let git_file = refused.0.join(".git");
+    std::fs::write(&git_file, "gitdir: /repo/.git/worktrees/scout\n").unwrap();
+
+    let landed = write_to(
+        &refused.file(),
+        contract(dir.path())
+            .with_contained_exec(SandboxConfig::new())
+            .with_writable_roots([git_file]),
+    )
+    .await;
+
+    assert!(
+        !landed,
+        "a file root must be dropped, and the boundary must still hold: {}",
+        refused.file().display()
+    );
+}
+
 /// A relative or absent root is dropped rather than granted.
 ///
 /// Not tidiness. The Linux mount setup binds every root it is given, a bind of a

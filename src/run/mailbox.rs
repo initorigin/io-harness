@@ -478,6 +478,17 @@ pub(super) async fn worktree_for<P: Provider>(
     // repositories briefly waiting on each other costs less than the map that
     // would avoid it; key it by `tree.root` if a host ever drives many repositories
     // at once.
+    //
+    // **The hold is unbounded, and that is a stated ceiling rather than an
+    // oversight.** `Git::run` ends in `child.output().await` with no wall-clock cap
+    // — `WORKTREE_ERR_CAP` bounds the output, not the wait — so a `git worktree
+    // add` that blocks on an `index.lock` held by a concurrent `git_commit` in the
+    // same repository, which this lock does not serialize, wedges every later
+    // spawn in the process for as long as git hangs. Nothing else takes this lock
+    // and the approval gate runs before it, so there is no cycle and a tokio mutex
+    // cannot be poisoned; what is missing is a timeout. The fix is a deadline on
+    // the git call rather than on the lock, which belongs with the other exec
+    // deadlines and not here.
     static CREATING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _one_at_a_time = CREATING.lock().await;
     match Git::new(parent_policy, &tree.root, WORKTREE_ERR_CAP)

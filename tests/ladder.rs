@@ -6,11 +6,20 @@
 //! Everything between them was a cliff, and compaction quality — not window size —
 //! is what a long run is actually limited by.
 //!
-//! Three rungs fill it, in order of increasing loss: reduction is lossless, snip
-//! drops old lookups by kind, microcompact replaces a run of one step's results
-//! with a counted line. Each is asserted here against the thing it claims to do,
-//! and each has a control showing what it does **not** touch — a rung that dropped
-//! more than it says would pass a test that only counted tokens.
+//! Three rungs fill it, in order of increasing loss: reduction buys observation
+//! room with the memory block's room, snip drops old lookups by kind, and
+//! microcompact elides a run of one step's results where the elisions are smaller
+//! than what they replace. Each is asserted here against the thing it claims to
+//! do, and each has a control showing what it does **not** touch.
+//!
+//! Two of those descriptions are second drafts, and the first drafts are the
+//! reason the controls matter. Reduction was called lossless in three doc comments
+//! and by this file's own test name, and it is not: a smaller memory block carries
+//! fewer notes. Microcompact was called "one counted line" and it is one elision
+//! per entry, which on short results is *larger* than what it replaced. Neither was
+//! visible to a test that asserted a counter and a substring; both are visible to a
+//! test that compares `recalled` and `est_tokens` against the same run with the
+//! rung off.
 
 use std::sync::Arc;
 
@@ -136,9 +145,17 @@ async fn f9_a_run_that_configures_no_rung_assembles_what_it_did_before() {
 
 // --------------------------------------------------------------------- F10
 
-/// Reduction gives the observations the memory block's room, and loses nothing.
+/// Reduction gives the observations the memory block's room, and says what that
+/// costs.
+///
+/// The first version of this test was called `..._and_drops_nothing` and asserted
+/// that the other two rungs had not fired, which is not the same claim at all. The
+/// rung buys observation room with note room: `render_notes` fits the block to the
+/// smaller ceiling and drops what no longer fits. Asserting `recalled` is what
+/// makes the trade visible, and asserting only `snipped + microcompacted` is what
+/// let a doc comment claim losslessness three times.
 #[tokio::test]
-async fn f10_reduction_trims_the_notes_share_and_drops_nothing() {
+async fn f10_reduction_trims_the_notes_share_and_says_what_it_costs() {
     let f = fixture();
     let l = ledger(12);
     let notes = notes();
@@ -167,7 +184,16 @@ async fn f10_reduction_trims_the_notes_share_and_drops_nothing() {
     assert_eq!(
         on.snipped + on.microcompacted,
         0,
-        "the lossless rung drops nothing"
+        "no observation was dropped — the room came from the memory block"
+    );
+    // The cost, asserted rather than assumed. A smaller block carries fewer notes,
+    // and a reader of this rung has to be able to see which side of the trade they
+    // are on.
+    assert!(
+        on.recalled <= off.recalled,
+        "reduction cannot carry more notes than the full share did: {} against {}",
+        on.recalled,
+        off.recalled
     );
 }
 
@@ -240,19 +266,22 @@ async fn f11_without_the_rung_no_lookup_is_dropped() {
 
 // --------------------------------------------------------------------- F12
 
-/// Microcompact replaces a run of one step's results with a counted line, and
-/// spends no model call doing it.
+/// Microcompact elides a run of one step's results, counting them in the first,
+/// and spends no model call doing it.
 #[tokio::test]
-async fn f12_microcompact_replaces_a_run_of_results_with_one_counted_line() {
+async fn f12_microcompact_elides_a_run_of_results_and_counts_them() {
     let f = fixture();
     let mut l = Ledger::default();
-    // One step with four results, and a later step with one.
+    // One step with four results, and a later step with one. The four are large:
+    // the rung fires only where the elisions are smaller than what they replace,
+    // and four one-line reads are a case where they are not — which is what
+    // `f12_microcompact_does_not_fire_where_it_would_grow_the_section` asserts.
     for i in 0..4 {
         l.push(obs(
             1,
             ObsKind::Read,
             &format!("src/a{i}.rs"),
-            &format!("[read src/a{i}.rs]\nfn a{i}() {{}}\n"),
+            &format!("[read src/a{i}.rs]\n{}\n", "fn body() {}\n".repeat(20)),
         ));
     }
     l.push(obs(
@@ -278,6 +307,92 @@ async fn f12_microcompact_replaces_a_run_of_results_with_one_counted_line() {
         on.text.contains("fn b()"),
         "a step with one result is not a run and is untouched: {}",
         on.text
+    );
+}
+
+/// Microcompact never makes the section bigger.
+///
+/// The assertion the first version of this file did not make. It asserted the
+/// counter and the counted line and never compared the tokens, so it passed while
+/// the rung replaced four ~28-character results with four ~70-character elisions —
+/// growing the thing it exists to shrink. A stub occupies its call's position, so
+/// the replacement is never one line, and on short results it is not smaller
+/// either.
+#[tokio::test]
+async fn f12_microcompact_does_not_fire_where_it_would_grow_the_section() {
+    let f = fixture();
+    let mut l = Ledger::default();
+    // Four one-line reads: shorter than the elisions that would replace them.
+    for i in 0..4 {
+        l.push(obs(
+            1,
+            ObsKind::Read,
+            &format!("src/a{i}.rs"),
+            &format!("[read src/a{i}.rs]\nfn a{i}() {{}}\n"),
+        ));
+    }
+
+    let off = at(&f, &l, 100_000, 3, Ladder::default(), &[]).await;
+    let on = at(
+        &f,
+        &l,
+        100_000,
+        3,
+        Ladder {
+            microcompact: true,
+            ..Ladder::default()
+        },
+        &[],
+    )
+    .await;
+
+    assert_eq!(
+        on.microcompacted, 0,
+        "it would not have paid, so it did not fire"
+    );
+    assert!(
+        on.est_tokens <= off.est_tokens,
+        "the rung must never grow the section: {} against {}",
+        on.est_tokens,
+        off.est_tokens
+    );
+}
+
+/// And where it does fire, it pays.
+#[tokio::test]
+async fn f12_microcompact_shrinks_the_section_when_it_fires() {
+    let f = fixture();
+    let mut l = Ledger::default();
+    for i in 0..4 {
+        l.push(obs(
+            1,
+            ObsKind::Read,
+            &format!("src/a{i}.rs"),
+            &format!("[read src/a{i}.rs]\n{}\n", "fn body() {}\n".repeat(20)),
+        ));
+    }
+
+    let off = at(&f, &l, 100_000, 3, Ladder::default(), &[]).await;
+    let on = at(
+        &f,
+        &l,
+        100_000,
+        3,
+        Ladder {
+            microcompact: true,
+            ..Ladder::default()
+        },
+        &[],
+    )
+    .await;
+
+    assert_eq!(on.microcompacted, 1);
+    assert!(
+        on.est_tokens < off.est_tokens,
+        "a rung that fires and saves nothing is a rung that should not have fired: \
+         {} against {}",
+        on.est_tokens,
+        off.est_tokens
     );
 }
 

@@ -2020,24 +2020,6 @@ impl TaskContract {
         self
     }
 
-    /// Declare directories beyond the workspace this run's commands may write to
-    /// (0.81.0).
-    ///
-    /// ```
-    /// use io_harness::TaskContract;
-    ///
-    /// // A run whose children work in worktrees writes to the parent repository's
-    /// // object store, which is outside every child's own workdir.
-    /// let contract = TaskContract::workspace("fan out", "/repo/.worktrees/scout")
-    ///     .with_writable_roots(["/repo/.git"]);
-    /// assert_eq!(contract.writable_roots.len(), 1);
-    ///
-    /// // Declaring nothing is the default and grants nothing beyond the
-    /// // workspace and the toolchain caches, which is 0.80.0's behaviour.
-    /// assert!(TaskContract::workspace("plain", "/repo")
-    ///     .writable_roots
-    ///     .is_empty());
-    /// ```
     /// Offer the core tools plus these families, and `expand_tools` for the rest
     /// (0.81.0).
     ///
@@ -2070,6 +2052,29 @@ impl TaskContract {
         self
     }
 
+    /// Declare directories beyond the workspace this run's commands may write to
+    /// (0.81.0).
+    ///
+    /// Each path must be absolute and must be a **directory** that exists when the
+    /// run starts. Anything else is dropped rather than granted: Landlock refuses
+    /// directory-only rights on a file, which fails the whole rule set, and a
+    /// failed rule set is a command that runs unwrapped.
+    ///
+    /// ```
+    /// use io_harness::TaskContract;
+    ///
+    /// // A run whose children work in worktrees writes to the parent repository's
+    /// // object store, which is outside every child's own workdir.
+    /// let contract = TaskContract::workspace("fan out", "/repo/.worktrees/scout")
+    ///     .with_writable_roots(["/repo/.git"]);
+    /// assert_eq!(contract.writable_roots.len(), 1);
+    ///
+    /// // Declaring nothing is the default and grants nothing beyond the
+    /// // workspace and the toolchain caches, which is 0.80.0's behaviour.
+    /// assert!(TaskContract::workspace("plain", "/repo")
+    ///     .writable_roots
+    ///     .is_empty());
+    /// ```
     #[must_use]
     pub fn with_writable_roots<I, P>(mut self, roots: I) -> Self
     where

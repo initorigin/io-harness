@@ -304,8 +304,13 @@ pub enum EventKind {
     /// The per-request ceiling this run will assemble under, and where it came
     /// from (0.81.0).
     ///
-    /// Emitted once, from the same place as [`Started`](EventKind::Started), before
-    /// the first step. It exists because the answer used to be invisible and wrong:
+    /// Emitted from the same place as [`Started`](EventKind::Started), before the
+    /// first step — so **once per attempt, not once per run**: a resume emits it
+    /// again, because a resumed attempt resolves the ceiling again and may resolve
+    /// it differently if the provider has since learned the model's window. A
+    /// consumer keeping one value per run keeps the newest.
+    ///
+    /// It exists because the answer used to be invisible and wrong:
     /// every run that did not write `[run.context]` assembled under 24,000 tokens
     /// whatever the model held, so a 128,000-token model spent most of its window on
     /// nothing and bought re-reads. An operator asking "why is this trimming" could

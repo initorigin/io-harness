@@ -1818,7 +1818,23 @@ impl ExecContainment {
         let roots = if config.mode == ExecMode::WorkspaceWrite {
             let mut roots = writable_cache_roots(toolchain);
             for root in declared {
-                if root.is_absolute() && root.exists() && !roots.contains(root) {
+                // `is_dir`, not `exists`. A path that exists and is a *file* is the
+                // dangerous case, and it is reachable without a caller doing
+                // anything unusual: a child working in a linked worktree or a
+                // submodule declares its parent's `.git`, which is a file there
+                // rather than a directory.
+                //
+                // Landlock refuses directory-only rights on a non-directory with
+                // `EINVAL`, so the rule set fails to build, and
+                // `sandbox::contain_command` then installs no rule set and no
+                // seccomp filter while the trace still records `LinuxLandlock`.
+                // One bad entry would therefore turn containment off for every
+                // shell stage, backgrounded child, git built-in and browser spawn
+                // in the run — a silent widening, which is the one failure this
+                // whole module exists to prevent. The mount rungs skip a file root
+                // and macOS grants nothing for one, so the three platforms also
+                // disagreed about it; refusing it here makes them agree.
+                if root.is_absolute() && root.is_dir() && !roots.contains(root) {
                     roots.push(root.clone());
                 }
             }
@@ -2120,7 +2136,22 @@ pub(crate) fn contain_command(
             &tmp,
             proxy.map(|a| a.port()),
         );
-        let ruleset = landlock::Ruleset::build(&plan).ok()?;
+        // 0.81.0 — say so. `ok()?` returned `None` here, and `None` from this
+        // function means "this command is not wrapped": the argv runs untouched
+        // while `select` has already told the trace the backend is
+        // `LinuxLandlock`. That is a silent widening, and it is the one outcome
+        // this module must never produce quietly. `linux::landlock_run` has warned
+        // and taken the next rung since 0.48.0; this path is now as loud.
+        let ruleset = match landlock::Ruleset::build(&plan) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "sandbox: the Landlock rule set could not be built ({e}); this command runs \
+                     unwrapped. A writable root that is not a directory is the usual cause."
+                );
+                return None;
+            }
+        };
         let fd = ruleset.raw();
         // 0.74.0, audit H9 — read from the plan, never written as a constant
         // here. Landlock can restrict TCP and nothing else, so a run that denied

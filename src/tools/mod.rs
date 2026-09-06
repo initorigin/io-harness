@@ -630,22 +630,51 @@ pub const EXPAND_TOOLS_TOOL: &str = "expand_tools";
 /// assert_eq!(tool_family("pdf_fill_form"), "documents");
 /// // A tool this crate does not ship — a registered one, or an MCP tool — is
 /// // never withheld by tiering, because tiering is about this crate's own
-/// // catalogue and not about what a caller added.
+/// // catalogue and not about what a caller added. Asserted on a name that
+/// // deliberately *looks* like a family member, since a prefix rule would have
+/// // withheld this one and a caller cannot be expected to avoid the crate's
+/// // naming.
 /// assert_eq!(tool_family("mcp__server__thing"), "core");
+/// assert_eq!(tool_family("pdf_summarise"), "core");
+/// assert_eq!(tool_family("browser_login"), "core");
 /// ```
 pub fn tool_family(name: &str) -> &'static str {
-    if name.starts_with("browser_") {
+    // Matched against the crate's own constants and never against a prefix. A
+    // prefix rule reads well and is wrong in the direction that matters: a caller
+    // registering `pdf_summarise` or `browser_login` would have their tool
+    // classified into a family and silently withheld from a tiered run, and
+    // tiering has no business deciding anything about a tool this crate did not
+    // ship. Anything unrecognised is `core`, which is the answer that withholds
+    // nothing.
+    if matches!(
+        name,
+        BROWSER_NAVIGATE_TOOL
+            | BROWSER_READ_TOOL
+            | BROWSER_SCREENSHOT_TOOL
+            | BROWSER_CLICK_TOOL
+            | BROWSER_TYPE_TOOL
+            | BROWSER_SCROLL_TOOL
+    ) {
         return "browser";
     }
     if matches!(name, SHELL_START_TOOL | SHELL_POLL_TOOL | SHELL_KILL_TOOL) {
         return "shell_jobs";
     }
-    if name.starts_with("xlsx_")
-        || name.starts_with("docx_")
-        || name.starts_with("pptx_")
-        || name.starts_with("pdf_")
-        || name.starts_with("barcode_")
-    {
+    if matches!(
+        name,
+        XLSX_READ_TOOL
+            | XLSX_SHEETS_TOOL
+            | XLSX_WRITE_TOOL
+            | XLSX_SET_CELL_TOOL
+            | DOCX_READ_TOOL
+            | DOCX_WRITE_TOOL
+            | PPTX_READ_TOOL
+            | PDF_READ_TOOL
+            | PDF_WRITE_TOOL
+            | PDF_WATERMARK_TOOL
+            | PDF_FILL_FORM_TOOL
+            | BARCODE_DECODE_TOOL
+    ) {
         return "documents";
     }
     "core"
