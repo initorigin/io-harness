@@ -161,7 +161,9 @@ impl Sandbox for LinuxSandbox {
             .with_network(spec.allow_network)
             .with_mode(spec.mode)
             .with_writable_roots(spec.writable_roots)
-            .with_proxy(spec.proxy);
+            .with_proxy(spec.proxy)
+            // 0.83.0 — forwarded, like every other field on the spec.
+            .with_inherited_env(spec.inherited_env);
         let outcome = run_capped(Backend::LinuxNamespaces, wspec, |_cmd| {}).await?;
         match wrapper_failure(&outcome) {
             Some(reason) => Err(Error::Sandbox { reason }),
@@ -388,7 +390,9 @@ async fn bwrap_run(spec: &RunSpec<'_>) -> Result<SandboxOutcome> {
         .with_network(spec.allow_network)
         .with_mode(spec.mode)
         .with_writable_roots(spec.writable_roots)
-        .with_proxy(spec.proxy);
+        .with_proxy(spec.proxy)
+        // 0.83.0 — forwarded, like every other field on the spec.
+        .with_inherited_env(spec.inherited_env);
     let outcome = run_capped(Backend::LinuxBubblewrap, wspec, |_cmd| {}).await?;
     match wrapper_failure(&outcome) {
         Some(reason) => Err(Error::Sandbox { reason }),
@@ -462,7 +466,9 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
         .with_network(spec.allow_network)
         .with_mode(spec.mode)
         .with_writable_roots(spec.writable_roots)
-        .with_proxy(spec.proxy);
+        .with_proxy(spec.proxy)
+        // 0.83.0 — forwarded, like every other field on the spec.
+        .with_inherited_env(spec.inherited_env);
 
     // The argv is the caller's own, untouched: this rung wraps the payload in
     // nothing. What runs between fork and exec is two syscalls with no

@@ -135,11 +135,15 @@ async fn h8_a_separately_mounted_filesystem_is_read_only_too() {
 ///
 /// The control matters as much as the assertion: `/proc/self/environ` must
 /// still read, or a sandbox with no working `/proc` at all would pass this
-/// having proven nothing. That control also shows what this finding does *not*
-/// close — the child inherits the parent's environment directly, so its own
-/// `environ` still holds whatever the harness was spawned with. Scrubbing that
-/// is a change to the one place every backend's spawn converges, `run_capped_hooked`
-/// in `src/sandbox.rs`, and not to either rung.
+/// having proven nothing.
+///
+/// 0.83.0 — that control used to close by saying what this finding does *not*
+/// close: the child inherited the parent's environment directly, so its own
+/// `environ` held whatever the harness was spawned with, and scrubbing it was a
+/// change to `run_capped_hooked` in `src/sandbox.rs` rather than to either rung.
+/// That change is now made, at that site, and the two arms at the end of this
+/// file assert it **without a rung guard** — because the rung this finding is
+/// live on is the one every ordinary host takes.
 #[tokio::test]
 async fn h10_the_harness_environ_is_not_reachable_from_inside_the_sandbox() {
     let Some(rung) = mount_rung("H10") else {
@@ -209,4 +213,110 @@ async fn l11_another_runs_workspace_is_not_writable_from_inside_this_one() {
         tmp.success(),
         "the run's own temporary directory must be writable: {tmp:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 0.83.0 F5 and F6 — the environment scrub, on the rung a real host takes
+// ---------------------------------------------------------------------------
+
+/// The same command on **whatever rung this host selects**, with a declaration.
+///
+/// Deliberately not `mount_rung`: the finding these two arms are about is open
+/// on `LinuxLandlock`, which is what `linux::rung` returns first on every
+/// ordinary Linux host and what this crate's CI runner takes. Guarding them the
+/// way the three arms above are guarded is exactly why the finding stayed open —
+/// the existing environ assertion has only ever run on a leg where Landlock was
+/// made unavailable at the kernel level.
+async fn run_selected(
+    argv: &[String],
+    workdir: &std::path::Path,
+    declared: &[String],
+) -> SandboxOutcome {
+    let limits = SandboxLimits::none();
+    select(&SandboxConfig::new())
+        .run(
+            RunSpec::new(argv, workdir, &limits)
+                .with_network(true)
+                .with_mode(ExecMode::WorkspaceWrite)
+                .with_inherited_env(declared),
+        )
+        .await
+        .expect("the selected rung must run the command")
+}
+
+/// F5 — the harness's provider credentials are not in a contained child's own
+/// environment.
+///
+/// The value is a marker rather than a real key, and the assertion is on both
+/// the value and the name: a scrub that emptied the variable while leaving it
+/// declared would still tell a payload which vendor this harness talks to.
+///
+/// The controls are half the test. `PATH`, `HOME` and `TMPDIR` must survive and
+/// the child must still run — a scrub written as `env_clear` passes every
+/// assertion above and produces a child that cannot find `cc`.
+#[tokio::test]
+async fn the_harness_provider_keys_are_not_in_a_contained_childs_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = "io-harness-0-83-0-scrub-marker";
+    std::env::set_var("OPENROUTER_API_KEY", marker);
+    std::env::set_var("ANTHROPIC_API_KEY", marker);
+
+    let out = run_selected(&sh("env"), dir.path(), &[]).await;
+    assert!(out.success(), "the child must still run: {out:?}");
+    assert!(
+        !out.stdout.contains(marker),
+        "a provider key set in the harness reached a contained child: {}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains("OPENROUTER_API_KEY"),
+        "and the name is gone too, not merely the value: {}",
+        out.stdout
+    );
+
+    for kept in ["PATH=", "HOME=", "TMPDIR="] {
+        assert!(
+            out.stdout.contains(kept),
+            "{kept} must survive the scrub or a toolchain cannot run: {}",
+            out.stdout
+        );
+    }
+
+    std::env::remove_var("OPENROUTER_API_KEY");
+    std::env::remove_var("ANTHROPIC_API_KEY");
+}
+
+/// F6 — a declared variable survives the scrub, and nothing else does.
+///
+/// The second half is the one worth having: an implementation that treats any
+/// declaration as "inherit everything" passes the first assertion and fails
+/// this one.
+#[tokio::test]
+async fn a_declared_variable_survives_the_scrub_and_its_neighbours_do_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let declared = "io-harness-0-83-0-declared";
+    let undeclared = "io-harness-0-83-0-undeclared";
+    std::env::set_var("OPENAI_API_KEY", declared);
+    std::env::set_var("ANTHROPIC_API_KEY", undeclared);
+
+    let out = run_selected(
+        &sh("env"),
+        dir.path(),
+        &["OPENAI_API_KEY".to_string()],
+    )
+    .await;
+    assert!(out.success(), "the child must still run: {out:?}");
+    assert!(
+        out.stdout.contains(declared),
+        "a declared variable must reach the child that declared it: {}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains(undeclared),
+        "and declaring one says nothing about the rest: {}",
+        out.stdout
+    );
+
+    std::env::remove_var("OPENAI_API_KEY");
+    std::env::remove_var("ANTHROPIC_API_KEY");
 }

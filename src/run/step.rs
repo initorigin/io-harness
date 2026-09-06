@@ -810,6 +810,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
         &contract.exec_sandbox,
         toolchain.as_ref(),
         &contract.writable_roots,
+        &contract.inherited_env,
     );
     // 0.48.0 — the run owns its proxy, and the containment carries the address so
     // every spawn site scopes the sandbox to it without asking a second question.

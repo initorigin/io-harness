@@ -466,6 +466,31 @@ pub struct TaskContract {
     ///
     /// Set it with [`TaskContract::with_writable_roots`].
     pub writable_roots: Vec<PathBuf>,
+    /// Environment variables a contained command may inherit from this process
+    /// (0.83.0).
+    ///
+    /// Every contained child now starts without the harness's own provider
+    /// credentials: the three variables the shipped providers read, and every
+    /// variable name a `${env:}` substitution resolved while loading this
+    /// process's configuration. A contained run reads files and runs commands on
+    /// the operator's behalf, and its own key sitting in its child's `environ` is
+    /// a boundary that was never closed — the H10 residual 0.74.0 named and 0.81.0
+    /// closed only on the mount rungs, which is not the rung an ordinary Linux
+    /// host takes.
+    ///
+    /// This is the way back for the run that genuinely needs one: an agent that
+    /// shells out to another model's CLI declares the variable that CLI reads, and
+    /// that variable alone survives. `PATH`, `HOME`, `LANG` and `TMPDIR` are never
+    /// removed and never need declaring — the scrub is a named list, not an
+    /// `env_clear`.
+    ///
+    /// **A child inherits no declaration it did not make**, on the same monotone
+    /// rule [`Policy::contain`](crate::Policy::contain) already enforces: a
+    /// sub-agent's contract carries its own list, and an empty one means the child
+    /// sees none of them however wide its parent's was.
+    ///
+    /// Set it with [`TaskContract::with_inherited_env`].
+    pub inherited_env: Vec<String>,
     /// Which families beyond the core tools this run offers up front (0.81.0).
     ///
     /// `None` — the default — offers the whole catalogue on every request, which
@@ -832,6 +857,7 @@ impl TaskContract {
             collapse: crate::context::Collapse::default(),
             ladder: crate::context::Ladder::default(),
             writable_roots: Vec::new(),
+            inherited_env: Vec::new(),
             tool_tiers: None,
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
@@ -920,6 +946,7 @@ impl TaskContract {
             collapse: crate::context::Collapse::default(),
             ladder: crate::context::Ladder::default(),
             writable_roots: Vec::new(),
+            inherited_env: Vec::new(),
             tool_tiers: None,
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
@@ -2082,6 +2109,43 @@ impl TaskContract {
         P: Into<PathBuf>,
     {
         self.writable_roots = roots.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Let a contained command inherit these environment variables (0.83.0).
+    ///
+    /// The scrub is on by default and removes the harness's own provider
+    /// credentials from every contained child on every rung — see
+    /// [`TaskContract::inherited_env`] for what is removed and what never is.
+    /// This is the declaration that opts one name back in, for the run that
+    /// genuinely shells out to something holding a key of its own.
+    ///
+    /// Declaring a name is a decision an embedder writes down, which is the
+    /// property the default-on scrub exists to create: a key reaches a child
+    /// because somebody said it should, not because it happened to be in the
+    /// parent's environment.
+    ///
+    /// ```
+    /// use io_harness::TaskContract;
+    ///
+    /// // An agent that shells out to another vendor's CLI needs that CLI's key.
+    /// let contract = TaskContract::workspace("review with the other model", "/repo")
+    ///     .with_inherited_env(["VENDOR_CLI_TOKEN"]);
+    /// assert_eq!(contract.inherited_env, ["VENDOR_CLI_TOKEN"]);
+    ///
+    /// // Declaring nothing is the default, and no provider credential reaches a
+    /// // contained child.
+    /// assert!(TaskContract::workspace("plain", "/repo")
+    ///     .inherited_env
+    ///     .is_empty());
+    /// ```
+    #[must_use]
+    pub fn with_inherited_env<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inherited_env = names.into_iter().map(Into::into).collect();
         self
     }
 

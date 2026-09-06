@@ -334,15 +334,22 @@ pub(super) const MAX_BOUNDARY_PATTERNS: usize = 24;
 /// rather than per call keeps `select`'s host probe and the toolchain's cache
 /// derivation off the dispatch path, and — the reason that matters — stops the
 /// flat loop and the tree loop from ever disagreeing about what a mode grants.
+///
+/// 0.83.0 — `inherited_env` is a parameter rather than something a caller
+/// remembers to attach afterwards, so adding it was a compile error at both
+/// loops rather than a grep. `tool_tiers` reached the flat loop and not the tree
+/// loop in 0.81.0 for exactly the want of that.
 pub(super) fn exec_containment(
     config: &SandboxConfig,
     toolchain: Option<&Toolchain>,
     declared: &[std::path::PathBuf],
+    inherited_env: &[String],
 ) -> Option<std::sync::Arc<crate::sandbox::ExecContainment>> {
     config.mode.is_contained().then(|| {
-        std::sync::Arc::new(crate::sandbox::ExecContainment::resolve(
-            config, toolchain, declared,
-        ))
+        std::sync::Arc::new(
+            crate::sandbox::ExecContainment::resolve(config, toolchain, declared)
+                .with_inherited_env(inherited_env.to_vec()),
+        )
     })
 }
 
@@ -660,7 +667,10 @@ pub(super) async fn probe_tree_boundary(
         return probe;
     }
     let toolchain = crate::toolchain::detect(root);
-    let containment = exec_containment(config, toolchain.as_ref(), &[]);
+    // No contract in scope here, and `&[]` is the right answer rather than a
+    // placeholder: the probe's own children are the harness's, not the operator's
+    // run, and nothing they do needs a provider key.
+    let containment = exec_containment(config, toolchain.as_ref(), &[], &[]);
     // Depth 0: the tree's boundary is measured before the root agent runs, and it
     // is the root's row.
     probe_boundary(store, watch, 0, run_id, config, containment.as_deref()).await

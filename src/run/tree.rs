@@ -347,6 +347,10 @@ where
             &contract.exec_sandbox,
             toolchain.as_ref(),
             &contract.writable_roots,
+            // This agent's own contract, so a child inherits a declaration only
+            // where its own contract carries one — the monotone rule
+            // `Policy::contain` already enforces, applied to the same field.
+            &contract.inherited_env,
         );
         // 0.48.0 — the same rule as the flat loop. A contained tree run whose
         // policy names hosts must not silently take the boolean while the flat

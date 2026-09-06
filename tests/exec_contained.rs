@@ -1441,6 +1441,83 @@ async fn a_run_whose_provider_names_a_host_is_proxied() {
     );
 }
 
+/// 0.83.0 — the environment scrub, through the whole run loop rather than
+/// through a backend called directly.
+///
+/// `tests/security_linux.rs` owns F5 and F6 and asserts them on the rung the
+/// finding lives on. This arm is what runs on the other two platforms: it proves
+/// the declaration travels from `TaskContract` through `exec_containment` and
+/// `RunSpec` to the spawn, which is the plumbing a rung-level test does not
+/// exercise at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_contained_command_cannot_read_the_harness_provider_key() {
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    std::env::set_var("OPENROUTER_API_KEY", "io-harness-0-83-0-loop-marker");
+    let provider = MockScript::new(vec![vec![exec_call(&[
+        "sh",
+        "-c",
+        "printenv OPENROUTER_API_KEY > key.txt; printenv PATH > path.txt",
+    ])]]);
+
+    run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    std::env::remove_var("OPENROUTER_API_KEY");
+
+    let key = std::fs::read_to_string(dir.path().join("key.txt")).unwrap_or_default();
+    assert!(
+        key.trim().is_empty(),
+        "the harness's provider key reached a contained command: {key:?}"
+    );
+    // The control, in the same run: the scrub is a named list and not an
+    // `env_clear`, so a toolchain command still has a `PATH`.
+    let path = std::fs::read_to_string(dir.path().join("path.txt")).unwrap_or_default();
+    assert!(
+        !path.trim().is_empty(),
+        "PATH must survive the scrub or no toolchain command can run"
+    );
+
+    // The other half, in the same test rather than beside it: both arms mutate
+    // this process's environment, and `cargo test` runs the file's tests
+    // concurrently in one process, so two functions setting the same variable
+    // would race each other for a reason that has nothing to do with the scrub.
+    let dir = workspace();
+    std::env::set_var("OPENROUTER_API_KEY", "io-harness-0-83-0-declared-marker");
+    let provider = MockScript::new(vec![vec![exec_call(&[
+        "sh",
+        "-c",
+        "printenv OPENROUTER_API_KEY > key.txt",
+    ])]]);
+
+    run_with(
+        &contract(dir.path())
+            .with_contained_exec(SandboxConfig::new())
+            .with_inherited_env(["OPENROUTER_API_KEY"]),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    std::env::remove_var("OPENROUTER_API_KEY");
+
+    let declared = std::fs::read_to_string(dir.path().join("key.txt")).unwrap_or_default();
+    assert_eq!(
+        declared.trim(),
+        "io-harness-0-83-0-declared-marker",
+        "a declared variable must reach the command the contract declared it for"
+    );
+}
+
 /// The negative control. Same script, same contract, same policy — with the
 /// endpoint absent, which is every release before this one.
 #[cfg(unix)]

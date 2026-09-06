@@ -45,7 +45,12 @@ impl Sandbox for MacosSandbox {
             .with_network(spec.allow_network)
             .with_mode(spec.mode)
             .with_writable_roots(spec.writable_roots)
-            .with_proxy(spec.proxy);
+            .with_proxy(spec.proxy)
+            // 0.83.0 — forwarded, like every other field. A rung that rebuilds the
+            // spec and drops this would silently un-declare what the contract
+            // declared, and the scrub would then remove a variable the embedder
+            // said their run needs. Every rung that wraps must forward every field.
+            .with_inherited_env(spec.inherited_env);
         run_capped(Backend::MacosSandboxExec, wspec, move |cmd| {
             // Keep rustc's temp writes inside the confined workdir — except under
             // `ReadOnly`, where the workdir is exactly what may not be written to
