@@ -91,6 +91,15 @@ release's headline behaviour was unreachable from the common case.
 - **`FALLBACK_MAX_TOKENS` keeps its value and its meaning** as
   `ContextBudget::default`'s ceiling, which is what makes "the caller stated a
   budget" decidable. It is simply no longer what the fallback rung returns.
+- **A local runtime nothing can size now assembles under 7,616 tokens, down from
+  24,000.** `FALLBACK_WINDOW_LOCAL` is a *window*, and like every window it is
+  sized through `ContextBudget::for_window`, which reserves the answer and the
+  request floor out of it. This is deliberate and it is a narrowing: 24,000 was
+  never an assumption about a local model, and sending it at a stock 4,096-token
+  Ollama produced a refusal rather than a trim. An operator who has raised
+  `num_ctx` should state the ceiling with `[run.context] max_tokens` — that rung
+  wins, and always did. The read cap moves with it, from about 12,000 characters
+  to about 3,800.
 - **The overshoot risk, stated rather than implied.** A hosted model smaller than
   128,000 that no catalogue carries is now assumed larger than it is. That is
   already recoverable — `ProviderErrorKind::ContextOverflow` folds the history and
@@ -98,6 +107,21 @@ release's headline behaviour was unreachable from the common case.
   has deliberately disabled compaction gets a failed turn where it used to get a
   trimmed one. `[run.context]` is the escape hatch, and it is why the `contract`
   rung is untouched.
+- **A recording made before 0.82.0 will not replay.** `Replay` keys on the
+  request's own bytes and the ceiling decides what those bytes are. True of every
+  context change this crate has made, but this one moves the ceiling for runs that
+  configured nothing. Re-record.
+- **`Record` and `Fallback` forward the sizing methods**, on the same reasoning
+  that already makes them forward `endpoints()`. A wrapper that dropped them would
+  not merely lose the feature — the trait defaults are answers rather than silence,
+  so recording a `Compatible` pointed at a local runtime would have assumed 128,000
+  where the provider itself assumes 24,000. `Fallback` reports the smaller of its
+  two windows, and only when both halves answer, because the ceiling is chosen once
+  and has to hold for whichever half serves.
+- **The two decision-resume entry points do not warm.** `resume_with_decision` and
+  `resume_tree_with_decision` authorize nothing in that call, so a warm there would
+  be a lookup the resume's own policy never saw — and it would fire on the way to a
+  `Decision::Deny`. They size from what the provider already knows.
 
 ### Fixed
 
@@ -108,6 +132,12 @@ release's headline behaviour was unreachable from the common case.
   ungoverned. The sizing now sits below the authorisation at every entry point that
   authorises. Found by the acceptance test written to assert the refusal, not after
   it shipped.
+- **`authorize_provider` asks about the FIRST host that needs a decision**, as its
+  own comment has claimed since 0.42.0. Every asking host overwrote the one before
+  it, so the last was the one asked about while only one pending row is ever
+  written. Latent until now because two asking hosts needed a `Fallback` or a
+  `Compatible` with a reference; this release gives `Anthropic` and `OpenAi` a
+  second endpoint.
 - **initorigin/io-harness#266** — `Provider::context_window` had no implementation
   on any of the three vendor providers, so io-cli 0.38.2 read `source: "fallback"`
   on every configuration it could build.

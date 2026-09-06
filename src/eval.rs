@@ -846,6 +846,17 @@ impl<P: Provider + Sync> Provider for Capture<'_, P> {
     fn max_output_tokens(&self) -> Option<u64> {
         self.inner.max_output_tokens()
     }
+
+    /// 0.82.0 — forwarded, because without it the two readers above can never be
+    /// filled. A capture that dropped the warm would score every case on the
+    /// fallback rung and report it as the provider's own sizing.
+    async fn warm_sizing(&self) -> Result<()> {
+        self.inner.warm_sizing().await
+    }
+
+    fn assumed_window(&self) -> u64 {
+        self.inner.assumed_window()
+    }
 }
 
 /// Records what an approver decided, and decides nothing itself.

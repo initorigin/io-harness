@@ -2987,13 +2987,14 @@ pub async fn resume_with_decision_observed<P: Provider>(
     // every read of `contract.context` below this line is the resolved value and
     // there is no second rule for a resumed run to disagree with.
     //
-    // 0.82.0 — **it sits below `authorize_provider` wherever that runs**, because
-    // sizing may now dial. `Provider::warm_sizing` reads a catalogue, and a
-    // catalogue host is declared by `endpoints()` precisely so the policy decides
-    // it; warming first would walk that connection through a deny-by-default
-    // boundary before the boundary was consulted. Sized here, the run is refused
-    // before the lookup rather than after it.
-    let contract = &size_context(watch, run_id, contract, provider).await;
+    // 0.82.0 — **this entry point does not warm**, because it authorizes nothing.
+    // `authorize_provider` appears nowhere in this function: it answers a pending
+    // decision for a run whose endpoints were authorized when that run started. A
+    // warm here would be a catalogue request the policy handed to *this* call
+    // never saw, and it would fire on the way to `Decision::Deny` — a human
+    // actively refusing an action. The ceiling comes from what the provider
+    // already knows; see `size_context_unwarmed`.
+    let contract = &size_context_unwarmed(watch, run_id, contract, provider);
 
     match decision {
         // Deferring again leaves it pending and the run paused.
@@ -3377,13 +3378,14 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
     // every read of `contract.context` below this line is the resolved value and
     // there is no second rule for a resumed run to disagree with.
     //
-    // 0.82.0 — **it sits below `authorize_provider` wherever that runs**, because
-    // sizing may now dial. `Provider::warm_sizing` reads a catalogue, and a
-    // catalogue host is declared by `endpoints()` precisely so the policy decides
-    // it; warming first would walk that connection through a deny-by-default
-    // boundary before the boundary was consulted. Sized here, the run is refused
-    // before the lookup rather than after it.
-    let contract = &size_context(watch, run_id, contract, provider).await;
+    // 0.82.0 — **this entry point does not warm**, because it authorizes nothing.
+    // `authorize_provider` appears nowhere in this function: it answers a pending
+    // decision for a run whose endpoints were authorized when that run started. A
+    // warm here would be a catalogue request the policy handed to *this* call
+    // never saw, and it would fire on the way to `Decision::Deny` — a human
+    // actively refusing an action. The ceiling comes from what the provider
+    // already knows; see `size_context_unwarmed`.
+    let contract = &size_context_unwarmed(watch, run_id, contract, provider);
 
     match decision {
         Decision::Defer => Ok(RunResult::new(

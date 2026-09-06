@@ -865,6 +865,47 @@ pub(super) async fn size_context<P: Provider>(
         // that has nothing to warm returns `Ok(())` without a request.
         let _ = provider.warm_sizing().await;
     }
+    resolve_and_announce(watch, run_id, contract, provider)
+}
+
+/// The same ceiling, resolved from what the provider already knows and **without
+/// warming** (0.82.0).
+///
+/// For the two entry points that answer a pending approval decision:
+/// [`resume_with_decision_observed`](crate::run::resume_with_decision_observed)
+/// and
+/// [`resume_tree_with_decision_observed`](crate::run::resume_tree_with_decision_observed).
+/// Neither calls [`authorize_provider`](super::gate::authorize_provider) anywhere
+/// in its body — they resume a run whose endpoints were authorized when it
+/// started — so there is no ordering that could put a warm after an
+/// authorization on those paths, and a warm there would be a catalogue request
+/// the policy handed to the resume never saw. It would also fire on the way to
+/// `Decision::Deny`, which is a human actively refusing an action.
+///
+/// So the ceiling is resolved from whatever the provider knows already. A caller
+/// resuming with the same provider instance it started with is unaffected: the
+/// `OnceLock` is warm and `context_window` answers. One that built a fresh
+/// provider takes the `fallback` rung, and the event says so — the same answer
+/// the run would have had before 0.82.0, rather than a request nobody authorized.
+pub(super) fn size_context_unwarmed<P: Provider>(
+    watch: &Watch<'_>,
+    run_id: i64,
+    contract: &TaskContract,
+    provider: &P,
+) -> TaskContract {
+    resolve_and_announce(watch, run_id, contract, provider)
+}
+
+/// Resolve the ceiling, announce it, and hand back the sized contract.
+///
+/// Split out so the warming and non-warming entry points cannot disagree about
+/// anything except the warm itself.
+fn resolve_and_announce<P: Provider>(
+    watch: &Watch<'_>,
+    run_id: i64,
+    contract: &TaskContract,
+    provider: &P,
+) -> TaskContract {
     let (context, source) = crate::context::resolve_budget(
         contract.context,
         provider.context_window(),

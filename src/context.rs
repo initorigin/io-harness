@@ -570,6 +570,17 @@ pub const FALLBACK_WINDOW: u64 = 128_000;
 /// [`FALLBACK_WINDOW`] against a 4,096-token runtime is the one case where
 /// overshoot is not cheap: a small local model refuses the turn rather than
 /// trimming it, every step, until the operator finds the knob.
+///
+/// **This is a window, not a ceiling, and the difference is a factor of three.**
+/// Like every window it is sized through [`ContextBudget::for_window`], which
+/// reserves the model's answer and the request floor out of it, so the ceiling a
+/// local run actually assembles under is **7,616** tokens — smaller than the
+/// 24,000 that was every run's ceiling before 0.82.0. That is a deliberate
+/// narrowing rather than an oversight: 24,000 was never an assumption about a
+/// local model, it was the only number the crate had, and it sent nearly six times
+/// a stock Ollama's whole context at a model that would refuse it. An operator who
+/// has raised `num_ctx` and wants the room should say so with
+/// [`ContextBudget`] — the `contract` rung wins over this one.
 pub const FALLBACK_WINDOW_LOCAL: u64 = 24_000;
 
 /// What a window-derived budget holds back for the model's own answer when the
@@ -2139,7 +2150,10 @@ mod tests {
         //    identical and the number is not.
         assert_eq!(
             resolve_budget(ContextBudget::default(), None, None, FALLBACK_WINDOW_LOCAL),
-            (ContextBudget::for_window(FALLBACK_WINDOW_LOCAL, None), "fallback"),
+            (
+                ContextBudget::for_window(FALLBACK_WINDOW_LOCAL, None),
+                "fallback"
+            ),
         );
     }
 
@@ -2159,12 +2173,8 @@ mod tests {
 
         // The local assumption is deliberately *smaller* than the old flat
         // ceiling, because the reservations now come out of it.
-        let (local, _) = resolve_budget(
-            ContextBudget::default(),
-            None,
-            None,
-            FALLBACK_WINDOW_LOCAL,
-        );
+        let (local, _) =
+            resolve_budget(ContextBudget::default(), None, None, FALLBACK_WINDOW_LOCAL);
         assert_eq!(local.max_tokens, 7_616);
     }
 

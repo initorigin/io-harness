@@ -304,8 +304,11 @@ mod sizing_tests {
     #[tokio::test]
     async fn f2_a_reference_answers_the_window_and_joins_the_endpoints() {
         let (reference_url, seen) = serve_recording(catalogue());
-        let provider = OpenAi::at("http://127.0.0.1:9/v1/chat/completions", Duration::from_secs(2))
-            .with_reference_catalogue(Reference::at(&reference_url));
+        let provider = OpenAi::at(
+            "http://127.0.0.1:9/v1/chat/completions",
+            Duration::from_secs(2),
+        )
+        .with_reference_catalogue(Reference::at(&reference_url));
 
         assert_eq!(
             provider.endpoints(),
@@ -317,7 +320,10 @@ mod sizing_tests {
         );
 
         assert_eq!(provider.context_window(), None, "nothing before the warm");
-        provider.warm_sizing().await.expect("the reference answered");
+        provider
+            .warm_sizing()
+            .await
+            .expect("the reference answered");
 
         assert_eq!(provider.context_window(), Some(128_000));
         assert_eq!(provider.max_output_tokens(), Some(16_384));
@@ -328,10 +334,15 @@ mod sizing_tests {
     #[tokio::test]
     async fn f3_no_reference_means_no_connection_at_all() {
         let (reference_url, seen) = serve_recording(catalogue());
-        let provider =
-            OpenAi::at("http://127.0.0.1:9/v1/chat/completions", Duration::from_secs(2));
+        let provider = OpenAi::at(
+            "http://127.0.0.1:9/v1/chat/completions",
+            Duration::from_secs(2),
+        );
 
-        provider.warm_sizing().await.expect("a warm with nothing to do cannot fail");
+        provider
+            .warm_sizing()
+            .await
+            .expect("a warm with nothing to do cannot fail");
 
         assert_eq!(provider.context_window(), None);
         assert!(

@@ -305,7 +305,10 @@ mod tests {
         );
         assert_eq!(provider.max_output_tokens(), None);
 
-        provider.warm_sizing().await.expect("the catalogue answered");
+        provider
+            .warm_sizing()
+            .await
+            .expect("the catalogue answered");
 
         assert_eq!(provider.context_window(), Some(200_000));
         assert_eq!(provider.max_output_tokens(), Some(64_000));
@@ -367,7 +370,10 @@ mod tests {
         let (url, seen) = serve_recording(json_response(r#"{"data":[{"id":"other"}]}"#));
         let provider = OpenRouter::at(&url, Duration::from_secs(2));
 
-        provider.warm_sizing().await.expect("the catalogue answered");
+        provider
+            .warm_sizing()
+            .await
+            .expect("the catalogue answered");
         provider.warm_sizing().await.expect("and is not re-read");
 
         assert_eq!(provider.context_window(), None);

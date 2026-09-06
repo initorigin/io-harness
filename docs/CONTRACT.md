@@ -4690,11 +4690,28 @@ documentation gives three different answers for that default — and there an
 overshoot refuses the turn instead of trimming it, on every step, until the
 operator finds the knob.
 
-**The one configuration this is a regression for**, stated rather than buried: a
-run that has deliberately disabled compaction and is pointed at a hosted model
-smaller than 128,000 that no catalogue carries now gets a refused turn where it
-used to get a trimmed one. `[run.context] max_tokens` is the answer, and it is why
-the `contract` rung is untouched.
+**Two configurations this is a regression for**, stated rather than buried.
+
+*Overshoot.* A run that has deliberately disabled compaction and is pointed at a
+hosted model smaller than 128,000 that no catalogue carries now gets a refused
+turn where it used to get a trimmed one. `[run.context] max_tokens` is the answer,
+and it is why the `contract` rung is untouched.
+
+*Undershoot, and it is the larger of the two in practice.* A local runtime that no
+catalogue sizes assembles under **7,616** tokens — `FALLBACK_WINDOW_LOCAL` less the
+two reservations — where before 0.82.0 it assembled under 24,000. An operator who
+raised `num_ctx` and was relying on the old flat ceiling gets a third of the room
+and a read cap of about 3,800 characters instead of 12,000. This is deliberate:
+24,000 was never an assumption about a local model, and sending it at a stock
+4,096-token Ollama produced a refusal rather than a trim. An operator who has the
+room should state it — the `contract` rung wins over the assumption, and always
+did.
+
+**A recording made before 0.82.0 will not replay.** `Replay` keys on the request's
+own bytes, and a run that assembles under a different ceiling sends different
+bytes. That is true of every change to context assembly this crate has ever made
+and is not specific to this release, but this release changes the ceiling for runs
+that configured nothing, which is most of them. Re-record.
 
 **The reference catalogue is opt-in for `Anthropic` and `OpenAi`, and opt-in means
 off reaches nothing.** Neither vendor publishes a context window, so the only way
@@ -4714,13 +4731,33 @@ believe it, exactly as it believes a reported price. The recovery is the same
 overflow path, and `[run.context]` is the escape hatch that exists for it.
 
 **What `warm_sizing` promises an out-of-tree implementer.** It is called at most
-once per run, before the first step, and only when the answer could matter — a
-declared contract budget or an already-known window skips it. Its default makes no
+once per *attempt* — before the first step of a run, and again before the first
+step of each resume — and only when the answer could matter, since a declared
+contract budget or an already-known window skips it. **Once per attempt, not once
+per run**: an embedder that retains the provider instance pays one catalogue fetch
+because the cache answers on every attempt after the first, while one that rebuilds
+the provider per request handler pays one per attempt. Its default makes no
 request, so implementing nothing costs nothing. An implementation **must not reach
 a host `endpoints()` does not declare**; that list is the egress boundary, and a
 lookup outside it walks a connection past a deny-by-default policy. A failure is
 swallowed by the caller and reported as `"fallback"`, so a warm may fail but must
 not panic.
+
+**The two entry points that answer a pending approval decision do not warm at
+all** — `resume_with_decision` and `resume_tree_with_decision`, with their
+`_observed` twins. Neither authorizes the provider's hosts in that call; they
+resume a run whose endpoints were authorized when it started. A warm there would
+be a lookup the policy handed to *that* call never saw, and it would fire on the
+way to a `Decision::Deny` — a human actively refusing an action. Those resumes
+size from what the provider already knows, which for a retained instance is the
+window it read and for a fresh one is the assumption.
+
+**A wrapper must forward all four methods.** `Record` and `Fallback` do, on the
+same reasoning that makes them forward `endpoints()`: dropping them would not
+merely lose a feature, it would *change the ceiling*, because the trait defaults
+are answers rather than silence. `Fallback` reports the **smaller** of its two
+windows and only when both halves answer, and the smaller of the two assumptions,
+because the ceiling is chosen once and has to hold for whichever half serves.
 
 **The public surface this added.** Six names, and the snapshot in
 [public-api.txt](public-api.txt) shows none of them — it enumerates the crate

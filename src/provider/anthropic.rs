@@ -2255,7 +2255,10 @@ mod sizing_tests {
         );
 
         assert_eq!(provider.context_window(), None, "nothing before the warm");
-        provider.warm_sizing().await.expect("the reference answered");
+        provider
+            .warm_sizing()
+            .await
+            .expect("the reference answered");
 
         // `anthropic/test-model` in the catalogue, `test-model` on the provider:
         // the one documented normalisation, and no second matcher.
@@ -2274,7 +2277,10 @@ mod sizing_tests {
         let (reference_url, seen) = serve_recording(catalogue());
         let provider = Anthropic::at("http://127.0.0.1:9/v1/messages", Duration::from_secs(2));
 
-        provider.warm_sizing().await.expect("a warm with nothing to do cannot fail");
+        provider
+            .warm_sizing()
+            .await
+            .expect("a warm with nothing to do cannot fail");
 
         assert_eq!(provider.context_window(), None);
         assert_eq!(provider.max_output_tokens(), None);
