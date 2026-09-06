@@ -44,6 +44,9 @@ struct MockScript {
     steps: Vec<Vec<ToolCall>>,
     at: AtomicUsize,
     offered: Mutex<Vec<ToolSpec>>,
+    /// The host this provider reports (0.83.0). `Some` by default, which is what
+    /// makes a run driven by this mock a proxied run.
+    endpoint: Option<String>,
 }
 
 impl MockScript {
@@ -52,7 +55,16 @@ impl MockScript {
             steps,
             at: AtomicUsize::new(0),
             offered: Mutex::new(Vec::new()),
+            endpoint: Some("https://192.0.2.10/v1".to_string()),
         }
+    }
+
+    /// The same script with no endpoint — the 0.82.0 fixture, kept as the control
+    /// that proves the proxy in the tests below comes from the endpoint and not
+    /// from something else the run does.
+    fn unproxied(mut self) -> Self {
+        self.endpoint = None;
+        self
     }
 }
 
@@ -64,6 +76,26 @@ impl Provider for MockScript {
             tool_calls: self.steps.get(i).cloned().unwrap_or_default(),
             ..Default::default()
         })
+    }
+
+    /// 0.83.0 — the mock names a host, so a run driven by it is proxied the way a
+    /// real one is.
+    ///
+    /// This is the load-bearing line of the release and it is worth saying why a
+    /// fixture gained a field. `authorize_provider` early-returns when a provider
+    /// reports no endpoint, so no provider layer is merged, `names_hosts()` stays
+    /// false, and `start_egress_proxy` never fires. Every widening test in this
+    /// crate therefore ran **unproxied**, and every proxy test built its proxy by
+    /// hand — the two halves had never met, which is how a proxied arm that
+    /// discarded `allow_network` survived three releases with a green suite.
+    ///
+    /// The address is TEST-NET-1 (RFC 5737) rather than a name or a loopback
+    /// address: it needs no DNS, so the suite stays offline, and M10's grading
+    /// refuses a `base_url` that resolves onto loopback or the internal network
+    /// before the run's first step. Nothing dials it — the mock answers from its
+    /// script — so the port is never opened.
+    fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
     }
 }
 
@@ -397,6 +429,16 @@ fn backend_confines_writes() -> bool {
     select(&SandboxConfig::new()).backend().confines_writes()
 }
 
+/// Can a contained command on this host reach a loopback listener? A run on a
+/// backend that cannot is given no proxy at all (`start_egress_proxy`), so the
+/// proxied assertions below have nothing to assert there.
+fn backend_reaches_loopback_proxy() -> bool {
+    use io_harness::sandbox::{select, Sandbox};
+    select(&SandboxConfig::new())
+        .backend()
+        .reaches_loopback_proxy()
+}
+
 /// Does this host's backend claim a network boundary at all? A Job Object and the
 /// portable floor do not, and asserting a denial they never promised is how a
 /// suite starts lying about what it proved.
@@ -416,15 +458,26 @@ async fn a_policy_that_denies_the_network_denies_it_to_a_contained_command() {
     let (addr, server) = loopback_listener().await;
     let store = Store::memory().unwrap();
     let url = format!("http://{addr}/");
-    let provider = MockScript::new(vec![vec![exec_call(&["curl", "-s", "-m", "5", &url])]]);
+    // `-f` because this run is proxied: a refused dial comes back as an HTTP error
+    // response from the proxy rather than as a dead socket, and plain `curl -s`
+    // exits 0 on any status. Without it the command's exit code stopped being able
+    // to tell "the host answered" from "the proxy refused" — the instrument, not
+    // the boundary.
+    let provider = MockScript::new(vec![vec![exec_call(&["curl", "-sf", "-m", "5", &url])]]);
 
-    // `Policy::default()` leaves `net` at `Ask` and carries no allowing rule, so
-    // nothing here would permit an outbound connection.
+    // 0.83.0 — the deny is written down rather than left to `Policy::default()`'s
+    // `Ask`. The mock now names an endpoint, so this run is proxied the way a real
+    // one is, and a proxied run puts every host to the policy and then to the
+    // approver: `ApproveAll` answers an `Ask` with yes, so "the default says
+    // nothing" stopped meaning "nothing permits this". What the test is about — a
+    // policy that denies the network denies it to a contained command — is
+    // unchanged, and it is now stated by the policy instead of inferred from a
+    // fixture that had never met a proxy.
     let result = run_with(
         &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
         &provider,
         &store,
-        &Policy::default().allow_exec("curl"),
+        &Policy::default().allow_exec("curl").deny_net("127.0.0.1"),
         &ApproveAll,
     )
     .await
@@ -449,7 +502,10 @@ async fn a_policy_that_allows_the_network_allows_it_to_a_contained_command() {
     let (addr, server) = loopback_listener().await;
     let store = Store::memory().unwrap();
     let url = format!("http://{addr}/");
-    let provider = MockScript::new(vec![vec![exec_call(&["curl", "-s", "-m", "5", &url])]]);
+    // `-f` for the same reason the denying arm above takes it: on a proxied run a
+    // plain `curl -s` exits 0 whether the host answered or the proxy refused, so
+    // this positive control would have proven nothing about the allowance.
+    let provider = MockScript::new(vec![vec![exec_call(&["curl", "-sf", "-m", "5", &url])]]);
 
     let result = run_with(
         &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
@@ -1328,5 +1384,204 @@ async fn the_verification_gate_gets_the_same_writable_roots() {
         marker.exists(),
         "the gate could not write to the toolchain's own cache: {}",
         marker.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 0.83.0 F4 — a run under test is proxied the way a real one is
+// ---------------------------------------------------------------------------
+
+/// The criterion the two behaviour fixes in this release rest on.
+///
+/// It asserts the proxy *started for this run* rather than inferring it from a
+/// profile string: the run's contained command reads its own `HTTPS_PROXY`, which
+/// `run_capped_hooked` sets from `RunSpec::proxy` — the address the containment
+/// was rebound to at run start. A run that was never proxied has no address to
+/// carry, so the file it writes is empty.
+///
+/// Sabotage: remove the `endpoint` override on `MockScript` and this test fails
+/// with an empty proxy, and so do the proxied arms of F1 and F3.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_whose_provider_names_a_host_is_proxied() {
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![exec_call(&[
+        "sh",
+        "-c",
+        "printenv HTTPS_PROXY > proxy.txt",
+    ])]]);
+
+    run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let seen = std::fs::read_to_string(dir.path().join("proxy.txt")).unwrap_or_default();
+    let seen = seen.trim();
+    if !backend_reaches_loopback_proxy() {
+        // A backend a loopback listener cannot be reached from is given no proxy
+        // at all, by construction (`start_egress_proxy`). Assert that rather than
+        // skipping: an absent proxy on such a host is the designed answer, and a
+        // skip would read as a pass on a host where the address should be there.
+        assert!(
+            seen.is_empty(),
+            "this backend cannot reach a loopback proxy, so the run must have none: {seen:?}"
+        );
+        return;
+    }
+    assert!(
+        seen.starts_with("http://127.0.0.1:"),
+        "the run's contained command was not routed through the proxy this run owns: {seen:?}"
+    );
+}
+
+/// 0.83.0 — the environment scrub, through the whole run loop rather than
+/// through a backend called directly.
+///
+/// `tests/security_linux.rs` owns F5 and F6 and asserts them on the rung the
+/// finding lives on. This arm is what runs on the other two platforms: it proves
+/// the declaration travels from `TaskContract` through `exec_containment` and
+/// `RunSpec` to the spawn, which is the plumbing a rung-level test does not
+/// exercise at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_contained_command_cannot_read_the_harness_provider_key() {
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    std::env::set_var("OPENROUTER_API_KEY", "io-harness-0-83-0-loop-marker");
+    let provider = MockScript::new(vec![vec![exec_call(&[
+        "sh",
+        "-c",
+        "printenv OPENROUTER_API_KEY > key.txt; printenv PATH > path.txt",
+    ])]]);
+
+    run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    std::env::remove_var("OPENROUTER_API_KEY");
+
+    let key = std::fs::read_to_string(dir.path().join("key.txt")).unwrap_or_default();
+    assert!(
+        key.trim().is_empty(),
+        "the harness's provider key reached a contained command: {key:?}"
+    );
+    // The control, in the same run: the scrub is a named list and not an
+    // `env_clear`, so a toolchain command still has a `PATH`.
+    let path = std::fs::read_to_string(dir.path().join("path.txt")).unwrap_or_default();
+    assert!(
+        !path.trim().is_empty(),
+        "PATH must survive the scrub or no toolchain command can run"
+    );
+
+    // **The `shell` tool, in the same test, because it is a different spawn
+    // path.** `run_pipeline` builds its own `Command` and hand-copies the
+    // pre-spawn work — rlimits, containment, proxy variables — from
+    // `run_capped_hooked`. A scrub added to only one of those two copies covers
+    // `exec` and misses every shell stage, foreground and detached, which is the
+    // path a model reaches for first. An adversarial review of this release found
+    // exactly that, against a fully green suite, because nothing here exercised
+    // it.
+    let dir = workspace();
+    std::env::set_var("OPENROUTER_API_KEY", "io-harness-0-83-0-loop-marker");
+    let provider = MockScript::new(vec![vec![shell_call(
+        "printenv OPENROUTER_API_KEY > shell-key.txt; printenv PATH > shell-path.txt",
+    )]]);
+
+    run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    std::env::remove_var("OPENROUTER_API_KEY");
+
+    let shell_key = std::fs::read_to_string(dir.path().join("shell-key.txt")).unwrap_or_default();
+    assert!(
+        shell_key.trim().is_empty(),
+        "the harness's provider key reached a shell stage: {shell_key:?}"
+    );
+    let shell_path = std::fs::read_to_string(dir.path().join("shell-path.txt")).unwrap_or_default();
+    assert!(
+        !shell_path.trim().is_empty(),
+        "and a shell stage still has a PATH"
+    );
+
+    // The other half, in the same test rather than beside it: both arms mutate
+    // this process's environment, and `cargo test` runs the file's tests
+    // concurrently in one process, so two functions setting the same variable
+    // would race each other for a reason that has nothing to do with the scrub.
+    let dir = workspace();
+    std::env::set_var("OPENROUTER_API_KEY", "io-harness-0-83-0-declared-marker");
+    let provider = MockScript::new(vec![vec![exec_call(&[
+        "sh",
+        "-c",
+        "printenv OPENROUTER_API_KEY > key.txt",
+    ])]]);
+
+    run_with(
+        &contract(dir.path())
+            .with_contained_exec(SandboxConfig::new())
+            .with_inherited_env(["OPENROUTER_API_KEY"]),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    std::env::remove_var("OPENROUTER_API_KEY");
+
+    let declared = std::fs::read_to_string(dir.path().join("key.txt")).unwrap_or_default();
+    assert_eq!(
+        declared.trim(),
+        "io-harness-0-83-0-declared-marker",
+        "a declared variable must reach the command the contract declared it for"
+    );
+}
+
+/// The negative control. Same script, same contract, same policy — with the
+/// endpoint absent, which is every release before this one.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_whose_provider_names_no_host_is_not_proxied() {
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![exec_call(&[
+        "sh",
+        "-c",
+        "printenv HTTPS_PROXY > proxy.txt",
+    ])]])
+    .unproxied();
+
+    run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let seen = std::fs::read_to_string(dir.path().join("proxy.txt")).unwrap_or_default();
+    assert!(
+        seen.trim().is_empty(),
+        "a provider that names no host must leave the run unproxied: {:?}",
+        seen.trim()
     );
 }

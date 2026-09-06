@@ -2010,6 +2010,14 @@ const README_MUST_NAME: &[(&str, &str)] = &[
     // change — or because they want a window read for a vendor that publishes
     // none, which is a thing they have to call.
     ("0.82.0", "with_reference_catalogue"),
+    // 0.83.0. Two names, and both are things a reader arrives at the page
+    // *needing* rather than browsing for: the grant that lets a dev server bind a
+    // port inside the boundary, which io-cli's field test reported as impossible
+    // from any setting, and the declaration an embedder must add when their
+    // contained run stops seeing a provider key it used to read. The second is
+    // this release's one break.
+    ("0.83.0", "network-bind"),
+    ("0.83.0", "with_inherited_env"),
 ];
 
 /// Releases since the floor that introduced no public name of their own.
@@ -2286,4 +2294,172 @@ fn comparison_table_staleness_checker_reports_a_rewound_date() {
 
     // A README that lost the date entirely is a failure, not a pass.
     assert!(comparison_table_is_current("no date here", index).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// 0.83.0 N1 — SECURITY.md holds no unfilled placeholder
+// ---------------------------------------------------------------------------
+
+/// Every `<lower-case-with-hyphens>` token in `text`, which is the shape a
+/// template placeholder has.
+///
+/// Deliberately narrow. A markdown autolink — `<https://example.invalid/x>` —
+/// contains `:` and `/` and does not match, and neither does an HTML tag with
+/// attributes or an email address in angle brackets. What it does match is
+/// `<project-contact-email>`, which is the string this file shipped as its
+/// reporting address from 0.35.0 until 0.83.0.
+fn placeholder_tokens(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while let Some(open) = text[at..].find('<') {
+        let open = at + open;
+        let Some(close) = text[open + 1..].find('>') else {
+            break;
+        };
+        let close = open + 1 + close;
+        let inner = &text[open + 1..close];
+        if !inner.is_empty()
+            && inner
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_')
+        {
+            found.push(inner.to_string());
+        }
+        at = close + 1;
+        if at >= bytes.len() {
+            break;
+        }
+    }
+    found
+}
+
+/// N1 — the address a reporter is told to use is an address.
+///
+/// `SECURITY.md` told reporters to email the literal string
+/// `<project-contact-email>` for eight releases, including the four releases
+/// after 0.74.0 fixed four CRITICALs it never disclosed. The failure mode is
+/// that nobody reads a security policy until they need it, and the person who
+/// needs it is the one who cannot report the finding. This is a gate rather than
+/// a fix so the next placeholder is caught the day it lands.
+#[test]
+fn security_policy_holds_no_unfilled_placeholder() {
+    let text = read("SECURITY.md");
+    let found = placeholder_tokens(&text);
+    assert!(
+        found.is_empty(),
+        "SECURITY.md still carries template placeholders: {found:?}"
+    );
+    // Not vacuous: the file must actually say where to report, or a file emptied
+    // of its reporting section would pass.
+    assert!(
+        text.contains("security/advisories/new"),
+        "and it must name a working reporting channel"
+    );
+}
+
+/// The negative control the checker above needs to be worth anything.
+#[test]
+fn the_placeholder_checker_finds_a_placeholder_and_spares_an_autolink() {
+    assert_eq!(
+        placeholder_tokens("Email **<project-contact-email>** with:"),
+        vec!["project-contact-email".to_string()]
+    );
+    assert!(placeholder_tokens("see <https://example.invalid/security>").is_empty());
+    assert!(placeholder_tokens("a < b and c > d").is_empty());
+    assert!(placeholder_tokens("<https://github.com/o/r/security/advisories>").is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 0.83.0 N2 — every document this release corrects is gated by the code
+// ---------------------------------------------------------------------------
+
+/// `CAPABILITIES.md` no longer credits 0.80.0 with a fix it did not make.
+///
+/// The 0.80.0 row claimed "no dev server could bind a port" among the things
+/// that release fixed. It did not: the macOS profile's proxied arm discarded
+/// `allow_network`, and every real run is proxied, so the bind stayed refused
+/// until 0.83.0. A capabilities table that credits the wrong release is how an
+/// operator concludes the lever works and stops looking.
+#[test]
+fn the_capabilities_table_does_not_credit_0_80_0_with_the_bind_fix() {
+    let text = read("docs/CAPABILITIES.md");
+    assert!(
+        !text.contains("so no dev server could bind a port and no package install"),
+        "the 0.80.0 row still claims it fixed the bind"
+    );
+    assert!(
+        text.contains("not** in fact fixed until 0.83.0"),
+        "and it must say which release did"
+    );
+}
+
+/// `docs/guide/sandbox.md` states the bind ceiling under a proxy.
+///
+/// Documented nowhere before this release, while `docs/CONTRACT.md` and
+/// `docs/guide/command-execution.md` both present a dev server as a supported
+/// shape. The phrases below are ones a reader would act on — "may listen" and
+/// the two halves of the ceiling — rather than words that also occur elsewhere.
+#[test]
+fn the_sandbox_guide_states_the_bind_ceiling_under_a_proxy() {
+    let text = read("docs/guide/sandbox.md");
+    assert!(
+        text.contains("may **listen**"),
+        "a widened run's ability to serve a port is not stated"
+    );
+    assert!(
+        text.contains("grants `network-bind`"),
+        "and what the profile actually grants is not named"
+    );
+    assert!(
+        text.contains("The policy's per-host rules do not"),
+        "and the half that does NOT widen the sandbox is the half a reader gets \
+         wrong"
+    );
+}
+
+/// `docs/guide/browser.md` names which rungs contain the browser child.
+///
+/// `src/browser.rs` says in its own comment that the guide says so "rather than
+/// leaving a reader to infer parity that is not there" — and the guide did not.
+#[test]
+fn the_browser_guide_names_the_rungs_that_contain_the_child() {
+    let text = read("docs/guide/browser.md");
+    assert!(
+        text.contains("Landlock rung — contained"),
+        "the rung that does contain the browser child is not named"
+    );
+    assert!(
+        text.contains("mount rungs — not contained"),
+        "nor are the rungs that do not"
+    );
+    assert!(
+        text.contains("macOS and Windows — not contained"),
+        "nor are the other two platforms"
+    );
+    assert!(
+        text.contains("its own profile directory, and only that"),
+        "and the writable root the child is granted must be stated"
+    );
+}
+
+/// `guide/configuration.md` and `CONTRACT.md` drop the pre-0.80.0 sentence.
+///
+/// Both said, in the present tense, that *every spawn site resolves that flag
+/// from the policy rather than from `[sandbox]`* — which stopped being true in
+/// 0.80.0 and is now wrong in a second way, because a proxied run reads only
+/// `[sandbox]`.
+#[test]
+fn the_configuration_pages_do_not_still_resolve_the_flag_from_the_policy() {
+    for page in ["docs/guide/configuration.md", "docs/CONTRACT.md"] {
+        let text = read(page);
+        assert!(
+            !text.contains("because every spawn site resolves that flag from the"),
+            "{page} still states the pre-0.80.0 behaviour in the present tense"
+        );
+        assert!(
+            text.contains("0.83.0"),
+            "{page} must say what the answer is now"
+        );
+    }
 }

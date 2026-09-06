@@ -716,11 +716,17 @@ pub(super) fn speculable(
             // only sound if nothing needing one can be started here, so the
             // requirement is stated as a condition rather than left to the
             // caller: `Speculation::offer` already refuses anything that is not
-            // `ToolEffect::ReadOnly`, and a `ReadOnly` tool derives
             // `ToolRecovery::Replayable`, so the two agree — but a release that
             // moved either would otherwise start an indeterminate call with no
             // record that it had begun, which is the exact defect 0.65.0 exists
             // to prevent.
+            //
+            // 0.83.0 — that sentence used to read "refuses anything that is not
+            // `ToolEffect::ReadOnly`, and a `ReadOnly` tool derives
+            // `Replayable`", which was true by a derivation rather than by a
+            // check. `offer` now asks `ToolRecovery` directly, so this condition
+            // and that one are the same question asked twice rather than two
+            // questions that happen to agree.
             (tool.recovery() == crate::ToolRecovery::Replayable && allowed(Act::Exec, name)).then(
                 || ReadWork::Custom {
                     name: name.to_string(),

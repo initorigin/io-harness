@@ -4838,9 +4838,16 @@ impl<'a> Speculation<'a> {
         // position closes speculation rather than guessing what fills the gap,
         // and a cap already full closes it rather than queueing work whose whole
         // value was starting early.
+        // 0.83.0 — `speculable_call`, not `tool_effect(..) == ReadOnly`. The
+        // effect answers "does this change anything", and speculation needs two
+        // other answers: may this happen twice (`ToolRecovery`), and may it run
+        // beside its siblings (`Tool::concurrent`). Reading the effect answered
+        // the second by accident and the first not at all — the lazy predicate,
+        // and the dangerous one, because it is the permissive direction that a
+        // registered tool could not correct for itself.
         if at != self.started.len()
             || self.started.len() >= self.max_parallel
-            || tool_effect(&call.name, self.tools) != ToolEffect::ReadOnly
+            || !speculable_call(&call.name, self.tools)
         {
             self.closed = true;
             return;

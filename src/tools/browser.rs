@@ -252,15 +252,26 @@ pub(crate) struct BrowserSession {
     /// until the first action — so the address is always in place before it is
     /// needed, and a session for an uncontained run never gets one.
     proxy: std::sync::Mutex<Option<String>>,
+    /// Directories beyond its own profile that this run's browser child may write
+    /// to (0.83.0) — the run's own
+    /// [`TaskContract::writable_roots`](crate::TaskContract::writable_roots).
+    ///
+    /// The child is confined to a profile directory it owns, which is what stops
+    /// it reaching another run's workspace. A browser doing work that is not
+    /// self-contained is the same shape as any other child doing it, and it gets
+    /// the same answer: the embedder declares the directory on the contract, once,
+    /// for the whole run.
+    roots: Vec<std::path::PathBuf>,
     started: tokio::sync::Mutex<Option<Browser>>,
 }
 
 impl BrowserSession {
     /// A session for a run that configured a browser, or one that did nothing.
-    pub(crate) fn new(config: Option<BrowserConfig>) -> Self {
+    pub(crate) fn new(config: Option<BrowserConfig>, roots: Vec<std::path::PathBuf>) -> Self {
         Self {
             config,
             proxy: std::sync::Mutex::new(None),
+            roots,
             started: tokio::sync::Mutex::new(None),
         }
     }
@@ -300,9 +311,16 @@ impl BrowserSession {
                 .lock()
                 .expect("browser proxy is not poisoned")
                 .clone();
-            let browser =
-                crate::browser::launch(&config, policy, store, run_id, watch, proxy.as_deref())
-                    .await?;
+            let browser = crate::browser::launch(
+                &config,
+                policy,
+                store,
+                run_id,
+                watch,
+                proxy.as_deref(),
+                &self.roots,
+            )
+            .await?;
             started = Some(Started {
                 binary: browser.binary().to_string(),
                 headless: config.headless,

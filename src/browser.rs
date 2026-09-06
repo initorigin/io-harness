@@ -1053,6 +1053,53 @@ pub(crate) fn resolve(config: &BrowserConfig) -> Result<std::path::PathBuf> {
 ///
 /// Split out so a test reads the same list the launch uses rather than a copy of
 /// it that can drift.
+/// The browser child's own temporary directory (0.83.0).
+///
+/// Inside the profile it already owns, so the grant that lets it write its
+/// profile is the same grant that lets it write its temporary files, and both
+/// end when the profile is removed.
+pub(crate) fn browser_tmp_dir(profile: &std::path::Path) -> std::path::PathBuf {
+    profile.join("tmp")
+}
+
+/// Where a contained browser child may write (0.83.0).
+///
+/// Its own profile, and whatever the run's contract declared — nothing else. It
+/// was the profile **and the whole system temporary directory** through 0.82.0,
+/// which is where `sandbox::workdir()` puts every run's ephemeral workspace — so
+/// a browser under one contained run could read and rewrite every concurrently
+/// running run's workspace. That is L11, handed back on the one path 0.81.0's
+/// narrowing did not cover.
+///
+/// **`declared` is the run's own
+/// [`TaskContract::writable_roots`](crate::TaskContract::writable_roots)**, and it
+/// is here because a browser doing work that is not self-contained is the same
+/// shape as any other child doing it. The Linux all-features leg is what said so:
+/// with the blanket grant removed, seven browser tests failed with "the fixture
+/// recorded no argv", because the fixture writes its record beside the test that
+/// started it — outside any profile. That is a genuinely not-self-contained child,
+/// and the affordance for one already exists rather than needing a second.
+///
+/// A function rather than a literal at the spawn site so the decision can be
+/// asserted without a browser: the tests below ask it whether a `workdir()`-
+/// shaped path is reachable, which is the question L11 actually poses.
+pub(crate) fn browser_writable_roots(
+    profile: &std::path::Path,
+    declared: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![profile.to_path_buf()];
+    for root in declared {
+        // Absolute, present, named once — the same three rules
+        // `ExecContainment::resolve` applies, and for the same reason: the Linux
+        // mount setup binds every root it is given, and a bind of an absent path
+        // fails the setup and degrades the whole backend.
+        if root.is_absolute() && root.is_dir() && !roots.contains(root) {
+            roots.push(root.clone());
+        }
+    }
+    roots
+}
+
 pub(crate) fn launch_args(
     config: &BrowserConfig,
     profile: &std::path::Path,
@@ -1216,6 +1263,9 @@ pub(crate) async fn launch(
     run_id: i64,
     watch: &crate::run::Watch<'_>,
     proxy: Option<&str>,
+    // The run's own declared writable roots (0.83.0). See
+    // `browser_writable_roots`.
+    declared_roots: &[std::path::PathBuf],
 ) -> Result<Browser> {
     use crate::sandbox::appcontainer::win::{Plan, Spawned};
     use std::os::windows::io::AsRawHandle;
@@ -1383,6 +1433,9 @@ pub(crate) async fn launch(
     run_id: i64,
     watch: &crate::run::Watch<'_>,
     proxy: Option<&str>,
+    // The run's own declared writable roots (0.83.0). See
+    // `browser_writable_roots`.
+    declared_roots: &[std::path::PathBuf],
 ) -> Result<Browser> {
     use std::os::fd::AsRawFd;
 
@@ -1471,10 +1524,37 @@ pub(crate) async fn launch(
     // So the grant did not disappear; it moved to the one child that needs it and
     // is now visible in the argv the trace records, rather than being a line in a
     // rung that every other run also paid for.
+    //
+    // **0.83.0 — and it moved again, because "the system temporary directory" is
+    // where every other run's workspace lives.** `sandbox::workdir()` is a
+    // `tempfile::tempdir()` inside `std::env::temp_dir()`, so granting the whole
+    // of it to this child handed L11 straight back on the one path 0.81.0's fix
+    // does not cover: a browser under one contained run could read and rewrite
+    // every concurrently running run's ephemeral workspace. The child now gets a
+    // `tmp` directory **inside its own profile**, which it already owns and which
+    // is already granted, with `TMPDIR` pointed at it — the pattern
+    // `linux::tmp_target` established. It is removed with the profile when the
+    // session ends.
+    //
+    // The failure mode to watch is a browser that hardcodes `/tmp` instead of
+    // reading `TMPDIR`; that shows up as a child that will not start, which is
+    // what the Linux all-features leg saw when 0.81.0 made the equivalent change.
     // Held to the end of this function rather than dropped explicitly after the
     // spawn: it owns the rule set's descriptor, the child needs it only until
     // `exec`, and `Option<Contained>` does not itself implement `Drop`, so an
     // explicit `drop` here would extend a lifetime rather than end one.
+    let own_tmp = browser_tmp_dir(profile.path());
+    std::fs::create_dir_all(&own_tmp).map_err(|e| {
+        fail(format!(
+            "could not make the browser's temporary directory: {e}"
+        ))
+    })?;
+    let browser_roots = browser_writable_roots(profile.path(), declared_roots);
+    // 0.83.0 — a browser is a child of this process like any other, and it does
+    // not need the harness's provider credentials to render a page. `&[]`: the
+    // contract's declaration is for a command the *model* asked to run, not for
+    // this one, so the browser is scrubbed unconditionally.
+    crate::sandbox::scrub_env(&mut command, &[]);
     let _contained = if proxy.is_some() {
         let sandbox = crate::sandbox::SandboxConfig {
             allow_network: true,
@@ -1485,12 +1565,19 @@ pub(crate) async fn launch(
             &sandbox,
             profile.path(),
             true,
-            &[profile.path().to_path_buf(), std::env::temp_dir()],
+            &browser_roots,
             None,
         )
     } else {
         None
     };
+    // **After `contain_command`, deliberately.** That function sets `TMPDIR` to
+    // the target its own rung grants — for this call, the profile root — and the
+    // last write wins, so setting it above would have been silently overwritten on
+    // the one rung that contains the browser and honoured on every rung that does
+    // not. The child's temporary directory would then differ by rung for no
+    // reason anyone chose.
+    command.env("TMPDIR", &own_tmp);
 
     let child = command
         .spawn()
@@ -1638,6 +1725,63 @@ async fn attach(client: &Client, config: &BrowserConfig) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// **0.83.0 F7 — a browser child cannot reach another run's workspace.**
+    ///
+    /// The shape is the one the crate itself produces: `sandbox::workdir()` is a
+    /// `tempfile::tempdir()` inside the system temporary directory, and so is
+    /// every other run's. Through 0.82.0 the browser declared that whole
+    /// directory as a writable root, so one run's browser held write access to
+    /// every other run's workspace — L11 exactly, on the path 0.81.0's narrowing
+    /// does not cover.
+    ///
+    /// Sabotage: put `std::env::temp_dir()` back in `browser_writable_roots` and
+    /// the first assertion fails while the second still passes.
+    #[test]
+    fn a_browser_child_may_not_write_another_runs_workspace() {
+        let profile = tempfile::tempdir().unwrap();
+        let theirs = tempfile::tempdir().unwrap();
+        let roots = super::browser_writable_roots(profile.path(), &[]);
+
+        assert!(
+            !roots.iter().any(|r| theirs.path().starts_with(r)),
+            "another run's workspace is reachable from the browser child's \
+             grant: {roots:?} covers {}",
+            theirs.path().display()
+        );
+        // Not vacuous: the child must still be able to write the profile it was
+        // given, or the narrowing has produced a browser that cannot start.
+        assert!(
+            roots.iter().any(|r| profile.path().starts_with(r)),
+            "the child must own its own profile: {roots:?}"
+        );
+    }
+
+    /// And its temporary files land somewhere it owns, rather than nowhere.
+    ///
+    /// A narrowing that took the grant away without giving the child a `TMPDIR`
+    /// of its own is the failure 0.81.0 shipped into CI: a browser writes
+    /// singleton locks, shared memory segments and crash dumps whatever its
+    /// profile directory is, and one that cannot looks from outside like a child
+    /// that never started.
+    #[test]
+    fn the_browser_childs_temporary_directory_is_inside_its_own_grant() {
+        let profile = tempfile::tempdir().unwrap();
+        let tmp = super::browser_tmp_dir(profile.path());
+        let roots = super::browser_writable_roots(profile.path(), &[]);
+
+        assert!(
+            roots.iter().any(|r| tmp.starts_with(r)),
+            "the child's own temporary directory is not writable by it: \
+             {} against {roots:?}",
+            tmp.display()
+        );
+        assert!(
+            !tmp.starts_with(std::env::temp_dir()) || tmp.starts_with(profile.path()),
+            "and it is the child's own directory, not the shared one: {}",
+            tmp.display()
+        );
+    }
+
     /// **F12 — the run's proxy is in the list both platforms launch from.**
     ///
     /// The list is shared on purpose: unix hands it to `Command` and Windows

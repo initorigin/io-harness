@@ -905,10 +905,18 @@ rules = [{ act = "exec", effect = "allow", pattern = "*" }]
 ```
 
 was `policy.defaults.exec = "allow"` written five lines away from where that is
-refused — and the `net` spelling of it also switched the sandbox's own
-`allow_network` back on, because every spawn site resolves that flag from the
+refused — and through 0.79.0 the `net` spelling of it also switched the sandbox's
+own `allow_network` back on, because every spawn site resolved that flag from the
 policy rather than from `[sandbox]`. The key on the list was not the key that
 decided.
+
+**Two releases have since changed what that sentence describes.** 0.80.0 made the
+two answers *combine* rather than one replacing the other, so `[sandbox]` is read
+as well as the policy. 0.83.0 then separated them for a run that owns an egress
+proxy — which is every run whose policy names a host: there, the per-host rules
+are the proxy's to enforce and only `[sandbox] allow_network` widens the sandbox
+itself. A `[[policy.layers]]` allow rule is still refused in these files, and it
+no longer has a second route to the sandbox even if one were accepted.
 
 An **`ask` rule is refused too**, not only an `allow`: an ask hands capability out
 as well, since it converts an act the operator's own default *denied* into one an

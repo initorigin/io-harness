@@ -3151,9 +3151,12 @@ a projection onto the typed API and never a second path into the run loop:
   else** (0.74.0): layers append to the shipped defaults with no effect filter and
   `Policy::explain` resolves deny → ask → allow, so an `allow` layer in a cloned
   `io.toml` was `policy.defaults.exec = "allow"` written five lines from where that
-  is refused — and its `net` spelling also switched the sandbox's own
-  `allow_network` back on, because every spawn site resolves that flag from the
-  policy. An `ask` rule is refused too, because an ask hands capability out as
+  is refused — and through 0.79.0 its `net` spelling also switched the sandbox's
+  own `allow_network` back on, because every spawn site resolved that flag from
+  the policy. 0.80.0 made the two combine rather than replace, and 0.83.0
+  separated them on a proxied run: there the per-host rules are enforced by the
+  proxy and only `[sandbox] allow_network` widens the sandbox. An `ask` rule is
+  refused too, because an ask hands capability out as
   well: it converts an act the operator's default denied into one an approver is
   asked to wave through. This is the rule `plugin.rs` has held a *more* trusted
   file to since 0.35.0.
