@@ -96,6 +96,28 @@ not grant access to it.
 Under containment, the browser is pointed at the loopback proxy the run already
 owns, so a contained run has one egress path rather than two.
 
+### Which rungs contain the browser child, and which do not
+
+Stated rather than left to be inferred, because the answer is not the same on
+every platform and inferring parity that is not there is worse than knowing:
+
+- **Linux, Landlock rung — contained.** The child is wrapped by
+  `contain_command`, with its own profile directory as the only place it may
+  write.
+- **Linux, the two mount rungs — not contained.** `contain_command` installs a
+  Landlock rule set and answers `None` elsewhere; a browser under a mount rung is
+  spawned as it always was.
+- **macOS and Windows — not contained.** The macOS profile is applied by wrapping
+  an argv in `sandbox-exec`, which this spawn does not go through, and a Windows
+  AppContainer is entered at `CreateProcessW`.
+
+**Its writable root is its own profile directory, and only that (0.83.0).** It
+was the profile *and the whole system temporary directory* through 0.82.0, which
+is where `sandbox::workdir()` puts every run's ephemeral workspace — so a browser
+under one contained run could read and rewrite every concurrently running run's
+workspace. The child now gets a `tmp` directory inside the profile it owns, with
+`TMPDIR` pointed at it, and the profile is removed when the session ends.
+
 ## The transport, and why it is a pipe
 
 The browser is driven over a pipe on the child's own descriptors, not over a

@@ -1,13 +1,17 @@
 # Security advisory draft — four critical issues fixed in io-harness 0.74.0
 
-**Status: DRAFT. Not published.** This is the text prepared for a GitHub Security
-Advisory on `initorigin/io-harness`. Publication, and whether to request a CVE
-alongside it, are the maintainer's decisions and have not been taken.
+**Status: PUBLISHED as
+[GHSA-p4qf-q7x8-68m8](https://github.com/initorigin/io-harness/security/advisories/GHSA-p4qf-q7x8-68m8)
+on `initorigin/io-harness` in 0.83.0.** This file is the source text; the
+advisory itself is the published record, linked from the 0.74.0 section of the
+CHANGELOG. No CVE was requested alongside it.
 
-Written for 0.80.0, whose release contract makes the advisory part of the
-release. The fixes shipped in **0.74.0 on 2026-09-02** and were described in the
-CHANGELOG; no advisory was filed at the time. On a project whose stated purpose
-is an auditable boundary, that gap is the thing this document closes.
+Written for 0.80.0, whose release contract made the advisory part of that
+release, and re-checked against 0.82.0 and again against 0.83.0, which is the
+release that filed it. The fixes shipped in **0.74.0 on 2026-09-02** and were
+described in the CHANGELOG; no advisory was filed at the time. On a project whose
+stated purpose is an auditable boundary, that gap is the thing this document
+closes.
 
 Every claim below was checked against the code that shipped rather than against
 the finding text it came from. The audit's own status pass corrected twelve of
@@ -159,9 +163,14 @@ configuration files you have not read.
 
 Found by an internal security audit of io-harness conducted on 2026-08-29
 against 0.73.0, covering 51 findings of which these four were rated critical.
-47 were closed in 0.74.0; the remainder are being closed in 0.80.0.
+47 were closed in 0.74.0; the rest were closed across 0.80.0, 0.81.0 and 0.83.0,
+the last of which closed the two residuals that had been named rather than fixed
+— the harness environment readable from a contained child on the Landlock rung,
+and the browser child's grant of the whole system temporary directory.
 
 ## Reporting
 
-Vulnerabilities in this crate go to the contact in `SECURITY.md` under
-coordinated disclosure, not to a public issue.
+Vulnerabilities in this crate are reported privately through GitHub, on this
+repository's Security tab → "Report a vulnerability", under coordinated
+disclosure. Not to a public issue. `SECURITY.md` carries the same instruction and
+the direct link.
