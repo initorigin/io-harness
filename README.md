@@ -156,7 +156,7 @@ layer.
 | **Extensibility** | The `Tool` trait in-process, MCP over stdio and streamable HTTP, and markdown skills whose `read_skill` opens the references beside them under the same policy and never anything outside | [tools and skills](docs/guide/tools-and-skills.md) |
 | **Serving MCP** | Behind `mcp-server`: another harness calls **these** tools on stdio, through this crate's policy, gate, journal and trace rather than its own | [MCP and network egress](docs/guide/mcp-and-network.md) |
 | **Accounting** | Input, output, cache-read, cache-write and reasoning tokens per call, with latency and TTFT; cost derived on read from a price table you own | [accounting](docs/guide/accounting.md) |
-| **Observability** | An observer called as the run happens, a recorded provider that replays a case identically, and — behind `otel` — the same run exported as OpenTelemetry spans to any OTLP collector | [observability](docs/guide/observability.md) |
+| **Observability** | An observer called as the run happens, a recorded provider that replays a case identically, an in-crate `eval` suite that scores those replays with no key and no socket, and — behind `otel` — the same run exported as OpenTelemetry spans to any OTLP collector | [observability](docs/guide/observability.md) |
 | **Retention** | What the store holds, deleting a session whole, sweeping to a date, archiving the words while keeping the numbers | [retention](docs/guide/retention.md) |
 | **Reach** | A browser under the policy, LSP navigation, provider-executed web search, documents, images and fixed-argv git | [browser](docs/guide/browser.md), [web](docs/guide/web.md) |
 
@@ -278,6 +278,14 @@ places a call can begin — a batched read-only call does not route through the
 dispatch path the others take. See
 [tools and skills](docs/guide/tools-and-skills.md).
 
+A turn can also decline to *carry* most of the catalogue. `with_tool_tiers` offers
+the core file, exec and git tools and names the document, browser and shell-job
+families in one line, which one `expand_tools` call reaches from the next step. A
+withheld tool is not a denied tool — the policy is what denies — and the catalogue
+is re-sent on every step of every turn, so what it costs to carry is paid
+continuously. It is off by default: what tiering saves is measured in
+[MEASUREMENTS.md](docs/MEASUREMENTS.md) and what it costs is one extra turn.
+
 `TaskContract::with_plan_gate` opens a run in a planning phase: the agent reads,
 writes nothing, and the only exit is an ordered plan — each step optionally naming
 the agent that owns it — which a `PlanGate` approves, corrects or cancels. With no
@@ -318,8 +326,14 @@ than left to be inferred. See [CodeAct](docs/guide/codeact.md).
 ### Containment
 
 Every command `exec` and the foreground `shell` start runs inside the sandbox
-backend this host offers, writing to the workspace root, the system temporary
-directory and the detected toolchain's own caches — and nowhere else. `ExecMode`
+backend this host offers, writing to the workspace root, a temporary directory of
+the run's own and the detected toolchain's caches — and nowhere else. Work that is
+not self-contained says what else it needs: `writable_roots` on the contract, or
+`[run] writable_roots` in configuration, declares a directory beyond the workdir —
+which is how a child working in a `git worktree` reaches the parent repository's
+object store without widening the boundary for anything else. No rung grants the
+whole *system* temporary directory, where every run's ephemeral workspace lives, so
+one run cannot reach another's from inside its own sandbox. `ExecMode`
 names the three grants: `ReadOnly`, `WorkspaceWrite` (the default) and
 `FullAccess`, which is `TaskContract::with_full_access()` — a sentence in your
 source rather than a field you never set, because it is the widest thing the crate
@@ -525,6 +539,20 @@ keeps its kind and its target, so the stale-read rules still see it. It is off
 unless configured, and `fold` stays the last rung and the default trigger; the
 [context and memory guide](docs/guide/context-and-memory.md) has the ordering.
 
+Three rungs sit between the two. `TaskContract::with_ladder` takes a `Ladder`:
+*reduce* trims the memory block's share so the observations get the room and drops
+nothing, *snip* drops old lookups by kind — a `find` from thirty steps ago is not
+load-bearing where a read is — and *microcompact* replaces a run of one step's
+results with a counted line, mechanically and with no model call. A skill body can
+fold out of the conversation after the step that used it, since its catalogue line
+stays and `read_skill` brings it back. Every rung is off by default, all of them
+are reachable from `io.toml`, and the assembly trace names which ones ran.
+
+The per-request ceiling comes from the model rather than from a constant. A
+provider that knows its window says so, the ceiling is derived from it with the
+answer and the request floor reserved out, and a run that falls back to the
+constant reports that it did rather than applying it silently.
+
 Durable memory survives between runs — as a fact or a decision, pinnable so a run
 cannot overwrite a correction, with a per-run record of which entries it actually
 drew on. It is kept for what it is worth rather than for how recently it was
@@ -666,6 +694,18 @@ own worktree, so concurrent children stop overwriting each other's files.
 Register an observer and be called as the run happens — steps, tool calls, approvals,
 refusals, spend draws, retries, fallbacks, outcomes — instead of polling the store. A
 recorded provider replays a case so it runs identically twice.
+
+`io_harness::eval` is what sits on that replay. A `Case` is a task contract plus the
+outcome that decides it, a `Scorer` turns a finished run into one number, and a
+`Suite` runs the cases and reports both — with no API key and no socket, so it is a
+gate on a pull request rather than a benchmark you schedule. Four scorers ship: what
+a request costs whole, whether the facts a case declared it needs survived into the
+prompt, what the tool catalogue alone costs, and what fraction of injected dangerous
+acts an approver refused. **It scores the request, not the answer.** The replay key
+is the request's own bytes, so no recording can say what a model would have replied
+to a differently compacted history; an ignored live arm carries the questions that
+need a model. The numbers it has produced, and the defaults they did *not* move, are
+in [MEASUREMENTS.md](docs/MEASUREMENTS.md).
 
 Behind the `otel` feature that record also leaves the process. `OtelExporter` is an
 observer like any other, and exports a run as OpenTelemetry spans over OTLP/HTTP —

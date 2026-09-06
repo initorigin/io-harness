@@ -31,6 +31,25 @@ notes are produced from it.
 - **`io_harness::context::FALLBACK_MAX_TOKENS`**, the 24,000-token constant, now
   named and documented as the fallback rather than sitting unlabelled inside
   `ContextBudget::default`.
+- **Tiered tool exposure**, as `TaskContract::tool_tiers` / `with_tool_tiers` and
+  `[run] tool_tiers`, off by default. A run offers the core file, search, exec, git
+  and memory tools, names the `documents`, `browser` and `shell_jobs` families in
+  one line, and one `expand_tools` call reaches a family from the next step. A
+  measured turn carried 7,311 tokens before the user had typed anything, 5,436 of
+  them the catalogue, re-sent on every step; tiering takes 23% off the description
+  tokens on an all-features build. A withheld tool is not a denied tool — the
+  policy is what denies — and what tiering costs is one extra turn and a rewritten
+  cache prefix, which is why it is opt-in.
+- **A description budget**, gated at 60 estimated tokens per built-in tool with two
+  exception lists: descriptions whose length is load-bearing, and twelve that
+  predate the budget and are kept until a measurement says what shortening them
+  costs. The second list is closed.
+- **`catalog:` in skill frontmatter.** A skill declaring `catalog: false` stays
+  discoverable and reachable by `read_skill` and keeps its line out of the prompt
+  catalogue. Absent means catalogued, which is every skill written before this
+  release. A skill catalogue measured at 914 tokens over eighteen lines had
+  thirteen contributed by one bundle whose workflow most turns never enter;
+  `bundles/long-horizon/` is five skills and one catalogue line.
 - **A run can declare writable roots beyond its workdir**, as
   `TaskContract::writable_roots` / `with_writable_roots` and `[run] writable_roots`
   in `io.toml`. A contained run could write inside its workspace and the host's

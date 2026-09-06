@@ -255,6 +255,16 @@ Always write the down-migration first...
   relevant, which enters the observations once. The harness does not rank,
   match, or auto-inject — automatic relevance selection is a context-construction
   question and is deliberately not here.
+- **A bundle says which of its skills are catalogued (0.81.0)** — frontmatter
+  takes `catalog:`. Absent, or anything other than `false`, means catalogued,
+  which is every skill written before this release and the only safe default: a
+  skill that silently stopped appearing would be a capability an operator
+  installed and cannot find. `catalog: false` keeps the skill discoverable and
+  reachable by `read_skill` and keeps its line out of the prompt catalogue. The
+  measured reason is a catalogue of 914 tokens over eighteen lines, thirteen of
+  them contributed by one bundle whose workflow most turns never enter.
+  `bundles/long-horizon/` in this repository is the worked example — five skills,
+  one catalogue line.
 - **Reading one is an ordinary policy-checked read** — a policy denying
   `Act::Read` over the skills directory keeps the catalogue in the prompt and the
   bodies out of the context, with the refusal in the trace. An unknown skill name
@@ -340,6 +350,56 @@ resumed from a contract that names no mask withholds nothing. It is an
 instruction, not a boundary: it layers above the policy and never instead of it,
 so it grants nothing and narrows no permission. What stops an agent from acting is
 still the policy and the containment.
+
+## Offering part of the catalogue (0.81.0)
+
+A mask withholds named tools and still sends every definition. Tiering decides
+what is offered at all:
+
+```rust
+use io_harness::TaskContract;
+
+let contract = TaskContract::workspace("summarise the changelog", "/repo")
+    .with_tool_tiers(["documents"]);
+```
+
+`[run] tool_tiers` is the same list from a config file.
+
+`None` is the default and offers the whole catalogue on every request, which is
+what every release through 0.80.0 does. `Some(list)` offers the core file, search,
+exec, git and memory tools plus the named families, and adds one `expand_tools`
+tool naming the rest. One `expand_tools` call offers a family from the next step
+onwards.
+
+The families are `documents`, `browser` and `shell_jobs` —
+`io_harness::tools::TOOL_FAMILIES` — and a tool's family is derived from its own
+name by `tool_family` rather than read from a table beside the catalogue, because
+a table is a second list that can disagree with the first.
+
+**A withheld tool is not a denied tool.** The policy is what denies; tiering
+decides what is offered — the same distinction `ToolMask` draws.
+
+What it costs is one extra turn to reach a withheld family, and a rewritten
+cacheable prefix when a run expands mid-turn. That is why it is off by default.
+Measured, tiering takes 23% off the description tokens on an all-features build
+and 13% on the default one.
+
+### A budget on descriptions
+
+`tests/tool_tiers.rs` gates every built-in tool's description at 60 estimated
+tokens. There are two exception lists, and the difference between them matters.
+
+**Permanent** exceptions are descriptions whose length is load-bearing — the tool
+is defined by what it refuses, and a model that learns the refusal from the
+description does not learn it from a failed call. They are `list_dir`, `shell`,
+`run_program`, `expand_tools`, `patch_file`, `ask_question` and `ask_questions`.
+
+**Grandfathered** ones are merely long and predate the budget. That list is closed
+and takes nothing new; twelve descriptions are on it. This release does not
+shorten them, and that is a decision rather than a backlog: a description is what
+the model reads before deciding to call a tool, so rewriting twelve of them is a
+behavioural change to every run, and no default here moves ahead of the
+measurement that argues for it.
 
 ## See also
 

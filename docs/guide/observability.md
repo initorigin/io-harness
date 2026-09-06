@@ -83,8 +83,11 @@ new trait method every implementer inherits.
 | Variant | Emitted when |
 | --- | --- |
 | `Started { goal, provider }` | Once, before the first step |
+| `ContextCeiling { max_tokens, source }` | Once, beside `Started` — which of the contract, the model or the constant set the per-request ceiling |
 | `Step { decision, tool_call, tokens, changed }` | A step completed and was committed |
+| `StepUsage { fresh_prompt_tokens, cache_read_tokens, cache_write_tokens, completion_tokens }` | Beside `Step`, from the same place — the split behind that step's flat `tokens` |
 | `ToolCall { name, target }` | A tool was invoked, before its result is known |
+| `ImageAttached { media_type, bytes, digest, source }` | An image entered the run — from MCP, the browser, `view_image` or the caller |
 | `Refused { act, target, rule, layer }` | The policy refused an action — it did not happen |
 | `ApprovalRequested { act, target }` | A sensitive action stopped to ask a human; the run is waiting |
 | `ApprovalDecided { act, target, decision }` | A human answered: `approve`, `deny` or `defer` |
@@ -238,6 +241,48 @@ The attribution is written inside the same transaction as the step it belongs to
 after the lease check, so a driver that lost its lease cannot write one. Nothing
 here is a gate: no test asserts any of these durations, for the reason
 `docs/MEASUREMENTS.md` gives at its top.
+
+## Which ceiling the run got (0.81.0)
+
+`EventKind::ContextCeiling { max_tokens, source }` is emitted once per run, beside
+`Started`. `source` is `"contract"`, `"model"` or `"fallback"`, naming which of
+the three decided the per-request ceiling, and `"fallback"` is the one worth
+acting on: it means nothing knew the model's window and the ceiling is a guess.
+The three sources and the order they are consulted in are in
+[Context and memory](context-and-memory.md#where-the-ceiling-comes-from-0810).
+
+## What a step's tokens were made of (0.81.0)
+
+`Step` carries one flat `tokens`, so a consumer adding those up reported a run as
+though every re-sent tool catalogue were paid at full price.
+`Usage::cache_read_tokens` has been parsed and priced since 0.44.0 and reached no
+event.
+
+`EventKind::StepUsage` is that split — `fresh_prompt_tokens`,
+`cache_read_tokens`, `cache_write_tokens` and `completion_tokens` — emitted beside
+`Step`, from the same place. The two prompt figures are disjoint and sum back to
+the prompt.
+
+Two absences here are not zeroes. A step no provider answered emits nothing at all
+rather than four zeros, because an absent report is not a report of zero. And
+`cache_write_tokens` is `None` from a vendor that does not report one, which is
+not a claim that nothing was written.
+
+## An image entering a run (0.81.0)
+
+No image reached the event stream in any form before this release, requested or
+given. `EventKind::ImageAttached { media_type, bytes, digest, source }` reports
+one.
+
+It carries a descriptor and never the bytes, for the reason the transcript already
+gives: a trace holding images grows by megabytes a step in exactly the long
+unattended runs this crate exists for.
+
+`source` is `"mcp"`, `"browser"`, `"view_image"` or `"caller"`. Only `view_image`
+is an image the agent *asked for*; the other three are images it was *given*, and
+telling those apart is the point of the field. The caller's own images are
+announced once for the run rather than once per step, because they ride every
+request.
 
 ## What a finished run cost
 
