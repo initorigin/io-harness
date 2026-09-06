@@ -419,9 +419,18 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
     use std::os::fd::RawFd;
 
     let abi = super::landlock::abi()?;
-    // The system temporary directory, still — see `landlock::plan`, which
-    // carries what 0.80.0 tried here and why it came back out.
-    let tmp = std::env::temp_dir();
+    // 0.81.0 — the run's own directory, not the system temporary directory. The
+    // same resolver the mount rungs have used since 0.74.0, so the three Linux
+    // rungs now grant the same place rather than two of them narrowing and one
+    // not.
+    //
+    // 0.80.0 tried exactly this and put it back: a `git worktree` child's object
+    // store is in the parent repository, outside the child's workdir, so a
+    // contained child wrote its file and could not commit it. What was missing
+    // was not a smaller grant but a way to name the extra root — the child's
+    // `writable_roots` now carry the repository's common git directory, and that
+    // is what makes the narrowing survive `tests/worktree.rs` this time.
+    let tmp = tmp_target(spec.workdir, spec.mode);
     let plan = super::landlock::plan(
         abi,
         spec.mode,
@@ -458,7 +467,12 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
     // The argv is the caller's own, untouched: this rung wraps the payload in
     // nothing. What runs between fork and exec is two syscalls with no
     // allocation, which is why the rule set was built above rather than here.
+    // 0.81.0 — and the child is told where the grant is. A narrowed rule set with
+    // `TMPDIR` still pointing at `/tmp` is a run that fails on its first temporary
+    // file, which reads as a broken toolchain rather than as a boundary.
+    let tmp_env = tmp.clone();
     let outcome = run_capped(Backend::LinuxLandlock, wspec, move |cmd| {
+        cmd.env("TMPDIR", &tmp_env);
         // SAFETY: the closure runs in the forked child before `exec`. It
         // allocates nothing, takes no lock and calls only `prctl` and one
         // `landlock_restrict_self`, both async-signal-safe. `fd` is owned by

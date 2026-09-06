@@ -245,6 +245,85 @@ impl Store {
             .ok())
     }
 
+    /// What this run was asked to do, if the run exists (0.81.0).
+    ///
+    /// `runs.goal` is `NOT NULL` and has been written by
+    /// [`Store::start_run`] since 0.1.0, and until this release nothing published
+    /// it. The cost of that was a listing of parked runs in which every row read
+    /// `run 122  died  step 30` — thirteen dead runs, thirteen rows differing only
+    /// by a number, and nothing to choose on. Both facts that would separate them
+    /// were in the store and neither was reachable; this is one of them and
+    /// [`Store::run_created_at`] is the other.
+    ///
+    /// `Option` rather than a bare `String`, matching [`Store::run_file`] and
+    /// [`Store::run_status`]: `None` is a run id that does not exist, never a run
+    /// with no goal.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("summarise the release notes", "/repo")?;
+    ///
+    /// assert_eq!(
+    ///     store.run_goal(run)?.as_deref(),
+    ///     Some("summarise the release notes")
+    /// );
+    /// assert!(store.run_goal(9_999)?.is_none(), "no such run");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn run_goal(&self, run_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT goal FROM runs WHERE id = ?1", [run_id], |r| {
+                r.get(0)
+            })
+            .ok())
+    }
+
+    /// When this run was started, as the store recorded it (0.81.0).
+    ///
+    /// The stored string, verbatim, exactly as
+    /// [`Store::session_created_at`](crate::Store::session_created_at) returns a
+    /// session's. Reformatting it here would take a choice away from a consumer
+    /// that must not read a clock: it can still slice a stored stamp, and it cannot
+    /// unformat one.
+    ///
+    /// It reads `runs.started_at`, which is stamped from SQLite's own clock when
+    /// the row is made. **A run started before 0.7.0 has no stamp** — the column
+    /// was added then and existing rows kept the `NULL` they had — so `None` here
+    /// means either no such run or a run older than the column, and a consumer
+    /// listing runs must render both as "unknown" rather than as a time.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let first = store.start_run("earlier", "/repo")?;
+    /// let second = store.start_run("later", "/repo")?;
+    ///
+    /// let a = store.run_created_at(first)?.expect("a run started now is stamped");
+    /// let b = store.run_created_at(second)?.expect("and so is the next one");
+    /// // Stored UTC, sortable as text — which is the whole reason to hand it over
+    /// // unformatted.
+    /// assert!(a <= b);
+    /// assert!(store.run_created_at(9_999)?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn run_created_at(&self, run_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT started_at FROM runs WHERE id = ?1", [run_id], |r| {
+                r.get(0)
+            })
+            .ok()
+            .flatten())
+    }
+
     /// The durable run status as a typed [`RunStatus`], if the run exists.
     pub fn run_status(&self, run_id: i64) -> Result<Option<RunStatus>> {
         Ok(self.status(run_id)?.map(|s| RunStatus::from_str(&s)))

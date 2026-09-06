@@ -1517,6 +1517,7 @@ pub(crate) async fn dispatch(
                             media.byte_len(),
                             media.digest()
                         );
+                        watch.image(run_id, step, depth, &media, "view_image");
                         pending_media.push(media);
                         Dispatched::Continue {
                             decision: format!("viewed {target}"),
@@ -2183,6 +2184,7 @@ pub(crate) async fn dispatch(
                                     media.byte_len(),
                                     media.digest()
                                 );
+                                watch.image(run_id, step, depth, &media, "browser");
                                 pending_media.push(media);
                             }
                             Err(e) => {

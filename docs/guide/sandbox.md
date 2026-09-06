@@ -64,14 +64,21 @@ run executes is bounded by `Act::Exec` on the command rather than by a read rule
 on what that command then opens. If a run must not be able to read something, it
 belongs outside the machine the run is on.
 
-The two mount rungs grant a temporary directory the run owns; **the Landlock rung
-still grants the system one**, and since `sandbox::workdir` puts every run's
-ephemeral workspace inside it, two concurrent runs on that rung can read and
-rewrite each other's workspace from inside their own sandboxes. 0.80.0
-implemented the narrowing and withdrew it: a `git worktree` child's object store
-lives in the parent repository, outside its workdir, so the narrowed grant let
-the child write its file and refused its commit. Closing it needs a run to be
-able to declare a writable root of its own.
+**The Landlock rung no longer grants the whole system temporary directory
+(0.81.0).** This is a narrowing and a behavioural break. `sandbox::workdir` puts
+every run's ephemeral workspace inside that directory, so while the rung granted
+it whole, two concurrent runs on that rung could read and rewrite each other's
+workspace from inside their own sandboxes. The grant is now the run's own
+directory, resolved by the same resolver the two mount rungs have used since
+0.74.0 — so the three Linux rungs now grant the same place — and the child's
+`TMPDIR` points at it.
+
+0.80.0 implemented this narrowing and withdrew it: a `git worktree` child's object
+store lives in the parent repository, outside its workdir, so the narrowed grant
+let the child write its file and refused its commit. A run declaring writable
+roots of its own is what makes the narrowing survive that case. An operator whose
+contained run wrote outside its workdir declares the root; a run that only used a
+temporary file needs no change.
 
 **Windows, stated plainly.** Since 0.24.0 a Windows run is contained by a real
 Job Object and reports `Backend::WindowsJobObject`. Memory, CPU and the active
@@ -230,6 +237,31 @@ caps instead of the defaults.
 
 Run it live: `cargo run --example sandbox_run`.
 
+## Roots beyond the workdir (0.81.0)
+
+A contained run could write inside its workspace and the host's toolchain caches
+and nowhere else, which is wrong for work that is not self-contained: a `git
+worktree` child commits into the parent repository's object store, outside its own
+root by construction. A contract names the rest:
+
+```rust
+use io_harness::TaskContract;
+
+let contract = TaskContract::workspace("port the parser", "/repo/worktrees/parser")
+    .with_writable_roots(["/repo/.git"]);
+```
+
+`[run] writable_roots` is the same list from a config file.
+
+Each path must be absolute and must exist, and one that is neither is **dropped
+rather than granted**. The Linux mount setup binds every root it is given, and a
+bind of an absent path fails the setup and degrades the whole backend to the
+portable floor — so a typo that was granted would cost the run its containment
+rather than its write.
+
+Nothing is granted under `ExecMode::ReadOnly`. A mode that withholds the workspace
+must not hand a root back through the side door.
+
 ## What else runs in here (0.40.0)
 
 Until 0.40.0 the sandbox had exactly one caller: the verification gate. The
@@ -243,9 +275,8 @@ Two consequences land here rather than there:
 **Linux confines filesystem writes now, and did not before.** The backend unshared
 a mount namespace and then remounted nothing into it, so the namespace existed
 while the filesystem view stayed the host's. Only the network namespace was real.
-It now remounts the tree read-only and binds back the working directory and the
-system temporary directory — the same two places the macOS profile has always
-allowed.
+It now remounts the tree read-only and binds back the working directory, a
+temporary directory the run owns, and any root the run declared.
 
 **That change reaches the verification gate too**, because the gate uses the same
 backend. A gate command that wrote outside its working directory on Linux

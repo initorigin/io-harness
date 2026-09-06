@@ -500,17 +500,284 @@ pub struct ContextBudget {
 impl Default for ContextBudget {
     fn default() -> Self {
         Self {
-            max_tokens: 24_000,
+            max_tokens: FALLBACK_MAX_TOKENS,
             share: 0.5,
         }
     }
 }
 
+/// The per-request ceiling a run uses when nothing tells it the model's own
+/// context window (0.81.0).
+///
+/// It was the ceiling for *every* run until this release, on every model, because
+/// [`ContextBudget::default`] declared it and nothing read the window the provider
+/// catalogue already carries. On a model holding 128,000 tokens that threw away
+/// most of the window and bought re-reads; the field test of 2026-09-05 measured a
+/// 7,311-token request floor against it, so history began being trimmed at roughly
+/// 16,000 tokens of conversation.
+///
+/// It remains the honest answer for a model nothing knows the size of — a ceiling
+/// guessed too high is a request the provider refuses — and a run that falls back
+/// to it says so through
+/// [`EventKind::ContextCeiling`](crate::EventKind::ContextCeiling) rather than
+/// applying it silently.
+pub const FALLBACK_MAX_TOKENS: u64 = 24_000;
+
+/// What a window-derived budget holds back for the model's own answer when the
+/// provider does not say how long an answer may be.
+///
+/// Deliberately generous. The cost of reserving too much is a shorter history; the
+/// cost of reserving too little is a refused request, which ends the turn.
+const DEFAULT_OUTPUT_RESERVE: u64 = 8_192;
+
+/// What a window-derived budget holds back for the parts of a request that are not
+/// the assembled section — the system block, the tool catalogue and the skill
+/// catalogue.
+///
+/// The same field test measured that floor at 7,311 tokens, of which 5,436 was the
+/// tool catalogue. This rounds it up rather than tracking it, because the number
+/// moves with the operator's own tools and a ceiling derived from a stale
+/// measurement is worse than one derived from a stated reservation.
+const REQUEST_FLOOR_RESERVE: u64 = 8_192;
+
 /// The smallest assembled section a nearly-exhausted budget still gets: a prompt
 /// too small to carry one observation is a turn the agent cannot act on.
 const BUDGET_FLOOR: u64 = 2_000;
 
+/// The rungs between Context Collapse and a fold (0.81.0).
+///
+/// Compaction quality, not window size, is what a long run is actually limited by,
+/// and through 0.80.0 this crate had two rungs where it needed five: [`Collapse`],
+/// a non-destructive read-time projection, and the fold, which spends a model call
+/// and destroys detail. Everything between them was a cliff.
+///
+/// Three rungs fill it, and they run in this order because it is the order of
+/// increasing loss:
+///
+/// 1. **Reduction** ([`Ladder::reduce`]) — the cheapest, and lossless *for
+///    observations*, which is the whole of what it is for. The memory block's
+///    quarter of the ceiling is trimmed towards a sixteenth so the observations get
+///    the room. **It is not lossless overall**: `render_notes` fits the block to
+///    whatever ceiling it is given and drops the notes that no longer fit, so a run
+///    with many notes trades some of them for the observations of the turn it is
+///    taking. That is the trade the rung exists to make — a note is durable and can
+///    be recalled again, where an observation dropped from this turn is gone from
+///    this turn — and it is stated here rather than discovered from a prompt that
+///    quietly stopped mentioning something.
+/// 2. **Snip** ([`Ladder::snip`]) — drops old results whose kind is a lookup rather
+///    than a finding. A `find` from thirty steps ago is not load-bearing; a file
+///    the agent read, a command it ran, or a skill it opened is.
+/// 3. **Microcompact** ([`Ladder::microcompact`]) — replaces a contiguous run of
+///    one step's results with elisions, the first of which counts them. Not one
+///    line: a stub occupies its call's position, so a run of ten results becomes
+///    ten short lines rather than one. It fires only where that is smaller than
+///    what it replaces, measured rather than assumed — a run of four one-line reads
+///    is one this rung would otherwise make bigger.
+///
+/// The fold stays the last rung and stays the default trigger. Every rung here is
+/// **off by default**, so a caller who changes nothing assembles exactly what
+/// 0.80.0 assembled.
+///
+/// ```
+/// use io_harness::context::{Ladder, Snip};
+///
+/// // Off is the default, and off is what a run that says nothing gets.
+/// let off = Ladder::default();
+/// assert!(!off.reduce && !off.microcompact && off.snip.is_none());
+///
+/// // The cheapest rung alone, which is the one that loses nothing.
+/// let lossless = Ladder { reduce: true, ..Ladder::default() };
+/// assert!(lossless.reduce);
+///
+/// // Everything, in the order the ladder runs it.
+/// let full = Ladder {
+///     reduce: true,
+///     snip: Some(Snip { older_than_steps: 20 }),
+///     microcompact: true,
+///     skill_bodies_leave: true,
+/// };
+/// assert_eq!(full.snip.unwrap().older_than_steps, 20);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Ladder {
+    /// Trim the memory block's share so the observations get the room.
+    ///
+    /// Fires only when the ledger will not fit, and costs whichever notes no longer
+    /// fit the smaller block. See the ordering note above: it is the cheapest rung
+    /// and it is not free.
+    pub reduce: bool,
+    /// Drop old lookup results, or `None` to drop nothing.
+    pub snip: Option<Snip>,
+    /// Elide a contiguous run of one step's results, counting them in the first.
+    ///
+    /// Applied only where the elisions are smaller than the results they replace.
+    pub microcompact: bool,
+    /// Fold a skill's body out of the conversation after the step that used it
+    /// (0.81.0).
+    ///
+    /// A body read through `read_skill` is 7 to 10 KB in the bundles measured, and
+    /// it sits in the conversation for the rest of the session, re-sent on every
+    /// later step. It is the one observation whose loss costs nothing: its
+    /// catalogue line stays in the system prompt and `read_skill` brings the body
+    /// back by name, so an agent that needs it again asks again.
+    ///
+    /// Off by default, like every rung here.
+    pub skill_bodies_leave: bool,
+}
+
+/// How old a lookup result must be before [`Ladder::snip`] drops it.
+///
+/// Age is in steps rather than in entries, because a step is what a reader counts
+/// back in and an entry count moves with how chatty a step happened to be.
+///
+/// ```
+/// use io_harness::context::Snip;
+///
+/// let snip = Snip { older_than_steps: 30 };
+/// assert_eq!(snip.older_than_steps, 30);
+/// // The default is deliberately generous: a rung that drops recent work is a
+/// // rung nobody will turn on.
+/// assert_eq!(Snip::default().older_than_steps, 20);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Snip {
+    /// Results from more than this many steps ago are droppable.
+    pub older_than_steps: u32,
+}
+
+impl Default for Snip {
+    fn default() -> Self {
+        Self {
+            older_than_steps: 20,
+        }
+    }
+}
+
+impl Snip {
+    /// Whether a result of this kind may be dropped at all.
+    ///
+    /// A lookup is droppable and a finding is not. `find` and `grep` answer "what
+    /// exists" — a question the agent can ask again for the price of one tool call,
+    /// and whose answer thirty steps ago is probably stale anyway. A read, a write,
+    /// a command's output, a skill body, an MCP reply and an answer from a human
+    /// are all findings: re-asking either costs the run something it cannot get
+    /// back, or cannot be re-asked at all.
+    ///
+    /// ```
+    /// use io_harness::context::{ObsKind, Snip};
+    ///
+    /// assert!(Snip::droppable(ObsKind::Find));
+    /// assert!(Snip::droppable(ObsKind::Grep));
+    /// assert!(!Snip::droppable(ObsKind::Read));
+    /// assert!(!Snip::droppable(ObsKind::Skill));
+    /// ```
+    pub fn droppable(kind: ObsKind) -> bool {
+        matches!(kind, ObsKind::Find | ObsKind::Grep)
+    }
+}
+
+/// The smallest share of the ceiling the memory block keeps once
+/// [`Ladder::reduce`] has trimmed it.
+///
+/// A quarter by default and never below a sixteenth: notes are what make a second
+/// run over a workspace cheaper than the first, and a rung that reduced them to
+/// nothing would buy one turn's room by paying for every later one.
+const NOTES_SHARE_FLOOR: u64 = 16;
+
+/// How many contiguous results one step must have produced before
+/// [`Ladder::microcompact`] replaces them with a line.
+///
+/// Two is not a run. Compacting a pair costs a reader both results to save one
+/// line, which is the wrong trade at every ceiling.
+const MICROCOMPACT_MIN: usize = 3;
+
+/// The ceiling a run will actually use, and the one word that says where it came
+/// from (0.81.0).
+///
+/// Three sources, in this order, and the order is the whole of the rule:
+///
+/// 1. **`contract`** — the caller wrote a budget. It wins over everything, because
+///    an operator who states a ceiling has stated it for a reason the crate cannot
+///    see.
+///
+///    **"Wrote one" is `declared != ContextBudget::default()`, and that has one
+///    sharp edge worth stating rather than discovering.** A caller who writes
+///    `ContextBudget { max_tokens: 24_000, share: 0.5 }` — byte-equal to the
+///    default — is indistinguishable from one who wrote nothing, so the model's
+///    window answers instead and the ceiling is *larger* than what they typed.
+///    There is no way to tell the two apart without making the field an `Option`,
+///    which would break every caller that reads it. A caller who means exactly
+///    24,000 whatever the model holds should say so with a value that is not the
+///    default — `24_001`, or a `share` of their own — and
+///    [`EventKind::ContextCeiling`](crate::EventKind::ContextCeiling) is what shows
+///    which source actually answered.
+/// 2. **`model`** — the provider knows the model's window. The ceiling is
+///    [`ContextBudget::for_window`], so the answer and the request floor are
+///    reserved out of it.
+/// 3. **`fallback`** — nothing knows the window, so [`FALLBACK_MAX_TOKENS`] applies.
+///    This was every run's ceiling before 0.81.0.
+///
+/// The label rides [`EventKind::ContextCeiling`](crate::EventKind::ContextCeiling),
+/// so an operator wondering why a 128,000-token model is trimming at 16,000 can read
+/// the answer rather than infer it.
+pub(crate) fn resolve_budget(
+    declared: ContextBudget,
+    window: Option<u64>,
+    max_output: Option<u64>,
+) -> (ContextBudget, &'static str) {
+    if declared != ContextBudget::default() {
+        return (declared, "contract");
+    }
+    match window {
+        Some(window) => (ContextBudget::for_window(window, max_output), "model"),
+        None => (declared, "fallback"),
+    }
+}
+
 impl ContextBudget {
+    /// A budget sized to a model's own context window (0.81.0).
+    ///
+    /// `window` is the model's total context length, as
+    /// [`ModelInfo::context_length`](crate::provider::ModelInfo::context_length)
+    /// reports it, and `max_output` is what the vendor says an answer may be, as
+    /// [`ModelInfo::max_output_tokens`](crate::provider::ModelInfo::max_output_tokens)
+    /// reports it. The whole window is not available to the assembled section: the
+    /// answer has to fit, and so do the system block and the tool catalogue. Both
+    /// are reserved, and what is left is the ceiling.
+    ///
+    /// A window smaller than its own reservations floors at the same 2,000 tokens
+    /// [`effective_tokens`](ContextBudget::effective_tokens) floors at, because a
+    /// prompt too small to carry one observation is a turn the agent cannot act on.
+    ///
+    /// ```
+    /// use io_harness::ContextBudget;
+    ///
+    /// // A 128k model, with the vendor's own 8k answer limit reported.
+    /// let big = ContextBudget::for_window(128_000, Some(8_192));
+    /// assert_eq!(big.max_tokens, 128_000 - 8_192 - 8_192);
+    ///
+    /// // The same window with no stated answer limit reserves the default instead.
+    /// assert_eq!(ContextBudget::for_window(128_000, None).max_tokens, 111_616);
+    ///
+    /// // A window smaller than its reservations still gets a usable floor.
+    /// assert_eq!(ContextBudget::for_window(4_096, None).max_tokens, 2_000);
+    ///
+    /// // `share` is untouched: it is a different axis — how much of what is *left*
+    /// // of a run's token budget the prompt may take.
+    /// assert_eq!(big.share, ContextBudget::default().share);
+    /// ```
+    pub fn for_window(window: u64, max_output: Option<u64>) -> Self {
+        let reserve = max_output
+            .unwrap_or(DEFAULT_OUTPUT_RESERVE)
+            .saturating_add(REQUEST_FLOOR_RESERVE);
+        Self {
+            max_tokens: window.saturating_sub(reserve).max(BUDGET_FLOOR),
+            ..Self::default()
+        }
+    }
+
     /// The ceiling for this turn's assembled section.
     ///
     /// With no run token budget it is [`max_tokens`](ContextBudget::max_tokens)
@@ -836,6 +1103,9 @@ pub struct Assembly<'a> {
     /// Context Collapse for this turn (0.76.0). [`Collapse::default`] is off,
     /// which assembles exactly what 0.75.0 assembled.
     pub collapse: Collapse,
+    /// The rungs between Collapse and a fold (0.81.0). [`Ladder::default`] is
+    /// every rung off, which assembles exactly what 0.80.0 assembled.
+    pub ladder: Ladder,
 }
 
 /// The observation section for one turn, and what it cost.
@@ -877,6 +1147,28 @@ pub struct Assembled {
     pub collapsed: bool,
     /// Estimated tokens for `text` — see [`estimate_tokens`].
     pub est_tokens: u64,
+    /// (0.81.0) Whether [`Ladder::reduce`] trimmed the memory block's share to
+    /// make room for observations.
+    ///
+    /// Read it beside [`recalled`](Assembled::recalled), which is how many notes
+    /// the smaller block still carried: the rung buys observation room with note
+    /// room, so the pair is the trade it made and either number alone is half of it.
+    pub reduced: bool,
+    /// (0.81.0) Observations a *rung* dropped rather than the budget: old lookups
+    /// under [`Ladder::snip`], and skill bodies under
+    /// [`Ladder::skill_bodies_leave`].
+    ///
+    /// **`stubbed` is a superset, not a sibling.** Every entry counted here is also
+    /// counted there, because the emission counts everything that was not carried
+    /// whole. So the budget's own share is `stubbed - snipped - microcompacted`,
+    /// and a reader wanting "how much did the ceiling cost me" has to do that
+    /// subtraction rather than read `stubbed` directly. Stated because the obvious
+    /// reading of two counters side by side is that they partition, and these
+    /// do not.
+    pub snipped: usize,
+    /// (0.81.0) Contiguous runs of one step's results that
+    /// [`Ladder::microcompact`] replaced with a counted line.
+    pub microcompacted: usize,
     /// (0.49.0) The same emission, piece by piece, so the run loop can build a
     /// role-tagged transcript from it.
     ///
@@ -1038,6 +1330,7 @@ pub async fn assemble(
         run_id,
         step,
         collapse,
+        ladder,
     } = at;
     let entries = ledger.entries();
     let n = entries.len();
@@ -1049,7 +1342,20 @@ pub async fn assemble(
     // but they are also the part a long run must not let crowd out what it just
     // observed, so they get a quarter of the ceiling and the observations get what
     // is left.
-    let (notes_text, recalled_keys) = render_notes(notes, global, budget_tokens / 4);
+    //
+    // 0.81.0, the ladder's first rung: when the ledger already will not fit, the
+    // memory block's quarter is trimmed towards a floor and the observations get
+    // the difference. Lossless — nothing leaves the prompt, the ceiling is
+    // re-divided — which is why it runs before any rung that drops something.
+    // Conditional on the overflow rather than always on, because a run that fits
+    // has nothing to gain and its notes would be shortened for no reason.
+    let notes_share = if ladder.reduce && ledger.est_tokens() > budget_tokens {
+        out.reduced = true;
+        NOTES_SHARE_FLOOR
+    } else {
+        4
+    };
+    let (notes_text, recalled_keys) = render_notes(notes, global, budget_tokens / notes_share);
     out.recalled = recalled_keys.len();
     out.recalled_keys = recalled_keys;
     let budget_tokens = budget_tokens.saturating_sub(estimate_tokens(&notes_text));
@@ -1115,6 +1421,128 @@ pub async fn assemble(
                      not be done ({why}) — read it yourself"
                 )));
             }
+        }
+    }
+
+    // 3a. Snip (0.81.0), the ladder's second rung. An old lookup is dropped by
+    // *kind*, before the budget is consulted, so the room it frees is room the fit
+    // loop can give to something newer. It becomes a stub rather than vanishing:
+    // a stub still occupies its call's position, which is what keeps the ordinals
+    // below counting the same calls they counted before.
+    if let Some(snip) = ladder.snip {
+        for i in 0..n {
+            if superseded[i].is_some()
+                || shapes[i].is_some()
+                || !Snip::droppable(entries[i].kind)
+                || step.saturating_sub(entries[i].step) <= snip.older_than_steps
+            {
+                continue;
+            }
+            out.snipped += 1;
+            shapes[i] = Some(Shape::Stub(format!(
+                "dropped as a lookup older than {} steps — ask again if it still matters",
+                snip.older_than_steps
+            )));
+        }
+    }
+
+    // 3a-bis. Skill bodies leave (0.81.0). The same read-time predicate shape as
+    // snip, on the one observation whose loss is free: the catalogue line that
+    // named it is in the system prompt and `read_skill` fetches it again by name,
+    // so an agent that needs it back asks and gets it. Everything else the fit
+    // loop drops is gone for the rest of the turn.
+    //
+    // One step of grace, not zero: the body is read on step N and *used* on step
+    // N+1, so evicting it at N+1 would fold it out of the very turn that asked for
+    // it.
+    if ladder.skill_bodies_leave {
+        for i in 0..n {
+            if superseded[i].is_some()
+                || shapes[i].is_some()
+                || entries[i].kind != ObsKind::Skill
+                || step.saturating_sub(entries[i].step) <= 1
+            {
+                continue;
+            }
+            // Counted in `snipped` with the lookups: both are "a rung decided this
+            // was not worth carrying", which is the distinction the field draws
+            // against the budget's own drops. `Assembled::snipped` says so.
+            out.snipped += 1;
+            shapes[i] = Some(Shape::Stub(
+                "the body has been folded out; read the skill again if you need it".to_string(),
+            ));
+        }
+    }
+
+    // 3b. Microcompact (0.81.0), the ladder's third rung: a contiguous run of one
+    // step's results becomes one counted line.
+    //
+    // **Mechanical, with no model call, and that is the design rather than a
+    // shortcut.** `assemble` is a pure function of the ledger, the store, the
+    // policy and the workspace; giving it a provider to write prose with would make
+    // every assembled prompt depend on a completion, which is what the fold already
+    // is and what this rung exists to sit below. It also keeps the rung
+    // deterministic, which is what lets the evaluation suite score it against the
+    // ones beside it.
+    if ladder.microcompact {
+        let mut i = 0;
+        while i < n {
+            let at_step = entries[i].step;
+            let mut j = i;
+            while j < n
+                && entries[j].step == at_step
+                && Piece::of(&entries[j]) == Piece::Result
+                && superseded[j].is_none()
+                && shapes[j].is_none()
+            {
+                j += 1;
+            }
+            // Never the step being assembled for: the agent has just made those
+            // calls and is about to read their results.
+            if j - i >= MICROCOMPACT_MIN && at_step < step {
+                // The replacement is built and measured before it is installed,
+                // because it is **not** one line: a stub still occupies its call's
+                // position, so the emission renders an elision line per entry and a
+                // run of ten results becomes ten lines. Each is short, but a run of
+                // *short* results — four one-line reads — is one this rung would
+                // otherwise make bigger, which is the opposite of the job.
+                //
+                // So the rung fires only where it pays. Measured against the same
+                // estimator the fit loop uses, over the same strings the emission
+                // will render, rather than against a length heuristic that would be
+                // right on average and wrong on the case in front of it.
+                let replacement: Vec<String> = (i..j)
+                    .enumerate()
+                    .map(|(n_kept, _)| {
+                        if n_kept == 0 {
+                            format!(
+                                "step {at_step} made {} calls; their results are compacted here",
+                                j - i
+                            )
+                        } else {
+                            format!("compacted into the first result of step {at_step}")
+                        }
+                    })
+                    .collect();
+                let before: u64 = (i..j).map(|k| estimate_tokens(&entries[k].text)).sum();
+                let after: u64 = (i..j)
+                    .zip(replacement.iter())
+                    .map(|(k, why)| {
+                        let subject = match &entries[k].target {
+                            Some(t) => format!("{} {t}", entries[k].kind.label()),
+                            None => entries[k].kind.label().to_string(),
+                        };
+                        estimate_tokens(&format!("\n[{subject}] (elided: {why})\n"))
+                    })
+                    .sum();
+                if after < before {
+                    out.microcompacted += 1;
+                    for (k, why) in (i..j).zip(replacement) {
+                        shapes[k] = Some(Shape::Stub(why));
+                    }
+                }
+            }
+            i = j.max(i + 1);
         }
     }
 
@@ -1308,8 +1736,17 @@ pub async fn assemble(
                 // are not the same event, so both are printed and each names the
                 // other at its own definition. A reader with the release notes in
                 // hand would otherwise read `collapsed=` as Context Collapse.
-                "carried={} stubbed={} shortened={} reread={} recalled={} stubs_collapsed={}",
-                out.carried, out.stubbed, out.shortened, out.reread, out.recalled, out.collapsed
+                "carried={} stubbed={} shortened={} reread={} recalled={} stubs_collapsed={} \
+                 reduced={} snipped={} microcompacted={}",
+                out.carried,
+                out.stubbed,
+                out.shortened,
+                out.reread,
+                out.recalled,
+                out.collapsed,
+                out.reduced,
+                out.snipped,
+                out.microcompacted
             ),
             out.est_tokens,
         ),

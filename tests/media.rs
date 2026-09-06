@@ -384,3 +384,117 @@ async fn an_svg_is_refused_by_name_through_the_tool_and_attaches_nothing() {
         "the refusal names the format and the fix, not the vendors' list: {obs}"
     );
 }
+
+// ------------------------------------------------------------------- F8
+
+/// Every image that reaches a run is announced, by descriptor and by path.
+///
+/// Through 0.80.0 nothing reached the event stream at all — not the bytes, which
+/// is deliberate, and not a descriptor either, which was not. A consumer could
+/// tell an image had arrived only by parsing prose out of an observation, and
+/// could not tell an image the agent *asked* for from one it was handed.
+mod image_events {
+    use super::*;
+    use io_harness::{run_with_observed, EventKind, Flow, Observer, RunEvent};
+
+    #[derive(Default)]
+    struct Seen(Mutex<Vec<(String, String, u64)>>);
+
+    impl Observer for Seen {
+        fn event(&self, event: &RunEvent) -> Flow {
+            if let EventKind::ImageAttached {
+                source,
+                media_type,
+                bytes,
+                ..
+            } = &event.kind
+            {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((source.clone(), media_type.clone(), *bytes));
+            }
+            Flow::Continue
+        }
+    }
+
+    impl Seen {
+        fn sources(&self) -> Vec<String> {
+            self.0.lock().unwrap().iter().map(|s| s.0.clone()).collect()
+        }
+    }
+
+    /// An image the agent asked for is announced as `view_image`.
+    #[tokio::test]
+    async fn f8_an_image_the_agent_asked_for_is_announced_as_such() {
+        let dir = fixture();
+        // A real one-pixel PNG: `view_image` decodes what it attaches, so the
+        // four-byte header the rest of this file uses would be refused.
+        std::fs::write(
+            dir.path().join("real.png"),
+            include_bytes!("fixtures/one-pixel.png"),
+        )
+        .unwrap();
+        let provider = Spy::new(vec![vec![view("real.png")]]);
+        let store = store(&dir);
+        let seen = Seen::default();
+
+        let _ = run_with_observed(
+            &contract(&dir),
+            &provider,
+            &store,
+            &guarded(),
+            &io_harness::ApproveAll,
+            &seen,
+        )
+        .await
+        .unwrap();
+
+        let events = seen.0.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "one image, one event: {events:?}");
+        assert_eq!(events[0].0, "view_image");
+        assert_eq!(events[0].1, "image/png");
+        assert!(
+            events[0].2 > 0,
+            "a descriptor with no size describes nothing"
+        );
+    }
+
+    /// The contract's own images are announced once, not once per step.
+    ///
+    /// They ride every request — that is what makes them the task's subject — so an
+    /// event per step would repeat one fact for the length of the run.
+    #[tokio::test]
+    async fn f8_the_contracts_own_images_are_announced_once_for_the_run() {
+        let dir = fixture();
+        let provider = Spy::new(vec![vec![], vec![]]);
+        let store = store(&dir);
+        let seen = Seen::default();
+        let contract = contract(&dir).with_images([Media::attach(
+            "image/png",
+            include_bytes!("fixtures/one-pixel.png"),
+        )
+        .unwrap()]);
+
+        let _ = run_with_observed(
+            &contract,
+            &provider,
+            &store,
+            &guarded(),
+            &io_harness::ApproveAll,
+            &seen,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            seen.sources(),
+            vec!["caller".to_string()],
+            "one image announced once, however many steps carried it"
+        );
+        assert!(
+            provider.images_per_request().len() > 1,
+            "the run took more than one step, which is what makes the count a claim"
+        );
+    }
+}

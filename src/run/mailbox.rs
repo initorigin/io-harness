@@ -461,6 +461,36 @@ pub(super) async fn worktree_for<P: Provider>(
         name: slug,
         path: target,
     };
+    // 0.81.0 — one `git worktree add` at a time, because git's is not safe to run
+    // concurrently in one repository and this crate is what makes it concurrent.
+    //
+    // `worktree add` walks `.git/worktrees/*` while it prepares, and a sibling
+    // `add` that has created its directory but not yet written its `commondir`
+    // file is a half-written entry the walk reads. The loser exits 128 with
+    // `failed to read .git/worktrees/<the other child>/commondir`, naming the
+    // directory it was not creating, and the spawn fails. Reproduced at roughly one
+    // in four hundred under load while closing issue #232, whose two named sites
+    // were made deterministic in 0.76.0; this is the third and it was a real
+    // defect rather than a test that could not tell slow from broken.
+    //
+    // ponytail: one lock for the whole process rather than one per repository
+    // root. Creation is rare and takes tens of milliseconds, so two trees over two
+    // repositories briefly waiting on each other costs less than the map that
+    // would avoid it; key it by `tree.root` if a host ever drives many repositories
+    // at once.
+    //
+    // **The hold is unbounded, and that is a stated ceiling rather than an
+    // oversight.** `Git::run` ends in `child.output().await` with no wall-clock cap
+    // — `WORKTREE_ERR_CAP` bounds the output, not the wait — so a `git worktree
+    // add` that blocks on an `index.lock` held by a concurrent `git_commit` in the
+    // same repository, which this lock does not serialize, wedges every later
+    // spawn in the process for as long as git hangs. Nothing else takes this lock
+    // and the approval gate runs before it, so there is no cycle and a tokio mutex
+    // cannot be poisoned; what is missing is a timeout. The fix is a deadline on
+    // the git call rather than on the lock, which belongs with the other exec
+    // deadlines and not here.
+    static CREATING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one_at_a_time = CREATING.lock().await;
     match Git::new(parent_policy, &tree.root, WORKTREE_ERR_CAP)
         .gated()
         .run(&cmd)

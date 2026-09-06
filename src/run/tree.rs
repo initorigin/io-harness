@@ -343,7 +343,11 @@ where
         // Children share their parent's workspace, so they share its detection too.
         let toolchain = crate::toolchain::detect(&tree.root);
         // Children share their parent's workspace, so they share its containment.
-        let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
+        let containment = exec_containment(
+            &contract.exec_sandbox,
+            toolchain.as_ref(),
+            &contract.writable_roots,
+        );
         // 0.48.0 — the same rule as the flat loop. A contained tree run whose
         // policy names hosts must not silently take the boolean while the flat
         // loop scopes its egress.
@@ -490,6 +494,15 @@ where
         if planning {
             tools.push(propose_plan_spec());
         }
+        // 0.81.0 — tiering applies here too. `collapse`, `ladder` and
+        // `writable_roots` were threaded into this loop when they were added and
+        // `tool_tiers` was not, which would have made it a setting that silently
+        // does nothing for every sub-agent while working for a flat run — the
+        // worst shape a configuration key can have, because nothing reports it.
+        let mut offered: Vec<String> = contract.tool_tiers.clone().unwrap_or_default();
+        let full_catalogue = tools;
+        let mut tools =
+            crate::run::prompts::tiered(full_catalogue.clone(), contract.tool_tiers.as_deref());
         // The budget this agent runs under is the smaller of what its contract
         // asked for and what the tree has left — a contract cannot raise it.
         let token_cap = tree.ledger.effective_token_budget(contract.max_tokens);
@@ -687,6 +700,7 @@ where
                         // default, which is off — the same boundary `compaction`
                         // and `fold_now` already draw at a spawn.
                         collapse: contract.collapse,
+                        ladder: contract.ladder,
                     },
                 )
                 .await?;
@@ -957,6 +971,43 @@ where
             let mut spawn_calls: Vec<&ToolCall> = Vec::new();
             for call in &response.tool_calls {
                 calls_json.push(format!("{}:{}", call.name, call.arguments));
+                // 0.81.0 — answered here for the reason the flat loop answers it
+                // there: it changes what the next request offers rather than doing
+                // anything, so there is nothing for the policy to resolve. Without
+                // this arm a tiered tree run would be offered `expand_tools` and
+                // have the call fall through to `dispatch` as an unknown tool.
+                if contract.tool_tiers.is_some() && call.name == crate::tools::EXPAND_TOOLS_TOOL {
+                    let asked = call
+                        .arguments
+                        .get("family")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let obs = if !crate::tools::TOOL_FAMILIES.contains(&asked.as_str()) {
+                        format!(
+                            "\n[expand_tools] no such family {asked:?}; the families are {}\n",
+                            crate::tools::TOOL_FAMILIES.join(", ")
+                        )
+                    } else if offered.contains(&asked) {
+                        format!("\n[expand_tools] {asked} is already offered\n")
+                    } else {
+                        offered.push(asked.clone());
+                        tools = crate::run::prompts::tiered(full_catalogue.clone(), Some(&offered));
+                        format!(
+                            "\n[expand_tools] {asked} is offered from the next step; make the \
+                             call you wanted\n"
+                        )
+                    };
+                    decisions.push(format!("expanded {asked}"));
+                    ledger.push(Observation::new(
+                        step,
+                        ObsKind::Tool,
+                        Some(crate::tools::EXPAND_TOOLS_TOOL.to_string()),
+                        obs,
+                        Origin::Prose,
+                    ));
+                    continue;
+                }
                 // 0.74.0 — the three tools this loop handles itself never reach
                 // `dispatch`, which is where every other call is put to the
                 // operator's `before_tool` checks. They are asked here instead,
@@ -1394,6 +1445,7 @@ where
                 ),
                 step_changed,
                 committed,
+                response.usage,
             )?;
             // Only when the step actually committed. A step paused by a child is
             // deliberately left uncommitted so the resume replays it (0.7.0's
@@ -1957,6 +2009,20 @@ pub(super) async fn spawn_child<'f, P: Provider>(
     // spawn arguments are never read for this, so "give the sub-agent web access"
     // is unwritable in the JSON the model controls.
     child_contract.web = tree.web.clone();
+    // 0.81.0 — a child working in its own worktree writes outside that worktree by
+    // construction: `git commit` there writes objects and refs into the *parent*
+    // repository's `.git`, which is not under the child's root. Through 0.80.0 that
+    // worked only because the Landlock rung granted the whole system temporary
+    // directory to everything; with the grant narrowed to the run's own directory,
+    // the child has to name what it needs.
+    //
+    // The parent's own root, not a path the model chose: the spawn arguments are
+    // never read for this, exactly as they are not read for `web` above, so
+    // "give the sub-agent another writable root" is unwritable in the JSON the
+    // model controls.
+    if child_root != tree.root {
+        child_contract = child_contract.with_writable_roots([tree.root.join(".git")]);
+    }
     if let Some(n) = a.get("max_steps").and_then(|v| v.as_u64()) {
         child_contract = child_contract.with_max_steps(n as u32);
     }

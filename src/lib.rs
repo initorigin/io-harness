@@ -502,6 +502,7 @@ pub mod context;
 mod contract;
 mod diff;
 mod error;
+pub mod eval;
 mod harness;
 pub mod hooks;
 pub mod lsp;

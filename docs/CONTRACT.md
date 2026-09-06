@@ -231,12 +231,20 @@ for:
 | `linux-namespaces` | unprivileged user namespaces | Yes | Yes |
 | `portable-floor` | nothing | No | No |
 
-**A workspace inside the system temporary directory is not confined**, on any
-unix backend. Every one of them grants the system
-temporary directory writable — the mount setup binds `${TMPDIR:-/tmp}`, the macOS
-profile allows `/private/var/folders`, and the Landlock rung grants it — because a
-toolchain that cannot open a temporary file cannot run at all. A workspace *located* under that directory therefore sits
-inside a writable grant, and `ExecMode::ReadOnly` does not make it read-only.
+**A workspace inside the system temporary directory is not confined on macOS.**
+The macOS profile allows `/private/var/folders` outright, because a toolchain that
+cannot open a temporary file cannot run at all. A workspace *located* under that
+directory therefore sits inside a writable grant, and `ExecMode::ReadOnly` does not
+make it read-only.
+
+**The three Linux rungs no longer do this.** The two mount rungs narrowed to a
+directory the run owns in 0.74.0 and the Landlock rung joined them in 0.81.0, with
+the child's `TMPDIR` pointed at the grant. That closes what was a real hole rather
+than a documented ceiling: every run's ephemeral workspace lives inside the system
+temporary directory, so while the rung granted the whole of it, two concurrent runs
+could read and rewrite each other's workspace from inside their own sandboxes. A
+run needing to write somewhere else names it — `TaskContract::writable_roots`, or
+`[run] writable_roots` — and gets that root and nothing more.
 This was found by the CI matrix in 0.47.0, on a test whose own workspace and
 whose "outside" target were both `tempfile::tempdir()`s and so had both been
 granted. It is a property of the design, not a defect in one rung: put a
@@ -1456,9 +1464,17 @@ contained turn is a tree like any other in this respect.
 
 | `ExecMode` | A command may write to |
 | --- | --- |
-| `ReadOnly` | the system temporary directory, and nothing else |
-| `WorkspaceWrite` *(the default)* | the workspace root, the system temporary directory, and the detected toolchain's own cache directories |
+| `ReadOnly` | a temporary directory, and nothing else — **not** the roots the contract declared, because a mode that withholds the workspace must not hand a root back beside it |
+| `WorkspaceWrite` *(the default)* | the workspace root, a temporary directory, the detected toolchain's own cache directories, and any absolute existing path in `TaskContract::writable_roots` |
 | `FullAccess` | anywhere this program's user can write |
+
+"A temporary directory" is the system one on macOS and the run's own on Linux,
+which is the difference the section above states. A declared root that is relative,
+or that does not exist when the run starts, is **dropped rather than granted**: the
+Linux mount setup binds every root it is given, a bind of an absent path fails the
+setup, and a failed setup degrades the whole backend to the portable floor — so a
+bad entry would silently unwind the confinement the good ones were added to
+preserve.
 
 **Every mode may also write `/dev/null`**, on every backend. The bit bucket is
 where a toolchain's own scripts send output they mean to discard, and a write to

@@ -17,11 +17,14 @@ let contract = TaskContract::workspace("Refactor the parser.", &root)
     .with_token_budget(400_000)
     // Absolute ceiling per request, and the share of the *unspent* token
     // budget a request may carry of what the run has already observed.
-    .with_context_budget(ContextBudget { max_tokens: 24_000, share: 0.5 });
+    .with_context_budget(ContextBudget { max_tokens: 60_000, share: 0.5 });
 ```
 
-Those are the values `ContextBudget::default()` already holds; the call above
-states them rather than changes them.
+A budget that differs from `ContextBudget::default()` is a statement, and a run
+that states one keeps it. A budget byte-equal to the default is indistinguishable
+from writing nothing, so the model's own window answers instead — see
+[Where the ceiling comes from](#where-the-ceiling-comes-from-0810) for the order
+the three sources are consulted in.
 
 Each turn, under that budget:
 
@@ -43,6 +46,33 @@ Each turn, under that budget:
 
 Run it live: `cargo run --example context_growth` and
 `cargo run --example context_growth_bounded`.
+
+## Where the ceiling comes from (0.81.0)
+
+`max_tokens` is the absolute ceiling one request assembles under, and three
+sources answer for it, in this order:
+
+1. **The contract** — a caller who stated a budget keeps it.
+2. **The model** — `Provider::context_window` and `Provider::max_output_tokens`,
+   both defaulting to `None`, which means "not saying" rather than zero.
+   `ContextBudget::for_window(window, max_output)` derives the ceiling from them,
+   reserving the model's answer and about 8,192 tokens of request floor out of the
+   window, floored at 2,000.
+3. **The constant**, `FALLBACK_MAX_TOKENS`, as the fallback.
+
+Which of the three answered is on the event stream: `EventKind::ContextCeiling`
+carries the ceiling and a `source` of `"contract"`, `"model"` or `"fallback"`.
+`"fallback"` is the one worth acting on, because it is the case where nothing knew
+the window and the ceiling is a guess.
+
+Before 0.81.0 nothing read the `context_length` the provider catalogue already
+carried, so every consumer that wrote no `[run.context]` assembled under 24,000
+tokens whatever the model held — on a 128,000-token model that threw most of the
+window away and bought re-reads of observations that would have fit.
+
+`Provider::context_window` is synchronous and must never dial. `Compatible`
+answers from a catalogue it has already fetched and `None` until then, so the same
+run is sized differently depending on whether the embedder asked for prices.
 
 ## Durable memory
 
@@ -142,7 +172,8 @@ let contract = contract.with_memory_limits(MemoryLimits {
 ```
 
 Those three numbers were not arbitrary. The memory block gets a quarter of a
-turn's effective tokens, and the defaults were chosen so the *whole* store fits
+turn's effective tokens — a sixteenth where `Ladder::reduce` is on and the ledger
+will not otherwise fit — and the defaults were chosen so the *whole* store fits
 inside that share — which is why raising them is not the free win it looks like.
 Past that point recall can no longer carry everything and selection starts
 deciding what the model sees. What that selection is has moved twice: 0.56.0 put
@@ -470,8 +501,57 @@ configures nothing is projected exactly what 0.75.0 projected. `fold` stays the
 last rung and stays the default trigger; a collapse only ever changes what happens
 to an entry that was going to be stubbed anyway.
 
-There is no `io.toml` key for it. It is set on the contract, like the budget and
-unlike the memory limits.
+## The rungs between a collapse and a fold (0.81.0)
+
+A collapse shortens an entry; a fold buys a paragraph and destroys the detail
+behind it. Three rungs sit between them, as `io_harness::context::Ladder`, and
+every one is **off by default**, so a caller who changes nothing assembles exactly
+what 0.80.0 assembled.
+
+```rust
+use io_harness::context::{Ladder, Snip};
+use io_harness::TaskContract;
+
+let contract = TaskContract::workspace("audit the handlers", "/repo")
+    .with_ladder(Ladder {
+        reduce: true,
+        snip: Some(Snip { older_than_steps: 20 }),
+        microcompact: true,
+        skill_bodies_leave: true,
+    });
+```
+
+In order of increasing loss:
+
+- **Reduce** is lossless. The memory block's quarter of the ceiling is trimmed
+  towards a sixteenth so the observations get the room, and only when the ledger
+  will not otherwise fit.
+- **Snip** drops old lookups by kind. `find` and `grep` answer "what exists",
+  which the agent can ask again for the price of one tool call; a read, a
+  command's output or a skill body is a finding and is kept. `Snip {
+  older_than_steps }` defaults to 20.
+- **Microcompact** replaces a contiguous run of three or more of one step's
+  results with a counted line, mechanically and with no model call — which is what
+  keeps `assemble` a pure function and the rung deterministic enough to score. It
+  never touches the step being assembled for.
+
+`skill_bodies_leave` sits beside them and folds a `read_skill` body out of the
+conversation two steps after it arrived. It is the one observation whose loss is
+free: the skill's catalogue line stays in the system prompt, and `read_skill`
+fetches the body back by name.
+
+The fold stays the last rung and stays the default trigger.
+
+**All of it is reachable from `io.toml` for the first time** — `[run] compaction`,
+`[run] collapse` and `[run] ladder`. `Compaction` and `Collapse` had carried serde
+derives since they were written and no config key deserialized them, so writing
+either into a config file used to be a hard parse error.
+
+The assembly trace names which rungs ran, as `reduced=`, `snipped=` and
+`microcompacted=` beside the counters that were already there. On the case set
+measured only snip moved the number, and it moved it 1.4% — which is why no
+default changed with the ladder. See
+[docs/MEASUREMENTS.md](../MEASUREMENTS.md).
 
 ## The limits, stated plainly
 

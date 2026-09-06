@@ -1189,3 +1189,90 @@ async fn a_server_offering_no_tools_announces_zero_rather_than_nothing() {
         "only the connect carries the count: {mcp:?}"
     );
 }
+
+// ------------------------------------------------------------------- F8
+
+/// An image a server hands over is announced, and announced as *given*.
+///
+/// This is the one path in the crate where content the model will look at arrives
+/// from a third party the operator did not write. Through 0.80.0 it reached the
+/// event stream in no form at all: the transcript carried `[image: image/png, N
+/// bytes]` in prose and a consumer had to parse that to know an image existed —
+/// and could not tell it from one the agent asked for with `view_image`.
+#[cfg(feature = "media")]
+mod image_events {
+    use super::*;
+
+    /// The scripted provider above declines images, and a run whose provider
+    /// declines them never attaches one.
+    struct Looks(Mutex<Vec<Vec<ToolCall>>>, AtomicUsize);
+
+    impl Provider for Looks {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> io_harness::Result<CompletionResponse> {
+            let i = self.1.fetch_add(1, Ordering::SeqCst);
+            Ok(CompletionResponse {
+                tool_calls: self.0.lock().unwrap().get(i).cloned().unwrap_or_default(),
+                ..Default::default()
+            })
+        }
+
+        fn name(&self) -> &str {
+            "looks"
+        }
+
+        fn accepts_images(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct Seen(Mutex<Vec<(String, String)>>);
+
+    impl Observer for Seen {
+        fn event(&self, event: &RunEvent) -> Flow {
+            if let EventKind::ImageAttached {
+                source, media_type, ..
+            } = &event.kind
+            {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((source.clone(), media_type.clone()));
+            }
+            Flow::Continue
+        }
+    }
+
+    #[tokio::test]
+    async fn f8_an_image_an_mcp_server_hands_over_is_announced_as_given() {
+        let dir = workspace();
+        let provider = Looks(
+            Mutex::new(vec![vec![call("mcp__fix__snapshot", json!({}))]]),
+            AtomicUsize::new(0),
+        );
+        let store = Store::open(dir.path().join("trace.db")).unwrap();
+        let seen = Seen::default();
+        let contract = contract(dir.path(), 2).with_mcp([fixture("fix")]);
+
+        let _ = run_with_observed(
+            &contract,
+            &provider,
+            &store,
+            &permitted(),
+            &ApproveAll,
+            &seen,
+        )
+        .await
+        .unwrap();
+
+        let events = seen.0.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![("mcp".to_string(), "image/png".to_string())],
+            "one image from one server, announced once and marked as the server's"
+        );
+    }
+}
