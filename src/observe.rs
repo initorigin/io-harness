@@ -483,6 +483,65 @@ pub enum EventKind {
         /// Tokens the model produced.
         completion_tokens: u64,
     },
+    /// An image reached this run, and where it came from (0.81.0).
+    ///
+    /// **No image reached the event stream at all before this release**, in any
+    /// form, requested or given. Each of the four paths writes a *description* into
+    /// the transcript instead — `[image: image/png, 41200 bytes]` and the like —
+    /// because a trace holding the bytes would grow by megabytes a step in exactly
+    /// the long unattended runs this crate exists for. That decision stands: this
+    /// carries the same descriptor the transcript already writes, never the image.
+    ///
+    /// What it adds is that a consumer can now *find* the image. A renderer knows a
+    /// screenshot arrived on step 7, what type and how big it was, and that it came
+    /// from the browser rather than from an MCP server — none of which was
+    /// answerable from the stream, and the first three of which were only
+    /// answerable by parsing prose out of an observation.
+    ///
+    /// `source` is one of four words: `"mcp"` (a tool reply carried it), `"browser"`
+    /// (a screenshot), `"view_image"` (the agent asked for it) or `"caller"` (the
+    /// contract's own images, which are the task's subject and ride every step).
+    /// The first, second and fourth are images the agent was *given*; only
+    /// `view_image` is one it asked for, and telling them apart is the point of the
+    /// field.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent};
+    ///
+    /// struct Gallery;
+    ///
+    /// impl Observer for Gallery {
+    ///     fn event(&self, event: &RunEvent) -> Flow {
+    ///         if let EventKind::ImageAttached { media_type, bytes, source, .. } = &event.kind {
+    ///             println!("step {}: {media_type}, {bytes} bytes, from {source}", event.step);
+    ///         }
+    ///         Flow::Continue
+    ///     }
+    /// }
+    ///
+    /// let flow = Gallery.event(&RunEvent::new(
+    ///     7,
+    ///     3,
+    ///     EventKind::ImageAttached {
+    ///         media_type: "image/png".into(),
+    ///         bytes: 41_200,
+    ///         digest: "9f2c…".into(),
+    ///         source: "browser".into(),
+    ///     },
+    /// ));
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    ImageAttached {
+        /// The media type as it will be sent, after any transcode.
+        media_type: String,
+        /// How many bytes of image, as sent.
+        bytes: u64,
+        /// The digest the transcript records for the same image, so a reader can
+        /// match the two without parsing prose.
+        digest: String,
+        /// `"mcp"`, `"browser"`, `"view_image"` or `"caller"`.
+        source: String,
+    },
     /// A tool was invoked, before its result is known.
     ToolCall {
         /// The tool's name.
@@ -1482,6 +1541,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "step_attributed",
     // 0.81.0
     "step_usage",
+    "image_attached",
     "tool_call",
     "refused",
     "approval_requested",
@@ -2345,6 +2405,12 @@ mod tests {
                 cache_write_tokens: None,
                 completion_tokens: 62,
             },
+            EventKind::ImageAttached {
+                media_type: "image/png".into(),
+                bytes: 41_200,
+                digest: "9f2c".into(),
+                source: "browser".into(),
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
@@ -2356,6 +2422,7 @@ mod tests {
                 | EventKind::Step { .. }
                 | EventKind::StepAttributed { .. }
                 | EventKind::StepUsage { .. }
+                | EventKind::ImageAttached { .. }
                 | EventKind::ToolCall { .. }
                 | EventKind::Refused { .. }
                 | EventKind::ApprovalRequested { .. }

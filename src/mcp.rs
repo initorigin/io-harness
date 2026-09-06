@@ -662,6 +662,14 @@ impl McpSession {
                 #[cfg(feature = "media")]
                 let body = {
                     if !failed {
+                        // 0.81.0 — announced here, where the provenance is known by
+                        // construction. By the time these reach the request they
+                        // are indistinguishable from a screenshot or the caller's
+                        // own, and "which server handed this over" is the question
+                        // a reader has.
+                        for media in &rendered.images {
+                            watch.image(run_id, step, depth, media, "mcp");
+                        }
                         pending_media.extend(rendered.images);
                     }
                     rendered.text

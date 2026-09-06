@@ -41,6 +41,20 @@ notes are produced from it.
   reports its own network count so that claim has a witness rather than a promise.
   Deterministic replay has shipped since 0.12.0 with nothing on top of it; this is
   the layer that lets a default change be argued from this crate's own numbers.
+- **`EventKind::ImageAttached`.** No image reached the event stream in any form
+  before this release — not the bytes, which is deliberate, and not a descriptor
+  either, which was not. Each of the four paths an image arrives by (an MCP tool
+  reply, a browser screenshot, the `view_image` built-in, and the contract's own
+  images) now announces the media type, the byte length, the digest the transcript
+  already records, and which path it came from. Still never the bytes: a trace
+  holding images grows by megabytes a step in exactly the long unattended runs this
+  crate exists for.
+- **`bundles/long-horizon/`, the repository's first capability bundle.** The
+  long-horizon session protocol — a git baseline, a feature list of boolean passes
+  and an append-only progress log — shipped as skills over primitives that already
+  exist (`todo_write`, the memory tools, the git built-ins and the verification
+  gate). It adds no Rust code, and a test loads it from its shipped path so a
+  bundle broken by a later change fails a gate rather than a person.
 - **`Store::run_goal` and `Store::run_created_at`.** `runs.goal` has been written
   since 0.1.0 and published by nothing, and a run had no timestamp accessor at all,
   so a listing of parked runs showed thirteen rows differing only by a number with

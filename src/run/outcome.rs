@@ -852,6 +852,16 @@ pub(super) fn size_context<P: Provider>(
             source: source.to_string(),
         },
     ));
+    // 0.81.0 — the contract's own images, announced once here rather than once per
+    // step. They are the task's subject and ride every request, so a per-step event
+    // would repeat one fact for the length of the run to say nothing new; a reader
+    // wants to know a run started carrying two images, not that step forty still
+    // was.
+    #[cfg(feature = "media")]
+    for media in contract.images.iter() {
+        watch.image(run_id, 0, 0, media, "caller");
+    }
+
     let mut sized = contract.clone();
     sized.context = context;
     sized

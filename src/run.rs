@@ -3740,6 +3740,37 @@ impl<'a> Watch<'a> {
         }
     }
 
+    /// Report that an image reached this run, by its descriptor (0.81.0).
+    ///
+    /// One helper rather than four copies: an image arrives by four paths — an MCP
+    /// tool reply, a browser screenshot, the `view_image` built-in and the
+    /// contract's own images — and a descriptor assembled slightly differently at
+    /// each of them would be four accounts of one fact. The bytes are never
+    /// carried, for the reason `view_image`'s own observation states: a trace
+    /// holding images grows by megabytes a step in exactly the long unattended runs
+    /// this crate exists for.
+    #[cfg(feature = "media")]
+    pub(crate) fn image(
+        &self,
+        run_id: i64,
+        step: u32,
+        depth: u32,
+        media: &crate::provider::Media,
+        source: &str,
+    ) {
+        self.emit(RunEvent::at_depth(
+            run_id,
+            step,
+            depth,
+            EventKind::ImageAttached {
+                media_type: media.media_type.to_string(),
+                bytes: media.byte_len() as u64,
+                digest: media.digest(),
+                source: source.to_string(),
+            },
+        ));
+    }
+
     /// Ask for the run to stop, without an event to hang it off (0.42.0).
     ///
     /// What `on_failure = "cancel"` on a `before_tool` hook reaches. An event hook
