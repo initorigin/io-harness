@@ -1222,6 +1222,57 @@ async fn the_floor_is_told_its_proxy_is_advisory() {
     );
 }
 
+/// 0.83.0 F3 — a proxied run that widened its sandbox is told its commands have
+/// the network, and one that did not is told the proxy bounds them.
+///
+/// **A sabotage that failed nothing found this test's absence.** The three
+/// proxied arms above all describe a *narrow* proxied run, so replacing the
+/// widened branch with `false` — the state this release found the code in, where
+/// `containment_line`'s proxied branch never read its egress answer at all — broke
+/// none of them. The io-cli field test read the old sentence with the sandbox
+/// open and declined a `curl` it could have run; that is what this arm is for.
+///
+/// Both halves are required. A criterion that only asserts the widened sentence
+/// cannot tell a widened boundary from an absent one.
+#[tokio::test]
+async fn a_widened_proxied_run_is_told_its_commands_have_the_network() {
+    let dir = workspace();
+    // A policy that names a host is what makes a run proxied.
+    let policy = Policy::default().layer("test").allow_net("api.example.com");
+
+    let widened = boundary_line_for(
+        &policy,
+        &contract(dir.path()).with_contained_exec(SandboxConfig {
+            allow_network: true,
+            ..SandboxConfig::new()
+        }),
+    )
+    .await;
+    assert!(
+        widened.contains("open to the commands you run"),
+        "an operator who widened the sandbox is told the commands have it: {widened}"
+    );
+    assert!(
+        !widened.contains("only the hosts this run's policy names"),
+        "and is never told the per-host rules bound a command they do not: {widened}"
+    );
+
+    let narrow = boundary_line_for(
+        &policy,
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+    )
+    .await;
+    assert_ne!(
+        widened, narrow,
+        "the two states must not produce the same sentence — that identity is the \
+         whole of the defect"
+    );
+    assert!(
+        !narrow.contains("open to the commands you run"),
+        "a run that widened nothing is not told it did: {narrow}"
+    );
+}
+
 /// The negative control: a run whose policy names no host is not proxied, and is
 /// told what its commands actually have.
 ///
