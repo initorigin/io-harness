@@ -1064,17 +1064,40 @@ pub(crate) fn browser_tmp_dir(profile: &std::path::Path) -> std::path::PathBuf {
 
 /// Where a contained browser child may write (0.83.0).
 ///
-/// Its profile, and nothing else. It was the profile **and the whole system
-/// temporary directory** through 0.82.0, which is where `sandbox::workdir()`
-/// puts every run's ephemeral workspace — so a browser under one contained run
-/// could read and rewrite every concurrently running run's workspace. That is
-/// L11, handed back on the one path 0.81.0's narrowing did not cover.
+/// Its own profile, and whatever the run's contract declared — nothing else. It
+/// was the profile **and the whole system temporary directory** through 0.82.0,
+/// which is where `sandbox::workdir()` puts every run's ephemeral workspace — so
+/// a browser under one contained run could read and rewrite every concurrently
+/// running run's workspace. That is L11, handed back on the one path 0.81.0's
+/// narrowing did not cover.
+///
+/// **`declared` is the run's own
+/// [`TaskContract::writable_roots`](crate::TaskContract::writable_roots)**, and it
+/// is here because a browser doing work that is not self-contained is the same
+/// shape as any other child doing it. The Linux all-features leg is what said so:
+/// with the blanket grant removed, seven browser tests failed with "the fixture
+/// recorded no argv", because the fixture writes its record beside the test that
+/// started it — outside any profile. That is a genuinely not-self-contained child,
+/// and the affordance for one already exists rather than needing a second.
 ///
 /// A function rather than a literal at the spawn site so the decision can be
 /// asserted without a browser: the tests below ask it whether a `workdir()`-
 /// shaped path is reachable, which is the question L11 actually poses.
-pub(crate) fn browser_writable_roots(profile: &std::path::Path) -> Vec<std::path::PathBuf> {
-    vec![profile.to_path_buf()]
+pub(crate) fn browser_writable_roots(
+    profile: &std::path::Path,
+    declared: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![profile.to_path_buf()];
+    for root in declared {
+        // Absolute, present, named once — the same three rules
+        // `ExecContainment::resolve` applies, and for the same reason: the Linux
+        // mount setup binds every root it is given, and a bind of an absent path
+        // fails the setup and degrades the whole backend.
+        if root.is_absolute() && root.is_dir() && !roots.contains(root) {
+            roots.push(root.clone());
+        }
+    }
+    roots
 }
 
 pub(crate) fn launch_args(
@@ -1240,6 +1263,9 @@ pub(crate) async fn launch(
     run_id: i64,
     watch: &crate::run::Watch<'_>,
     proxy: Option<&str>,
+    // The run's own declared writable roots (0.83.0). See
+    // `browser_writable_roots`.
+    declared_roots: &[std::path::PathBuf],
 ) -> Result<Browser> {
     use crate::sandbox::appcontainer::win::{Plan, Spawned};
     use std::os::windows::io::AsRawHandle;
@@ -1407,6 +1433,9 @@ pub(crate) async fn launch(
     run_id: i64,
     watch: &crate::run::Watch<'_>,
     proxy: Option<&str>,
+    // The run's own declared writable roots (0.83.0). See
+    // `browser_writable_roots`.
+    declared_roots: &[std::path::PathBuf],
 ) -> Result<Browser> {
     use std::os::fd::AsRawFd;
 
@@ -1520,7 +1549,7 @@ pub(crate) async fn launch(
             "could not make the browser's temporary directory: {e}"
         ))
     })?;
-    let browser_roots = browser_writable_roots(profile.path());
+    let browser_roots = browser_writable_roots(profile.path(), declared_roots);
     // 0.83.0 — a browser is a child of this process like any other, and it does
     // not need the harness's provider credentials to render a page. `&[]`: the
     // contract's declaration is for a command the *model* asked to run, not for
@@ -1711,7 +1740,7 @@ mod tests {
     fn a_browser_child_may_not_write_another_runs_workspace() {
         let profile = tempfile::tempdir().unwrap();
         let theirs = tempfile::tempdir().unwrap();
-        let roots = super::browser_writable_roots(profile.path());
+        let roots = super::browser_writable_roots(profile.path(), &[]);
 
         assert!(
             !roots.iter().any(|r| theirs.path().starts_with(r)),
@@ -1738,7 +1767,7 @@ mod tests {
     fn the_browser_childs_temporary_directory_is_inside_its_own_grant() {
         let profile = tempfile::tempdir().unwrap();
         let tmp = super::browser_tmp_dir(profile.path());
-        let roots = super::browser_writable_roots(profile.path());
+        let roots = super::browser_writable_roots(profile.path(), &[]);
 
         assert!(
             roots.iter().any(|r| tmp.starts_with(r)),

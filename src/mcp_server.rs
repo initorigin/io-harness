@@ -512,7 +512,7 @@ impl<'a> Served<'a> {
 fn browser_session() -> BrowserSession {
     #[cfg(feature = "browser")]
     {
-        BrowserSession::new(None)
+        BrowserSession::new(None, Vec::new())
     }
     #[cfg(not(feature = "browser"))]
     {

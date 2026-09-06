@@ -173,12 +173,26 @@ fn permitted() -> Policy {
         .allow_exec("*")
 }
 
+/// 0.83.0 — the fixture's record file is declared rather than reached by accident.
+///
+/// The browser child used to be granted the whole system temporary directory,
+/// which is where this test's own `tempdir` lives, so the fixture could write its
+/// record without anyone saying it could. That grant is exactly L11 — it also let
+/// a browser under one run rewrite every other run's workspace — and removing it
+/// broke seven tests here on the Linux all-features leg with "the fixture recorded
+/// no argv", which is what a child that could not start looks like from outside.
+///
+/// The fixture is a genuinely not-self-contained child: it writes beside the test
+/// that started it. The affordance for one already exists, so it is used rather
+/// than a second one invented, and the declaration is visible in the test that
+/// depends on it.
 fn contract(root: &Path, steps: u32) -> TaskContract {
     TaskContract::workspace("look at the page", root)
         .with_verification(Verification::WorkspaceFileContains {
             file: "done.txt".into(),
             needle: "ok".into(),
         })
+        .with_writable_roots([root])
         .with_max_steps(steps)
 }
 
