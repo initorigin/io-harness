@@ -518,6 +518,39 @@ impl Provider for Compatible {
         self.cached_entry().and_then(|m| m.max_output_tokens)
     }
 
+    /// 0.82.0 — fill the cache the two methods above read from, once, before the
+    /// run's first step.
+    ///
+    /// This is [`models`](Compatible::models) and nothing else. Before this
+    /// release an embedder had to know to call it themselves for the window to be
+    /// read at all — a requirement discoverable only by reading the method body —
+    /// so in practice every run on a `Compatible` provider that had not asked for
+    /// prices took the fallback rung.
+    async fn warm_sizing(&self) -> Result<()> {
+        self.models().await.map(|_| ())
+    }
+
+    /// 0.82.0 — how big to assume this model is when the catalogue could not say.
+    ///
+    /// **A loopback base assumes far less than a remote one, and that is the whole
+    /// reason this is a provider method.** A local runtime's default context is an
+    /// order of magnitude smaller than a hosted model's — Ollama's is 4,096 — so
+    /// assuming [`FALLBACK_WINDOW`](crate::context::FALLBACK_WINDOW) against one
+    /// turns a trimmed turn into a refused one, every step, until the operator
+    /// finds the knob. Eight of this type's presets are local runtimes.
+    ///
+    /// Decided by the same [`is_loopback`] reading 0.74.0 wrote for the
+    /// cleartext-bearer refusal, so "on this machine" has one definition here and
+    /// not two — including its fail-closed treatment of a base it cannot parse,
+    /// which reads as remote and therefore assumes the larger window.
+    fn assumed_window(&self) -> u64 {
+        if is_loopback(&self.base) {
+            crate::context::FALLBACK_WINDOW_LOCAL
+        } else {
+            crate::context::FALLBACK_WINDOW
+        }
+    }
+
     /// The chat endpoint, and the reference catalogue when one was asked for.
     ///
     /// Both, for the reason [`Fallback`](super::Fallback) reports both of its
@@ -943,6 +976,48 @@ mod tests {
         ] {
             assert!(!is_loopback(base), "{base}");
         }
+    }
+
+    /// F5 — a local base assumes the local window (0.82.0).
+    ///
+    /// Driven over the whole preset table rather than one hand-picked base,
+    /// because the claim is about the eight local runtimes as a class. A preset
+    /// added on the wrong side of `is_loopback` would be a hosted model assuming
+    /// 24,000 or, worse, a 4,096-token local one assuming 128,000 and refusing
+    /// every turn.
+    #[test]
+    fn f5_a_local_base_assumes_the_local_window() {
+        let mut local = 0;
+        let mut hosted = 0;
+        for (name, base, _) in PRESETS {
+            let built = Compatible::preset(name, "k", "m").unwrap();
+            if is_loopback(base) {
+                local += 1;
+                assert_eq!(
+                    built.assumed_window(),
+                    crate::context::FALLBACK_WINDOW_LOCAL,
+                    "{name} is a local runtime and must assume the local window"
+                );
+            } else {
+                hosted += 1;
+                assert_eq!(
+                    built.assumed_window(),
+                    crate::context::FALLBACK_WINDOW,
+                    "{name} is hosted and must assume the remote window"
+                );
+            }
+        }
+        // The counts are asserted so a preset silently changing sides is a
+        // failure here rather than a number nobody reads.
+        assert_eq!((local, hosted), (8, 13));
+    }
+
+    /// An unparseable base is not local, so it assumes the remote window — the
+    /// same fail-closed reading `is_loopback` already gives the cleartext guard.
+    #[test]
+    fn f5_an_unreadable_base_assumes_the_remote_window() {
+        let built = Compatible::new("not a url", Auth::None, "", "m");
+        assert_eq!(built.assumed_window(), crate::context::FALLBACK_WINDOW);
     }
 
     /// The eight local-runtime presets, and the thirteen hosted ones, are on the
