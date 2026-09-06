@@ -204,6 +204,38 @@ pub(crate) fn fill_missing_prices(vendor: &mut [ModelInfo], reference: &[ModelIn
     }
 }
 
+/// How big one model is, as a catalogue reports it (0.82.0).
+///
+/// Both fields are `Option` for the reason every field of [`ModelInfo`] is: `None`
+/// means the document did not say, which is not the same as zero and not the same
+/// as the model being absent. A miss and a row that states neither number are the
+/// same answer here on purpose — in both cases nothing was learned, and the
+/// `fallback` rung is what handles that.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Sizing {
+    /// The model's total context, in tokens.
+    pub(crate) window: Option<u64>,
+    /// The longest answer the vendor says the model will produce.
+    pub(crate) max_output: Option<u64>,
+}
+
+/// Look a model's size out of a fetched catalogue (0.82.0).
+///
+/// Over the same [`Index`] and the same single [`normalise`] as
+/// [`fill_missing_prices`], deliberately: a second matcher would be a second set
+/// of rules for what counts as "the same model", and the two would drift. A
+/// price and a window read out of one document should agree about which row they
+/// came from.
+pub(crate) fn sizing(catalogue: &[ModelInfo], id: &str) -> Sizing {
+    match Index::new(catalogue).find(id) {
+        Some(hit) => Sizing {
+            window: hit.context_length,
+            max_output: hit.max_output_tokens,
+        },
+        None => Sizing::default(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Matching
 // ---------------------------------------------------------------------------

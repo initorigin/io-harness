@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use super::openai_wire::WebFlavor;
-use super::{openai_wire, CompletionRequest, CompletionResponse, Provider};
+use super::{catalog, openai_wire, CompletionRequest, CompletionResponse, ModelInfo, Provider};
 use crate::error::{Error, Result};
 
 /// The request deadline this provider uses unless [`OpenRouter::with_timeout`]
@@ -45,6 +45,14 @@ pub struct OpenRouter {
     api_key: String,
     model: String,
     endpoint: String,
+    /// This model's size, read from OpenRouter's own catalogue by
+    /// [`Provider::warm_sizing`] and then answered synchronously (0.82.0).
+    ///
+    /// A `OnceLock` rather than a `Mutex` for the reason
+    /// [`Reference`](catalog::Reference) uses one: two threads racing the first
+    /// warm cost a second request and the first `set` wins, which is a cheaper
+    /// failure than a lock held across an await.
+    sizing: std::sync::OnceLock<catalog::Sizing>,
 }
 
 impl OpenRouter {
@@ -55,6 +63,7 @@ impl OpenRouter {
             api_key: api_key.into(),
             model: model.into(),
             endpoint: ENDPOINT.to_string(),
+            sizing: std::sync::OnceLock::new(),
         }
     }
 
@@ -80,6 +89,7 @@ impl OpenRouter {
             api_key: "test-key".into(),
             model: "test-model".into(),
             endpoint,
+            sizing: std::sync::OnceLock::new(),
         }
     }
 
@@ -132,6 +142,49 @@ impl Provider for OpenRouter {
         true
     }
 
+    /// OpenRouter's catalogue, which is the same document the rest of the crate
+    /// already treats as the reference (0.82.0).
+    ///
+    /// A live call, uncached: this is the "what do you serve" question, and an
+    /// answer cached for the life of a process would go stale in exactly the case
+    /// someone asks it. The *sizing* half is cached, because a run asks it once
+    /// and needs an answer that does not dial.
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        catalog::fetch(
+            self.client.ready().await?,
+            &self.models_url(),
+            &super::PriceSource::Vendor,
+        )
+        .await
+    }
+
+    /// Read this model's window out of OpenRouter's own catalogue (0.82.0).
+    ///
+    /// No opt-in, and no new host: the catalogue is `/models` on the host this
+    /// provider already dials for completions, so it is already covered by the
+    /// entry [`endpoint`](Provider::endpoint) puts in front of the run's egress
+    /// check. This is the whole reason OpenRouter needs no
+    /// `with_reference_catalogue` while `Anthropic` and `OpenAi` do.
+    async fn warm_sizing(&self) -> Result<()> {
+        if self.sizing.get().is_some() {
+            return Ok(());
+        }
+        let catalogue = self.models().await?;
+        // A miss stores `Sizing::default()` rather than leaving the cell empty, so
+        // a slug this catalogue does not carry is asked about once and not once
+        // per resume.
+        let _ = self.sizing.set(catalog::sizing(&catalogue, &self.model));
+        Ok(())
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        self.sizing.get().and_then(|s| s.window)
+    }
+
+    fn max_output_tokens(&self) -> Option<u64> {
+        self.sizing.get().and_then(|s| s.max_output)
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         self.stream(request, &|_| {}, &|_, _| {}).await
     }
@@ -155,6 +208,22 @@ impl Provider for OpenRouter {
 }
 
 impl OpenRouter {
+    /// The catalogue URL for this instance's endpoint (0.82.0).
+    ///
+    /// Derived from the completions endpoint rather than declared as a second
+    /// constant, so the two can never point at different hosts — which is what
+    /// makes "no new host is reached" a property of the code and not a comment.
+    /// Against the default `ENDPOINT` this is exactly
+    /// [`catalog::DEFAULT_REFERENCE_URL`], the document the rest of the crate
+    /// already reads.
+    fn models_url(&self) -> String {
+        let base = self
+            .endpoint
+            .strip_suffix("/chat/completions")
+            .unwrap_or(&self.endpoint);
+        format!("{base}/models")
+    }
+
     /// One completion, with each text delta handed to `on_token` as it arrives.
     /// Both trait methods are this function; `complete` passes a sink that does
     /// nothing.
@@ -197,5 +266,159 @@ impl OpenRouter {
             on_call,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::failures::{json_response, serve, serve_recording};
+
+    /// One row, spelled the way OpenRouter spells its own: a `vendor/model` id, a
+    /// `context_length` beside it, and the answer limit one level down under
+    /// `top_provider`, which is where OpenRouter puts it and not where a reader
+    /// would guess.
+    fn catalogue() -> String {
+        json_response(
+            r#"{"data":[
+                {"id":"test-model","context_length":200000,
+                 "top_provider":{"max_completion_tokens":64000}},
+                {"id":"someone/else","context_length":8000}
+            ]}"#,
+        )
+    }
+
+    /// F1 — OpenRouter reads its own catalogue (0.82.0).
+    ///
+    /// The `None` before the warm is half the criterion: `context_window` must
+    /// stay synchronous and must never dial, so an un-warmed provider answering
+    /// anything but `None` would mean it had reached the network to do it.
+    #[tokio::test]
+    async fn f1_openrouter_reads_its_own_catalogue() {
+        let url = serve(catalogue());
+        let provider = OpenRouter::at(&url, Duration::from_secs(2));
+
+        assert_eq!(
+            provider.context_window(),
+            None,
+            "nothing is known before the warm, and nothing dialled to find out",
+        );
+        assert_eq!(provider.max_output_tokens(), None);
+
+        provider
+            .warm_sizing()
+            .await
+            .expect("the catalogue answered");
+
+        assert_eq!(provider.context_window(), Some(200_000));
+        assert_eq!(provider.max_output_tokens(), Some(64_000));
+    }
+
+    /// The catalogue URL is derived from the completions endpoint, so the two
+    /// cannot point at different hosts — which is what makes "no new host is
+    /// reached" a property of the code rather than a claim about it.
+    #[test]
+    fn f1_the_catalogue_is_models_on_the_host_already_dialled() {
+        assert_eq!(
+            OpenRouter::new("k", "m").models_url(),
+            crate::provider::catalog::DEFAULT_REFERENCE_URL,
+            "the default endpoint's catalogue is the crate's own reference document",
+        );
+        // A test socket's base carries no `/chat/completions` to strip.
+        assert_eq!(
+            OpenRouter::at("http://127.0.0.1:9/v1", Duration::from_secs(1)).models_url(),
+            "http://127.0.0.1:9/v1/models",
+        );
+    }
+
+    /// N2 — one catalogue request per provider instance (0.82.0).
+    ///
+    /// The `OnceLock` is what makes this true and the count is what proves it. Two
+    /// warms stand in for two runs on one provider, which is the configuration an
+    /// embedder actually builds.
+    #[tokio::test]
+    async fn n2_the_catalogue_is_fetched_once_per_instance() {
+        let (url, seen) = serve_recording(catalogue());
+        let provider = OpenRouter::at(&url, Duration::from_secs(2));
+
+        provider.warm_sizing().await.expect("first warm");
+        provider.warm_sizing().await.expect("second warm");
+
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the second warm must read the cache, not the socket",
+        );
+        assert_eq!(provider.context_window(), Some(200_000));
+    }
+
+    /// F8's provider-level half — a warm that cannot reach its catalogue reports
+    /// the failure and teaches the provider nothing, rather than poisoning the
+    /// cache with a wrong answer.
+    #[tokio::test]
+    async fn a_failed_warm_leaves_the_provider_unsized() {
+        // Port 9 is discard: nothing accepts, so this is a refused connection.
+        let provider = OpenRouter::at("http://127.0.0.1:9/v1", Duration::from_millis(500));
+        assert!(provider.warm_sizing().await.is_err());
+        assert_eq!(provider.context_window(), None);
+    }
+
+    /// A slug the catalogue does not carry is a miss, not a wrong number — and it
+    /// is cached as a miss, so a resumed run does not re-ask.
+    #[tokio::test]
+    async fn a_slug_the_catalogue_does_not_carry_stays_unsized() {
+        let (url, seen) = serve_recording(json_response(r#"{"data":[{"id":"other"}]}"#));
+        let provider = OpenRouter::at(&url, Duration::from_secs(2));
+
+        provider
+            .warm_sizing()
+            .await
+            .expect("the catalogue answered");
+        provider.warm_sizing().await.expect("and is not re-read");
+
+        assert_eq!(provider.context_window(), None);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// The live arm: the real catalogue, the real slug, the real normalisation.
+    ///
+    /// `#[ignore]`d because it needs a key and a network, and a gate that fails
+    /// when a vendor is down is a gate nobody trusts. It is not decoration — every
+    /// arm above drives a fixture this repository wrote, so a schema drift at
+    /// OpenRouter would ship unnoticed and each of those tests would still pass.
+    /// This is the only thing that reads a row nobody here authored.
+    ///
+    /// Run with `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` set:
+    /// `cargo test --lib the_live_catalogue -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs OPENROUTER_API_KEY, OPENROUTER_MODEL and a network"]
+    async fn the_live_catalogue_sizes_the_configured_model() {
+        let provider = OpenRouter::from_env().expect("key and model in the environment");
+        let model = provider.model.clone();
+
+        assert_eq!(provider.context_window(), None, "nothing before the warm");
+        provider.warm_sizing().await.expect("openrouter answered");
+
+        let window = provider.context_window().unwrap_or_else(|| {
+            panic!(
+                "the live catalogue carries no window for {model} — either the slug is \
+                 wrong or the document's shape moved"
+            )
+        });
+        println!(
+            "live: {model} window={window} max_output={:?}",
+            provider.max_output_tokens()
+        );
+        assert!(
+            window >= 8_192,
+            "a window this small from the live catalogue means the field was misread, \
+             not that the model is tiny: got {window}"
+        );
+
+        // The whole point of the release, measured against the real number rather
+        // than a fixture: this model's ceiling is not the pre-0.82.0 constant.
+        let sized = crate::ContextBudget::for_window(window, provider.max_output_tokens());
+        println!("live: ceiling={} (was 24,000)", sized.max_tokens);
+        assert!(sized.max_tokens > crate::context::FALLBACK_MAX_TOKENS);
     }
 }

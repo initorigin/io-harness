@@ -521,7 +521,67 @@ impl Default for ContextBudget {
 /// to it says so through
 /// [`EventKind::ContextCeiling`](crate::EventKind::ContextCeiling) rather than
 /// applying it silently.
+///
+/// **Since 0.82.0 it is no longer the `fallback` rung's answer.** It is the value
+/// [`ContextBudget::default`] carries, which is what makes "the caller wrote a
+/// budget" decidable at all, and the `fallback` rung now sizes
+/// [`Provider::assumed_window`](crate::Provider::assumed_window) through
+/// [`ContextBudget::for_window`] instead — because "nothing indexed this model"
+/// and "this model holds 24,000 tokens" were never the same claim.
 pub const FALLBACK_MAX_TOKENS: u64 = 24_000;
+
+/// The window a run assumes for a model nothing can size, when the provider is
+/// reaching a remote endpoint (0.82.0).
+///
+/// The default of [`Provider::assumed_window`](crate::Provider::assumed_window),
+/// and read only on the `fallback` rung — a provider that answers
+/// [`context_window`](crate::Provider::context_window) never reaches it.
+///
+/// **128,000 because that is the floor of the 2026 hosted field, not because it is
+/// a typical size.** Every model a remote vendor was still serving when this
+/// release was cut holds at least that much, so it is the largest number that is
+/// still a *safe* reading of a slug no catalogue has indexed. Assuming high is
+/// what the crate can afford here and assuming low is not: overshooting is already
+/// recoverable, because
+/// [`ProviderErrorKind::ContextOverflow`](crate::ProviderErrorKind::ContextOverflow)
+/// folds the history and retries — shipped in 0.43.0 and enabled by
+/// [`Compaction::default`] — whereas undershooting silently throws away most of a
+/// window nobody gets told about.
+///
+/// The one configuration this is a regression for is a run that has deliberately
+/// disabled compaction: it gets a refused turn where it used to get a trimmed one.
+/// [`ContextBudget`] written by the caller is the escape hatch, and it still wins
+/// over everything.
+pub const FALLBACK_WINDOW: u64 = 128_000;
+
+/// The window a run assumes for a model nothing can size, when the provider is
+/// reaching a loopback base (0.82.0).
+///
+/// What [`Compatible`](crate::provider::Compatible) returns from
+/// [`assumed_window`](crate::Provider::assumed_window) for any of the eight local
+/// runtimes in its preset table, decided by the same `is_loopback` reading 0.74.0
+/// already wrote for the cleartext-bearer refusal.
+///
+/// **24,000 because a local runtime's default is nothing like a hosted model's,
+/// and because its own documentation does not agree with itself.** Ollama's
+/// default context is 4,096 tokens and its documentation gives three different
+/// answers for that default, so the honest move is a number that is generous
+/// against the default and still nowhere near the hosted floor. Assuming
+/// [`FALLBACK_WINDOW`] against a 4,096-token runtime is the one case where
+/// overshoot is not cheap: a small local model refuses the turn rather than
+/// trimming it, every step, until the operator finds the knob.
+///
+/// **This is a window, not a ceiling, and the difference is a factor of three.**
+/// Like every window it is sized through [`ContextBudget::for_window`], which
+/// reserves the model's answer and the request floor out of it, so the ceiling a
+/// local run actually assembles under is **7,616** tokens — smaller than the
+/// 24,000 that was every run's ceiling before 0.82.0. That is a deliberate
+/// narrowing rather than an oversight: 24,000 was never an assumption about a
+/// local model, it was the only number the crate had, and it sent nearly six times
+/// a stock Ollama's whole context at a model that would refuse it. An operator who
+/// has raised `num_ctx` and wants the room should say so with
+/// [`ContextBudget`] — the `contract` rung wins over this one.
+pub const FALLBACK_WINDOW_LOCAL: u64 = 24_000;
 
 /// What a window-derived budget holds back for the model's own answer when the
 /// provider does not say how long an answer may be.
@@ -716,23 +776,36 @@ const MICROCOMPACT_MIN: usize = 3;
 /// 2. **`model`** — the provider knows the model's window. The ceiling is
 ///    [`ContextBudget::for_window`], so the answer and the request floor are
 ///    reserved out of it.
-/// 3. **`fallback`** — nothing knows the window, so [`FALLBACK_MAX_TOKENS`] applies.
-///    This was every run's ceiling before 0.81.0.
+/// 3. **`fallback`** — nothing knows the window, so the provider's *assumption*
+///    about it is sized instead, through the same [`ContextBudget::for_window`].
+///
+///    **Before 0.82.0 this rung was [`FALLBACK_MAX_TOKENS`] flat, on every model,
+///    remote or local.** That was defensible while it was the only answer anything
+///    ever gave; it stopped being defensible once the other two rungs could answer,
+///    because what is left on this rung is local runtimes, air-gapped hosts and
+///    slugs nothing has indexed yet — and that population does not have one honest
+///    size. [`Provider::assumed_window`](crate::Provider::assumed_window) splits it,
+///    and sizing it through `for_window` means an *assumed* window reserves the
+///    answer and the request floor exactly as a *read* one does, rather than being
+///    a raw ceiling the reservations were never taken out of.
 ///
 /// The label rides [`EventKind::ContextCeiling`](crate::EventKind::ContextCeiling),
 /// so an operator wondering why a 128,000-token model is trimming at 16,000 can read
-/// the answer rather than infer it.
+/// the answer rather than infer it. Note that `fallback` does not mean 24,000 any
+/// more — it means the number was assumed rather than read, and the assumption is
+/// the provider's.
 pub(crate) fn resolve_budget(
     declared: ContextBudget,
     window: Option<u64>,
     max_output: Option<u64>,
+    assumed: u64,
 ) -> (ContextBudget, &'static str) {
     if declared != ContextBudget::default() {
         return (declared, "contract");
     }
     match window {
         Some(window) => (ContextBudget::for_window(window, max_output), "model"),
-        None => (declared, "fallback"),
+        None => (ContextBudget::for_window(assumed, max_output), "fallback"),
     }
 }
 
@@ -2033,6 +2106,76 @@ mod tests {
             share: 0.5,
         };
         assert_eq!(tiny.effective_tokens(Some(0)), 500);
+    }
+
+    /// F4 — the three rungs resolve as documented (0.82.0).
+    ///
+    /// Four cases in one test because the rungs are one rule with three outcomes,
+    /// and the thing worth catching is a rung answering out of order rather than
+    /// any one of them being wrong in isolation.
+    #[test]
+    fn f4_the_three_rungs_resolve_as_documented() {
+        // 1. `contract` — a declared budget wins over everything, and is returned
+        //    byte for byte rather than re-derived.
+        let declared = ContextBudget {
+            max_tokens: 9_000,
+            share: 0.25,
+        };
+        assert_eq!(
+            resolve_budget(declared, Some(200_000), Some(8_192), FALLBACK_WINDOW),
+            (declared, "contract"),
+            "a caller who states a ceiling keeps it even when the window is known",
+        );
+
+        // 2. `model` — a known window is sized, and the assumption is not read.
+        assert_eq!(
+            resolve_budget(
+                ContextBudget::default(),
+                Some(200_000),
+                Some(8_192),
+                FALLBACK_WINDOW,
+            ),
+            (ContextBudget::for_window(200_000, Some(8_192)), "model"),
+        );
+
+        // 3. `fallback`, remote — the assumption is sized through the same
+        //    `for_window`, so it reserves the answer and the request floor.
+        assert_eq!(
+            resolve_budget(ContextBudget::default(), None, None, FALLBACK_WINDOW),
+            (ContextBudget::for_window(FALLBACK_WINDOW, None), "fallback"),
+        );
+
+        // 4. `fallback`, local — the same rung, a different assumption. This is
+        //    the case that makes `assumed_window` a provider method: the label is
+        //    identical and the number is not.
+        assert_eq!(
+            resolve_budget(ContextBudget::default(), None, None, FALLBACK_WINDOW_LOCAL),
+            (
+                ContextBudget::for_window(FALLBACK_WINDOW_LOCAL, None),
+                "fallback"
+            ),
+        );
+    }
+
+    /// The `fallback` rung stopped being one flat number in 0.82.0, and the
+    /// regression worth guarding is it quietly returning to one.
+    #[test]
+    fn f4_the_fallback_rung_is_no_longer_flat_fallback_max_tokens() {
+        let (remote, _) = resolve_budget(ContextBudget::default(), None, None, FALLBACK_WINDOW);
+        assert!(
+            remote.max_tokens > FALLBACK_MAX_TOKENS,
+            "a remote assumption must give a run more room than the pre-0.82.0 ceiling, \
+             got {}",
+            remote.max_tokens,
+        );
+        // 128,000 less the default answer reserve and the request floor.
+        assert_eq!(remote.max_tokens, 111_616);
+
+        // The local assumption is deliberately *smaller* than the old flat
+        // ceiling, because the reservations now come out of it.
+        let (local, _) =
+            resolve_budget(ContextBudget::default(), None, None, FALLBACK_WINDOW_LOCAL);
+        assert_eq!(local.max_tokens, 7_616);
     }
 
     #[test]

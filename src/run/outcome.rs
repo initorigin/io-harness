@@ -831,9 +831,76 @@ pub(super) fn persist_ledger(
 /// four copies of one rule is four places for it to diverge, and the resolution has
 /// to happen once anyway to emit one event.
 ///
-/// Nothing here dials. [`Provider::context_window`] is synchronous precisely so this
-/// cannot become a network round trip in front of every run.
-pub(super) fn size_context<P: Provider>(
+/// **This may now dial, once, behind three guards (0.82.0).**
+/// [`Provider::context_window`] is still synchronous and still must never dial —
+/// what changed is that [`Provider::warm_sizing`] exists to fill it, and this is
+/// the one place in a run that calls it. The guards are the whole reason that is
+/// affordable:
+///
+/// 1. **A contract that declared its own budget skips it.** The `contract` rung
+///    wins, so nothing would read the answer — asking would be a round trip whose
+///    result is discarded.
+/// 2. **A provider that already knows its window skips it.** A second warm cannot
+///    teach it anything, and this is what makes a resumed run free.
+/// 3. **A provider that implements neither still makes no request**, because
+///    `warm_sizing`'s default is a no-op. Every mock the run loop is tested with
+///    dials nothing without having to opt out of anything.
+///
+/// A failure is swallowed. A catalogue being unreachable is not a reason to end a
+/// run, and the `fallback` label on the event is what says the sizing was assumed
+/// rather than read — so an operator can tell the two apart without the run dying
+/// to tell them.
+pub(super) async fn size_context<P: Provider>(
+    watch: &Watch<'_>,
+    run_id: i64,
+    contract: &TaskContract,
+    provider: &P,
+) -> TaskContract {
+    // Guard 1 and guard 2. Written as one condition because they are one
+    // question — is there anything a warm could change? — and splitting them
+    // would invite a later edit to satisfy only half of it.
+    let declared = contract.context != crate::ContextBudget::default();
+    if !declared && provider.context_window().is_none() {
+        // Guard 3 is the default implementation, not a branch here: a provider
+        // that has nothing to warm returns `Ok(())` without a request.
+        let _ = provider.warm_sizing().await;
+    }
+    resolve_and_announce(watch, run_id, contract, provider)
+}
+
+/// The same ceiling, resolved from what the provider already knows and **without
+/// warming** (0.82.0).
+///
+/// For the two entry points that answer a pending approval decision:
+/// [`resume_with_decision_observed`](crate::run::resume_with_decision_observed)
+/// and
+/// [`resume_tree_with_decision_observed`](crate::run::resume_tree_with_decision_observed).
+/// Neither calls [`authorize_provider`](super::gate::authorize_provider) anywhere
+/// in its body — they resume a run whose endpoints were authorized when it
+/// started — so there is no ordering that could put a warm after an
+/// authorization on those paths, and a warm there would be a catalogue request
+/// the policy handed to the resume never saw. It would also fire on the way to
+/// `Decision::Deny`, which is a human actively refusing an action.
+///
+/// So the ceiling is resolved from whatever the provider knows already. A caller
+/// resuming with the same provider instance it started with is unaffected: the
+/// `OnceLock` is warm and `context_window` answers. One that built a fresh
+/// provider takes the `fallback` rung, and the event says so — the same answer
+/// the run would have had before 0.82.0, rather than a request nobody authorized.
+pub(super) fn size_context_unwarmed<P: Provider>(
+    watch: &Watch<'_>,
+    run_id: i64,
+    contract: &TaskContract,
+    provider: &P,
+) -> TaskContract {
+    resolve_and_announce(watch, run_id, contract, provider)
+}
+
+/// Resolve the ceiling, announce it, and hand back the sized contract.
+///
+/// Split out so the warming and non-warming entry points cannot disagree about
+/// anything except the warm itself.
+fn resolve_and_announce<P: Provider>(
     watch: &Watch<'_>,
     run_id: i64,
     contract: &TaskContract,
@@ -843,6 +910,7 @@ pub(super) fn size_context<P: Provider>(
         contract.context,
         provider.context_window(),
         provider.max_output_tokens(),
+        provider.assumed_window(),
     );
     watch.emit(RunEvent::new(
         run_id,

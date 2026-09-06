@@ -235,6 +235,68 @@ impl<A: Provider + Sync, B: Provider + Sync> Provider for Fallback<A, B> {
         out
     }
 
+    /// 0.82.0 — the SMALLER window, and only when both halves answer.
+    ///
+    /// The same "both, or neither" reasoning
+    /// [`accepts_images`](Provider::accepts_images) is written with, and for a
+    /// sharper reason: the ceiling is chosen once, before the first step, and it
+    /// has to hold for whichever half ends up serving. Reporting the primary's
+    /// 200,000 and then falling over to a model holding 32,000 would send a
+    /// request the secondary refuses — on the one call that matters, the fallover,
+    /// when something has already gone wrong.
+    ///
+    /// A half that is not saying makes the pair not saying, rather than letting
+    /// the other half speak for both, and the run then takes the assumption below.
+    fn context_window(&self) -> Option<u64> {
+        match (
+            self.primary.context_window(),
+            self.secondary.context_window(),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            _ => None,
+        }
+    }
+
+    /// The smaller answer limit, on the same terms. A larger reservation leaves
+    /// less history, which is the safe direction; a larger *answer* than the
+    /// serving model will produce is a refused request.
+    fn max_output_tokens(&self) -> Option<u64> {
+        match (
+            self.primary.max_output_tokens(),
+            self.secondary.max_output_tokens(),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            _ => None,
+        }
+    }
+
+    /// Both halves warm. The secondary is the one that serves when it matters, so
+    /// warming only the primary would leave the fallover unsized.
+    ///
+    /// A failure from either is returned — the caller swallows it and takes the
+    /// assumption — but the other half is warmed first, so one unreachable
+    /// catalogue does not stop the other from answering.
+    async fn warm_sizing(&self) -> Result<()> {
+        let primary = self.primary.warm_sizing().await;
+        let secondary = self.secondary.warm_sizing().await;
+        primary.and(secondary)
+    }
+
+    /// The smaller assumption, so a chain with a local half is not sized for the
+    /// hosted one.
+    ///
+    /// Without this the default would apply — [`FALLBACK_WINDOW`] — and a
+    /// `Fallback` whose secondary is a local runtime would assume 128,000 for a
+    /// model holding a fraction of it, which is the one case the local constant
+    /// exists to prevent.
+    ///
+    /// [`FALLBACK_WINDOW`]: crate::context::FALLBACK_WINDOW
+    fn assumed_window(&self) -> u64 {
+        self.primary
+            .assumed_window()
+            .min(self.secondary.assumed_window())
+    }
+
     /// The LEAF that answered, not the branch it sits in.
     ///
     /// A nested `Fallback::new(a, Fallback::new(b, c))` whose `c` answered must
@@ -390,5 +452,92 @@ mod tests {
         // A provider with no endpoint contributes none, rather than a blank.
         let g = Fallback::new(p("x", ok), p("y", ok));
         assert!(g.endpoints().is_empty());
+    }
+
+    /// A provider that answers a fixed window and a fixed assumption (0.82.0).
+    struct Sized {
+        window: Option<u64>,
+        assumed: u64,
+    }
+
+    impl Provider for Sized {
+        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+            ok()
+        }
+        fn context_window(&self) -> Option<u64> {
+            self.window
+        }
+        fn assumed_window(&self) -> u64 {
+            self.assumed
+        }
+    }
+
+    fn sized(window: Option<u64>, assumed: u64) -> Sized {
+        Sized { window, assumed }
+    }
+
+    /// 0.82.0 — a chain reports the smaller window, and only when both halves
+    /// answer.
+    ///
+    /// The ceiling is chosen once, before the first step, and has to hold for
+    /// whichever half serves. Reporting the primary's and falling over to a
+    /// smaller model would send a request the secondary refuses, on the one call
+    /// where something has already gone wrong.
+    #[test]
+    fn a_chain_is_sized_for_whichever_half_serves() {
+        let both = Fallback::new(sized(Some(200_000), 128_000), sized(Some(32_000), 128_000));
+        assert_eq!(both.context_window(), Some(32_000), "the smaller window");
+
+        let half = Fallback::new(sized(Some(200_000), 128_000), sized(None, 128_000));
+        assert_eq!(
+            half.context_window(),
+            None,
+            "a half that is not saying makes the pair not saying, rather than \
+             letting the other speak for both"
+        );
+    }
+
+    /// 0.82.0 — and a chain with a local half assumes the local window.
+    ///
+    /// The regression this guards is silent and specific: without the override, a
+    /// `Fallback` falls through to the trait default of `FALLBACK_WINDOW`, so
+    /// wrapping a local runtime would assume 128,000 for a model holding a
+    /// fraction of it — the one case `FALLBACK_WINDOW_LOCAL` exists to prevent,
+    /// reintroduced by wrapping.
+    #[test]
+    fn a_chain_with_a_local_half_assumes_the_local_window() {
+        let chain = Fallback::new(
+            sized(None, crate::context::FALLBACK_WINDOW),
+            sized(None, crate::context::FALLBACK_WINDOW_LOCAL),
+        );
+        assert_eq!(
+            chain.assumed_window(),
+            crate::context::FALLBACK_WINDOW_LOCAL
+        );
+    }
+
+    /// 0.82.0 — both halves warm, because the secondary is the one that serves
+    /// when it matters.
+    #[tokio::test]
+    async fn both_halves_of_a_chain_are_warmed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Counting(AtomicUsize);
+
+        impl Provider for Counting {
+            async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse> {
+                ok()
+            }
+            async fn warm_sizing(&self) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let chain = Fallback::new(Counting::default(), Counting::default());
+        chain.warm_sizing().await.unwrap();
+        assert_eq!(chain.primary.0.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.secondary.0.load(Ordering::SeqCst), 1);
     }
 }

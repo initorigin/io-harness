@@ -42,7 +42,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.81"
+io-harness = "0.82"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -548,10 +548,16 @@ fold out of the conversation after the step that used it, since its catalogue li
 stays and `read_skill` brings it back. Every rung is off by default, all of them
 are reachable from `io.toml`, and the assembly trace names which ones ran.
 
-The per-request ceiling comes from the model rather than from a constant. A
-provider that knows its window says so, the ceiling is derived from it with the
-answer and the request floor reserved out, and a run that falls back to the
-constant reports that it did rather than applying it silently.
+The per-request ceiling comes from the model rather than from a constant, on every
+provider this crate ships. `OpenRouter` reads its own catalogue, on the host it
+already dials; `Anthropic` and `OpenAi` read a reference catalogue when you ask for
+one with `with_reference_catalogue`, and reach nothing when you do not; `Compatible`
+reads the catalogue it already fetches. The lookup happens once, before the first
+step, and never when a stated budget or an already-known window makes it pointless.
+A denied catalogue host refuses the run rather than being reached anyway. When
+nothing can size the model the run says so, and what it assumes depends on where
+the model is served from — a remote endpoint and a local runtime do not have one
+honest guess between them. A budget you state still wins over all of it.
 
 Durable memory survives between runs — as a fact or a decision, pinnable so a run
 cannot overwrite a correction, with a per-run record of which entries it actually

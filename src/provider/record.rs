@@ -271,6 +271,32 @@ impl<P: Provider + Sync> Provider for Record<P> {
     fn last_served(&self) -> Option<String> {
         self.inner.last_served()
     }
+
+    /// 0.82.0 — all four sizing methods forwarded, for the reason
+    /// [`endpoints`](Provider::endpoints) above is forwarded and then some.
+    ///
+    /// A wrapper that dropped these would not merely lose a feature. It would
+    /// **change the ceiling**, because the defaults are not "no answer": the
+    /// default `assumed_window` is
+    /// [`FALLBACK_WINDOW`](crate::context::FALLBACK_WINDOW), so recording a
+    /// `Compatible` pointed at a local runtime would have assumed 128,000 where
+    /// the provider itself assumes 24,000. Recording changes what is stored, not
+    /// what the run assembles under.
+    fn context_window(&self) -> Option<u64> {
+        self.inner.context_window()
+    }
+
+    fn max_output_tokens(&self) -> Option<u64> {
+        self.inner.max_output_tokens()
+    }
+
+    async fn warm_sizing(&self) -> Result<()> {
+        self.inner.warm_sizing().await
+    }
+
+    fn assumed_window(&self) -> u64 {
+        self.inner.assumed_window()
+    }
 }
 
 #[cfg(test)]
@@ -284,5 +310,53 @@ mod tests {
         // A version string that is not one still compares by what it has, rather
         // than panicking on a fixture someone hand-wrote.
         assert_eq!(series("nightly"), "nightly");
+    }
+
+    /// 0.82.0 — recording a provider does not change the ceiling it runs under.
+    ///
+    /// The regression this guards is silent: the trait's sizing defaults are
+    /// answers rather than silence, so a `Record` that failed to forward
+    /// `assumed_window` would report `FALLBACK_WINDOW` for a provider that assumes
+    /// the local one, and a run through the recorder would assemble under 111,616
+    /// tokens where the same provider unwrapped assembles under 7,616.
+    #[tokio::test]
+    async fn recording_a_provider_does_not_change_how_it_is_sized() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Local(AtomicUsize);
+
+        impl Provider for Local {
+            async fn complete(
+                &self,
+                _r: crate::provider::CompletionRequest,
+            ) -> Result<crate::provider::CompletionResponse> {
+                Ok(Default::default())
+            }
+            async fn warm_sizing(&self) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn context_window(&self) -> Option<u64> {
+                Some(8_192)
+            }
+            fn max_output_tokens(&self) -> Option<u64> {
+                Some(1_024)
+            }
+            fn assumed_window(&self) -> u64 {
+                crate::context::FALLBACK_WINDOW_LOCAL
+            }
+        }
+
+        let recorded = Record::new(Local::default());
+        assert_eq!(recorded.context_window(), Some(8_192));
+        assert_eq!(recorded.max_output_tokens(), Some(1_024));
+        assert_eq!(
+            recorded.assumed_window(),
+            crate::context::FALLBACK_WINDOW_LOCAL,
+            "the wrapper must not substitute the trait default"
+        );
+        recorded.warm_sizing().await.unwrap();
+        assert_eq!(recorded.inner.0.load(Ordering::SeqCst), 1, "and it warms");
     }
 }

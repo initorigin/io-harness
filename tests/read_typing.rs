@@ -362,7 +362,27 @@ async fn through_the_loop_an_image_read_carries_no_content_and_names_the_route()
 // F9 — a read that will not fit returns no content
 // ---------------------------------------------------------------------------
 
-/// A file over the default ceiling — `entry_cap_chars(24_000)` is 12,000 chars —
+/// The contract these two tests use, with the ceiling pinned rather than
+/// inherited.
+///
+/// **0.82.0 — pinned because the fallback rung stopped being a constant.** These
+/// tests are about what a refused read says and carries, not about which rung
+/// answered, and they used to read the 24,000 default by accident: a provider
+/// that names no window now assumes `FALLBACK_WINDOW` instead, which is large
+/// enough that `too_big()` fits and the refusal never fires.
+///
+/// The `share` is deliberately not `0.5`. A budget byte-equal to
+/// `ContextBudget::default()` is indistinguishable from one nobody wrote, so it
+/// would take the fallback rung again — the sharp edge `resolve_budget` documents,
+/// reached here for real.
+fn pinned_ceiling(root: &std::path::Path) -> TaskContract {
+    contract(root).with_context_budget(io_harness::ContextBudget {
+        max_tokens: 24_000,
+        share: 0.49,
+    })
+}
+
+/// A file over the pinned ceiling — `entry_cap_chars(24_000)` is 12,000 chars —
 /// with a sentinel at its head, its middle and its tail, so "none of the file's
 /// bytes" is an assertion rather than a claim about the first line.
 fn too_big() -> tempfile::TempDir {
@@ -380,7 +400,7 @@ async fn a_read_that_will_not_fit_returns_none_of_the_file() {
     let provider = MockScript::new(vec![vec![read("huge.txt")]]);
 
     let result = run_with(
-        &contract(dir.path()),
+        &pinned_ceiling(dir.path()),
         &provider,
         &store,
         &Policy::permissive(),
@@ -476,7 +496,7 @@ async fn the_two_ceilings_produce_two_different_refusals() {
     let budget_store = Store::memory().unwrap();
     let provider = MockScript::new(vec![vec![read("huge.txt")]]);
     let result = run_with(
-        &contract(big.path()),
+        &pinned_ceiling(big.path()),
         &provider,
         &budget_store,
         &Policy::permissive(),

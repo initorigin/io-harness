@@ -117,11 +117,19 @@ pub(super) async fn authorize_provider<P: Provider>(
             .watching(watch, 0)
             .check_target(&target)
             .await?;
-        if verdict.effect == Effect::Ask {
+        if verdict.effect == Effect::Ask && ask.is_none() {
             // One human decision covers the run; the first host that needs asking
             // is the one asked about. The verdict rides along because the approver
             // is told which rule and which layer asked (0.42.0), and only the
             // asking host's verdict is the answer to that.
+            //
+            // **0.82.0 — `ask.is_none()` is what makes the sentence above true.**
+            // Without it every asking host overwrote the one before, so the
+            // *last* was asked about while only one pending row is ever written,
+            // and the operator was prompted about a host they did not expect.
+            // Latent since 0.42.0 because two asking hosts needed a `Fallback` or
+            // a `Compatible` with a reference; this release gives `Anthropic` and
+            // `OpenAi` a second endpoint, which is a far more common shape.
             ask = Some((target.clone(), verdict));
         }
     }

@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use super::catalog::{self, Reference};
 use super::openai_wire::WebFlavor;
 use super::{openai_wire, CompletionRequest, CompletionResponse, Provider};
 use crate::error::{Error, Result};
@@ -48,6 +49,12 @@ pub struct OpenAi {
     api_key: String,
     model: String,
     endpoint: String,
+    /// The catalogue to size this model against, when the caller asked for one
+    /// (0.82.0). `None` is the default, and `None` reaches nothing.
+    reference: Option<Reference>,
+    /// This model's size, read from [`OpenAi::reference`] by
+    /// [`Provider::warm_sizing`] and then answered synchronously (0.82.0).
+    sizing: std::sync::OnceLock<catalog::Sizing>,
 }
 
 impl OpenAi {
@@ -58,7 +65,41 @@ impl OpenAi {
             api_key: api_key.into(),
             model: model.into(),
             endpoint: ENDPOINT.to_string(),
+            reference: None,
+            sizing: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Size this model against a reference catalogue (0.82.0).
+    ///
+    /// **Off by default, and off means nothing is dialled.** OpenAI's `/v1/models`
+    /// returns identifiers and no context window, so there is no vendor document
+    /// to read and the only way to learn this model's size is a third-party
+    /// catalogue — a host this provider would not otherwise reach. That is why it
+    /// is opt-in: [`Provider::endpoints`] is what the run authorises against the
+    /// policy's network rules before its first step, and adding a reference host
+    /// unconditionally would end every OpenAI run under a tight egress policy.
+    ///
+    /// When one is set, its host joins [`endpoints`](Provider::endpoints) and is
+    /// authorised with the rest — so a policy that denies it refuses the run
+    /// rather than silently skipping the lookup. The same shape
+    /// [`Compatible::with_reference_prices`](crate::provider::Compatible::with_reference_prices)
+    /// has had since 0.29.0, for the same reason.
+    ///
+    /// ```
+    /// use io_harness::provider::{catalog::Reference, Provider};
+    /// use io_harness::OpenAi;
+    ///
+    /// let plain = OpenAi::new("k", "gpt-4o");
+    /// assert_eq!(plain.endpoints().len(), 1, "no reference, no extra host");
+    ///
+    /// let sized = OpenAi::new("k", "gpt-4o").with_reference_catalogue(Reference::new());
+    /// assert_eq!(sized.endpoints().len(), 2, "the reference is authorised too");
+    /// ```
+    #[must_use]
+    pub fn with_reference_catalogue(mut self, reference: Reference) -> Self {
+        self.reference = Some(reference);
+        self
     }
 
     /// Set the deadline for one request, replacing the [`REQUEST_TIMEOUT`] default.
@@ -83,6 +124,8 @@ impl OpenAi {
             api_key: "test-key".into(),
             model: "test-model".into(),
             endpoint,
+            reference: None,
+            sizing: std::sync::OnceLock::new(),
         }
     }
 
@@ -132,6 +175,43 @@ impl Provider for OpenAi {
 
     fn endpoint(&self) -> Option<&str> {
         Some(&self.endpoint)
+    }
+
+    /// 0.82.0 — the reference catalogue is a second host this provider may dial,
+    /// so it is declared here and authorised before the run's first step. A
+    /// provider with no reference set declares exactly what it always did.
+    fn endpoints(&self) -> Vec<&str> {
+        let mut out = vec![self.endpoint.as_str()];
+        if let Some(reference) = &self.reference {
+            out.push(reference.url());
+        }
+        out
+    }
+
+    /// 0.82.0 — read this model's window from the reference catalogue, if the
+    /// caller asked for one.
+    ///
+    /// With no reference this makes no request and learns nothing, which is the
+    /// documented default and what F3 asserts against a listener that counts its
+    /// connections.
+    async fn warm_sizing(&self) -> Result<()> {
+        let Some(reference) = &self.reference else {
+            return Ok(());
+        };
+        if self.sizing.get().is_some() {
+            return Ok(());
+        }
+        let catalogue = reference.models().await?;
+        let _ = self.sizing.set(catalog::sizing(&catalogue, &self.model));
+        Ok(())
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        self.sizing.get().and_then(|s| s.window)
+    }
+
+    fn max_output_tokens(&self) -> Option<u64> {
+        self.sizing.get().and_then(|s| s.max_output)
     }
 
     #[cfg(feature = "media")]
@@ -200,5 +280,87 @@ impl OpenAi {
             on_call,
         )
         .await
+    }
+}
+
+/// The 0.82.0 sizing arms. This file had no test module before; the socket-driven
+/// failure arms for `OpenAi` live in `provider::mod`'s `failures`.
+#[cfg(test)]
+mod sizing_tests {
+    use super::*;
+    use crate::provider::failures::{json_response, serve_recording};
+
+    fn catalogue() -> String {
+        json_response(
+            r#"{"data":[
+                {"id":"openai/test-model","context_length":128000,
+                 "top_provider":{"max_completion_tokens":16384}}
+            ]}"#,
+        )
+    }
+
+    /// F2 — OpenAi reads a reference when one is set, and declares the host it
+    /// reads it from.
+    #[tokio::test]
+    async fn f2_a_reference_answers_the_window_and_joins_the_endpoints() {
+        let (reference_url, seen) = serve_recording(catalogue());
+        let provider = OpenAi::at(
+            "http://127.0.0.1:9/v1/chat/completions",
+            Duration::from_secs(2),
+        )
+        .with_reference_catalogue(Reference::at(&reference_url));
+
+        assert_eq!(
+            provider.endpoints(),
+            vec![
+                "http://127.0.0.1:9/v1/chat/completions",
+                reference_url.as_str()
+            ],
+            "the reference host is declared, so the run authorises it",
+        );
+
+        assert_eq!(provider.context_window(), None, "nothing before the warm");
+        provider
+            .warm_sizing()
+            .await
+            .expect("the reference answered");
+
+        assert_eq!(provider.context_window(), Some(128_000));
+        assert_eq!(provider.max_output_tokens(), Some(16_384));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// F3 — and reach nothing when one is not.
+    #[tokio::test]
+    async fn f3_no_reference_means_no_connection_at_all() {
+        let (reference_url, seen) = serve_recording(catalogue());
+        let provider = OpenAi::at(
+            "http://127.0.0.1:9/v1/chat/completions",
+            Duration::from_secs(2),
+        );
+
+        provider
+            .warm_sizing()
+            .await
+            .expect("a warm with nothing to do cannot fail");
+
+        assert_eq!(provider.context_window(), None);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the reference at {reference_url} was never dialled",
+        );
+        assert_eq!(
+            provider.endpoints(),
+            vec!["http://127.0.0.1:9/v1/chat/completions"],
+            "and it is not declared either",
+        );
+    }
+
+    #[test]
+    fn openai_assumes_the_remote_window() {
+        assert_eq!(
+            OpenAi::new("k", "m").assumed_window(),
+            crate::context::FALLBACK_WINDOW,
+        );
     }
 }
