@@ -837,7 +837,34 @@ pub(super) fn containment_line(
     // watched leave without the proxy scoping it. `None` is an attempt that could
     // not be made, and an attempt that could not be made is evidence of nothing —
     // so it gets its own sentence rather than borrowing either of the others.
-    let egress = if proxied {
+    // 0.83.0 — the proxied branch is asked about `egress_open` before it is asked
+    // about the probe, and until now it was never asked at all. `egress_open` is
+    // computed at the call site and handed in, and the three arms below all
+    // describe a run whose only route out is the proxy — so a proxied run whose
+    // sandbox was widened got a sentence naming the provider's host as the only
+    // reachable one while the operator had opened the network. That is the exact
+    // reading the io-cli field test made of the *unproxied* sentence 0.80.0
+    // corrected, on the branch 0.80.0's correction could not reach: every real
+    // run is proxied, so the corrected sentence has never been rendered.
+    //
+    // The proxy is still named, because it is still there and still scopes what
+    // *this harness* dials. What changed is which of the two the sentence says
+    // bounds the commands.
+    //
+    // **`config.allow_network` and not `egress_open`, and the difference is the
+    // whole sentence.** `egress_open` is `sandbox.allow_network ||
+    // policy.permits_any_egress()`, and the second half is true for any allow
+    // rule naming any host — which a proxied run has by construction, because
+    // that is what made it proxied. Reading it here would tell every proxied run
+    // that its commands' network is open while `ExecContainment::with_egress`
+    // gives them the narrow profile, which is this release's own defect pointed
+    // the other way. The two sites answer the same question and must answer it
+    // from the same input.
+    let egress = if proxied && config.allow_network {
+        " Outbound network is open to the commands you run: this run's sandbox grants it \
+         wholesale rather than per host, so the proxy this run owns bounds what this harness \
+         dials on your behalf and not what a command you run may reach."
+    } else if proxied {
         match probe.dial_refused {
             Some(true) => {
                 " Outbound network goes through a proxy this run owns, which permits only the \

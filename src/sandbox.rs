@@ -1884,13 +1884,27 @@ impl ExecContainment {
     /// re-opened the sandbox through `permits_any_egress`, and that is closed by
     /// [`refuse_granting_layers`](crate::Config), not by discarding `[sandbox]`.
     ///
-    /// A run that owns an egress proxy is unaffected either way: the backends
-    /// deny everything and allow the proxy's own address back, so `proxy` beats
-    /// both answers.
+    /// **A proxied run takes the operator's answer and not the policy's, and
+    /// 0.83.0 is where that stopped being academic.** Until this release the
+    /// sentence here read that a proxied run was unaffected either way, because
+    /// the backends denied everything and allowed the proxy's address back
+    /// whatever this returned — the macOS profile matched `(Some(addr), _)` and
+    /// discarded the flag. Now that the flag reaches the backend, the two inputs
+    /// have to be told apart: `Policy::permits_any_egress` answers true for *any*
+    /// allow rule naming *any* host, so a policy that permits one host would
+    /// otherwise widen the whole sandbox and hand back the direct dial the proxy
+    /// exists to prevent. The per-host rules on a proxied run are the proxy's to
+    /// enforce; `[sandbox] allow_network` is the operator saying they want more
+    /// than that, and it is the only thing that widens here.
     pub(crate) fn with_egress(&self, allow_network: bool) -> Self {
+        let granted = if self.proxy.is_some() {
+            self.config.allow_network
+        } else {
+            allow_network || self.config.allow_network
+        };
         Self {
             config: SandboxConfig {
-                allow_network: allow_network || self.config.allow_network,
+                allow_network: granted,
                 ..self.config.clone()
             },
             roots: self.roots.clone(),
@@ -3405,6 +3419,49 @@ mod tests {
         assert!(
             !contained.with_egress(false).config.allow_network,
             "and when neither says so, nothing grants it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 0.83.0 — and a proxied run takes the operator's answer alone
+    // -----------------------------------------------------------------------
+
+    /// The invariant 0.48.0's F7 rests on, which only became load-bearing here.
+    ///
+    /// `Policy::permits_any_egress` is true for *any* allow rule naming *any*
+    /// host, and a proxied run has at least one by construction — that is what
+    /// made it proxied. Before the macOS profile read the flag, widening from
+    /// the policy was harmless because the proxied arm discarded it; now it
+    /// would mean "the policy permits one host" silently granting an unfiltered
+    /// direct dial, and the proxy would become advice.
+    #[test]
+    fn a_proxied_run_is_not_widened_by_its_own_policy() {
+        let addr: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let proxied = ExecContainment::resolve(&SandboxConfig::new(), None, &[])
+            .with_proxy(Some(addr));
+
+        assert!(
+            !proxied.with_egress(true).config.allow_network,
+            "a policy that permits a host is enforced by the proxy, not by \
+             opening the sandbox to everything"
+        );
+    }
+
+    /// And the other half: the operator's own section still reaches the backend
+    /// through a proxy, which is the whole point of this release.
+    #[test]
+    fn a_proxied_run_is_widened_by_the_operators_own_section() {
+        let addr: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let config = SandboxConfig {
+            allow_network: true,
+            ..SandboxConfig::new()
+        };
+        let proxied = ExecContainment::resolve(&config, None, &[]).with_proxy(Some(addr));
+
+        assert!(
+            proxied.with_egress(false).config.allow_network,
+            "`sandbox.allow_network = true` is the operator asking for more than \
+             the proxy's host list, and it survives to the backend"
         );
     }
 }
