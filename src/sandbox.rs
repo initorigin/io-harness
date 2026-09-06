@@ -1797,12 +1797,48 @@ impl ExecContainment {
     /// native backends already grant it unconditionally (`/private/var/folders` in
     /// the macOS profile, `${TMPDIR:-/tmp}` in the Linux mount setup), and a
     /// second grant saying what the first already said is a line that can drift.
+    /// `declared` are the roots the run itself asked for beyond its workdir
+    /// (0.81.0) — [`TaskContract::writable_roots`](crate::TaskContract::writable_roots).
+    ///
+    /// They ride the same list as the toolchain caches and are filtered the same
+    /// way, for the same reason: the Linux mount setup binds every root it is
+    /// given, a bind of a path that is not there fails the setup, and a failed
+    /// setup degrades the whole backend to the portable floor. A root granted for
+    /// a directory that does not exist would silently unwind the confinement it
+    /// was added to preserve.
+    ///
+    /// A read-only run gets none of them. `ReadOnly` withholding the workspace and
+    /// then granting a root beside it would hand back through the side door
+    /// exactly what the mode exists to withhold.
     pub(crate) fn resolve(
         config: &SandboxConfig,
         toolchain: Option<&crate::toolchain::Toolchain>,
+        declared: &[PathBuf],
     ) -> Self {
         let roots = if config.mode == ExecMode::WorkspaceWrite {
-            writable_cache_roots(toolchain)
+            let mut roots = writable_cache_roots(toolchain);
+            for root in declared {
+                // `is_dir`, not `exists`. A path that exists and is a *file* is the
+                // dangerous case, and it is reachable without a caller doing
+                // anything unusual: a child working in a linked worktree or a
+                // submodule declares its parent's `.git`, which is a file there
+                // rather than a directory.
+                //
+                // Landlock refuses directory-only rights on a non-directory with
+                // `EINVAL`, so the rule set fails to build, and
+                // `sandbox::contain_command` then installs no rule set and no
+                // seccomp filter while the trace still records `LinuxLandlock`.
+                // One bad entry would therefore turn containment off for every
+                // shell stage, backgrounded child, git built-in and browser spawn
+                // in the run — a silent widening, which is the one failure this
+                // whole module exists to prevent. The mount rungs skip a file root
+                // and macOS grants nothing for one, so the three platforms also
+                // disagreed about it; refusing it here makes them agree.
+                if root.is_absolute() && root.is_dir() && !roots.contains(root) {
+                    roots.push(root.clone());
+                }
+            }
+            roots
         } else {
             Vec::new()
         };
@@ -2083,9 +2119,14 @@ pub(crate) fn contain_command(
             return None;
         }
         let abi = landlock::abi()?;
-        // The system temporary directory, still — see `landlock::plan`, which
-        // carries what 0.80.0 tried here and why it came back out.
-        let tmp = std::env::temp_dir();
+        // 0.81.0 — the run's own directory, the same resolver `linux::landlock_run`
+        // uses. **Both Landlock spawn paths or neither**: the comment below already
+        // says two paths reporting `LinuxLandlock` while installing different
+        // filters is the failure to avoid, and a narrowing applied to one of them
+        // is exactly that — this path is what wraps `shell_start`, the browser
+        // child and the git built-ins, so leaving it wide would have left the hole
+        // open for every backgrounded command while closing it for `exec`.
+        let tmp = linux::tmp_target(workdir, config.mode);
         let plan = landlock::plan(
             abi,
             config.mode,
@@ -2095,7 +2136,22 @@ pub(crate) fn contain_command(
             &tmp,
             proxy.map(|a| a.port()),
         );
-        let ruleset = landlock::Ruleset::build(&plan).ok()?;
+        // 0.81.0 — say so. `ok()?` returned `None` here, and `None` from this
+        // function means "this command is not wrapped": the argv runs untouched
+        // while `select` has already told the trace the backend is
+        // `LinuxLandlock`. That is a silent widening, and it is the one outcome
+        // this module must never produce quietly. `linux::landlock_run` has warned
+        // and taken the next rung since 0.48.0; this path is now as loud.
+        let ruleset = match landlock::Ruleset::build(&plan) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "sandbox: the Landlock rule set could not be built ({e}); this command runs \
+                     unwrapped. A writable root that is not a directory is the usual cause."
+                );
+                return None;
+            }
+        };
         let fd = ruleset.raw();
         // 0.74.0, audit H9 — read from the plan, never written as a constant
         // here. Landlock can restrict TCP and nothing else, so a run that denied
@@ -2106,6 +2162,11 @@ pub(crate) fn contain_command(
         // both report `LinuxLandlock` while installing different filters is the
         // failure this release exists to stop.
         let net_restricted = plan.restricts_network();
+        // 0.81.0 — and the child is told where the grant is, as on the other path.
+        // A narrowed rule set with `TMPDIR` still pointing at `/tmp` is a run that
+        // fails on its first temporary file, which reads as a broken toolchain
+        // rather than as a boundary.
+        cmd.env("TMPDIR", &tmp);
         // SAFETY: the closure runs in the forked child before `exec`, allocates
         // nothing and calls only `prctl`, `landlock_restrict_self` and one
         // `seccomp` install. `fd` belongs to the returned guard, which the caller
@@ -3315,7 +3376,7 @@ mod tests {
             allow_network: true,
             ..SandboxConfig::new()
         };
-        let contained = ExecContainment::resolve(&config, None);
+        let contained = ExecContainment::resolve(&config, None, &[]);
 
         assert!(
             contained.with_egress(false).config.allow_network,
@@ -3335,7 +3396,7 @@ mod tests {
     /// only the first test above would have caught the defect.
     #[test]
     fn a_policy_that_grants_egress_still_reaches_a_silent_sandbox_section() {
-        let contained = ExecContainment::resolve(&SandboxConfig::new(), None);
+        let contained = ExecContainment::resolve(&SandboxConfig::new(), None, &[]);
 
         assert!(
             contained.with_egress(true).config.allow_network,

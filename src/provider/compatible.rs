@@ -347,6 +347,16 @@ impl Compatible {
         format!("{}/chat/completions", self.base)
     }
 
+    /// This provider's own model in a catalogue that has already been fetched, or
+    /// `None` (0.81.0).
+    ///
+    /// Never fetches. The two sizing questions a run asks before its first step —
+    /// [`Provider::context_window`] and [`Provider::max_output_tokens`] — are
+    /// synchronous, and a fetch behind either would dial on every run.
+    fn cached_entry(&self) -> Option<&ModelInfo> {
+        self.cached.get()?.iter().find(|m| m.id == self.model)
+    }
+
     /// A [`PriceTable`] built from this provider's catalogue, dated by the
     /// moment it was read.
     ///
@@ -489,6 +499,23 @@ impl Provider for Compatible {
 
     fn endpoint(&self) -> Option<&str> {
         Some(&self.base)
+    }
+
+    /// 0.81.0 — this model's window, from a catalogue already in hand.
+    ///
+    /// Only from the cache. [`models`](Compatible::models) is what fetches, and it
+    /// is `async`; this is the sizing question a run asks before its first step, and
+    /// answering it with a request would put a round trip in front of every run. So
+    /// an embedder who has called `models` — for prices, or for the model list —
+    /// gets a window-sized ceiling, and one who has not gets the fallback and an
+    /// event saying so.
+    fn context_window(&self) -> Option<u64> {
+        self.cached_entry().and_then(|m| m.context_length)
+    }
+
+    /// 0.81.0 — the vendor's own answer limit, reserved out of the window above.
+    fn max_output_tokens(&self) -> Option<u64> {
+        self.cached_entry().and_then(|m| m.max_output_tokens)
     }
 
     /// The chat endpoint, and the reference catalogue when one was asked for.

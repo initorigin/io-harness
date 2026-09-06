@@ -260,9 +260,18 @@ async fn a_one_shot_run_emits_no_deltas_and_a_session_turn_does() {
     // step rather than before it: `StepAttributed` says where that step's wall
     // clock went, and it is emitted beside `Step` from the same place, once the
     // checkpoint that carries the numbers has succeeded.
+    //
+    // 0.81.0 adds two more, one at each position, for the fifth and sixth time.
+    // `ContextCeiling` joins the run-start group — the ceiling is resolved once,
+    // before the first step, exactly as the containment and the prompt are — and
+    // `StepUsage` joins `StepAttributed` beside the step, because a step's token
+    // split is known where its wall clock is. The count moving again is the point
+    // the comment above already makes: what this test asserts is that streaming
+    // adds no `Token` events to a one-shot run, and that is the two assertions
+    // above rather than this one.
     assert_eq!(
         *quiet.kinds.lock().unwrap(),
-        vec!["started", "other", "other", "other", "step", "other", "finished"]
+        vec!["started", "other", "other", "other", "other", "step", "other", "other", "finished"]
     );
 
     // The control: the same provider, through a session turn.

@@ -86,6 +86,15 @@ impl ServerHandler for Fixture {
                 "Exits the server process.",
                 schema(serde_json::json!({})),
             ),
+            // 0.81.0 — a server handing over an image the agent did not ask for.
+            // It is the only path in this crate where content the model will look
+            // at arrives from a third party, so it needs a fixture rather than a
+            // description.
+            Tool::new(
+                "snapshot",
+                "Returns a one-pixel PNG.",
+                schema(serde_json::json!({})),
+            ),
         ]))
     }
 
@@ -122,6 +131,14 @@ impl ServerHandler for Fixture {
                 "the tool failed on purpose",
             )])
             .into()),
+            // A real one-pixel PNG rather than arbitrary bytes: the crate decodes
+            // and re-encodes what a server hands over, so a fixture that is not an
+            // image would test the refusal path instead of the attach path.
+            "snapshot" => Ok(CallToolResult::success(vec![ContentBlock::image(
+                ONE_PIXEL_PNG.to_string(),
+                "image/png".to_string(),
+            )])
+            .into()),
             // No reply is sent: the process is gone, which is exactly the
             // mid-run death the harness has to survive.
             "die" => std::process::exit(0),
@@ -136,6 +153,10 @@ impl ServerHandler for Fixture {
         }
     }
 }
+
+/// A 1×1 transparent PNG, base64, as an MCP server would send one.
+const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk\
+                             YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -155,7 +155,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::context::ContextBudget;
+use crate::context::{Collapse, Compaction, ContextBudget, Ladder};
 use crate::error::{Error, Result};
 use crate::mcp::McpServer;
 use crate::policy::{Defaults, Effect, Layer, Policy};
@@ -890,6 +890,24 @@ struct RunSection {
     retry: Option<RetryPolicy>,
     stall: Option<StallPolicy>,
     context: Option<ContextBudget>,
+    // 0.81.0 — the compaction rungs, reachable from a config file for the first
+    // time. `Compaction` and `Collapse` have carried `Serialize`/`Deserialize`
+    // since they were written and no key deserialized them, so an operator could
+    // choose a fold threshold or a projection only in Rust. Three keys rather than
+    // one nested table because they are three independent knobs: when to fold, how
+    // to shorten, and which rungs run before either.
+    compaction: Option<Compaction>,
+    collapse: Option<Collapse>,
+    ladder: Option<Ladder>,
+    // 0.81.0 — directories beyond the workspace this run's commands may write to.
+    // In `[run]` rather than `[sandbox]` because it is a property of the work, not
+    // of the backend: the same declaration has to mean the same thing on three
+    // hosts whose confinement mechanisms have nothing in common.
+    writable_roots: Option<Vec<PathBuf>>,
+    // 0.81.0 — the tool families this run offers up front. Absent offers the whole
+    // catalogue, which is what every release through 0.80.0 did; an empty list is
+    // still a declaration and means core only.
+    tool_tiers: Option<Vec<String>>,
     // 0.55.0 — the ceiling a read is refused against, in characters. Beside the
     // other budgets because it is one: what a run may spend, what one request may
     // carry, and what one read may be.
@@ -2348,6 +2366,27 @@ impl Config {
         if let Some(v) = run.context {
             out = out.with_context_budget(v);
         }
+        if let Some(v) = run.compaction {
+            out = out.with_compaction(v);
+        }
+        if let Some(v) = run.collapse {
+            out = out.with_collapse(v);
+        }
+        if let Some(v) = run.ladder {
+            out = out.with_ladder(v);
+        }
+        if let Some(v) = &run.writable_roots {
+            out = out.with_writable_roots(v.clone());
+        }
+        if let Some(v) = &run.tool_tiers {
+            out = out.with_tool_tiers(v.clone());
+        }
+        // 0.81.0 — a family name is validated at load, where the operator is still
+        // reading their own file. An unrecognised one matches nothing, withholds
+        // everything and says nothing, which is the shape of setting that gets
+        // written once and misread for a year. The hook loader validates its `on:`
+        // names against `EVENT_NAMES` for the same reason; this is that rule
+        // applied to the key added here.
         if let Some(v) = run.max_read_chars {
             out = out.with_max_read_chars(v);
         }
@@ -2790,7 +2829,30 @@ fn check_providers(providers: &[ProviderSpec]) -> Result<()> {
 /// path and be dropped just as silently. Every sibling validator in this module
 /// recurses the same way; a check that did not would be absent on the one path it
 /// does not cover.
+/// Every `[run] tool_tiers` name is a family this crate has (0.81.0).
+///
+/// Checked while the operator is still reading their own file. An unrecognised
+/// family matches nothing, withholds every optional tool and reports nothing,
+/// which is a setting that gets written once and misread for a year. The hook
+/// loader validates its `on:` names against `EVENT_NAMES` for exactly this reason.
+fn check_tool_tiers(file: &File) -> Result<()> {
+    let sections = std::iter::once(&file.run).chain(file.profile.values().map(|p| &p.run));
+    for run in sections.flatten() {
+        for name in run.tool_tiers.iter().flatten() {
+            if !crate::tools::TOOL_FAMILIES.contains(&name.as_str()) {
+                return Err(Error::Config(format!(
+                    "[run] tool_tiers names {name:?}, which is not a tool family. \
+                     The families are {}.",
+                    crate::tools::TOOL_FAMILIES.join(", ")
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check_routing(file: &File) -> Result<()> {
+    check_tool_tiers(file)?;
     check_routing_section(&file.routing)?;
     for profile in file.profile.values() {
         check_routing_section(&profile.routing)?;

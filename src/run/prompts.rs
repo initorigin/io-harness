@@ -337,11 +337,13 @@ pub(super) const MAX_BOUNDARY_PATTERNS: usize = 24;
 pub(super) fn exec_containment(
     config: &SandboxConfig,
     toolchain: Option<&Toolchain>,
+    declared: &[std::path::PathBuf],
 ) -> Option<std::sync::Arc<crate::sandbox::ExecContainment>> {
-    config
-        .mode
-        .is_contained()
-        .then(|| std::sync::Arc::new(crate::sandbox::ExecContainment::resolve(config, toolchain)))
+    config.mode.is_contained().then(|| {
+        std::sync::Arc::new(crate::sandbox::ExecContainment::resolve(
+            config, toolchain, declared,
+        ))
+    })
 }
 
 /// The writable roots the verification gate gets (0.46.0).
@@ -354,6 +356,75 @@ pub(super) fn exec_containment(
 /// are configured from different places.
 pub(super) fn gate_roots(toolchain: Option<&Toolchain>) -> Vec<std::path::PathBuf> {
     crate::sandbox::writable_cache_roots(toolchain)
+}
+
+/// Keep the core tools and the families this run offers, and name the rest in one
+/// line (0.81.0).
+///
+/// Returns the catalogue to send and, when anything was withheld, the
+/// `expand_tools` spec that reaches it. A run whose `tool_tiers` is `None` gets
+/// its catalogue back untouched — the whole of what every release through 0.80.0
+/// sent.
+///
+/// **A withheld tool is not a denied tool.** The policy is what denies; this
+/// decides what is *offered*, which is the same distinction
+/// [`ToolMask`](crate::tools::ToolMask) draws and for the same reason. What
+/// tiering costs is one extra turn to reach a withheld family, and a rewritten
+/// cacheable prefix when a run expands mid-turn.
+pub(super) fn tiered(tools: Vec<ToolSpec>, tiers: Option<&[String]>) -> Vec<ToolSpec> {
+    let Some(tiers) = tiers else {
+        return tools;
+    };
+    let offered = |family: &str| family == "core" || tiers.iter().any(|t| t == family);
+    let withheld: Vec<&str> = crate::tools::TOOL_FAMILIES
+        .iter()
+        .copied()
+        .filter(|f| !offered(f))
+        // A family this build did not compile has no tools to withhold, and
+        // naming it would offer the model a call that can only fail.
+        .filter(|f| {
+            tools
+                .iter()
+                .any(|t| crate::tools::tool_family(&t.name) == *f)
+        })
+        .collect();
+
+    let mut kept: Vec<ToolSpec> = tools
+        .into_iter()
+        .filter(|t| offered(crate::tools::tool_family(&t.name)))
+        .collect();
+    if !withheld.is_empty() {
+        kept.push(expand_tools_spec(&withheld));
+    }
+    kept
+}
+
+/// The one line that stands in for a withheld family.
+///
+/// It names the families rather than describing them, because the point of the
+/// tier is that the model spends no tokens on a capability it is not using — a
+/// paragraph per withheld family would give back most of what withholding them
+/// saved.
+fn expand_tools_spec(withheld: &[&str]) -> ToolSpec {
+    ToolSpec {
+        name: crate::tools::EXPAND_TOOLS_TOOL.to_string(),
+        description: format!(
+            "Offer a family of tools this run is not currently carrying, from the next step \
+             onwards. Available: {}. Call this once, then make the call you wanted.",
+            withheld.join(", ")
+        ),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "family": {
+                    "type": "string",
+                    "description": "One of the families named in this tool's description.",
+                    "enum": withheld,
+                }
+            },
+            "required": ["family"]
+        }),
+    }
 }
 
 /// Report how this run's commands are contained, once (0.46.0).
@@ -589,7 +660,7 @@ pub(super) async fn probe_tree_boundary(
         return probe;
     }
     let toolchain = crate::toolchain::detect(root);
-    let containment = exec_containment(config, toolchain.as_ref());
+    let containment = exec_containment(config, toolchain.as_ref(), &[]);
     // Depth 0: the tree's boundary is measured before the root agent runs, and it
     // is the root's row.
     probe_boundary(store, watch, 0, run_id, config, containment.as_deref()).await

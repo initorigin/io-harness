@@ -1410,6 +1410,11 @@ pub(crate) async fn run_with_extras<P: Provider>(
         },
     ));
     emit_plugins(watch, run_id, contract);
+    // 0.81.0 — the ceiling this run assembles under, sized to the model the provider
+    // is about to ask and reported once. It shadows the parameter deliberately, so
+    // every read of `contract.context` below this line is the resolved value and
+    // there is no second rule for a resumed run to disagree with.
+    let contract = &size_context(watch, run_id, contract, provider);
     // Decided against the *caller's* policy, before the provider layer is merged
     // in: the harness adding a network layer of its own must not turn a
     // permissive caller into a policy-bearing one and push it off the
@@ -2415,6 +2420,11 @@ pub async fn resume_with_observed<P: Provider>(
         },
     ));
     emit_plugins(watch, run_id, contract);
+    // 0.81.0 — the ceiling this run assembles under, sized to the model the provider
+    // is about to ask and reported once. It shadows the parameter deliberately, so
+    // every read of `contract.context` below this line is the resolved value and
+    // there is no second rule for a resumed run to disagree with.
+    let contract = &size_context(watch, run_id, contract, provider);
     match contract.root.clone() {
         Some(root) => {
             // Re-authorized on resume rather than trusted from the interrupted
@@ -2950,6 +2960,11 @@ pub async fn resume_with_decision_observed<P: Provider>(
         },
     ));
     emit_plugins(watch, run_id, contract);
+    // 0.81.0 — the ceiling this run assembles under, sized to the model the provider
+    // is about to ask and reported once. It shadows the parameter deliberately, so
+    // every read of `contract.context` below this line is the resolved value and
+    // there is no second rule for a resumed run to disagree with.
+    let contract = &size_context(watch, run_id, contract, provider);
 
     match decision {
         // Deferring again leaves it pending and the run paused.
@@ -3328,6 +3343,11 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
         },
     ));
     emit_plugins(watch, run_id, contract);
+    // 0.81.0 — the ceiling this run assembles under, sized to the model the provider
+    // is about to ask and reported once. It shadows the parameter deliberately, so
+    // every read of `contract.context` below this line is the resolved value and
+    // there is no second rule for a resumed run to disagree with.
+    let contract = &size_context(watch, run_id, contract, provider);
 
     match decision {
         Decision::Defer => Ok(RunResult::new(
@@ -3718,6 +3738,37 @@ impl<'a> Watch<'a> {
         if self.observer.event(&event).is_cancel() {
             self.cancelled.set(true);
         }
+    }
+
+    /// Report that an image reached this run, by its descriptor (0.81.0).
+    ///
+    /// One helper rather than four copies: an image arrives by four paths — an MCP
+    /// tool reply, a browser screenshot, the `view_image` built-in and the
+    /// contract's own images — and a descriptor assembled slightly differently at
+    /// each of them would be four accounts of one fact. The bytes are never
+    /// carried, for the reason `view_image`'s own observation states: a trace
+    /// holding images grows by megabytes a step in exactly the long unattended runs
+    /// this crate exists for.
+    #[cfg(feature = "media")]
+    pub(crate) fn image(
+        &self,
+        run_id: i64,
+        step: u32,
+        depth: u32,
+        media: &crate::provider::Media,
+        source: &str,
+    ) {
+        self.emit(RunEvent::at_depth(
+            run_id,
+            step,
+            depth,
+            EventKind::ImageAttached {
+                media_type: media.media_type.to_string(),
+                bytes: media.byte_len() as u64,
+                digest: media.digest(),
+                source: source.to_string(),
+            },
+        ));
     }
 
     /// Ask for the run to stop, without an event to hang it off (0.42.0).
@@ -4217,6 +4268,11 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
         },
     ));
     emit_plugins(watch, run_id, contract);
+    // 0.81.0 — the ceiling this run assembles under, sized to the model the provider
+    // is about to ask and reported once. It shadows the parameter deliberately, so
+    // every read of `contract.context` below this line is the resolved value and
+    // there is no second rule for a resumed run to disagree with.
+    let contract = &size_context(watch, run_id, contract, provider);
     // Authorized once at the root. Children inherit the root's policy through
     // `Policy::contain`, so the provider layer flows down the tree and no child
     // needs (or gets) its own chance to widen network access.
@@ -4455,6 +4511,11 @@ pub async fn resume_tree_observed<P: Provider>(
         },
     ));
     emit_plugins(watch, run_id, contract);
+    // 0.81.0 — the ceiling this run assembles under, sized to the model the provider
+    // is about to ask and reported once. It shadows the parameter deliberately, so
+    // every read of `contract.context` below this line is the resolved value and
+    // there is no second rule for a resumed run to disagree with.
+    let contract = &size_context(watch, run_id, contract, provider);
     emit_backlog(
         watch,
         run_id,

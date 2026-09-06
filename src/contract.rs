@@ -444,6 +444,57 @@ pub struct TaskContract {
     ///
     /// Set it with [`TaskContract::with_collapse`].
     pub collapse: crate::context::Collapse,
+    /// Directories beyond the workspace this run's commands may write to (0.81.0).
+    ///
+    /// A contained run may write inside its workspace and inside the toolchain
+    /// caches the host was found to have, and nowhere else. That is right for most
+    /// runs and wrong for the ones that are not self-contained: a `git worktree`
+    /// child's object store is in the *parent* repository, outside the child's
+    /// workdir, so a run doing work in a worktree writes outside its own root by
+    /// construction.
+    ///
+    /// Declaring the root here is what makes that legal without widening the
+    /// boundary for everything else — and it is what lets the Linux backend stop
+    /// granting the whole system temporary directory to every run, which it did
+    /// through 0.80.0 because there was no way to say what a run actually needed.
+    ///
+    /// Each path must be absolute and must exist when the run starts; one that is
+    /// neither is dropped rather than granted, because a bind of a path that is
+    /// not there fails the Linux mount setup and degrades the whole backend.
+    /// Nothing is granted at all under
+    /// [`ExecMode::ReadOnly`](crate::ExecMode::ReadOnly).
+    ///
+    /// Set it with [`TaskContract::with_writable_roots`].
+    pub writable_roots: Vec<PathBuf>,
+    /// Which families beyond the core tools this run offers up front (0.81.0).
+    ///
+    /// `None` — the default — offers the whole catalogue on every request, which
+    /// is what every release through 0.80.0 did. `Some(..)` offers the core tools
+    /// plus the named families, and adds `expand_tools` so the model can ask for
+    /// one of the rest in a single call.
+    ///
+    /// **The reason is the request floor.** A measured turn carried 7,311 tokens
+    /// before the user had typed anything, of which 5,436 was the tool catalogue —
+    /// re-sent whole on every step of every turn, twelve of its entries being
+    /// document tools a run editing Rust will never call.
+    ///
+    /// **Tiering changes what is offered, never what exists.** A tool withheld
+    /// here is not denied: the policy is what denies, and a masked or tiered run
+    /// still resolves every call through it. What tiering costs is that reaching a
+    /// withheld family takes one extra turn, and that expanding mid-run rewrites
+    /// the cacheable prefix — which is why it is off by default and why the
+    /// evaluation suite measures it rather than this documentation asserting it
+    /// pays.
+    ///
+    /// Set it with [`TaskContract::with_tool_tiers`]. Family names are
+    /// [`TOOL_FAMILIES`](crate::tools::TOOL_FAMILIES).
+    pub tool_tiers: Option<Vec<String>>,
+    /// The compaction rungs between Collapse and a fold (0.81.0).
+    ///
+    /// Every rung off by default, which assembles exactly what 0.80.0 assembled.
+    /// See [`Ladder`](crate::context::Ladder) for what each one costs and what it
+    /// keeps, and set it with [`TaskContract::with_ladder`].
+    pub ladder: crate::context::Ladder,
     /// How long a command the agent runs with the `exec` tool may take before it
     /// is killed and reported as a timeout.
     ///
@@ -779,6 +830,9 @@ impl TaskContract {
             fold_now: false,
             tool_mask: crate::ToolMask::none(),
             collapse: crate::context::Collapse::default(),
+            ladder: crate::context::Ladder::default(),
+            writable_roots: Vec::new(),
+            tool_tiers: None,
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -864,6 +918,9 @@ impl TaskContract {
             fold_now: false,
             tool_mask: crate::ToolMask::none(),
             collapse: crate::context::Collapse::default(),
+            ladder: crate::context::Ladder::default(),
+            writable_roots: Vec::new(),
+            tool_tiers: None,
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -1934,6 +1991,97 @@ impl TaskContract {
     #[must_use]
     pub fn with_collapse(mut self, collapse: crate::context::Collapse) -> Self {
         self.collapse = collapse;
+        self
+    }
+
+    /// Choose the compaction rungs between Collapse and a fold (0.81.0).
+    ///
+    /// ```
+    /// use io_harness::context::{Ladder, Snip};
+    /// use io_harness::TaskContract;
+    ///
+    /// let contract = TaskContract::workspace("audit", "/repo").with_ladder(Ladder {
+    ///     reduce: true,
+    ///     snip: Some(Snip { older_than_steps: 30 }),
+    ///     microcompact: false,
+    ///     skill_bodies_leave: false,
+    /// });
+    /// assert!(contract.ladder.reduce);
+    ///
+    /// // Unset is every rung off, which assembles what 0.80.0 assembled.
+    /// assert_eq!(
+    ///     TaskContract::workspace("audit", "/repo").ladder,
+    ///     Ladder::default()
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_ladder(mut self, ladder: crate::context::Ladder) -> Self {
+        self.ladder = ladder;
+        self
+    }
+
+    /// Offer the core tools plus these families, and `expand_tools` for the rest
+    /// (0.81.0).
+    ///
+    /// ```
+    /// use io_harness::TaskContract;
+    ///
+    /// // A run that edits code and never opens a spreadsheet.
+    /// let lean = TaskContract::workspace("fix the parser", "/repo").with_tool_tiers(["browser"]);
+    /// assert_eq!(lean.tool_tiers.as_deref(), Some(&["browser".to_string()][..]));
+    ///
+    /// // An empty list is still a declaration: core only, everything else one
+    /// // `expand_tools` call away.
+    /// let core_only = TaskContract::workspace("fix the parser", "/repo")
+    ///     .with_tool_tiers(Vec::<String>::new());
+    /// assert_eq!(core_only.tool_tiers.as_deref(), Some(&[][..]));
+    ///
+    /// // Declaring nothing offers the whole catalogue, which is what every
+    /// // release through 0.80.0 did.
+    /// assert!(TaskContract::workspace("fix the parser", "/repo")
+    ///     .tool_tiers
+    ///     .is_none());
+    /// ```
+    #[must_use]
+    pub fn with_tool_tiers<I, S>(mut self, families: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tool_tiers = Some(families.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Declare directories beyond the workspace this run's commands may write to
+    /// (0.81.0).
+    ///
+    /// Each path must be absolute and must be a **directory** that exists when the
+    /// run starts. Anything else is dropped rather than granted: Landlock refuses
+    /// directory-only rights on a file, which fails the whole rule set, and a
+    /// failed rule set is a command that runs unwrapped.
+    ///
+    /// ```
+    /// use io_harness::TaskContract;
+    ///
+    /// // A run whose children work in worktrees writes to the parent repository's
+    /// // object store, which is outside every child's own workdir.
+    /// let contract = TaskContract::workspace("fan out", "/repo/.worktrees/scout")
+    ///     .with_writable_roots(["/repo/.git"]);
+    /// assert_eq!(contract.writable_roots.len(), 1);
+    ///
+    /// // Declaring nothing is the default and grants nothing beyond the
+    /// // workspace and the toolchain caches, which is 0.80.0's behaviour.
+    /// assert!(TaskContract::workspace("plain", "/repo")
+    ///     .writable_roots
+    ///     .is_empty());
+    /// ```
+    #[must_use]
+    pub fn with_writable_roots<I, P>(mut self, roots: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.writable_roots = roots.into_iter().map(Into::into).collect();
         self
     }
 

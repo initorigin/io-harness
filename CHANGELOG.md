@@ -16,7 +16,113 @@ notes are produced from it.
 
 ### Added
 
+- **A run's context ceiling is sized to the model it is running.** `Provider` gains
+  `context_window` and `max_output_tokens`, both defaulting to `None` — "this
+  provider is not saying" — so every implementation written before this release
+  keeps compiling and keeps the ceiling it had. `ContextBudget::for_window` derives
+  a ceiling from a window, reserving the model's answer and the request's own floor
+  out of it. `Compatible` answers both from a catalogue it has already fetched and
+  never dials to do so.
+- **`EventKind::ContextCeiling`**, emitted once per run beside `Started`. It carries
+  the ceiling the run will assemble under and one word for where it came from:
+  `contract` (the caller stated one), `model` (derived from the window), or
+  `fallback` (nothing knew the window, so the crate's constant applies). The last is
+  the one worth acting on, and it used to be invisible.
+- **`io_harness::context::FALLBACK_MAX_TOKENS`**, the 24,000-token constant, now
+  named and documented as the fallback rather than sitting unlabelled inside
+  `ContextBudget::default`.
+- **Tiered tool exposure**, as `TaskContract::tool_tiers` / `with_tool_tiers` and
+  `[run] tool_tiers`, off by default. A run offers the core file, search, exec, git
+  and memory tools, names the `documents`, `browser` and `shell_jobs` families in
+  one line, and one `expand_tools` call reaches a family from the next step. A
+  measured turn carried 7,311 tokens before the user had typed anything, 5,436 of
+  them the catalogue, re-sent on every step; tiering takes 23% off the description
+  tokens on an all-features build. A withheld tool is not a denied tool — the
+  policy is what denies — and what tiering costs is one extra turn and a rewritten
+  cache prefix, which is why it is opt-in.
+- **A description budget**, gated at 60 estimated tokens per built-in tool with two
+  exception lists: descriptions whose length is load-bearing, and twelve that
+  predate the budget and are kept until a measurement says what shortening them
+  costs. The second list is closed.
+- **`catalog:` in skill frontmatter.** A skill declaring `catalog: false` stays
+  discoverable and reachable by `read_skill` and keeps its line out of the prompt
+  catalogue. Absent means catalogued, which is every skill written before this
+  release. A skill catalogue measured at 914 tokens over eighteen lines had
+  thirteen contributed by one bundle whose workflow most turns never enter;
+  `bundles/long-horizon/` is five skills and one catalogue line.
+- **A run can declare writable roots beyond its workdir**, as
+  `TaskContract::writable_roots` / `with_writable_roots` and `[run] writable_roots`
+  in `io.toml`. A contained run could write inside its workspace and the host's
+  toolchain caches and nowhere else, which is wrong for work that is not
+  self-contained: a `git worktree` child commits into the parent repository's
+  object store, outside its own root by construction. Each path must be absolute
+  and must exist; one that is neither is dropped rather than granted, because a
+  bind of an absent path fails the Linux mount setup and would degrade the whole
+  backend. Nothing is granted under `ExecMode::ReadOnly`.
+- **Three compaction rungs between Context Collapse and a fold**, as
+  `io_harness::context::Ladder`, with every rung off by default. *Reduction* is
+  lossless: the memory block's quarter of the ceiling is trimmed towards a floor so
+  the observations get the room, and only when the ledger will not fit. *Snip*
+  drops old lookups by kind — a `find` from thirty steps ago is not load-bearing,
+  and a read, a command's output or a skill body is a finding rather than a lookup
+  and is kept. *Microcompact* replaces a contiguous run of one step's results with
+  a counted line, mechanically and with no model call, which is what keeps
+  `assemble` a pure function and keeps the rung deterministic enough for the
+  evaluation suite to score. The fold stays the last rung and stays the default
+  trigger.
+- **`[run] compaction`, `[run] collapse` and `[run] ladder` in `io.toml`.**
+  `Compaction` and `Collapse` have been serde-ready since they were written and no
+  config key deserialized them, so an operator could choose a fold threshold or a
+  projection only in Rust — and writing one in a config file was a hard parse
+  error. The assembly trace names every rung that ran, so a reader can tell a
+  reduction from a snip from a fold.
+- **An in-crate evaluation suite, `io_harness::eval`.** A `Case` is a task contract
+  plus the outcome that decides it; a `Scorer` turns a finished run into one number;
+  a `Suite` runs the cases over a `Replay` and reports both. Four scorers ship:
+  `PromptTokens` (what a request costs, whole, including the tool array),
+  `Retention` (whether the facts a case declared it needs survived into the prompt),
+  `CatalogueCost` (what the tool array alone costs, re-sent every step) and
+  `ApproverCatchRate`. It needs no API key and opens no socket, and the suite
+  reports its own network count so that claim has a witness rather than a promise.
+  Deterministic replay has shipped since 0.12.0 with nothing on top of it; this is
+  the layer that lets a default change be argued from this crate's own numbers.
+- **`EventKind::ImageAttached`.** No image reached the event stream in any form
+  before this release — not the bytes, which is deliberate, and not a descriptor
+  either, which was not. Each of the four paths an image arrives by (an MCP tool
+  reply, a browser screenshot, the `view_image` built-in, and the contract's own
+  images) now announces the media type, the byte length, the digest the transcript
+  already records, and which path it came from. Still never the bytes: a trace
+  holding images grows by megabytes a step in exactly the long unattended runs this
+  crate exists for.
+- **`bundles/long-horizon/`, the repository's first capability bundle.** The
+  long-horizon session protocol — a git baseline, a feature list of boolean passes
+  and an append-only progress log — shipped as skills over primitives that already
+  exist (`todo_write`, the memory tools, the git built-ins and the verification
+  gate). It adds no Rust code, and a test loads it from its shipped path so a
+  bundle broken by a later change fails a gate rather than a person.
+- **`Store::run_goal` and `Store::run_created_at`.** `runs.goal` has been written
+  since 0.1.0 and published by nothing, and a run had no timestamp accessor at all,
+  so a listing of parked runs showed thirteen rows differing only by a number with
+  nothing to choose on. Closes #258.
+- **`EventKind::StepUsage`**, emitted beside `EventKind::Step` from the same place,
+  splitting a step's tokens into `fresh_prompt_tokens`, `cache_read_tokens`,
+  `cache_write_tokens` and `completion_tokens`. `Usage::cache_read_tokens` has been
+  parsed and priced since 0.44.0 and reached no event, so a consumer adding up
+  `Step`'s flat `tokens` reported every re-sent tool catalogue as paid at full
+  price. The two prompt figures are disjoint and sum back to the prompt. A step no
+  provider answered emits nothing rather than four zeros — an absent report is not a
+  report of zero.
+
 ### Changed
+
+- **A consumer that never wrote `[run.context]` gets its model's window instead of
+  24,000 tokens.** Through 0.80.0 `ContextBudget::default` declared `max_tokens:
+  24_000` and nothing read the `context_length` the provider catalogue already
+  carries, so a run on a 128,000-token model assembled under 24,000 whatever the
+  model held — with a measured 7,311-token request floor, that began trimming
+  history at roughly 16,000 tokens of conversation and bought re-reads. The ceiling
+  now follows the model where the provider knows it. A caller who stated a budget is
+  unaffected: an explicit `ContextBudget` still wins over everything.
 
 ### Deprecated
 
@@ -24,7 +130,28 @@ notes are produced from it.
 
 ### Fixed
 
+- **Two children of a `worktree = true` definition no longer race each other's
+  checkout.** `git worktree add` walks `.git/worktrees/*` while it prepares, so a
+  sibling that has created its directory but not yet written its `commondir` file is
+  a half-written entry the walk reads: the loser exits 128 naming a directory it was
+  not creating, and the spawn fails. Worktree creation is now serialised. Reproduced
+  at roughly one run in four hundred under load — it was a real defect in the crate,
+  not a test that could not tell slow from broken, and the two sites issue #232
+  names were made deterministic back in 0.76.0. Closes #232.
+
 ### Security
+
+- **BREAKING (behaviour): the Landlock rung no longer grants the whole system
+  temporary directory.** Every run's ephemeral workspace lives inside it, so two
+  concurrent runs on that rung could read and rewrite each other's workspace from
+  inside their own sandboxes — a residual 0.74.0 named, 0.80.0 attempted and
+  withdrew, and this release closes. The grant is now the run's own directory, the
+  same one the two mount rungs have used since 0.74.0, and the child's `TMPDIR`
+  points at it. **Migration:** a contained run that wrote somewhere outside its
+  workdir and relied on that grant declares it with
+  `TaskContract::with_writable_roots` or `[run] writable_roots`; a run that only
+  used a temporary file needs no change. A `worktree = true` child declares its
+  parent repository's `.git` for itself.
 
 ## [0.80.0] - 2026-09-05
 

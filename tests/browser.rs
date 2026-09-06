@@ -539,22 +539,49 @@ async fn an_action_that_produced_no_console_output_says_so() {
     );
 }
 
-/// F7 — a screenshot reaches the model as an image on the outbound request.
+/// F7 — a screenshot reaches the model as an image on the outbound request, and
+/// (0.81.0) the run announces it as one the agent was given.
 #[tokio::test]
 async fn a_screenshot_is_sent_to_the_model_as_an_image() {
+    use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
+    use std::sync::Mutex;
+
+    /// The stream's own account of the screenshot. Through 0.80.0 there was none:
+    /// an image reached no event in any form, so a renderer could learn one had
+    /// arrived only by parsing prose out of an observation.
+    #[derive(Default)]
+    struct Seen(Mutex<Vec<(String, String)>>);
+
+    impl Observer for Seen {
+        fn event(&self, event: &RunEvent) -> Flow {
+            if let EventKind::ImageAttached {
+                source, media_type, ..
+            } = &event.kind
+            {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((source.clone(), media_type.clone()));
+            }
+            Flow::Continue
+        }
+    }
+
     let dir = workspace();
     let record = Record::new(dir.path());
     let browser = fixture_config(&record, &[]);
 
     let script = Script::new(vec![vec![call("browser_screenshot", json!({}))], finish()]);
     let store = Store::memory().unwrap();
+    let seen = Seen::default();
 
-    run_with(
+    io_harness::run_with_observed(
         &contract(dir.path(), 6).with_browser(browser),
         &script,
         &store,
         &permitted(),
         &ApproveAll,
+        &seen,
     )
     .await
     .unwrap();
@@ -568,6 +595,13 @@ async fn a_screenshot_is_sent_to_the_model_as_an_image() {
         transcript.contains("1280x800"),
         "the observation did not name the viewport: {transcript}"
     );
+    let events = seen.0.lock().unwrap().clone();
+    assert_eq!(
+        events.len(),
+        1,
+        "one screenshot, one announcement: {events:?}"
+    );
+    assert_eq!(events[0].0, "browser");
 }
 
 /// F8 — no browser process survives the run.

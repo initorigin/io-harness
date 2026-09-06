@@ -1,0 +1,10 @@
+name = "long-horizon"
+description = "The long-horizon session protocol: a git baseline, a feature list of boolean passes, and an append-only progress log."
+version = "0.1.0"
+
+# Skills only. The protocol is composed of primitives the crate already ships —
+# `todo_write`, `remember`/`forget`, the seven git built-ins and the verification
+# gate — so it needs no agent, no MCP server, no executable and no policy of its
+# own, and declaring any of those would claim a contribution the bundle does not
+# make.
+skills = "skills"

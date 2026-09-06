@@ -817,6 +817,60 @@ pub(super) fn persist_ledger(
     Ok(ledger.len())
 }
 
+/// Size this run's context ceiling to the model it is about to ask, and say which
+/// of the three sources decided it (0.81.0).
+///
+/// Emitted at run start, beside `Started`, on step 0, for the reason
+/// [`emit_plugins`] is: a ceiling is part of a run's configuration rather than
+/// something that happened on a step.
+///
+/// It returns an owned contract rather than mutating the caller's, and every entry
+/// point shadows its parameter with the result — six of them, because a resumed run
+/// must assemble under the same ceiling the run it resumes did. The alternative,
+/// resolving at each of the four sites that read `contract.context`, was rejected:
+/// four copies of one rule is four places for it to diverge, and the resolution has
+/// to happen once anyway to emit one event.
+///
+/// Nothing here dials. [`Provider::context_window`] is synchronous precisely so this
+/// cannot become a network round trip in front of every run.
+pub(super) fn size_context<P: Provider>(
+    watch: &Watch<'_>,
+    run_id: i64,
+    contract: &TaskContract,
+    provider: &P,
+) -> TaskContract {
+    let (context, source) = crate::context::resolve_budget(
+        contract.context,
+        provider.context_window(),
+        provider.max_output_tokens(),
+    );
+    watch.emit(RunEvent::new(
+        run_id,
+        0,
+        EventKind::ContextCeiling {
+            max_tokens: context.max_tokens,
+            source: source.to_string(),
+        },
+    ));
+    // 0.81.0 — the contract's own images, announced here rather than once per step.
+    // They are the task's subject and ride every request, so a per-step event would
+    // repeat one fact for the length of the run to say nothing new; a reader wants
+    // to know a run started carrying two images, not that step forty still was.
+    //
+    // Once per *attempt*, which means a resumed run announces them again — this
+    // function is called from all six entry points, four of which are resumes. A
+    // consumer building a gallery deduplicates on the digest, which is carried for
+    // exactly this kind of reason.
+    #[cfg(feature = "media")]
+    for media in contract.images.iter() {
+        watch.image(run_id, 0, 0, media, "caller");
+    }
+
+    let mut sized = contract.clone();
+    sized.context = context;
+    sized
+}
+
 /// Report the capability bundles this run is carrying, loaded and dropped
 /// (0.35.0).
 ///

@@ -136,6 +136,7 @@ async fn assembled(
         &[],
         Assembly {
             collapse,
+            ladder: io_harness::context::Ladder::default(),
             ws: Some(&f.ws),
             policy: &f.policy,
             store: &f.store,

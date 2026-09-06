@@ -301,6 +301,62 @@ pub enum EventKind {
         /// The provider that will serve it, by name.
         provider: String,
     },
+    /// The per-request ceiling this run will assemble under, and where it came
+    /// from (0.81.0).
+    ///
+    /// Emitted from the same place as [`Started`](EventKind::Started), before the
+    /// first step — so **once per attempt, not once per run**: a resume emits it
+    /// again, because a resumed attempt resolves the ceiling again and may resolve
+    /// it differently if the provider has since learned the model's window. A
+    /// consumer keeping one value per run keeps the newest.
+    ///
+    /// It exists because the answer used to be invisible and wrong:
+    /// every run that did not write `[run.context]` assembled under 24,000 tokens
+    /// whatever the model held, so a 128,000-token model spent most of its window on
+    /// nothing and bought re-reads. An operator asking "why is this trimming" could
+    /// only find out by reading the crate.
+    ///
+    /// `source` is one of three words and each is a different situation, which is
+    /// why it is a word rather than a boolean:
+    ///
+    /// - `"contract"` — the caller stated a budget, and it wins. Nothing is being
+    ///   inferred.
+    /// - `"model"` — the provider knew the model's window and the ceiling is derived
+    ///   from it, with the answer and the request floor reserved out.
+    /// - `"fallback"` — nothing knew the window, so the crate's constant applies.
+    ///   **This is the one worth acting on**: it means the ceiling is a guess, and
+    ///   on most providers it is fixed by fetching the catalogue once or by stating
+    ///   the budget.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent};
+    ///
+    /// struct Ceilings;
+    ///
+    /// impl Observer for Ceilings {
+    ///     fn event(&self, event: &RunEvent) -> Flow {
+    ///         if let EventKind::ContextCeiling { max_tokens, source } = &event.kind {
+    ///             if source == "fallback" {
+    ///                 eprintln!("assembling under a guessed {max_tokens} tokens");
+    ///             }
+    ///         }
+    ///         Flow::Continue
+    ///     }
+    /// }
+    ///
+    /// let flow = Ceilings.event(&RunEvent::new(
+    ///     7,
+    ///     0,
+    ///     EventKind::ContextCeiling { max_tokens: 24_000, source: "fallback".into() },
+    /// ));
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    ContextCeiling {
+        /// The assembled section's ceiling for this run, in tokens.
+        max_tokens: u64,
+        /// `"contract"`, `"model"` or `"fallback"`.
+        source: String,
+    },
     /// (0.65.0) The run was resumed and refused to drive, because its journal
     /// holds a call the harness cannot inspect that was started and never
     /// finished. Emitted once, from the resume that found it, before anything is
@@ -369,6 +425,127 @@ pub enum EventKind {
         gate_ms: Option<u64>,
         /// The durable write that ended the previous step.
         store_ms: Option<u64>,
+    },
+    /// What a committed step's tokens were actually spent on (0.81.0).
+    ///
+    /// Emitted beside [`EventKind::Step`], from the same place, for the reason
+    /// [`StepAttributed`](EventKind::StepAttributed) is: nothing an observer already
+    /// matches on moves, and a step that is not committed announces nothing.
+    ///
+    /// [`Step`](EventKind::Step) carries one flat `tokens`, and a consumer adding
+    /// those up reports a run as though every re-sent tool catalogue were paid
+    /// fresh. It is not: `cache_read_tokens` has been parsed from the vendor's
+    /// `prompt_tokens_details.cached_tokens` and priced since 0.44.0, and reached no
+    /// event. An io-cli field test on 2026-09-05 watched a running figure move from
+    /// 8.1k to 52k over four one-word turns that cost a hundredth of a cent each —
+    /// the tokens were real, and almost all of them were cache reads.
+    ///
+    /// The two prompt figures are disjoint and sum to the prompt: `fresh_prompt
+    /// _tokens` is what the vendor charged full price for, `cache_read_tokens` is
+    /// what it served from a cache. `cache_write_tokens` is `None` from a vendor
+    /// that does not report one, which is not a claim that nothing was written.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent};
+    ///
+    /// #[derive(Default)]
+    /// struct Footer;
+    ///
+    /// impl Observer for Footer {
+    ///     fn event(&self, event: &RunEvent) -> Flow {
+    ///         if let EventKind::StepUsage { fresh_prompt_tokens, cache_read_tokens, .. } =
+    ///             &event.kind
+    ///         {
+    ///             println!("{fresh_prompt_tokens} fresh, {cache_read_tokens} cached");
+    ///         }
+    ///         Flow::Continue
+    ///     }
+    /// }
+    ///
+    /// let flow = Footer.event(&RunEvent::new(
+    ///     7,
+    ///     3,
+    ///     EventKind::StepUsage {
+    ///         fresh_prompt_tokens: 1_400,
+    ///         cache_read_tokens: 5_900,
+    ///         cache_write_tokens: None,
+    ///         completion_tokens: 62,
+    ///     },
+    /// ));
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    StepUsage {
+        /// Prompt tokens the vendor charged full price for — the prompt minus what
+        /// it served from a cache.
+        fresh_prompt_tokens: u64,
+        /// Prompt tokens served from a vendor cache, as
+        /// [`Usage::cache_read_tokens`](crate::Usage::cache_read_tokens) reports
+        /// them.
+        cache_read_tokens: u64,
+        /// Tokens written into a vendor cache, where the vendor reports it. `None`
+        /// is "not reported", never "none written".
+        cache_write_tokens: Option<u64>,
+        /// Tokens the model produced.
+        completion_tokens: u64,
+    },
+    /// An image reached this run, and where it came from (0.81.0).
+    ///
+    /// **No image reached the event stream at all before this release**, in any
+    /// form, requested or given. Each of the four paths writes a *description* into
+    /// the transcript instead — `[image: image/png, 41200 bytes]` and the like —
+    /// because a trace holding the bytes would grow by megabytes a step in exactly
+    /// the long unattended runs this crate exists for. That decision stands: this
+    /// carries the same descriptor the transcript already writes, never the image.
+    ///
+    /// What it adds is that a consumer can now *find* the image. A renderer knows a
+    /// screenshot arrived on step 7, what type and how big it was, and that it came
+    /// from the browser rather than from an MCP server — none of which was
+    /// answerable from the stream, and the first three of which were only
+    /// answerable by parsing prose out of an observation.
+    ///
+    /// `source` is one of four words: `"mcp"` (a tool reply carried it), `"browser"`
+    /// (a screenshot), `"view_image"` (the agent asked for it) or `"caller"` (the
+    /// contract's own images, which are the task's subject and ride every step).
+    /// The first, second and fourth are images the agent was *given*; only
+    /// `view_image` is one it asked for, and telling them apart is the point of the
+    /// field.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent};
+    ///
+    /// struct Gallery;
+    ///
+    /// impl Observer for Gallery {
+    ///     fn event(&self, event: &RunEvent) -> Flow {
+    ///         if let EventKind::ImageAttached { media_type, bytes, source, .. } = &event.kind {
+    ///             println!("step {}: {media_type}, {bytes} bytes, from {source}", event.step);
+    ///         }
+    ///         Flow::Continue
+    ///     }
+    /// }
+    ///
+    /// let flow = Gallery.event(&RunEvent::new(
+    ///     7,
+    ///     3,
+    ///     EventKind::ImageAttached {
+    ///         media_type: "image/png".into(),
+    ///         bytes: 41_200,
+    ///         digest: "9f2c…".into(),
+    ///         source: "browser".into(),
+    ///     },
+    /// ));
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    ImageAttached {
+        /// The media type as it will be sent, after any transcode.
+        media_type: String,
+        /// How many bytes of image, as sent.
+        bytes: u64,
+        /// The digest the transcript records for the same image, so a reader can
+        /// match the two without parsing prose.
+        digest: String,
+        /// `"mcp"`, `"browser"`, `"view_image"` or `"caller"`.
+        source: String,
     },
     /// A tool was invoked, before its result is known.
     ToolCall {
@@ -1362,9 +1539,14 @@ pub enum EventKind {
 /// whole job is to be regenerated by hand whenever the enum grows.
 pub(crate) const EVENT_NAMES: &[&str] = &[
     "started",
+    // 0.81.0
+    "context_ceiling",
     "recovery_paused",
     "step",
     "step_attributed",
+    // 0.81.0
+    "step_usage",
+    "image_attached",
     "tool_call",
     "refused",
     "approval_requested",
@@ -2218,15 +2400,34 @@ mod tests {
             EventKind::ChildCollected {
                 text: "[child 2 \"survey the parser\" -> Success { steps: 4 }]".into(),
             },
+            EventKind::ContextCeiling {
+                max_tokens: 24_000,
+                source: "fallback".into(),
+            },
+            EventKind::StepUsage {
+                fresh_prompt_tokens: 1_400,
+                cache_read_tokens: 5_900,
+                cache_write_tokens: None,
+                completion_tokens: 62,
+            },
+            EventKind::ImageAttached {
+                media_type: "image/png".into(),
+                bytes: 41_200,
+                digest: "9f2c".into(),
+                source: "browser".into(),
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
         for k in &all {
             match k {
                 EventKind::Started { .. }
+                | EventKind::ContextCeiling { .. }
                 | EventKind::RecoveryPaused { .. }
                 | EventKind::Step { .. }
                 | EventKind::StepAttributed { .. }
+                | EventKind::StepUsage { .. }
+                | EventKind::ImageAttached { .. }
                 | EventKind::ToolCall { .. }
                 | EventKind::Refused { .. }
                 | EventKind::ApprovalRequested { .. }

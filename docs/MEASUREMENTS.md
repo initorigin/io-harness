@@ -9,6 +9,158 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What each compaction rung costs and keeps (0.81.0)
+
+**What is being measured.** The first thing this crate's own evaluation suite was
+built to answer: does a graduated projection beat a fold on the same run. Prompt
+tokens over a whole run, and retention — whether the facts the case declared it
+needs were still in the last request — for each rung of the ladder against the
+same script.
+
+**Why it is measured here at all.** Context Collapse shipped in 0.76.0 and the
+three rungs beside it ship in this release, and none of them had a number
+attached. The crate has decided twice that a default is not changed ahead of the
+measurement that decides it; this is that measurement, and the answer is that it
+does not decide much yet.
+
+**The shape expected before it was measured.** Reduction lossless and cheap, snip
+cheap and slightly lossy, microcompact the largest saving and the largest loss,
+retention falling as the rungs get more aggressive.
+
+**Method.** `n5_what_each_compaction_rung_costs_and_keeps` in `tests/eval.rs`,
+`#[ignore]`d because it prints rather than asserts. Each arm records its own
+cassette and replays it: the replay key is the request's own bytes, so an arm that
+compacts differently cannot answer from another arm's recording. The arms are
+comparable because the **script is identical**, which fixes the model's answers by
+construction. Eleven scripted turns, two tool calls a turn, a 1,500-token context
+ceiling. Run it with:
+
+```text
+cargo test --test eval -- --ignored --nocapture
+```
+
+**Machine.** Apple M1, macOS 26.5.2, debug profile, 2026-09-06.
+
+**Numbers.**
+
+| Arm | Prompt tokens | Retention |
+| --- | --- | --- |
+| none (0.80.0) | 55,160 | 1.00 |
+| collapse only | 55,160 | 1.00 |
+| reduce | 55,160 | 1.00 |
+| snip | 54,365 | 1.00 |
+| microcompact | 55,160 | 1.00 |
+
+**Only snip moves the number, and it moves it by 1.4%.** Every rung keeps
+everything the case declared it needed, so nothing here argues for changing any
+default — and no default changed.
+
+**What it does not measure, and this is the finding rather than a caveat.** Three
+of the four arms report the baseline because the case never reaches them, and each
+for its own reason, all of them correct behaviour: **reduce** trims the memory
+block's share and this case has no memory notes, so there is nothing to reduce;
+**microcompact** needs three contiguous results from one step and the script makes
+two calls a turn; **collapse** shortens an entry that would otherwise be stubbed,
+and the fit loop stubs these before it gets there. A rung that does not fire
+reports the same number as one that fires and buys nothing, and only the arm's own
+reason tells them apart.
+
+So the case set is the limit, exactly as this release's contract said it would be:
+*"four cases that all read files will argue for dropping the document tools"*. The
+suite is what makes the next case set cheap to run; it is not itself evidence that
+a rung is worthless.
+
+## What the tool mask costs (0.81.0)
+
+**What is being measured.** 0.76.0 decided that a masked run offers exactly the
+catalogue an unmasked one offers — the same `ToolSpec` values, in the same order,
+serialised to the same bytes — so that the vendor's cacheable prefix does not
+move. The decision was argued from first principles and never measured.
+
+**Method.** `n5_what_the_tool_mask_costs` in `tests/eval.rs`, `#[ignore]`d. Two
+arms over one script, masking a tool the case never calls. Masking a tool the case
+*does* call measures something else — the run loses a step to a refusal and the
+request count roughly doubles, which is a real number about masking a needed tool
+and not this question. Same command as above.
+
+**Machine.** Apple M1, macOS 26.5.2, debug profile, 2026-09-06.
+
+**Numbers.**
+
+| Arm | Catalogue tokens | Whole request |
+| --- | --- | --- |
+| unmasked | 4,409 | 9,677 |
+| masked | 4,409 | 9,735 |
+
+**The catalogue is byte-identical, and the guarantee holds under measurement.**
+What a mask costs is 58 tokens in the system block, once per request — the
+sentence that tells the model which tools it may not call. That is the whole
+price, and it is roughly 0.6% of a request against a cache invalidation that would
+have cost the entire prefix.
+
+## What the tool catalogue costs, and what tiering saves (0.81.0)
+
+**What is being measured.** The request floor. An io-cli field test on 2026-09-05
+measured 7,311 tokens per request before the user had typed anything, 5,436 of
+them the tool catalogue. This is the same measurement taken inside the crate,
+against the descriptions alone, with and without tiered exposure.
+
+**Method.** `f14_every_tool_description_fits_the_budget_or_is_a_named_exception`
+in `tests/tool_tiers.rs` prints the pair as it runs. Description tokens only — the
+schemas are counted by the `catalogue_cost` scorer above, and separating them is
+what shows whether a description budget or a tier is the better lever.
+
+```text
+cargo test --all-features --test tool_tiers f14 -- --nocapture
+```
+
+**Machine.** Apple M1, macOS 26.5.2, debug profile, 2026-09-06.
+
+**Numbers.**
+
+| Build | Full catalogue | Core tier only |
+| --- | --- | --- |
+| default features | 2,140 | 1,860 |
+| all features | 2,488 | 1,914 |
+
+**Tiering takes 23% off the descriptions on a full build**, and 13% on the default
+one — the difference being that the default build compiles no document tools to
+withhold. The saving is per request and paid on every step of every turn.
+
+**What it does not measure.** What tiering *costs*: an `expand_tools` call is one
+extra turn, and expanding mid-run rewrites the cacheable prefix. The break-even
+depends on how often a turn reaches beyond the core set, which this crate has no
+case set for yet. Tiering therefore ships opt-in with the full catalogue as the
+default.
+
+## What `ModelApprover` catches (0.81.0) — not measured
+
+**The question.** The field publishes a figure of roughly 89% against 13.6% for
+the equivalent of `ModelApprover`. This crate has the primitive and no measurement
+of it, and this release's contract named answering that as one of three
+retroactive debts.
+
+**It is not answered here, and the reason is structural rather than a shortage of
+time.** `ApproverCatchRate` exists in `io_harness::eval` and scores what it says.
+What the deterministic arm cannot supply is the evidence: an approver's decision is
+a completion, and a *recorded* approver refusing an act is not evidence that a
+differently prompted approver would refuse it. Replaying the recording measures the
+recording.
+
+Answering it needs a real model as the approver, which is the ignored live arm
+(`n5_the_live_arm_scores_a_case_against_a_real_provider` in `tests/eval.rs`) and a
+case set of injected acts that does not exist yet. **No default moves on the
+strength of a number this crate has not taken**, which is why `ModelApprover` is
+unchanged in this release.
+
+**The live arm itself is real and was run.** Against `openai/gpt-4o-mini` through
+OpenRouter on 2026-09-06, one case — read the readme, write a file, gated on the
+file's contents — scored `prompt_tokens` 9,647 over two requests, `retention` 1.00,
+`catalogue_cost` 4,409 over 25 tools, and decided as the case declared. A live
+model took the same two steps the recorded one did, which is the smallest useful
+statement the arm can make: the scorers read a real run, not only a replayed one.
+What it does not yet have is a case set worth drawing a conclusion from.
+
 ## What one program costs against the chain of calls it replaces (0.79.0)
 
 **What is being measured.** The token cost of one task done three ways against a
