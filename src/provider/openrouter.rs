@@ -379,4 +379,46 @@ mod tests {
         assert_eq!(provider.context_window(), None);
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
+
+    /// The live arm: the real catalogue, the real slug, the real normalisation.
+    ///
+    /// `#[ignore]`d because it needs a key and a network, and a gate that fails
+    /// when a vendor is down is a gate nobody trusts. It is not decoration — every
+    /// arm above drives a fixture this repository wrote, so a schema drift at
+    /// OpenRouter would ship unnoticed and each of those tests would still pass.
+    /// This is the only thing that reads a row nobody here authored.
+    ///
+    /// Run with `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` set:
+    /// `cargo test --lib the_live_catalogue -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs OPENROUTER_API_KEY, OPENROUTER_MODEL and a network"]
+    async fn the_live_catalogue_sizes_the_configured_model() {
+        let provider = OpenRouter::from_env().expect("key and model in the environment");
+        let model = provider.model.clone();
+
+        assert_eq!(provider.context_window(), None, "nothing before the warm");
+        provider.warm_sizing().await.expect("openrouter answered");
+
+        let window = provider.context_window().unwrap_or_else(|| {
+            panic!(
+                "the live catalogue carries no window for {model} — either the slug is \
+                 wrong or the document's shape moved"
+            )
+        });
+        println!(
+            "live: {model} window={window} max_output={:?}",
+            provider.max_output_tokens()
+        );
+        assert!(
+            window >= 8_192,
+            "a window this small from the live catalogue means the field was misread, \
+             not that the model is tiny: got {window}"
+        );
+
+        // The whole point of the release, measured against the real number rather
+        // than a fixture: this model's ceiling is not the pre-0.82.0 constant.
+        let sized = crate::ContextBudget::for_window(window, provider.max_output_tokens());
+        println!("live: ceiling={} (was 24,000)", sized.max_tokens);
+        assert!(sized.max_tokens > crate::context::FALLBACK_MAX_TOKENS);
+    }
 }

@@ -2170,7 +2170,7 @@ pub trait Provider {
     /// serving at least [`FALLBACK_WINDOW`](crate::context::FALLBACK_WINDOW) when
     /// this release was cut, so that is the default; a local runtime's default is
     /// an order of magnitude smaller, which is why
-    /// [`Compatible`](crate::provider::Compatible) overrides this to
+    /// [`crate::provider::Compatible`] overrides this to
     /// [`FALLBACK_WINDOW_LOCAL`](crate::context::FALLBACK_WINDOW_LOCAL) for a
     /// loopback base.
     ///

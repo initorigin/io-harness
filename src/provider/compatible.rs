@@ -539,10 +539,10 @@ impl Provider for Compatible {
     /// turns a trimmed turn into a refused one, every step, until the operator
     /// finds the knob. Eight of this type's presets are local runtimes.
     ///
-    /// Decided by the same [`is_loopback`] reading 0.74.0 wrote for the
-    /// cleartext-bearer refusal, so "on this machine" has one definition here and
-    /// not two — including its fail-closed treatment of a base it cannot parse,
-    /// which reads as remote and therefore assumes the larger window.
+    /// Decided by the same crate-private `is_loopback` reading 0.74.0 wrote for
+    /// the cleartext-bearer refusal, so "on this machine" has one definition here
+    /// and not two — including its fail-closed treatment of a base it cannot
+    /// parse, which reads as remote and therefore assumes the larger window.
     fn assumed_window(&self) -> u64 {
         if is_loopback(&self.base) {
             crate::context::FALLBACK_WINDOW_LOCAL
