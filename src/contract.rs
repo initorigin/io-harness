@@ -466,6 +466,29 @@ pub struct TaskContract {
     ///
     /// Set it with [`TaskContract::with_writable_roots`].
     pub writable_roots: Vec<PathBuf>,
+    /// Which families beyond the core tools this run offers up front (0.81.0).
+    ///
+    /// `None` — the default — offers the whole catalogue on every request, which
+    /// is what every release through 0.80.0 did. `Some(..)` offers the core tools
+    /// plus the named families, and adds `expand_tools` so the model can ask for
+    /// one of the rest in a single call.
+    ///
+    /// **The reason is the request floor.** A measured turn carried 7,311 tokens
+    /// before the user had typed anything, of which 5,436 was the tool catalogue —
+    /// re-sent whole on every step of every turn, twelve of its entries being
+    /// document tools a run editing Rust will never call.
+    ///
+    /// **Tiering changes what is offered, never what exists.** A tool withheld
+    /// here is not denied: the policy is what denies, and a masked or tiered run
+    /// still resolves every call through it. What tiering costs is that reaching a
+    /// withheld family takes one extra turn, and that expanding mid-run rewrites
+    /// the cacheable prefix — which is why it is off by default and why the
+    /// evaluation suite measures it rather than this documentation asserting it
+    /// pays.
+    ///
+    /// Set it with [`TaskContract::with_tool_tiers`]. Family names are
+    /// [`TOOL_FAMILIES`](crate::tools::TOOL_FAMILIES).
+    pub tool_tiers: Option<Vec<String>>,
     /// The compaction rungs between Collapse and a fold (0.81.0).
     ///
     /// Every rung off by default, which assembles exactly what 0.80.0 assembled.
@@ -809,6 +832,7 @@ impl TaskContract {
             collapse: crate::context::Collapse::default(),
             ladder: crate::context::Ladder::default(),
             writable_roots: Vec::new(),
+            tool_tiers: None,
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -896,6 +920,7 @@ impl TaskContract {
             collapse: crate::context::Collapse::default(),
             ladder: crate::context::Ladder::default(),
             writable_roots: Vec::new(),
+            tool_tiers: None,
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -2012,6 +2037,38 @@ impl TaskContract {
     ///     .writable_roots
     ///     .is_empty());
     /// ```
+    /// Offer the core tools plus these families, and `expand_tools` for the rest
+    /// (0.81.0).
+    ///
+    /// ```
+    /// use io_harness::TaskContract;
+    ///
+    /// // A run that edits code and never opens a spreadsheet.
+    /// let lean = TaskContract::workspace("fix the parser", "/repo").with_tool_tiers(["browser"]);
+    /// assert_eq!(lean.tool_tiers.as_deref(), Some(&["browser".to_string()][..]));
+    ///
+    /// // An empty list is still a declaration: core only, everything else one
+    /// // `expand_tools` call away.
+    /// let core_only = TaskContract::workspace("fix the parser", "/repo")
+    ///     .with_tool_tiers(Vec::<String>::new());
+    /// assert_eq!(core_only.tool_tiers.as_deref(), Some(&[][..]));
+    ///
+    /// // Declaring nothing offers the whole catalogue, which is what every
+    /// // release through 0.80.0 did.
+    /// assert!(TaskContract::workspace("fix the parser", "/repo")
+    ///     .tool_tiers
+    ///     .is_none());
+    /// ```
+    #[must_use]
+    pub fn with_tool_tiers<I, S>(mut self, families: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tool_tiers = Some(families.into_iter().map(Into::into).collect());
+        self
+    }
+
     #[must_use]
     pub fn with_writable_roots<I, P>(mut self, roots: I) -> Self
     where

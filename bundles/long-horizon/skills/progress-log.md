@@ -1,6 +1,7 @@
 ---
 name: progress-log
 description: progress.md — append-only, one entry per feature that passed, carrying what changed and how it was verified.
+catalog: false
 ---
 
 # The progress log

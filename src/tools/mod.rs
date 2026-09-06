@@ -595,3 +595,65 @@ pub(crate) fn cap_result(s: String, cap: usize) -> (String, bool) {
 /// Offered only when the contract configures skills — a tool that could do
 /// nothing but fail would cost a slot in every request of every other run.
 pub const READ_SKILL_TOOL: &str = "read_skill";
+
+/// The name the model uses to ask for a family of tools it was not offered
+/// (0.81.0).
+///
+/// Offered only by a run that declared tiers. A run offering everything already
+/// has nothing to expand, and a tool whose only answer is "you have them" would
+/// cost a slot in every request to say so.
+pub const EXPAND_TOOLS_TOOL: &str = "expand_tools";
+
+/// Which family a built-in tool belongs to, for
+/// [`TaskContract::tool_tiers`](crate::TaskContract::tool_tiers) (0.81.0).
+///
+/// `"core"` is the file, search, exec, git and memory tools — the set a turn that
+/// does ordinary work needs, and the set a run always gets. The other three are
+/// capabilities most turns never reach: a measured request floor of 7,311 tokens
+/// carried a 5,436-token tool catalogue, twelve of whose entries were the document
+/// tools, and every step of every turn re-sent all of it.
+///
+/// Derived from the name rather than declared in a table beside the catalogue,
+/// because a table is a second list that can disagree with the first: a document
+/// tool added later is in its family the moment it is named, and nothing has to
+/// remember to file it.
+///
+/// ```
+/// use io_harness::tools::tool_family;
+///
+/// assert_eq!(tool_family("read_file"), "core");
+/// assert_eq!(tool_family("git_commit"), "core");
+/// assert_eq!(tool_family("shell"), "core");
+/// assert_eq!(tool_family("browser_click"), "browser");
+/// assert_eq!(tool_family("shell_start"), "shell_jobs");
+/// assert_eq!(tool_family("xlsx_read"), "documents");
+/// assert_eq!(tool_family("pdf_fill_form"), "documents");
+/// // A tool this crate does not ship — a registered one, or an MCP tool — is
+/// // never withheld by tiering, because tiering is about this crate's own
+/// // catalogue and not about what a caller added.
+/// assert_eq!(tool_family("mcp__server__thing"), "core");
+/// ```
+pub fn tool_family(name: &str) -> &'static str {
+    if name.starts_with("browser_") {
+        return "browser";
+    }
+    if matches!(name, SHELL_START_TOOL | SHELL_POLL_TOOL | SHELL_KILL_TOOL) {
+        return "shell_jobs";
+    }
+    if name.starts_with("xlsx_")
+        || name.starts_with("docx_")
+        || name.starts_with("pptx_")
+        || name.starts_with("pdf_")
+        || name.starts_with("barcode_")
+    {
+        return "documents";
+    }
+    "core"
+}
+
+/// Every family [`tool_family`] can answer other than `"core"`, in the order a
+/// prompt names them.
+///
+/// The list an `expand_tools` call is validated against, and the list the one line
+/// standing in for the withheld catalogue is built from.
+pub const TOOL_FAMILIES: &[&str] = &["documents", "browser", "shell_jobs"];

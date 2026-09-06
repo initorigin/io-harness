@@ -642,6 +642,10 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     super::LIST_DIR_TOOL,
     super::READ_FILE_TOOL,
     super::READ_SKILL_TOOL,
+    // 0.81.0. Offered only by a run that declared tiers, and reserved on every run
+    // regardless: a name that is a built-in *sometimes* is the worst of both, since
+    // a registered tool taking it would work until the day someone tiered the run.
+    super::EXPAND_TOOLS_TOOL,
     super::REMEMBER_TOOL,
     super::FORGET_TOOL,
     super::TODO_WRITE_TOOL,

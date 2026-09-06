@@ -25,7 +25,7 @@ use io_harness::eval::{
 use io_harness::provider::{
     CompletionRequest, CompletionResponse, Record, Replay, ToolCall, Usage,
 };
-use io_harness::tools::{READ_FILE_TOOL, WRITE_FILE_TOOL};
+use io_harness::tools::{FIND_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL};
 use io_harness::{ApproveAll, Policy, Provider, TaskContract, ToolSpec, Verification};
 use serde_json::json;
 
@@ -420,6 +420,253 @@ async fn f5_the_deterministic_arm_makes_no_network_act_to_refuse() {
         report[0].scores[0].value, 0.0,
         "a replayed case must not reach the network: {}",
         report[0].scores[0].detail
+    );
+}
+
+// ---------------------------------------------------------------------- F6
+
+/// What a graduated projection costs against a fold, and what each keeps.
+///
+/// `#[ignore]`d and `n5_`-prefixed: it prints and asserts nothing, because the
+/// numbers depend on the case set and a threshold asserted on one machine is a
+/// flake on another. `docs/MEASUREMENTS.md` records the output and the command.
+///
+/// **Each arm records its own cassette.** The replay key is the request's own
+/// bytes, so an arm that compacts differently cannot answer from another arm's
+/// recording — the arms are comparable because the *script* is identical, which
+/// fixes the model's answers by construction. That is the honest form of this
+/// comparison and its stated limit: it measures what each rung costs and keeps,
+/// never whether the model would have answered better.
+#[tokio::test]
+#[ignore]
+async fn n5_what_each_compaction_rung_costs_and_keeps() {
+    use io_harness::context::{Collapse, Ladder, Snip};
+
+    let arms: Vec<(&str, Ladder, Collapse)> = vec![
+        ("none (0.80.0)", Ladder::default(), Collapse::default()),
+        (
+            "collapse only",
+            Ladder::default(),
+            Collapse { keep_chars: 400 },
+        ),
+        (
+            "reduce",
+            Ladder {
+                reduce: true,
+                ..Ladder::default()
+            },
+            Collapse::default(),
+        ),
+        (
+            "snip",
+            Ladder {
+                snip: Some(Snip {
+                    older_than_steps: 2,
+                }),
+                ..Ladder::default()
+            },
+            Collapse::default(),
+        ),
+        (
+            "microcompact",
+            Ladder {
+                microcompact: true,
+                ..Ladder::default()
+            },
+            Collapse::default(),
+        ),
+    ];
+
+    // A long case with a tight ceiling, because a rung that never fires reports
+    // the same number as every other rung — which is what the first run of this
+    // measurement produced, and is a fact about the case set rather than about the
+    // ladder.
+    let long_script = || {
+        let mut turns: Vec<CompletionResponse> = (0..10)
+            .map(|i| {
+                turn(vec![
+                    call(FIND_TOOL, json!({"name_glob": format!("*{i}.rs")})),
+                    call(READ_FILE_TOOL, json!({"path": "README.md"})),
+                ])
+            })
+            .collect();
+        turns.push(turn(vec![call(
+            WRITE_FILE_TOOL,
+            json!({"path": "out.txt", "content": "done"}),
+        )]));
+        turns
+    };
+
+    println!("arm | prompt tokens | retention");
+    for (name, ladder, collapse) in arms {
+        let dir = workspace();
+        let shaped = |c: TaskContract| {
+            c.with_ladder(ladder)
+                .with_collapse(collapse)
+                .with_max_steps(12)
+                .with_context_budget(io_harness::ContextBudget {
+                    max_tokens: 1_500,
+                    share: 0.5,
+                })
+        };
+        let path = dir.path().join("recording.json");
+        let recorder = Record::new(Canned::new(long_script()));
+        let store = io_harness::Store::memory().unwrap();
+        let result = io_harness::run_with(
+            &shaped(contract(dir.path())),
+            &recorder,
+            &store,
+            &offline(dir.path()),
+            &ApproveAll,
+        )
+        .await
+        .unwrap();
+        recorder.save(&path).unwrap();
+        let steps = store.last_step(result.run_id).unwrap();
+        let _ = std::fs::remove_file(dir.path().join("out.txt"));
+        let replay = Replay::load(&path).unwrap();
+
+        let report = Suite::new()
+            .with_case(
+                Case::new(name, shaped(contract(dir.path())))
+                    .needing(["hello from the readme"])
+                    .expecting(true, steps),
+            )
+            .with_scorer(PromptTokens)
+            .with_scorer(Retention)
+            .run(&replay, &offline(dir.path()), &ApproveAll)
+            .await
+            .unwrap();
+
+        let value = |scorer: &str| {
+            report[0]
+                .scores
+                .iter()
+                .find(|s| s.scorer == scorer)
+                .map(|s| s.value)
+                .unwrap_or_default()
+        };
+        println!(
+            "{name} | {} | {}",
+            value("prompt_tokens"),
+            value("retention")
+        );
+    }
+}
+
+/// What the tool mask costs, now that the catalogue it offers is deliberately
+/// byte-identical to an unmasked one.
+///
+/// 0.76.0 decided a masked run offers exactly the catalogue an unmasked one does,
+/// so that the vendor's cache prefix does not move. That decision has been
+/// argued from first principles and never measured; this prints the number.
+#[tokio::test]
+#[ignore]
+async fn n5_what_the_tool_mask_costs() {
+    use io_harness::tools::ToolMask;
+
+    for (name, mask) in [
+        ("unmasked", ToolMask::none()),
+        // A tool this case never calls. Masking one it *does* call measures
+        // something else entirely — the run loses a step to a refusal and the
+        // request count doubles — which is a real number about masking a needed
+        // tool and not the question here. The question is what the mask costs a run
+        // that never notices it, and the answer has to isolate the catalogue.
+        ("masked", ToolMask::withholding(["git_worktree"])),
+    ] {
+        let dir = workspace();
+        let shaped = |c: TaskContract| c.with_tool_mask(mask.clone());
+        let path = dir.path().join("recording.json");
+        let recorder = Record::new(Canned::new(script()));
+        let store = io_harness::Store::memory().unwrap();
+        let _ = io_harness::run_with(
+            &shaped(contract(dir.path())),
+            &recorder,
+            &store,
+            &offline(dir.path()),
+            &ApproveAll,
+        )
+        .await;
+        recorder.save(&path).unwrap();
+        let _ = std::fs::remove_file(dir.path().join("out.txt"));
+
+        let replay = Replay::load(&path).unwrap();
+        let report = Suite::new()
+            .with_case(Case::new(name, shaped(contract(dir.path()))).expecting(true, 2))
+            .with_scorer(CatalogueCost)
+            .with_scorer(PromptTokens)
+            .run(&replay, &offline(dir.path()), &ApproveAll)
+            .await
+            .unwrap();
+        println!(
+            "{name} | catalogue {} | request {}",
+            report[0].scores[0].value, report[0].scores[1].value
+        );
+    }
+}
+
+// ---------------------------------------------------------------------- F7
+
+/// The live arm: one case against a real provider.
+///
+/// **It is never a gate.** `#[ignore]`d, keyed on `OPENROUTER_API_KEY` being
+/// present, and no acceptance criterion in this release is evidenced by it. CI does
+/// not run it and must not: a test that needs a key and a network is a test whose
+/// failure says nothing about the code.
+///
+/// It exists because the deterministic arm answers what a request *costs* and
+/// cannot answer what an answer is *worth*. A recording fixes the model's replies
+/// by construction, which is what makes the scores stable and what stops them
+/// saying anything about quality. The questions that need a model — does a
+/// graduated projection produce a better answer than a fold, does `ModelApprover`
+/// catch an injected dangerous act — are answered here or not at all.
+///
+/// Run it with:
+///
+/// ```text
+/// set -a && . ./.env && set +a
+/// cargo test --test eval -- --ignored --nocapture n5_the_live_arm
+/// ```
+#[tokio::test]
+#[ignore]
+async fn n5_the_live_arm_scores_a_case_against_a_real_provider() {
+    let Ok(key) = std::env::var("OPENROUTER_API_KEY") else {
+        println!("no OPENROUTER_API_KEY; the live arm is skipped, which is not a pass");
+        return;
+    };
+    let dir = workspace();
+    let provider = io_harness::provider::OpenRouter::new(key, "openai/gpt-4o-mini");
+
+    let report = Suite::new()
+        .with_case(
+            Case::new(
+                "a real model reads the readme and writes a file",
+                contract(dir.path()),
+            )
+            .needing(["README.md"])
+            // A live model chooses its own path, so the step count is a
+            // ceiling here rather than a claim. The case is scored, not
+            // decided.
+            .expecting(true, 2),
+        )
+        .with_scorer(PromptTokens)
+        .with_scorer(Retention)
+        .with_scorer(CatalogueCost)
+        .run(&provider, &Policy::permissive(), &ApproveAll)
+        .await
+        .unwrap();
+
+    for score in &report[0].scores {
+        println!("{}: {} — {}", score.scorer, score.value, score.detail);
+    }
+    println!(
+        "case {}: {}",
+        report[0].case,
+        if report[0].passed {
+            "as declared".to_string()
+        } else {
+            report[0].why.clone()
+        }
     );
 }
 

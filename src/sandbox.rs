@@ -2103,9 +2103,14 @@ pub(crate) fn contain_command(
             return None;
         }
         let abi = landlock::abi()?;
-        // The system temporary directory, still — see `landlock::plan`, which
-        // carries what 0.80.0 tried here and why it came back out.
-        let tmp = std::env::temp_dir();
+        // 0.81.0 — the run's own directory, the same resolver `linux::landlock_run`
+        // uses. **Both Landlock spawn paths or neither**: the comment below already
+        // says two paths reporting `LinuxLandlock` while installing different
+        // filters is the failure to avoid, and a narrowing applied to one of them
+        // is exactly that — this path is what wraps `shell_start`, the browser
+        // child and the git built-ins, so leaving it wide would have left the hole
+        // open for every backgrounded command while closing it for `exec`.
+        let tmp = linux::tmp_target(workdir, config.mode);
         let plan = landlock::plan(
             abi,
             config.mode,
@@ -2126,6 +2131,11 @@ pub(crate) fn contain_command(
         // both report `LinuxLandlock` while installing different filters is the
         // failure this release exists to stop.
         let net_restricted = plan.restricts_network();
+        // 0.81.0 — and the child is told where the grant is, as on the other path.
+        // A narrowed rule set with `TMPDIR` still pointing at `/tmp` is a run that
+        // fails on its first temporary file, which reads as a broken toolchain
+        // rather than as a boundary.
+        cmd.env("TMPDIR", &tmp);
         // SAFETY: the closure runs in the forked child before `exec`, allocates
         // nothing and calls only `prctl`, `landlock_restrict_self` and one
         // `seccomp` install. `fd` belongs to the returned guard, which the caller

@@ -947,6 +947,18 @@ pub(super) async fn run_workspace_from<P: Provider>(
     if let Some(ready) = &codeact {
         tools.push(run_program_spec(&ready.callable));
     }
+    // 0.81.0 — tiering, applied last so it sees the whole catalogue including the
+    // caller's registered tools and whatever the feature set compiled. A run that
+    // declared no tiers gets this untouched, which is every release through
+    // 0.80.0.
+    //
+    // `offered` is the families this run is currently carrying. It grows when the
+    // model calls `expand_tools`, and the catalogue is rebuilt from it at the top
+    // of the step below rather than mutated in place — one derivation of "what is
+    // offered" instead of two that could disagree about what an expansion did.
+    let mut offered: Vec<String> = contract.tool_tiers.clone().unwrap_or_default();
+    let full_catalogue = tools;
+    let mut tools = tiered(full_catalogue.clone(), contract.tool_tiers.as_deref());
     // Durable budget: restored from the store so a resume continues the same
     // token and wall-clock budget rather than restarting it at zero.
     let mut tokens_used: u64 = store.spent_tokens(run_id)?;
@@ -1640,6 +1652,50 @@ pub(super) async fn run_workspace_from<P: Provider>(
             let position = at;
             at += 1;
             calls_json.push(format!("{}:{}", call.name, call.arguments));
+            // 0.81.0 — answered here rather than in `dispatch`, because the answer
+            // is a change to what the *next* request offers and `dispatch` decides
+            // what one call does. It touches no file, runs no process and reaches
+            // no host, so there is nothing for the policy to resolve and nothing
+            // for an approver to be asked about.
+            if contract.tool_tiers.is_some() && call.name == crate::tools::EXPAND_TOOLS_TOOL {
+                let asked = call
+                    .arguments
+                    .get("family")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let obs = if !crate::tools::TOOL_FAMILIES.contains(&asked.as_str()) {
+                    format!(
+                        "\n[expand_tools] no such family {asked:?}; the families are {}\n",
+                        crate::tools::TOOL_FAMILIES.join(", ")
+                    )
+                } else if offered.contains(&asked) {
+                    format!("\n[expand_tools] {asked} is already offered\n")
+                } else {
+                    offered.push(asked.clone());
+                    // Rebuilt from the full catalogue and the grown list, never by
+                    // pushing the family's specs onto what is already there: the
+                    // second would drift from `tiered`'s own idea of the order,
+                    // and the order is what the vendor's cache prefix is keyed on.
+                    tools = tiered(full_catalogue.clone(), Some(&offered));
+                    format!(
+                        "\n[expand_tools] {asked} is offered from the next step; make the call \
+                         you wanted\n"
+                    )
+                };
+                decisions.push(format!("expanded {asked}"));
+                ledger.push(Observation::new(
+                    step,
+                    ObsKind::Tool,
+                    Some(crate::tools::EXPAND_TOOLS_TOOL.to_string()),
+                    obs,
+                    // `Prose`, not `Tool`: nothing outside this process produced a
+                    // byte of it. It is the crate answering the model about the
+                    // crate's own catalogue.
+                    Origin::Prose,
+                ));
+                continue;
+            }
             // 0.54.0 — a call whose read already happened, off the stream. The
             // work is the only thing that moved: the announcement is made here,
             // in call order, at exactly the point `read_batch` makes it, so an

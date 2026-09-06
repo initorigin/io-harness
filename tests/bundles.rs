@@ -74,9 +74,21 @@ fn the_long_horizon_bundle_publishes_the_skills_it_declares() {
         "the protocol has four parts and an overview: {catalog}"
     );
 
-    // Every skill has to reach the catalogue with a description, because the
-    // catalogue line is the only thing a model sees until it reads the body — a
-    // skill with an empty description is a skill nothing will ever open.
+    // F16 — one catalogue line for a five-skill bundle. The overview announces
+    // itself; the four parts declare `catalog: false` and are reached by name from
+    // it. That is what the declaration is for: a skill catalogue measured at 914
+    // tokens over eighteen lines had thirteen contributed by one bundle whose
+    // workflow most turns never enter.
+    assert_eq!(
+        catalog.lines().count(),
+        1,
+        "one line for the whole protocol:\n{catalog}"
+    );
+    assert!(catalog.contains("long-horizon:"), "{catalog}");
+
+    // Withheld from the catalogue is not gone. Every part is still discovered, and
+    // `read_skill` resolves against exactly this list.
+    let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
     for name in [
         "long-horizon",
         "long-horizon-init",
@@ -85,8 +97,8 @@ fn the_long_horizon_bundle_publishes_the_skills_it_declares() {
         "progress-log",
     ] {
         assert!(
-            catalog.contains(name),
-            "{name} is missing from the catalogue:\n{catalog}"
+            names.contains(&name),
+            "{name} was not discovered: {names:?}"
         );
     }
 }

@@ -100,6 +100,19 @@ pub struct Skill {
     /// The file the body lives in. Absolute, and what the policy decides on when
     /// the agent asks to read it.
     pub path: PathBuf,
+    /// Whether this skill's line goes into the prompt catalogue (0.81.0).
+    ///
+    /// `true` unless the frontmatter says `catalog: false`, which is every skill
+    /// written before this release. A skill declaring `false` is still *there* —
+    /// `read_skill` reaches it by name, and the policy decides that read exactly as
+    /// it decides every other — it simply does not spend a line of every request
+    /// announcing itself.
+    ///
+    /// The measured reason: a skill catalogue was 914 tokens over eighteen lines,
+    /// thirteen of them contributed by one capability bundle whose workflow most
+    /// turns never enter. A bundle that says which of its skills are worth
+    /// announcing turns thirteen always-on lines into one.
+    pub catalog: bool,
     /// The directory a companion file asked for by name resolves beneath, and
     /// may not leave (0.73.0).
     ///
@@ -418,7 +431,7 @@ impl Skills {
             };
 
             let text = std::fs::read_to_string(&file)?;
-            let (front_name, front_desc, body) = split_front_matter(&text);
+            let (front_name, front_desc, front_catalog, body) = split_front_matter_full(&text);
             let fallback_name = default_name(&file);
             let name = front_name.unwrap_or(fallback_name);
             let description = front_desc
@@ -438,6 +451,9 @@ impl Skills {
                 // `namespaced`.
                 root: path.parent().unwrap_or(&path).to_path_buf(),
                 path,
+                // Absent means catalogued, which is what every skill written
+                // before 0.81.0 gets.
+                catalog: front_catalog.unwrap_or(true),
             });
 
             if skills.len() > MAX_SKILLS {
@@ -538,6 +554,11 @@ impl Skills {
     pub fn catalog(&self) -> String {
         self.skills
             .iter()
+            // 0.81.0 — a skill that declared `catalog: false` is reachable and not
+            // announced. Filtered here rather than at discovery, because
+            // `read_skill` resolves against the same list and a skill dropped at
+            // discovery would be one an operator installed and nothing can open.
+            .filter(|s| s.catalog)
             .map(|s| format!("- {}: {}", s.name, s.description))
             .collect::<Vec<_>>()
             .join("\n")
@@ -571,11 +592,24 @@ fn default_name(file: &Path) -> String {
 /// Supports `key: value`, YAML block scalars (`key: >` / `key: |`), and plain
 /// continuation lines, since a `description:` long enough to wrap is common.
 pub(crate) fn split_front_matter(text: &str) -> (Option<String>, Option<String>, &str) {
+    let (name, description, _, body) = split_front_matter_full(text);
+    (name, description, body)
+}
+
+/// The same split, and the `catalog` flag beside it (0.81.0).
+///
+/// `None` is "the file did not say", which is catalogued — the behaviour of every
+/// skill written before this release, and the only safe default: a skill that
+/// silently stopped appearing would be a capability an operator installed and
+/// nothing can find.
+pub(crate) fn split_front_matter_full(
+    text: &str,
+) -> (Option<String>, Option<String>, Option<bool>, &str) {
     let stripped = text
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"));
     let Some(rest) = stripped else {
-        return (None, None, text);
+        return (None, None, None, text);
     };
 
     // Find the closing fence. Byte offsets are tracked so the body can be
@@ -590,7 +624,7 @@ pub(crate) fn split_front_matter(text: &str) -> (Option<String>, Option<String>,
         offset += line.len();
     }
     let Some((front_len, body_start)) = front_end else {
-        return (None, None, text);
+        return (None, None, None, text);
     };
 
     let front = &rest[..front_len];
@@ -598,6 +632,7 @@ pub(crate) fn split_front_matter(text: &str) -> (Option<String>, Option<String>,
 
     let mut name = None;
     let mut description = None;
+    let mut catalog = None;
     // Which key the current continuation lines belong to.
     let mut open: Option<&str> = None;
     let mut buffer = String::new();
@@ -605,7 +640,8 @@ pub(crate) fn split_front_matter(text: &str) -> (Option<String>, Option<String>,
     let flush = |key: Option<&str>,
                  buffer: &mut String,
                  name: &mut Option<String>,
-                 description: &mut Option<String>| {
+                 description: &mut Option<String>,
+                 catalog: &mut Option<bool>| {
         let value = buffer.trim().to_string();
         buffer.clear();
         if value.is_empty() {
@@ -614,6 +650,11 @@ pub(crate) fn split_front_matter(text: &str) -> (Option<String>, Option<String>,
         match key {
             Some("name") => *name = Some(value),
             Some("description") => *description = Some(value),
+            // Anything that is not `false` is catalogued, including a typo. The
+            // asymmetry is deliberate: a misread flag that hides a skill is a
+            // capability an operator installed and cannot find, and a misread flag
+            // that shows one costs a line.
+            Some("catalog") => *catalog = Some(!value.eq_ignore_ascii_case("false")),
             _ => {}
         }
     };
@@ -639,13 +680,15 @@ pub(crate) fn split_front_matter(text: &str) -> (Option<String>, Option<String>,
             continue;
         }
 
-        flush(open, &mut buffer, &mut name, &mut description);
+        flush(open, &mut buffer, &mut name, &mut description, &mut catalog);
         let (key, value) = line.split_once(':').expect("starts_key found one");
         let key = key.trim();
         let value = value.trim();
         open = match key {
             "name" => Some("name"),
             "description" => Some("description"),
+            // 0.81.0
+            "catalog" => Some("catalog"),
             // A key this reader does not care about (`metadata:`, `allowed-tools:`)
             // still has to be tracked, so its own continuation lines are not
             // appended to whichever key came before it.
@@ -657,9 +700,9 @@ pub(crate) fn split_front_matter(text: &str) -> (Option<String>, Option<String>,
             buffer.push_str(value);
         }
     }
-    flush(open, &mut buffer, &mut name, &mut description);
+    flush(open, &mut buffer, &mut name, &mut description, &mut catalog);
 
-    (name, description, body)
+    (name, description, catalog, body)
 }
 
 /// The first line of a body that reads as prose, for a file with no
@@ -839,6 +882,7 @@ mod tests {
             description: "d".into(),
             path: canon(root.join("skills/codex/SKILL.md")),
             root: canon(root),
+            catalog: true,
         };
 
         assert_eq!(

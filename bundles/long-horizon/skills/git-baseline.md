@@ -1,6 +1,7 @@
 ---
 name: git-baseline
 description: The commit or branch a long-horizon session measures "done" against, and how a resumed session recovers it.
+catalog: false
 ---
 
 # The git baseline

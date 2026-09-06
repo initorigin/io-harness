@@ -1,6 +1,7 @@
 ---
 name: long-horizon-init
 description: Start a long-horizon session — cut the git baseline, write the feature list, open the progress log, in that order.
+catalog: false
 ---
 
 # Initializing a long-horizon session

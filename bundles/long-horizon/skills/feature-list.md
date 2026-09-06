@@ -1,6 +1,7 @@
 ---
 name: feature-list
 description: features.json — one named feature per entry, progress carried by a boolean pass and never by a percentage.
+catalog: false
 ---
 
 # The feature list

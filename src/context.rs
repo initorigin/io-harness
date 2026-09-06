@@ -583,6 +583,7 @@ const BUDGET_FLOOR: u64 = 2_000;
 ///     reduce: true,
 ///     snip: Some(Snip { older_than_steps: 20 }),
 ///     microcompact: true,
+///     skill_bodies_leave: true,
 /// };
 /// assert_eq!(full.snip.unwrap().older_than_steps, 20);
 /// ```
@@ -595,6 +596,17 @@ pub struct Ladder {
     pub snip: Option<Snip>,
     /// Replace a contiguous run of one step's results with a counted line.
     pub microcompact: bool,
+    /// Fold a skill's body out of the conversation after the step that used it
+    /// (0.81.0).
+    ///
+    /// A body read through `read_skill` is 7 to 10 KB in the bundles measured, and
+    /// it sits in the conversation for the rest of the session, re-sent on every
+    /// later step. It is the one observation whose loss costs nothing: its
+    /// catalogue line stays in the system prompt and `read_skill` brings the body
+    /// back by name, so an agent that needs it again asks again.
+    ///
+    /// Off by default, like every rung here.
+    pub skill_bodies_leave: bool,
 }
 
 /// How old a lookup result must be before [`Ladder::snip`] drops it.
@@ -671,8 +683,19 @@ const MICROCOMPACT_MIN: usize = 3;
 ///
 /// 1. **`contract`** — the caller wrote a budget. It wins over everything, because
 ///    an operator who states a ceiling has stated it for a reason the crate cannot
-///    see. "Wrote one" is `declared != ContextBudget::default()`; a caller who sets
-///    exactly the default has asked for exactly the default, which is what they get.
+///    see.
+///
+///    **"Wrote one" is `declared != ContextBudget::default()`, and that has one
+///    sharp edge worth stating rather than discovering.** A caller who writes
+///    `ContextBudget { max_tokens: 24_000, share: 0.5 }` — byte-equal to the
+///    default — is indistinguishable from one who wrote nothing, so the model's
+///    window answers instead and the ceiling is *larger* than what they typed.
+///    There is no way to tell the two apart without making the field an `Option`,
+///    which would break every caller that reads it. A caller who means exactly
+///    24,000 whatever the model holds should say so with a value that is not the
+///    default — `24_001`, or a `share` of their own — and
+///    [`EventKind::ContextCeiling`](crate::EventKind::ContextCeiling) is what shows
+///    which source actually answered.
 /// 2. **`model`** — the provider knows the model's window. The ceiling is
 ///    [`ContextBudget::for_window`], so the answer and the request floor are
 ///    reserved out of it.
@@ -1394,6 +1417,31 @@ pub async fn assemble(
                 "dropped as a lookup older than {} steps — ask again if it still matters",
                 snip.older_than_steps
             )));
+        }
+    }
+
+    // 3a-bis. Skill bodies leave (0.81.0). The same read-time predicate shape as
+    // snip, on the one observation whose loss is free: the catalogue line that
+    // named it is in the system prompt and `read_skill` fetches it again by name,
+    // so an agent that needs it back asks and gets it. Everything else the fit
+    // loop drops is gone for the rest of the turn.
+    //
+    // One step of grace, not zero: the body is read on step N and *used* on step
+    // N+1, so evicting it at N+1 would fold it out of the very turn that asked for
+    // it.
+    if ladder.skill_bodies_leave {
+        for i in 0..n {
+            if superseded[i].is_some()
+                || shapes[i].is_some()
+                || entries[i].kind != ObsKind::Skill
+                || step.saturating_sub(entries[i].step) <= 1
+            {
+                continue;
+            }
+            out.snipped += 1;
+            shapes[i] = Some(Shape::Stub(
+                "the body has been folded out; read the skill again if you need it".to_string(),
+            ));
         }
     }
 

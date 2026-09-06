@@ -347,6 +347,74 @@ async fn f12_the_current_steps_own_results_are_never_compacted() {
     assert!(on.text.contains("fn a3()"));
 }
 
+// --------------------------------------------------------------------- F15
+
+/// A skill body folds out after the step that used it, and comes back on request.
+///
+/// The one observation whose loss is free: its catalogue line is in the system
+/// prompt and `read_skill` fetches it again by name. A body is 7 to 10 KB in the
+/// bundles measured and sits in the conversation for the rest of the session.
+#[tokio::test]
+async fn f15_a_skill_body_leaves_after_the_step_that_used_it() {
+    let f = fixture();
+    let mut l = Ledger::default();
+    l.push(obs(
+        1,
+        ObsKind::Skill,
+        "long-horizon",
+        "[read_skill long-horizon]\nthe whole body, at length\n",
+    ));
+    l.push(obs(
+        2,
+        ObsKind::Read,
+        "src/a.rs",
+        "[read src/a.rs]\nfn a() {}\n",
+    ));
+
+    let ladder = Ladder {
+        skill_bodies_leave: true,
+        ..Ladder::default()
+    };
+
+    // Step 2 still carries it: the body is read on one step and used on the next,
+    // so evicting it at N+1 would fold it out of the turn that asked for it.
+    let used = at(&f, &l, 100_000, 2, ladder, &[]).await;
+    assert!(
+        used.text.contains("the whole body"),
+        "one step of grace: {}",
+        used.text
+    );
+
+    // Step 3 does not.
+    let later = at(&f, &l, 100_000, 3, ladder, &[]).await;
+    assert!(!later.text.contains("the whole body"));
+    assert!(
+        later.text.contains("read the skill again"),
+        "the model is told it can get the body back, rather than the body simply \
+         vanishing: {}",
+        later.text
+    );
+    // A read of the same age is untouched — this lever is about skill bodies, not
+    // about age.
+    assert!(later.text.contains("fn a()"));
+}
+
+/// Without the lever a body stays for the length of the run.
+#[tokio::test]
+async fn f15_without_the_lever_a_skill_body_stays() {
+    let f = fixture();
+    let mut l = Ledger::default();
+    l.push(obs(
+        1,
+        ObsKind::Skill,
+        "long-horizon",
+        "[read_skill long-horizon]\nthe whole body, at length\n",
+    ));
+
+    let later = at(&f, &l, 100_000, 30, Ladder::default(), &[]).await;
+    assert!(later.text.contains("the whole body"));
+}
+
 /// The trace says which rungs ran, so an operator reading a run can tell a
 /// reduction from a snip from a fold.
 #[tokio::test]
@@ -364,6 +432,7 @@ async fn f9_the_assembly_trace_names_every_rung_that_ran() {
                 older_than_steps: 5,
             }),
             microcompact: true,
+            skill_bodies_leave: true,
         },
         &notes(),
     )

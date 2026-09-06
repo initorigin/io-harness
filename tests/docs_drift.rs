@@ -1997,6 +1997,13 @@ const README_MUST_NAME: &[(&str, &str)] = &[
     ("0.77.0", "OutputSchema"),
     ("0.78.0", "mcp-server"),
     ("0.79.0", "run_program"),
+    // 0.81.0. Three names because the release has three surfaces a reader arrives
+    // looking for, and one of them is a security narrowing an operator has to be
+    // able to find: the suite that measures, the ladder it measures, and the
+    // declaration that let the Landlock grant come down.
+    ("0.81.0", "eval"),
+    ("0.81.0", "Ladder"),
+    ("0.81.0", "writable_roots"),
 ];
 
 /// Releases since the floor that introduced no public name of their own.
