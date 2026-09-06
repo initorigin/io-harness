@@ -2004,6 +2004,7 @@ impl TaskContract {
     ///     reduce: true,
     ///     snip: Some(Snip { older_than_steps: 30 }),
     ///     microcompact: false,
+    ///     skill_bodies_leave: false,
     /// });
     /// assert!(contract.ladder.reduce);
     ///

@@ -271,9 +271,7 @@ async fn a_one_shot_run_emits_no_deltas_and_a_session_turn_does() {
     // above rather than this one.
     assert_eq!(
         *quiet.kinds.lock().unwrap(),
-        vec![
-            "started", "other", "other", "other", "other", "step", "other", "other", "finished"
-        ]
+        vec!["started", "other", "other", "other", "other", "step", "other", "other", "finished"]
     );
 
     // The control: the same provider, through a session turn.
