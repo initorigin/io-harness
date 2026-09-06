@@ -16,7 +16,32 @@ notes are produced from it.
 
 ### Added
 
+- **A run's context ceiling is sized to the model it is running.** `Provider` gains
+  `context_window` and `max_output_tokens`, both defaulting to `None` — "this
+  provider is not saying" — so every implementation written before this release
+  keeps compiling and keeps the ceiling it had. `ContextBudget::for_window` derives
+  a ceiling from a window, reserving the model's answer and the request's own floor
+  out of it. `Compatible` answers both from a catalogue it has already fetched and
+  never dials to do so.
+- **`EventKind::ContextCeiling`**, emitted once per run beside `Started`. It carries
+  the ceiling the run will assemble under and one word for where it came from:
+  `contract` (the caller stated one), `model` (derived from the window), or
+  `fallback` (nothing knew the window, so the crate's constant applies). The last is
+  the one worth acting on, and it used to be invisible.
+- **`io_harness::context::FALLBACK_MAX_TOKENS`**, the 24,000-token constant, now
+  named and documented as the fallback rather than sitting unlabelled inside
+  `ContextBudget::default`.
+
 ### Changed
+
+- **A consumer that never wrote `[run.context]` gets its model's window instead of
+  24,000 tokens.** Through 0.80.0 `ContextBudget::default` declared `max_tokens:
+  24_000` and nothing read the `context_length` the provider catalogue already
+  carries, so a run on a 128,000-token model assembled under 24,000 whatever the
+  model held — with a measured 7,311-token request floor, that began trimming
+  history at roughly 16,000 tokens of conversation and bought re-reads. The ceiling
+  now follows the model where the provider knows it. A caller who stated a budget is
+  unaffected: an explicit `ContextBudget` still wins over everything.
 
 ### Deprecated
 

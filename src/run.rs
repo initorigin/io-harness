@@ -1410,6 +1410,11 @@ pub(crate) async fn run_with_extras<P: Provider>(
         },
     ));
     emit_plugins(watch, run_id, contract);
+    // 0.81.0 — the ceiling this run assembles under, sized to the model the provider
+    // is about to ask and reported once. It shadows the parameter deliberately, so
+    // every read of `contract.context` below this line is the resolved value and
+    // there is no second rule for a resumed run to disagree with.
+    let contract = &size_context(watch, run_id, contract, provider);
     // Decided against the *caller's* policy, before the provider layer is merged
     // in: the harness adding a network layer of its own must not turn a
     // permissive caller into a policy-bearing one and push it off the
@@ -2415,6 +2420,11 @@ pub async fn resume_with_observed<P: Provider>(
         },
     ));
     emit_plugins(watch, run_id, contract);
+    // 0.81.0 — the ceiling this run assembles under, sized to the model the provider
+    // is about to ask and reported once. It shadows the parameter deliberately, so
+    // every read of `contract.context` below this line is the resolved value and
+    // there is no second rule for a resumed run to disagree with.
+    let contract = &size_context(watch, run_id, contract, provider);
     match contract.root.clone() {
         Some(root) => {
             // Re-authorized on resume rather than trusted from the interrupted
@@ -2950,6 +2960,11 @@ pub async fn resume_with_decision_observed<P: Provider>(
         },
     ));
     emit_plugins(watch, run_id, contract);
+    // 0.81.0 — the ceiling this run assembles under, sized to the model the provider
+    // is about to ask and reported once. It shadows the parameter deliberately, so
+    // every read of `contract.context` below this line is the resolved value and
+    // there is no second rule for a resumed run to disagree with.
+    let contract = &size_context(watch, run_id, contract, provider);
 
     match decision {
         // Deferring again leaves it pending and the run paused.
@@ -3328,6 +3343,11 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
         },
     ));
     emit_plugins(watch, run_id, contract);
+    // 0.81.0 — the ceiling this run assembles under, sized to the model the provider
+    // is about to ask and reported once. It shadows the parameter deliberately, so
+    // every read of `contract.context` below this line is the resolved value and
+    // there is no second rule for a resumed run to disagree with.
+    let contract = &size_context(watch, run_id, contract, provider);
 
     match decision {
         Decision::Defer => Ok(RunResult::new(
@@ -4217,6 +4237,11 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
         },
     ));
     emit_plugins(watch, run_id, contract);
+    // 0.81.0 — the ceiling this run assembles under, sized to the model the provider
+    // is about to ask and reported once. It shadows the parameter deliberately, so
+    // every read of `contract.context` below this line is the resolved value and
+    // there is no second rule for a resumed run to disagree with.
+    let contract = &size_context(watch, run_id, contract, provider);
     // Authorized once at the root. Children inherit the root's policy through
     // `Policy::contain`, so the provider layer flows down the tree and no child
     // needs (or gets) its own chance to widen network access.
@@ -4455,6 +4480,11 @@ pub async fn resume_tree_observed<P: Provider>(
         },
     ));
     emit_plugins(watch, run_id, contract);
+    // 0.81.0 — the ceiling this run assembles under, sized to the model the provider
+    // is about to ask and reported once. It shadows the parameter deliberately, so
+    // every read of `contract.context` below this line is the resolved value and
+    // there is no second rule for a resumed run to disagree with.
+    let contract = &size_context(watch, run_id, contract, provider);
     emit_backlog(
         watch,
         run_id,

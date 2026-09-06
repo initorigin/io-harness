@@ -2052,6 +2052,64 @@ pub trait Provider {
         None
     }
 
+    /// How many tokens the model this provider will ask holds in one request
+    /// (0.81.0).
+    ///
+    /// Defaulted to `None` — "this provider is not saying" — so every existing
+    /// implementation keeps compiling and keeps the ceiling it had.
+    ///
+    /// **Synchronous on purpose, and it must never dial.** A run reads this once,
+    /// before its first step, to size [`ContextBudget`](crate::ContextBudget). A
+    /// method that fetched a catalogue here would put a network round trip in front
+    /// of every run, on a crate whose default build makes no request the caller did
+    /// not ask for. So an implementation answers from what it already knows: a
+    /// constant, a value the embedder configured, or a catalogue it has already
+    /// fetched for another reason. [`Compatible`] answers from its cached
+    /// catalogue when one has been fetched and `None` until then, which means the
+    /// same run can be sized differently depending on whether the embedder asked
+    /// for prices — stated here rather than left to be discovered.
+    ///
+    /// A run whose provider says nothing uses
+    /// [`FALLBACK_MAX_TOKENS`](crate::context::FALLBACK_MAX_TOKENS) and emits
+    /// [`EventKind::ContextCeiling`](crate::EventKind::ContextCeiling) saying so.
+    ///
+    /// ```
+    /// use io_harness::{CompletionRequest, CompletionResponse, Provider};
+    ///
+    /// struct Mine;
+    ///
+    /// impl Provider for Mine {
+    ///     async fn complete(&self, _r: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+    ///         Ok(CompletionResponse::default())
+    ///     }
+    ///     fn context_window(&self) -> Option<u64> { Some(200_000) }
+    /// }
+    ///
+    /// assert_eq!(Mine.context_window(), Some(200_000));
+    /// // Saying nothing is the default, and is not a claim of zero.
+    /// struct Quiet;
+    /// impl Provider for Quiet {
+    ///     async fn complete(&self, _r: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+    ///         Ok(CompletionResponse::default())
+    ///     }
+    /// }
+    /// assert_eq!(Quiet.context_window(), None);
+    /// ```
+    fn context_window(&self) -> Option<u64> {
+        None
+    }
+
+    /// The longest answer the model this provider will ask may produce (0.81.0).
+    ///
+    /// Read beside [`context_window`](Provider::context_window) and reserved out of
+    /// it, because a ceiling that let the assembled prompt fill the whole window
+    /// would leave the model no room to answer. `None` reserves a default instead,
+    /// which is what [`ContextBudget::for_window`](crate::ContextBudget::for_window)
+    /// documents. The same "never dial" rule applies.
+    fn max_output_tokens(&self) -> Option<u64> {
+        None
+    }
+
     /// A short label recorded in the run's trace so an audit shows which
     /// provider ran. Defaults to `"provider"` so existing implementers keep
     /// compiling; the built-in providers override it.

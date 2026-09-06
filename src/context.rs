@@ -500,17 +500,124 @@ pub struct ContextBudget {
 impl Default for ContextBudget {
     fn default() -> Self {
         Self {
-            max_tokens: 24_000,
+            max_tokens: FALLBACK_MAX_TOKENS,
             share: 0.5,
         }
     }
 }
 
+/// The per-request ceiling a run uses when nothing tells it the model's own
+/// context window (0.81.0).
+///
+/// It was the ceiling for *every* run until this release, on every model, because
+/// [`ContextBudget::default`] declared it and nothing read the window the provider
+/// catalogue already carries. On a model holding 128,000 tokens that threw away
+/// most of the window and bought re-reads; the field test of 2026-09-05 measured a
+/// 7,311-token request floor against it, so history began being trimmed at roughly
+/// 16,000 tokens of conversation.
+///
+/// It remains the honest answer for a model nothing knows the size of — a ceiling
+/// guessed too high is a request the provider refuses — and a run that falls back
+/// to it says so through
+/// [`EventKind::ContextCeiling`](crate::EventKind::ContextCeiling) rather than
+/// applying it silently.
+pub const FALLBACK_MAX_TOKENS: u64 = 24_000;
+
+/// What a window-derived budget holds back for the model's own answer when the
+/// provider does not say how long an answer may be.
+///
+/// Deliberately generous. The cost of reserving too much is a shorter history; the
+/// cost of reserving too little is a refused request, which ends the turn.
+const DEFAULT_OUTPUT_RESERVE: u64 = 8_192;
+
+/// What a window-derived budget holds back for the parts of a request that are not
+/// the assembled section — the system block, the tool catalogue and the skill
+/// catalogue.
+///
+/// The same field test measured that floor at 7,311 tokens, of which 5,436 was the
+/// tool catalogue. This rounds it up rather than tracking it, because the number
+/// moves with the operator's own tools and a ceiling derived from a stale
+/// measurement is worse than one derived from a stated reservation.
+const REQUEST_FLOOR_RESERVE: u64 = 8_192;
+
 /// The smallest assembled section a nearly-exhausted budget still gets: a prompt
 /// too small to carry one observation is a turn the agent cannot act on.
 const BUDGET_FLOOR: u64 = 2_000;
 
+/// The ceiling a run will actually use, and the one word that says where it came
+/// from (0.81.0).
+///
+/// Three sources, in this order, and the order is the whole of the rule:
+///
+/// 1. **`contract`** — the caller wrote a budget. It wins over everything, because
+///    an operator who states a ceiling has stated it for a reason the crate cannot
+///    see. "Wrote one" is `declared != ContextBudget::default()`; a caller who sets
+///    exactly the default has asked for exactly the default, which is what they get.
+/// 2. **`model`** — the provider knows the model's window. The ceiling is
+///    [`ContextBudget::for_window`], so the answer and the request floor are
+///    reserved out of it.
+/// 3. **`fallback`** — nothing knows the window, so [`FALLBACK_MAX_TOKENS`] applies.
+///    This was every run's ceiling before 0.81.0.
+///
+/// The label rides [`EventKind::ContextCeiling`](crate::EventKind::ContextCeiling),
+/// so an operator wondering why a 128,000-token model is trimming at 16,000 can read
+/// the answer rather than infer it.
+pub(crate) fn resolve_budget(
+    declared: ContextBudget,
+    window: Option<u64>,
+    max_output: Option<u64>,
+) -> (ContextBudget, &'static str) {
+    if declared != ContextBudget::default() {
+        return (declared, "contract");
+    }
+    match window {
+        Some(window) => (ContextBudget::for_window(window, max_output), "model"),
+        None => (declared, "fallback"),
+    }
+}
+
 impl ContextBudget {
+    /// A budget sized to a model's own context window (0.81.0).
+    ///
+    /// `window` is the model's total context length, as
+    /// [`ModelInfo::context_length`](crate::provider::ModelInfo::context_length)
+    /// reports it, and `max_output` is what the vendor says an answer may be, as
+    /// [`ModelInfo::max_output_tokens`](crate::provider::ModelInfo::max_output_tokens)
+    /// reports it. The whole window is not available to the assembled section: the
+    /// answer has to fit, and so do the system block and the tool catalogue. Both
+    /// are reserved, and what is left is the ceiling.
+    ///
+    /// A window smaller than its own reservations floors at the same 2,000 tokens
+    /// [`effective_tokens`](ContextBudget::effective_tokens) floors at, because a
+    /// prompt too small to carry one observation is a turn the agent cannot act on.
+    ///
+    /// ```
+    /// use io_harness::ContextBudget;
+    ///
+    /// // A 128k model, with the vendor's own 8k answer limit reported.
+    /// let big = ContextBudget::for_window(128_000, Some(8_192));
+    /// assert_eq!(big.max_tokens, 128_000 - 8_192 - 8_192);
+    ///
+    /// // The same window with no stated answer limit reserves the default instead.
+    /// assert_eq!(ContextBudget::for_window(128_000, None).max_tokens, 111_616);
+    ///
+    /// // A window smaller than its reservations still gets a usable floor.
+    /// assert_eq!(ContextBudget::for_window(4_096, None).max_tokens, 2_000);
+    ///
+    /// // `share` is untouched: it is a different axis — how much of what is *left*
+    /// // of a run's token budget the prompt may take.
+    /// assert_eq!(big.share, ContextBudget::default().share);
+    /// ```
+    pub fn for_window(window: u64, max_output: Option<u64>) -> Self {
+        let reserve = max_output
+            .unwrap_or(DEFAULT_OUTPUT_RESERVE)
+            .saturating_add(REQUEST_FLOOR_RESERVE);
+        Self {
+            max_tokens: window.saturating_sub(reserve).max(BUDGET_FLOOR),
+            ..Self::default()
+        }
+    }
+
     /// The ceiling for this turn's assembled section.
     ///
     /// With no run token budget it is [`max_tokens`](ContextBudget::max_tokens)
