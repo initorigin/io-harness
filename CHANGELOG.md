@@ -14,6 +14,20 @@ notes are produced from it.
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.84.0] - 2026-09-09
+
 **What the provider said about its rate limit reaches the caller.** Every vendor
 publishes its allowance on every response and this crate read one header of it —
 `Retry-After`, and only on the way to an error. A run could say how much of an
