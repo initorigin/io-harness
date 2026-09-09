@@ -3806,6 +3806,97 @@ mod rate_limit_headers {
         }
     }
 
+    /// Every vendor path fills the field, over a real socket.
+    ///
+    /// In-crate rather than in `tests/rate_limit.rs` because `Anthropic::at`,
+    /// `OpenAi::at` and `OpenRouter::at` are `pub(crate)`: the three pin their
+    /// vendor's own URL, so nothing outside this crate can point one at a
+    /// fixture. Without this the anthropic fill site — a whole vendor's worth of
+    /// it — is asserted by nothing, which is the shape of hole a release like
+    /// this one is most likely to ship.
+    #[tokio::test]
+    async fn f6_each_vendor_fills_the_field_from_its_own_response() {
+        use super::failures::{serve, stream_response};
+
+        const PATIENT: Duration = Duration::from_secs(30);
+        let request = || CompletionRequest {
+            system: "s".into(),
+            user: "u".into(),
+            ..Default::default()
+        };
+
+        // The OpenAI wire, and the header block the OpenAI family sends.
+        let openai_events = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+             data: [DONE]\n\n";
+        let openai_headers = "x-ratelimit-remaining-requests: 99\r\n\
+             x-ratelimit-reset-requests: 6m0s\r\n";
+        let with_headers = |events: &str, headers: &str| {
+            stream_response(events).replacen("\r\n\r\n", &format!("\r\n{headers}\r\n"), 1)
+        };
+
+        for (vendor, response) in [
+            (
+                "OpenAi",
+                OpenAi::at(serve(with_headers(openai_events, openai_headers)), PATIENT)
+                    .complete(request())
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "OpenRouter",
+                OpenRouter::at(serve(with_headers(openai_events, openai_headers)), PATIENT)
+                    .complete(request())
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "Compatible",
+                Compatible::at(&serve(with_headers(openai_events, openai_headers)), PATIENT)
+                    .complete(request())
+                    .await
+                    .unwrap(),
+            ),
+        ] {
+            let limit = response
+                .rate_limit
+                .unwrap_or_else(|| panic!("{vendor} read the headers off its own response"));
+            assert_eq!(limit.requests.remaining, Some(99), "{vendor}");
+            assert_eq!(
+                limit.requests.reset,
+                Some(Duration::from_secs(360)),
+                "{vendor}"
+            );
+        }
+
+        // Anthropic's own wire and its own header family, which no other test in
+        // the crate drives end to end.
+        let anthropic = Anthropic::at(
+            serve(with_headers(
+                "event: content_block_delta\n\
+                 data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+                 event: message_stop\n\
+                 data: {\"type\":\"message_stop\"}\n\n",
+                "anthropic-ratelimit-requests-remaining: 42\r\n\
+                 anthropic-ratelimit-tokens-limit: 80000\r\n",
+            )),
+            PATIENT,
+        )
+        .complete(request())
+        .await
+        .unwrap();
+
+        let limit = anthropic
+            .rate_limit
+            .expect("Anthropic read the headers off its own response");
+        assert_eq!(limit.requests.remaining, Some(42));
+        assert_eq!(limit.tokens.limit, Some(80_000));
+        assert_eq!(
+            anthropic.text.as_deref(),
+            Some("hi"),
+            "the body still parsed"
+        );
+    }
+
     #[test]
     fn an_instant_this_parser_declines_is_absent_rather_than_wrong() {
         assert!(crate::net::parse_rfc3339("2026-09-09T13:20:00+05:30").is_none());
