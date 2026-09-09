@@ -10,6 +10,12 @@
 //! The other half of every assertion is the trace: bounding what the model sees
 //! must never bound what an operator can audit, so wherever a prompt is asserted
 //! to be smaller, `steps.result` is asserted to still hold everything.
+//!
+//! (0.85.0) Every direct `assemble` call here passes `folding: true`. These cases
+//! are about what the fit rule does when the ceiling is reached, and that is now a
+//! fold's decision — a folding step is the step they were written against.
+//! `tests/prefix_append_only.rs` holds the other half: what an ordinary step may
+//! not do.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -437,6 +443,8 @@ async fn a_policy_refused_reread_is_a_stub_naming_the_invalidating_step_and_the_
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 3,
+            folding: true,
             ws: Some(&ws),
             policy: &policy,
             store: &store,
@@ -695,6 +703,8 @@ async fn assembling_one_turn_costs_a_bounded_amount_of_time() {
             Assembly {
                 collapse: Collapse::default(),
                 ladder: Ladder::default(),
+                since: step,
+            folding: true,
                 ws: Some(&workspace),
                 policy: &policy,
                 store: &store,
@@ -795,6 +805,8 @@ async fn two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_colla
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 5,
+            folding: true,
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -864,6 +876,8 @@ async fn a_re_read_cannot_escape_the_workspace_root() {
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 3,
+            folding: true,
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -944,6 +958,8 @@ async fn the_rendered_note_block_is_byte_identical_whatever_run_id_the_notes_car
                 Assembly {
                     collapse: Collapse::default(),
                     ladder: Ladder::default(),
+                    since: 9,
+            folding: true,
                     ws: None,
                     policy,
                     store,
@@ -1101,6 +1117,8 @@ async fn a_long_runs_stubs_collapse_so_the_ceiling_still_holds() {
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 401,
+            folding: true,
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -1377,6 +1395,8 @@ async fn a_surviving_result_keeps_the_position_of_the_call_it_answers() {
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 3,
+            folding: true,
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -1653,6 +1673,8 @@ async fn emitted_for(ledger: &mut Ledger, budget: u64) -> Assembled {
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 9,
+            folding: true,
             ws: Some(&ws),
             policy: &policy,
             store: &store,
@@ -1994,6 +2016,8 @@ async fn a_read_that_no_longer_fits_is_a_stub_and_not_a_tail() {
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 3,
+            folding: true,
             ws: None,
             policy: &policy,
             store: &store,

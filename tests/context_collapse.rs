@@ -143,6 +143,10 @@ async fn assembled(
         Assembly {
             collapse,
             ladder: io_harness::context::Ladder::default(),
+            // 0.85.0 — a collapse happens where the fit rule would have stubbed,
+            // and the fit rule runs on a folding step.
+            since: 9,
+            folding: true,
             ws: Some(&f.ws),
             policy: &f.policy,
             store: &f.store,

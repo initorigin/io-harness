@@ -11,11 +11,20 @@
 //! The assertions are on `Assembled::text` and on recorded request bodies, not on
 //! a counter: a counter can be right while the bytes move.
 
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
 use io_harness::context::{
-    assemble, Assembly, Collapse, Ladder, Ledger, ObsKind, Observation, Origin,
+    assemble, Assembly, Collapse, ContextBudget, Ladder, Ledger, ObsKind, Observation, Origin,
 };
+use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::Workspace;
-use io_harness::{Policy, Store};
+use io_harness::{
+    run_with, run_with_observed, ApproveAll, EventKind, Flow, Observer, Policy, Provider, RunEvent,
+    Store, TaskContract, Verification,
+};
+use serde_json::json;
 
 /// A workspace with an open read policy, and the policy beside it.
 fn ws(dir: &std::path::Path) -> (Workspace, Policy) {
@@ -44,11 +53,198 @@ async fn at_step(
             step,
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            // The ordinary step of a run that has not folded: the prefix was built
+            // at the run's first step, and nothing this step renders may change
+            // from what the step before it rendered.
+            since: 1,
+            folding: false,
         },
     )
     .await
     .unwrap()
     .text
+}
+
+// ------------------------------------------------------------ the loop harness
+
+/// Plays a fixed script of tool calls and keeps every request it was sent. The
+/// requests are the whole of what this file asserts on: the property is about what
+/// a vendor receives, and nothing else can see it.
+struct Script {
+    steps: Vec<Vec<ToolCall>>,
+    at: AtomicUsize,
+    seen: Arc<Mutex<Vec<CompletionRequest>>>,
+}
+
+impl Script {
+    fn new(steps: Vec<Vec<ToolCall>>) -> Self {
+        Self {
+            steps,
+            at: AtomicUsize::new(0),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Every request the run made, the fold's own summarisation call included.
+    fn requests(&self) -> Vec<CompletionRequest> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    /// The steps' own requests.
+    ///
+    /// A fold buys its summary through the same provider, so a run that folds
+    /// sends one request that is not a step and carries none of the workspace
+    /// framing. It is a completion the crate makes on its own behalf, and reading
+    /// it as a step would compare a step's prompt against a summariser's.
+    fn steps(&self) -> Vec<CompletionRequest> {
+        self.requests()
+            .into_iter()
+            .filter(|r| r.user.contains(FRAME))
+            .collect()
+    }
+}
+
+impl Provider for Script {
+    async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        // A fold's summarisation request carries no tools, and it must be answered
+        // with prose: a summariser that says nothing is not allowed to replace the
+        // notes with nothing, so an empty answer aborts the fold and the run
+        // silently goes on never folding. It also takes no slot in the script —
+        // the script is the agent's turns, and this is not one of them.
+        if req.tools.is_empty() {
+            self.seen.lock().unwrap().push(req);
+            return Ok(CompletionResponse {
+                text: Some("the run read some files and grepped for some names".into()),
+                ..Default::default()
+            });
+        }
+        let i = self.at.fetch_add(1, Ordering::SeqCst);
+        self.seen.lock().unwrap().push(req);
+        Ok(CompletionResponse {
+            tool_calls: self.steps.get(i).cloned().unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+}
+
+/// The steps a run folded on, which are the steps allowed to break the property.
+#[derive(Default)]
+struct Folds(Arc<Mutex<Vec<u32>>>);
+
+impl Observer for Folds {
+    fn event(&self, event: &RunEvent) -> Flow {
+        if let EventKind::Compacted { through_step, .. } = &event.kind {
+            self.0.lock().unwrap().push(*through_step);
+        }
+        Flow::Continue
+    }
+}
+
+impl Folds {
+    /// The fold steps as indices into the step requests, which are one-based
+    /// steps in order.
+    fn indices(&self) -> Vec<usize> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| *s as usize - 1)
+            .collect()
+    }
+}
+
+fn call(name: &str, args: serde_json::Value) -> ToolCall {
+    ToolCall {
+        name: name.into(),
+        arguments: args,
+    }
+}
+
+fn open_policy() -> Policy {
+    Policy::default()
+        .layer("test")
+        .allow_read("*")
+        .allow_write("*")
+        .allow_exec("*")
+}
+
+/// A contract that can never be satisfied, so the loop runs its whole step budget.
+fn never_passes(root: &Path, steps: u32) -> TaskContract {
+    TaskContract::workspace("exercise the assembler", root)
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "unreachable.txt".into(),
+            needle: "never".into(),
+        })
+        .with_max_steps(steps)
+}
+
+/// The prompt's three parts. `user` is `head + section + tail`, and the section is
+/// what assembly produced — so the property is asserted over the section, with the
+/// framing either side asserted equal rather than assumed to be.
+fn split(user: &str) -> (String, String, String) {
+    let head = FRAME;
+    let from = user.find(head).expect("the workspace prompt frame") + head.len();
+    let rest = &user[from..];
+    let to = rest.find("\n\nCall a tool").unwrap_or(rest.len());
+    (
+        user[..from].to_string(),
+        rest[..to].to_string(),
+        rest[to..].to_string(),
+    )
+}
+
+/// The line a workspace prompt puts above the observation section.
+const FRAME: &str = "Observations so far (results of your tool calls):\n";
+
+/// What the section says when the run has observed nothing yet.
+const EMPTY_LOG: &str = "(nothing yet — start by grepping or finding)";
+
+/// The memory block, or the empty string when the turn carried none.
+fn memory_block(section: &str) -> String {
+    let Some(from) = section.find("\n[memory]") else {
+        return String::new();
+    };
+    let rest = &section[from + 1..];
+    let to = rest.find("\n\n[").unwrap_or(rest.len());
+    rest[..to].to_string()
+}
+
+/// Every step's prompt is the step before it plus new bytes at the end.
+///
+/// The transcript is a pure function of the system string, the framing either side
+/// of the observation section, the section itself and the turns so far — so a
+/// system string that did not change, framing that did not change and a section
+/// that only grew at the end is a vendor-side prefix that was not disturbed. Each
+/// of the three is asserted rather than argued.
+fn assert_append_only(requests: &[CompletionRequest], except: &[usize]) {
+    for i in 1..requests.len() {
+        if except.contains(&i) {
+            continue;
+        }
+        let (before, after) = (&requests[i - 1], &requests[i]);
+        assert_eq!(
+            before.system, after.system,
+            "step {i} changed the system prompt, which is the head of every prefix"
+        );
+        let (head_a, section_a, tail_a) = split(&before.user);
+        let (head_b, section_b, tail_b) = split(&after.user);
+        assert_eq!(head_a, head_b, "step {i} changed the framing above the log");
+        assert_eq!(tail_a, tail_b, "step {i} changed the framing below the log");
+        // The first step's section is the placeholder that stands in for an empty
+        // log, and the second step replaces it rather than extending it. That is
+        // one transition per run, at the point where there is no prefix to keep,
+        // and it is exempted by matching the placeholder exactly rather than by
+        // exempting the first step — an exemption that reads "index 1" would go on
+        // covering step 2 the day something else moved into that position.
+        if section_a == EMPTY_LOG {
+            continue;
+        }
+        assert!(
+            section_b.starts_with(&section_a),
+            "step {i} rewrote what step {} was shown.\nbefore:\n{section_a}\nafter:\n{section_b}",
+            i - 1
+        );
+    }
 }
 
 // ------------------------------------------------------- F1: a re-read appends
@@ -125,4 +321,243 @@ async fn f1_a_stale_read_is_appended_at_the_tail_and_the_original_becomes_a_stab
         );
         previous = text;
     }
+}
+
+// ------------------------------------------------- F2: the memory block is held
+
+/// F2 — the notes render once and then stand still. A note the run writes about
+/// its own work is an observation, not a rewrite of the block above everything.
+///
+/// The block is re-read from the store every turn by design, and it renders ahead
+/// of the observations, so through 0.84.0 one `remember` call moved the earliest
+/// user text in the prompt and cost the cache from the first byte on.
+#[tokio::test]
+async fn f2_a_note_written_mid_run_does_not_move_the_memory_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let key = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    // One note from an earlier run, so there is a block to hold still.
+    store
+        .memory_put(&key, "earlier", "the parser rejects a trailing comma", 1, 1)
+        .unwrap();
+
+    // A different file each step: repeating one call is what the stall policy is
+    // for, and a run that stalls never reaches the steps this case is about.
+    for i in 0..8 {
+        std::fs::write(dir.path().join(format!("f{i}.txt")), format!("file {i}\n")).unwrap();
+    }
+    let script = Script::new(
+        (0..8)
+            .map(|i| match i {
+                2 => vec![call(
+                    "remember",
+                    json!({ "key": "midrun", "value": "this run learned something" }),
+                )],
+                _ => vec![call("read_file", json!({ "path": format!("f{i}.txt") }))],
+            })
+            .collect(),
+    );
+    run_with(
+        &never_passes(dir.path(), 8),
+        &script,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let requests = script.steps();
+    assert!(requests.len() >= 8, "the fixture must reach step 8");
+    let at_two = memory_block(&split(&requests[1].user).1);
+    assert!(
+        at_two.contains("earlier"),
+        "the fixture needs a memory block to hold still, got:\n{at_two}"
+    );
+    for (i, request) in requests.iter().enumerate().skip(3).take(5) {
+        assert_eq!(
+            memory_block(&split(&request.user).1),
+            at_two,
+            "step {} rendered a different memory block from step 2",
+            i + 1
+        );
+    }
+    assert!(
+        !split(&requests[7].user).1.contains("this run learned"),
+        "a note written mid-run belongs to the run's observations, not to the block \
+         above them"
+    );
+    assert_append_only(&requests, &[]);
+}
+
+// ------------------------------------------- F8: the budget is held between folds
+
+/// F8 — a `max_tokens` run's assembly budget does not shrink under it.
+///
+/// `effective_tokens` is computed from what the run has left, so through 0.84.0
+/// every step assembled against a smaller ceiling than the one before it and the
+/// fit rule stubbed one more entry at a time — a rewrite of the head with no fold
+/// anywhere near it.
+#[tokio::test]
+async fn f8_a_token_budgeted_run_does_not_stub_its_way_down_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..8 {
+        std::fs::write(
+            dir.path().join(format!("f{i}.txt")),
+            format!("file {i}\n{}", "filler line\n".repeat(30)),
+        )
+        .unwrap();
+    }
+    let script = Script::new(
+        (0..8)
+            .map(|i| vec![call("read_file", json!({ "path": format!("f{i}.txt") }))])
+            .collect(),
+    );
+    // Compaction is left at its default. `keep_recent` is 8, so eight observations
+    // cannot fold and the run reaches step 8 without one — the property is being
+    // asserted over ordinary steps rather than over the one step allowed to break
+    // it. The token budget is what makes `effective_tokens` shrink under the
+    // assembler, which is the whole point of the case.
+    let contract = never_passes(dir.path(), 8)
+        .with_token_budget(200_000)
+        .with_context_budget(ContextBudget {
+            max_tokens: 8_000,
+            share: 0.5,
+        });
+    let store = Store::memory().unwrap();
+    run_with(&contract, &script, &store, &open_policy(), &ApproveAll)
+        .await
+        .unwrap();
+
+    let requests = script.steps();
+    assert!(requests.len() >= 8, "the fixture must reach step 8");
+    assert!(
+        !split(&requests[7].user).1.contains("older than the current context window"),
+        "eight reads fit this ceiling, so nothing may have been elided:\n{}",
+        split(&requests[7].user).1
+    );
+    assert_append_only(&requests, &[]);
+}
+
+// ------------------------------------------------ F4: the rungs wait for a fold
+
+/// F4 — with the ladder rungs on, an entry is untouched until the fold and
+/// rewritten only there. The rungs keep their meaning; what changed is what they
+/// judge an entry's age against.
+///
+/// A rung is a rewrite of the middle of the prompt, and a rewrite is free exactly
+/// once: at the fold, where the prefix is being thrown away anyway. Gating the
+/// rungs on the fold *step* is not enough and was tried first — a rung that fires
+/// at the fold and lapses on the next step rewrites the prompt twice, once to
+/// elide the entry and once to bring it back. Judged against the step the prefix
+/// was built at, a rung's output is the same on every step between two folds.
+#[tokio::test]
+async fn f4_the_ladder_rungs_do_not_rewrite_an_entry_before_the_fold() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..14 {
+        std::fs::write(
+            dir.path().join(format!("f{i}.txt")),
+            format!("file {i}\n{}", "filler line\n".repeat(120)),
+        )
+        .unwrap();
+    }
+    // A lookup per step, which is the kind `snip` drops, beside a read that
+    // carries enough bytes for the ledger to cross the fold threshold once
+    // `keep_recent` stops holding it back.
+    let script = Script::new(
+        (0..14)
+            .map(|i| {
+                vec![
+                    call("grep", json!({ "pattern": format!("fn{i}"), "path": "." })),
+                    call("read_file", json!({ "path": format!("f{i}.txt") })),
+                ]
+            })
+            .collect(),
+    );
+    // `keep_recent` is what decides whether the fold gets there first. At the
+    // default of 8 this fixture crosses the assembly ceiling before it has enough
+    // entries to fold, and a run that cannot fold has nothing but the fit rule to
+    // hold its ceiling with — which is a different case, and the one
+    // `tests/context.rs` already owns.
+    let contract = never_passes(dir.path(), 14)
+        .with_context_budget(ContextBudget {
+            max_tokens: 2_000,
+            share: 0.5,
+        })
+        // Six kept entries is three of this script's steps, so the fold leaves
+        // something older than `snip`'s two-step grace for the rung to act on. Keep
+        // fewer and the fold itself removes every site the rung would have had.
+        .with_compaction(io_harness::Compaction {
+            at_share: 0.8,
+            keep_recent: 6,
+        })
+        .with_ladder(Ladder {
+            reduce: true,
+            snip: Some(io_harness::context::Snip {
+                older_than_steps: 2,
+            }),
+            microcompact: true,
+            ..Default::default()
+        });
+    let store = Store::memory().unwrap();
+    let folds = Folds::default();
+    run_with_observed(
+        &contract,
+        &script,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+        &folds,
+    )
+    .await
+    .unwrap();
+
+    let requests = script.steps();
+    let sections: Vec<String> = requests.iter().map(|r| split(&r.user).1).collect();
+    let folded_at = sections
+        .iter()
+        .position(|s| s.contains("[earlier work, summarised]"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the fixture must fold, or it is not testing when a rung runs — {} step(s), last \
+                 section {} chars:\n{}",
+                sections.len(),
+                sections.last().map(|s| s.len()).unwrap_or(0),
+                sections.last().cloned().unwrap_or_default()
+            )
+        });
+    for (i, section) in sections.iter().enumerate().take(folded_at) {
+        assert!(
+            !section.contains("dropped as a lookup"),
+            "step {} ran a rung before the fold at step {folded_at}:\n{section}",
+            i + 1
+        );
+    }
+    assert!(
+        sections[folded_at].contains("dropped as a lookup"),
+        "the rung must still run, and the fold is where it runs:\n{}",
+        sections[folded_at]
+    );
+    for (i, section) in sections.iter().enumerate().skip(folded_at + 1) {
+        assert!(
+            section.contains("dropped as a lookup"),
+            "step {} un-dropped what the fold at step {folded_at} dropped, which is a \
+             rewrite in the other direction:\n{section}",
+            i + 1
+        );
+    }
+    // A fold is the one deliberate break, and this fixture is tight enough to make
+    // several. They come from the run's own `Compacted` events rather than from
+    // reading the prompts: a step excepted because its prompt changed would except
+    // exactly the failure this is looking for.
+    let folded = folds.indices();
+    assert!(
+        folded.contains(&folded_at),
+        "the fold this read out of the prompts must be one the run announced: \
+         {folded:?} against {folded_at}"
+    );
+    assert_append_only(&requests, &folded);
 }

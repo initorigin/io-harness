@@ -28,6 +28,19 @@ struct Seen(std::sync::Mutex<Vec<String>>, Vec<Vec<ToolCall>>);
 
 impl Provider for Seen {
     async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        // A fold's summarisation request carries no tools and must be answered with
+        // prose: a summariser that says nothing is not allowed to replace the notes
+        // with nothing, so an empty answer aborts the fold and a fixture written to
+        // fold silently never does. It takes no slot in the script either — the
+        // script is the agent's turns, and this is not one of them. It is not
+        // recorded either: the script is indexed by how many prompts have been
+        // seen, so recording it would slide every later step onto the wrong turn.
+        if req.tools.is_empty() {
+            return Ok(CompletionResponse {
+                text: Some("the run read a few files".into()),
+                ..Default::default()
+            });
+        }
         let mut seen = self.0.lock().unwrap();
         let i = seen.len();
         seen.push(req.user.clone());
@@ -196,12 +209,21 @@ async fn a_turn_about_one_subject_carries_the_notes_about_that_subject() {
     }
 }
 
-/// F2 — a path the run has already read counts as a signal, so the second turn
-/// of a run recalls differently from its first.
+/// F2 — a path the run has already read counts as a signal, and the block that
+/// signal chooses is then held still for the rest of the run.
 ///
 /// The goal deliberately names nothing in the store: with signals from the goal
 /// alone the sandbox notes have no claim, and the newest cohort survives. It is
 /// reading the file that moves them.
+///
+/// **(0.85.0) The ranking is taken once per run and again at each fold, not once
+/// per step.** The block renders ahead of everything the run observes, so a block
+/// that re-ranked mid-run rewrote the earliest bytes of the prompt on a step where
+/// nothing else had changed — one cache miss per step, for a re-ordering the model
+/// had already read. What the signal decides is unchanged; when it is asked is.
+/// Across the turns of a session the signal still moves the block, because a turn's
+/// ledger is seeded with the turns before it — that is
+/// [`a_session_turn_recalls_by_what_the_turn_before_it_read`].
 #[tokio::test]
 async fn a_path_the_run_has_read_is_a_signal_the_next_turn_recalls_by() {
     let dir = tempfile::tempdir().unwrap();
@@ -238,19 +260,131 @@ async fn a_path_the_run_has_read_is_a_signal_the_next_turn_recalls_by() {
         "with no signal at all the newest note is kept, as it was through 0.56.0:\n{}",
         seen[0]
     );
-    // Turn two: the run has read `sandbox.rs`, and `sandbox` is a word three
-    // notes share.
-    for kept in ["n04", "n05"] {
-        assert!(
-            seen[1].contains(&format!("- {kept}:")),
-            "the run has read sandbox.rs and {kept} is about the sandbox:\n{}",
-            seen[1]
-        );
+    // Step two: the block the run started with, byte for byte. The run has read
+    // `sandbox.rs` by now and `sandbox` is a word three notes share, but the block
+    // sits ahead of everything the run observes and re-ranking it here would move
+    // the earliest bytes of the prompt on a step where nothing else had.
+    assert_eq!(
+        block(&seen[0]),
+        block(&seen[1]),
+        "the block is taken once per run and held; step two re-ranked it"
+    );
+}
+
+/// The memory block of a prompt, which is what must stand still within a run.
+fn block(prompt: &str) -> &str {
+    let from = prompt.find("\n[memory]").expect("the prompt carries a block");
+    let rest = &prompt[from..];
+    let to = ["\n<external_content>", "\n\nCall a tool", "\n\n["]
+        .iter()
+        .filter_map(|mark| rest.find(mark))
+        .min()
+        .unwrap_or(rest.len());
+    rest[..to].trim_end()
+}
+
+/// F2 (the fold half, 0.85.0) — the signal still moves the block, and a fold is
+/// where it moves it.
+///
+/// The ranking is asked for again whenever the prefix is being rebuilt anyway, and
+/// by then the run has read the file — so the sandbox notes take the block that the
+/// newest cohort held at run start. This is the coverage the case above used to
+/// carry at step granularity, at the granularity 0.85.0 moved it to. Without it,
+/// "the signal still decides" would be a claim with nothing asserting it.
+///
+/// The signals are taken before the fold runs, which is what makes the read
+/// countable: a fold folds the read away, and a ranking taken after it would see a
+/// summary and no path at all.
+#[tokio::test]
+async fn a_fold_re_ranks_the_block_by_what_the_run_has_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let key = ws_key(dir.path());
+    three_subjects(&store, &key);
+    std::fs::write(
+        dir.path().join("sandbox.rs"),
+        "// the file this run reads\n",
+    )
+    .unwrap();
+    for i in 0..6 {
+        std::fs::write(
+            dir.path().join(format!("f{i}.txt")),
+            format!("file {i}\n{}", "filler line\n".repeat(60)),
+        )
+        .unwrap();
     }
+
+    let mut script = vec![vec![ToolCall {
+        name: "read_file".into(),
+        arguments: json!({ "path": "sandbox.rs" }),
+    }]];
+    script.extend((0..6).map(|i| {
+        vec![ToolCall {
+            name: "read_file".into(),
+            arguments: json!({ "path": format!("f{i}.txt") }),
+        }]
+    }));
+    let steps = script.len() as u32;
+    let seen = Seen(std::sync::Mutex::new(Vec::new()), script);
+
+    // The same 1,000-token ceiling the rest of this file ranks under: a block that
+    // holds every note makes a ranking unobservable, which is what a wider one did
+    // when this case was first written.
+    let contract = TaskContract::workspace("carry out the assignment", dir.path())
+        .with_max_steps(steps)
+        .with_context_budget(ContextBudget {
+            max_tokens: 1_000,
+            share: 0.5,
+        })
+        .with_compaction(io_harness::Compaction {
+            at_share: 0.8,
+            keep_recent: 2,
+        });
+    run_with(
+        &contract,
+        &seen,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .expect("the run itself must not error");
+
+    let prompts = seen.0.lock().unwrap().clone();
+    let first = prompts
+        .iter()
+        .find(|p| p.contains("\n[memory]"))
+        .expect("the first step carried a block");
+    // The first fold, and not the last prompt: a fold folds the read away, so by the
+    // second fold the path is no longer among the signals and the ranking falls back
+    // to recency. What is being asserted is that a fold asks again, and the first one
+    // is where the answer is visibly different.
+    let last = prompts
+        .iter()
+        .find(|p| p.contains("[earlier work, summarised]"))
+        .expect("the fixture must fold, or there is no re-ranking to observe");
+    // At run start nothing has been read, so the goal alone ranks and the sandbox
+    // notes have no claim.
     assert!(
-        !seen[1].contains("- n09:"),
-        "the path the run touched must outrank the note that is merely newest:\n{}",
-        seen[1]
+        !["n04", "n05"]
+            .iter()
+            .any(|kept| block(first).contains(&format!("- {kept}:"))),
+        "the fixture's premise is that the sandbox notes start with no claim:\n{}",
+        block(first)
+    );
+    // By the fold the run has read `sandbox.rs`, and `sandbox` is a word three
+    // notes share.
+    assert!(
+        ["n04", "n05"]
+            .iter()
+            .all(|kept| block(last).contains(&format!("- {kept}:"))),
+        "the run has read sandbox.rs and the fold is where that counts:\n{}",
+        block(last)
+    );
+    assert_ne!(
+        block(first),
+        block(last),
+        "a fold is where the ranking is asked for again; nothing moved"
     );
 }
 

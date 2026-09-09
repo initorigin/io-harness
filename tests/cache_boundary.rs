@@ -254,17 +254,21 @@ async fn the_boundary_appears_only_after_a_fold_and_only_once_the_prefix_repeats
 
 // ------------------------------------------------------------------------ F4
 
-/// F4 — a note written mid-run moves the prefix, and the marker is withdrawn for
-/// exactly one step.
+/// F4 — a note written mid-run no longer moves the prefix, so the marker stands.
 ///
-/// This is the criterion that exists because the roadmap's "immutable by construction"
-/// is not true of the whole prefix. `remember` writes to the store, the memory block is
-/// re-read every turn and renders *ahead* of the summary, so the frozen prefix moves
-/// underneath the summary without the summary changing at all. An implementation that
-/// compares the summary rather than the whole candidate prefix passes F3 and fails
-/// here, having asked the vendor to cache bytes it never sent.
+/// **This criterion was inverted by 0.85.0, and the inversion is the release.**
+/// Through 0.84.0 `remember` wrote to the store, the memory block was re-read every
+/// turn and rendered *ahead* of the summary, and the frozen prefix moved underneath
+/// the summary without the summary changing at all — so the guard withdrew the
+/// marker for a step and the run paid for a new prefix. 0.85.0 holds the block at
+/// what it was when the run last folded, so the note lands as an observation at the
+/// tail and the bytes above it do not move.
+///
+/// What the case still proves is what it always proved: that the guard compares the
+/// whole candidate prefix rather than the summary. It proves it from the other side
+/// now — the prefix a note used to move is asserted equal across the note.
 #[tokio::test]
-async fn a_note_written_mid_run_withdraws_the_marker_for_one_step() {
+async fn a_note_written_mid_run_leaves_the_marked_prefix_where_it_was() {
     let dir = workspace();
     // Read enough to fold, then keep reading, then write a note, then read again.
     let mut script: Vec<Vec<ToolCall>> = NAMES.iter().map(|n| vec![read(n)]).collect();
@@ -275,58 +279,83 @@ async fn a_note_written_mid_run_withdraws_the_marker_for_one_step() {
 
     let provider = Recorder::new(script);
     let store = Store::memory().unwrap();
-
-    run_with(
+    // A fold rebuilds the prefix on purpose, and the guard withdraws the marker for
+    // the step after one — that is 0.44.0's cost and it is unchanged. So the fold
+    // steps come from the run's own events, and every *other* withdrawal is the
+    // failure this case is looking for.
+    let folds = Folds::default();
+    let folded = std::sync::Arc::clone(&folds.0);
+    io_harness::run_with_observed(
         &contract(dir.path(), steps),
         &provider,
         &store,
         &open_policy(),
         &ApproveAll,
+        &folds,
     )
     .await
     .unwrap();
 
     let working = provider.working();
     let boundaries: Vec<Option<usize>> = working.iter().map(|r| r.cache_boundary).collect();
+    let folded = folded.lock().unwrap().clone();
 
     // The run must actually have marked something, or this asserts nothing.
     let first_marked = boundaries
         .iter()
         .position(Option::is_some)
         .expect("the run never marked a prefix");
+    // The note is written on the third step from the end.
+    let note_at = boundaries.len() - 3;
+    assert!(
+        note_at > first_marked,
+        "the fixture must write its note after the first mark, or it asserts nothing"
+    );
 
-    // Somewhere after the first mark the note lands and the marker is withdrawn.
-    let withdrawn = boundaries
-        .iter()
-        .enumerate()
-        .skip(first_marked)
-        .find(|(_, b)| b.is_none())
-        .map(|(i, _)| i)
-        .expect("the note never withdrew the marker; the prefix is not being compared whole");
+    for (i, boundary) in boundaries.iter().enumerate().skip(first_marked) {
+        let step = i as u32 + 1;
+        // A fold withdraws the marker for the step after it, which is the step that
+        // first sees the rebuilt prefix.
+        if boundary.is_none() && folded.iter().any(|f| *f + 1 == step || *f == step) {
+            continue;
+        }
+        assert!(
+            boundary.is_some(),
+            "step {step} withdrew the marker and no fold explains it, so something \
+             moved the prefix that nothing is allowed to move any more. folds: {folded:?}"
+        );
+    }
 
-    // The step after the withdrawal is marked again — one step, not permanently.
-    let back = boundaries
-        .get(withdrawn + 1)
-        .copied()
-        .flatten()
-        .expect("the marker never came back after the note");
-
-    // And the prefix that came back is a different one: the memory block grew.
-    let before = marked(&working[first_marked]).expect("the earlier marked prefix");
-    let after = &working[withdrawn + 1].user[..back];
-    assert_ne!(
+    // And the note itself moved nothing: the prefix marked on the step after it is
+    // the prefix marked on the step before it, byte for byte.
+    let before = marked(&working[note_at - 1]).expect("the prefix before the note");
+    let after = marked(&working[note_at + 1]).expect("the prefix after the note");
+    assert_eq!(
         before, after,
-        "the prefix after the note must differ, or nothing moved and the withdrawal \
-         was spurious"
+        "the marked prefix must be the same one, or the note moved it after all"
     );
     assert!(
-        after.contains("the parser lives in src/parse.rs"),
-        "the note is what moved the prefix, so it must be inside the new one"
+        !after.contains("the parser lives in src/parse.rs"),
+        "a note written mid-run belongs to the run's observations at the tail, never \
+         to the block above them"
     );
     assert!(
-        working[withdrawn + 1].user.starts_with(after),
+        working[note_at + 1].user.starts_with(after),
         "the marked span must still be a prefix of the request"
     );
+}
+
+/// The steps a run folded on.
+#[derive(Default)]
+struct Folds(std::sync::Arc<std::sync::Mutex<Vec<u32>>>);
+
+impl io_harness::Observer for Folds {
+    fn event(&self, event: &io_harness::RunEvent) -> io_harness::Flow {
+        if let EventKind::Compacted { through_step, .. } = &event.kind {
+            self.0.lock().unwrap().push(*through_step);
+        }
+        io_harness::Flow::Continue
+    }
 }
 
 // ------------------------------------------------------------------------ N6
@@ -460,7 +489,14 @@ fn nothing_shipped_still_denies_the_second_breakpoint() {
 /// This is 0.34.0's `Routed` defect reproduced deliberately: a rule applied to each
 /// freshly built request reports a transition every step and stops meaning anything.
 /// The count is what discriminates — a run marking one prefix for many steps emits
-/// once, and the withdrawal-and-return of F4 emits a second time and no more.
+/// once, and it stays once for as long as that prefix stands.
+///
+/// (0.85.0) It is now exactly once for this fixture. The second event used to come
+/// from the withdrawal and return F4 asserted, and F4 has been inverted: a note
+/// written mid-run no longer moves the block above the summary, so there is no
+/// second prefix to announce. The discrimination the case exists for is unchanged —
+/// a rule applied to each freshly built request would report a transition on every
+/// one of these steps.
 #[tokio::test]
 async fn cache_marked_fires_on_change_and_not_once_per_step() {
     let dir = workspace();
@@ -503,8 +539,8 @@ async fn cache_marked_fires_on_change_and_not_once_per_step() {
     );
     assert_eq!(
         events.len(),
-        2,
-        "one for the first prefix and one for the prefix the note moved it to, got {events:?}"
+        1,
+        "one for the first prefix, and nothing after it moved the prefix, got {events:?}"
     );
 
     // Each event's `prefix_bytes` is the offset that was actually sent on that step,
@@ -519,8 +555,9 @@ async fn cache_marked_fires_on_change_and_not_once_per_step() {
         assert!(*through_step > 0, "a marker is never sent before step 1");
     }
 
-    // The two prefixes really are different, which is what "on change" means.
-    assert_ne!(events[0].1, events[1].1, "{events:?}");
+    // And the one event marks a real span rather than an empty one, which is what
+    // keeps "fires on change" from being satisfied by firing on nothing.
+    assert!(events[0].1 > 0, "{events:?}");
 }
 
 /// The negative control: a run that cannot fold emits none.

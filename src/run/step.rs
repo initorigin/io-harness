@@ -1049,6 +1049,10 @@ pub(super) async fn run_workspace_from<P: Provider>(
     // whose summary assembly stubbed, and on a resume — a resumed run has sent this
     // prefix zero times from where it now stands, so it earns the marker again.
     let mut marked_prefix = PrefixGuard::default();
+    // 0.85.0 — the assembly inputs this run holds still between folds, run-scoped
+    // for the same reason `marked_prefix` is: what they must be is decided by what
+    // the run has done, not by what this step recomputed.
+    let mut frozen = Frozen::default();
     // 0.70.0 — has the criterion ever judged this run and said no? Held here for
     // the same reason `marked_prefix` above is: it is a fact about the run rather
     // than about a step, and the loop's tail is where it is needed and where the
@@ -1291,7 +1295,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
             )
         });
         let (response, assembled, user) = loop {
-            fold_tokens += compact_ledger(
+            let fold = compact_ledger(
                 provider,
                 contract,
                 store,
@@ -1305,11 +1309,20 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 fold_forced(recovered, 0, &mut fold_asked),
             )
             .await?;
+            fold_tokens += fold.tokens;
+            // 0.85.0 — the notes and the budget are held at what they were when
+            // this run last folded, because both change under the assembler on a
+            // step that observed nothing: the notes are re-read from the store
+            // every turn, and `effective_tokens` shrinks as a `max_tokens` run
+            // spends. Either one moves the head of the prompt, and a moved head is
+            // the whole prefix.
+            frozen.hold(fold.folded, step, budget_tokens, &notes, &global_notes);
+            let (frozen_notes, frozen_global) = frozen.notes();
             let mut assembled = assemble(
                 &mut ledger,
-                budget_tokens,
-                &notes,
-                &global_notes,
+                frozen.budget(budget_tokens),
+                frozen_notes,
+                frozen_global,
                 Assembly {
                     ws: Some(&ws),
                     policy: &effective,
@@ -1318,6 +1331,8 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     step,
                     collapse: contract.collapse,
                     ladder: contract.ladder,
+                    since: frozen.since(),
+                    folding: fold.folded || !contract.compaction.enabled(),
                 },
             )
             .await?;

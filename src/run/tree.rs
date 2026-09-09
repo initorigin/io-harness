@@ -516,6 +516,10 @@ where
         // prompt from its own ledger, so one agent's frozen prefix says nothing about
         // another's, and a shared one would mark a prefix this agent has never sent.
         let mut marked_prefix = PrefixGuard::default();
+        // 0.85.0 — the assembly inputs this agent holds still between folds. Each
+        // agent in the tree has its own, because each has its own ledger and its
+        // own folds.
+        let mut frozen = Frozen::default();
         // 0.49.0 — per agent in the tree, for the reason the flat loop keeps one per
         // run: a child's turns are its own and must never reach its parent's request.
         //
@@ -671,7 +675,7 @@ where
             let mut fold_tokens = 0;
             let mut recovered = false;
             let (response, assembled, user) = loop {
-                fold_tokens += compact_ledger(
+                let fold = compact_ledger(
                     tree.provider,
                     contract,
                     tree.store,
@@ -685,11 +689,17 @@ where
                     fold_forced(recovered, depth, &mut fold_asked),
                 )
                 .await?;
+                fold_tokens += fold.tokens;
+                // 0.85.0 — held between folds, exactly as the flat loop holds
+                // them. One rule, two loops, and a rule spelled out twice is the
+                // drift `tests/session_fanout.rs` exists to catch.
+                frozen.hold(fold.folded, step, budget_tokens, &notes, &global_notes);
+                let (frozen_notes, frozen_global) = frozen.notes();
                 let mut assembled = assemble(
                     &mut ledger,
-                    budget_tokens,
-                    &notes,
-                    &global_notes,
+                    frozen.budget(budget_tokens),
+                    frozen_notes,
+                    frozen_global,
                     Assembly {
                         ws: Some(&ws),
                         // 0.74.0 — the policy this agent is running under, which is
@@ -705,6 +715,8 @@ where
                         // and `fold_now` already draw at a spawn.
                         collapse: contract.collapse,
                         ladder: contract.ladder,
+                        since: frozen.since(),
+                        folding: fold.folded || !contract.compaction.enabled(),
                     },
                 )
                 .await?;

@@ -315,6 +315,71 @@ impl PrefixGuard {
     }
 }
 
+/// The assembly inputs a run holds still between folds (0.85.0).
+///
+/// Two of the six things that moved the prefix every step were not in the
+/// assembler at all — they were what the loop handed it.
+///
+/// - **The notes.** They are re-read from the store every turn by design, so a
+///   note the run writes about its own work changes the earliest user text.
+/// - **The budget.** With a `[run] max_tokens` ceiling, `effective_tokens` shrinks
+///   as the run spends, so the fit loop's ceiling is lower on every step and the
+///   oldest entries are stubbed progressively even when nothing folds.
+///
+/// Both are held at the value they had when the run last folded — or at run start,
+/// which is the first frozen prefix a run has. A fold is the one point where the
+/// prefix is deliberately thrown away, so it is the one point where refreshing
+/// them costs nothing that was not already being paid.
+///
+/// Run-scoped state held by the loop and passed in, exactly as [`PrefixGuard`] is
+/// and for the same reason: a rule applied to freshly-built inputs cannot detect
+/// its own transition.
+#[derive(Default)]
+pub(super) struct Frozen {
+    budget: Option<u64>,
+    notes: Option<(Vec<MemoryEntry>, Vec<MemoryEntry>)>,
+    since: u32,
+}
+
+impl Frozen {
+    /// Take this step's inputs if the run has none yet or has just folded, and
+    /// keep what is already held otherwise.
+    pub(super) fn hold(
+        &mut self,
+        folded: bool,
+        step: u32,
+        budget: u64,
+        notes: &[MemoryEntry],
+        global: &[MemoryEntry],
+    ) {
+        if folded || self.budget.is_none() {
+            self.budget = Some(budget);
+            self.notes = Some((notes.to_vec(), global.to_vec()));
+            self.since = step;
+        }
+    }
+
+    /// The step the prefix now being extended was built at, which is what every
+    /// ladder rung judges an entry's age against.
+    pub(super) fn since(&self) -> u32 {
+        self.since
+    }
+
+    /// The budget to assemble against. `live` is used only before the first
+    /// [`Frozen::hold`], which no loop reaches.
+    pub(super) fn budget(&self, live: u64) -> u64 {
+        self.budget.unwrap_or(live)
+    }
+
+    /// The notes to assemble with, workspace scope first.
+    pub(super) fn notes(&self) -> (&[MemoryEntry], &[MemoryEntry]) {
+        match &self.notes {
+            Some((notes, global)) => (notes, global),
+            None => (&[], &[]),
+        }
+    }
+}
+
 /// This step's boundary, emitting [`EventKind::CacheMarked`] when the marked prefix
 /// changes.
 ///
@@ -424,6 +489,31 @@ pub(super) fn fold_forced(recovered: bool, depth: u32, asked: &mut bool) -> bool
 }
 
 #[allow(clippy::too_many_arguments)]
+/// What one fold attempt did (0.85.0).
+///
+/// The token count on its own could never answer "did this step fold": a fold that
+/// re-read a stored summary rather than buying one spends nothing, and so does a
+/// fold that did not happen. Everything a step decides about *how* it renders the
+/// work it has already shown now hangs on that distinction, so it is stated rather
+/// than inferred.
+pub(super) struct Fold {
+    /// Tokens the fold spent — zero when it did not fold, and zero when it re-read
+    /// a stored summary rather than buying one.
+    pub(super) tokens: u64,
+    /// Whether the ledger was actually replaced by a summary at this step.
+    pub(super) folded: bool,
+}
+
+impl Fold {
+    /// A step that did not fold, whatever the reason.
+    fn none(tokens: u64) -> Self {
+        Self {
+            tokens,
+            folded: false,
+        }
+    }
+}
+
 pub(super) async fn compact_ledger<P: Provider>(
     provider: &P,
     contract: &TaskContract,
@@ -446,14 +536,14 @@ pub(super) async fn compact_ledger<P: Provider>(
     // off asked for 0.42.0's behaviour, and dying on an over-window request is
     // part of what they asked for.
     forced: bool,
-) -> Result<u64> {
+) -> Result<Fold> {
     let folding = contract.compaction;
     if !folding.enabled() {
-        return Ok(0);
+        return Ok(Fold::none(0));
     }
     let keep = folding.keep();
     if ledger.len() <= keep {
-        return Ok(0);
+        return Ok(Fold::none(0));
     }
     // Fold from the front, and never past the watermark: an observation the store
     // has not got yet is one a summary would erase rather than stand in for, and
@@ -461,11 +551,11 @@ pub(super) async fn compact_ledger<P: Provider>(
     // acceptable at all.
     let count = (ledger.len() - keep).min(*written);
     if count == 0 {
-        return Ok(0);
+        return Ok(Fold::none(0));
     }
     let before_tokens = ledger.est_tokens();
     if !forced && before_tokens < folding.threshold_tokens(budget_tokens) {
-        return Ok(0);
+        return Ok(Fold::none(0));
     }
 
     // The stored half, and the reason a resumed, branched or replayed run reaching
@@ -536,7 +626,10 @@ pub(super) async fn compact_ledger<P: Provider>(
                 // nothing. Stubbing is what 0.42.0 would have done here, and it is
                 // strictly better than an empty paragraph. The call still
                 // happened and is still billed.
-                return Ok(spent);
+                //
+                // (0.85.0) And it is not a fold: the ledger is untouched, so
+                // nothing this step renders may change either.
+                return Ok(Fold::none(spent));
             }
             // Written before the ledger is edited, so a process that dies between
             // the call and the next request has already kept what it paid for.
@@ -571,7 +664,7 @@ pub(super) async fn compact_ledger<P: Provider>(
         ),
     );
     if folded == 0 {
-        return Ok(spent);
+        return Ok(Fold::none(spent));
     }
     // The summary itself is never a `ledger_observations` row — it is a
     // `summaries` row — so it sits below the watermark rather than waiting to be
@@ -589,7 +682,10 @@ pub(super) async fn compact_ledger<P: Provider>(
             after_tokens,
         },
     ));
-    Ok(spent)
+    Ok(Fold {
+        tokens: spent,
+        folded: true,
+    })
 }
 
 /// Call the provider, retrying a failing call up to `max_retries` times. Each

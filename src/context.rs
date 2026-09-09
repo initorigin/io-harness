@@ -1183,6 +1183,36 @@ pub struct Assembly<'a> {
     /// The rungs between Collapse and a fold (0.81.0). [`Ladder::default`] is
     /// every rung off, which assembles exactly what 0.80.0 assembled.
     pub ladder: Ladder,
+    /// (0.85.0) The step the prefix this run is extending was built at — the last
+    /// fold's step, or the run's first step before there has been one.
+    ///
+    /// Every ladder rung judges an entry's age against this rather than against
+    /// [`step`](Assembly::step), and that one substitution is what makes a rung's
+    /// output the same on every step between two folds. Judged against the
+    /// assembling step instead, `snip` drops one more lookup each step as the run
+    /// walks away from it — which is a rewrite of the middle of the prompt on a
+    /// step where nothing folded.
+    ///
+    /// It also makes the rungs inert before the first fold without a flag saying
+    /// so: no entry is older than the step the run started on.
+    pub since: u32,
+    /// (0.85.0) Whether this step may change how an entry it has already shown
+    /// renders.
+    ///
+    /// A fold is the one point in a run where the prompt's head is deliberately
+    /// thrown away and rebuilt, so it is the one point where eliding an older
+    /// entry costs nothing that was not already being paid. Between folds every
+    /// entry renders as it first rendered and the ledger only grows, which is what
+    /// makes each step's text a byte prefix of the next — and therefore what a
+    /// vendor's prompt cache can serve.
+    ///
+    /// All four ladder rungs are held behind this, and so is the fit rule —
+    /// except on a step whose entries do not fit the ceiling at all, where
+    /// assembly elides anyway because there is nothing else it can do. `false` is
+    /// the ordinary step; the caller sets `true` on a step that folded, and on
+    /// every step of a run whose caller turned folding off — asking for 0.42.0's
+    /// behaviour is asking for its prompt bounds too.
+    pub folding: bool,
 }
 
 /// The observation section for one turn, and what it cost.
@@ -1535,6 +1565,8 @@ pub async fn assemble(
         step,
         collapse,
         ladder,
+        since,
+        folding,
     } = at;
     let cap = entry_cap_chars(budget_tokens);
     let mut out = Assembled::default();
@@ -1566,7 +1598,17 @@ pub async fn assemble(
     // re-divided — which is why it runs before any rung that drops something.
     // Conditional on the overflow rather than always on, because a run that fits
     // has nothing to gain and its notes would be shortened for no reason.
-    let notes_share = if ladder.reduce && ledger.est_tokens() > budget_tokens {
+    // (0.85.0) Measured over the ledger as it stood at the last fold, not as it
+    // stands now: a rung whose condition is met partway through a run is a rung
+    // that trims the memory block — the very head of the prompt — on a step where
+    // nothing else changed.
+    let ledger_at_fold: u64 = ledger
+        .entries()
+        .iter()
+        .filter(|e| e.step < since)
+        .map(|e| estimate_tokens(&e.text))
+        .sum();
+    let notes_share = if ladder.reduce && ledger_at_fold > budget_tokens {
         out.reduced = true;
         NOTES_SHARE_FLOOR
     } else {
@@ -1646,7 +1688,7 @@ pub async fn assemble(
             if superseded[i].is_some()
                 || elided[i].is_some()
                 || !Snip::droppable(entries[i].kind)
-                || step.saturating_sub(entries[i].step) <= snip.older_than_steps
+                || since.saturating_sub(entries[i].step) <= snip.older_than_steps
             {
                 continue;
             }
@@ -1672,7 +1714,7 @@ pub async fn assemble(
             if superseded[i].is_some()
                 || elided[i].is_some()
                 || entries[i].kind != ObsKind::Skill
-                || step.saturating_sub(entries[i].step) <= 1
+                || since.saturating_sub(entries[i].step) <= 1
             {
                 continue;
             }
@@ -1711,7 +1753,7 @@ pub async fn assemble(
             }
             // Never the step being assembled for: the agent has just made those
             // calls and is about to read their results.
-            if j - i >= MICROCOMPACT_MIN && at_step < step {
+            if j - i >= MICROCOMPACT_MIN && at_step < since {
                 // The replacement is built and measured before it is installed,
                 // because it is **not** one line: a stub still occupies its call's
                 // position, so the emission renders an elision line per entry and a
@@ -1761,6 +1803,20 @@ pub async fn assemble(
     // 4. Fit: newest first, whole while the running total stays inside the
     // ceiling; once one does not fit, every older entry is a stub. Superseded and
     // stale-unrefreshable entries never consume budget — they are stubs already.
+    //
+    // (0.85.0) It runs on a folding step, and on a step whose entries do not fit
+    // at all. The second case is not a loophole in the append-only property, it is
+    // the floor underneath it: `keep` may hold a ledger too short to fold, and a
+    // ceiling can be tighter than what a fold would leave behind, and a run in
+    // either state has no third option but to elide. What it must not do is elide
+    // *progressively* — one more entry per step as a shrinking budget catches up
+    // with it — which is what the frozen budget above already removed. A run that
+    // fits carries everything and rewrites nothing.
+    let total: u64 = (0..n)
+        .filter(|&i| superseded[i].is_none() && elided[i].is_none())
+        .map(|i| estimate_tokens(&entries[i].text))
+        .sum();
+    let fitting = folding || total > budget_tokens;
     let mut used = 0u64;
     let mut whole = vec![false; n];
     // 0.76.0 — Context Collapse. Where an entry would have been stubbed, its
@@ -1774,7 +1830,12 @@ pub async fn assemble(
         }
         let text = entries[i].text.as_str();
         let t = estimate_tokens(text);
-        if used + t > budget_tokens {
+        // (0.85.0) On a step that fits, the ceiling is not consulted at all. The
+        // walk is newest-first, so an entry that fits this step is an entry that
+        // may not fit the next one — a step's prompt rewriting what the step
+        // before it showed, whatever the budget does. Holding the ceiling is the
+        // fold's job, and `compact_ledger` is asked before assembly on every step.
+        if fitting && used + t > budget_tokens {
             // The rung beneath a fold: an entry that will not fit whole may still
             // fit shortened, and a shortened entry keeps its kind and its target
             // where a stub keeps neither. Carrying it does not end the walk —
@@ -1890,7 +1951,10 @@ pub async fn assemble(
         origin: entries[i].origin,
         text: text.to_string(),
     };
-    if stub_tokens <= stub_ceiling {
+    // (0.85.0) And the same rule holds for merging the elision lines themselves:
+    // their total grows with the run, so a step that merges them is a step that
+    // rewrites what the step before it showed.
+    if !fitting || stub_tokens <= stub_ceiling {
         for (i, (_, t)) in pieces.iter().enumerate() {
             out.text.push_str(t);
             out.emitted.push(piece(i, t));

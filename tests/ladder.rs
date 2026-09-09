@@ -123,6 +123,12 @@ async fn at(
             step,
             collapse: Collapse::default(),
             ladder,
+            // 0.85.0 — a rung judges an entry's age against the step the prefix
+            // was built at. These cases are about what a rung does once it fires,
+            // so they place that step at the assembling step, which is where every
+            // one of them was written to expect it.
+            since: step,
+            folding: true,
         },
     )
     .await
