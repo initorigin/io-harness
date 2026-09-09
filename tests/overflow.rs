@@ -118,7 +118,8 @@ fn an_overflow_is_not_retryable_and_the_reason_is_the_point() {
 fn the_classification_reaches_the_error_every_provider_builds() {
     // The funnel: no built-in provider classifies a status itself, so this is
     // where the three wires are proven not to have drifted apart.
-    let over = io_harness::Error::provider_status(400, None, "maximum context length is 8192");
+    let over =
+        io_harness::Error::provider_status(400, None, None, "maximum context length is 8192");
     match over {
         io_harness::Error::Provider { kind, status, .. } => {
             assert_eq!(kind, ProviderErrorKind::ContextOverflow);
@@ -127,7 +128,7 @@ fn the_classification_reaches_the_error_every_provider_builds() {
         other => panic!("expected a provider error, got {other:?}"),
     }
 
-    let ordinary = io_harness::Error::provider_status(400, None, "unknown parameter");
+    let ordinary = io_harness::Error::provider_status(400, None, None, "unknown parameter");
     match ordinary {
         io_harness::Error::Provider { kind, .. } => assert_eq!(kind, ProviderErrorKind::Request),
         other => panic!("expected a provider error, got {other:?}"),
@@ -205,6 +206,7 @@ mod the_recovery {
                 self.refusals.fetch_add(1, Ordering::SeqCst);
                 return Err(io_harness::Error::provider_status(
                     400,
+                    None,
                     None,
                     "This model's maximum context length is 8192 tokens, however you requested more",
                 ));

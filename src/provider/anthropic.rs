@@ -597,6 +597,9 @@ impl Anthropic {
         let resp = super::ensure_success(resp).await?;
 
         let mut acc = Accumulator::since(sent);
+        // 0.84.0 — before `read_sse`, which takes the response by value and
+        // consumes the body. There is nowhere later this could be read from.
+        let rate_limit = super::RateLimit::from_headers(resp.headers());
         read_sse(resp, |data| {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
                 if value.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
@@ -623,7 +626,9 @@ impl Anthropic {
             return Err(super::over_budget());
         }
         // A stream where nothing at all parsed is a failure, not a quiet model.
-        super::ensure_parsed(acc.finish())
+        let mut response = super::ensure_parsed(acc.finish())?;
+        response.rate_limit = rate_limit;
+        Ok(response)
     }
 }
 
@@ -1058,6 +1063,9 @@ impl Accumulator {
             ttft_ms: self.ttft_ms,
             citations: self.citations,
             server_tools: self.server_tools,
+            // The accumulator sees events, never headers. `stream` fills this
+            // from the response it read them off.
+            rate_limit: None,
         }
     }
 }

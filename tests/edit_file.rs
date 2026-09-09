@@ -127,7 +127,7 @@ struct MockAlwaysErr;
 
 impl Provider for MockAlwaysErr {
     async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
-        Err(io_harness::Error::provider_status(503, None, "down"))
+        Err(io_harness::Error::provider_status(503, None, None, "down"))
     }
 }
 

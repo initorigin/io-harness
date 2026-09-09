@@ -1450,6 +1450,7 @@ where
                 step_changed,
                 committed,
                 response.usage,
+                response.rate_limit.clone(),
             )?;
             // Only when the step actually committed. A step paused by a child is
             // deliberately left uncommitted so the resume replays it (0.7.0's

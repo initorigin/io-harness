@@ -387,7 +387,74 @@ fn parse_http_date(value: &str) -> Option<SystemTime> {
         hms.next()?.parse().ok()?,
         hms.next()?.parse().ok()?,
     );
-    if hms.next().is_some() || !(1..=31).contains(&day) || h > 23 || m > 59 || s > 60 {
+    if hms.next().is_some() {
+        return None;
+    }
+    civil_to_system_time(year, month, day, h, m, s)
+}
+
+/// Parse the RFC 3339 instant a vendor spells a rate-limit reset with
+/// (`2026-09-09T13:20:00Z`) into a `SystemTime` (0.84.0).
+///
+/// ponytail: UTC only — `Z`, or a `+00:00`/`-00:00` offset. Anthropic states its
+/// reset in UTC and every other family this crate reads states a duration, so a
+/// general offset parser would have no caller. A value in any other shape is
+/// *absent*, which is the same degradation [`parse_retry_after`] makes: the
+/// header is advice, and a wrong instant is worse than no instant.
+///
+/// A fractional second is accepted and discarded, because the field this feeds
+/// is a whole-second wait.
+pub(crate) fn parse_rfc3339(value: &str) -> Option<SystemTime> {
+    let value = value.trim();
+    let (date, rest) = value.split_once('T').or_else(|| value.split_once('t'))?;
+
+    // The zone comes off the end first: what remains is the time, and only then
+    // can a fractional second be split off it.
+    let time = match rest.as_bytes().last()? {
+        b'Z' | b'z' => &rest[..rest.len() - 1],
+        _ => {
+            let (time, offset) = rest.rsplit_once(['+', '-'])?;
+            // A non-zero offset is a real instant this parser declines to
+            // compute rather than one it gets wrong.
+            if offset != "00:00" && offset != "0000" && offset != "00" {
+                return None;
+            }
+            time
+        }
+    };
+    let time = time
+        .split_once('.')
+        .map_or(time, |(whole, _fraction)| whole);
+
+    let mut ymd = date.split('-');
+    let (year, month, day): (i64, i64, i64) = (
+        ymd.next()?.parse().ok()?,
+        ymd.next()?.parse().ok()?,
+        ymd.next()?.parse().ok()?,
+    );
+    let mut hms = time.split(':');
+    let (h, m, s): (i64, i64, i64) = (
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+    );
+    if ymd.next().is_some() || hms.next().is_some() || !(1..=12).contains(&month) {
+        return None;
+    }
+    civil_to_system_time(year, month, day, h, m, s)
+}
+
+/// A UTC civil date and time as a `SystemTime`, or `None` for a field out of
+/// range or an instant before the epoch.
+fn civil_to_system_time(
+    year: i64,
+    month: i64,
+    day: i64,
+    h: i64,
+    m: i64,
+    s: i64,
+) -> Option<SystemTime> {
+    if !(1..=31).contains(&day) || h > 23 || m > 59 || s > 60 {
         return None;
     }
 
