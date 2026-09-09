@@ -269,8 +269,8 @@ rather than four zeros, because an absent report is not a report of zero. And
 `cache_write_tokens` is `None` from a vendor that does not report one, which is
 not a claim that nothing was written.
 
-`EventKind::RateLimit` is emitted beside it, from the same place, for a completion
-whose response carried a rate-limit header (0.84.0) — `requests_remaining` and
+`EventKind::RateLimit` is emitted beside it, from the same place, for a committed
+step whose own completion carried a rate-limit header (0.84.0) — `requests_remaining` and
 `tokens_remaining` as the provider sent them, and `requests_reset_secs` and
 `tokens_reset_secs` as whole seconds until each window refills. A completion that
 carried no such header emits nothing at all, so a consumer that never sees this

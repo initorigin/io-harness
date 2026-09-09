@@ -74,12 +74,28 @@ pub(crate) const ROW_BYTES: usize = 64;
 
 /// The most bytes of one rate-limit header value that are kept (0.84.0).
 ///
-/// A response may carry any number of headers whose name contains `ratelimit`
-/// and every one of them is recorded verbatim, so the value is the part that
-/// needs a bound. A rate-limit value is a number or a short duration; 256 bytes
-/// is orders of magnitude past any of them, and a value that exceeds it is kept
-/// truncated as evidence rather than parsed into a figure nobody sent.
+/// A rate-limit value is a number or a short duration; 256 bytes is orders of
+/// magnitude past any of them, and a value that exceeds it is kept truncated as
+/// evidence rather than parsed into a figure nobody sent.
+///
+/// The bound is on the string that is **kept**, after decoding. A header value
+/// may legally carry `0x80..=0xFF`, each of which decodes to a three-byte
+/// replacement character, so a cap applied to the arriving bytes would bound
+/// nothing this constant is read as bounding.
 pub(crate) const MAX_RATE_LIMIT_VALUE_BYTES: usize = 256;
+
+/// The most rate-limit headers from one response that are kept (0.84.0).
+///
+/// The value bound above is per header, and the *count* is as much the sender's
+/// choice as the values are: hyper admits about a hundred headers on HTTP/1.1
+/// and h2's default header-list ceiling is 16 MiB, which is tens of thousands of
+/// them. Every kept pair is cloned into the response, into any recording written
+/// to disk, and past every step of the run — so the product of the two bounds is
+/// what actually needs to be small.
+///
+/// Sixteen is past every family this crate knows: OpenAI sends six, Anthropic
+/// six, and a gateway publishing two windows of its own still fits.
+pub(crate) const MAX_RATE_LIMIT_HEADERS: usize = 16;
 
 /// The most bytes of a non-success body that reach an [`Error`] message.
 ///
@@ -1642,9 +1658,10 @@ pub struct Window {
 /// ```
 /// use io_harness::provider::RateLimit;
 ///
-/// // What a caller reads off a completion. Construct with `..Default::default()`:
-/// // the struct is `#[non_exhaustive]` because a later release may type a third
-/// // family.
+/// // What a caller reads off a completion. `#[non_exhaustive]`, because a later
+/// // release may type a third family — so one is built from the default and
+/// // filled in rather than written as a literal, functional-update form
+/// // included. Reading one, which is what this type is for, is unaffected.
 /// let limit = RateLimit::default();
 /// assert!(limit.requests.remaining.is_none());
 /// assert!(limit.raw.is_empty());
@@ -1674,10 +1691,11 @@ impl RateLimit {
     /// and "this provider reports an allowance of nothing" are different facts,
     /// and only the second should ever read as a number.
     ///
-    /// A header that appears twice is taken from its **first** occurrence for
-    /// the typed fields — a response that contradicts itself has no right answer
-    /// and a deterministic one is worth more than the last line winning. Both
-    /// occurrences are kept in [`raw`](Self::raw).
+    /// A header that appears twice is taken from the **first occurrence that
+    /// parses** — a response that contradicts itself has no right answer and a
+    /// deterministic one is worth more than the last line winning, and a value
+    /// that parsed into nothing has not answered the question a later one still
+    /// can. Both occurrences are kept in [`raw`](Self::raw).
     pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Option<Self> {
         let mut out = Self::default();
         for (name, value) in headers.iter() {
@@ -1688,15 +1706,34 @@ impl RateLimit {
                 continue;
             }
 
-            let bytes = value.as_bytes();
-            let overlong = bytes.len() > MAX_RATE_LIMIT_VALUE_BYTES;
-            let text =
-                String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_RATE_LIMIT_VALUE_BYTES)]);
-            out.raw.push((name.to_string(), text.to_string()));
+            // Cut what is *kept*, not what arrived. A header value may legally
+            // carry obs-text — `0x80..=0xFF` — and each of those bytes becomes a
+            // three-byte replacement character, so cutting the input at the cap
+            // and then decoding stores up to three times the bound this constant
+            // claims. Decode first, then cut on a character boundary.
+            let mut text = String::from_utf8_lossy(value.as_bytes()).into_owned();
+            let overlong = text.len() > MAX_RATE_LIMIT_VALUE_BYTES;
+            if overlong {
+                let cut = (0..=MAX_RATE_LIMIT_VALUE_BYTES)
+                    .rev()
+                    .find(|at| text.is_char_boundary(*at))
+                    .unwrap_or(0);
+                text.truncate(cut);
+            }
 
-            // A value past the cap is recorded truncated and read as nothing: a
-            // number that long is not a number, and parsing the prefix of one
-            // would invent a value the provider never sent.
+            // A response may carry as many rate-limit headers as it likes, and
+            // every one of them is kept — so the count is as attacker-controlled
+            // as the values are, and on HTTP/2 the transport's own ceiling is
+            // measured in mebibytes. What is past the cap is dropped rather than
+            // truncated: an eleventh header is not evidence of anything, and
+            // `raw` travels into a recording written to disk.
+            if out.raw.len() < MAX_RATE_LIMIT_HEADERS {
+                out.raw.push((name.to_string(), text.clone()));
+            }
+
+            // A value past the byte cap is recorded truncated and read as
+            // nothing: a number that long is not a number, and parsing the
+            // prefix of one would invent a value the provider never sent.
             if overlong {
                 continue;
             }
@@ -3694,6 +3731,94 @@ mod rate_limit_headers {
     }
 
     #[test]
+    fn nf2_a_value_of_obs_text_is_bounded_after_decoding_not_before() {
+        // The arm the first version of this pass did not have. A header value may
+        // legally carry `0x80..=0xFF`, each of which decodes to a three-byte
+        // replacement character — so a cap applied to the arriving bytes bounds
+        // the input and stores three times the bound.
+        let mut map = HeaderMap::new();
+        map.append(
+            HeaderName::from_static("x-ratelimit-remaining-requests"),
+            HeaderValue::from_bytes(&[0xFF; MAX_RATE_LIMIT_VALUE_BYTES])
+                .expect("obs-text is a legal header value"),
+        );
+
+        let limit = RateLimit::from_headers(&map).expect("one rate-limit header");
+
+        assert!(
+            limit.raw[0].1.len() <= MAX_RATE_LIMIT_VALUE_BYTES,
+            "the bound is on what is kept, and this value decoded to {} bytes",
+            limit.raw[0].1.len()
+        );
+        assert_eq!(limit.requests.remaining, None, "and it is not a number");
+    }
+
+    #[test]
+    fn nf2_a_response_of_nothing_but_rate_limit_headers_is_bounded_in_count() {
+        // The count is the sender's choice as much as the values are, and every
+        // kept pair is cloned into any recording written to disk.
+        let names: Vec<String> = (0..MAX_RATE_LIMIT_HEADERS * 4)
+            .map(|n| format!("x-ratelimit-window-{n}"))
+            .collect();
+        let pairs: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "1")).collect();
+
+        let limit = RateLimit::from_headers(&headers(&pairs)).expect("many rate-limit headers");
+
+        assert_eq!(limit.raw.len(), MAX_RATE_LIMIT_HEADERS);
+    }
+
+    #[test]
+    fn nf2_a_header_past_the_count_is_still_read_for_its_typed_field() {
+        // The control. Dropping the pair from `raw` must not stop the parser
+        // reading the one header a caller most wants, however far down it is.
+        let mut pairs: Vec<(&str, &str)> = (0..MAX_RATE_LIMIT_HEADERS)
+            .map(|_| ("x-ratelimit-window-a", "1"))
+            .collect();
+        pairs.push(("x-ratelimit-remaining-requests", "99"));
+
+        let limit = RateLimit::from_headers(&headers(&pairs)).expect("many rate-limit headers");
+
+        assert_eq!(limit.raw.len(), MAX_RATE_LIMIT_HEADERS);
+        assert_eq!(limit.requests.remaining, Some(99));
+    }
+
+    #[test]
+    fn raw_reproduces_the_order_the_response_listed_them_in() {
+        // Asserted across distinct names rather than by counting: a parser that
+        // sorted, reversed or grouped them would pass every length assertion in
+        // this module.
+        let limit = RateLimit::from_headers(&headers(&[
+            ("x-ratelimit-reset-tokens", "1s"),
+            ("x-ratelimit-remaining-5h", "42"),
+            ("x-ratelimit-limit-requests", "500"),
+        ]))
+        .expect("three rate-limit headers");
+
+        assert_eq!(
+            limit.raw,
+            vec![
+                ("x-ratelimit-reset-tokens".to_string(), "1s".to_string()),
+                ("x-ratelimit-remaining-5h".to_string(), "42".to_string()),
+                ("x-ratelimit-limit-requests".to_string(), "500".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repeated_header_is_read_from_the_first_occurrence_that_parses() {
+        // The rule as implemented and as documented. An unparseable first
+        // occurrence has not answered the question, so the second still can —
+        // which is the one case where "first that parses" and "first" differ.
+        let limit = RateLimit::from_headers(&headers(&[
+            ("x-ratelimit-remaining-requests", "lots"),
+            ("x-ratelimit-remaining-requests", "1"),
+        ]))
+        .expect("two rate-limit headers");
+
+        assert_eq!(limit.requests.remaining, Some(1));
+    }
+
+    #[test]
     fn a_repeated_header_is_taken_from_its_first_occurrence() {
         let limit = RateLimit::from_headers(&headers(&[
             ("x-ratelimit-remaining-requests", "99"),
@@ -3779,14 +3904,19 @@ mod rate_limit_headers {
             for _ in 0..(next() % 6) {
                 let name = names[(next() % names.len() as u64) as usize];
                 let len = (next() % 300) as usize;
-                // Visible ASCII only: anything else is refused by the wire
-                // before this parser could see it.
-                let value: String = (0..len)
-                    .map(|_| char::from(0x21 + (next() % 94) as u8))
+                // Visible ASCII *and* obs-text, which `HeaderValue` accepts and
+                // a real endpoint may send. Excluding `0x80..=0xFF` is what let
+                // the first version of this fuzz miss a bound that was applied
+                // to the arriving bytes rather than to the decoded string.
+                let value: Vec<u8> = (0..len)
+                    .map(|_| match next() % 4 {
+                        0 => 0x80 + (next() % 128) as u8,
+                        _ => 0x21 + (next() % 94) as u8,
+                    })
                     .collect();
                 let (Ok(name), Ok(value)) = (
                     HeaderName::from_bytes(name.as_bytes()),
-                    HeaderValue::from_str(&value),
+                    HeaderValue::from_bytes(&value),
                 ) else {
                     continue;
                 };

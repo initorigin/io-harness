@@ -4800,7 +4800,9 @@ all — a number that long is not a number, and parsing the prefix of one would
 invent a value the provider never sent. A header that appears twice is taken from
 its **first** occurrence for the typed fields, because a response that contradicts
 itself has no right answer and a deterministic one is worth more than the last
-line winning; both occurrences are in `raw`.
+line winning — and, precisely, from the first occurrence that *parses*: a value
+that parsed into nothing has not answered the question a later one still can.
+Both occurrences are in `raw`.
 
 **Anthropic's absolute reset is converted against the local clock**, since a
 duration is what a caller can act on and the header states an instant. A machine
@@ -4823,6 +4825,18 @@ headers land beside it in `Error::Provider { rate_limit }`, reachable through
 `Error::rate_limit()`; `Error::provider_status` takes it as its third argument,
 which is a break for anyone calling that constructor.
 
-**The event fires once per completion that carried a rate limit**, beside
-`EventKind::StepUsage` and from the same place, and not at all for a completion
-that carried none.
+**The event fires once per committed step whose own completion carried a rate
+limit**, beside `EventKind::StepUsage` and from the same place, and not at all
+for one that carried none. The qualifier is the same one `StepUsage` carries: a
+run makes completions that are not steps — the summariser call behind a
+compaction is one — and their rate limits reach `CompletionResponse::rate_limit`
+inside the loop without reaching the stream. A step the tree left uncommitted
+because a child is waiting on a human announces nothing, exactly as it writes
+nothing.
+
+**`raw` is bounded in both directions**: 256 bytes per value, and 16 headers per
+response. The count is as much the sender's choice as the values are — h2's
+default header-list ceiling admits tens of thousands of them — and every kept
+pair is cloned into the response and into any recording written to disk. Sixteen
+is past every family this crate knows with room for a gateway's own. A header
+past the count is dropped from `raw` and still read for the typed fields.

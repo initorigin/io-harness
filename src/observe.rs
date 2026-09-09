@@ -490,10 +490,16 @@ pub enum EventKind {
     },
     /// What the provider said about its rate limit on this completion (0.84.0).
     ///
-    /// Emitted beside [`EventKind::StepUsage`], once per completion that carried
-    /// a rate-limit header, and not at all for one that carried none — so a
-    /// consumer that never sees this event is looking at a provider that reports
-    /// nothing, not at an allowance of zero.
+    /// Emitted beside [`EventKind::StepUsage`], once per **committed step**
+    /// whose own completion carried a rate-limit header, and not at all for one
+    /// that carried none — so a consumer that never sees this event is looking
+    /// at a provider that reports nothing, not at an allowance of zero.
+    ///
+    /// "The step's own completion" is the limit of the claim, and it is the same
+    /// limit `StepUsage` has: the summariser call behind a compaction is a
+    /// completion the run made, and its rate limit is not reported here. A step
+    /// left uncommitted — the tree's path when a child is waiting on a human —
+    /// announces nothing, exactly as it writes nothing.
     ///
     /// The numbers are the provider's own, unmodified: this crate does not pace,
     /// throttle or retry differently because of them. `raw_count` says how many

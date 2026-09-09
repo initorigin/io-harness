@@ -73,13 +73,18 @@ deciding for the application layer whose allowance it is.
   families are typed, OpenAI's `x-ratelimit-{limit,remaining,reset}-{requests,tokens}`
   and Anthropic's `anthropic-ratelimit-{requests,tokens}-{limit,remaining,reset}`;
   anything else a gateway publishes reaches a caller through `raw` without this
-  crate knowing the name. A value longer than 256 bytes is kept truncated and read
-  as no number at all.
+  crate knowing the name. `raw` is bounded in both directions — 256 bytes per
+  value, measured after decoding, and 16 headers per response — because both are
+  the sender's choice and every kept pair is cloned into any recording written to
+  disk. A value the byte bound cut is kept truncated and read as no number at all.
 - **`Error::rate_limit()`**, the same struct off a failing call — so a 429 says
   what refused it and not only how long to wait. `Retry-After` is not a
   rate-limit header, keeps its own field, and is unchanged by this release.
 - **`EventKind::RateLimit`**, emitted beside `EventKind::StepUsage`, once per
-  completion that carried a limit and not at all for one that did not. It carries
+  committed step whose own completion carried a limit and not at all for one that
+  did not — the summariser call behind a compaction is a completion the run makes
+  and not a step, and its rate limit reaches the response without reaching the
+  stream. It carries
   what is left of each window, the whole seconds until each refills, and how many
   rate-limit headers the response held — the count is how an operator learns a
   gateway is publishing a window this crate does not name.

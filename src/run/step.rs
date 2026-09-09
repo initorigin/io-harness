@@ -88,7 +88,10 @@ pub(super) fn commit_step(
     changed: bool,
     commit: bool,
     usage: Option<crate::Usage>,
-    rate_limit: Option<crate::RateLimit>,
+    // By reference: the only things read off it are four `Option<u64>`s and a
+    // length, and a `RateLimit` owns a `Vec` of header pairs that would
+    // otherwise be deep-cloned once per step to be counted and dropped.
+    rate_limit: Option<&crate::RateLimit>,
 ) -> Result<()> {
     if !commit {
         info!(
@@ -673,7 +676,7 @@ pub(super) async fn run_from<P: Provider>(
             write.is_some(),
             true,
             response.usage,
-            response.rate_limit.clone(),
+            response.rate_limit.as_ref(),
         )?;
 
         // Cost budget: checked after this step's tokens are counted.
@@ -1924,7 +1927,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
             step_changed,
             true,
             response.usage,
-            response.rate_limit.clone(),
+            response.rate_limit.as_ref(),
         )?;
         // The step is committed, so the observations behind it are safe to make
         // durable. After the commit rather than before: a ledger that ran ahead of
