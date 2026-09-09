@@ -56,9 +56,12 @@ fn serve_once(status_line: &str, headers: &str, body: &str) -> String {
         let Ok((mut socket, _)) = listener.accept() else {
             return;
         };
-        // Read until the head is complete. The body follows on the same socket
-        // and is of no interest — a request that never finishes its headers gets
-        // no answer, which is what a hung fixture should look like.
+        // Read the head *and then the body*, so the client is never answered
+        // before its own write has been consumed. Closing a socket with unread
+        // inbound data resets the connection on Windows, and the caller sees a
+        // transport error instead of the response under test — which is what
+        // `provider::failures::drain_request` says in the same words, and what
+        // this fixture had to learn from a Windows CI leg.
         let mut seen = Vec::new();
         let mut byte = [0u8; 1];
         while socket.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
@@ -66,6 +69,16 @@ fn serve_once(status_line: &str, headers: &str, body: &str) -> String {
             if seen.ends_with(b"\r\n\r\n") {
                 break;
             }
+        }
+        let head = String::from_utf8_lossy(&seen).to_ascii_lowercase();
+        let length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; length];
+        if length > 0 {
+            let _ = socket.read_exact(&mut body);
         }
         let _ = socket.write_all(response.as_bytes());
         let _ = socket.flush();
