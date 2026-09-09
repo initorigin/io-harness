@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::observe::PrefixBreak;
+use crate::provider::Usage;
 
 /// The key one workspace's durable memory is stored under.
 ///
@@ -370,6 +371,9 @@ pub(super) struct Frozen {
     last: Option<(String, String)>,
     /// The previous step's request, which a fold extends rather than replaces.
     request: Option<Sent>,
+    /// The previous step's prompt size, which is what the next one's cache read is
+    /// measured against.
+    prompt: Option<u64>,
 }
 
 /// The parts of a request a fold reuses (0.85.0).
@@ -550,6 +554,55 @@ pub(super) fn session_key(session_id: i64, system: &str, tools: &[ToolSpec]) -> 
         // integers a session id is drawn from.
         digest64(format!("io-harness session {session_id}").as_bytes())
     )
+}
+
+/// Announce a request that paid again for a prompt the one before it had cached
+/// (0.85.0).
+///
+/// Two thresholds, and both are Claude Code's: more than 5% of the previous
+/// prompt **and** at least 2,000 tokens. Either alone reports noise — a 6% drop on
+/// a 300-token prompt is eighteen tokens, and a 2,000-token drop on a
+/// 400,000-token prompt is half a percent — and a miss report an operator learns
+/// to ignore is worse than none.
+///
+/// The previous request's **prompt** is the baseline rather than what it had
+/// cached: what the vendor could serve this request from is everything the last
+/// one sent, and measuring against the last one's cache read would call a run that
+/// has never hit a run that is doing fine.
+///
+/// A fold is the one rebuild a run asks for, and it is reported with
+/// `expected: true` rather than suppressed: a run that folded ten times paid for
+/// ten rebuilds, and an operator reading its bill needs to see them.
+pub(super) fn check_cache(
+    frozen: &mut Frozen,
+    usage: Option<&Usage>,
+    rebuilt: bool,
+    watch: &Watch<'_>,
+    run_id: i64,
+    step: u32,
+    depth: u32,
+) {
+    let Some(usage) = usage else {
+        return;
+    };
+    let before = frozen.prompt.replace(usage.prompt_tokens);
+    let Some(before) = before.filter(|before| *before > 0) else {
+        return;
+    };
+    let reprocessed = before.saturating_sub(usage.cache_read_tokens);
+    if reprocessed < 2_000 || reprocessed.saturating_mul(100) <= before.saturating_mul(5) {
+        return;
+    }
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        step,
+        depth,
+        EventKind::CacheMiss {
+            step,
+            reprocessed_tokens: reprocessed,
+            expected: rebuilt,
+        },
+    ));
 }
 
 /// A prefix a step did not extend (0.85.0).

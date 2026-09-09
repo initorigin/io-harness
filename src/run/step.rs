@@ -151,6 +151,13 @@ pub(super) fn commit_step(
                 cache_read_tokens: usage.cache_read_tokens,
                 cache_write_tokens: usage.cache_write_tokens,
                 completion_tokens: usage.completion_tokens,
+                // 0.85.0 — the rate itself, so a renderer prints it rather than
+                // deriving it. Permille, and zero for a prompt of zero tokens,
+                // which is the same answer a division would refuse to give.
+                cached_fraction: match usage.prompt_tokens {
+                    0 => 0,
+                    prompt => usage.cache_read_tokens.saturating_mul(1_000) / prompt,
+                },
             },
         ));
     }
@@ -1976,6 +1983,20 @@ pub(super) async fn run_workspace_from<P: Provider>(
         // only step whose row can hold it.
         let commit_from = std::time::Instant::now();
         store.close_step_attribution(run_id, step, span_from.elapsed());
+        // 0.85.0 — before the step is committed, from the completion that answered
+        // it. `frozen.since() == step` is what "the prefix was rebuilt on this
+        // step" means, and it is the fold's own definition rather than a second
+        // one: a rebuild is expected and is reported as expected.
+        let rebuilt = frozen.since() == step;
+        check_cache(
+            &mut frozen,
+            response.usage.as_ref(),
+            rebuilt,
+            watch,
+            run_id,
+            step,
+            0,
+        );
         commit_step(
             store,
             watch,

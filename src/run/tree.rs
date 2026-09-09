@@ -1483,6 +1483,17 @@ where
             // re-adopts that child; committing it would leave the child stranded and
             // the parent believing the spawn was done.
             let committed = !((paused.is_some() || asked.is_some()) && paused_by_child);
+            // 0.85.0 — the same check the flat loop makes, through the same helper.
+            let rebuilt = frozen.since() == step;
+            check_cache(
+                &mut frozen,
+                response.usage.as_ref(),
+                rebuilt,
+                tree.watch,
+                run_id,
+                step,
+                depth,
+            );
             commit_step(
                 tree.store,
                 tree.watch,

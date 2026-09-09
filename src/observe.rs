@@ -470,6 +470,8 @@ pub enum EventKind {
     ///         cache_read_tokens: 5_900,
     ///         cache_write_tokens: None,
     ///         completion_tokens: 62,
+    ///         // 5,900 of a 7,300-token prompt, in permille.
+    ///         cached_fraction: 808,
     ///     },
     /// ));
     /// assert_eq!(flow, Flow::Continue);
@@ -537,6 +539,64 @@ pub enum EventKind {
         cache_write_tokens: Option<u64>,
         /// Tokens the model produced.
         completion_tokens: u64,
+        /// (0.85.0) The share of the prompt the vendor served from its cache, in
+        /// **permille** — 950 is 95.0%.
+        ///
+        /// Permille and not a float, because this is an event a renderer prints
+        /// and a store round-trips: an integer compares, sums and serializes the
+        /// same everywhere, and a rate is wanted to a tenth of a percent and no
+        /// finer. `0` when the prompt was zero tokens or nothing was cached, which
+        /// are the same number and mean the same thing to a reader — that this
+        /// request paid for its whole prompt.
+        ///
+        /// Derived rather than reported: `cache_read_tokens * 1000 /
+        /// prompt_tokens`, so it agrees with the two fields above it by
+        /// construction and a renderer needs no arithmetic of its own.
+        ///
+        /// `#[serde(default)]`, and it is load-bearing: these events are written
+        /// to the trace as JSON and read back, so a row a 0.84.0 process wrote
+        /// carries no such key and a required field would make every one of them
+        /// undeserializable — an attached reader against a store an older binary
+        /// had written would fail on the first step it read. Zero is also what
+        /// that row meant: nothing recorded a cached share.
+        #[serde(default)]
+        cached_fraction: u64,
+    },
+    /// A request reprocessed a prompt the one before it had cached (0.85.0).
+    ///
+    /// The rule is Claude Code's: a miss is a request whose cached share fell by
+    /// more than 5% of the previous prompt **and** by at least 2,000 tokens. Two
+    /// thresholds because either alone reports noise — a 6% drop on a 300-token
+    /// prompt is eighteen tokens, and a 2,000-token drop on a 400,000-token prompt
+    /// is half a percent.
+    ///
+    /// **A fold is an expected rebuild, not a defect**, and says so in `expected`
+    /// rather than being suppressed: a run that folded ten times paid for ten
+    /// rebuilds, and an operator reading its cost needs to see them.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent, Ignore};
+    ///
+    /// let flow = Ignore.event(&RunEvent::new(
+    ///     7,
+    ///     6,
+    ///     EventKind::CacheMiss {
+    ///         step: 6,
+    ///         reprocessed_tokens: 12_400,
+    ///         expected: true,
+    ///     },
+    /// ));
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    CacheMiss {
+        /// The step whose request reprocessed the prompt.
+        #[serde(rename = "at_step")]
+        step: u32,
+        /// How many tokens of the previous request's cached prompt were paid for
+        /// again.
+        reprocessed_tokens: u64,
+        /// Whether the run had just folded, which is the one rebuild it asks for.
+        expected: bool,
     },
     /// What the provider said about its rate limit on this completion (0.84.0).
     ///
@@ -1676,6 +1736,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "step_attributed",
     // 0.85.0
     "prefix_broke",
+    "cache_miss",
     // 0.81.0
     "step_usage",
     // 0.84.0
@@ -2543,6 +2604,7 @@ mod tests {
                 cache_read_tokens: 5_900,
                 cache_write_tokens: None,
                 completion_tokens: 62,
+                cached_fraction: 808,
             },
             EventKind::RateLimit {
                 requests_remaining: Some(99),
@@ -2562,6 +2624,11 @@ mod tests {
                 at_byte: 1_204,
                 reason: PrefixBreak::Reread,
             },
+            EventKind::CacheMiss {
+                step: 6,
+                reprocessed_tokens: 12_400,
+                expected: true,
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
@@ -2573,6 +2640,7 @@ mod tests {
                 | EventKind::Step { .. }
                 | EventKind::StepAttributed { .. }
                 | EventKind::PrefixBroke { .. }
+                | EventKind::CacheMiss { .. }
                 | EventKind::StepUsage { .. }
                 | EventKind::RateLimit { .. }
                 | EventKind::ImageAttached { .. }
