@@ -1385,10 +1385,23 @@ pub(super) async fn run_workspace_from<P: Provider>(
             let messages = transcript(&user, &assembled, &turns);
             #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
+                // 0.37.0 — permitting an answer is a decision about a turn's first
+                // completion, not a licence to stop at a plan in prose on step nine.
+                //
                 // 0.37.0 — the conversational prompt is this turn's opening only. Every
                 // later step is the loop of 0.36.1, asked the way it has always been
                 // asked: permitting an answer is a decision about a turn's first
                 // completion, not a licence to stop at a plan in prose on step nine.
+                //
+                // 0.85.0 looked at unifying the two, since a turn whose opening and
+                // whose second step carry different system prompts writes a cache
+                // entry it then throws away. It is not a wrapper around a sentence:
+                // the work prompt says the turn has a stated specification that is
+                // checked after every step, and the plan gate's directive says to
+                // propose a plan before doing anything. A turn told either of those
+                // *and* "if a plain answer is the whole of what is wanted, answer"
+                // has been told two things, which is the contradiction 0.45.0 and
+                // 0.48.0 each removed. One system block per turn is what that costs.
                 system: match &conversational {
                     Some(c) if step == start_step => c.clone(),
                     _ => system.clone(),

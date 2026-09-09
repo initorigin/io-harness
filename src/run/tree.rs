@@ -781,6 +781,9 @@ where
                     // 0.39.0 — a contained turn's opening is its first completion
                     // only. Every later step is the tree loop of 0.38.0, asked the way
                     // it has always been asked.
+                    // The tree's own opening, as the flat loop's — and unified with
+                    // the work prompt for the reason the flat loop states, which is
+                    // that it cannot be.
                     system: match &conversational {
                         Some(c) if step == start_step => c.clone(),
                         _ => system.clone(),

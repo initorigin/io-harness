@@ -200,7 +200,15 @@ fn split(user: &str) -> (String, String, String) {
     let head = FRAME;
     let from = user.find(head).expect("the workspace prompt frame") + head.len();
     let rest = &user[from..];
-    let to = rest.find("\n\nCall a tool").unwrap_or(rest.len());
+    // The tail starts at whichever comes first: the withheld sentence, when a mask
+    // is on, or the closing instruction. Cutting only at the instruction would put
+    // the withheld sentence inside the section and make a toggled mask read as a
+    // rewritten log — which is the opposite of what it is.
+    let to = ["\n\nUnavailable this turn", "\n\nCall a tool"]
+        .iter()
+        .filter_map(|mark| rest.find(mark))
+        .min()
+        .unwrap_or(rest.len());
     (
         user[..from].to_string(),
         rest[..to].to_string(),
@@ -477,6 +485,63 @@ async fn f3_a_ten_step_run_with_one_fold_breaks_its_prefix_nowhere_else() {
     assert!(
         announced.is_empty(),
         "the run announced a break its own prompts do not have: {announced:?}"
+    );
+}
+
+// --------------------------------------------------- F10: masking stays in the tail
+
+/// F10 — turning a tool mask on changes nothing above the newest message.
+///
+/// The system text and the tool catalogue are the head of the prefix on every chat
+/// template, and on some the catalogue renders *before* the system text — so a
+/// mask written into either would cost the whole prompt every time it was toggled.
+/// It is a sentence in the user block, after the observations, and the catalogue
+/// the mask applies to is sent unchanged: a withheld tool is refused when called,
+/// not hidden.
+#[tokio::test]
+async fn f10_a_tool_mask_moves_nothing_above_the_newest_message() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "content\n").unwrap();
+
+    let run = async |mask: io_harness::ToolMask| {
+        let script = Script::new(vec![vec![call(
+            "read_file",
+            json!({ "path": "a.txt" }),
+        )]]);
+        let store = Store::memory().unwrap();
+        run_with(
+            &never_passes(dir.path(), 2).with_tool_mask(mask),
+            &script,
+            &store,
+            &open_policy(),
+            &ApproveAll,
+        )
+        .await
+        .unwrap();
+        script.steps()
+    };
+
+    let plain = run(io_harness::ToolMask::none()).await;
+    let masked = run(io_harness::ToolMask::withholding(["write_file"])).await;
+
+    assert_eq!(
+        plain[0].system, masked[0].system,
+        "a mask must not touch the system prompt"
+    );
+    assert_eq!(
+        plain[0].tools, masked[0].tools,
+        "nor the catalogue: a withheld tool is refused when called, not hidden"
+    );
+    assert!(
+        masked[0].user.contains("Unavailable this turn"),
+        "and the turn is still told, in its newest message:\n{}",
+        masked[0].user
+    );
+    let (_, section, _) = split(&masked[0].user);
+    assert!(
+        !section.contains("Unavailable this turn"),
+        "the sentence sits after the observation section, past every breakpoint \
+         this crate marks:\n{section}"
     );
 }
 
