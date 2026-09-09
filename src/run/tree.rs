@@ -699,6 +699,7 @@ where
                     &mut written,
                     budget_tokens,
                     fold_forced(recovered, depth, &mut fold_asked),
+                    frozen.last_request(),
                 )
                 .await?;
                 fold_tokens += fold.tokens;
@@ -813,6 +814,9 @@ where
                     media: attach_media(contract, pending_media)?,
                     ..Default::default()
                 };
+                // 0.85.0 — what a fold on the next step extends. The tree loop
+                // does not route per step, so this is the request as built.
+                frozen.sent(&request);
                 match driving(
                     inflight,
                     &mut collected,

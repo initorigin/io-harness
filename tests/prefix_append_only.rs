@@ -92,14 +92,15 @@ impl Script {
 
     /// The steps' own requests.
     ///
-    /// A fold buys its summary through the same provider, so a run that folds
-    /// sends one request that is not a step and carries none of the workspace
-    /// framing. It is a completion the crate makes on its own behalf, and reading
-    /// it as a step would compare a step's prompt against a summariser's.
+    /// A fold buys its summary through the same provider, and (0.85.0) it does so
+    /// by *extending the step's own request* — so it carries the workspace framing
+    /// too and the frame alone no longer tells them apart. The instruction does.
+    /// Reading a fold as a step would compare a step's prompt against a
+    /// summariser's and call the difference a broken prefix.
     fn steps(&self) -> Vec<CompletionRequest> {
         self.requests()
             .into_iter()
-            .filter(|r| r.user.contains(FRAME))
+            .filter(|r| r.user.contains(FRAME) && !r.user.contains(SUMMARISER))
             .collect()
     }
 }
@@ -111,7 +112,7 @@ impl Provider for Script {
         // notes with nothing, so an empty answer aborts the fold and the run
         // silently goes on never folding. It also takes no slot in the script —
         // the script is the agent's turns, and this is not one of them.
-        if req.tools.is_empty() {
+        if req.user.contains(SUMMARISER) {
             self.seen.lock().unwrap().push(req);
             return Ok(CompletionResponse {
                 text: Some("the run read some files and grepped for some names".into()),
@@ -209,6 +210,9 @@ fn split(user: &str) -> (String, String, String) {
 
 /// The line a workspace prompt puts above the observation section.
 const FRAME: &str = "Observations so far (results of your tool calls):\n";
+
+/// How the fold's own call is told apart from a step's.
+const SUMMARISER: &str = "compacting an agent's own working notes";
 
 /// What the section says when the run has observed nothing yet.
 const EMPTY_LOG: &str = "(nothing yet — start by grepping or finding)";
@@ -473,6 +477,83 @@ async fn f3_a_ten_step_run_with_one_fold_breaks_its_prefix_nowhere_else() {
     assert!(
         announced.is_empty(),
         "the run announced a break its own prompts do not have: {announced:?}"
+    );
+}
+
+// ------------------------------------------ F9: the fold reuses what it folds
+
+/// F9 — the fold's own request is the step's request with one message added.
+///
+/// A fold is the moment a run can least afford a second full prefill of its own
+/// conversation, and buying a summary with a request of its own is exactly that:
+/// the same transcript, sent again, to a vendor that has already been paid to
+/// hold it. Sending the step's own system, tools and messages with the
+/// instruction appended means every byte before the instruction is served from
+/// the cache entry the run is already keeping warm.
+#[tokio::test]
+async fn f9_the_folds_own_request_extends_the_step_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..10 {
+        std::fs::write(
+            dir.path().join(format!("f{i}.txt")),
+            format!("file {i}\n{}", "filler line\n".repeat(90)),
+        )
+        .unwrap();
+    }
+    let script = Script::new(
+        (0..10)
+            .map(|i| vec![call("read_file", json!({ "path": format!("f{i}.txt") }))])
+            .collect(),
+    );
+    let contract = never_passes(dir.path(), 10)
+        .with_context_budget(ContextBudget {
+            max_tokens: 2_400,
+            share: 0.5,
+        })
+        .with_compaction(io_harness::Compaction {
+            at_share: 0.8,
+            keep_recent: 4,
+        });
+    let store = Store::memory().unwrap();
+    run_with(&contract, &script, &store, &open_policy(), &ApproveAll)
+        .await
+        .unwrap();
+
+    let all = script.requests();
+    let at = all
+        .iter()
+        .position(|r| r.user.contains(SUMMARISER))
+        .expect("the fixture must fold, or there is no fold request to look at");
+    let fold = &all[at];
+    let before = &all[at - 1];
+
+    assert_eq!(
+        fold.system, before.system,
+        "the fold sends the step's system prompt, which is the head of the prefix"
+    );
+    assert_eq!(
+        fold.tools, before.tools,
+        "and its tool list: on some chat templates the tools render before the \
+         system text, so a fold with an empty catalogue shares no prefix at all"
+    );
+    assert_eq!(
+        fold.messages.len(),
+        before.messages.len() + 1,
+        "one message added and none rewritten"
+    );
+    assert_eq!(
+        fold.messages[..before.messages.len()],
+        before.messages[..],
+        "every message the step sent, byte for byte"
+    );
+    assert!(
+        fold.user.starts_with(&before.user),
+        "and the flat rendering extends the step's, which is the invariant the \
+         transcript is built on"
+    );
+    assert_eq!(
+        fold.session_key, before.session_key,
+        "the fold asks the replica holding the prefix it is reusing"
     );
 }
 

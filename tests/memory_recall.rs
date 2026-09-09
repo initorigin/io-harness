@@ -35,7 +35,9 @@ impl Provider for Seen {
         // script is the agent's turns, and this is not one of them. It is not
         // recorded either: the script is indexed by how many prompts have been
         // seen, so recording it would slide every later step onto the wrong turn.
-        if req.tools.is_empty() {
+        // (0.85.0) Recognised by the instruction rather than by an empty tool list:
+        // the fold now extends the step's own request, tools and all.
+        if req.user.contains("compacting an agent's own working notes") {
             return Ok(CompletionResponse {
                 text: Some("the run read a few files".into()),
                 ..Default::default()

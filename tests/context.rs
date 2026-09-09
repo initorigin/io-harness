@@ -88,12 +88,15 @@ impl MockScript {
 
 impl Provider for MockScript {
     async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
-        // A fold's summarisation request carries no tools and must be answered with
-        // prose: a summariser that says nothing is not allowed to replace the notes
-        // with nothing, so an empty answer aborts the fold and a fixture written to
-        // fold silently never does. It takes no slot in the script either — the
-        // script is the agent's turns, and this is not one of them.
-        if req.tools.is_empty() {
+        // A fold's summarisation request must be answered with prose: a summariser
+        // that says nothing is not allowed to replace the notes with nothing, so an
+        // empty answer aborts the fold and a fixture written to fold silently never
+        // does. It takes no slot in the script either — the script is the agent's
+        // turns, and this is not one of them.
+        //
+        // (0.85.0) Recognised by the instruction rather than by an empty tool list:
+        // the fold now extends the step's own request, tools and all.
+        if req.user.contains("compacting an agent's own working notes") {
             self.seen.lock().unwrap().push(req);
             return Ok(CompletionResponse {
                 text: Some("the run read a file more than once".into()),

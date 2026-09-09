@@ -1320,6 +1320,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 &mut written,
                 budget_tokens,
                 fold_forced(recovered, 0, &mut fold_asked),
+                frozen.last_request(),
             )
             .await?;
             fold_tokens += fold.tokens;
@@ -1432,6 +1433,9 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 watch,
                 0,
             );
+            // 0.85.0 — after routing, because what a fold reuses has to be what
+            // this step actually sent rather than what it was about to send.
+            frozen.sent(&request);
 
             // 0.75.0 — the step's provider phase, bracketed here rather than read
             // off the per-attempt bracket `complete_with_retry` already keeps for

@@ -52,7 +52,17 @@ const SUMMARY_SENTENCE: &str = "ZZ-SUMMARY-ZZ read alpha.txt and kept the token 
 
 /// How a summarising request is told apart from a working one without the test
 /// re-implementing the prompt.
+///
+/// (0.85.0) In `system` when the fold builds a request of its own, and in `user`
+/// when it extends the step's — which it does whenever the run has sent anything,
+/// because a fold that reuses the prefix it is folding pays for one message
+/// instead of a second copy of the conversation. The phrase is the same either
+/// way, which is what keeps this one line the only thing a fixture has to know.
 const SUMMARISER: &str = "compacting an agent's own working notes";
+
+fn is_fold(request: &CompletionRequest) -> bool {
+    request.system.contains(SUMMARISER) || request.user.contains(SUMMARISER)
+}
 
 /// Records the whole request rather than `(system, user)`: the boundary is only
 /// observable on the `CompletionRequest`, and it is the field under test.
@@ -77,7 +87,7 @@ impl Recorder {
             .lock()
             .unwrap()
             .iter()
-            .filter(|r| !r.system.contains(SUMMARISER))
+            .filter(|r| !is_fold(r))
             .cloned()
             .collect()
     }
@@ -85,7 +95,7 @@ impl Recorder {
 
 impl Provider for Recorder {
     async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
-        let summarising = req.system.contains(SUMMARISER);
+        let summarising = is_fold(&req);
         self.seen.lock().unwrap().push(req);
         let usage = Some(Usage {
             prompt_tokens: 10,
