@@ -425,6 +425,71 @@ async fn f10_every_provider_in_the_crate_forwards_the_field() {
     }
 }
 
+// --------------------------------------------------------------------- live
+
+/// A real vendor, over the real wire.
+///
+/// `#[ignore]`d and needing `OPENROUTER_API_KEY`, like every live arm in this
+/// crate. Every other test here drives a fixture written in this repository, so
+/// this is the only one that would notice a vendor renaming a header, adding a
+/// family or dropping one — which is the whole risk a header parser carries.
+///
+/// **What it asserts is the invariant, not a number.** An allowance is the
+/// vendor's to change and a test asserting a figure would be asserting somebody
+/// else's billing plan. It prints what came back, so the run is readable
+/// evidence either way.
+///
+/// **OpenRouter reports no rate limit on a completion, and that is a fact about
+/// the vendor rather than about this crate.** Checked at the wire when 0.84.0
+/// shipped: a 200 from `/api/v1/chat/completions` carried thirteen headers and
+/// none of them named a rate limit, so this arm exercises the `None` path
+/// against a real endpoint. The day the vendor starts sending a family, this
+/// test is what notices — the `Some` branch below is not decoration.
+#[tokio::test]
+#[ignore = "live: needs OPENROUTER_API_KEY and spends a request"]
+async fn live_a_real_vendor_is_read_the_way_a_fixture_is() {
+    use io_harness::OpenRouter;
+
+    let provider = OpenRouter::from_env().expect("OPENROUTER_API_KEY and OPENROUTER_MODEL are set");
+    let response = provider
+        .complete(CompletionRequest {
+            system: "Answer with one word.".into(),
+            user: "Say hello.".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("the live call succeeded");
+
+    println!("live rate limit: {:?}", response.rate_limit);
+    assert!(
+        response.text.is_some() || !response.tool_calls.is_empty(),
+        "the completion itself still arrived, whatever the headers said"
+    );
+
+    let Some(limit) = response.rate_limit else {
+        // The vendor said nothing, which is what this vendor does. `None` is the
+        // claim being checked here: nothing invented a window out of a response
+        // that named none.
+        return;
+    };
+
+    assert!(
+        !limit.raw.is_empty(),
+        "a `Some` with an empty `raw` is impossible by construction"
+    );
+    for (name, value) in &limit.raw {
+        assert!(
+            name.contains("ratelimit"),
+            "{name} is not a rate-limit header"
+        );
+        assert!(value.len() <= 256, "{name} was kept past the byte bound");
+    }
+    assert!(limit.raw.len() <= 16, "kept past the count bound");
+    if let (Some(left), Some(of)) = (limit.requests.remaining, limit.requests.limit) {
+        assert!(left <= of, "{left} left of an allowance of {of}");
+    }
+}
+
 /// Every `.rs` file under `dir`, recursively.
 fn walk(dir: std::path::PathBuf) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
