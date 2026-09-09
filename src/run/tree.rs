@@ -686,7 +686,7 @@ where
                 )
                 .await?;
                 let mut assembled = assemble(
-                    &ledger,
+                    &mut ledger,
                     budget_tokens,
                     &notes,
                     &global_notes,

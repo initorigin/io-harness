@@ -97,6 +97,10 @@ fn notes() -> Vec<MemoryEntry> {
         .collect()
 }
 
+/// 0.85.0 — assembly may append a refreshed read at the tail, so it takes the
+/// ledger by mutable reference. These cases assemble one ledger repeatedly to
+/// compare a rung against itself, so each call gets its own copy and none of them
+/// can see another's appends.
 async fn at(
     f: &Fixture,
     l: &Ledger,
@@ -105,8 +109,9 @@ async fn at(
     ladder: Ladder,
     notes: &[MemoryEntry],
 ) -> io_harness::context::Assembled {
+    let mut l = l.clone();
     assemble(
-        l,
+        &mut l,
         budget,
         notes,
         &[],

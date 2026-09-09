@@ -430,7 +430,7 @@ async fn a_policy_refused_reread_is_a_stub_naming_the_invalidating_step_and_the_
 
     let ws = Workspace::with_policy(dir.path(), policy.clone());
     let out = assemble(
-        &ledger,
+        &mut ledger,
         24_000,
         &[],
         &[],
@@ -688,7 +688,7 @@ async fn assembling_one_turn_costs_a_bounded_amount_of_time() {
     let started = Instant::now();
     for step in 0..TURNS {
         let out = assemble(
-            &ledger,
+            &mut ledger,
             24_000,
             &[],
             &[],
@@ -788,7 +788,7 @@ async fn two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_colla
     ));
 
     let out = assemble(
-        &ledger,
+        &mut ledger,
         24_000,
         &[],
         &[],
@@ -857,7 +857,7 @@ async fn a_re_read_cannot_escape_the_workspace_root() {
     ));
 
     let out = assemble(
-        &ledger,
+        &mut ledger,
         24_000,
         &[],
         &[],
@@ -937,7 +937,7 @@ async fn the_rendered_note_block_is_byte_identical_whatever_run_id_the_notes_car
         let policy = &policy;
         async move {
             assemble(
-                &Ledger::new(),
+                &mut Ledger::new(),
                 24_000,
                 &notes,
                 &[],
@@ -1094,7 +1094,7 @@ async fn a_long_runs_stubs_collapse_so_the_ceiling_still_holds() {
 
     const CEILING: u64 = 1_500;
     let out = assemble(
-        &ledger,
+        &mut ledger,
         CEILING,
         &[],
         &[],
@@ -1370,7 +1370,7 @@ async fn a_surviving_result_keeps_the_position_of_the_call_it_answers() {
     let policy = open_policy().deny_read("a.txt");
     let workspace = Workspace::with_policy(dir.path(), policy.clone());
     let out = assemble(
-        &ledger,
+        &mut ledger,
         24_000,
         &[],
         &[],
@@ -1640,7 +1640,7 @@ async fn what_the_run_observed_before_the_interruption_is_in_the_prompt_after_it
 // ------------------------------------------------- 0.49.0: the emitted pieces
 
 /// Assemble a ledger with an open policy and no notes, at `step`.
-async fn emitted_for(ledger: &Ledger, budget: u64) -> Assembled {
+async fn emitted_for(ledger: &mut Ledger, budget: u64) -> Assembled {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("s.db")).unwrap();
     let policy = open_policy();
@@ -1696,7 +1696,7 @@ async fn the_emitted_pieces_reconstruct_the_assembled_text_exactly() {
     ));
     ledger.push(observed(2, ObsKind::Read, "b.txt", "\n[read b.txt]\nBBB\n"));
 
-    let out = emitted_for(&ledger, 24_000).await;
+    let out = emitted_for(&mut ledger, 24_000).await;
     let rebuilt: String = out.emitted.iter().map(|e| e.text.as_str()).collect();
     assert_eq!(
         rebuilt, out.text,
@@ -1725,7 +1725,7 @@ async fn a_results_ordinal_is_the_index_of_the_call_it_answers() {
     ));
     ledger.push(observed(2, ObsKind::Read, "b.txt", "\n[read b.txt]\nBBB\n"));
 
-    let out = emitted_for(&ledger, 24_000).await;
+    let out = emitted_for(&mut ledger, 24_000).await;
     let shape: Vec<(u32, usize, bool)> = out
         .emitted
         .iter()
@@ -1756,7 +1756,7 @@ async fn an_elided_result_keeps_its_calls_position() {
     ledger.push(observed(1, ObsKind::Grep, "todo", "\n[grep todo]\nhit\n"));
     ledger.push(observed(1, ObsKind::Read, "a.txt", "\n[read a.txt]\nNEW\n"));
 
-    let out = emitted_for(&ledger, 24_000).await;
+    let out = emitted_for(&mut ledger, 24_000).await;
     let results: Vec<(usize, bool)> = out
         .emitted
         .iter()
@@ -1985,7 +1985,7 @@ async fn a_read_that_no_longer_fits_is_a_stub_and_not_a_tail() {
     ));
 
     let out = assemble(
-        &ledger,
+        &mut ledger,
         // A ceiling too small to carry the read whole, and large enough to carry
         // the newer entry — which is exactly the squeeze the rule is about.
         200,

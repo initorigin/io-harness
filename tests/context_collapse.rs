@@ -123,14 +123,20 @@ fn fixture() -> Fixture {
     }
 }
 
+/// 0.85.0 — assembly may append a refreshed read at the tail, so it takes the
+/// ledger by mutable reference. These cases assemble the *same* ledger under two
+/// collapse settings and compare the results, so each call gets its own copy:
+/// sharing one would let the first call's appends into the second's input and
+/// make the comparison a comparison of two different ledgers.
 async fn assembled(
     f: &Fixture,
     l: &Ledger,
     budget: u64,
     collapse: Collapse,
 ) -> io_harness::context::Assembled {
+    let mut l = l.clone();
     assemble(
-        l,
+        &mut l,
         budget,
         &[],
         &[],

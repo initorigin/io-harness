@@ -1306,7 +1306,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
             )
             .await?;
             let mut assembled = assemble(
-                &ledger,
+                &mut ledger,
                 budget_tokens,
                 &notes,
                 &global_notes,

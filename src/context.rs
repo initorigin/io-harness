@@ -328,8 +328,12 @@ impl Observation {
     }
 }
 
-/// The observations of one run, in order. Assembly reads it; nothing mutates
-/// history.
+/// The observations of one run, in order.
+///
+/// Append-only, and (0.85.0) that is now the whole of what assembly may do to it:
+/// [`assemble`] appends the current contents of a path whose earlier read has
+/// gone stale, and rewrites nothing. What an earlier step was shown stays what it
+/// was shown.
 ///
 /// `entries` stays private through serde too — it serializes as the one field it
 /// is, so a restored ledger is still append-only through [`Ledger::push`].
@@ -1274,6 +1278,21 @@ pub const SEED_AGENT: &str = "agent";
 /// conversation rather than a thing either party said.
 pub const SEED_SUMMARY: &str = "summary";
 
+/// (0.85.0) The `target` prefix on the observation a refreshed stale read is
+/// appended as, followed by the path that was re-read.
+///
+/// A re-read is the crate's own action rather than an answer to a call the model
+/// made, so the appended entry is an [`ObsKind::Message`] and maps to
+/// [`Piece::Prose`]: it takes no ordinal, and taking one would slide every later
+/// result of that step onto the wrong call.
+///
+/// It is a target prefix rather than a new [`ObsKind`] because the kind is a
+/// stored value — every persisted ledger would have to be readable by a decoder
+/// that had never seen the variant — and because `Message` with a reserved target
+/// is the shape [`SEED_OPERATOR`], [`SEED_AGENT`] and [`SEED_SUMMARY`] already
+/// established.
+pub const REREAD: &str = "reread:";
+
 /// How a summary reads to the model, wherever it was written.
 ///
 /// One definition rather than two format strings: `compact_ledger` writes it when
@@ -1368,12 +1387,122 @@ pub struct Emitted {
     pub text: String,
 }
 
-/// How one entry is going to appear this turn.
-enum Shape {
-    /// Carried, with the text to carry (a re-read entry's text is the fresh one).
-    Whole(String),
-    /// Elided, with the reason.
-    Stub(String),
+/// Why one entry is going to be elided this turn, decided before the budget is
+/// consulted.
+///
+/// (0.85.0) There is no second shape any more. Until this release a re-read was
+/// carried as text assembly had *written*, which is what let the step number into
+/// an entry the model had already been shown; now every entry that is carried is
+/// carried as the bytes the ledger recorded, and the only decision left here is
+/// whether an entry is elided and what the elision says.
+type Elision = Option<String>;
+
+/// Whether `entry` is the appended refresh of a read of `target` (0.85.0).
+fn is_reread_of(entry: &Observation, target: &str) -> bool {
+    entry.kind == ObsKind::Message
+        && entry.target.as_deref().and_then(|t| t.strip_prefix(REREAD)) == Some(target)
+}
+
+/// Append the current contents of every path whose newest read is older than the
+/// newest write of the same path (0.85.0).
+///
+/// The refresh is still made through the policy, at this step, for the reason it
+/// always was: the read the model would otherwise trust was decided many steps
+/// ago. What changed is where the answer goes. It is appended at the tail as its
+/// own observation, so the entry that went stale keeps the bytes it has always
+/// had and the step number that used to be written into it now belongs to an
+/// entry that arrives once and never changes again.
+///
+/// A refusal is appended too, and for the same reason: a refusal that was not
+/// recorded would be re-attempted on every later step, and each attempt would
+/// write the assembling step's number into the prompt again.
+fn append_refreshes(
+    ledger: &mut Ledger,
+    at: &Assembly<'_>,
+    cap: usize,
+    out: &mut Assembled,
+) -> Result<()> {
+    // A run with no workspace can never re-read anything, so nothing is appended
+    // and the stale entry says so once instead of saying it again every step.
+    if at.ws.is_none() {
+        return Ok(());
+    }
+    let entries = ledger.entries();
+    let mut stale: Vec<(String, u32)> = Vec::new();
+    for e in entries {
+        if e.kind != ObsKind::Read {
+            continue;
+        }
+        let Some(target) = e.target.as_deref() else {
+            continue;
+        };
+        if stale.iter().any(|(t, _)| t == target) {
+            continue;
+        }
+        // Positions rather than steps: one step may read a path and then write
+        // it, and which of the two is current is the order they were recorded in.
+        let Some(wrote) = entries
+            .iter()
+            .rposition(|l| l.kind == ObsKind::Write && l.target.as_deref() == Some(target))
+        else {
+            continue;
+        };
+        // An ordinary later read of the path is as good as a refresh — it is why
+        // supersession never sends a re-read of something the agent just read
+        // again — and so is an earlier refresh that already caught this write.
+        let fresh = entries.iter().rposition(|l| {
+            (l.kind == ObsKind::Read && l.target.as_deref() == Some(target))
+                || is_reread_of(l, target)
+        });
+        if fresh.is_some_and(|fresh| fresh > wrote) {
+            continue;
+        }
+        stale.push((target.to_string(), entries[wrote].step));
+    }
+
+    let step = at.step;
+    for (target, wrote_at) in stale {
+        out.reread += 1;
+        let (text, origin) = match refresh(at.ws, at.policy, &target, cap) {
+            Ok(fresh) => {
+                at.store.record_context_event(
+                    at.run_id,
+                    &ContextEvent::reread(step, format!("{target} (written at step {wrote_at})")),
+                )?;
+                (
+                    format!(
+                        "\n[read {target}] (re-read at step {step}; the earlier read was \
+                         invalidated by the write at step {wrote_at})\n{fresh}\n"
+                    ),
+                    Origin::File,
+                )
+            }
+            Err(why) => {
+                at.store.record_context_event(
+                    at.run_id,
+                    &ContextEvent::reread_refused(step, format!("{target}: {why}")),
+                )?;
+                (
+                    format!(
+                        "\n[read {target}] (the re-read at step {step} could not be done ({why}) \
+                         — read it yourself; the earlier read was invalidated by the write at \
+                         step {wrote_at})\n"
+                    ),
+                    // No bytes arrived from anywhere: this is the crate's own
+                    // narration about a refusal, which is what `Prose` means.
+                    Origin::Prose,
+                )
+            }
+        };
+        ledger.push(Observation::new(
+            step,
+            ObsKind::Message,
+            Some(format!("{REREAD}{target}")),
+            text,
+            origin,
+        ));
+    }
+    Ok(())
 }
 
 /// Build the observation section the model sees this turn.
@@ -1386,7 +1515,7 @@ enum Shape {
 ///
 /// One `assembled` trace row per turn, plus one per re-read. Never a row per stub.
 pub async fn assemble(
-    ledger: &Ledger,
+    ledger: &mut Ledger,
     budget_tokens: u64,
     notes: &[MemoryEntry],
     // 0.56.0 — the scope above the workspace, already stripped of anything the
@@ -1397,18 +1526,33 @@ pub async fn assemble(
     at: Assembly<'_>,
 ) -> Result<Assembled> {
     let Assembly {
-        ws,
-        policy,
+        // Read by `append_refreshes` above, which is the only step that reads a
+        // file or asks the policy anything.
+        ws: _,
+        policy: _,
         store,
         run_id,
         step,
         collapse,
         ladder,
     } = at;
-    let entries = ledger.entries();
-    let n = entries.len();
     let cap = entry_cap_chars(budget_tokens);
     let mut out = Assembled::default();
+
+    // 0. Re-read (0.85.0). A stale read is refreshed by appending the current
+    // contents at the *tail*, before anything below looks at the ledger, so the
+    // rest of this function sees the refreshed entry as an ordinary observation
+    // and the entry that went stale as an ordinary stub.
+    //
+    // Through 0.84.0 the refresh was written in place, carrying the assembling
+    // step's own number in its text — so a file read once and written once
+    // rendered differently on every remaining step of the run, from a position
+    // early in the transcript. That is a prefix change per step, which is a cache
+    // miss per step from that byte on.
+    append_refreshes(ledger, &at, cap, &mut out)?;
+
+    let entries = ledger.entries();
+    let n = entries.len();
 
     // Memory first. Notes from earlier runs are the cheapest context there is —
     // they are what makes a second run over a workspace cheaper than the first —
@@ -1462,39 +1606,34 @@ pub async fn assemble(
         })
         .collect();
 
-    // 3. Re-read. A stale read is worth carrying only as its *current* contents,
-    // so it is refreshed here — through the policy, at this step, because the
-    // read the model would otherwise trust was decided many steps ago.
-    let mut shapes: Vec<Option<Shape>> = (0..n).map(|_| None).collect();
+    // 3. The stale read itself. Its current contents are already in the ledger as
+    // the appended entry step 0 wrote, so what is left here is one stub — and the
+    // stub names two steps that have both already happened, which is what makes it
+    // the same string on every later step.
+    let mut elided: Vec<Elision> = (0..n).map(|_| None).collect();
     for i in 0..n {
         let (Some(wrote_at), None) = (invalidated[i], superseded[i]) else {
             continue;
         };
-        let target = entries[i].target.clone().unwrap_or_default();
-        out.reread += 1;
-        match refresh(ws, policy, &target, cap) {
-            Ok(fresh) => {
-                store.record_context_event(
-                    run_id,
-                    &ContextEvent::reread(step, format!("{target} (written at step {wrote_at})")),
-                )?;
-                shapes[i] = Some(Shape::Whole(format!(
-                    "\n[read {target}] (re-read at step {step}; the read at step {} was invalidated \
-                     by the write at step {wrote_at})\n{fresh}\n",
-                    entries[i].step
-                )));
+        let target = entries[i].target.as_deref().unwrap_or_default();
+        // The first refresh that happened after the write this entry went stale
+        // on. The *first*, not the newest: a second write appends a second
+        // refresh, and naming that one would rewrite this stub on the step it
+        // arrived — the rewrite this release exists to remove.
+        let caught_up = entries[i + 1..]
+            .iter()
+            .find(|l| is_reread_of(l, target) && l.step >= wrote_at)
+            .map(|l| l.step);
+        elided[i] = Some(match caught_up {
+            Some(at) => {
+                format!("invalidated by the write at step {wrote_at}; re-read at step {at}")
             }
-            Err(why) => {
-                store.record_context_event(
-                    run_id,
-                    &ContextEvent::reread_refused(step, format!("{target}: {why}")),
-                )?;
-                shapes[i] = Some(Shape::Stub(format!(
-                    "invalidated by the write at step {wrote_at}; the re-read at step {step} could \
-                     not be done ({why}) — read it yourself"
-                )));
-            }
-        }
+            // Reachable only when the refresh pass could not run at all — no
+            // workspace on the assembly, which is a flat run with no files to
+            // re-read. Says what is known rather than naming a step that does not
+            // exist.
+            None => format!("invalidated by the write at step {wrote_at}; not re-read"),
+        });
     }
 
     // 3a. Snip (0.81.0), the ladder's second rung. An old lookup is dropped by
@@ -1505,17 +1644,17 @@ pub async fn assemble(
     if let Some(snip) = ladder.snip {
         for i in 0..n {
             if superseded[i].is_some()
-                || shapes[i].is_some()
+                || elided[i].is_some()
                 || !Snip::droppable(entries[i].kind)
                 || step.saturating_sub(entries[i].step) <= snip.older_than_steps
             {
                 continue;
             }
             out.snipped += 1;
-            shapes[i] = Some(Shape::Stub(format!(
+            elided[i] = Some(format!(
                 "dropped as a lookup older than {} steps — ask again if it still matters",
                 snip.older_than_steps
-            )));
+            ));
         }
     }
 
@@ -1531,7 +1670,7 @@ pub async fn assemble(
     if ladder.skill_bodies_leave {
         for i in 0..n {
             if superseded[i].is_some()
-                || shapes[i].is_some()
+                || elided[i].is_some()
                 || entries[i].kind != ObsKind::Skill
                 || step.saturating_sub(entries[i].step) <= 1
             {
@@ -1541,9 +1680,9 @@ pub async fn assemble(
             // was not worth carrying", which is the distinction the field draws
             // against the budget's own drops. `Assembled::snipped` says so.
             out.snipped += 1;
-            shapes[i] = Some(Shape::Stub(
+            elided[i] = Some(
                 "the body has been folded out; read the skill again if you need it".to_string(),
-            ));
+            );
         }
     }
 
@@ -1566,7 +1705,7 @@ pub async fn assemble(
                 && entries[j].step == at_step
                 && Piece::of(&entries[j]) == Piece::Result
                 && superseded[j].is_none()
-                && shapes[j].is_none()
+                && elided[j].is_none()
             {
                 j += 1;
             }
@@ -1611,7 +1750,7 @@ pub async fn assemble(
                 if after < before {
                     out.microcompacted += 1;
                     for (k, why) in (i..j).zip(replacement) {
-                        shapes[k] = Some(Shape::Stub(why));
+                        elided[k] = Some(why);
                     }
                 }
             }
@@ -1630,13 +1769,10 @@ pub async fn assemble(
     // byte-identical to 0.75.0's for a caller who changed nothing.
     let mut shortened: Vec<Option<String>> = vec![None; n];
     for i in (0..n).rev() {
-        if superseded[i].is_some() || matches!(shapes[i], Some(Shape::Stub(_))) {
+        if superseded[i].is_some() || elided[i].is_some() {
             continue;
         }
-        let text = match &shapes[i] {
-            Some(Shape::Whole(t)) => t.as_str(),
-            _ => entries[i].text.as_str(),
-        };
+        let text = entries[i].text.as_str();
         let t = estimate_tokens(text);
         if used + t > budget_tokens {
             // The rung beneath a fold: an entry that will not fit whole may still
@@ -1687,24 +1823,23 @@ pub async fn assemble(
         let e = &entries[i];
         if whole[i] {
             out.carried += 1;
-            let text = match (&shortened[i], &shapes[i]) {
+            let text = match &shortened[i] {
                 // A collapsed entry is carried, so it counts as carried — and
                 // separately as shortened, which is what lets a reader of the
                 // trace tell a collapsed turn from a folded one.
-                (Some(short), _) => {
+                Some(short) => {
                     out.shortened += 1;
                     short.clone()
                 }
-                (None, Some(Shape::Whole(t))) => t.clone(),
-                _ => e.text.clone(),
+                None => e.text.clone(),
             };
             pieces.push((true, text));
             continue;
         }
         out.stubbed += 1;
-        let why = match (&shapes[i], superseded[i]) {
+        let why = match (&elided[i], superseded[i]) {
             (_, Some(at)) => format!("superseded by the {} at step {at}", e.kind.label()),
-            (Some(Shape::Stub(why)), _) => why.clone(),
+            (Some(why), _) => why.clone(),
             // 0.55.0 — a read says how to get the part that matters back, by
             // name. Every other kind is re-run rather than re-read: a command's
             // output and a search's matches have no line range to ask for.
