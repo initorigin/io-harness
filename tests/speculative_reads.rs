@@ -152,6 +152,7 @@ impl Script {
                     kind: ProviderErrorKind::Server,
                     status: Some(503),
                     retry_after: None,
+                    rate_limit: None,
                     message: "scripted mid-stream failure".into(),
                 });
             }

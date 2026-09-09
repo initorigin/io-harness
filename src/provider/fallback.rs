@@ -350,10 +350,10 @@ mod tests {
         })
     }
     fn down() -> Result<CompletionResponse> {
-        Err(Error::provider_status(503, None, "down"))
+        Err(Error::provider_status(503, None, None, "down"))
     }
     fn bad_key() -> Result<CompletionResponse> {
-        Err(Error::provider_status(401, None, "bad key"))
+        Err(Error::provider_status(401, None, None, "bad key"))
     }
     fn boom() -> Result<CompletionResponse> {
         panic!("the secondary must not be called");

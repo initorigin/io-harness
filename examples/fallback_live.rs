@@ -26,7 +26,12 @@ impl Provider for Down {
         &self,
         _request: CompletionRequest,
     ) -> io_harness::Result<CompletionResponse> {
-        Err(Error::provider_status(503, None, "service unavailable"))
+        Err(Error::provider_status(
+            503,
+            None,
+            None,
+            "service unavailable",
+        ))
     }
     fn name(&self) -> &str {
         "down-fixture"

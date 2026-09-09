@@ -221,6 +221,12 @@ pub mod shim {
         out.extend_from_slice(inherited);
         out
     }
+    // The second item it reaches out for, since 0.83.0's scrub. Stubbed for the
+    // same reason and returning one name, because a test asserting the scrub
+    // reaches a child needs the list to be non-empty to assert anything.
+    pub fn scrubbed_env(_declared: &[String]) -> Vec<String> {
+        vec!["OPENROUTER_API_KEY".to_string()]
+    }
 }
 #[path = "appcontainer.rs"] pub mod appcontainer;
 fn main() {}
@@ -230,6 +236,7 @@ RS
         sed -e 's|crate::sandbox::windows::Grant|crate::shim::Grant|g' \
             -e 's|crate::sandbox::windows::Reach|crate::shim::Reach|g' \
             -e 's|crate::sandbox::windows::inheritable_handles|crate::shim::inheritable_handles|g' \
+            -e 's|crate::sandbox::scrubbed_env|crate::shim::scrubbed_env|g' \
             -e 's|tempfile::tempdir()|crate::shim::tempdir()|g' \
             "$ROOT/src/sandbox/appcontainer.rs" >"$WORK/ac_raw.rs"
         elide_tracing "$WORK/ac_raw.rs" "$WORK/appcontainer.rs"

@@ -488,6 +488,40 @@ pub enum EventKind {
         /// Tokens the model produced.
         completion_tokens: u64,
     },
+    /// What the provider said about its rate limit on this completion (0.84.0).
+    ///
+    /// Emitted beside [`EventKind::StepUsage`], once per **committed step**
+    /// whose own completion carried a rate-limit header, and not at all for one
+    /// that carried none — so a consumer that never sees this event is looking
+    /// at a provider that reports nothing, not at an allowance of zero.
+    ///
+    /// "The step's own completion" is the limit of the claim, and it is the same
+    /// limit `StepUsage` has: the summariser call behind a compaction is a
+    /// completion the run made, and its rate limit is not reported here. A step
+    /// left uncommitted — the tree's path when a child is waiting on a human —
+    /// announces nothing, exactly as it writes nothing.
+    ///
+    /// The numbers are the provider's own, unmodified: this crate does not pace,
+    /// throttle or retry differently because of them. `raw_count` says how many
+    /// rate-limit headers the response carried in total, typed or not, which is
+    /// how an operator learns a gateway is publishing a window this crate does
+    /// not name — the pairs themselves are on
+    /// [`CompletionResponse::rate_limit`](crate::CompletionResponse::rate_limit).
+    RateLimit {
+        /// Requests left in the window, where the provider reported it.
+        requests_remaining: Option<u64>,
+        /// Tokens left in the window, where the provider reported it.
+        tokens_remaining: Option<u64>,
+        /// Whole seconds until the request window refills, where the provider
+        /// reported it. Rounded down; a sub-second reset reads as `Some(0)`,
+        /// which is "about to refill" rather than "not reported".
+        requests_reset_secs: Option<u64>,
+        /// Whole seconds until the token window refills, where the provider
+        /// reported it.
+        tokens_reset_secs: Option<u64>,
+        /// How many rate-limit headers the response carried.
+        raw_count: usize,
+    },
     /// An image reached this run, and where it came from (0.81.0).
     ///
     /// **No image reached the event stream at all before this release**, in any
@@ -1546,6 +1580,8 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "step_attributed",
     // 0.81.0
     "step_usage",
+    // 0.84.0
+    "rate_limit",
     "image_attached",
     "tool_call",
     "refused",
@@ -2410,6 +2446,13 @@ mod tests {
                 cache_write_tokens: None,
                 completion_tokens: 62,
             },
+            EventKind::RateLimit {
+                requests_remaining: Some(99),
+                tokens_remaining: Some(4_000),
+                requests_reset_secs: Some(360),
+                tokens_reset_secs: None,
+                raw_count: 5,
+            },
             EventKind::ImageAttached {
                 media_type: "image/png".into(),
                 bytes: 41_200,
@@ -2427,6 +2470,7 @@ mod tests {
                 | EventKind::Step { .. }
                 | EventKind::StepAttributed { .. }
                 | EventKind::StepUsage { .. }
+                | EventKind::RateLimit { .. }
                 | EventKind::ImageAttached { .. }
                 | EventKind::ToolCall { .. }
                 | EventKind::Refused { .. }

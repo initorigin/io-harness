@@ -297,6 +297,18 @@ pub enum Error {
         status: Option<u16>,
         /// The server's `Retry-After`, when it sent one.
         retry_after: Option<Duration>,
+        /// (0.84.0) What the response said about the rate limit that refused it,
+        /// when it said anything. A 429 is the one failure whose headers a
+        /// caller wants as much as its status, and this is the same
+        /// [`crate::provider::RateLimit`] a successful completion carries.
+        ///
+        /// Boxed, alone among this variant's fields: a `RateLimit` owns two
+        /// windows and a `Vec` of header pairs, and this enum is the `Err` half
+        /// of every `Result` the crate returns — inlining it would widen every
+        /// one of them by the size of a struct almost none of them carry.
+        /// [`Error::rate_limit`] hands back a reference, so the box is not in
+        /// the way of reading it.
+        rate_limit: Option<Box<crate::provider::RateLimit>>,
         /// What the provider or the transport reported.
         message: String,
     },
@@ -434,6 +446,7 @@ impl Error {
             kind,
             status: None,
             retry_after: None,
+            rate_limit: None,
             message: message.into(),
         }
     }
@@ -460,6 +473,7 @@ impl Error {
     pub fn provider_status(
         status: u16,
         retry_after: Option<Duration>,
+        rate_limit: Option<crate::provider::RateLimit>,
         message: impl Into<String>,
     ) -> Self {
         let message = message.into();
@@ -467,7 +481,22 @@ impl Error {
             kind: ProviderErrorKind::from_response(status, &message),
             status: Some(status),
             retry_after,
+            rate_limit: rate_limit.map(Box::new),
             message,
+        }
+    }
+
+    /// What the failing response said about the rate limit, when it said
+    /// anything (0.84.0).
+    ///
+    /// `None` for every failure that is not a provider response, and for a
+    /// provider response that carried no rate-limit header — including, on some
+    /// vendors, a 429 itself. An accessor rather than a match so a caller can
+    /// ask the question without naming the variant's other fields.
+    pub fn rate_limit(&self) -> Option<&crate::provider::RateLimit> {
+        match self {
+            Self::Provider { rate_limit, .. } => rate_limit.as_deref(),
+            _ => None,
         }
     }
 }
@@ -639,7 +668,7 @@ mod tests {
 
     #[test]
     fn a_status_failure_keeps_its_status_and_retry_after() {
-        let e = Error::provider_status(429, Some(Duration::from_secs(7)), "slow down");
+        let e = Error::provider_status(429, Some(Duration::from_secs(7)), None, "slow down");
         let Error::Provider {
             kind,
             status,

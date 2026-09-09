@@ -922,3 +922,54 @@ impl Approver for Watching<'_> {
         self.inner.self_approval_allowed()
     }
 }
+
+#[cfg(test)]
+mod capture_forwards {
+    use super::*;
+
+    /// A provider that answers with a response carrying a rate limit.
+    struct Limited;
+
+    impl Provider for Limited {
+        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+            let mut limit = crate::provider::RateLimit::default();
+            limit.requests.remaining = Some(7);
+            Ok(CompletionResponse {
+                text: Some("hi".into()),
+                rate_limit: Some(limit),
+                ..Default::default()
+            })
+        }
+
+        fn name(&self) -> &str {
+            "limited"
+        }
+    }
+
+    /// `Capture` is private, so the wrapper census in `tests/rate_limit.rs` can
+    /// name it and nothing outside this file can assert on it. This is that
+    /// assertion: a wrapper that rebuilt the response instead of forwarding it
+    /// would drop the field here and pass every other test in the crate.
+    #[tokio::test]
+    async fn a_captured_completion_keeps_its_rate_limit() {
+        let capture = Capture::new(&Limited);
+        let response = capture
+            .complete(CompletionRequest {
+                system: "s".into(),
+                user: "u".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.rate_limit.and_then(|l| l.requests.remaining),
+            Some(7)
+        );
+        assert_eq!(
+            capture.take().len(),
+            1,
+            "and the request was still captured"
+        );
+    }
+}

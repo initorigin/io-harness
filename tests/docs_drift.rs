@@ -2018,6 +2018,11 @@ const README_MUST_NAME: &[(&str, &str)] = &[
     // this release's one break.
     ("0.83.0", "network-bind"),
     ("0.83.0", "with_inherited_env"),
+    // 0.84.0. One name, and it is the field rather than either type: a reader
+    // arrives here having been rate-limited and wanting to know what the response
+    // said, which is a thing they read off a completion rather than a thing they
+    // construct.
+    ("0.84.0", "rate_limit"),
 ];
 
 /// Releases since the floor that introduced no public name of their own.

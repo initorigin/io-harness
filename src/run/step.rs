@@ -88,6 +88,10 @@ pub(super) fn commit_step(
     changed: bool,
     commit: bool,
     usage: Option<crate::Usage>,
+    // By reference: the only things read off it are four `Option<u64>`s and a
+    // length, and a `RateLimit` owns a `Vec` of header pairs that would
+    // otherwise be deep-cloned once per step to be counted and dropped.
+    rate_limit: Option<&crate::RateLimit>,
 ) -> Result<()> {
     if !commit {
         info!(
@@ -147,6 +151,24 @@ pub(super) fn commit_step(
                 cache_read_tokens: usage.cache_read_tokens,
                 cache_write_tokens: usage.cache_write_tokens,
                 completion_tokens: usage.completion_tokens,
+            },
+        ));
+    }
+    // 0.84.0 — beside the usage, from the same completion, and only when the
+    // provider actually said something: an event carrying four `None`s would
+    // report "the allowance is unknown" once per step for every provider that
+    // reports no rate limit at all, which is most of them.
+    if let Some(limit) = rate_limit {
+        watch.emit(RunEvent::at_depth(
+            run_id,
+            record_step,
+            depth,
+            EventKind::RateLimit {
+                requests_remaining: limit.requests.remaining,
+                tokens_remaining: limit.tokens.remaining,
+                requests_reset_secs: limit.requests.reset.map(|d| d.as_secs()),
+                tokens_reset_secs: limit.tokens.reset.map(|d| d.as_secs()),
+                raw_count: limit.raw.len(),
             },
         ));
     }
@@ -654,6 +676,7 @@ pub(super) async fn run_from<P: Provider>(
             write.is_some(),
             true,
             response.usage,
+            response.rate_limit.as_ref(),
         )?;
 
         // Cost budget: checked after this step's tokens are counted.
@@ -1904,6 +1927,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
             step_changed,
             true,
             response.usage,
+            response.rate_limit.as_ref(),
         )?;
         // The step is committed, so the observations behind it are safe to make
         // durable. After the commit rather than before: a ledger that ran ahead of

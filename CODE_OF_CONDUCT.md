@@ -33,9 +33,13 @@ Examples of unacceptable behavior:
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the maintainers at **<project-contact-email>**. All complaints will be reviewed and
-investigated promptly and fairly. Maintainers will respect the privacy and
-security of the reporter of any incident.
+reported to the maintainers privately through
+**[GitHub's private reporting](https://github.com/initorigin/io-harness/security/advisories/new)**
+on this repository. That form is labelled for vulnerabilities and is this
+project's private channel for either kind of report — it is visible only to you
+and the maintainers. All complaints will be reviewed and investigated promptly
+and fairly. Maintainers will respect the privacy and security of the reporter of
+any incident.
 
 ## Attribution
 

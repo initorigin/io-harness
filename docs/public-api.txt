@@ -213,6 +213,7 @@ struct Progress src/resilience.rs
 struct ProviderCall src/state.rs
 struct Pruned src/state.rs
 struct Question src/approve.rs
+struct RateLimit src/provider/mod.rs
 struct Recovery src/state.rs
 struct Reference src/provider/catalog.rs
 struct Request src/approve.rs
@@ -267,6 +268,7 @@ struct TurnResult src/session.rs
 struct Usage src/provider/mod.rs
 struct Verdict src/policy.rs
 struct WebAccess src/web.rs
+struct Window src/provider/mod.rs
 trait Approver src/approve.rs
 trait Observer src/observe.rs
 trait PlanGate src/approve.rs

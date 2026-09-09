@@ -580,8 +580,8 @@ pub use plugin::{Dropped, Plugin, Plugins, MAX_ID, NAMESPACE, PLUGIN_FILE};
 pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{
     Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, Effort, Message, ModelInfo,
-    OpenAi, OpenRouter, PriceSource, PromptFamily, Provider, Reference, ToolCall, ToolResult,
-    ToolSpec, Usage,
+    OpenAi, OpenRouter, PriceSource, PromptFamily, Provider, RateLimit, Reference, ToolCall,
+    ToolResult, ToolSpec, Usage, Window,
 };
 #[cfg(feature = "media")]
 pub use provider::{Media, IMAGE_MEDIA_TYPES};

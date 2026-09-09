@@ -2502,7 +2502,7 @@ mod span_tests {
             // carries a latency the exporter has to place like any other.
             tokio::time::sleep(Duration::from_millis(CALL_MS)).await;
             match self.script.get(i) {
-                Some(Turn::Failure) => Err(Error::provider_status(503, None, "unavailable")),
+                Some(Turn::Failure) => Err(Error::provider_status(503, None, None, "unavailable")),
                 other => Ok(CompletionResponse {
                     tool_calls: match other {
                         Some(Turn::Calls(calls)) => calls.clone(),

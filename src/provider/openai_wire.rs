@@ -547,6 +547,10 @@ pub(crate) async fn parse_stream_with(
     on_call: &(dyn Fn(usize, &ToolCall) + Send + Sync),
 ) -> Result<CompletionResponse> {
     let mut acc = Accumulator::since(sent).from(vendor);
+    // 0.84.0 — before `read_sse`, which takes the response by value and consumes
+    // the body. There is nowhere later this could be read from: the ordering the
+    // contract asks for is the one the borrow checker already enforces.
+    let rate_limit = crate::provider::RateLimit::from_headers(resp.headers());
     read_sse(resp, |data| {
         if data == "[DONE]" {
             return true;
@@ -569,7 +573,9 @@ pub(crate) async fn parse_stream_with(
     if acc.budget.spent() {
         return Err(super::over_budget());
     }
-    ensure_parsed(acc.finish())
+    let mut response = ensure_parsed(acc.finish())?;
+    response.rate_limit = rate_limit;
+    Ok(response)
 }
 
 /// The assistant-text delta a chunk carries, if it carries one.
@@ -896,6 +902,9 @@ impl Accumulator {
             ttft_ms: self.ttft_ms,
             citations: self.citations,
             server_tools: self.server_tools,
+            // The accumulator sees deltas, never headers. `parse_stream_with`
+            // fills this from the response it read them off.
+            rate_limit: None,
         }
     }
 }

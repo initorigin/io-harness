@@ -83,7 +83,7 @@ impl Provider for Mock {
     async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
         let i = self.at.fetch_add(1, Ordering::SeqCst);
         match self.script.get(i) {
-            Some(Turn::Failure) => Err(Error::provider_status(503, None, "unavailable")),
+            Some(Turn::Failure) => Err(Error::provider_status(503, None, None, "unavailable")),
             other => Ok(CompletionResponse {
                 tool_calls: match other {
                     Some(Turn::Calls(c)) => c.clone(),
