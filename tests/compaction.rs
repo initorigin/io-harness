@@ -1111,6 +1111,7 @@ mod requested {
                     return Err(io_harness::Error::provider_status(
                         400,
                         None,
+                        None,
                         "This model's maximum context length is 8192 tokens, however you requested more",
                     ));
                 }

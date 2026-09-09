@@ -103,6 +103,7 @@ impl Provider for Down {
         Err(Error::provider_status(
             self.status,
             None,
+            None,
             format!("{} is down", self.label),
         ))
     }

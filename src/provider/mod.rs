@@ -72,6 +72,31 @@ pub(crate) const MAX_TOOL_CALL_BLOCKS: usize = 1024;
 /// draws nothing and the byte budget never notices it.
 pub(crate) const ROW_BYTES: usize = 64;
 
+/// The most bytes of one rate-limit header value that are kept (0.84.0).
+///
+/// A rate-limit value is a number or a short duration; 256 bytes is orders of
+/// magnitude past any of them, and a value that exceeds it is kept truncated as
+/// evidence rather than parsed into a figure nobody sent.
+///
+/// The bound is on the string that is **kept**, after decoding. A header value
+/// may legally carry `0x80..=0xFF`, each of which decodes to a three-byte
+/// replacement character, so a cap applied to the arriving bytes would bound
+/// nothing this constant is read as bounding.
+pub(crate) const MAX_RATE_LIMIT_VALUE_BYTES: usize = 256;
+
+/// The most rate-limit headers from one response that are kept (0.84.0).
+///
+/// The value bound above is per header, and the *count* is as much the sender's
+/// choice as the values are: hyper admits about a hundred headers on HTTP/1.1
+/// and h2's default header-list ceiling is 16 MiB, which is tens of thousands of
+/// them. Every kept pair is cloned into the response, into any recording written
+/// to disk, and past every step of the run — so the product of the two bounds is
+/// what actually needs to be small.
+///
+/// Sixteen is past every family this crate knows: OpenAI sends six, Anthropic
+/// six, and a gateway publishing two windows of its own still fits.
+pub(crate) const MAX_RATE_LIMIT_HEADERS: usize = 16;
+
 /// The most bytes of a non-success body that reach an [`Error`] message.
 ///
 /// Vendors put a sentence in an error body. This string travels into a typed
@@ -161,13 +186,15 @@ pub(crate) async fn ensure_success(resp: reqwest::Response) -> Result<reqwest::R
     if status.is_success() {
         return Ok(resp);
     }
-    // Read the header before the body: reading the body consumes the response.
+    // Read the headers before the body: reading the body consumes the response.
     let retry_after = crate::net::retry_after(resp.headers());
+    let rate_limit = RateLimit::from_headers(resp.headers());
     let detail = capped_body(resp).await;
     let detail = detail.trim();
     Err(Error::provider_status(
         status.as_u16(),
         retry_after,
+        rate_limit,
         if detail.is_empty() {
             status.canonical_reason().unwrap_or("no detail").to_string()
         } else {
@@ -1554,6 +1581,266 @@ pub struct CompletionResponse {
     /// record of what was spent; this is the live view of what was spent on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// (0.84.0) What the provider said about its rate limit on this call, as
+    /// [`RateLimit::from_headers`] read it off the response headers. `None` when
+    /// the provider sent no header naming a rate limit — which is most local
+    /// runtimes and any endpoint that simply does not report one.
+    ///
+    /// The harness reads the headers and does nothing with them: there is no
+    /// pacing, no throttling and no retry policy here. An application layer that
+    /// wants to show an operator how much allowance is left is the caller this
+    /// field exists for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimit>,
+}
+
+/// One rate-limit window a provider reported: how many, how many are left, and
+/// when it refills (0.84.0).
+///
+/// Every field is an `Option` for the same reason it is on [`ModelInfo`]:
+/// **`None` means the provider did not say.** A vendor that sends `remaining`
+/// and no `limit` is common, and a zero would report a real allowance as spent.
+///
+/// ```
+/// use io_harness::Window;
+///
+/// // What an operator's status line has to render. The two unknowns are
+/// // different from a zero, so neither is turned into one.
+/// fn line(window: &Window) -> String {
+///     match (window.remaining, window.limit) {
+///         (Some(left), Some(of)) => format!("{left} of {of} left"),
+///         (Some(left), None) => format!("{left} left"),
+///         // The provider reports this window and said nothing about it, which
+///         // is not the same as reporting an allowance of nothing.
+///         (None, _) => "not reported".into(),
+///     }
+/// }
+///
+/// let mut window = Window::default();
+/// assert_eq!(line(&window), "not reported");
+///
+/// // `#[non_exhaustive]`: built from the default and filled in, because a later
+/// // release may name a fourth thing a vendor says about a window.
+/// window.remaining = Some(99);
+/// assert_eq!(line(&window), "99 left");
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct Window {
+    /// The size of the window — the whole allowance, not what is left of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    /// What was left of the allowance when this response was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<u64>,
+    /// How long until the window refills, **from when the header was read**.
+    ///
+    /// A vendor that states an absolute instant (Anthropic spells it RFC 3339)
+    /// has it converted here against the local clock, so a machine whose clock
+    /// is skewed reads a duration skewed by the same amount. A vendor that
+    /// states a duration (the OpenAI family spells it `6m0s`) is taken as sent
+    /// and depends on no clock at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset: Option<std::time::Duration>,
+}
+
+/// What a provider said about its rate limit on one response (0.84.0).
+///
+/// Two families are typed: OpenAI's `x-ratelimit-{limit,remaining,reset}-{requests,tokens}`
+/// and Anthropic's `anthropic-ratelimit-{requests,tokens}-{limit,remaining,reset}`.
+/// **Every** header whose name contains `ratelimit` is kept verbatim in [`raw`](Self::raw)
+/// in arrival order, typed or not, so a gateway that publishes a window of its
+/// own reaches a caller without this crate knowing the name.
+///
+/// Nothing here is interpreted. The harness does not pace, throttle, or change
+/// a retry policy because of these numbers; it reports what the provider said.
+///
+/// ```
+/// use io_harness::provider::RateLimit;
+///
+/// // What a caller reads off a completion. `#[non_exhaustive]`, because a later
+/// // release may type a third family — so one is built from the default and
+/// // filled in rather than written as a literal, functional-update form
+/// // included. Reading one, which is what this type is for, is unaffected.
+/// let limit = RateLimit::default();
+/// assert!(limit.requests.remaining.is_none());
+/// assert!(limit.raw.is_empty());
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct RateLimit {
+    /// The request-count window.
+    #[serde(default)]
+    pub requests: Window,
+    /// The token-count window.
+    #[serde(default)]
+    pub tokens: Window,
+    /// Every rate-limit header the response carried, name and value, in the
+    /// order the response listed them. Names are lowercased by the wire; a
+    /// value longer than 256 bytes is truncated to it and read as no number at
+    /// all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw: Vec<(String, String)>,
+}
+
+impl RateLimit {
+    /// Read the rate-limit headers off a response, or `None` when it carried
+    /// none.
+    ///
+    /// `None` rather than an empty struct: "this provider reports no rate limit"
+    /// and "this provider reports an allowance of nothing" are different facts,
+    /// and only the second should ever read as a number.
+    ///
+    /// A header that appears twice is taken from the **first occurrence that
+    /// parses** — a response that contradicts itself has no right answer and a
+    /// deterministic one is worth more than the last line winning, and a value
+    /// that parsed into nothing has not answered the question a later one still
+    /// can. Both occurrences are kept in [`raw`](Self::raw).
+    pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Option<Self> {
+        let mut out = Self::default();
+        for (name, value) in headers.iter() {
+            // `HeaderName` is lowercase on the wire and in this map, so the
+            // contains-check is already the lowercased one.
+            let name = name.as_str();
+            if !name.contains("ratelimit") {
+                continue;
+            }
+
+            // Cut what is *kept*, not what arrived. A header value may legally
+            // carry obs-text — `0x80..=0xFF` — and each of those bytes becomes a
+            // three-byte replacement character, so cutting the input at the cap
+            // and then decoding stores up to three times the bound this constant
+            // claims. Decode first, then cut on a character boundary.
+            let mut text = String::from_utf8_lossy(value.as_bytes()).into_owned();
+            let overlong = text.len() > MAX_RATE_LIMIT_VALUE_BYTES;
+            if overlong {
+                let cut = (0..=MAX_RATE_LIMIT_VALUE_BYTES)
+                    .rev()
+                    .find(|at| text.is_char_boundary(*at))
+                    .unwrap_or(0);
+                text.truncate(cut);
+            }
+
+            // A response may carry as many rate-limit headers as it likes, and
+            // every one of them is kept — so the count is as attacker-controlled
+            // as the values are, and on HTTP/2 the transport's own ceiling is
+            // measured in mebibytes. What is past the cap is dropped rather than
+            // truncated: an eleventh header is not evidence of anything, and
+            // `raw` travels into a recording written to disk.
+            if out.raw.len() < MAX_RATE_LIMIT_HEADERS {
+                out.raw.push((name.to_string(), text.clone()));
+            }
+
+            // A value past the byte cap is recorded truncated and read as
+            // nothing: a number that long is not a number, and parsing the
+            // prefix of one would invent a value the provider never sent.
+            if overlong {
+                continue;
+            }
+            let text = text.trim();
+
+            let (window, field) = match name {
+                "x-ratelimit-limit-requests" => (&mut out.requests, Field::Limit),
+                "x-ratelimit-remaining-requests" => (&mut out.requests, Field::Remaining),
+                "x-ratelimit-reset-requests" => (&mut out.requests, Field::ResetDuration),
+                "x-ratelimit-limit-tokens" => (&mut out.tokens, Field::Limit),
+                "x-ratelimit-remaining-tokens" => (&mut out.tokens, Field::Remaining),
+                "x-ratelimit-reset-tokens" => (&mut out.tokens, Field::ResetDuration),
+                "anthropic-ratelimit-requests-limit" => (&mut out.requests, Field::Limit),
+                "anthropic-ratelimit-requests-remaining" => (&mut out.requests, Field::Remaining),
+                "anthropic-ratelimit-requests-reset" => (&mut out.requests, Field::ResetInstant),
+                "anthropic-ratelimit-tokens-limit" => (&mut out.tokens, Field::Limit),
+                "anthropic-ratelimit-tokens-remaining" => (&mut out.tokens, Field::Remaining),
+                "anthropic-ratelimit-tokens-reset" => (&mut out.tokens, Field::ResetInstant),
+                _ => continue,
+            };
+
+            // A second occurrence of a name already read is not a parse failure
+            // and is not logged as one — it is the first-wins rule above.
+            let read = match field {
+                Field::Limit if window.limit.is_none() => {
+                    window.limit = text.parse().ok();
+                    window.limit.is_some()
+                }
+                Field::Remaining if window.remaining.is_none() => {
+                    window.remaining = text.parse().ok();
+                    window.remaining.is_some()
+                }
+                Field::ResetDuration if window.reset.is_none() => {
+                    window.reset = parse_go_duration(text);
+                    window.reset.is_some()
+                }
+                Field::ResetInstant if window.reset.is_none() => {
+                    window.reset = crate::net::parse_rfc3339(text).map(|at| {
+                        at.duration_since(std::time::SystemTime::now())
+                            .unwrap_or(std::time::Duration::ZERO)
+                    });
+                    window.reset.is_some()
+                }
+                _ => true,
+            };
+            if !read {
+                tracing::debug!(header = name, "rate-limit header value did not parse");
+            }
+        }
+
+        (!out.raw.is_empty()).then_some(out)
+    }
+}
+
+/// Which part of a [`Window`] a header name selects, and in which spelling.
+enum Field {
+    Limit,
+    Remaining,
+    /// A duration, as the OpenAI family sends it.
+    ResetDuration,
+    /// An RFC 3339 instant, as Anthropic sends it.
+    ResetInstant,
+}
+
+/// Parse the duration spelling the OpenAI family uses for a reset — `6m0s`,
+/// `1s`, `128ms`, `1h2m3s` — into a [`std::time::Duration`] (0.84.0).
+///
+/// This is Go's `time.Duration` format, which is what the header is: a sequence
+/// of decimal numbers each with a unit suffix. A bare number is **not** accepted
+/// — Go's own parser refuses one, and a vendor that started sending seconds
+/// without a unit would be sending a different header than this one.
+fn parse_go_duration(value: &str) -> Option<std::time::Duration> {
+    let mut rest = value;
+    let mut total = std::time::Duration::ZERO;
+    let mut any = false;
+
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        let number: f64 = rest[..digits].parse().ok()?;
+        rest = &rest[digits..];
+
+        // Longest suffix first: `ms` and `m` share a prefix, and reading `6m0s`
+        // as milliseconds would be wrong by three orders of magnitude.
+        let (unit, nanos_each) = [
+            ("ns", 1.0),
+            ("us", 1_000.0),
+            ("µs", 1_000.0),
+            ("ms", 1_000_000.0),
+            ("s", 1_000_000_000.0),
+            ("m", 60_000_000_000.0),
+            ("h", 3_600_000_000_000.0),
+        ]
+        .into_iter()
+        .find(|(unit, _)| rest.starts_with(unit))?;
+        rest = &rest[unit.len()..];
+
+        let nanos = number * nanos_each;
+        if !nanos.is_finite() || nanos < 0.0 || nanos > u64::MAX as f64 {
+            return None;
+        }
+        total = total.checked_add(std::time::Duration::from_nanos(nanos as u64))?;
+        any = true;
+    }
+
+    any.then_some(total)
 }
 
 /// Where a [`ModelInfo`]'s price came from (0.29.0).
@@ -3273,5 +3560,509 @@ mod transport_bounds {
             .await
             .unwrap_err();
         assert_eq!(failure(err).1, body);
+    }
+}
+
+/// What a vendor said about its rate limit, read off the headers (0.84.0).
+#[cfg(test)]
+mod rate_limit_headers {
+    use std::time::Duration;
+
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    use super::*;
+
+    /// A header map in the order the pairs are given, which is the order
+    /// [`RateLimit::raw`] must reproduce.
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(
+                HeaderName::from_bytes(name.as_bytes()).expect("a test writes a legal header name"),
+                HeaderValue::from_str(value).expect("a test writes a legal header value"),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn f1_the_openai_family_is_typed() {
+        let limit = RateLimit::from_headers(&headers(&[
+            ("x-ratelimit-limit-requests", "500"),
+            ("x-ratelimit-remaining-requests", "99"),
+            ("x-ratelimit-reset-requests", "6m0s"),
+            ("x-ratelimit-remaining-tokens", "158000"),
+            ("x-ratelimit-reset-tokens", "1s"),
+        ]))
+        .expect("five rate-limit headers");
+
+        assert_eq!(limit.requests.limit, Some(500));
+        assert_eq!(limit.requests.remaining, Some(99));
+        assert_eq!(limit.requests.reset, Some(Duration::from_secs(360)));
+        assert_eq!(limit.tokens.remaining, Some(158_000));
+        assert_eq!(limit.tokens.reset, Some(Duration::from_secs(1)));
+        assert_eq!(limit.raw.len(), 5, "typed and raw, not typed or raw");
+    }
+
+    #[test]
+    fn f2_the_anthropic_family_is_typed_and_its_instant_becomes_a_wait() {
+        // Far enough ahead that the arithmetic is unambiguous on any clock this
+        // test could run on, and stated in UTC because that is what the vendor
+        // sends.
+        let at = std::time::SystemTime::now() + Duration::from_secs(3_600);
+        let secs = at
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("now is after the epoch")
+            .as_secs();
+        let reset = rfc3339(secs);
+
+        let limit = RateLimit::from_headers(&headers(&[
+            ("anthropic-ratelimit-tokens-remaining", "4000"),
+            ("anthropic-ratelimit-tokens-limit", "80000"),
+            ("anthropic-ratelimit-tokens-reset", &reset),
+        ]))
+        .expect("three rate-limit headers");
+
+        assert_eq!(limit.tokens.remaining, Some(4_000));
+        assert_eq!(limit.tokens.limit, Some(80_000));
+        let wait = limit.tokens.reset.expect("the reset parsed");
+        assert!(
+            wait > Duration::from_secs(3_540) && wait <= Duration::from_secs(3_600),
+            "an absolute instant an hour out reads as about an hour, not {wait:?}"
+        );
+    }
+
+    #[test]
+    fn f2_an_instant_already_past_is_no_wait_at_all() {
+        let limit = RateLimit::from_headers(&headers(&[(
+            "anthropic-ratelimit-requests-reset",
+            "2020-01-01T00:00:00Z",
+        )]))
+        .expect("one rate-limit header");
+
+        assert_eq!(
+            limit.requests.reset,
+            Some(Duration::ZERO),
+            "a window that refilled before the response arrived is refilled, not negative"
+        );
+    }
+
+    #[test]
+    fn f3_a_family_this_crate_does_not_name_reaches_raw_and_nothing_else() {
+        let limit = RateLimit::from_headers(&headers(&[("x-ratelimit-remaining-5h", "42")]))
+            .expect("its name contains ratelimit");
+
+        assert_eq!(
+            limit.raw,
+            vec![("x-ratelimit-remaining-5h".to_string(), "42".to_string())]
+        );
+        assert_eq!(limit.requests, Window::default());
+        assert_eq!(limit.tokens, Window::default());
+    }
+
+    #[test]
+    fn f4_a_response_naming_no_rate_limit_yields_none() {
+        assert_eq!(
+            RateLimit::from_headers(&headers(&[
+                ("content-type", "text/event-stream"),
+                ("retry-after", "30"),
+            ])),
+            None,
+            "`retry-after` is not a rate-limit header and has its own field"
+        );
+        assert_eq!(RateLimit::from_headers(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn nf2_an_overlong_value_is_truncated_and_read_as_nothing() {
+        let long = "9".repeat(MAX_RATE_LIMIT_VALUE_BYTES + 1);
+        let limit = RateLimit::from_headers(&headers(&[(
+            "x-ratelimit-remaining-requests",
+            long.as_str(),
+        )]))
+        .expect("one rate-limit header");
+
+        assert_eq!(
+            limit.raw[0].1.len(),
+            MAX_RATE_LIMIT_VALUE_BYTES,
+            "the evidence is kept, bounded"
+        );
+        assert_eq!(
+            limit.requests.remaining, None,
+            "a 257-byte number is not a number, and parsing its prefix would invent one"
+        );
+    }
+
+    #[test]
+    fn nf2_a_truncated_value_whose_prefix_would_parse_is_still_read_as_nothing() {
+        // The arm that makes the bound load-bearing. A 257-digit number is
+        // refused by `u64::from_str` whatever the cap does, so a test using one
+        // passes with the cap deleted — which is exactly what the sabotage pass
+        // found. A duration does not have that luxury: the first 256 bytes of
+        // this value are a *legal* duration, so a parse of the truncation would
+        // report a wait the provider never named.
+        let long = "1s".repeat(200);
+        assert!(long.len() > MAX_RATE_LIMIT_VALUE_BYTES);
+        assert!(
+            parse_go_duration(&long[..MAX_RATE_LIMIT_VALUE_BYTES]).is_some(),
+            "the prefix parses, which is what makes this arm worth having"
+        );
+
+        let limit =
+            RateLimit::from_headers(&headers(&[("x-ratelimit-reset-requests", long.as_str())]))
+                .expect("one rate-limit header");
+
+        assert_eq!(limit.raw[0].1.len(), MAX_RATE_LIMIT_VALUE_BYTES);
+        assert_eq!(
+            limit.requests.reset, None,
+            "a value the cap cut is evidence, not a number"
+        );
+    }
+
+    #[test]
+    fn nf2_a_value_at_the_cap_is_still_read() {
+        // The control for the two tests above: a cap that rejected everything
+        // would pass both and make the typed fields unreachable.
+        let at_cap = format!("{:>width$}", "99", width = MAX_RATE_LIMIT_VALUE_BYTES);
+        let limit =
+            RateLimit::from_headers(&headers(&[("x-ratelimit-remaining-requests", &at_cap)]))
+                .expect("one rate-limit header");
+        assert_eq!(limit.requests.remaining, Some(99));
+    }
+
+    #[test]
+    fn nf2_a_value_of_obs_text_is_bounded_after_decoding_not_before() {
+        // The arm the first version of this pass did not have. A header value may
+        // legally carry `0x80..=0xFF`, each of which decodes to a three-byte
+        // replacement character — so a cap applied to the arriving bytes bounds
+        // the input and stores three times the bound.
+        let mut map = HeaderMap::new();
+        map.append(
+            HeaderName::from_static("x-ratelimit-remaining-requests"),
+            HeaderValue::from_bytes(&[0xFF; MAX_RATE_LIMIT_VALUE_BYTES])
+                .expect("obs-text is a legal header value"),
+        );
+
+        let limit = RateLimit::from_headers(&map).expect("one rate-limit header");
+
+        assert!(
+            limit.raw[0].1.len() <= MAX_RATE_LIMIT_VALUE_BYTES,
+            "the bound is on what is kept, and this value decoded to {} bytes",
+            limit.raw[0].1.len()
+        );
+        assert_eq!(limit.requests.remaining, None, "and it is not a number");
+    }
+
+    #[test]
+    fn nf2_a_response_of_nothing_but_rate_limit_headers_is_bounded_in_count() {
+        // The count is the sender's choice as much as the values are, and every
+        // kept pair is cloned into any recording written to disk.
+        let names: Vec<String> = (0..MAX_RATE_LIMIT_HEADERS * 4)
+            .map(|n| format!("x-ratelimit-window-{n}"))
+            .collect();
+        let pairs: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "1")).collect();
+
+        let limit = RateLimit::from_headers(&headers(&pairs)).expect("many rate-limit headers");
+
+        assert_eq!(limit.raw.len(), MAX_RATE_LIMIT_HEADERS);
+    }
+
+    #[test]
+    fn nf2_a_header_past_the_count_is_still_read_for_its_typed_field() {
+        // The control. Dropping the pair from `raw` must not stop the parser
+        // reading the one header a caller most wants, however far down it is.
+        let mut pairs: Vec<(&str, &str)> = (0..MAX_RATE_LIMIT_HEADERS)
+            .map(|_| ("x-ratelimit-window-a", "1"))
+            .collect();
+        pairs.push(("x-ratelimit-remaining-requests", "99"));
+
+        let limit = RateLimit::from_headers(&headers(&pairs)).expect("many rate-limit headers");
+
+        assert_eq!(limit.raw.len(), MAX_RATE_LIMIT_HEADERS);
+        assert_eq!(limit.requests.remaining, Some(99));
+    }
+
+    #[test]
+    fn raw_reproduces_the_order_the_response_listed_them_in() {
+        // Asserted across distinct names rather than by counting: a parser that
+        // sorted, reversed or grouped them would pass every length assertion in
+        // this module.
+        let limit = RateLimit::from_headers(&headers(&[
+            ("x-ratelimit-reset-tokens", "1s"),
+            ("x-ratelimit-remaining-5h", "42"),
+            ("x-ratelimit-limit-requests", "500"),
+        ]))
+        .expect("three rate-limit headers");
+
+        assert_eq!(
+            limit.raw,
+            vec![
+                ("x-ratelimit-reset-tokens".to_string(), "1s".to_string()),
+                ("x-ratelimit-remaining-5h".to_string(), "42".to_string()),
+                ("x-ratelimit-limit-requests".to_string(), "500".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repeated_header_is_read_from_the_first_occurrence_that_parses() {
+        // The rule as implemented and as documented. An unparseable first
+        // occurrence has not answered the question, so the second still can —
+        // which is the one case where "first that parses" and "first" differ.
+        let limit = RateLimit::from_headers(&headers(&[
+            ("x-ratelimit-remaining-requests", "lots"),
+            ("x-ratelimit-remaining-requests", "1"),
+        ]))
+        .expect("two rate-limit headers");
+
+        assert_eq!(limit.requests.remaining, Some(1));
+    }
+
+    #[test]
+    fn a_repeated_header_is_taken_from_its_first_occurrence() {
+        let limit = RateLimit::from_headers(&headers(&[
+            ("x-ratelimit-remaining-requests", "99"),
+            ("x-ratelimit-remaining-requests", "1"),
+        ]))
+        .expect("two rate-limit headers");
+
+        assert_eq!(limit.requests.remaining, Some(99));
+        assert_eq!(
+            limit.raw.len(),
+            2,
+            "both are evidence even though one is read"
+        );
+    }
+
+    #[test]
+    fn a_value_that_does_not_parse_leaves_the_field_unknown() {
+        let limit = RateLimit::from_headers(&headers(&[
+            ("x-ratelimit-remaining-requests", "lots"),
+            ("x-ratelimit-reset-requests", "soon"),
+            ("anthropic-ratelimit-tokens-reset", "tomorrow"),
+        ]))
+        .expect("three rate-limit headers");
+
+        assert_eq!(limit.requests.remaining, None);
+        assert_eq!(limit.requests.reset, None);
+        assert_eq!(limit.tokens.reset, None);
+        assert_eq!(limit.raw.len(), 3, "unparsed is not unrecorded");
+    }
+
+    #[test]
+    fn the_reset_spelling_the_openai_family_uses() {
+        assert_eq!(parse_go_duration("1s"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_go_duration("6m0s"), Some(Duration::from_secs(360)));
+        assert_eq!(
+            parse_go_duration("1h2m3s"),
+            Some(Duration::from_secs(3_723))
+        );
+        assert_eq!(parse_go_duration("128ms"), Some(Duration::from_millis(128)));
+        assert_eq!(
+            parse_go_duration("1.5s"),
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(parse_go_duration("0s"), Some(Duration::ZERO));
+        // `ms` and `m` share a prefix, and reading one as the other is wrong by
+        // three orders of magnitude in the direction that looks plausible.
+        assert_ne!(parse_go_duration("6ms"), parse_go_duration("6m"));
+
+        // A bare number is a different header than this one.
+        assert_eq!(parse_go_duration("60"), None);
+        assert_eq!(parse_go_duration(""), None);
+        assert_eq!(parse_go_duration("soon"), None);
+        assert_eq!(parse_go_duration("s"), None);
+        assert_eq!(parse_go_duration("1y"), None);
+    }
+
+    #[test]
+    fn nf3_no_header_set_makes_the_parser_panic() {
+        // A provider response is untrusted input, and this parser runs on every
+        // one of them. 10,000 sets of bytes chosen to land on the boundaries a
+        // hand-written case would miss: empty values, huge ones, digits followed
+        // by nothing, unit suffixes with no number, and every legal header byte.
+        let names = [
+            "x-ratelimit-limit-requests",
+            "x-ratelimit-remaining-requests",
+            "x-ratelimit-reset-requests",
+            "x-ratelimit-reset-tokens",
+            "anthropic-ratelimit-requests-reset",
+            "anthropic-ratelimit-tokens-limit",
+            "x-ratelimit-something-else",
+            "content-type",
+        ];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for _ in 0..10_000 {
+            let mut map = HeaderMap::new();
+            for _ in 0..(next() % 6) {
+                let name = names[(next() % names.len() as u64) as usize];
+                let len = (next() % 300) as usize;
+                // Visible ASCII *and* obs-text, which `HeaderValue` accepts and
+                // a real endpoint may send. Excluding `0x80..=0xFF` is what let
+                // the first version of this fuzz miss a bound that was applied
+                // to the arriving bytes rather than to the decoded string.
+                let value: Vec<u8> = (0..len)
+                    .map(|_| match next() % 4 {
+                        0 => 0x80 + (next() % 128) as u8,
+                        _ => 0x21 + (next() % 94) as u8,
+                    })
+                    .collect();
+                let (Ok(name), Ok(value)) = (
+                    HeaderName::from_bytes(name.as_bytes()),
+                    HeaderValue::from_bytes(&value),
+                ) else {
+                    continue;
+                };
+                map.append(name, value);
+            }
+            // The assertion is that this returns at all.
+            let _ = RateLimit::from_headers(&map);
+        }
+    }
+
+    /// A UTC instant `secs` after the epoch, spelled the way Anthropic spells a
+    /// reset. Hand-rolled because the crate depends on no date library, which is
+    /// also why the parser under test is hand-rolled.
+    fn rfc3339(secs: u64) -> String {
+        let days = (secs / 86_400) as i64;
+        let (h, m, s) = ((secs % 86_400) / 3_600, (secs % 3_600) / 60, secs % 60);
+        // civil_from_days, the inverse of the algorithm in `crate::net`.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if month <= 2 { y + 1 } else { y };
+        format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+    }
+
+    #[test]
+    fn the_test_helper_agrees_with_the_parser_it_feeds() {
+        // The fixture above is a second implementation of a calendar, so it is
+        // checked against the one under test rather than trusted: a helper that
+        // was wrong would make `f2` assert against its own mistake.
+        for secs in [0_u64, 1_600_000_000, 1_767_225_600, 2_000_000_001] {
+            let text = rfc3339(secs);
+            assert_eq!(
+                crate::net::parse_rfc3339(&text),
+                Some(std::time::UNIX_EPOCH + Duration::from_secs(secs)),
+                "{text}"
+            );
+        }
+    }
+
+    /// Every vendor path fills the field, over a real socket.
+    ///
+    /// In-crate rather than in `tests/rate_limit.rs` because `Anthropic::at`,
+    /// `OpenAi::at` and `OpenRouter::at` are `pub(crate)`: the three pin their
+    /// vendor's own URL, so nothing outside this crate can point one at a
+    /// fixture. Without this the anthropic fill site — a whole vendor's worth of
+    /// it — is asserted by nothing, which is the shape of hole a release like
+    /// this one is most likely to ship.
+    #[tokio::test]
+    async fn f6_each_vendor_fills_the_field_from_its_own_response() {
+        use super::failures::{serve, stream_response};
+
+        const PATIENT: Duration = Duration::from_secs(30);
+        let request = || CompletionRequest {
+            system: "s".into(),
+            user: "u".into(),
+            ..Default::default()
+        };
+
+        // The OpenAI wire, and the header block the OpenAI family sends.
+        let openai_events = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+             data: [DONE]\n\n";
+        let openai_headers = "x-ratelimit-remaining-requests: 99\r\n\
+             x-ratelimit-reset-requests: 6m0s\r\n";
+        let with_headers = |events: &str, headers: &str| {
+            stream_response(events).replacen("\r\n\r\n", &format!("\r\n{headers}\r\n"), 1)
+        };
+
+        for (vendor, response) in [
+            (
+                "OpenAi",
+                OpenAi::at(serve(with_headers(openai_events, openai_headers)), PATIENT)
+                    .complete(request())
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "OpenRouter",
+                OpenRouter::at(serve(with_headers(openai_events, openai_headers)), PATIENT)
+                    .complete(request())
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "Compatible",
+                Compatible::at(serve(with_headers(openai_events, openai_headers)), PATIENT)
+                    .complete(request())
+                    .await
+                    .unwrap(),
+            ),
+        ] {
+            let limit = response
+                .rate_limit
+                .unwrap_or_else(|| panic!("{vendor} read the headers off its own response"));
+            assert_eq!(limit.requests.remaining, Some(99), "{vendor}");
+            assert_eq!(
+                limit.requests.reset,
+                Some(Duration::from_secs(360)),
+                "{vendor}"
+            );
+        }
+
+        // Anthropic's own wire and its own header family, which no other test in
+        // the crate drives end to end.
+        let anthropic = Anthropic::at(
+            serve(with_headers(
+                "event: content_block_delta\n\
+                 data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+                 event: message_stop\n\
+                 data: {\"type\":\"message_stop\"}\n\n",
+                "anthropic-ratelimit-requests-remaining: 42\r\n\
+                 anthropic-ratelimit-tokens-limit: 80000\r\n",
+            )),
+            PATIENT,
+        )
+        .complete(request())
+        .await
+        .unwrap();
+
+        let limit = anthropic
+            .rate_limit
+            .expect("Anthropic read the headers off its own response");
+        assert_eq!(limit.requests.remaining, Some(42));
+        assert_eq!(limit.tokens.limit, Some(80_000));
+        assert_eq!(
+            anthropic.text.as_deref(),
+            Some("hi"),
+            "the body still parsed"
+        );
+    }
+
+    #[test]
+    fn an_instant_this_parser_declines_is_absent_rather_than_wrong() {
+        assert!(crate::net::parse_rfc3339("2026-09-09T13:20:00+05:30").is_none());
+        assert!(crate::net::parse_rfc3339("2026-09-09").is_none());
+        assert!(crate::net::parse_rfc3339("").is_none());
+        assert!(crate::net::parse_rfc3339("2026-13-09T00:00:00Z").is_none());
+        // Accepted spellings: a fractional second, a lowercase separator, and a
+        // zero offset written out.
+        assert!(crate::net::parse_rfc3339("2026-09-09T13:20:00.512Z").is_some());
+        assert!(crate::net::parse_rfc3339("2026-09-09t13:20:00z").is_some());
+        assert!(crate::net::parse_rfc3339("2026-09-09T13:20:00+00:00").is_some());
     }
 }

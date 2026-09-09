@@ -35,11 +35,12 @@ fn worth_retrying(e: &Error) -> bool {
 
 #[test]
 fn a_status_failure_carries_the_status_a_caller_needs_to_branch_on() {
-    let e = Error::provider_status(429, Some(Duration::from_secs(30)), "slow down");
+    let e = Error::provider_status(429, Some(Duration::from_secs(30)), None, "slow down");
     let Error::Provider {
         kind,
         status,
         retry_after,
+        rate_limit: _,
         message,
     } = &e
     else {
@@ -70,10 +71,10 @@ fn a_failure_with_no_status_says_so_rather_than_inventing_one() {
 #[test]
 fn a_wrong_key_and_a_bad_request_are_terminal_not_retried() {
     for e in [
-        Error::provider_status(401, None, "invalid api key"),
-        Error::provider_status(403, None, "not entitled to this model"),
-        Error::provider_status(400, None, "unknown field"),
-        Error::provider_status(422, None, "schema violation"),
+        Error::provider_status(401, None, None, "invalid api key"),
+        Error::provider_status(403, None, None, "not entitled to this model"),
+        Error::provider_status(400, None, None, "unknown field"),
+        Error::provider_status(422, None, None, "schema violation"),
     ] {
         assert!(!worth_retrying(&e), "{e}");
     }
@@ -130,7 +131,7 @@ fn every_kind_states_whether_a_retry_is_worth_it() {
 
 #[test]
 fn the_rendering_names_the_kind_and_the_status_without_being_the_api() {
-    let shown = Error::provider_status(503, None, "upstream unavailable").to_string();
+    let shown = Error::provider_status(503, None, None, "upstream unavailable").to_string();
     assert!(shown.contains("Server"), "{shown}");
     assert!(shown.contains("503"), "{shown}");
     assert!(shown.contains("upstream unavailable"), "{shown}");
@@ -188,6 +189,7 @@ impl Provider for AlwaysFails {
         Err(Error::provider_status(
             self.status,
             self.retry_after,
+            None,
             "fixture failure",
         ))
     }

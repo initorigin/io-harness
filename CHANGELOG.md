@@ -14,9 +14,88 @@ notes are produced from it.
 
 ## [Unreleased]
 
+**What the provider said about its rate limit reaches the caller.** Every vendor
+publishes its allowance on every response and this crate read one header of it —
+`Retry-After`, and only on the way to an error. A run could say how much of an
+allowance was left only after it had been refused. A completion now carries what
+the response said, a 429 carries it beside the wait it already carried, and the
+event stream announces it once per completion that reported one.
+
+Nothing here interprets the numbers. There is no pacing, no throttling and no
+change to the retry policy: a harness that started managing an allowance would be
+deciding for the application layer whose allowance it is.
+
+### Breaking changes
+
+- **BREAKING** — `CompletionResponse` gained a `rate_limit` field, so an
+  exhaustive struct literal of it no longer compiles. This is the break
+  `docs/CONTRACT.md` has warned this struct may take since 0.24.0.
+  *Migration:* add `..Default::default()` to the literal, which is what the
+  type's own documentation has recommended since 0.2.0.
+
+  ```rust
+  // before
+  CompletionResponse { text: Some("hi".into()), tool_calls: vec![], usage: None,
+                       model: None, finish_reason: None, ttft_ms: None,
+                       citations: vec![], server_tools: vec![], reasoning: None }
+  // after
+  CompletionResponse { text: Some("hi".into()), ..Default::default() }
+  ```
+
+- **BREAKING** — `Error::provider_status` takes the parsed rate limit as its
+  third argument, and `Error::Provider` gained a `rate_limit` field.
+  *Migration:* pass `None` at the new position, and add `..` to any pattern that
+  named every field.
+
+  ```rust
+  // before
+  Error::provider_status(503, None, "down")
+  // after
+  Error::provider_status(503, None, None, "down")
+  ```
+
+- **BREAKING** — `EventKind` gained a `RateLimit` variant. It is
+  `#[non_exhaustive]`, so a `match` with a wildcard arm is unaffected.
+  *Migration:* there is nothing to write for a consumer that already has a
+  wildcard arm; one that enumerated the variants adds an arm for the new event or
+  a wildcard.
+
 ### Added
 
+- **`CompletionResponse::rate_limit`**, what the provider said about its rate
+  limit on that call. `None` — never a struct of zeroes — when the response
+  carried no header whose name contains `ratelimit`, because "this provider
+  reports nothing" and "this provider reports an allowance of nothing" are
+  different facts and only the second is a number.
+- **`RateLimit` and `Window`**, the two types behind it: a requests window and a
+  tokens window, each with `limit`, `remaining` and `reset`, plus `raw` — every
+  rate-limit header the response carried, name and value, in arrival order. Two
+  families are typed, OpenAI's `x-ratelimit-{limit,remaining,reset}-{requests,tokens}`
+  and Anthropic's `anthropic-ratelimit-{requests,tokens}-{limit,remaining,reset}`;
+  anything else a gateway publishes reaches a caller through `raw` without this
+  crate knowing the name. `raw` is bounded in both directions — 256 bytes per
+  value, measured after decoding, and 16 headers per response — because both are
+  the sender's choice and every kept pair is cloned into any recording written to
+  disk. A value the byte bound cut is kept truncated and read as no number at all.
+- **`Error::rate_limit()`**, the same struct off a failing call — so a 429 says
+  what refused it and not only how long to wait. `Retry-After` is not a
+  rate-limit header, keeps its own field, and is unchanged by this release.
+- **`EventKind::RateLimit`**, emitted beside `EventKind::StepUsage`, once per
+  committed step whose own completion carried a limit and not at all for one that
+  did not — the summariser call behind a compaction is a completion the run makes
+  and not a step, and its rate limit reaches the response without reaching the
+  stream. It carries
+  what is left of each window, the whole seconds until each refills, and how many
+  rate-limit headers the response held — the count is how an operator learns a
+  gateway is publishing a window this crate does not name.
+
 ### Changed
+
+- **An absolute reset becomes a wait against the local clock.** Anthropic states
+  its reset as an RFC 3339 instant and the OpenAI family states a duration; the
+  typed field is a duration either way, so a machine whose clock is skewed reads a
+  wait skewed by the same amount. The alternative — reporting each vendor's own
+  spelling — would put the conversion in every caller instead of in one place.
 
 ### Deprecated
 
