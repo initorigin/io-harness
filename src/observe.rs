@@ -474,6 +474,56 @@ pub enum EventKind {
     /// ));
     /// assert_eq!(flow, Flow::Continue);
     /// ```
+    /// A step's prompt was not an extension of the step before it (0.85.0).
+    ///
+    /// Every vendor's prompt cache serves a request only up to the first byte that
+    /// differs from one it has already seen, so anything this crate rewrites
+    /// *before* the newest message throws the cache away from that byte on for the
+    /// rest of the run. 0.85.0 makes the assembly append-only between folds; this
+    /// is what says so out loud when it is not.
+    ///
+    /// **A fold is not a break.** A fold replaces the run's history with a written
+    /// summary on purpose, so the step after one is expected to differ and emits
+    /// nothing. Every other difference is reported.
+    ///
+    /// It is an observation about this crate's own behaviour rather than about the
+    /// run's work, and a consumer should read one as a defect to file: the assembly
+    /// is meant to have no way of producing it.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent, Ignore};
+    /// use io_harness::observe::PrefixBreak;
+    ///
+    /// let flow = Ignore.event(&RunEvent::new(
+    ///     7,
+    ///     4,
+    ///     EventKind::PrefixBroke {
+    ///         step: 4,
+    ///         at_byte: 1_204,
+    ///         reason: PrefixBreak::Reread,
+    ///     },
+    /// ));
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    PrefixBroke {
+        /// The step whose prompt diverged from the one before it.
+        ///
+        /// Renamed on the wire, and only on the wire. [`RunEvent`] flattens its
+        /// own `step` into the same JSON object, so a variant field spelled `step`
+        /// serializes two keys of that name and fails to deserialize with
+        /// *duplicate field `step`* — which `every_variant_round_trips` catches
+        /// and nothing else would. The two are always equal; this one is here so a
+        /// consumer matching on the variant has the step without reaching for the
+        /// envelope.
+        #[serde(rename = "at_step")]
+        step: u32,
+        /// The byte of the assembled observation section at which the two first
+        /// differ — everything before it was served from the cache, and everything
+        /// from it on was charged as fresh.
+        at_byte: u64,
+        /// Which of the assembly's mutation sites the divergence looks like.
+        reason: PrefixBreak,
+    },
     StepUsage {
         /// Prompt tokens the vendor charged full price for — the prompt minus what
         /// it served from a cache.
@@ -1553,6 +1603,52 @@ pub enum EventKind {
     },
 }
 
+/// Which of the assembly's mutation sites an [`EventKind::PrefixBroke`] looks
+/// like (0.85.0).
+///
+/// A closed set, so a consumer can count breaks by cause rather than by message —
+/// a run that breaks its prefix twice for the same reason is one defect, and twice
+/// for different reasons is two.
+///
+/// It is an attribution rather than a proof. The check compares two prompts and
+/// has only the bytes either side of the divergence to go on, so the answer is the
+/// site whose fingerprint is at that byte, and [`PrefixBreak::Other`] is what it
+/// says when there is none. It never guesses at a site it cannot see the marks of.
+///
+/// ```
+/// use io_harness::PrefixBreak;
+///
+/// // A renderer counts by cause, so the set is closed and comparable.
+/// let seen = [PrefixBreak::Reread, PrefixBreak::Reread, PrefixBreak::Memory];
+/// let rereads = seen.iter().filter(|r| **r == PrefixBreak::Reread).count();
+/// assert_eq!(rereads, 2);
+///
+/// // And it serializes as the name a trace reader sees.
+/// let json = serde_json::to_string(&PrefixBreak::Ladder)?;
+/// assert_eq!(json, "\"ladder\"");
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixBreak {
+    /// The memory block moved — it renders ahead of everything and is the most
+    /// expensive thing in the prompt to disturb.
+    Memory,
+    /// A stale read was refreshed in place rather than appended at the tail.
+    Reread,
+    /// An entry the run had already been shown was replaced by an elision line.
+    Stub,
+    /// A ladder rung rewrote an entry — snipped, microcompacted, or folded a skill
+    /// body out.
+    Ladder,
+    /// The framing around an entry changed: the provenance frame, or the prompt's
+    /// own scaffolding.
+    Frame,
+    /// Something else. A break with no site's fingerprint at the divergence.
+    Other,
+}
+
 /// Every wire tag [`EventKind`] can serialize to, in declaration order (0.28.0).
 ///
 /// The names an operator writes in a `[[hook]]`'s `on` list, and therefore the list
@@ -1578,6 +1674,8 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "recovery_paused",
     "step",
     "step_attributed",
+    // 0.85.0
+    "prefix_broke",
     // 0.81.0
     "step_usage",
     // 0.84.0
@@ -2459,6 +2557,11 @@ mod tests {
                 digest: "9f2c".into(),
                 source: "browser".into(),
             },
+            EventKind::PrefixBroke {
+                step: 4,
+                at_byte: 1_204,
+                reason: PrefixBreak::Reread,
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
@@ -2469,6 +2572,7 @@ mod tests {
                 | EventKind::RecoveryPaused { .. }
                 | EventKind::Step { .. }
                 | EventKind::StepAttributed { .. }
+                | EventKind::PrefixBroke { .. }
                 | EventKind::StepUsage { .. }
                 | EventKind::RateLimit { .. }
                 | EventKind::ImageAttached { .. }

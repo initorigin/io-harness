@@ -1350,6 +1350,20 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 }
                 _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
             };
+            // 0.85.0 — before the request is built, and over the same two strings
+            // the transcript is built from. A break here is a defect in this
+            // crate's own assembly rather than a condition of the run.
+            check_prefix(
+                &mut frozen,
+                &assembled.text,
+                &system,
+                fold.folded,
+                assembled.refit,
+                watch,
+                run_id,
+                step,
+                0,
+            );
             // 0.44.0 — the second cache breakpoint, at the end of what compaction
             // froze, and only once that prefix has already gone out once.
             let cache_boundary =

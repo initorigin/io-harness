@@ -21,8 +21,8 @@ use io_harness::context::{
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::Workspace;
 use io_harness::{
-    run_with, run_with_observed, ApproveAll, EventKind, Flow, Observer, Policy, Provider, RunEvent,
-    Store, TaskContract, Verification,
+    run_with, run_with_observed, ApproveAll, EventKind, Flow, Observer, PrefixBreak, Policy,
+    Provider, RunEvent, Store, TaskContract, Verification,
 };
 use serde_json::json;
 
@@ -127,29 +127,43 @@ impl Provider for Script {
     }
 }
 
-/// The steps a run folded on, which are the steps allowed to break the property.
+/// What a run said about its own prefix: the steps it folded on, which are the
+/// steps allowed to break the property, and the breaks it announced.
 #[derive(Default)]
-struct Folds(Arc<Mutex<Vec<u32>>>);
+struct Watched {
+    folds: Arc<Mutex<Vec<u32>>>,
+    breaks: Arc<Mutex<Vec<(u32, PrefixBreak)>>>,
+}
 
-impl Observer for Folds {
+impl Observer for Watched {
     fn event(&self, event: &RunEvent) -> Flow {
-        if let EventKind::Compacted { through_step, .. } = &event.kind {
-            self.0.lock().unwrap().push(*through_step);
+        match &event.kind {
+            EventKind::Compacted { through_step, .. } => {
+                self.folds.lock().unwrap().push(*through_step);
+            }
+            EventKind::PrefixBroke { step, reason, .. } => {
+                self.breaks.lock().unwrap().push((*step, *reason));
+            }
+            _ => {}
         }
         Flow::Continue
     }
 }
 
-impl Folds {
+impl Watched {
     /// The fold steps as indices into the step requests, which are one-based
     /// steps in order.
     fn indices(&self) -> Vec<usize> {
-        self.0
+        self.folds
             .lock()
             .unwrap()
             .iter()
             .map(|s| *s as usize - 1)
             .collect()
+    }
+
+    fn breaks(&self) -> Vec<(u32, PrefixBreak)> {
+        self.breaks.lock().unwrap().clone()
     }
 }
 
@@ -250,15 +264,21 @@ fn assert_append_only(requests: &[CompletionRequest], except: &[usize]) {
 // ------------------------------------------------------- F1: a re-read appends
 
 /// F1 — a stale read is refreshed by *appending* the current contents at the
-/// tail, and the entry that went stale renders as one stable stub from then on.
+/// tail, and the entry that went stale is left exactly as it was.
 ///
 /// Through 0.84.0 the refresh was written in place with the assembling step's own
 /// number baked into it (`re-read at step {step}`), so once a file had been read
 /// and then written every later step rendered that observation differently. It
 /// sat early in the transcript and it changed on every step, which made it the
 /// worst of the six.
+///
+/// Replacing it with a *stub* was the first version of this release and is wrong
+/// for the same reason: a stub is a rewrite of bytes the model has already been
+/// shown, and it costs the cache from that byte on exactly as the old text did.
+/// The stub is what the next fold does with the entry. Until then both copies
+/// stand, and the appended one says which is current.
 #[tokio::test]
-async fn f1_a_stale_read_is_appended_at_the_tail_and_the_original_becomes_a_stable_stub() {
+async fn f1_a_stale_read_is_appended_at_the_tail_and_the_original_is_left_alone() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "NEW-CONTENT\n").unwrap();
     let (workspace, policy) = ws(dir.path());
@@ -287,29 +307,24 @@ async fn f1_a_stale_read_is_appended_at_the_tail_and_the_original_becomes_a_stab
          got:\n{five}"
     );
     assert!(
-        !five.contains("OLD-CONTENT"),
-        "the stale contents must not be presented as current, got:\n{five}"
+        five.contains("these are the current contents and that one is stale"),
+        "the refresh must mark the copy above it stale, got:\n{five}"
     );
 
     // The stale entry's own line, which is what the next three steps must repeat
-    // byte for byte.
-    let stub = five
-        .lines()
-        .find(|line| line.contains("[read a.rs] (elided:"))
-        .unwrap_or_else(|| panic!("the stale read must render as a stub, got:\n{five}"))
-        .to_string();
+    // byte for byte — unchanged, not restated.
+    let stale = "\n[read a.rs]\nOLD-CONTENT\n";
     assert!(
-        stub.contains("invalidated by the write at step 4"),
-        "the stub must still say why it went stale, got:\n{stub}"
+        five.contains(stale),
+        "the entry the model has already been shown is left alone, got:\n{five}"
     );
 
     let mut previous = five;
     for step in 6..=8 {
         let text = at_step(&mut ledger, &store, &workspace, &policy, step).await;
         assert!(
-            text.contains(&stub),
-            "step {step} must render the stale entry exactly as step 5 did.\nwanted: \
-             {stub}\ngot:\n{text}"
+            text.contains(stale),
+            "step {step} rewrote the stale entry instead of leaving it:\n{text}"
         );
         assert!(
             text.contains("re-read at step 5") && !text.contains(&format!("re-read at step {step}")),
@@ -391,6 +406,74 @@ async fn f2_a_note_written_mid_run_does_not_move_the_memory_block() {
          above them"
     );
     assert_append_only(&requests, &[]);
+}
+
+// ------------------------------------------------ F3: the run says so out loud
+
+/// F3 — a ten-step run with one fold emits no `PrefixBroke` on either side of it,
+/// and every step's prompt extends the one before it within each range.
+///
+/// The property and the event are asserted together on purpose. The event alone
+/// could be silenced by a check that never fires, and the byte comparison alone
+/// would hold with nothing reporting a break that did happen — so the case asserts
+/// the bytes directly and then asserts that the run agreed with them.
+#[tokio::test]
+async fn f3_a_ten_step_run_with_one_fold_breaks_its_prefix_nowhere_else() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..10 {
+        std::fs::write(
+            dir.path().join(format!("f{i}.txt")),
+            format!("file {i}\n{}", "filler line\n".repeat(90)),
+        )
+        .unwrap();
+    }
+    let script = Script::new(
+        (0..10)
+            .map(|i| vec![call("read_file", json!({ "path": format!("f{i}.txt") }))])
+            .collect(),
+    );
+    // Sized so the ledger crosses the fold threshold about two thirds of the way
+    // in and lands back well under it: one fold, which is the case the contract
+    // names. `keep_recent` of 4 lets the fold happen before the ceiling forces the
+    // fit rule to elide, which is the regime the whole release is about.
+    let contract = never_passes(dir.path(), 10)
+        .with_context_budget(ContextBudget {
+            max_tokens: 2_400,
+            share: 0.5,
+        })
+        .with_compaction(io_harness::Compaction {
+            at_share: 0.8,
+            keep_recent: 4,
+        });
+    let store = Store::memory().unwrap();
+    let watched = Watched::default();
+    run_with_observed(
+        &contract,
+        &script,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+        &watched,
+    )
+    .await
+    .unwrap();
+
+    let requests = script.steps();
+    assert_eq!(requests.len(), 10, "the fixture must reach step 10");
+    let folded = watched.indices();
+    assert_eq!(
+        folded.len(),
+        1,
+        "one fold, or the case is not the one the contract names: {folded:?}"
+    );
+    assert_append_only(&requests, &folded);
+
+    // And the run reported exactly what the bytes say: nothing.
+    let announced = watched.breaks();
+    assert!(
+        announced.is_empty(),
+        "the run announced a break its own prompts do not have: {announced:?}"
+    );
 }
 
 // ------------------------------------------- F8: the budget is held between folds
@@ -503,7 +586,7 @@ async fn f4_the_ladder_rungs_do_not_rewrite_an_entry_before_the_fold() {
             ..Default::default()
         });
     let store = Store::memory().unwrap();
-    let folds = Folds::default();
+    let folds = Watched::default();
     run_with_observed(
         &contract,
         &script,

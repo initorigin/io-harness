@@ -737,6 +737,19 @@ where
                     ),
                     _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
                 };
+                // 0.85.0 — the same check the flat loop makes, through the same
+                // helper, in the same position.
+                check_prefix(
+                    &mut frozen,
+                    &assembled.text,
+                    &system,
+                    fold.folded,
+                    assembled.refit,
+                    tree.watch,
+                    run_id,
+                    step,
+                    depth,
+                );
                 // 0.44.0 — the same rule as the flat loop, through the same helper.
                 // A boundary computed in one loop and not the other would make a
                 // contained run and a flat one cache differently while nothing failed.

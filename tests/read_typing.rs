@@ -454,9 +454,19 @@ async fn the_offered_range_actually_works_on_the_file_that_was_refused() {
         after_range.contains("HEAD-SENTINEL") && after_range.contains("lines 1-1 of 5"),
         "the range the refusal offered returns the line asked for: {after_range}"
     );
+    // And only that line — asserted over the range read's own entry rather than
+    // over the whole prompt. (0.85.0) The earlier whole-file read is still in the
+    // prompt until the next fold: eliding it on the spot would rewrite bytes the
+    // model has already been shown, which costs the vendor's prompt cache from
+    // that byte on. What the range read returned is the claim here, and the prompt
+    // carrying an older read beside it was never part of it.
+    let entry = after_range
+        .split("[read huge.txt lines 1-1 of 5]")
+        .nth(1)
+        .expect("the range read's own entry");
     assert!(
-        !after_range.contains("MIDDLE-SENTINEL"),
-        "and only that line: {after_range}"
+        !entry.contains("MIDDLE-SENTINEL"),
+        "and only that line: {entry}"
     );
 }
 

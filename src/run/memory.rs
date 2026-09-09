@@ -5,6 +5,7 @@
 //! defining file and moving one would rewrite a line of the snapshot.
 
 use super::*;
+use crate::observe::PrefixBreak;
 
 /// The key one workspace's durable memory is stored under.
 ///
@@ -339,6 +340,9 @@ pub(super) struct Frozen {
     budget: Option<u64>,
     notes: Option<(Vec<MemoryEntry>, Vec<MemoryEntry>)>,
     since: u32,
+    /// The previous step's assembled section and system string, which is what the
+    /// next one has to be an extension of.
+    last: Option<(String, String)>,
 }
 
 impl Frozen {
@@ -365,6 +369,64 @@ impl Frozen {
         self.since
     }
 
+    /// Check this step's assembly against the step before it, and take it.
+    ///
+    /// Returns the break to announce, or `None` when the prompt extended the one
+    /// before it — which is every step of a run this release did its job on.
+    ///
+    /// The comparison is over the assembled observation section and the system
+    /// string, and not over the flat `user`: `user` is `head + section + tail`, so
+    /// the framing below the log sits at the end of every step's prompt and no
+    /// step's `user` is ever literally a prefix of the next one's. The transcript
+    /// is built from those same three parts, so a system string that did not
+    /// change, framing that did not change and a section that only grew at the end
+    /// is a vendor-side prefix that was not disturbed.
+    pub(super) fn extended_by(
+        &mut self,
+        section: &str,
+        system: &str,
+        folded: bool,
+    ) -> Option<Break> {
+        let was = self.last.replace((section.to_string(), system.to_string()));
+        // A fold throws the prefix away on purpose, so the step it happens on is
+        // expected to differ and announces nothing.
+        let Some((before_section, before_system)) = was.filter(|_| !folded) else {
+            return None;
+        };
+        if before_system != system {
+            // The system string is the head of every prefix, so a change there
+            // costs the whole prompt however small it is.
+            return Some(Break {
+                at_byte: 0,
+                reason: PrefixBreak::Frame,
+                window: "the system string changed".to_string(),
+                from_assembly: false,
+            });
+        }
+        if section.starts_with(&before_section) {
+            return None;
+        }
+        let at = section
+            .bytes()
+            .zip(before_section.bytes())
+            .position(|(a, b)| a != b)
+            .unwrap_or(section.len().min(before_section.len()));
+        Some(Break {
+            at_byte: at as u64,
+            reason: attribute(&before_section, section, at),
+            // What a reader of a failing build needs and cannot get from the byte
+            // offset: the two texts either side of the divergence. Bounded, and
+            // cut on a character boundary so a multi-byte character at the edge
+            // cannot panic the panic.
+            window: format!(
+                "was …{}…\nis  …{}…",
+                window(&before_section, at),
+                window(section, at)
+            ),
+            from_assembly: true,
+        })
+    }
+
     /// The budget to assemble against. `live` is used only before the first
     /// [`Frozen::hold`], which no loop reaches.
     pub(super) fn budget(&self, live: u64) -> u64 {
@@ -377,6 +439,174 @@ impl Frozen {
             Some((notes, global)) => (notes, global),
             None => (&[], &[]),
         }
+    }
+}
+
+/// A prefix a step did not extend (0.85.0).
+#[derive(Debug)]
+pub(super) struct Break {
+    at_byte: u64,
+    reason: PrefixBreak,
+    /// The two texts either side of the divergence, for a failing debug build.
+    window: String,
+    /// Whether the assembler is what moved. A system prompt that changed mid-run
+    /// is a break, is reported as one, and is not this crate's assembly doing it:
+    /// the plan gate withdraws its directive when a plan is approved, and a
+    /// session's opening turn is composed differently from its later steps. Those
+    /// are decisions a caller made, so they are announced and not asserted.
+    from_assembly: bool,
+}
+
+/// A short slice of `text` around `at`, cut on character boundaries.
+fn window(text: &str, at: usize) -> &str {
+    let from = text[..at.min(text.len())]
+        .char_indices()
+        .rev()
+        .nth(40)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let rest = &text[from..];
+    let to = rest
+        .char_indices()
+        .nth(120)
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len());
+    &rest[..to]
+}
+
+/// Which mutation site the divergence at `at` looks like (0.85.0).
+///
+/// The bytes either side of the divergence are all there is to go on, so this looks
+/// for each site's own fingerprint in the text that replaced what was there. The
+/// order is by cost: the memory block sits ahead of everything, so a break inside
+/// it is the memory block's whatever else also changed.
+fn attribute(before: &str, after: &str, at: usize) -> PrefixBreak {
+    // The block renders first, so a divergence inside its span is the block's.
+    if before[..at].find("\n[memory]").is_some_and(|from| {
+        before[from..]
+            .find("\n\n")
+            .is_none_or(|len| at < from + len)
+    }) {
+        return PrefixBreak::Memory;
+    }
+    let arrived = &after[at..];
+    let marks = [
+        ("(re-read at step", PrefixBreak::Reread),
+        ("dropped as a lookup", PrefixBreak::Ladder),
+        ("compacted into", PrefixBreak::Ladder),
+        ("calls; their results are compacted", PrefixBreak::Ladder),
+        ("has been folded out", PrefixBreak::Ladder),
+        ("(elided:", PrefixBreak::Stub),
+        ("observation(s) elided", PrefixBreak::Stub),
+        ("<external_content>", PrefixBreak::Frame),
+    ];
+    for (mark, reason) in marks {
+        // Bounded: the fingerprint is looked for in what arrived at the divergence
+        // rather than anywhere in the prompt, so a run that merely *mentions* one of
+        // these words later is not attributed to it.
+        if arrived
+            .get(..mark.len() + 512)
+            .unwrap_or(arrived)
+            .contains(mark)
+        {
+            return reason;
+        }
+    }
+    PrefixBreak::Other
+}
+
+#[cfg(test)]
+mod attribution {
+    use super::*;
+
+    /// Every reason in the closed set, and the shape of the break that produces it.
+    ///
+    /// The event is what a renderer counts by cause, and a debug build refuses to
+    /// continue past a break — so a run cannot be driven into one from a test.
+    /// These cases feed the attribution directly, which is what makes the set
+    /// something asserted rather than something documented.
+    fn attributed(before: &str, after: &str) -> PrefixBreak {
+        let at = before
+            .bytes()
+            .zip(after.bytes())
+            .position(|(a, b)| a != b)
+            .unwrap_or(before.len().min(after.len()));
+        attribute(before, after, at)
+    }
+
+    #[test]
+    fn a_moved_memory_block_is_attributed_to_the_block() {
+        let before = "\n[memory] your notes\n- a: one\n\n[read x]\nbody\n";
+        let after = "\n[memory] your notes\n- b: two\n\n[read x]\nbody\n";
+        assert_eq!(attributed(before, after), PrefixBreak::Memory);
+    }
+
+    #[test]
+    fn a_refresh_written_in_place_is_attributed_to_the_re_read() {
+        let before = "\n[read x]\nold\n";
+        let after = "\n[read x] (re-read at step 7)\nnew\n";
+        assert_eq!(attributed(before, after), PrefixBreak::Reread);
+    }
+
+    #[test]
+    fn an_entry_replaced_by_an_elision_is_attributed_to_the_stub() {
+        let before = "\n[read x]\nbody\n";
+        let after = "\n[read x] (elided: 12 chars, older than the current context window)\n";
+        assert_eq!(attributed(before, after), PrefixBreak::Stub);
+    }
+
+    #[test]
+    fn a_rung_that_dropped_a_lookup_is_attributed_to_the_ladder() {
+        let before = "\n[grep fn]\nmatches\n";
+        let after = "\n[grep fn] (elided: dropped as a lookup older than 2 steps)\n";
+        assert_eq!(attributed(before, after), PrefixBreak::Ladder);
+    }
+
+    #[test]
+    fn framing_that_moved_is_attributed_to_the_frame() {
+        let before = "\n[read x]\nbody\n";
+        let after = "<external_content>\n[read x]\nbody\n";
+        assert_eq!(attributed(before, after), PrefixBreak::Frame);
+    }
+
+    #[test]
+    fn a_break_with_no_fingerprint_is_attributed_to_nothing_in_particular() {
+        let before = "\n[read x]\nbody\n";
+        let after = "\n[read x]\nsomething else entirely\n";
+        assert_eq!(attributed(before, after), PrefixBreak::Other);
+    }
+
+    /// The rung marks are looked for at the divergence, not anywhere after it. A
+    /// prompt that merely goes on to mention one of these words later must not be
+    /// attributed to it — the reason is meant to name where the bytes moved.
+    #[test]
+    fn a_fingerprint_far_past_the_divergence_does_not_claim_the_break() {
+        let before = "\n[read x]\nbody\n";
+        let after = format!("\n[read x]\nsomething else\n{}\n(elided: later)\n", "y".repeat(900));
+        assert_eq!(attributed(before, &after), PrefixBreak::Other);
+    }
+
+    /// A fold is not a break, and the guard is what says so.
+    #[test]
+    fn a_folding_step_is_not_asked_whether_it_extended_anything() {
+        let mut frozen = Frozen::default();
+        assert!(frozen.extended_by("one", "sys", false).is_none());
+        assert!(frozen.extended_by("two", "sys", true).is_none());
+        // And the fold's own text is what the next step has to extend.
+        assert!(frozen.extended_by("two and more", "sys", false).is_none());
+        assert!(frozen.extended_by("three", "sys", false).is_some());
+    }
+
+    /// The system string is the head of every prefix, so a change there is a break
+    /// at byte zero however small it is and whatever the section did.
+    #[test]
+    fn a_changed_system_string_breaks_the_whole_prefix() {
+        let mut frozen = Frozen::default();
+        frozen.extended_by("one", "sys", false);
+        let broke = frozen
+            .extended_by("one and more", "other", false)
+            .expect("a changed system string is a break");
+        assert_eq!((broke.at_byte, broke.reason), (0, PrefixBreak::Frame));
     }
 }
 
@@ -407,6 +637,60 @@ pub(super) fn cache_boundary_for(
         ));
     }
     Some(at)
+}
+
+/// Announce a prefix this step did not extend (0.85.0).
+///
+/// One definition, called by the flat loop and the tree loop immediately after the
+/// prompt is built, for the reason [`cache_boundary_for`] is: a rule written into
+/// one of two near-parallel loops is a rule that lapses in the other.
+///
+/// The `debug_assert` is the other half of the contract's gate. A release build
+/// pays only for the byte comparison that produces the event — which it has to make
+/// anyway to know whether there is one — and a debug build refuses to continue,
+/// because a break is a defect in this crate rather than a condition of the run.
+///
+/// `refit` is the exception, and it is not a way out: a run whose ceiling is too
+/// tight to fold into elides anyway, which really does move the prefix, so the
+/// event is emitted exactly as for any other break. What it does not do is fail the
+/// build — a ceiling doing what a ceiling is for is not a defect in the assembler,
+/// and asserting on it would make every tight-budget test in the suite panic while
+/// saying nothing about the property this release is about.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_prefix(
+    frozen: &mut Frozen,
+    section: &str,
+    system: &str,
+    folded: bool,
+    refit: bool,
+    watch: &Watch<'_>,
+    run_id: i64,
+    step: u32,
+    depth: u32,
+) {
+    let Some(Break {
+        at_byte,
+        reason,
+        window,
+        from_assembly,
+    }) = frozen.extended_by(section, system, folded)
+    else {
+        return;
+    };
+    debug_assert!(
+        refit || !from_assembly,
+        "step {step} did not extend the prefix it was handed: {reason:?} at byte {at_byte}\n{window}"
+    );
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        step,
+        depth,
+        EventKind::PrefixBroke {
+            step,
+            at_byte,
+            reason,
+        },
+    ));
 }
 
 /// The transcript half of 0.44.0's second breakpoint (0.49.0).

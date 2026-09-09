@@ -1276,6 +1276,18 @@ pub struct Assembled {
     /// (0.81.0) Contiguous runs of one step's results that
     /// [`Ladder::microcompact`] replaced with a counted line.
     pub microcompacted: usize,
+    /// (0.85.0) Whether the fit rule ran this turn — the floor underneath the
+    /// append-only property.
+    ///
+    /// The fit rule is a fold's job, and between folds an entry renders as it first
+    /// rendered. A run whose `keep_recent` holds a ledger too short to fold, or
+    /// whose ceiling is tighter than what a fold leaves behind, has no third option
+    /// but to elide anyway. That rewrites what an earlier step was shown, so it
+    /// costs the vendor's cache from that byte on and the run reports it as
+    /// [`EventKind::PrefixBroke`](crate::EventKind::PrefixBroke) — but it is a
+    /// ceiling doing what a ceiling is for rather than a defect, which is what this
+    /// field tells the loop.
+    pub refit: bool,
     /// (0.49.0) The same emission, piece by piece, so the run loop can build a
     /// role-tagged transcript from it.
     ///
@@ -1500,9 +1512,15 @@ fn append_refreshes(
                     &ContextEvent::reread(step, format!("{target} (written at step {wrote_at})")),
                 )?;
                 (
+                    // The warning lives here and not on the stale entry, because
+                    // the stale entry's bytes are ones the model has already been
+                    // shown and this release does not touch those. So it has to be
+                    // unmistakable: it names the path, says the earlier copy above
+                    // is wrong, and says these are the current contents.
                     format!(
-                        "\n[read {target}] (re-read at step {step}; the earlier read was \
-                         invalidated by the write at step {wrote_at})\n{fresh}\n"
+                        "\n[read {target}] (re-read at step {step}; the write at step {wrote_at} \
+                         invalidated the earlier read of this path above — these are the current \
+                         contents and that one is stale)\n{fresh}\n"
                     ),
                     Origin::File,
                 )
@@ -1514,9 +1532,9 @@ fn append_refreshes(
                 )?;
                 (
                     format!(
-                        "\n[read {target}] (the re-read at step {step} could not be done ({why}) \
-                         — read it yourself; the earlier read was invalidated by the write at \
-                         step {wrote_at})\n"
+                        "\n[read {target}] (the write at step {wrote_at} invalidated the earlier \
+                         read of this path above, and the re-read at step {step} could not be \
+                         done ({why}) — that copy is stale, read it yourself)\n"
                     ),
                     // No bytes arrived from anywhere: this is the crate's own
                     // narration about a refusal, which is what `Prose` means.
@@ -1652,6 +1670,24 @@ pub async fn assemble(
     // the appended entry step 0 wrote, so what is left here is one stub — and the
     // stub names two steps that have both already happened, which is what makes it
     // the same string on every later step.
+    // (0.85.0) Every elision is judged as of the step the prefix was built at, and
+    // this is the same rule the ladder rungs above are under. An entry superseded
+    // by something the run did *after* that step is still carried whole, because
+    // eliding it would rewrite bytes the model has already been shown — the first
+    // version of this release stubbed on the spot and broke the prefix once per
+    // read-then-write pair, which the debug assertion caught across the suite.
+    //
+    // The cost is one extra copy of a file read twice, carried until the next fold,
+    // and it is charged once: a vendor serves the earlier copy from its cache.
+    // Strictly earlier than `since`, not "at or before it". A step's own results
+    // reach the ledger *after* its prompt was assembled, so an entry superseded by
+    // the fold step's own work is one the fold never saw — stubbing it on the step
+    // after would be a rewrite one step past the fold, which is where it would do
+    // the most damage.
+    let superseded: Vec<Option<u32>> = superseded
+        .into_iter()
+        .map(|at| at.filter(|at| *at < since))
+        .collect();
     let mut elided: Vec<Elision> = (0..n).map(|_| None).collect();
     for i in 0..n {
         let (Some(wrote_at), None) = (invalidated[i], superseded[i]) else {
@@ -1665,17 +1701,17 @@ pub async fn assemble(
         let caught_up = entries[i + 1..]
             .iter()
             .find(|l| is_reread_of(l, target) && l.step >= wrote_at)
-            .map(|l| l.step);
-        elided[i] = Some(match caught_up {
-            Some(at) => {
-                format!("invalidated by the write at step {wrote_at}; re-read at step {at}")
-            }
-            // Reachable only when the refresh pass could not run at all — no
-            // workspace on the assembly, which is a flat run with no files to
-            // re-read. Says what is known rather than naming a step that does not
-            // exist.
-            None => format!("invalidated by the write at step {wrote_at}; not re-read"),
-        });
+            .map(|l| l.step)
+            // As of the step the prefix was built at, for the reason above: the
+            // refresh is appended at the tail on the step it happens, and this
+            // entry keeps the bytes it has until the next fold.
+            .filter(|at| *at < since);
+        let Some(at) = caught_up else {
+            continue;
+        };
+        elided[i] = Some(format!(
+            "invalidated by the write at step {wrote_at}; re-read at step {at}"
+        ));
     }
 
     // 3a. Snip (0.81.0), the ladder's second rung. An old lookup is dropped by
@@ -1817,6 +1853,12 @@ pub async fn assemble(
         .map(|i| estimate_tokens(&entries[i].text))
         .sum();
     let fitting = folding || total > budget_tokens;
+    // Whether the fit rule ran at all, and not whether it ran *outside* a fold: a
+    // caller who turned folding off gets `folding` on every step and folds on none,
+    // so subtracting it here would tell the loop the ceiling did nothing on exactly
+    // the runs where the ceiling is the only thing there is. The loop knows which
+    // steps actually folded and skips those before it asks.
+    out.refit = fitting;
     let mut used = 0u64;
     let mut whole = vec![false; n];
     // 0.76.0 — Context Collapse. Where an entry would have been stubbed, its
