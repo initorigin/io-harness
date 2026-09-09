@@ -2848,6 +2848,9 @@ exactly that. If you construct either in a mock provider or a test, prefer
 `..Default::default()` so that a new field costs you nothing.
 
 **0.49.0 is that minor, and it added two: `messages` and `cache_through`.**
+**0.84.0 is another instance of exactly this break**, on the response half:
+`CompletionResponse::rate_limit`, which a struct literal written against 0.83.0
+has to name.
 
 ## What a message is, and what `user` is still for (0.49.0)
 
@@ -4770,3 +4773,56 @@ root's re-exports, so it descends into neither a trait nor `pub mod context`:
 `OpenAi::with_reference_catalogue`. Nothing was removed, renamed or deprecated;
 `FALLBACK_MAX_TOKENS` keeps its value and its meaning as `ContextBudget::default`'s
 ceiling.
+
+## What a reported rate limit is, and what it is not (0.84.0)
+
+**It is what the provider said, and nothing in this crate acts on it.** There is
+no pacing, no throttling, and no retry policy that reads these numbers.
+`CompletionResponse::rate_limit` is a report handed to an application layer that
+wants to show an operator how much allowance is left; a harness that slowed itself
+down on a header would be making a scheduling decision the caller never asked for
+and could not see.
+
+**Two header families are typed**, and only two: OpenAI's
+`x-ratelimit-{limit,remaining,reset}-{requests,tokens}`, whose reset is a Go
+duration — `6m0s`, `128ms`, and a bare number is refused because Go's own parser
+refuses one — and Anthropic's
+`anthropic-ratelimit-{requests,tokens}-{limit,remaining,reset}`, whose reset is an
+RFC 3339 instant. Everything typed lands on `RateLimit::requests` and
+`RateLimit::tokens` as a `Window { limit, remaining, reset }`.
+
+**`raw` is every rate-limit header the response carried, verbatim, in the order
+the response listed them.** Every header whose name contains `ratelimit` is kept
+there whether or not it is one of the two families, so a gateway publishing a
+window of its own reaches a caller without this crate knowing the name. A value
+longer than **256 bytes** is truncated to 256 in `raw` and read as no number at
+all — a number that long is not a number, and parsing the prefix of one would
+invent a value the provider never sent. A header that appears twice is taken from
+its **first** occurrence for the typed fields, because a response that contradicts
+itself has no right answer and a deterministic one is worth more than the last
+line winning; both occurrences are in `raw`.
+
+**Anthropic's absolute reset is converted against the local clock**, since a
+duration is what a caller can act on and the header states an instant. A machine
+whose clock is skewed therefore reads a `reset` skewed by the same amount, and an
+instant already in the past reads as `Some(0)` rather than as an error. That is
+stated rather than corrected — this crate has no clock it trusts more than the one
+it is running on. The OpenAI family states a duration, is taken as sent, and
+depends on no clock at all.
+
+**`None` is not zero.** `rate_limit` is `None` when the response carried no
+rate-limit header at all, and each `Window` field is `None` when that particular
+header was absent or did not parse. "This provider reports no rate limit" and
+"this provider reports an allowance of nothing" are different facts, and only the
+second should ever read as a number.
+
+**`retry-after` is not a rate-limit header and is unchanged.** It keeps
+`Error::Provider { retry_after }`, it is what a retry honours, and it is parsed
+and used exactly as it was before this release. A failing response's rate-limit
+headers land beside it in `Error::Provider { rate_limit }`, reachable through
+`Error::rate_limit()`; `Error::provider_status` takes it as its third argument,
+which is a break for anyone calling that constructor.
+
+**The event fires once per completion that carried a rate limit**, beside
+`EventKind::StepUsage` and from the same place, and not at all for a completion
+that carried none.

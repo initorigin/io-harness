@@ -86,6 +86,7 @@ new trait method every implementer inherits.
 | `ContextCeiling { max_tokens, source }` | Once, beside `Started` — which of the contract, the model or the constant set the per-request ceiling |
 | `Step { decision, tool_call, tokens, changed }` | A step completed and was committed |
 | `StepUsage { fresh_prompt_tokens, cache_read_tokens, cache_write_tokens, completion_tokens }` | Beside `Step`, from the same place — the split behind that step's flat `tokens` |
+| `RateLimit { requests_remaining, tokens_remaining, requests_reset_secs, tokens_reset_secs, raw_count }` | Beside `StepUsage`, for a completion whose response carried a rate-limit header — what the provider said its allowance was, unmodified |
 | `ToolCall { name, target }` | A tool was invoked, before its result is known |
 | `ImageAttached { media_type, bytes, digest, source }` | An image entered the run — from MCP, the browser, `view_image` or the caller |
 | `Refused { act, target, rule, layer }` | The policy refused an action — it did not happen |
@@ -267,6 +268,19 @@ Two absences here are not zeroes. A step no provider answered emits nothing at a
 rather than four zeros, because an absent report is not a report of zero. And
 `cache_write_tokens` is `None` from a vendor that does not report one, which is
 not a claim that nothing was written.
+
+`EventKind::RateLimit` is emitted beside it, from the same place, for a completion
+whose response carried a rate-limit header (0.84.0) — `requests_remaining` and
+`tokens_remaining` as the provider sent them, and `requests_reset_secs` and
+`tokens_reset_secs` as whole seconds until each window refills. A completion that
+carried no such header emits nothing at all, so a consumer that never sees this
+event is looking at a provider that reports no rate limit rather than one
+reporting an allowance of zero. `raw_count` is how many rate-limit headers the
+response carried in total, typed or not, and it is how an operator learns a
+gateway is publishing a window this crate does not name — the pairs themselves
+are on `CompletionResponse::rate_limit`, which keeps every one of them verbatim.
+The numbers reach the stream and go nowhere else: nothing here paces, throttles or
+retries differently because of them.
 
 ## An image entering a run (0.81.0)
 

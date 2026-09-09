@@ -1584,6 +1584,30 @@ pub struct CompletionResponse {
 /// Every field is an `Option` for the same reason it is on [`ModelInfo`]:
 /// **`None` means the provider did not say.** A vendor that sends `remaining`
 /// and no `limit` is common, and a zero would report a real allowance as spent.
+///
+/// ```
+/// use io_harness::Window;
+///
+/// // What an operator's status line has to render. The two unknowns are
+/// // different from a zero, so neither is turned into one.
+/// fn line(window: &Window) -> String {
+///     match (window.remaining, window.limit) {
+///         (Some(left), Some(of)) => format!("{left} of {of} left"),
+///         (Some(left), None) => format!("{left} left"),
+///         // The provider reports this window and said nothing about it, which
+///         // is not the same as reporting an allowance of nothing.
+///         (None, _) => "not reported".into(),
+///     }
+/// }
+///
+/// let mut window = Window::default();
+/// assert_eq!(line(&window), "not reported");
+///
+/// // `#[non_exhaustive]`: built from the default and filled in, because a later
+/// // release may name a fourth thing a vendor says about a window.
+/// window.remaining = Some(99);
+/// assert_eq!(line(&window), "99 left");
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct Window {

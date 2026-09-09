@@ -42,7 +42,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.83"
+io-harness = "0.84"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -519,6 +519,17 @@ on the developer's own laptop costs nothing to run. `Provider::models()` reports
 what a provider can run and what it costs. A provider that is down or rate-limited
 falls back to the next configured one; failures are classified so a caller can tell
 a retryable transport error from a terminal one.
+
+What a vendor says about the allowance itself arrives on the completion.
+`CompletionResponse::rate_limit` carries the requests window and the tokens window
+— how many, how many are left, how long until each refills — read off the response
+headers on the way past, in either family the vendors use, plus every other
+rate-limit header the response held, verbatim and in order, so a gateway
+publishing a window of its own reaches a caller without this crate knowing the
+name. The same struct rides a 429, beside the `Retry-After` a 429 already carried.
+`None` means the provider said nothing, which is not an allowance of nothing.
+Nothing in the harness acts on the numbers: pacing an allowance is a decision for
+whoever owns it.
 
 A request carries an ordered transcript — user turns, assistant turns holding the
 calls the model made, and the results answering them — and each wire maps it onto
