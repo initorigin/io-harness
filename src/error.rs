@@ -301,7 +301,14 @@ pub enum Error {
         /// when it said anything. A 429 is the one failure whose headers a
         /// caller wants as much as its status, and this is the same
         /// [`crate::provider::RateLimit`] a successful completion carries.
-        rate_limit: Option<crate::provider::RateLimit>,
+        ///
+        /// Boxed, alone among this variant's fields: a `RateLimit` owns two
+        /// windows and a `Vec` of header pairs, and this enum is the `Err` half
+        /// of every `Result` the crate returns — inlining it would widen every
+        /// one of them by the size of a struct almost none of them carry.
+        /// [`Error::rate_limit`] hands back a reference, so the box is not in
+        /// the way of reading it.
+        rate_limit: Option<Box<crate::provider::RateLimit>>,
         /// What the provider or the transport reported.
         message: String,
     },
@@ -474,7 +481,7 @@ impl Error {
             kind: ProviderErrorKind::from_response(status, &message),
             status: Some(status),
             retry_after,
-            rate_limit,
+            rate_limit: rate_limit.map(Box::new),
             message,
         }
     }
@@ -488,7 +495,7 @@ impl Error {
     /// ask the question without naming the variant's other fields.
     pub fn rate_limit(&self) -> Option<&crate::provider::RateLimit> {
         match self {
-            Self::Provider { rate_limit, .. } => rate_limit.as_ref(),
+            Self::Provider { rate_limit, .. } => rate_limit.as_deref(),
             _ => None,
         }
     }

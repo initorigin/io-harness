@@ -3877,7 +3877,7 @@ mod rate_limit_headers {
             ),
             (
                 "Compatible",
-                Compatible::at(&serve(with_headers(openai_events, openai_headers)), PATIENT)
+                Compatible::at(serve(with_headers(openai_events, openai_headers)), PATIENT)
                     .complete(request())
                     .await
                     .unwrap(),
