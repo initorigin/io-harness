@@ -507,6 +507,18 @@ where
         let full_catalogue = tools;
         let mut tools =
             crate::run::prompts::tiered(full_catalogue.clone(), contract.tool_tiers.as_deref());
+        // 0.85.0 — per TREE, not per agent, and that is the whole point: a child
+        // shares its parent's system text and tool list, so concentrating the
+        // fan-out on the replica already holding that head is what the key buys. The
+        // root reaches this first and its answer stands for every agent under it.
+        let session_key = tree
+            .session
+            .get_or_init(|| {
+                tree.turn
+                    .and_then(|extras| extras.turn.as_ref())
+                    .map(|turn| session_key(turn.session_id, &base_system, &tools))
+            })
+            .clone();
         // The budget this agent runs under is the smaller of what its contract
         // asked for and what the tree has left — a contract cannot raise it.
         let token_cap = tree.ledger.effective_token_budget(contract.max_tokens);
@@ -795,6 +807,8 @@ where
                     cache_boundary,
                     // 0.49.0 — as the flat loop, through the same helper.
                     cache_through: cache_through_for(cache_boundary, &messages),
+                    // 0.85.0 — the parent's key, inherited rather than derived.
+                    session_key: session_key.clone(),
                     #[cfg(feature = "media")]
                     media: attach_media(contract, pending_media)?,
                     ..Default::default()

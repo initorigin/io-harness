@@ -452,6 +452,10 @@ impl Compatible {
             Auth::Bearer => req.bearer_auth(&self.api_key),
             Auth::None => req,
         };
+        // 0.85.0 — the header half of the session key, beside the body field.
+        if let Some((name, value)) = openai_wire::affinity_header(&request) {
+            req = req.header(name, value);
+        }
         let resp = req
             .json(&openai_wire::body(&self.model, &request, WebFlavor::OpenAi))
             .send()

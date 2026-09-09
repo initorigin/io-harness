@@ -442,6 +442,58 @@ impl Frozen {
     }
 }
 
+/// A stable 64-bit digest, for the parts of a session key (0.85.0).
+///
+/// FNV-1a written out rather than `std::hash::DefaultHasher`, for the reason
+/// `run::mailbox::goal_digest` gives: the standard hasher is documented as
+/// unstable across releases, and a key that changed when the crate was rebuilt on
+/// a newer toolchain would send a resumed session to a replica that has never seen
+/// its prefix — which is the one property this derivation exists for. It is not a
+/// cryptographic hash and does not need to be: what it protects is the *shape* of
+/// the key, and what keeps the id out of it is that a digest is one-way enough
+/// that nothing downstream can read a path or an account out of a routing token.
+fn digest64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The routing key for one session's requests (0.85.0).
+///
+/// `io-<prefix-version>:<session-hash>`, 28 characters — well inside the 64 a
+/// vendor clamps at.
+///
+/// **Two halves, and each is load-bearing.** The session half concentrates a
+/// conversation's traffic on one replica, which is the whole of what a
+/// replica-local cache needs. The prefix half is a digest of the head of the
+/// prompt — the system text and the tool list, which every chat template renders
+/// first — so a session whose head changed asks for a fresh replica instead of
+/// landing on one whose cache it can no longer use. Without it a tool being added
+/// mid-session would route every later request at a machine holding a prefix that
+/// no longer matches, which is worse than not routing at all.
+///
+/// The tool list is digested by name, description and schema rather than by name
+/// alone: a description is prompt text, and a changed one changes the head as
+/// surely as a new tool does.
+pub(super) fn session_key(session_id: i64, system: &str, tools: &[ToolSpec]) -> String {
+    let mut head = system.as_bytes().to_vec();
+    for tool in tools {
+        head.extend_from_slice(tool.name.as_bytes());
+        head.extend_from_slice(tool.description.as_bytes());
+        head.extend_from_slice(tool.parameters.to_string().as_bytes());
+    }
+    format!(
+        "io-{:08x}:{:016x}",
+        digest64(&head) as u32,
+        // Salted, so the key cannot be read back to the id by digesting the small
+        // integers a session id is drawn from.
+        digest64(format!("io-harness session {session_id}").as_bytes())
+    )
+}
+
 /// A prefix a step did not extend (0.85.0).
 #[derive(Debug)]
 pub(super) struct Break {

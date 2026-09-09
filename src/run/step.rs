@@ -983,6 +983,19 @@ pub(super) async fn run_workspace_from<P: Provider>(
     let mut offered: Vec<String> = contract.tool_tiers.clone().unwrap_or_default();
     let full_catalogue = tools;
     let mut tools = tiered(full_catalogue.clone(), contract.tool_tiers.as_deref());
+    // 0.85.0 — the session's routing key, derived once per run from the head of
+    // the prompt: the system text and the tool list, which is what every chat
+    // template renders first and therefore what a replica's cache is keyed on.
+    //
+    // `base_system` and not the planning variant, because the planning directive
+    // is withdrawn when a plan is approved and a key that moved with it would send
+    // the rest of the session to a replica holding nothing. The catalogue as it
+    // stands at the start of the run, for the same reason: `expand_tools` grows it
+    // mid-run, and 0.85.0 does not make the head follow.
+    let session_key = extras
+        .turn
+        .as_ref()
+        .map(|turn| session_key(turn.session_id, &base_system, &tools));
     // Durable budget: restored from the store so a resume continues the same
     // token and wall-clock budget rather than restarting it at zero.
     let mut tokens_used: u64 = store.spent_tokens(run_id)?;
@@ -1393,6 +1406,9 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 // 0.49.0 — the same breakpoint the line above names, counted in
                 // messages because that is what this request sends.
                 cache_through: cache_through_for(cache_boundary, &messages),
+                // 0.85.0 — the same key on every request of the session, which is
+                // what a replica-local cache needs to be able to serve it.
+                session_key: session_key.clone(),
                 // 0.77.0 — the shape the caller demanded, carried to the vendors
                 // whose wire has a place for it. A hint that reduces attempts, and
                 // never the thing trusted: `validate_final_output` below is the

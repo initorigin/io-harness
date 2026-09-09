@@ -66,6 +66,17 @@ pub(crate) fn body(
     if let Some(value) = response_format(request.output_schema.as_ref()) {
         body["response_format"] = value;
     }
+    // 0.85.0 — the session's routing key, added the same way and absent entirely
+    // for a caller that named none, which is what keeps a request that carries no
+    // key byte-identical to the one 0.84.0 sent.
+    //
+    // `prompt_cache_key` and never `user`: OpenAI has deprecated `user` for this
+    // purpose in favour of this field plus `safety_identifier`, and Fireworks
+    // documents this field as taking priority over `user` for session affinity.
+    // Both vendors spell it the same, so there is no per-flavour table here.
+    if let Some(key) = &request.session_key {
+        body["prompt_cache_key"] = json!(key);
+    }
     // 0.38.0 — the cache breakpoint, added the third time in the shape the two
     // above established: a per-vendor difference resolved here rather than in each
     // provider, and absent entirely for a wire that does not take one — which is
@@ -106,6 +117,23 @@ pub(crate) fn body(
         }
     }
     body
+}
+
+/// The header half of 0.85.0's session key, or `None` when there is no key.
+///
+/// The same value as the body field, sent both ways because which one a hop reads
+/// is not uniform: a vendor may route on the body field, a gateway in front of it
+/// may only see headers, and neither documents a precedence between them. Sending
+/// one value twice cannot disagree with itself.
+///
+/// `x-session-affinity` is the name Fireworks documents. It is a request header
+/// and never a body field, so it changes no byte of the body a caller without a
+/// key would have sent.
+pub(crate) fn affinity_header(request: &CompletionRequest) -> Option<(&'static str, &str)> {
+    request
+        .session_key
+        .as_deref()
+        .map(|key| ("x-session-affinity", key))
 }
 
 /// The `messages` array.
@@ -913,6 +941,46 @@ impl Accumulator {
 mod tests {
     use super::*;
     use crate::provider::ToolSpec;
+
+    /// F6 — the key reaches the wire twice and never as `user`.
+    ///
+    /// Twice because which hop reads which is not uniform: a vendor may route on
+    /// the body field, a gateway in front of it may only see headers, and neither
+    /// documents a precedence. Never as `user` because that field means abuse
+    /// monitoring at OpenAI, which has deprecated it for routing, and because
+    /// Fireworks documents `prompt_cache_key` as taking priority over it.
+    #[test]
+    fn f6_a_session_key_reaches_the_body_and_the_header_and_never_user() {
+        let request = CompletionRequest {
+            system: "be brief".into(),
+            user: "hello".into(),
+            session_key: Some("io-deadbeef:0123456789abcdef".into()),
+            ..Default::default()
+        };
+        let sent = body("m", &request, WebFlavor::OpenAi);
+        assert_eq!(
+            sent["prompt_cache_key"], "io-deadbeef:0123456789abcdef",
+            "{sent}"
+        );
+        assert!(sent.get("user").is_none(), "{sent}");
+        assert_eq!(
+            affinity_header(&request),
+            Some(("x-session-affinity", "io-deadbeef:0123456789abcdef"))
+        );
+    }
+
+    /// F6 (the control) — a caller that named no key changes no byte.
+    #[test]
+    fn a_request_with_no_session_key_sends_the_0_84_0_body() {
+        let bare = CompletionRequest {
+            system: "be brief".into(),
+            user: "hello".into(),
+            ..Default::default()
+        };
+        let sent = body("m", &bare, WebFlavor::OpenAi);
+        assert!(sent.get("prompt_cache_key").is_none(), "{sent}");
+        assert_eq!(affinity_header(&bare), None);
+    }
 
     /// What the 0.54.0 completeness edge reported, in the order it reported it.
     type Reported = std::sync::Arc<std::sync::Mutex<Vec<(usize, ToolCall)>>>;
