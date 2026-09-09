@@ -3657,9 +3657,35 @@ mod rate_limit_headers {
     }
 
     #[test]
+    fn nf2_a_truncated_value_whose_prefix_would_parse_is_still_read_as_nothing() {
+        // The arm that makes the bound load-bearing. A 257-digit number is
+        // refused by `u64::from_str` whatever the cap does, so a test using one
+        // passes with the cap deleted — which is exactly what the sabotage pass
+        // found. A duration does not have that luxury: the first 256 bytes of
+        // this value are a *legal* duration, so a parse of the truncation would
+        // report a wait the provider never named.
+        let long = "1s".repeat(200);
+        assert!(long.len() > MAX_RATE_LIMIT_VALUE_BYTES);
+        assert!(
+            parse_go_duration(&long[..MAX_RATE_LIMIT_VALUE_BYTES]).is_some(),
+            "the prefix parses, which is what makes this arm worth having"
+        );
+
+        let limit =
+            RateLimit::from_headers(&headers(&[("x-ratelimit-reset-requests", long.as_str())]))
+                .expect("one rate-limit header");
+
+        assert_eq!(limit.raw[0].1.len(), MAX_RATE_LIMIT_VALUE_BYTES);
+        assert_eq!(
+            limit.requests.reset, None,
+            "a value the cap cut is evidence, not a number"
+        );
+    }
+
+    #[test]
     fn nf2_a_value_at_the_cap_is_still_read() {
-        // The control for the test above: a cap that rejected everything would
-        // pass it and make the typed fields unreachable.
+        // The control for the two tests above: a cap that rejected everything
+        // would pass both and make the typed fields unreachable.
         let at_cap = format!("{:>width$}", "99", width = MAX_RATE_LIMIT_VALUE_BYTES);
         let limit =
             RateLimit::from_headers(&headers(&[("x-ratelimit-remaining-requests", &at_cap)]))
