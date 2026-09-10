@@ -143,6 +143,56 @@ impl Refusal {
     }
 }
 
+/// (0.86.0) Every construct this parser will refuse, by the name it refuses it
+/// under.
+///
+/// **This is what the model is told, and it is the same list the parser uses.**
+/// Up to 0.85.0 the grammar existed in three places that could disagree: the
+/// refusals themselves, scattered as literals through `parse`; the prose in
+/// `docs/CONTRACT.md`; and the model's own knowledge of it, which was empty —
+/// the tool's description said what `shell` runs and never what it will not, so
+/// a model discovered the set one refusal at a time, at a model round trip each.
+/// The description is now composed from this list, and `a_refusal_this_parser_
+/// can_produce_is_in_the_table` reads this file back and fails if a construct is
+/// refused under a name the list does not carry.
+///
+/// Alphabetical, because it is rendered into a prompt and a stable order is one
+/// fewer thing that can move a cached prefix.
+pub(crate) const REFUSED_CONSTRUCTS: &[&str] = &[
+    "a `case` clause terminator",
+    "a brace group or brace expansion",
+    "a clobbering redirect",
+    "a comment",
+    "a control character",
+    "a dangling operator",
+    "a dangling pipe",
+    "a descriptor duplication",
+    "a glob pattern",
+    "a here-document",
+    "a read-write redirect",
+    "a redirect of an unsupported file descriptor",
+    "a redirect with no command",
+    "a redirect with no target",
+    "a shell keyword",
+    "a stream merge on a piped stage",
+    "a subshell",
+    "a trailing backslash",
+    "an empty command line",
+    "an input descriptor duplication",
+    "an over-long command line",
+    "an unsupported character",
+    "an unterminated double quote",
+    "an unterminated single quote",
+    "arithmetic expansion",
+    "background execution",
+    "command substitution",
+    "parameter expansion",
+    "parameter or command expansion",
+    "pipeline negation or history expansion",
+    "process substitution",
+    "tilde expansion",
+];
+
 /// A parse either produces a line or refuses it. There is no third outcome, and in
 /// particular no "parsed with warnings" — a line this module is unsure about is a
 /// line it refuses.
@@ -687,17 +737,22 @@ fn lex(src: &str) -> ParseResult<Vec<Token>> {
             // are enumerated only so the message names the construct, because a
             // model told "unsupported character" cannot rewrite its line and a
             // model told "command substitution" can.
+            // 0.86.0 — three `Refusal::new` calls rather than one over a tuple of
+            // variables. `REFUSED_CONSTRUCTS` is checked against this file by
+            // reading it back, and a construct named through a binding is one the
+            // reader cannot see: it would drop out of the list the model is given
+            // without dropping out of the refusals the parser produces, which is
+            // the exact drift the list exists to prevent.
             '$' => {
-                let what = if chars.get(i + 1) == Some(&'(') {
-                    if chars.get(i + 2) == Some(&'(') {
-                        ("arithmetic expansion", "`$(( ))` is not evaluated by this tool.")
-                    } else {
-                        ("command substitution", "`$( )` would run a command this tool never sees and therefore never checks. Run it as its own step and use the output.")
+                return Err(match (chars.get(i + 1), chars.get(i + 2)) {
+                    (Some(&'('), Some(&'(')) => {
+                        Refusal::new("arithmetic expansion", i, "`$(( ))` is not evaluated by this tool.")
                     }
-                } else {
-                    ("parameter expansion", "this tool does not expand variables: the argv it checks must be the argv it runs, and a value read from the environment is neither. Pass the value literally.")
-                };
-                return Err(Refusal::new(what.0, i, what.1));
+                    (Some(&'('), _) => {
+                        Refusal::new("command substitution", i, "`$( )` would run a command this tool never sees and therefore never checks. Run it as its own step and use the output.")
+                    }
+                    _ => Refusal::new("parameter expansion", i, "this tool does not expand variables: the argv it checks must be the argv it runs, and a value read from the environment is neither. Pass the value literally."),
+                });
             }
             '`' => {
                 return Err(Refusal::new(
@@ -1093,6 +1148,107 @@ pub(crate) fn plan(line: &Line, root: &Path) -> Result<Vec<Planned>> {
         }
     }
     Ok(out)
+}
+
+/// The commands whose operands name files they write, beside their redirects.
+///
+/// **A closed list, and short on purpose.** Every entry is a command whose
+/// written path is decidable from the argv alone, in one spelling, on every
+/// platform. `sed -i` is the one deliberately left out: it takes an optional
+/// suffix attached to the flag on GNU and a mandatory separate argument on BSD,
+/// so an inspection that models both spellings picks the wrong operand on an
+/// unusual invocation — and a restore point that names the wrong file is a
+/// silent corruption, where a missing one is a stated limit. `docs/CONTRACT.md`
+/// carries the limit.
+const WRITES_ITS_OPERANDS: &[&str] = &["cp", "mv", "tee"];
+
+/// Every path under `root` that this line's stages may write, in written order.
+///
+/// (0.86.0) Until this release a file a shell stage changed had no restore
+/// point: `write_file`, `edit_file` and `patch_file` each journalled the file
+/// before touching it, and `echo x >> notes.md` — the same edit by another door
+/// — journalled nothing, so `rewind` reported the path as one this run never
+/// wrote. The product promised an undo it did not have.
+///
+/// **Two sources, and the difference matters.** A redirect's target is taken
+/// from [`Planned`], already resolved and already policy-checked, so the path
+/// journalled is the path the runner will open. An operand of one of
+/// [`WRITES_ITS_OPERANDS`] is resolved here against that stage's own `cwd`,
+/// which is the same base the runner uses.
+///
+/// **`mv` journals its sources too.** It removes them, and a restore point that
+/// covered only the destination would put the copy back and leave the original
+/// missing.
+///
+/// A path that resolves outside `root` is dropped rather than journalled. A
+/// snapshot of an unreachable path reads back as [`Kept::Absent`], and putting
+/// an `Absent` back means deleting it — so journalling what this tool cannot
+/// reach would turn an undo into a delete of something outside the workspace.
+///
+/// What it does not see is stated rather than implied: a command not on the
+/// list, a path built by the program itself, and any in-place editor. Those are
+/// the same class of miss, they are documented, and they are why this returns
+/// what it *may* write rather than claiming what it will.
+pub(crate) fn written_paths(line: &Line, plan: &[Planned], root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut add = |abs: PathBuf| {
+        if abs.starts_with(root) && !out.contains(&abs) {
+            out.push(abs);
+        }
+    };
+    for (cmd, planned) in line.commands().zip(plan.iter()) {
+        for (kind, target) in &planned.redirects {
+            if kind.is_write() {
+                if let Some(t) = target {
+                    add(t.clone());
+                }
+            }
+        }
+        // The basename, so `/bin/cp` is the same command as `cp`. A path in
+        // command position is still the program it names.
+        let program = Path::new(&cmd.argv[0])
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        if !WRITES_ITS_OPERANDS.contains(&program) {
+            continue;
+        }
+        // Flags are not operands. A file genuinely named `-x` is unreachable
+        // through this and is one more thing the documented limit covers.
+        let operands: Vec<&String> = cmd.argv[1..]
+            .iter()
+            .filter(|a| !a.starts_with('-'))
+            .collect();
+        if program == "tee" {
+            for o in &operands {
+                add(planned.cwd.join(o));
+            }
+            continue;
+        }
+        let Some((dest, sources)) = operands.split_last() else {
+            continue;
+        };
+        let dest = planned.cwd.join(dest);
+        // `cp a b dir/` writes `dir/a` and `dir/b`, not `dir`. Decided against
+        // the tree as it stands, which is the same moment the runner will decide
+        // it; a directory created between here and the spawn is a miss the
+        // documented limit covers rather than a wrong path journalled.
+        if dest.is_dir() {
+            for s in sources {
+                if let Some(name) = Path::new(s).file_name() {
+                    add(dest.join(name));
+                }
+            }
+        } else {
+            add(dest);
+        }
+        if program == "mv" {
+            for s in sources {
+                add(planned.cwd.join(s));
+            }
+        }
+    }
+    out
 }
 
 /// What one `shell` invocation produced.
@@ -1945,6 +2101,78 @@ mod tests {
                 "target for `{src}`"
             );
         }
+    }
+
+    /// The name of every construct this file refuses, read out of this file.
+    ///
+    /// The scan is deliberately total: it takes the first argument of every
+    /// `Refusal::new(` in the source and demands a string literal there. A call
+    /// that names its construct through a variable is reported as a hole rather
+    /// than skipped, because a skipped call site is exactly how a construct
+    /// stays refused while dropping out of the list the model is shown.
+    fn constructs_in_this_file() -> std::collections::BTreeSet<String> {
+        // The parser's half only. This module's own prose names the constructor
+        // it scans for, and a checker that matched its own description would
+        // report the description as a hole.
+        let whole = include_str!("shell.rs");
+        let src = whole.split("#[cfg(test)]").next().expect("a first half");
+        assert!(
+            src.len() < whole.len(),
+            "the test module marker was not found, so the scan is reading its own \
+             source and this checker is measuring itself"
+        );
+        let mut out = std::collections::BTreeSet::new();
+        for (at, _) in src.match_indices("Refusal::new(") {
+            let rest = &src[at + "Refusal::new(".len()..];
+            let head: String = rest.chars().take_while(|c| c.is_whitespace()).collect();
+            let rest = &rest[head.len()..];
+            assert!(
+                rest.starts_with('"'),
+                "a `Refusal::new` at byte {at} names its construct through something \
+                 other than a string literal, so this checker cannot see it. Name it \
+                 literally at the call site — see the note on REFUSED_CONSTRUCTS. \
+                 Found: {:?}",
+                &rest[..rest.len().min(60)]
+            );
+            let body = &rest[1..];
+            let end = body.find('"').expect("a closing quote");
+            out.insert(body[..end].to_string());
+        }
+        out
+    }
+
+    /// The list and the parser agree, in both directions.
+    #[test]
+    fn a_refusal_this_parser_can_produce_is_in_the_table() {
+        let found = constructs_in_this_file();
+        assert!(
+            found.len() > 20,
+            "the scan found only {} refusals, which cannot be right — it has stopped \
+             matching and every assertion here is now vacuous",
+            found.len()
+        );
+        let listed: std::collections::BTreeSet<String> =
+            REFUSED_CONSTRUCTS.iter().map(|s| s.to_string()).collect();
+        let missing: Vec<_> = found.difference(&listed).collect();
+        let extra: Vec<_> = listed.difference(&found).collect();
+        assert!(
+            missing.is_empty(),
+            "the parser refuses these under names REFUSED_CONSTRUCTS does not carry, so \
+             the model is not told about them: {missing:?}"
+        );
+        assert!(
+            extra.is_empty(),
+            "REFUSED_CONSTRUCTS names these and nothing refuses them, so the model is \
+             told about a rule that does not exist: {extra:?}"
+        );
+    }
+
+    /// The list is sorted, because it is rendered into a cached prompt prefix.
+    #[test]
+    fn the_table_is_in_a_stable_order() {
+        let mut sorted = REFUSED_CONSTRUCTS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(REFUSED_CONSTRUCTS, sorted.as_slice());
     }
 
     #[test]

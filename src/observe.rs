@@ -1011,6 +1011,32 @@ pub enum EventKind {
         /// The backend that isolated it, when one is known.
         backend: Option<String>,
     },
+    /// (0.86.0) What a failing gate command printed, and what it exited with.
+    ///
+    /// Beside [`Sandbox`](EventKind::Sandbox) rather than inside it. That
+    /// variant announces *that* a `"gate_output"` row was written and has
+    /// carried no payload since 0.17.0, so an observer watching a run learned a
+    /// gate had failed and had to open the store to learn anything about why —
+    /// which an attached reader watching a live run cannot do cheaply and a
+    /// caller with no store cannot do at all. Adding the two fields to
+    /// `Sandbox` would say the same thing and break every exhaustive match on
+    /// it, and this enum's `#[non_exhaustive]` does not extend to its variants.
+    ///
+    /// Emitted once per failing [`Verification::Command`](crate::Verification),
+    /// after the row is written and from the same values, so the event and the
+    /// `sandbox_events` row cannot disagree. A gate that passes emits nothing.
+    GateOutput {
+        /// Both streams as the gate produced them, merged and bounded the way
+        /// the stored row is: 4,000 characters, kept from the head *and* the
+        /// tail, because a test runner puts the invocation at one end and the
+        /// failure at the other. Empty when the command printed nothing, which
+        /// is a real answer and not a missing one.
+        output: String,
+        /// What the command exited with, or `None` when it was killed by a
+        /// signal or by a sandbox cap — the case where there is no exit status
+        /// to report rather than one that happens to be zero.
+        exit_code: Option<i32>,
+    },
     /// An MCP server was reached, or one of its tools was called.
     Mcp {
         /// The server, by the name it was configured under.
@@ -1767,6 +1793,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "server_tool_used",
     "token",
     "sandbox",
+    "gate_output",
     "mcp",
     "handle_started",
     "handle_polled",
@@ -2430,6 +2457,10 @@ mod tests {
                 kind: "create".into(),
                 backend: Some("b".into()),
             },
+            EventKind::GateOutput {
+                output: "boom".into(),
+                exit_code: Some(3),
+            },
             EventKind::Mcp {
                 server: "s".into(),
                 tool: Some("t".into()),
@@ -2658,6 +2689,7 @@ mod tests {
                 | EventKind::MemoryWrote { .. }
                 | EventKind::MemoryForgot { .. }
                 | EventKind::Sandbox { .. }
+                | EventKind::GateOutput { .. }
                 | EventKind::Mcp { .. }
                 // The five handle events sit with `Sandbox` and `Mcp` rather than
                 // anywhere else: all of them report something outside this process

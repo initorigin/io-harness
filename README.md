@@ -42,7 +42,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.85"
+io-harness = "0.86"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -404,6 +404,13 @@ being a criterion that could not run at all, which is a different problem from o
 that ran and said no. `retry_gate` re-runs *only* the criterion, against the
 workspace the run left, so a transport failure on the gate does not cost the forty
 steps that produced the work.
+
+A failing command gate says why, on the event stream as well as in the trace:
+`EventKind::GateOutput` carries what the command printed — both streams, bounded
+— and the status it exited with, so "the agent's work is wrong" and "the test
+runner is not installed" are told apart without opening the store. A gate that
+printed nothing still reports its exit status, which is then the only thing there
+is to report.
 
 ### Budgets, routing and caching
 

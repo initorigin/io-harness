@@ -2265,6 +2265,8 @@ pub(crate) async fn dispatch(
                 ShellCheck::Stop(d) => return Ok(d),
             };
 
+            journal_shell_targets(ws, store, run_id, step, &parsed, &plan);
+
             let contained = exec_sandbox
                 .map(|c| std::sync::Arc::new(c.with_egress(ws.policy().permits_any_egress())));
             if let Some(containment) = &contained {
@@ -2412,6 +2414,11 @@ pub(crate) async fn dispatch(
                 ShellCheck::Go(remember) => remember,
                 ShellCheck::Stop(d) => return Ok(d),
             };
+
+            // A backgrounded line writes the same files a foreground one does,
+            // and journalling only the foreground door would make the undo
+            // depend on which tool the model happened to reach for.
+            journal_shell_targets(ws, store, run_id, step, &parsed, &plan);
 
             // Reserved only after the whole line has cleared. A refused line
             // must not consume a slot, and a reservation is the first thing that
@@ -4201,5 +4208,36 @@ pub(super) fn relative_to(root: &std::path::Path, path: &std::path::Path) -> Str
         ".".to_string()
     } else {
         rel.to_string_lossy().into_owned()
+    }
+}
+
+/// (0.86.0) Journal every file this shell line may write, before it runs.
+///
+/// The same journal `write_file` uses, through the same two calls in the same
+/// order — [`read_before`] then [`record_snapshot`] — so a file changed by a
+/// redirect and a file changed by a tool are restored by one mechanism rather
+/// than by two that could disagree. `Store::record_snapshot` keeps the earliest
+/// row per path per run, so journalling on every stage of every line is correct
+/// without a first-write check here.
+///
+/// **Before the run and after the policy check.** Before, because the point is
+/// what the file held *first*; after, because a line the policy refuses must not
+/// leave a restore point for a write that never happened.
+///
+/// The paths are what [`crate::tools::shell::written_paths`] can see, which is
+/// a stated subset rather than everything a process might do — the whole reason
+/// it returns what a line *may* write.
+fn journal_shell_targets(
+    ws: &Workspace,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    parsed: &crate::tools::shell::Line,
+    plan: &[crate::tools::shell::Planned],
+) {
+    for abs in crate::tools::shell::written_paths(parsed, plan, ws.root()) {
+        let rel = relative_to(ws.root(), &abs);
+        let (_, kept) = read_before(ws, &rel);
+        record_snapshot(store, run_id, step, &rel, kept);
     }
 }
