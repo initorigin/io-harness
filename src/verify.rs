@@ -1103,14 +1103,34 @@ impl<'a> ExecGuard<'a> {
     /// machine to fix. Bounded because a build log is unbounded and this is a
     /// trace row, and truncated from the tail, which is where a test runner puts
     /// the failure.
-    fn record_gate_output(&self, output: &str) {
-        if output.trim().is_empty() {
-            return;
-        }
+    /// (0.86.0) …and announce it, with the exit status, on the event stream.
+    ///
+    /// The row and the event are bounded from the same value, so a reader
+    /// watching the run and a reader opening the store afterwards see the same
+    /// text. The two differ in one way, deliberately: a command that printed
+    /// nothing writes no row — an empty row says nothing an absent one does not
+    /// — but it *does* emit the event, because `exit_code` is worth reporting
+    /// on its own and a gate that failed silently is exactly the case where the
+    /// exit status is all there is to go on.
+    fn record_gate_output(&self, output: &str, exit_code: Option<i32>) {
+        let (bounded, _) =
+            crate::tools::exec::head_and_tail(output.trim(), GATE_OUTPUT_TRACE_CHARS);
         if let Some((store, run_id, step)) = self.trace {
-            let (bounded, _) =
-                crate::tools::exec::head_and_tail(output.trim(), GATE_OUTPUT_TRACE_CHARS);
-            self.sandboxed_event(store, &SandboxEvent::gate_output(run_id, step, &bounded));
+            if !bounded.is_empty() {
+                self.sandboxed_event(store, &SandboxEvent::gate_output(run_id, step, &bounded));
+            }
+        }
+        if let Some((watch, depth)) = self.watch {
+            let (run_id, step) = self.trace.map_or((0, 0), |(_, r, s)| (r, s));
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::GateOutput {
+                    output: bounded,
+                    exit_code,
+                },
+            ));
         }
     }
 
@@ -1382,7 +1402,7 @@ impl Verification {
                 run.exit
                     .map_or_else(|| "on a signal or a cap".to_string(), |c| c.to_string()),
             ));
-            guard.record_gate_output(&run.output);
+            guard.record_gate_output(&run.output, run.exit);
         }
         Ok(passed)
     }

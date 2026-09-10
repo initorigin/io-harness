@@ -565,6 +565,14 @@ construct nobody anticipated fails closed rather than being absorbed into a
 word. **This set may widen in a later release and will not silently narrow.** A
 line that runs today will still run.
 
+**The model is told all of this before its first step (0.86.0).** The paragraph
+above opens by saying that a model discovering the refusal set one construct at a
+time spends steps doing it — which is what happened, at a model round trip per
+construct, because the set was in this document and not in the prompt. The
+`shell` tool's description now names every construct the parser can refuse,
+generated from the same table the refusals are raised from, so the two cannot
+drift and neither can drift from this page without a test failing.
+
 Two consequences worth stating because they are limitations rather than
 oversights. Globs are refused rather than expanded: expanding one would let the
 argv the policy checked differ from the argv that ran, since the filesystem can
@@ -878,6 +886,24 @@ does not snapshot a workspace at gate time.
 said no; re-running it over an unchanged tree asks the same question until the
 answer is convenient. `retry_gate` returns `Error::Resume` for that, and for a run
 that never gated at all.
+
+**What a failing gate says, and where (0.86.0).** A failing
+`Verification::Command` emits `EventKind::GateOutput { output, exit_code }`. The
+output is both streams as the command produced them, merged and bounded at 4,000
+characters kept from the head *and* the tail — a test runner puts the invocation
+at one end and the failure at the other — and is the same value written to the
+`"gate_output"` row, so a reader watching the run and a reader opening the store
+afterwards cannot be shown different text. `exit_code` is `None` when the command
+was killed by a signal or by a sandbox cap, which is a different fact from an exit
+status that happens to be zero.
+
+Two things this deliberately does not do. It emits nothing for a gate that
+passed, so an event on this stream is always a failure. And a command that
+printed nothing writes no `"gate_output"` row — an empty row says nothing an
+absent one does not — while still emitting the event, because the exit status is
+then the only thing there is to report. The older
+`EventKind::Sandbox { kind: "gate_phase_failed", .. }` is unchanged and still
+announces *that* a gate failed; it has never carried a payload.
 
 ## What routing changes, and what it cannot (0.34.0)
 
@@ -2607,6 +2633,18 @@ An agent's own words are durable for the first time, as one `agent_events` row p
 step that said something; a child that never spoke says so rather than reporting
 an empty answer.
 
+**Where that text lands, stated exactly (0.86.0).** It is the observation for the
+`spawn_agent` call that produced it — an `ObsKind::Child` entry, which is a
+`Piece::Result` and therefore occupies that call's position in the transcript, so
+the model reads a child's conclusion the way it reads any other tool result.
+Several children spawned in one step fold in **spawn order**, not completion
+order. A child that ended without saying anything folds
+`(returned nothing; read its trace by run id)`: both halves, because naming the
+trace without naming the emptiness reads as a build that cannot report, and
+naming the emptiness without the trace leaves the child's work unreachable. Up to
+0.85.0 that line read `(it ended without saying anything; read its trace by run
+id)`. None of this is opt-in and none of it ever was.
+
 **Concurrency, exactly.** A detached child is a future on its parent's own task,
 polled while the parent waits for its own completion — not a spawned task. It
 cannot be one: `rusqlite::Connection` is `Send` and not `Sync`, so the store
@@ -2665,6 +2703,32 @@ minimal diff. For a `write_file` that rewrote two distant regions it is one hunk
 spanning both: a valid unified diff that reverse-applies exactly, and not the
 shortest one. A minimal diff is a dependency or several hundred lines of
 algorithm, and it buys shorter output rather than a capability.
+
+**What a `shell` stage leaves behind, and what it does not (0.86.0).** A shell
+stage that names a file it may write has that file journalled — the same restore
+point `write_file` takes, written before the line runs and after the policy has
+cleared it — so `rewind` puts it back. Until this release it did not, and
+`echo x >> notes.md` left `rewind` reporting `NotRecorded` for a file the run had
+just rewritten.
+
+**Covered:** the write redirects `>`, `>>`, `2>` and `2>>`; and the operands of
+`tee`, `cp` and `mv`, resolved against that stage's own working directory. `cp`
+and `mv` into an existing directory journal `dir/<name>` per source rather than
+the directory. **`mv` also journals its sources**, because it removes them and a
+restore point covering only the destination would put the copy back and leave the
+original missing. A path that resolves outside the workspace is not journalled at
+all: a snapshot of an unreachable path reads back as absent, and putting an
+absence back means deleting it.
+
+**Not covered, and this is a limit rather than an oversight:** `sed -i` and every
+other in-place editor; a command not on the list above; a path the program
+computes for itself; and a directory created between the plan and the spawn.
+`sed -i` is the one singled out because it looks covered and is not — the flag
+takes an optional attached suffix on GNU (`-i.bak`) and a mandatory separate
+argument on BSD (`-i ''`), so an inspection that modelled both would pick the
+wrong operand on an unusual invocation, and a restore point naming the wrong file
+is a silent corruption where a missing one is this paragraph. A shell stage's
+journal answers what a line *may* write; it does not claim to know what it will.
 
 **Three reasons a hunk is absent, and none of them is "nothing happened".** The
 row was written before 0.51.0; the file's previous contents were not kept, so
@@ -4894,6 +4958,24 @@ rate-limit header at all, and each `Window` field is `None` when that particular
 header was absent or did not parse. "This provider reports no rate limit" and
 "this provider reports an allowance of nothing" are different facts, and only the
 second should ever read as a number.
+
+**What an error body carries, and what is taken out of it (0.86.0).** The body of
+a non-success response becomes `Error::Provider`'s message, bounded at 8 KiB and
+then **redacted**: every JSON field whose name ends in `_id` or `-id`, in any
+case, has its value replaced with `[redacted]`. That is `user_id`,
+`organization_id`, `request_id` and the `x-request-id` a gateway echoes into its
+own body. The vendor's `message` survives, so an error still says what went
+wrong. A body with nothing to redact reaches the caller byte-identical.
+
+Three limits, stated rather than implied. A bare `id` is **not** redacted: it
+names the failing object — a model, a batch, a file — as often as it names the
+caller, and taking it would leave an error that says something failed and refuses
+to say what. The redaction is a scanner rather than a JSON parse, because the 8
+KiB bound means a large error body arrives *truncated* and no parser accepts one —
+a redaction that silently did nothing on exactly the biggest bodies would be a
+hole wearing a feature's clothes. And it sees fields, not prose: an identifier a
+vendor writes into a sentence (`"user user_abc is over quota"`) is out of reach of
+any rule this cheap. Nothing in a **success** body is redacted.
 
 **`retry-after` is not a rate-limit header and is unchanged.** It keeps
 `Error::Provider { retry_after }`, it is what a retry honours, and it is parsed

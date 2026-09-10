@@ -189,7 +189,9 @@ pub(crate) async fn ensure_success(resp: reqwest::Response) -> Result<reqwest::R
     // Read the headers before the body: reading the body consumes the response.
     let retry_after = crate::net::retry_after(resp.headers());
     let rate_limit = RateLimit::from_headers(resp.headers());
-    let detail = capped_body(resp).await;
+    // Bounded first, then redacted, so the scan runs over exactly the bytes that
+    // become the error and not over bytes that were about to be dropped.
+    let detail = redact_identifiers(&capped_body(resp).await);
     let detail = detail.trim();
     Err(Error::provider_status(
         status.as_u16(),
@@ -224,17 +226,6 @@ async fn capped_body(resp: reqwest::Response) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Reject a response that parsed to nothing at all.
-///
-/// A stream that completed but yielded no text, no tool call and no usage is a
-/// failure the loop cannot see: [`CompletionResponse::default`] reads exactly
-/// like "the model chose not to call a tool", so a truncated or garbled transfer
-/// ends the run as if the model had decided to stop. Naming it
-/// [`crate::error::ProviderErrorKind::Malformed`] makes it retryable instead of
-/// invisible.
-///
-/// A response with text and no tool call is *not* this: that is a model that
-/// answered without calling anything, and it keeps its meaning exactly.
 /// An endpoint with anything credential-shaped taken out of it, for the four
 /// providers' hand-written [`std::fmt::Debug`] impls (0.70.0).
 ///
@@ -267,6 +258,136 @@ pub(crate) fn redacted_endpoint(endpoint: &str) -> String {
     format!("{head}{}", &rest[..cut])
 }
 
+/// What [`redact_identifiers`] puts where an identifier was.
+const REDACTED: &str = "\"[redacted]\"";
+
+/// Is `key` the name of a field that identifies somebody?
+///
+/// Two suffixes rather than a list of names, and case-insensitively, because the
+/// four the vendors actually send — `user_id`, `organization_id`, `request_id`
+/// and the `x-request-id` a gateway echoes into its body — are four spellings of
+/// one shape, and a list would be a thing to keep up to date against endpoints
+/// this crate does not control.
+///
+/// A bare `id` is **not** matched. It is by far the commonest key of all and it
+/// names the failing object as often as it names the caller — the id of a model,
+/// a batch or a file, which is what someone reading the error needs. Redacting
+/// it would leave a message that says something failed and refuses to say what.
+fn identifies_someone(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k.ends_with("_id") || k.ends_with("-id")
+}
+
+/// (0.86.0) Replace the value of every identifying field in an error body.
+///
+/// A vendor echoes the caller's own identifiers into its error bodies, and this
+/// crate puts that body verbatim into [`Error::Provider`]'s message — which is
+/// then logged, traced, recorded and rendered by whatever embeds the crate. The
+/// leak is the crate's to close: an embedder that redacts on the way *out* has
+/// already written the value into a trace on the way in.
+///
+/// **A scanner rather than a JSON parse, and that is the point.** The body it is
+/// given has already been cut at [`MAX_ERROR_DETAIL_BYTES`], so the common case
+/// for a large error body is a *truncated* document that no parser will accept —
+/// and a redaction that silently does nothing on exactly the biggest bodies is
+/// the shape of a hole rather than a feature. Scanning also leaves every other
+/// byte where it was, so the message a human reads is the message the vendor
+/// sent, minus the identifiers.
+///
+/// It runs after the bound rather than before it, so what is scanned is what
+/// will be stored, and no work is done on bytes that were about to be dropped.
+///
+/// What it does not do: a value spread over several fields, a body that is not
+/// field-shaped at all, and an identifier inside prose (`"user user_abc is over
+/// quota"`) are all out of reach of any rule this cheap. `docs/CONTRACT.md` says
+/// so rather than implying a guarantee this cannot make.
+pub(crate) fn redact_identifiers(body: &str) -> String {
+    let b = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'"' {
+            out.push_str(&body[i..=i]);
+            i += 1;
+            continue;
+        }
+        // A quoted token. Whether it is a key is decided by what follows it, so
+        // the token is copied out first and emitted either way.
+        let Some(end) = quoted_end(b, i) else {
+            out.push_str(&body[i..]);
+            return out;
+        };
+        let token = &body[i + 1..end];
+        out.push_str(&body[i..=end]);
+        i = end + 1;
+        let after = skip_ws(b, i);
+        if after >= b.len() || b[after] != b':' || !identifies_someone(token) {
+            continue;
+        }
+        out.push_str(&body[i..=after]);
+        i = after + 1;
+        // Its value, whatever shape it is. A quoted value ends at its closing
+        // quote; anything else (a number, `null`, a bare token a lax encoder
+        // emitted) ends where the next field or container does.
+        let start = skip_ws(b, i);
+        out.push_str(&body[i..start]);
+        i = start;
+        if i >= b.len() {
+            break;
+        }
+        if b[i] == b'"' {
+            match quoted_end(b, i) {
+                Some(v) => i = v + 1,
+                // Truncated mid-value: there is nothing after it to keep, and
+                // emitting the opening quote alone would leave a fragment of the
+                // identifier behind.
+                None => i = b.len(),
+            }
+        } else {
+            while i < b.len() && !matches!(b[i], b',' | b'}' | b']') {
+                i += 1;
+            }
+        }
+        out.push_str(REDACTED);
+    }
+    out
+}
+
+/// The index of the closing quote of the string starting at `open`, or `None`
+/// when the input ends first. Backslash escapes are honoured, so a `\"` inside
+/// the string does not end it.
+fn quoted_end(b: &[u8], open: usize) -> Option<usize> {
+    let mut i = open + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The first index at or after `from` that is not ASCII whitespace.
+fn skip_ws(b: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Reject a response that parsed to nothing at all.
+///
+/// A stream that completed but yielded no text, no tool call and no usage is a
+/// failure the loop cannot see: [`CompletionResponse::default`] reads exactly
+/// like "the model chose not to call a tool", so a truncated or garbled transfer
+/// ends the run as if the model had decided to stop. Naming it
+/// [`crate::error::ProviderErrorKind::Malformed`] makes it retryable instead of
+/// invisible.
+///
+/// A response with text and no tool call is *not* this: that is a model that
+/// answered without calling anything, and it keeps its meaning exactly.
 pub(crate) fn ensure_parsed(response: CompletionResponse) -> Result<CompletionResponse> {
     if response.text.is_none() && response.tool_calls.is_empty() && response.usage.is_none() {
         return Err(Error::provider_malformed(
@@ -2667,7 +2788,11 @@ pub(crate) mod failures {
 
     /// A status response with `extra` header lines (each already `\r\n`-free).
     fn status_response(status: &str, extra: &[&str]) -> String {
-        let body = "{\"error\":\"nope\"}";
+        status_response_with_body(status, extra, "{\"error\":\"nope\"}")
+    }
+
+    /// [`status_response`], for a test whose subject is the body itself.
+    fn status_response_with_body(status: &str, extra: &[&str], body: &str) -> String {
         let mut head = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n", body.len());
         for line in extra {
             head.push_str(line);
@@ -2866,6 +2991,95 @@ pub(crate) mod failures {
         assert_eq!(kind, Kind::Request);
         assert_eq!(status, Some(400));
         assert!(!kind.is_retryable(), "the same request fails the same way");
+    }
+
+    /// The message a caller sees is what the vendor said, minus who it said it
+    /// about (0.86.0).
+    #[tokio::test]
+    async fn an_error_body_reaches_the_caller_without_the_identifiers_it_carried() {
+        let url = serve(status_response_with_body(
+            "400 Bad Request",
+            &[],
+            "{\"error\":{\"message\":\"bad model\",\"user_id\":\"user_abc\"}}",
+        ));
+        let Err(Error::Provider { message, .. }) = openrouter(&url).complete(request()).await
+        else {
+            panic!("expected a provider error");
+        };
+        assert!(
+            message.contains("bad model"),
+            "what the vendor said survives: {message}"
+        );
+        assert!(
+            !message.contains("user_abc"),
+            "who it said it about does not: {message}"
+        );
+    }
+
+    /// The redaction, over the shapes a real error body actually arrives in.
+    ///
+    /// A unit test beside the socket tests rather than instead of them: these
+    /// pin the scanner's edges, and the two above pin that anything calls it.
+    #[test]
+    fn the_redaction_takes_identifiers_and_leaves_everything_else() {
+        for (body, want) in [
+            // The four names the vendors send.
+            (
+                r#"{"user_id":"u1","organization_id":"o1","request_id":"r1","x-request-id":"x1"}"#,
+                r#"{"user_id":"[redacted]","organization_id":"[redacted]","request_id":"[redacted]","x-request-id":"[redacted]"}"#,
+            ),
+            // Case is the vendor's business, not the rule's.
+            (r#"{"User_ID":"u1"}"#, r#"{"User_ID":"[redacted]"}"#),
+            // A value that is not a string still goes.
+            (r#"{"account_id":12345}"#, r#"{"account_id":"[redacted]"}"#),
+            (r#"{"account_id":null}"#, r#"{"account_id":"[redacted]"}"#),
+            // Whitespace is the encoder's and is preserved.
+            (
+                "{\n  \"user_id\" : \"u1\"\n}",
+                "{\n  \"user_id\" : \"[redacted]\"\n}",
+            ),
+            // A bare `id` names the failing object as often as the caller.
+            (r#"{"id":"batch_7"}"#, r#"{"id":"batch_7"}"#),
+            // The same token as a VALUE is not a key and is left alone.
+            (
+                r#"{"message":"user_id must be set"}"#,
+                r#"{"message":"user_id must be set"}"#,
+            ),
+            // An escaped quote does not end the string it is inside.
+            (
+                r#"{"message":"he said \"user_id\"","user_id":"u1"}"#,
+                r#"{"message":"he said \"user_id\"","user_id":"[redacted]"}"#,
+            ),
+            // The case the bound creates: a document cut mid-value. The
+            // fragment goes with the value rather than being left behind.
+            (r##"{"user_id":"user_ab"##, r##"{"user_id":"[redacted]""##),
+            // And cut mid-key, where there is no `:` and so no value yet.
+            (r#"{"message":"x","user_i"#, r#"{"message":"x","user_i"#),
+            // Not JSON at all, and nothing in it to take.
+            ("upstream connect error", "upstream connect error"),
+            ("", ""),
+        ] {
+            assert_eq!(redact_identifiers(body), want, "over {body}");
+        }
+    }
+
+    /// Negative control for the test above. Without it, a build whose redaction
+    /// replaced the *whole* body would pass every assertion there.
+    #[tokio::test]
+    async fn an_error_body_with_no_identifier_in_it_is_passed_through_whole() {
+        let url = serve(status_response_with_body(
+            "400 Bad Request",
+            &[],
+            "{\"error\":{\"message\":\"bad model\",\"model\":\"gpt-nope\"}}",
+        ));
+        let Err(Error::Provider { message, .. }) = openrouter(&url).complete(request()).await
+        else {
+            panic!("expected a provider error");
+        };
+        assert_eq!(
+            message, "{\"error\":{\"message\":\"bad model\",\"model\":\"gpt-nope\"}}",
+            "a body with nothing to redact is byte-identical"
+        );
     }
 
     #[tokio::test]

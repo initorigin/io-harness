@@ -62,6 +62,18 @@ let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?
   with latency and outcome, and every network verdict with the layer that decided
   it. The MCP conversation is a new table rather than a changed one, so an
   existing store gains it in place and an older binary still reads it.
+- **A server's stderr goes into the run, not onto yours** (0.86.0) — a stdio
+  server is spawned with its stderr piped and drained on its own task, and what
+  it wrote is recorded as a `"mcp_stderr"` context event and logged at `debug`
+  under `io_harness::mcp`. Before this it was inherited, so every banner, warning
+  and stack trace a server printed went to your process's stderr, looking like
+  this crate's output and appearing in no trace at all. Bounded at 8 KiB per
+  server per drain, with the number of dropped bytes stated; the reader keeps
+  reading past the bound and discards the excess, because a reader that stopped
+  would let the pipe fill and block the server inside its own `write`. Drained
+  after connect, after every tool call and at shutdown — a server logs on its own
+  schedule, so every server is drained at each of those points rather than only
+  the one that was called.
 - **Switched off is not absent** — `enabled = false` on a server, or
   `McpServer { enabled: false, .. }`, means it is never started and contributes no
   tools, while every listing still shows it as configured-and-off. A server that

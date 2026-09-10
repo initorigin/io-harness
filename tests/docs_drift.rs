@@ -2023,6 +2023,24 @@ const README_MUST_NAME: &[(&str, &str)] = &[
     // said, which is a thing they read off a completion rather than a thing they
     // construct.
     ("0.84.0", "rate_limit"),
+    // 0.85.0. Two names, and neither of them is the property the release is
+    // about: "the prompt is append-only between folds" is a behaviour, and a
+    // reader arriving because their cache hit rate is low needs the two things
+    // they can act on — the routing key a replica-local cache is served from,
+    // and the event that names a break by cause when the property does not hold.
+    //
+    // This release is also why the register's link column is no longer allowed
+    // to read `[Unreleased]` after a changelog cut: `register_rows` only matches
+    // a row with a dated link, so 0.85.0 shipped exempt from this whole check
+    // without anybody deciding it should be.
+    ("0.85.0", "session_key"),
+    ("0.85.0", "PrefixBroke"),
+    // 0.86.0. One name. Five of the six changes are things that start being true
+    // without anyone calling anything — a child's silent result, a captured
+    // stderr, a redacted error body, a journalled shell target, a grammar in the
+    // prompt — and the sixth is the event an operator goes looking for when a
+    // gate fails and the loop will not say why.
+    ("0.86.0", "GateOutput"),
 ];
 
 /// Releases since the floor that introduced no public name of their own.
@@ -2086,6 +2104,74 @@ fn names_whole(text: &str, needle: &str) -> bool {
         let after = text[at + needle.len()..].chars().next();
         !before.is_some_and(is_word) && !after.is_some_and(is_word)
     })
+}
+
+/// Does the register still point a released version at `[Unreleased]`?
+///
+/// (0.86.0) [`register_rows`] only matches a row whose link column is a dated
+/// `[YYYY-MM-DD]`, so a row left pointing at `[Unreleased]` after its changelog
+/// section was cut is invisible to every check built on that scan — including
+/// the README-coverage one below. 0.85.0 shipped that way and was exempt from
+/// the whole check without anyone deciding it should be.
+///
+/// The scan cannot report it, by construction: a row it cannot see is a row it
+/// cannot complain about. So the cross-check is here instead, against the
+/// changelog, which is the file that knows whether a version has shipped.
+fn register_links_are_dated_once_the_changelog_is_cut(
+    index: &str,
+    changelog: &str,
+) -> Result<(), String> {
+    let row = Regex::new(r"^\|\s*\[?(\d+\.\d+\.\d+)\]?").unwrap();
+    let stale: Vec<String> = index
+        .lines()
+        .filter_map(|line| {
+            let version = row.captures(line.trim())?.get(1)?.as_str().to_string();
+            let cut = changelog.contains(&format!("## [{version}] - "));
+            let undated = line.contains("(../CHANGELOG.md#unreleased)");
+            (cut && undated).then_some(version)
+        })
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{stale:?} have a dated section in CHANGELOG.md and a register row still \
+         linking to [Unreleased]. A row without a dated link is invisible to \
+         `register_rows`, so every check built on that scan silently skips these \
+         releases. Point the link at the version's own section."
+    ))
+}
+
+#[test]
+fn a_released_version_does_not_still_link_to_unreleased() {
+    if let Err(why) = register_links_are_dated_once_the_changelog_is_cut(
+        &read("docs/CAPABILITIES.md"),
+        &read("CHANGELOG.md"),
+    ) {
+        panic!("docs/CAPABILITIES.md: {why}");
+    }
+}
+
+/// Negative control: the check finds a stale row when there is one.
+#[test]
+fn control_a_released_row_still_pointing_at_unreleased_is_reported() {
+    let index = "| 0.85.0 | something | [Unreleased](../CHANGELOG.md#unreleased) |";
+    let changelog = "## [0.85.0] - 2026-09-10\n";
+    assert!(
+        register_links_are_dated_once_the_changelog_is_cut(index, changelog).is_err(),
+        "a shipped version still linking to Unreleased is reported"
+    );
+}
+
+/// Negative control: a version that genuinely has not shipped is left alone.
+#[test]
+fn control_an_unshipped_row_pointing_at_unreleased_is_fine() {
+    let index = "| 0.99.0 | something | [Unreleased](../CHANGELOG.md#unreleased) |";
+    let changelog = "## [Unreleased]\n";
+    assert!(
+        register_links_are_dated_once_the_changelog_is_cut(index, changelog).is_ok(),
+        "a version with no cut section may point at Unreleased"
+    );
 }
 
 /// Is every release the register records since the floor findable in the README?

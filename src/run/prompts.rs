@@ -2170,7 +2170,20 @@ pub(crate) fn workspace_tools() -> Vec<ToolSpec> {
                           outside quotes — quote a character to pass it literally, and use \
                           `find` or `list_dir` to choose paths rather than globbing. A line that \
                           runs too long is killed and reported as a timeout."
-                .to_string(),
+                .to_string()
+                // 0.86.0 — and then the complete set, in the parser's own words.
+                //
+                // The sentence above gives the syntax, which is what a model
+                // needs to rewrite a line; this gives every name a refusal can
+                // arrive under, which is what stops the model learning the set
+                // one refusal at a time at a round trip each. It is generated
+                // from the table the parser refuses from, so the two cannot say
+                // different things — the prose above can drift and be caught by
+                // nothing, which is why the authoritative half is not prose.
+                + &format!(
+                    " The complete set this tool refuses, each named in the refusal itself: {}.",
+                    crate::tools::shell::REFUSED_CONSTRUCTS.join(", ")
+                ),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -2407,6 +2420,76 @@ pub(crate) fn workspace_tools() -> Vec<ToolSpec> {
 /// built by hand here: an integration test can only measure the host it runs on,
 /// and the case that matters is the one where the measurement and the backend's
 /// declaration disagree — which a healthy host never produces.
+/// The model is told the shell tool's grammar once, before its first refusal
+/// (0.86.0).
+///
+/// `docs/CONTRACT.md` has said since 0.24.0 that "a model that discovers the
+/// refusal set one construct at a time spends steps doing it", and until this
+/// release the prompt did not carry the set — so that is exactly what a model
+/// did, at one round trip per construct.
+///
+/// In-crate rather than under `tests/`, because the assertion is against
+/// [`crate::tools::shell::REFUSED_CONSTRUCTS`] itself. A test carrying its own
+/// copy of the names would be a third place for the grammar to live and drift,
+/// which is the thing being fixed, and making the table public to reach it from
+/// an integration test would add permanent API surface to run one assertion.
+#[cfg(test)]
+mod shell_grammar {
+    use super::*;
+    use crate::tools::shell::REFUSED_CONSTRUCTS;
+
+    /// Everything the composed offer puts in front of a model: the tool
+    /// descriptions as well as the prompt.
+    ///
+    /// Both, because a vendor wire sends tool descriptions in a field of their
+    /// own rather than inside `system`, and asserting on the prompt alone would
+    /// fail on a claim that is in fact satisfied.
+    fn what_the_model_is_offered() -> String {
+        workspace_tools()
+            .iter()
+            .map(|t| format!("{}: {}", t.name, t.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_construct_the_shell_tool_refuses_is_named_before_the_first_step() {
+        let offered = what_the_model_is_offered();
+        assert!(
+            REFUSED_CONSTRUCTS.len() > 20,
+            "the refusal table has {} entries, which cannot be right — this assertion \
+             would be vacuous",
+            REFUSED_CONSTRUCTS.len()
+        );
+        let missing: Vec<&&str> = REFUSED_CONSTRUCTS
+            .iter()
+            .filter(|name| !offered.contains(**name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the offer does not name these refusals, so a model meets each of them for \
+             the first time as a refused step: {missing:?}"
+        );
+    }
+
+    /// Negative control. A description that named every plausible construct
+    /// would satisfy the test above while telling the model nothing true.
+    #[test]
+    fn a_name_the_parser_cannot_refuse_is_not_offered() {
+        let offered = what_the_model_is_offered();
+        for invented in [
+            "coprocess substitution",
+            "a signal trap",
+            "an alias expansion",
+        ] {
+            assert!(
+                !offered.contains(invented),
+                "the offer names `{invented}`, which nothing in the parser refuses"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod boundary_sentence {
     use super::*;
