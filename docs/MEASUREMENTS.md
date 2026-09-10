@@ -9,6 +9,62 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What an append-only prefix is served from cache (0.85.0)
+
+**What is being measured.** The cached share of every step's prompt on a live
+session against Fireworks, once the assembly is append-only between folds and
+every request of the session carries the same routing key. Reported by
+`EventKind::StepUsage::cached_fraction`, which is `cache_read_tokens` over
+`prompt_tokens` in permille.
+
+**The shape to expect, stated before it was measured.** A vendor can serve
+everything it has already seen and nothing it has not, so the ceiling on any one
+request is `(prompt − newest message) / prompt`. The share therefore has no fixed
+value: it rises as a session's history grows past the size of one step's
+observation, and it dips whenever a step observes something large. What is worth
+measuring is not the percentage but the *gap* — how far below that ceiling the
+crate actually lands.
+
+**The machine.** macOS 15 on Apple silicon, against
+`accounts/fireworks/models/kimi-k2p6` on Fireworks serverless, 2026-09-10. A
+ten-step session reading one ~450-token file per step:
+
+| Step | cached / prompt | share |
+| --- | --- | --- |
+| 1 | 0 / 4,022 | 0.0% |
+| 2 | 3,995 / 4,165 | 95.9% |
+| 3 | 4,145 / 4,605 | 90.0% |
+| 5 | 5,025 / 5,485 | 91.6% |
+| 8 | 6,345 / 6,805 | 93.2% |
+| 10 | 7,225 / 7,685 | 94.0% |
+
+A twenty-step run of the same shape reached 99.9% on its first step — the prefix
+was still warm from the run before it — and dipped to 69.6% on a step whose
+observation was 2,620 tokens rather than 450.
+
+**The gap, which is the actual result.** On every step after the first,
+`cache_read_tokens` was the *previous step's whole prompt* minus about 20 tokens.
+The crate is at the ceiling: what is not served is the newest message, which no
+cache can serve, plus roughly 20 tokens where the prompt's closing instruction
+moves down as observations are appended below it. Raising the share above 94% is
+a matter of a session's history being long relative to one step's observation,
+not of anything left on the table here.
+
+**What this is not.** It is one model on one vendor's serverless fleet on one
+day. `accounts/fireworks/models/deepseek-v4-flash-0731`, measured the same way in
+the same session, served **805 of 6,314 tokens — 12.8% — on a byte-identical
+prompt repeated immediately**, and repeated that within one token on four
+attempts. The crate sent the same bytes and the same key to both. A cached share
+is a fact about a deployment, and a run that reports a low one is not necessarily
+a run doing anything wrong.
+
+**Which surface reported it.** All three the contract names, on this vendor:
+`usage.prompt_tokens_details.cached_tokens` in the body of a *streaming*
+response, the final chunk's `perf_metrics` when `perf_metrics_in_response` was
+sent, and `fireworks-cached-prompt-tokens` on a **non-streaming** response only —
+a streaming response carries `fireworks-prompt-tokens` but no cached header,
+which is what `perf_metrics_in_response` exists to answer.
+
 ## What a run's cache hit rate actually is (0.83.0)
 
 **What is being measured.** `Spend::cache_hit_rate` over a whole live run —
