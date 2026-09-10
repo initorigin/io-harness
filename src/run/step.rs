@@ -151,6 +151,18 @@ pub(super) fn commit_step(
                 cache_read_tokens: usage.cache_read_tokens,
                 cache_write_tokens: usage.cache_write_tokens,
                 completion_tokens: usage.completion_tokens,
+                // 0.85.0 — the rate itself, so a renderer prints it rather than
+                // deriving it. Permille, and zero for a prompt of zero tokens,
+                // which is the same answer a division would refuse to give.
+                //
+                // Clamped at 1,000 for the same reason the `saturating_sub` two
+                // fields up exists: a cache read larger than the prompt it was read
+                // into is a vendor bug, and one that is reported here as 1,400‰
+                // would put a rate above 100% in front of an operator.
+                cached_fraction: match usage.prompt_tokens {
+                    0 => 0,
+                    prompt => (usage.cache_read_tokens.saturating_mul(1_000) / prompt).min(1_000),
+                },
             },
         ));
     }
@@ -983,6 +995,26 @@ pub(super) async fn run_workspace_from<P: Provider>(
     let mut offered: Vec<String> = contract.tool_tiers.clone().unwrap_or_default();
     let full_catalogue = tools;
     let mut tools = tiered(full_catalogue.clone(), contract.tool_tiers.as_deref());
+    // 0.85.0 — the session's routing key, derived once per run from the head of
+    // the prompt: the system text and the tool list, which is what every chat
+    // template renders first and therefore what a replica's cache is keyed on.
+    //
+    // `base_system` and not the planning variant, because the planning directive
+    // is withdrawn when a plan is approved and a key that moved with it would send
+    // the rest of the session to a replica holding nothing — the plan gate opens
+    // and closes within one turn, and the head it leaves behind is the same head it
+    // started from.
+    //
+    // The tool list is read per step and not once, because `expand_tools` grows it
+    // mid-run: an expansion is exactly the head change the key's first half exists
+    // to follow, and a key that stayed put through one would route every later
+    // request at a replica holding a prefix that no longer matches.
+    let routing_key = |tools: &[ToolSpec]| {
+        extras
+            .turn
+            .as_ref()
+            .map(|turn| session_key(turn.session_id, &base_system, tools))
+    };
     // Durable budget: restored from the store so a resume continues the same
     // token and wall-clock budget rather than restarting it at zero.
     let mut tokens_used: u64 = store.spent_tokens(run_id)?;
@@ -1049,6 +1081,10 @@ pub(super) async fn run_workspace_from<P: Provider>(
     // whose summary assembly stubbed, and on a resume — a resumed run has sent this
     // prefix zero times from where it now stands, so it earns the marker again.
     let mut marked_prefix = PrefixGuard::default();
+    // 0.85.0 — the assembly inputs this run holds still between folds, run-scoped
+    // for the same reason `marked_prefix` is: what they must be is decided by what
+    // the run has done, not by what this step recomputed.
+    let mut frozen = Frozen::default();
     // 0.70.0 — has the criterion ever judged this run and said no? Held here for
     // the same reason `marked_prefix` above is: it is a fact about the run rather
     // than about a step, and the loop's tail is where it is needed and where the
@@ -1291,7 +1327,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
             )
         });
         let (response, assembled, user) = loop {
-            fold_tokens += compact_ledger(
+            let fold = compact_ledger(
                 provider,
                 contract,
                 store,
@@ -1303,13 +1339,32 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 &mut written,
                 budget_tokens,
                 fold_forced(recovered, 0, &mut fold_asked),
+                frozen.last_request(),
             )
             .await?;
+            fold_tokens += fold.tokens;
+            // 0.85.0 — the notes and the budget are held at what they were when
+            // this run last folded, because both change under the assembler on a
+            // step that observed nothing: the notes are re-read from the store
+            // every turn, and `effective_tokens` shrinks as a `max_tokens` run
+            // spends. Either one moves the head of the prompt, and a moved head is
+            // the whole prefix.
+            //
+            // The same condition `folding` is built from below, and for the same
+            // reason: a run whose caller turned compaction off never folds, so a
+            // `hold` keyed on `fold.folded` alone would pin `since` to the run's
+            // first step for the whole run — and every ladder rung judges age
+            // against `since`, so snip, skill bodies, microcompact and reduce would
+            // never fire again. There is no frozen prefix to protect on such a run;
+            // it re-decides how it renders every step by construction.
+            let re_deciding = fold.folded || !contract.compaction.enabled();
+            frozen.hold(re_deciding, step, budget_tokens, &notes, &global_notes);
+            let (frozen_notes, frozen_global) = frozen.notes();
             let mut assembled = assemble(
-                &ledger,
-                budget_tokens,
-                &notes,
-                &global_notes,
+                &mut ledger,
+                frozen.budget(budget_tokens),
+                frozen_notes,
+                frozen_global,
                 Assembly {
                     ws: Some(&ws),
                     policy: &effective,
@@ -1318,6 +1373,8 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     step,
                     collapse: contract.collapse,
                     ladder: contract.ladder,
+                    since: frozen.since(),
+                    folding: re_deciding,
                 },
             )
             .await?;
@@ -1335,6 +1392,30 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 }
                 _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
             };
+            // 0.85.0 — chosen here rather than inside the request literal, because
+            // the check below has to see the block this step actually sends. A turn
+            // whose opening carries the conversational prompt and whose second step
+            // carries the work prompt breaks its prefix at byte zero of the system
+            // block, and that is the one system-prompt change `docs/CONTRACT.md`
+            // promises is announced.
+            let sent_system = match &conversational {
+                Some(c) if step == start_step => c.clone(),
+                _ => system.clone(),
+            };
+            // 0.85.0 — before the request is built, and over the same two strings
+            // the transcript is built from. A break here is a defect in this
+            // crate's own assembly rather than a condition of the run.
+            check_prefix(
+                &mut frozen,
+                &assembled.text,
+                &sent_system,
+                re_deciding,
+                assembled.refit,
+                watch,
+                run_id,
+                step,
+                0,
+            );
             // 0.44.0 — the second cache breakpoint, at the end of what compaction
             // froze, and only once that prefix has already gone out once.
             let cache_boundary =
@@ -1342,14 +1423,24 @@ pub(super) async fn run_workspace_from<P: Provider>(
             let messages = transcript(&user, &assembled, &turns);
             #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
+                // 0.37.0 — permitting an answer is a decision about a turn's first
+                // completion, not a licence to stop at a plan in prose on step nine.
+                //
                 // 0.37.0 — the conversational prompt is this turn's opening only. Every
                 // later step is the loop of 0.36.1, asked the way it has always been
                 // asked: permitting an answer is a decision about a turn's first
                 // completion, not a licence to stop at a plan in prose on step nine.
-                system: match &conversational {
-                    Some(c) if step == start_step => c.clone(),
-                    _ => system.clone(),
-                },
+                //
+                // 0.85.0 looked at unifying the two, since a turn whose opening and
+                // whose second step carry different system prompts writes a cache
+                // entry it then throws away. It is not a wrapper around a sentence:
+                // the work prompt says the turn has a stated specification that is
+                // checked after every step, and the plan gate's directive says to
+                // propose a plan before doing anything. A turn told either of those
+                // *and* "if a plain answer is the whole of what is wanted, answer"
+                // has been told two things, which is the contradiction 0.45.0 and
+                // 0.48.0 each removed. One system block per turn is what that costs.
+                system: sent_system,
                 user: user.clone(),
                 // 0.49.0 — the same emission as a conversation. Empty until this run
                 // has driven a step of its own, which is what keeps a first step and a
@@ -1364,6 +1455,10 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 // 0.49.0 — the same breakpoint the line above names, counted in
                 // messages because that is what this request sends.
                 cache_through: cache_through_for(cache_boundary, &messages),
+                // 0.85.0 — the same key on every request of the session whose head
+                // has not changed, which is what a replica-local cache needs to be
+                // able to serve it.
+                session_key: routing_key(&tools),
                 // 0.77.0 — the shape the caller demanded, carried to the vendors
                 // whose wire has a place for it. A hint that reduces attempts, and
                 // never the thing trusted: `validate_final_output` below is the
@@ -1387,6 +1482,9 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 watch,
                 0,
             );
+            // 0.85.0 — after routing, because what a fold reuses has to be what
+            // this step actually sent rather than what it was about to send.
+            frozen.sent(&request);
 
             // 0.75.0 — the step's provider phase, bracketed here rather than read
             // off the per-attempt bracket `complete_with_retry` already keeps for
@@ -1914,6 +2012,20 @@ pub(super) async fn run_workspace_from<P: Provider>(
         // only step whose row can hold it.
         let commit_from = std::time::Instant::now();
         store.close_step_attribution(run_id, step, span_from.elapsed());
+        // 0.85.0 — before the step is committed, from the completion that answered
+        // it. `frozen.since() == step` is what "the prefix was rebuilt on this
+        // step" means, and it is the fold's own definition rather than a second
+        // one: a rebuild is expected and is reported as expected.
+        let rebuilt = frozen.since() == step;
+        check_cache(
+            &mut frozen,
+            response.usage.as_ref(),
+            rebuilt,
+            watch,
+            run_id,
+            step,
+            0,
+        );
         commit_step(
             store,
             watch,

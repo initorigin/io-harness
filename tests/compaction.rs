@@ -169,7 +169,7 @@ mod the_fold {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(system, _)| !system.contains(SUMMARISER))
+                .filter(|(system, user)| !system.contains(SUMMARISER) && !user.contains(SUMMARISER))
                 .map(|(_, user)| user.clone())
                 .collect()
         }
@@ -179,7 +179,7 @@ mod the_fold {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(system, _)| system.contains(SUMMARISER))
+                .filter(|(system, user)| system.contains(SUMMARISER) || user.contains(SUMMARISER))
                 .map(|(_, user)| user.clone())
                 .collect()
         }
@@ -187,7 +187,10 @@ mod the_fold {
 
     impl Provider for Recorder {
         async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
-            let summarising = req.system.contains(SUMMARISER);
+            // (0.85.0) In `system` when the fold builds a request of its own, and
+            // in `user` when it extends the step's — which it does whenever the run
+            // has already sent one.
+            let summarising = req.system.contains(SUMMARISER) || req.user.contains(SUMMARISER);
             self.seen
                 .lock()
                 .unwrap()
@@ -653,7 +656,7 @@ mod requested {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(system, _)| !system.contains(SUMMARISER))
+                .filter(|(system, user)| !system.contains(SUMMARISER) && !user.contains(SUMMARISER))
                 .map(|(_, user)| user.clone())
                 .collect()
         }
@@ -665,7 +668,10 @@ mod requested {
 
     impl Provider for Talker {
         async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
-            let summarising = req.system.contains(SUMMARISER);
+            // (0.85.0) In `system` when the fold builds a request of its own, and
+            // in `user` when it extends the step's — which it does whenever the run
+            // has already sent one.
+            let summarising = req.system.contains(SUMMARISER) || req.user.contains(SUMMARISER);
             self.seen
                 .lock()
                 .unwrap()
@@ -1098,7 +1104,7 @@ mod requested {
                     total_tokens: 12,
                     ..Default::default()
                 });
-                if req.system.contains(SUMMARISER) {
+                if req.system.contains(SUMMARISER) || req.user.contains(SUMMARISER) {
                     return Ok(CompletionResponse {
                         text: Some(SUMMARY_SENTENCE.into()),
                         usage,

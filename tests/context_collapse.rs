@@ -45,13 +45,22 @@ impl Folding {
     }
 }
 
+/// How the fold's own call is told apart from a step's, without the test
+/// re-implementing the prompt.
+const SUMMARISER: &str = "compacting an agent's own working notes";
+
 impl Provider for Folding {
     async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
-        // The fold's own completion is the one made with no tools at all — that
-        // is what buying a summary costs, and it is the cost the collapse avoids.
-        // Answering it with text is what makes the fold actually happen: an empty
-        // summary is refused rather than allowed to replace the entries.
-        if req.tools.is_empty() {
+        // The fold's own completion is the one carrying the summarising
+        // instruction — that is what buying a summary costs, and it is the cost the
+        // collapse avoids. Answering it with text is what makes the fold actually
+        // happen: an empty summary is refused rather than allowed to replace the
+        // entries.
+        //
+        // (0.85.0) Recognised by the instruction rather than by an empty tool list:
+        // the fold now extends the step's own request so a vendor serves the whole
+        // of the prefix from cache, and it carries the step's tools with it.
+        if req.user.contains(SUMMARISER) {
             self.seen.lock().unwrap().push(req);
             return Ok(CompletionResponse {
                 text: Some("A paragraph standing in for the earlier observations.".into()),
@@ -123,20 +132,30 @@ fn fixture() -> Fixture {
     }
 }
 
+/// 0.85.0 — assembly may append a refreshed read at the tail, so it takes the
+/// ledger by mutable reference. These cases assemble the *same* ledger under two
+/// collapse settings and compare the results, so each call gets its own copy:
+/// sharing one would let the first call's appends into the second's input and
+/// make the comparison a comparison of two different ledgers.
 async fn assembled(
     f: &Fixture,
     l: &Ledger,
     budget: u64,
     collapse: Collapse,
 ) -> io_harness::context::Assembled {
+    let mut l = l.clone();
     assemble(
-        l,
+        &mut l,
         budget,
         &[],
         &[],
         Assembly {
             collapse,
             ladder: io_harness::context::Ladder::default(),
+            // 0.85.0 — a collapse happens where the fit rule would have stubbed,
+            // and the fit rule runs on a folding step.
+            since: 9,
+            folding: true,
             ws: Some(&f.ws),
             policy: &f.policy,
             store: &f.store,
@@ -331,14 +350,14 @@ async fn a_fold_is_not_reversible_which_is_why_the_ladder_takes_the_collapse_fir
     // anti-vacuity guard: without it nothing folded and every assertion below
     // would hold because nothing happened.
     assert!(
-        seen.iter().any(|r| r.tools.is_empty()),
+        seen.iter().any(|r| r.user.contains(SUMMARISER)),
         "no summary was bought, so no fold happened and this test demonstrates nothing"
     );
     // The turn after the fold — the last request that is a real step rather than
     // the summary purchase — no longer carries what the fold replaced.
     let after = seen
         .iter()
-        .rfind(|r| !r.tools.is_empty())
+        .rfind(|r| !r.user.contains(SUMMARISER))
         .expect("there must be a step after the fold");
     assert!(
         !after.user.contains(FIRST_OBSERVATION),

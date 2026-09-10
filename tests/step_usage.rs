@@ -65,6 +65,9 @@ impl Recorder {
                     cache_read_tokens,
                     cache_write_tokens,
                     completion_tokens,
+                    // 0.85.0 — asserted by `tests/cache_accounting.rs`, which is
+                    // where the rate itself is the subject.
+                    cached_fraction: _,
                 } => Some((
                     *fresh_prompt_tokens,
                     *cache_read_tokens,

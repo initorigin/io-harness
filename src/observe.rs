@@ -470,6 +470,8 @@ pub enum EventKind {
     ///         cache_read_tokens: 5_900,
     ///         cache_write_tokens: None,
     ///         completion_tokens: 62,
+    ///         // 5,900 of a 7,300-token prompt, in permille.
+    ///         cached_fraction: 808,
     ///     },
     /// ));
     /// assert_eq!(flow, Flow::Continue);
@@ -487,6 +489,113 @@ pub enum EventKind {
         cache_write_tokens: Option<u64>,
         /// Tokens the model produced.
         completion_tokens: u64,
+        /// (0.85.0) The share of the prompt the vendor served from its cache, in
+        /// **permille** — 950 is 95.0%.
+        ///
+        /// Permille and not a float, because this is an event a renderer prints
+        /// and a store round-trips: an integer compares, sums and serializes the
+        /// same everywhere, and a rate is wanted to a tenth of a percent and no
+        /// finer. `0` when the prompt was zero tokens or nothing was cached, which
+        /// are the same number and mean the same thing to a reader — that this
+        /// request paid for its whole prompt.
+        ///
+        /// Derived rather than reported: `cache_read_tokens * 1000 /
+        /// prompt_tokens`, so it agrees with the two fields above it by
+        /// construction and a renderer needs no arithmetic of its own.
+        ///
+        /// `#[serde(default)]`, and it is load-bearing: these events are written
+        /// to the trace as JSON and read back, so a row a 0.84.0 process wrote
+        /// carries no such key and a required field would make every one of them
+        /// undeserializable — an attached reader against a store an older binary
+        /// had written would fail on the first step it read. Zero is also what
+        /// that row meant: nothing recorded a cached share.
+        #[serde(default)]
+        cached_fraction: u64,
+    },
+    /// A step's prompt was not an extension of the step before it (0.85.0).
+    ///
+    /// Every vendor's prompt cache serves a request only up to the first byte that
+    /// differs from one it has already seen, so anything this crate rewrites
+    /// *before* the newest message throws the cache away from that byte on for the
+    /// rest of the run. 0.85.0 makes the assembly append-only between folds; this
+    /// is what says so out loud when it is not.
+    ///
+    /// **A fold is not a break.** A fold replaces the run's history with a written
+    /// summary on purpose, so the step after one is expected to differ and emits
+    /// nothing. Every other difference is reported.
+    ///
+    /// It is an observation about this crate's own behaviour rather than about the
+    /// run's work, and a consumer should read one as a defect to file: the assembly
+    /// is meant to have no way of producing it.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Ignore, Observer, PrefixBreak, RunEvent};
+    ///
+    /// let flow = Ignore.event(&RunEvent::new(
+    ///     7,
+    ///     4,
+    ///     EventKind::PrefixBroke {
+    ///         step: 4,
+    ///         at_byte: 1_204,
+    ///         reason: PrefixBreak::Reread,
+    ///     },
+    /// ));
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    PrefixBroke {
+        /// The step whose prompt diverged from the one before it.
+        ///
+        /// Renamed on the wire, and only on the wire. [`RunEvent`] flattens its
+        /// own `step` into the same JSON object, so a variant field spelled `step`
+        /// serializes two keys of that name and fails to deserialize with
+        /// *duplicate field `step`* — which `every_variant_round_trips` catches
+        /// and nothing else would. The two are always equal; this one is here so a
+        /// consumer matching on the variant has the step without reaching for the
+        /// envelope.
+        #[serde(rename = "at_step")]
+        step: u32,
+        /// The byte of the assembled observation section at which the two first
+        /// differ — everything before it was served from the cache, and everything
+        /// from it on was charged as fresh.
+        at_byte: u64,
+        /// Which of the assembly's mutation sites the divergence looks like.
+        reason: PrefixBreak,
+    },
+    /// A request reprocessed a prompt the one before it had cached (0.85.0).
+    ///
+    /// The rule is Claude Code's: a miss is a request whose cached share fell by
+    /// more than 5% of the previous prompt **and** by at least 2,000 tokens. Two
+    /// thresholds because either alone reports noise — a 6% drop on a 300-token
+    /// prompt is eighteen tokens, and a 2,000-token drop on a 400,000-token prompt
+    /// is half a percent.
+    ///
+    /// **A fold is an expected rebuild, not a defect**, and says so in `expected`
+    /// rather than being suppressed: a run that folded ten times paid for ten
+    /// rebuilds, and an operator reading its cost needs to see them.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent, Ignore};
+    ///
+    /// let flow = Ignore.event(&RunEvent::new(
+    ///     7,
+    ///     6,
+    ///     EventKind::CacheMiss {
+    ///         step: 6,
+    ///         reprocessed_tokens: 12_400,
+    ///         expected: true,
+    ///     },
+    /// ));
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    CacheMiss {
+        /// The step whose request reprocessed the prompt.
+        #[serde(rename = "at_step")]
+        step: u32,
+        /// How many tokens of the previous request's cached prompt were paid for
+        /// again.
+        reprocessed_tokens: u64,
+        /// Whether the run had just folded, which is the one rebuild it asks for.
+        expected: bool,
     },
     /// What the provider said about its rate limit on this completion (0.84.0).
     ///
@@ -1553,6 +1662,52 @@ pub enum EventKind {
     },
 }
 
+/// Which of the assembly's mutation sites an [`EventKind::PrefixBroke`] looks
+/// like (0.85.0).
+///
+/// A closed set, so a consumer can count breaks by cause rather than by message —
+/// a run that breaks its prefix twice for the same reason is one defect, and twice
+/// for different reasons is two.
+///
+/// It is an attribution rather than a proof. The check compares two prompts and
+/// has only the bytes either side of the divergence to go on, so the answer is the
+/// site whose fingerprint is at that byte, and [`PrefixBreak::Other`] is what it
+/// says when there is none. It never guesses at a site it cannot see the marks of.
+///
+/// ```
+/// use io_harness::PrefixBreak;
+///
+/// // A renderer counts by cause, so the set is closed and comparable.
+/// let seen = [PrefixBreak::Reread, PrefixBreak::Reread, PrefixBreak::Memory];
+/// let rereads = seen.iter().filter(|r| **r == PrefixBreak::Reread).count();
+/// assert_eq!(rereads, 2);
+///
+/// // And it serializes as the name a trace reader sees.
+/// let json = serde_json::to_string(&PrefixBreak::Ladder)?;
+/// assert_eq!(json, "\"ladder\"");
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixBreak {
+    /// The memory block moved — it renders ahead of everything and is the most
+    /// expensive thing in the prompt to disturb.
+    Memory,
+    /// A stale read was refreshed in place rather than appended at the tail.
+    Reread,
+    /// An entry the run had already been shown was replaced by an elision line.
+    Stub,
+    /// A ladder rung rewrote an entry — snipped, microcompacted, or folded a skill
+    /// body out.
+    Ladder,
+    /// The framing around an entry changed: the provenance frame, or the prompt's
+    /// own scaffolding.
+    Frame,
+    /// Something else. A break with no site's fingerprint at the divergence.
+    Other,
+}
+
 /// Every wire tag [`EventKind`] can serialize to, in declaration order (0.28.0).
 ///
 /// The names an operator writes in a `[[hook]]`'s `on` list, and therefore the list
@@ -1578,6 +1733,9 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "recovery_paused",
     "step",
     "step_attributed",
+    // 0.85.0
+    "prefix_broke",
+    "cache_miss",
     // 0.81.0
     "step_usage",
     // 0.84.0
@@ -2445,6 +2603,7 @@ mod tests {
                 cache_read_tokens: 5_900,
                 cache_write_tokens: None,
                 completion_tokens: 62,
+                cached_fraction: 808,
             },
             EventKind::RateLimit {
                 requests_remaining: Some(99),
@@ -2459,6 +2618,16 @@ mod tests {
                 digest: "9f2c".into(),
                 source: "browser".into(),
             },
+            EventKind::PrefixBroke {
+                step: 4,
+                at_byte: 1_204,
+                reason: PrefixBreak::Reread,
+            },
+            EventKind::CacheMiss {
+                step: 6,
+                reprocessed_tokens: 12_400,
+                expected: true,
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
@@ -2469,6 +2638,8 @@ mod tests {
                 | EventKind::RecoveryPaused { .. }
                 | EventKind::Step { .. }
                 | EventKind::StepAttributed { .. }
+                | EventKind::PrefixBroke { .. }
+                | EventKind::CacheMiss { .. }
                 | EventKind::StepUsage { .. }
                 | EventKind::RateLimit { .. }
                 | EventKind::ImageAttached { .. }

@@ -227,6 +227,11 @@ pub struct Compatible {
     /// One catalogue fetch per instance, for the reason
     /// [`Reference`] holds one: `Provider::models` takes `&self`.
     cached: std::sync::Arc<std::sync::OnceLock<Vec<ModelInfo>>>,
+    /// (0.85.0) Whether to ask for per-request performance metrics in the final
+    /// chunk. On for the `fireworks` preset and for any endpoint that opts in
+    /// through [`Compatible::with_perf_metrics`]; off everywhere else, which keeps
+    /// every other vendor's body byte-identical to 0.84.0's.
+    perf_metrics: bool,
 }
 
 impl Compatible {
@@ -265,6 +270,7 @@ impl Compatible {
             auth,
             reference: None,
             cached: std::sync::Arc::new(std::sync::OnceLock::new()),
+            perf_metrics: false,
         }
     }
 
@@ -291,8 +297,46 @@ impl Compatible {
     /// unreachable by `f2_every_named_constructor_agrees_with_its_table_row`,
     /// which drives every one of them.
     fn known(name: &'static str, api_key: impl Into<String>, model: impl Into<String>) -> Self {
-        Self::preset(name, api_key, model)
-            .expect("every named constructor names a row in PRESETS; F2 asserts it")
+        let built = Self::preset(name, api_key, model)
+            .expect("every named constructor names a row in PRESETS; F2 asserts it");
+        // (0.85.0) Fireworks reports cached prompt tokens in headers, and a
+        // streaming response carries no per-request headers at all — so this crate,
+        // which always streams, would read zero from the one vendor the caching
+        // work is aimed at. Asking for the metrics in the final chunk is the only
+        // way to see them, and it is asked for by name rather than for everyone:
+        // every other body stays byte-identical to 0.84.0's.
+        match name {
+            "fireworks" => built.with_perf_metrics(),
+            _ => built,
+        }
+    }
+
+    /// Ask the endpoint to report per-request performance metrics in the final
+    /// streamed chunk (0.85.0).
+    ///
+    /// On already for [`Compatible::fireworks`]. Set it for a gateway or a
+    /// self-hosted deployment that speaks the same dialect — an endpoint that does
+    /// not understand the field ignores it, but the field is still a byte of body
+    /// that a vendor's prefix cache has to match, so it is opt-in rather than
+    /// universal.
+    ///
+    /// What it buys is [`Usage::cache_read_tokens`](super::Usage::cache_read_tokens)
+    /// on a streaming request. Without
+    /// it a run that streams reads the body's `prompt_tokens_details` or nothing.
+    ///
+    /// ```
+    /// use io_harness::provider::{Auth, Compatible};
+    ///
+    /// let host = Compatible::fireworks("key", "accounts/fireworks/models/kimi-k2");
+    /// // Already on for the preset; this is for everything else that speaks it.
+    /// let gateway = Compatible::new("https://gateway.example/v1", Auth::Bearer, "key", "m")
+    ///     .with_perf_metrics();
+    /// # let _ = (host, gateway);
+    /// ```
+    #[must_use]
+    pub fn with_perf_metrics(mut self) -> Self {
+        self.perf_metrics = true;
+        self
     }
 
     /// Replace the label recorded in the trace. A preset sets its own vendor
@@ -452,8 +496,17 @@ impl Compatible {
             Auth::Bearer => req.bearer_auth(&self.api_key),
             Auth::None => req,
         };
+        // 0.85.0 — the header half of the session key, beside the body field.
+        if let Some((name, value)) = openai_wire::affinity_header(&request) {
+            req = req.header(name, value);
+        }
         let resp = req
-            .json(&openai_wire::body(&self.model, &request, WebFlavor::OpenAi))
+            .json(&openai_wire::body_with(
+                &self.model,
+                &request,
+                WebFlavor::OpenAi,
+                self.perf_metrics,
+            ))
             .send()
             .await?;
 

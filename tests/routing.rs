@@ -402,7 +402,9 @@ mod mechanical {
 
     impl Provider for Recorder {
         async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
-            let summarising = req.system.contains(SUMMARISER);
+            // (0.85.0) The fold extends the step's request, so the instruction is
+            // its newest user message rather than its system prompt.
+            let summarising = req.system.contains(SUMMARISER) || req.user.contains(SUMMARISER);
             self.seen
                 .lock()
                 .unwrap()

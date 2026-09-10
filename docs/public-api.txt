@@ -107,6 +107,7 @@ enum Message src/provider/mod.rs
 enum OnFailure src/hooks.rs
 enum Origin src/context.rs
 enum PlanVerdict src/approve.rs
+enum PrefixBreak src/observe.rs
 enum PriceSource src/provider/mod.rs
 enum Progressing src/resilience.rs
 enum Preset src/contract.rs

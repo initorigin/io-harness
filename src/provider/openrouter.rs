@@ -244,12 +244,17 @@ impl OpenRouter {
         // `ready` resolves and grades the endpoint on the first call and pins the
         // client to what it graded, so the addresses the run authorised and the
         // addresses this request reaches cannot be two different answers.
-        let resp = self
+        let mut post = self
             .client
             .ready()
             .await?
             .post(&self.endpoint)
-            .bearer_auth(&self.api_key)
+            .bearer_auth(&self.api_key);
+        // 0.85.0 — the header half of the session key, beside the body field.
+        if let Some((name, value)) = openai_wire::affinity_header(&request) {
+            post = post.header(name, value);
+        }
+        let resp = post
             .json(&openai_wire::body(
                 &self.model,
                 &request,

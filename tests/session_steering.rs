@@ -279,7 +279,7 @@ impl Folding {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(system, _)| !system.contains(SUMMARISER))
+            .filter(|(system, user)| !system.contains(SUMMARISER) && !user.contains(SUMMARISER))
             .map(|(_, user)| user.clone())
             .collect()
     }
@@ -291,7 +291,9 @@ impl Folding {
 
 impl Provider for Folding {
     async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
-        let summarising = req.system.contains(SUMMARISER);
+        // (0.85.0) The fold extends the step's request, so the instruction is its
+        // newest user message rather than its system prompt.
+        let summarising = req.system.contains(SUMMARISER) || req.user.contains(SUMMARISER);
         self.seen
             .lock()
             .unwrap()

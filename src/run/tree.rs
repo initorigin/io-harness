@@ -507,6 +507,18 @@ where
         let full_catalogue = tools;
         let mut tools =
             crate::run::prompts::tiered(full_catalogue.clone(), contract.tool_tiers.as_deref());
+        // 0.85.0 — per TREE, not per agent, and that is the whole point: a child
+        // shares its parent's system text and tool list, so concentrating the
+        // fan-out on the replica already holding that head is what the key buys. The
+        // root reaches this first and its answer stands for every agent under it.
+        let session_key = tree
+            .session
+            .get_or_init(|| {
+                tree.turn
+                    .and_then(|extras| extras.turn.as_ref())
+                    .map(|turn| session_key(turn.session_id, &base_system, &tools))
+            })
+            .clone();
         // The budget this agent runs under is the smaller of what its contract
         // asked for and what the tree has left — a contract cannot raise it.
         let token_cap = tree.ledger.effective_token_budget(contract.max_tokens);
@@ -516,6 +528,10 @@ where
         // prompt from its own ledger, so one agent's frozen prefix says nothing about
         // another's, and a shared one would mark a prefix this agent has never sent.
         let mut marked_prefix = PrefixGuard::default();
+        // 0.85.0 — the assembly inputs this agent holds still between folds. Each
+        // agent in the tree has its own, because each has its own ledger and its
+        // own folds.
+        let mut frozen = Frozen::default();
         // 0.49.0 — per agent in the tree, for the reason the flat loop keeps one per
         // run: a child's turns are its own and must never reach its parent's request.
         //
@@ -671,7 +687,7 @@ where
             let mut fold_tokens = 0;
             let mut recovered = false;
             let (response, assembled, user) = loop {
-                fold_tokens += compact_ledger(
+                let fold = compact_ledger(
                     tree.provider,
                     contract,
                     tree.store,
@@ -683,13 +699,26 @@ where
                     &mut written,
                     budget_tokens,
                     fold_forced(recovered, depth, &mut fold_asked),
+                    frozen.last_request(),
                 )
                 .await?;
+                fold_tokens += fold.tokens;
+                // 0.85.0 — held between folds, exactly as the flat loop holds
+                // them. One rule, two loops, and a rule spelled out twice is the
+                // drift `tests/session_fanout.rs` exists to catch.
+                //
+                // Keyed on the same condition `folding` is built from, and not on
+                // `fold.folded` alone: a tree whose caller turned compaction off
+                // never folds, and `since` pinned to the first step leaves every
+                // ladder rung dead for the whole run.
+                let re_deciding = fold.folded || !contract.compaction.enabled();
+                frozen.hold(re_deciding, step, budget_tokens, &notes, &global_notes);
+                let (frozen_notes, frozen_global) = frozen.notes();
                 let mut assembled = assemble(
-                    &ledger,
-                    budget_tokens,
-                    &notes,
-                    &global_notes,
+                    &mut ledger,
+                    frozen.budget(budget_tokens),
+                    frozen_notes,
+                    frozen_global,
                     Assembly {
                         ws: Some(&ws),
                         // 0.74.0 — the policy this agent is running under, which is
@@ -705,6 +734,8 @@ where
                         // and `fold_now` already draw at a spawn.
                         collapse: contract.collapse,
                         ladder: contract.ladder,
+                        since: frozen.since(),
+                        folding: re_deciding,
                     },
                 )
                 .await?;
@@ -725,6 +756,19 @@ where
                     ),
                     _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
                 };
+                // 0.85.0 — the same check the flat loop makes, through the same
+                // helper, in the same position.
+                check_prefix(
+                    &mut frozen,
+                    &assembled.text,
+                    &system,
+                    re_deciding,
+                    assembled.refit,
+                    tree.watch,
+                    run_id,
+                    step,
+                    depth,
+                );
                 // 0.44.0 — the same rule as the flat loop, through the same helper.
                 // A boundary computed in one loop and not the other would make a
                 // contained run and a flat one cache differently while nothing failed.
@@ -743,6 +787,9 @@ where
                     // 0.39.0 — a contained turn's opening is its first completion
                     // only. Every later step is the tree loop of 0.38.0, asked the way
                     // it has always been asked.
+                    // The tree's own opening, as the flat loop's — and unified with
+                    // the work prompt for the reason the flat loop states, which is
+                    // that it cannot be.
                     system: match &conversational {
                         Some(c) if step == start_step => c.clone(),
                         _ => system.clone(),
@@ -770,10 +817,15 @@ where
                     cache_boundary,
                     // 0.49.0 — as the flat loop, through the same helper.
                     cache_through: cache_through_for(cache_boundary, &messages),
+                    // 0.85.0 — the parent's key, inherited rather than derived.
+                    session_key: session_key.clone(),
                     #[cfg(feature = "media")]
                     media: attach_media(contract, pending_media)?,
                     ..Default::default()
                 };
+                // 0.85.0 — what a fold on the next step extends. The tree loop
+                // does not route per step, so this is the request as built.
+                frozen.sent(&request);
                 match driving(
                     inflight,
                     &mut collected,
@@ -1437,6 +1489,17 @@ where
             // re-adopts that child; committing it would leave the child stranded and
             // the parent believing the spawn was done.
             let committed = !((paused.is_some() || asked.is_some()) && paused_by_child);
+            // 0.85.0 — the same check the flat loop makes, through the same helper.
+            let rebuilt = frozen.since() == step;
+            check_cache(
+                &mut frozen,
+                response.usage.as_ref(),
+                rebuilt,
+                tree.watch,
+                run_id,
+                step,
+                depth,
+            );
             commit_step(
                 tree.store,
                 tree.watch,
