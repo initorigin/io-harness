@@ -720,6 +720,76 @@ async fn f9_the_folds_own_request_extends_the_step_before_it() {
     );
 }
 
+/// F3 (the positive half) — a run that cannot hold its ceiling any other way
+/// elides anyway, and says so.
+///
+/// The case above asserts the event is *not* emitted, which a dead emitter would
+/// satisfy — and a sabotage arm that disabled the whole check killed nothing,
+/// which is how that was found. This is the arm that needs the machinery to work:
+/// a ceiling too tight for `keep_recent` to fold into leaves the fit rule as the
+/// only thing holding the prompt down, so entries the model has already been shown
+/// are elided, the prefix really does move, and the run reports it by cause.
+///
+/// It is the floor under the property rather than a hole in it. What must not
+/// happen is this going unreported, because an operator whose run is quietly
+/// paying full price on every step has no other way to find out.
+#[tokio::test]
+async fn f3_a_ceiling_too_tight_to_fold_into_reports_every_break_it_causes() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..8 {
+        std::fs::write(
+            dir.path().join(format!("f{i}.txt")),
+            format!("file {i}\n{}", "filler line\n".repeat(120)),
+        )
+        .unwrap();
+    }
+    let script = Script::new(
+        (0..8)
+            .map(|i| vec![call("read_file", json!({ "path": format!("f{i}.txt") }))])
+            .collect(),
+    );
+    // `keep_recent` of 32 is more entries than this run will ever have, so
+    // `compact_ledger` can never fold and the ceiling has nothing but the fit rule.
+    let contract = never_passes(dir.path(), 8)
+        .with_context_budget(ContextBudget {
+            max_tokens: 1_400,
+            share: 0.5,
+        })
+        .with_compaction(io_harness::Compaction {
+            at_share: 0.8,
+            keep_recent: 32,
+        });
+    let store = Store::memory().unwrap();
+    let watched = Watched::default();
+    run_with_observed(
+        &contract,
+        &script,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+        &watched,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        watched.indices().is_empty(),
+        "the fixture must not fold, or the ceiling is not what is eliding"
+    );
+    let announced = watched.breaks();
+    assert!(
+        !announced.is_empty(),
+        "the run elided under its ceiling and reported nothing"
+    );
+    assert!(
+        announced
+            .iter()
+            .all(|(_, reason)| matches!(reason, PrefixBreak::Stub | PrefixBreak::Other)),
+        "a break the ceiling caused is attributed to the elision that caused it: \
+         {announced:?}"
+    );
+}
+
 // ------------------------------------------- F8: the budget is held between folds
 
 /// F8 — a `max_tokens` run's assembly budget does not shrink under it.

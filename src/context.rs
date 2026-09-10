@@ -2000,10 +2000,12 @@ pub async fn assemble(
         origin: entries[i].origin,
         text: text.to_string(),
     };
-    // (0.85.0) And the same rule holds for merging the elision lines themselves:
-    // their total grows with the run, so a step that merges them is a step that
-    // rewrites what the step before it showed.
-    if !fitting || stub_tokens <= stub_ceiling {
+    // (0.85.0) Merging the elision lines needs no guard of its own, and the
+    // sabotage arm that removed one is what showed it: every elision is decided as
+    // of `since`, so the set of stubs — and therefore this total — is the same on
+    // every step between two folds. A decision that cannot change between folds
+    // cannot rewrite what an earlier step was shown, whatever it decides.
+    if stub_tokens <= stub_ceiling {
         for (i, (_, t)) in pieces.iter().enumerate() {
             out.text.push_str(t);
             out.emitted.push(piece(i, t));
