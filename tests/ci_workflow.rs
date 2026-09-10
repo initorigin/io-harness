@@ -257,6 +257,85 @@ fn the_matrix_builds_exactly_the_examples_the_tests_spawn() {
     }
 }
 
+/// The fixture examples a workflow builds on the **default** feature polarity.
+///
+/// A name whose own line also carries `--all-features` is excluded: those are
+/// the two fixtures behind `browser` and `mcp-server`, which cargo refuses to
+/// build on the default polarity and which each workflow handles its own way.
+/// What is left is the hand-written list that both workflows' default jobs need
+/// to agree on.
+fn default_polarity_examples(yaml: &str) -> BTreeSet<String> {
+    let flag = Regex::new(r"--example\s+([A-Za-z0-9_]+)").unwrap();
+    yaml.lines()
+        .filter(|line| !line.contains("--all-features"))
+        .flat_map(|line| {
+            flag.captures_iter(line)
+                .map(|c| c[1].to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// `ci.yml` and `release.yml` name the same default-polarity fixtures.
+///
+/// **0.86.0 paid for this not existing.** `release.yml` keeps its own copy of the
+/// list, for the same reason `ci.yml` does — `--lib --tests` does not build
+/// `examples/` — and the test above reads only `ci.yml`. A new fixture added to
+/// `ci.yml` alone passed that test, passed all 25 checks on the feature PR and
+/// all 47 on the release PR, and then failed the release workflow *after the tag
+/// had been pushed*, which is the most expensive place in the process to find it.
+///
+/// A guard covers the file it reads and no other. Where a list is duplicated, the
+/// guard has to name every copy — which is what this test is.
+///
+/// Set equality rather than a subset in either direction: a name in `release.yml`
+/// that `ci.yml` does not have is the same drift facing the other way, and would
+/// mean the release workflow builds a fixture nothing in CI proved is needed.
+#[test]
+fn both_workflows_name_the_same_default_polarity_fixtures() {
+    let ci = default_polarity_examples(&read(".github/workflows/ci.yml"));
+    let release = default_polarity_examples(&read(".github/workflows/release.yml"));
+
+    assert!(
+        ci.len() > 5,
+        "ci.yml names only {} default-polarity fixtures, which cannot be right — this \
+         comparison has stopped checking anything",
+        ci.len()
+    );
+    if let Err(diff) = sets_match(&ci, &release) {
+        panic!(
+            "ci.yml and release.yml name different fixture examples on the default \
+             polarity:\n\n{diff}\n ci.yml  ({}): {ci:?}\n release ({}): {release:?}\n\n\
+             Both lists exist because `--lib --tests` does not build `examples/`. A name \
+             in one and not the other fails the workflow that lacks it, on a runner, with \
+             a missing file rather than a reason.",
+            ci.len(),
+            release.len()
+        );
+    }
+}
+
+/// Negative control: the comparison notices a name present in only one file.
+#[test]
+fn control_a_fixture_in_only_one_workflow_is_reported() {
+    let ci = default_polarity_examples("run: cargo build --example a --example b\n");
+    let release = default_polarity_examples("run: cargo build --example a\n");
+    assert!(
+        sets_match(&ci, &release).is_err(),
+        "a fixture named in one workflow and not the other is reported"
+    );
+}
+
+/// Negative control: an all-features line is not part of the default list.
+#[test]
+fn control_an_all_features_fixture_is_not_a_default_polarity_build() {
+    let names = default_polarity_examples(
+        "run: cargo build --all-features --example browser_fixture\nrun: cargo build --example tick\n",
+    );
+    assert!(!names.contains("browser_fixture"), "{names:?}");
+    assert!(names.contains("tick"), "{names:?}");
+}
+
 // ---------------------------------------------------------------------------
 // Negative controls
 // ---------------------------------------------------------------------------
