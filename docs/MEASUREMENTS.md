@@ -25,22 +25,19 @@ observation, and it dips whenever a step observes something large. What is worth
 measuring is not the percentage but the *gap* — how far below that ceiling the
 crate actually lands.
 
-**The machine.** macOS 15 on Apple silicon, against
-`accounts/fireworks/models/kimi-k2p6` on Fireworks serverless, 2026-09-10. A
-ten-step session reading one ~450-token file per step:
+**The machine.** macOS 15 on Apple silicon, against Fireworks serverless,
+2026-09-10, on the seven models the account could reach that day. A ten-step
+session against `accounts/fireworks/models/glm-5p3`, reading one ~440-token file
+per step:
 
 | Step | cached / prompt | share |
 | --- | --- | --- |
-| 1 | 0 / 4,022 | 0.0% |
-| 2 | 3,995 / 4,165 | 95.9% |
-| 3 | 4,145 / 4,605 | 90.0% |
-| 5 | 5,025 / 5,485 | 91.6% |
-| 8 | 6,345 / 6,805 | 93.2% |
-| 10 | 7,225 / 7,685 | 94.0% |
-
-A twenty-step run of the same shape reached 99.9% on its first step — the prefix
-was still warm from the run before it — and dipped to 69.6% on a step whose
-observation was 2,620 tokens rather than 450.
+| 1 | 0 / 5,032 | 0.0% |
+| 2 | 5,008 / 5,257 | 95.2% |
+| 3 | 5,242 / 5,677 | 92.3% |
+| 5 | 6,102 / 6,557 | 93.0% |
+| 6 | 6,542 / 6,997 | 93.4% |
+| 8 | 7,495 / 7,960 | 94.1% |
 
 **The gap, which is the actual result.** On every step after the first,
 `cache_read_tokens` was the *previous step's whole prompt* minus about 20 tokens.
@@ -50,13 +47,35 @@ moves down as observations are appended below it. Raising the share above 94% is
 a matter of a session's history being long relative to one step's observation,
 not of anything left on the table here.
 
-**What this is not.** It is one model on one vendor's serverless fleet on one
-day. `accounts/fireworks/models/deepseek-v4-flash-0731`, measured the same way in
-the same session, served **805 of 6,314 tokens — 12.8% — on a byte-identical
-prompt repeated immediately**, and repeated that within one token on four
-attempts. The crate sent the same bytes and the same key to both. A cached share
-is a fact about a deployment, and a run that reports a low one is not necessarily
-a run doing anything wrong.
+**A cached share is a fact about a deployment.** The same bytes and the same key,
+sent five times in a row to each model — the first warms, the next four are
+reported:
+
+| Model | rounds 2–5 | rounds that hit |
+| --- | --- | --- |
+| `glm-5p3` | 99, 99, 99, 99 | 4 / 4 |
+| `minimax-m3` | 99, 99, 99, 99 | 4 / 4 |
+| `glm-5p3-flash` | 97, 97, 97, 97 | 4 / 4 |
+| `deepseek-v4-flash-0731` | 12, 12, 12, 12 | 0 / 4 |
+| `deepseek-v4-pro-0813` | 0, 0, 0, 0 | 0 / 4 |
+| `kimi-k3` | 0, 0, 0, 0 | 0 / 4 |
+| `qwen3p8-max` | 0, 0, 0, 0 | 0 / 4 |
+
+Four of the seven served little or nothing of a **byte-identical prompt repeated
+immediately**. `deepseek-v4-flash-0731` served 804 of 6,313 tokens — one block —
+four times within a token. The crate sent the same request to all seven, and the
+event stream reports what each one said. **A run that reports a low share is not
+necessarily a run doing anything wrong**, and a first reading can mislead in the
+other direction too: a single warm-then-measure pass put `glm-5p3` at 0% and then
+at 99% twenty minutes later, which is one draw from a fleet rather than a
+property of the model.
+
+**Consistency across a session is its own question.** `minimax-m3` matches
+`glm-5p3` on the repeated-prefix probe and does not hold it over a live session:
+the same ten-step run read 99.9%, 97.8%, 92.1%, then **84.1%**, and a second
+attempt dropped to **79.1%** at step 10 and reported one step at 0%. Nothing in
+the crate changed between them. Where a session must hold a floor, the floor is a
+property to measure per deployment rather than to assume from a probe.
 
 **Which surface reported it.** All three the contract names, on this vendor:
 `usage.prompt_tokens_details.cached_tokens` in the body of a *streaming*

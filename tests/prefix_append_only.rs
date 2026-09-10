@@ -32,6 +32,40 @@ fn ws(dir: &std::path::Path) -> (Workspace, Policy) {
     (Workspace::with_policy(dir, policy.clone()), policy)
 }
 
+/// One assembly at `step`, over a ledger the call may extend, with the prefix
+/// treated as having been built at `since`.
+async fn at_since(
+    ledger: &mut Ledger,
+    store: &Store,
+    workspace: &Workspace,
+    policy: &Policy,
+    step: u32,
+    since: u32,
+) -> String {
+    assemble(
+        ledger,
+        24_000,
+        &[],
+        &[],
+        Assembly {
+            ws: Some(workspace),
+            policy,
+            store,
+            run_id: 1,
+            step,
+            collapse: Collapse::default(),
+            ladder: Ladder::default(),
+            since,
+            // A fold is the step that rebuilt the prefix, and it is the only step
+            // allowed to elide what it has already shown.
+            folding: since == step,
+        },
+    )
+    .await
+    .unwrap()
+    .text
+}
+
 /// One assembly at `step`, over a ledger the call may extend.
 async fn at_step(
     ledger: &mut Ledger,
@@ -486,6 +520,70 @@ async fn f3_a_ten_step_run_with_one_fold_breaks_its_prefix_nowhere_else() {
         announced.is_empty(),
         "the run announced a break its own prompts do not have: {announced:?}"
     );
+}
+
+/// F1 (the fold half) — once a fold spends the invalidation, the stub it leaves
+/// behind is the same stub on every step after it.
+///
+/// The elision waits for a fold, and the stub it writes then is the one the model
+/// reads for the rest of the run. A stub that named the *assembling* step would
+/// be a rewrite of the head on every step, which is the defect this release
+/// exists to remove — in the shape it took before 0.85.0, and in the shape it
+/// would take again if the elision were written from the wrong step number.
+///
+/// Between folds there is no stub at all, so nothing here is covered by the case
+/// above: that one asserts what an ordinary step does, and this one asserts what
+/// survives the step that is allowed to change things.
+#[tokio::test]
+async fn f1_the_stub_a_fold_leaves_behind_does_not_move_afterwards() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "NEW-CONTENT\n").unwrap();
+    let (workspace, policy) = ws(dir.path());
+    let store = Store::memory().unwrap();
+
+    let mut ledger = Ledger::new();
+    ledger.push(Observation::new(
+        2,
+        ObsKind::Read,
+        Some("a.rs".into()),
+        "\n[read a.rs]\nOLD-CONTENT\n",
+        Origin::File,
+    ));
+    ledger.push(Observation::new(
+        4,
+        ObsKind::Write,
+        Some("a.rs".into()),
+        "\n[wrote a.rs] (12 chars)\n",
+        Origin::File,
+    ));
+
+    // Step 5 appends the refresh; nothing is elided yet.
+    let five = at_since(&mut ledger, &store, &workspace, &policy, 5, 1).await;
+    assert!(
+        five.contains("OLD-CONTENT"),
+        "between folds the stale entry keeps its bytes:\n{five}"
+    );
+
+    // Step 7 folds, which is where the invalidation is spent.
+    let seven = at_since(&mut ledger, &store, &workspace, &policy, 7, 7).await;
+    let stub = seven
+        .lines()
+        .find(|line| line.contains("[read a.rs] (elided:"))
+        .unwrap_or_else(|| panic!("the fold must spend the invalidation:\n{seven}"))
+        .to_string();
+    assert!(
+        stub.contains("invalidated by the write at step 4"),
+        "the stub says why the entry went stale: {stub}"
+    );
+
+    // And every step after it repeats that stub byte for byte.
+    for step in 8..=10 {
+        let text = at_since(&mut ledger, &store, &workspace, &policy, step, 7).await;
+        assert!(
+            text.contains(&stub),
+            "step {step} rewrote the stub the fold at step 7 wrote.\nwanted: {stub}\ngot:\n{text}"
+        );
+    }
 }
 
 // --------------------------------------------------- F10: masking stays in the tail

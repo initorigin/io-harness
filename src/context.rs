@@ -1276,8 +1276,8 @@ pub struct Assembled {
     /// (0.81.0) Contiguous runs of one step's results that
     /// [`Ladder::microcompact`] replaced with a counted line.
     pub microcompacted: usize,
-    /// (0.85.0) Whether the fit rule ran this turn — the floor underneath the
-    /// append-only property.
+    /// (0.85.0) Whether the ceiling elided something this turn — the floor
+    /// underneath the append-only property.
     ///
     /// The fit rule is a fold's job, and between folds an entry renders as it first
     /// rendered. A run whose `keep_recent` holds a ledger too short to fold, or
@@ -1287,6 +1287,13 @@ pub struct Assembled {
     /// [`EventKind::PrefixBroke`](crate::EventKind::PrefixBroke) — but it is a
     /// ceiling doing what a ceiling is for rather than a defect, which is what this
     /// field tells the loop.
+    ///
+    /// **It says the ceiling bit, not that the rule ran.** The walk runs on every
+    /// folding step and elides nothing when the entries fit, so a flag set from
+    /// "the rule ran" would mark a break expected on almost every step — and the
+    /// debug assertion this field exempts would never fire again. That is the
+    /// shape a gate goes vacuous in, and the sabotage arm that set `fitting`
+    /// unconditionally is what found it.
     pub refit: bool,
     /// (0.49.0) The same emission, piece by piece, so the run loop can build a
     /// role-tagged transcript from it.
@@ -1853,12 +1860,6 @@ pub async fn assemble(
         .map(|i| estimate_tokens(&entries[i].text))
         .sum();
     let fitting = folding || total > budget_tokens;
-    // Whether the fit rule ran at all, and not whether it ran *outside* a fold: a
-    // caller who turned folding off gets `folding` on every step and folds on none,
-    // so subtracting it here would tell the loop the ceiling did nothing on exactly
-    // the runs where the ceiling is the only thing there is. The loop knows which
-    // steps actually folded and skips those before it asks.
-    out.refit = fitting;
     let mut used = 0u64;
     let mut whole = vec![false; n];
     // 0.76.0 — Context Collapse. Where an entry would have been stubbed, its
@@ -1878,6 +1879,12 @@ pub async fn assemble(
         // before it showed, whatever the budget does. Holding the ceiling is the
         // fold's job, and `compact_ledger` is asked before assembly on every step.
         if fitting && used + t > budget_tokens {
+            // The ceiling actually bit. Recorded here and nowhere else, because
+            // "the fit rule ran" is not the same claim: the walk runs on every
+            // folding step and elides nothing at all when the entries fit, and a
+            // flag set from that would tell the loop a break was expected on every
+            // step of every run — which is an assertion that never fires.
+            out.refit = true;
             // The rung beneath a fold: an entry that will not fit whole may still
             // fit shortened, and a shortened entry keeps its kind and its target
             // where a stub keeps neither. Carrying it does not end the walk —
