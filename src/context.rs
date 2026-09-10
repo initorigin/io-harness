@@ -1471,11 +1471,14 @@ fn append_refreshes(
     cap: usize,
     out: &mut Assembled,
 ) -> Result<()> {
-    // A run with no workspace can never re-read anything, so nothing is appended
-    // and the stale entry says so once instead of saying it again every step.
-    if at.ws.is_none() {
-        return Ok(());
-    }
+    // A run with no workspace is not skipped here. It can never re-read anything,
+    // and `refresh` says exactly that — so it takes the refusal branch below and
+    // the model is told once, in an appended entry, that the copy above it is
+    // stale. Returning early instead would leave a workspace-less run showing a
+    // read the run has since written over with no warning at all, which is the one
+    // thing the invalidation rule has existed to prevent since 0.42.0. Appended
+    // once and never again: the notice is itself a `reread:` entry, so the
+    // freshness test above finds it and the next step appends nothing.
     let entries = ledger.entries();
     let mut stale: Vec<(String, u32)> = Vec::new();
     for e in entries {
@@ -1648,6 +1651,22 @@ pub async fn assemble(
     // that makes this one not the current answer".
     let superseded: Vec<Option<u32>> = (0..n)
         .map(|i| {
+            // (0.85.0) A refreshed read supersedes an earlier refresh of the same
+            // path. Without this a read-then-edit loop — the commonest thing an
+            // agent does — appends one whole copy of the file per write and keeps
+            // every one of them: the appended entry is a `Message`, so it is not
+            // `target_is_the_subject`, not a `Read` to be invalidated, and not a
+            // lookup for `snip` to drop. Nothing in the crate would ever elide it.
+            if let Some(target) = entries[i]
+                .target
+                .as_deref()
+                .and_then(|t| t.strip_prefix(REREAD))
+            {
+                return entries[i + 1..]
+                    .iter()
+                    .find(|l| is_reread_of(l, target))
+                    .map(|l| l.step);
+            }
             if !entries[i].kind.target_is_the_subject() {
                 return None;
             }

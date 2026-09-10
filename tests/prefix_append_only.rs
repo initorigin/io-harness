@@ -958,3 +958,91 @@ async fn f4_the_ladder_rungs_do_not_rewrite_an_entry_before_the_fold() {
     );
     assert_append_only(&requests, &folded);
 }
+
+/// F4 — a run that never folds still runs its rungs.
+///
+/// The other half of the case above, and the one 0.85.0 nearly shipped broken.
+/// Every rung judges an entry's age against the step the frozen prefix was built
+/// at, and that anchor advances at a fold. A run with `Compaction { at_share: 1.0 }`
+/// has no folds, so an anchor that only moved at one would sit at the run's first
+/// step forever: nothing is ever older than it, `snip`, the skill bodies, the
+/// microcompact and `reduce` never fire again, and 0.42.0's ladder — the only thing
+/// holding such a run's prompt down — quietly does nothing for the whole run.
+///
+/// There is no prefix to protect here, which is why the anchor may move: a run that
+/// cannot fold re-decides how it renders every step by construction, so this case
+/// asserts the rung fires and deliberately does not assert append-only.
+#[tokio::test]
+async fn f4_a_run_that_never_folds_still_runs_its_rungs() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..10 {
+        std::fs::write(
+            dir.path().join(format!("f{i}.txt")),
+            format!("file {i}\n{}", "filler line\n".repeat(60)),
+        )
+        .unwrap();
+    }
+    let script = Script::new(
+        (0..10)
+            .map(|i| {
+                vec![
+                    call("grep", json!({ "pattern": format!("fn{i}"), "path": "." })),
+                    call("read_file", json!({ "path": format!("f{i}.txt") })),
+                ]
+            })
+            .collect(),
+    );
+    let contract = never_passes(dir.path(), 10)
+        .with_context_budget(ContextBudget {
+            max_tokens: 2_000,
+            share: 0.5,
+        })
+        // 0.42.0's behaviour: never fold, whatever the ledger costs.
+        .with_compaction(io_harness::Compaction {
+            at_share: 1.0,
+            keep_recent: 6,
+        })
+        .with_ladder(Ladder {
+            reduce: true,
+            snip: Some(io_harness::context::Snip {
+                older_than_steps: 2,
+            }),
+            microcompact: true,
+            ..Default::default()
+        });
+    let store = Store::memory().unwrap();
+    let folds = Watched::default();
+    run_with_observed(
+        &contract,
+        &script,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+        &folds,
+    )
+    .await
+    .unwrap();
+
+    let sections: Vec<String> = script.steps().iter().map(|r| split(&r.user).1).collect();
+    assert!(
+        sections.len() >= 5,
+        "the fixture must take enough steps for an entry to age past the rung's \
+         grace, got {}",
+        sections.len()
+    );
+    assert!(
+        folds.indices().is_empty(),
+        "this contract must never fold, or the case says nothing about a run \
+         without folds: {:?}",
+        folds.indices()
+    );
+    assert!(
+        sections
+            .iter()
+            .any(|s| s.contains("dropped as a lookup") || s.contains("older than the current")),
+        "no rung fired in {} steps of a run that never folds — the ladder is dead \
+         for the whole of it. Last section:\n{}",
+        sections.len(),
+        sections.last().cloned().unwrap_or_default()
+    );
+}

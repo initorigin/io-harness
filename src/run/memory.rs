@@ -466,11 +466,21 @@ impl Frozen {
         if section.starts_with(&before_section) {
             return None;
         }
-        let at = section
+        let mut at = section
             .bytes()
             .zip(before_section.bytes())
             .position(|(a, b)| a != b)
             .unwrap_or(section.len().min(before_section.len()));
+        // Walked back to a character boundary in **both** strings before anything
+        // slices at it. Two prompts diverge inside a multi-byte sequence whenever
+        // one em dash becomes an ellipsis — `E2 80 94` against `E2 80 A6` — and
+        // this crate's own elision text is full of both, so the byte where they
+        // differ is two bytes into a three-byte character. Every `&s[..at]` below
+        // would panic on it, which would make a report of a defect worse than the
+        // defect: the run aborts instead of announcing a cache miss.
+        while at > 0 && !(section.is_char_boundary(at) && before_section.is_char_boundary(at)) {
+            at -= 1;
+        }
         Some(Break {
             at_byte: at as u64,
             reason: attribute(&before_section, section, at),
@@ -580,6 +590,12 @@ pub(super) fn check_cache(
     step: u32,
     depth: u32,
 ) {
+    // A step whose provider reported no usage leaves the baseline where it is
+    // rather than clearing it. The step still sent a prompt — a provider that
+    // reports nothing has not sent nothing — so the last size this run actually
+    // knows is still the best thing the next step can be measured against.
+    // Clearing it would mean one silent provider suppressed the check for the step
+    // after it as well, which is the step most likely to be the one that missed.
     let Some(usage) = usage else {
         return;
     };
@@ -715,6 +731,12 @@ pub(super) fn cache_boundary_for(
 /// pays only for the byte comparison that produces the event — which it has to make
 /// anyway to know whether there is one — and a debug build refuses to continue,
 /// because a break is a defect in this crate rather than a condition of the run.
+///
+/// `folded` is the step's own licence to rebuild: a fold, or a run whose caller
+/// turned compaction off and which therefore re-decides how it renders on every
+/// step. Neither is extending a frozen prefix — the first has just thrown one away
+/// and the second never had one — so the baseline is reset rather than compared
+/// against, and neither is reported as a break.
 ///
 /// `refit` is the exception, and it is not a way out: a run whose ceiling is too
 /// tight to fold into elides anyway, which really does move the prefix, so the
@@ -935,8 +957,15 @@ pub(super) async fn compact_ledger<P: Provider>(
             // render before the system text, so a fold with an empty catalogue
             // shares no prefix with the step at all. `SUMMARY_TURN` is what stops
             // a model reaching for one.
-            let request = match parent {
-                Some(sent) => {
+            // `forced` means a provider has just refused the step's request as too
+            // large. Extending *that* request with one more message is strictly
+            // bigger than the thing that was refused, so the fold would overflow
+            // too — and a fold cannot be answered by folding (`may_compact` is
+            // false below), so the error would propagate and kill the run that
+            // 0.42.0's recovery exists to save. The recovery builds the small
+            // notes-only request instead, which is what it has always done.
+            let request = match parent.filter(|_| !forced) {
+                Some(sent) if !sent.messages.is_empty() => {
                     let mut messages = sent.messages.clone();
                     messages.push(Message::User(SUMMARY_TURN.to_string()));
                     CompletionRequest {
@@ -955,10 +984,14 @@ pub(super) async fn compact_ledger<P: Provider>(
                         ..Default::default()
                     }
                 }
-                // No parent request yet — a fold forced at the first step of a run,
-                // or a caller driving `compact_ledger` before anything was sent.
-                // The 0.84.0 request, unchanged.
-                None => CompletionRequest {
+                // No parent request to extend: a fold at the first step of a run, a
+                // recovery from an over-window request, or a step whose transcript
+                // was empty — which is a real state (`transcript` returns nothing
+                // for a step whose turn this process never saw) and the one case
+                // where extending would send the summariser the instruction with
+                // **nothing above it** to summarise, and write whatever came back
+                // over `count` real observations. The 0.84.0 request, unchanged.
+                _ => CompletionRequest {
                     system: SUMMARY_SYSTEM.to_string(),
                     user: format!("The goal was: {}\n\nThe notes:\n{folded}", contract.goal),
                     // No tools. A summariser describes the run's work; it does not do
@@ -1023,6 +1056,21 @@ pub(super) async fn compact_ledger<P: Provider>(
             }
             // Written before the ledger is edited, so a process that dies between
             // the call and the next request has already kept what it paid for.
+            // `count` and not what `fold_first` will return: the two are the same
+            // number whenever a fold happens at all — `count` is bounded by the
+            // ledger's own length two screens up, and `fold_first` folds `count` or
+            // refuses — and this row is keyed by the ledger position it was taken
+            // at, which is what makes a resumed run's fold free.
+            //
+            // (0.85.0) The paragraph now describes more than it replaces: the fold
+            // extends the step's own request, so the model summarises the whole
+            // prompt including the `keep_recent` entries that stay in the ledger
+            // verbatim. That is redundancy and not a gap — nothing folded goes
+            // undescribed, and the entries described twice are still present in
+            // full — and it is the price of the fold being served from the prefix
+            // the run has already paid to keep warm. The `forced` path above builds
+            // the narrow request, so an over-window recovery still summarises
+            // exactly what it replaces.
             store.put_summary(
                 run_id,
                 step,
@@ -1423,6 +1471,26 @@ mod attribution {
             "y".repeat(900)
         );
         assert_eq!(attributed(before, &after), PrefixBreak::Other);
+    }
+
+    /// Two prompts that diverge inside a multi-byte character do not panic the
+    /// thing that reports it.
+    ///
+    /// An em dash against an ellipsis differ at the **third** byte of a three-byte
+    /// sequence, and this crate's elision text carries both. Every slice taken at
+    /// the divergence would split that character.
+    #[test]
+    fn a_divergence_inside_a_character_is_walked_back_to_a_boundary() {
+        let mut frozen = Frozen::default();
+        frozen.extended_by("\n[read x] — body\n", "sys", false);
+        let broke = frozen
+            .extended_by("\n[read x] … body\n", "sys", false)
+            .expect("the two differ");
+        assert!(
+            broke.at_byte as usize <= "\n[read x] ".len(),
+            "the offset must land on a boundary, got {}",
+            broke.at_byte
+        );
     }
 
     /// A fold is not a break, and the guard is what says so.

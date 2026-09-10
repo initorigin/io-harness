@@ -632,8 +632,13 @@ pub(crate) async fn parse_stream_with(
     // 0.85.0 — the third surface, and the last one asked. Each fills only what the
     // one before it left at zero, so a response carrying two of them is counted
     // once and the body's own accounting wins.
-    if counted.0.is_some() || counted.1.is_some() {
-        let usage = response.usage.get_or_insert_with(Usage::default);
+    //
+    // Only into a `Usage` the response already reported, and never into one
+    // synthesised here: these headers count the prompt and nothing else, so a
+    // record built from them alone would carry a zero completion and a zero total
+    // for a call that generated tokens — a partial accounting rendered as a
+    // complete one, which is what `cache_write_tokens` is left absent to avoid.
+    if let Some(usage) = response.usage.as_mut() {
         if usage.cache_read_tokens == 0 {
             if let Some(cached) = counted.0 {
                 usage.cache_read_tokens = cached;
@@ -764,7 +769,13 @@ impl Accumulator {
             // The breakdowns live one level down, in objects that are absent
             // entirely on a provider — or a model — that reports neither.
             let detail = |path| u.pointer(path).and_then(|v| v.as_u64()).unwrap_or(0);
-            self.usage = Some(Usage {
+            // (0.85.0) Whatever a `perf_metrics` chunk has already filled in is
+            // carried across the assignment below. The two chunks have no
+            // guaranteed order — a vendor is free to send its metrics first — and
+            // replacing the whole struct would discard the only cached count a
+            // streaming response carries.
+            let prior = self.usage.take();
+            let mut counted = Usage {
                 prompt_tokens: get("prompt_tokens"),
                 completion_tokens: get("completion_tokens"),
                 total_tokens: get("total_tokens"),
@@ -782,7 +793,16 @@ impl Accumulator {
                 // the counter is read where a provider does report it and stays
                 // zero where none does.
                 server_tool_requests: detail("/server_tool_use/web_search_requests"),
-            });
+            };
+            if let Some(prior) = prior {
+                if counted.cache_read_tokens == 0 {
+                    counted.cache_read_tokens = prior.cache_read_tokens;
+                }
+                if counted.prompt_tokens == 0 {
+                    counted.prompt_tokens = prior.prompt_tokens;
+                }
+            }
+            self.usage = Some(counted);
         }
 
         // 0.85.0 — the second surface a cached count arrives on, and on a

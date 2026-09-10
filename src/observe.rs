@@ -476,56 +476,6 @@ pub enum EventKind {
     /// ));
     /// assert_eq!(flow, Flow::Continue);
     /// ```
-    /// A step's prompt was not an extension of the step before it (0.85.0).
-    ///
-    /// Every vendor's prompt cache serves a request only up to the first byte that
-    /// differs from one it has already seen, so anything this crate rewrites
-    /// *before* the newest message throws the cache away from that byte on for the
-    /// rest of the run. 0.85.0 makes the assembly append-only between folds; this
-    /// is what says so out loud when it is not.
-    ///
-    /// **A fold is not a break.** A fold replaces the run's history with a written
-    /// summary on purpose, so the step after one is expected to differ and emits
-    /// nothing. Every other difference is reported.
-    ///
-    /// It is an observation about this crate's own behaviour rather than about the
-    /// run's work, and a consumer should read one as a defect to file: the assembly
-    /// is meant to have no way of producing it.
-    ///
-    /// ```
-    /// use io_harness::{EventKind, Flow, Observer, RunEvent, Ignore};
-    /// use io_harness::observe::PrefixBreak;
-    ///
-    /// let flow = Ignore.event(&RunEvent::new(
-    ///     7,
-    ///     4,
-    ///     EventKind::PrefixBroke {
-    ///         step: 4,
-    ///         at_byte: 1_204,
-    ///         reason: PrefixBreak::Reread,
-    ///     },
-    /// ));
-    /// assert_eq!(flow, Flow::Continue);
-    /// ```
-    PrefixBroke {
-        /// The step whose prompt diverged from the one before it.
-        ///
-        /// Renamed on the wire, and only on the wire. [`RunEvent`] flattens its
-        /// own `step` into the same JSON object, so a variant field spelled `step`
-        /// serializes two keys of that name and fails to deserialize with
-        /// *duplicate field `step`* — which `every_variant_round_trips` catches
-        /// and nothing else would. The two are always equal; this one is here so a
-        /// consumer matching on the variant has the step without reaching for the
-        /// envelope.
-        #[serde(rename = "at_step")]
-        step: u32,
-        /// The byte of the assembled observation section at which the two first
-        /// differ — everything before it was served from the cache, and everything
-        /// from it on was charged as fresh.
-        at_byte: u64,
-        /// Which of the assembly's mutation sites the divergence looks like.
-        reason: PrefixBreak,
-    },
     StepUsage {
         /// Prompt tokens the vendor charged full price for — the prompt minus what
         /// it served from a cache.
@@ -561,6 +511,55 @@ pub enum EventKind {
         /// that row meant: nothing recorded a cached share.
         #[serde(default)]
         cached_fraction: u64,
+    },
+    /// A step's prompt was not an extension of the step before it (0.85.0).
+    ///
+    /// Every vendor's prompt cache serves a request only up to the first byte that
+    /// differs from one it has already seen, so anything this crate rewrites
+    /// *before* the newest message throws the cache away from that byte on for the
+    /// rest of the run. 0.85.0 makes the assembly append-only between folds; this
+    /// is what says so out loud when it is not.
+    ///
+    /// **A fold is not a break.** A fold replaces the run's history with a written
+    /// summary on purpose, so the step after one is expected to differ and emits
+    /// nothing. Every other difference is reported.
+    ///
+    /// It is an observation about this crate's own behaviour rather than about the
+    /// run's work, and a consumer should read one as a defect to file: the assembly
+    /// is meant to have no way of producing it.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Ignore, Observer, PrefixBreak, RunEvent};
+    ///
+    /// let flow = Ignore.event(&RunEvent::new(
+    ///     7,
+    ///     4,
+    ///     EventKind::PrefixBroke {
+    ///         step: 4,
+    ///         at_byte: 1_204,
+    ///         reason: PrefixBreak::Reread,
+    ///     },
+    /// ));
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    PrefixBroke {
+        /// The step whose prompt diverged from the one before it.
+        ///
+        /// Renamed on the wire, and only on the wire. [`RunEvent`] flattens its
+        /// own `step` into the same JSON object, so a variant field spelled `step`
+        /// serializes two keys of that name and fails to deserialize with
+        /// *duplicate field `step`* — which `every_variant_round_trips` catches
+        /// and nothing else would. The two are always equal; this one is here so a
+        /// consumer matching on the variant has the step without reaching for the
+        /// envelope.
+        #[serde(rename = "at_step")]
+        step: u32,
+        /// The byte of the assembled observation section at which the two first
+        /// differ — everything before it was served from the cache, and everything
+        /// from it on was charged as fresh.
+        at_byte: u64,
+        /// Which of the assembly's mutation sites the divergence looks like.
+        reason: PrefixBreak,
     },
     /// A request reprocessed a prompt the one before it had cached (0.85.0).
     ///

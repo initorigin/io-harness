@@ -320,18 +320,18 @@ impl Compatible {
     /// that a vendor's prefix cache has to match, so it is opt-in rather than
     /// universal.
     ///
-    /// What it buys is [`Usage::cache_read_tokens`] on a streaming request. Without
+    /// What it buys is [`Usage::cache_read_tokens`](super::Usage::cache_read_tokens)
+    /// on a streaming request. Without
     /// it a run that streams reads the body's `prompt_tokens_details` or nothing.
     ///
     /// ```
-    /// use io_harness::provider::Compatible;
+    /// use io_harness::provider::{Auth, Compatible};
     ///
     /// let host = Compatible::fireworks("key", "accounts/fireworks/models/kimi-k2");
     /// // Already on for the preset; this is for everything else that speaks it.
-    /// let gateway = Compatible::new("https://gateway.example/v1", "key", "m")?
+    /// let gateway = Compatible::new("https://gateway.example/v1", Auth::Bearer, "key", "m")
     ///     .with_perf_metrics();
     /// # let _ = (host, gateway);
-    /// # Ok::<(), io_harness::Error>(())
     /// ```
     #[must_use]
     pub fn with_perf_metrics(mut self) -> Self {

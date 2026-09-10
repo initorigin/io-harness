@@ -168,6 +168,54 @@ async fn f5_a_changed_head_changes_the_prefix_half_and_not_the_session_half() {
     );
 }
 
+/// F5 (the prefix half, mid-run) — `expand_tools` changes the head, so it changes
+/// the half of the key that names the head.
+///
+/// The case the release nearly shipped without. The key was derived once, before
+/// the loop, from the catalogue as it stood at the start of the run — so a model
+/// that reached a withheld family on step two kept asking for the replica chosen
+/// for the catalogue of step one, and every request after the expansion paid for a
+/// machine holding a prefix it no longer had. The session half must not move with
+/// it: it is the same conversation, and only the head changed.
+#[tokio::test]
+async fn f5_expanding_a_tool_family_moves_the_prefix_half_and_not_the_session_half() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+
+    // Nothing withheld is offered at the start, so the first request's catalogue and
+    // the second's are genuinely different lists.
+    let seen = Seen::playing(vec![vec![ToolCall {
+        name: "expand_tools".into(),
+        arguments: json!({ "family": "shell_jobs" }),
+    }]]);
+    let contract = TaskContract::workspace("look around", dir.path())
+        .with_max_steps(3)
+        .with_tool_tiers(Vec::<String>::new());
+    let mut session = Session::open(&store, dir.path()).unwrap();
+    session
+        .turn_bounded(&contract, &seen, &store, &policy(), &ApproveAll)
+        .await
+        .unwrap();
+
+    let keys = seen.keys();
+    assert!(
+        keys.len() > 1,
+        "the fixture must take a step after the expansion, or it asserts nothing: {keys:?}"
+    );
+    let before = keys[0].clone().expect("a key");
+    let after = keys[1].clone().expect("a key");
+    let (before_prefix, before_session) = before.split_once(':').unwrap();
+    let (after_prefix, after_session) = after.split_once(':').unwrap();
+    assert_eq!(
+        before_session, after_session,
+        "one conversation, so the session half must not move: {before} then {after}"
+    );
+    assert_ne!(
+        before_prefix, after_prefix,
+        "the catalogue grew, so the half that names the head must follow it: {before} then {after}"
+    );
+}
+
 // --------------------------------------------------------- F17: record and replay
 
 /// F17 — a recording round-trips the key, so a replayed run asks for the same

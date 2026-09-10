@@ -706,7 +706,13 @@ where
                 // 0.85.0 — held between folds, exactly as the flat loop holds
                 // them. One rule, two loops, and a rule spelled out twice is the
                 // drift `tests/session_fanout.rs` exists to catch.
-                frozen.hold(fold.folded, step, budget_tokens, &notes, &global_notes);
+                //
+                // Keyed on the same condition `folding` is built from, and not on
+                // `fold.folded` alone: a tree whose caller turned compaction off
+                // never folds, and `since` pinned to the first step leaves every
+                // ladder rung dead for the whole run.
+                let re_deciding = fold.folded || !contract.compaction.enabled();
+                frozen.hold(re_deciding, step, budget_tokens, &notes, &global_notes);
                 let (frozen_notes, frozen_global) = frozen.notes();
                 let mut assembled = assemble(
                     &mut ledger,
@@ -729,7 +735,7 @@ where
                         collapse: contract.collapse,
                         ladder: contract.ladder,
                         since: frozen.since(),
-                        folding: fold.folded || !contract.compaction.enabled(),
+                        folding: re_deciding,
                     },
                 )
                 .await?;
@@ -756,7 +762,7 @@ where
                     &mut frozen,
                     &assembled.text,
                     &system,
-                    fold.folded,
+                    re_deciding,
                     assembled.refit,
                     tree.watch,
                     run_id,

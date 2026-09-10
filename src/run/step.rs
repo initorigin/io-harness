@@ -154,9 +154,14 @@ pub(super) fn commit_step(
                 // 0.85.0 — the rate itself, so a renderer prints it rather than
                 // deriving it. Permille, and zero for a prompt of zero tokens,
                 // which is the same answer a division would refuse to give.
+                //
+                // Clamped at 1,000 for the same reason the `saturating_sub` two
+                // fields up exists: a cache read larger than the prompt it was read
+                // into is a vendor bug, and one that is reported here as 1,400‰
+                // would put a rate above 100% in front of an operator.
                 cached_fraction: match usage.prompt_tokens {
                     0 => 0,
-                    prompt => usage.cache_read_tokens.saturating_mul(1_000) / prompt,
+                    prompt => (usage.cache_read_tokens.saturating_mul(1_000) / prompt).min(1_000),
                 },
             },
         ));
@@ -996,13 +1001,20 @@ pub(super) async fn run_workspace_from<P: Provider>(
     //
     // `base_system` and not the planning variant, because the planning directive
     // is withdrawn when a plan is approved and a key that moved with it would send
-    // the rest of the session to a replica holding nothing. The catalogue as it
-    // stands at the start of the run, for the same reason: `expand_tools` grows it
-    // mid-run, and 0.85.0 does not make the head follow.
-    let session_key = extras
-        .turn
-        .as_ref()
-        .map(|turn| session_key(turn.session_id, &base_system, &tools));
+    // the rest of the session to a replica holding nothing — the plan gate opens
+    // and closes within one turn, and the head it leaves behind is the same head it
+    // started from.
+    //
+    // The tool list is read per step and not once, because `expand_tools` grows it
+    // mid-run: an expansion is exactly the head change the key's first half exists
+    // to follow, and a key that stayed put through one would route every later
+    // request at a replica holding a prefix that no longer matches.
+    let routing_key = |tools: &[ToolSpec]| {
+        extras
+            .turn
+            .as_ref()
+            .map(|turn| session_key(turn.session_id, &base_system, tools))
+    };
     // Durable budget: restored from the store so a resume continues the same
     // token and wall-clock budget rather than restarting it at zero.
     let mut tokens_used: u64 = store.spent_tokens(run_id)?;
@@ -1337,7 +1349,16 @@ pub(super) async fn run_workspace_from<P: Provider>(
             // every turn, and `effective_tokens` shrinks as a `max_tokens` run
             // spends. Either one moves the head of the prompt, and a moved head is
             // the whole prefix.
-            frozen.hold(fold.folded, step, budget_tokens, &notes, &global_notes);
+            //
+            // The same condition `folding` is built from below, and for the same
+            // reason: a run whose caller turned compaction off never folds, so a
+            // `hold` keyed on `fold.folded` alone would pin `since` to the run's
+            // first step for the whole run — and every ladder rung judges age
+            // against `since`, so snip, skill bodies, microcompact and reduce would
+            // never fire again. There is no frozen prefix to protect on such a run;
+            // it re-decides how it renders every step by construction.
+            let re_deciding = fold.folded || !contract.compaction.enabled();
+            frozen.hold(re_deciding, step, budget_tokens, &notes, &global_notes);
             let (frozen_notes, frozen_global) = frozen.notes();
             let mut assembled = assemble(
                 &mut ledger,
@@ -1353,7 +1374,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                     collapse: contract.collapse,
                     ladder: contract.ladder,
                     since: frozen.since(),
-                    folding: fold.folded || !contract.compaction.enabled(),
+                    folding: re_deciding,
                 },
             )
             .await?;
@@ -1371,14 +1392,24 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 }
                 _ => workspace_user_prompt(contract, &assembled.text, toolchain.as_ref()),
             };
+            // 0.85.0 — chosen here rather than inside the request literal, because
+            // the check below has to see the block this step actually sends. A turn
+            // whose opening carries the conversational prompt and whose second step
+            // carries the work prompt breaks its prefix at byte zero of the system
+            // block, and that is the one system-prompt change `docs/CONTRACT.md`
+            // promises is announced.
+            let sent_system = match &conversational {
+                Some(c) if step == start_step => c.clone(),
+                _ => system.clone(),
+            };
             // 0.85.0 — before the request is built, and over the same two strings
             // the transcript is built from. A break here is a defect in this
             // crate's own assembly rather than a condition of the run.
             check_prefix(
                 &mut frozen,
                 &assembled.text,
-                &system,
-                fold.folded,
+                &sent_system,
+                re_deciding,
                 assembled.refit,
                 watch,
                 run_id,
@@ -1409,10 +1440,7 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 // *and* "if a plain answer is the whole of what is wanted, answer"
                 // has been told two things, which is the contradiction 0.45.0 and
                 // 0.48.0 each removed. One system block per turn is what that costs.
-                system: match &conversational {
-                    Some(c) if step == start_step => c.clone(),
-                    _ => system.clone(),
-                },
+                system: sent_system,
                 user: user.clone(),
                 // 0.49.0 — the same emission as a conversation. Empty until this run
                 // has driven a step of its own, which is what keeps a first step and a
@@ -1427,9 +1455,10 @@ pub(super) async fn run_workspace_from<P: Provider>(
                 // 0.49.0 — the same breakpoint the line above names, counted in
                 // messages because that is what this request sends.
                 cache_through: cache_through_for(cache_boundary, &messages),
-                // 0.85.0 — the same key on every request of the session, which is
-                // what a replica-local cache needs to be able to serve it.
-                session_key: session_key.clone(),
+                // 0.85.0 — the same key on every request of the session whose head
+                // has not changed, which is what a replica-local cache needs to be
+                // able to serve it.
+                session_key: routing_key(&tools),
                 // 0.77.0 — the shape the caller demanded, carried to the vendors
                 // whose wire has a place for it. A hint that reduces attempts, and
                 // never the thing trusted: `validate_final_output` below is the
