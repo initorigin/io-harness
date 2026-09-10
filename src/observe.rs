@@ -1793,6 +1793,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "server_tool_used",
     "token",
     "sandbox",
+    "gate_output",
     "mcp",
     "handle_started",
     "handle_polled",
