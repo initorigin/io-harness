@@ -82,12 +82,30 @@ async fn an_appending_redirect_is_journalled_and_the_file_comes_back() {
     let (dir, store, run_id) = run_line(&[("a.txt", "before\n")], "echo x >> a.txt").await;
     let ws = io_harness::tools::Workspace::new(dir.path());
 
-    // The stage really did change the file, or the rewind below proves nothing.
-    let changed = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
-    assert!(
-        changed.contains("before") && changed.contains('x'),
-        "the redirect appended: {changed:?}"
-    );
+    // The stage really did change the file, or the rewind below proves less than
+    // it looks like it does.
+    //
+    // Unix only, and the reason is the tool's own contract rather than a quirk of
+    // this test: `shell` parses the line here and spawns each stage as a program
+    // found on `PATH`, with no `sh -c` and no `cmd /c` after the parse. `echo` is
+    // a shell builtin rather than a program, and on the Windows runner nothing on
+    // `PATH` supplies it — the file came back as `"before\n"`, unchanged and not
+    // truncated, so the append-mode redirect opened it and the stage that would
+    // have written never ran. (`mv`, `tee` and `cat` are real programs there and
+    // their tests in this file pass on every platform.)
+    //
+    // The restore point is taken before the line runs either way, so every
+    // assertion below holds on Windows too and none of them is vacuous there:
+    // without journalling, `rewind` would answer `NotRecorded`. Only "the bytes
+    // actually moved" is Unix's to prove.
+    #[cfg(unix)]
+    {
+        let changed = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+        assert!(
+            changed.contains("before") && changed.contains('x'),
+            "the redirect appended: {changed:?}"
+        );
+    }
 
     let put_back = rewind(&ws, &store, run_id, "a.txt").unwrap();
     assert!(
