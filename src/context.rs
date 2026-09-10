@@ -328,8 +328,12 @@ impl Observation {
     }
 }
 
-/// The observations of one run, in order. Assembly reads it; nothing mutates
-/// history.
+/// The observations of one run, in order.
+///
+/// Append-only, and (0.85.0) that is now the whole of what assembly may do to it:
+/// [`assemble`] appends the current contents of a path whose earlier read has
+/// gone stale, and rewrites nothing. What an earlier step was shown stays what it
+/// was shown.
 ///
 /// `entries` stays private through serde too — it serializes as the one field it
 /// is, so a restored ledger is still append-only through [`Ledger::push`].
@@ -1179,6 +1183,36 @@ pub struct Assembly<'a> {
     /// The rungs between Collapse and a fold (0.81.0). [`Ladder::default`] is
     /// every rung off, which assembles exactly what 0.80.0 assembled.
     pub ladder: Ladder,
+    /// (0.85.0) The step the prefix this run is extending was built at — the last
+    /// fold's step, or the run's first step before there has been one.
+    ///
+    /// Every ladder rung judges an entry's age against this rather than against
+    /// [`step`](Assembly::step), and that one substitution is what makes a rung's
+    /// output the same on every step between two folds. Judged against the
+    /// assembling step instead, `snip` drops one more lookup each step as the run
+    /// walks away from it — which is a rewrite of the middle of the prompt on a
+    /// step where nothing folded.
+    ///
+    /// It also makes the rungs inert before the first fold without a flag saying
+    /// so: no entry is older than the step the run started on.
+    pub since: u32,
+    /// (0.85.0) Whether this step may change how an entry it has already shown
+    /// renders.
+    ///
+    /// A fold is the one point in a run where the prompt's head is deliberately
+    /// thrown away and rebuilt, so it is the one point where eliding an older
+    /// entry costs nothing that was not already being paid. Between folds every
+    /// entry renders as it first rendered and the ledger only grows, which is what
+    /// makes each step's text a byte prefix of the next — and therefore what a
+    /// vendor's prompt cache can serve.
+    ///
+    /// All four ladder rungs are held behind this, and so is the fit rule —
+    /// except on a step whose entries do not fit the ceiling at all, where
+    /// assembly elides anyway because there is nothing else it can do. `false` is
+    /// the ordinary step; the caller sets `true` on a step that folded, and on
+    /// every step of a run whose caller turned folding off — asking for 0.42.0's
+    /// behaviour is asking for its prompt bounds too.
+    pub folding: bool,
 }
 
 /// The observation section for one turn, and what it cost.
@@ -1242,6 +1276,25 @@ pub struct Assembled {
     /// (0.81.0) Contiguous runs of one step's results that
     /// [`Ladder::microcompact`] replaced with a counted line.
     pub microcompacted: usize,
+    /// (0.85.0) Whether the ceiling elided something this turn — the floor
+    /// underneath the append-only property.
+    ///
+    /// The fit rule is a fold's job, and between folds an entry renders as it first
+    /// rendered. A run whose `keep_recent` holds a ledger too short to fold, or
+    /// whose ceiling is tighter than what a fold leaves behind, has no third option
+    /// but to elide anyway. That rewrites what an earlier step was shown, so it
+    /// costs the vendor's cache from that byte on and the run reports it as
+    /// [`EventKind::PrefixBroke`](crate::EventKind::PrefixBroke) — but it is a
+    /// ceiling doing what a ceiling is for rather than a defect, which is what this
+    /// field tells the loop.
+    ///
+    /// **It says the ceiling bit, not that the rule ran.** The walk runs on every
+    /// folding step and elides nothing when the entries fit, so a flag set from
+    /// "the rule ran" would mark a break expected on almost every step — and the
+    /// debug assertion this field exempts would never fire again. That is the
+    /// shape a gate goes vacuous in, and the sabotage arm that set `fitting`
+    /// unconditionally is what found it.
+    pub refit: bool,
     /// (0.49.0) The same emission, piece by piece, so the run loop can build a
     /// role-tagged transcript from it.
     ///
@@ -1273,6 +1326,21 @@ pub const SEED_AGENT: &str = "agent";
 /// and, like that one, it maps to [`Piece::Prose`]: it is narration about the
 /// conversation rather than a thing either party said.
 pub const SEED_SUMMARY: &str = "summary";
+
+/// (0.85.0) The `target` prefix on the observation a refreshed stale read is
+/// appended as, followed by the path that was re-read.
+///
+/// A re-read is the crate's own action rather than an answer to a call the model
+/// made, so the appended entry is an [`ObsKind::Message`] and maps to
+/// [`Piece::Prose`]: it takes no ordinal, and taking one would slide every later
+/// result of that step onto the wrong call.
+///
+/// It is a target prefix rather than a new [`ObsKind`] because the kind is a
+/// stored value — every persisted ledger would have to be readable by a decoder
+/// that had never seen the variant — and because `Message` with a reserved target
+/// is the shape [`SEED_OPERATOR`], [`SEED_AGENT`] and [`SEED_SUMMARY`] already
+/// established.
+pub const REREAD: &str = "reread:";
 
 /// How a summary reads to the model, wherever it was written.
 ///
@@ -1368,12 +1436,131 @@ pub struct Emitted {
     pub text: String,
 }
 
-/// How one entry is going to appear this turn.
-enum Shape {
-    /// Carried, with the text to carry (a re-read entry's text is the fresh one).
-    Whole(String),
-    /// Elided, with the reason.
-    Stub(String),
+/// Why one entry is going to be elided this turn, decided before the budget is
+/// consulted.
+///
+/// (0.85.0) There is no second shape any more. Until this release a re-read was
+/// carried as text assembly had *written*, which is what let the step number into
+/// an entry the model had already been shown; now every entry that is carried is
+/// carried as the bytes the ledger recorded, and the only decision left here is
+/// whether an entry is elided and what the elision says.
+type Elision = Option<String>;
+
+/// Whether `entry` is the appended refresh of a read of `target` (0.85.0).
+fn is_reread_of(entry: &Observation, target: &str) -> bool {
+    entry.kind == ObsKind::Message
+        && entry.target.as_deref().and_then(|t| t.strip_prefix(REREAD)) == Some(target)
+}
+
+/// Append the current contents of every path whose newest read is older than the
+/// newest write of the same path (0.85.0).
+///
+/// The refresh is still made through the policy, at this step, for the reason it
+/// always was: the read the model would otherwise trust was decided many steps
+/// ago. What changed is where the answer goes. It is appended at the tail as its
+/// own observation, so the entry that went stale keeps the bytes it has always
+/// had and the step number that used to be written into it now belongs to an
+/// entry that arrives once and never changes again.
+///
+/// A refusal is appended too, and for the same reason: a refusal that was not
+/// recorded would be re-attempted on every later step, and each attempt would
+/// write the assembling step's number into the prompt again.
+fn append_refreshes(
+    ledger: &mut Ledger,
+    at: &Assembly<'_>,
+    cap: usize,
+    out: &mut Assembled,
+) -> Result<()> {
+    // A run with no workspace is not skipped here. It can never re-read anything,
+    // and `refresh` says exactly that — so it takes the refusal branch below and
+    // the model is told once, in an appended entry, that the copy above it is
+    // stale. Returning early instead would leave a workspace-less run showing a
+    // read the run has since written over with no warning at all, which is the one
+    // thing the invalidation rule has existed to prevent since 0.42.0. Appended
+    // once and never again: the notice is itself a `reread:` entry, so the
+    // freshness test above finds it and the next step appends nothing.
+    let entries = ledger.entries();
+    let mut stale: Vec<(String, u32)> = Vec::new();
+    for e in entries {
+        if e.kind != ObsKind::Read {
+            continue;
+        }
+        let Some(target) = e.target.as_deref() else {
+            continue;
+        };
+        if stale.iter().any(|(t, _)| t == target) {
+            continue;
+        }
+        // Positions rather than steps: one step may read a path and then write
+        // it, and which of the two is current is the order they were recorded in.
+        let Some(wrote) = entries
+            .iter()
+            .rposition(|l| l.kind == ObsKind::Write && l.target.as_deref() == Some(target))
+        else {
+            continue;
+        };
+        // An ordinary later read of the path is as good as a refresh — it is why
+        // supersession never sends a re-read of something the agent just read
+        // again — and so is an earlier refresh that already caught this write.
+        let fresh = entries.iter().rposition(|l| {
+            (l.kind == ObsKind::Read && l.target.as_deref() == Some(target))
+                || is_reread_of(l, target)
+        });
+        if fresh.is_some_and(|fresh| fresh > wrote) {
+            continue;
+        }
+        stale.push((target.to_string(), entries[wrote].step));
+    }
+
+    let step = at.step;
+    for (target, wrote_at) in stale {
+        out.reread += 1;
+        let (text, origin) = match refresh(at.ws, at.policy, &target, cap) {
+            Ok(fresh) => {
+                at.store.record_context_event(
+                    at.run_id,
+                    &ContextEvent::reread(step, format!("{target} (written at step {wrote_at})")),
+                )?;
+                (
+                    // The warning lives here and not on the stale entry, because
+                    // the stale entry's bytes are ones the model has already been
+                    // shown and this release does not touch those. So it has to be
+                    // unmistakable: it names the path, says the earlier copy above
+                    // is wrong, and says these are the current contents.
+                    format!(
+                        "\n[read {target}] (re-read at step {step}; the write at step {wrote_at} \
+                         invalidated the earlier read of this path above — these are the current \
+                         contents and that one is stale)\n{fresh}\n"
+                    ),
+                    Origin::File,
+                )
+            }
+            Err(why) => {
+                at.store.record_context_event(
+                    at.run_id,
+                    &ContextEvent::reread_refused(step, format!("{target}: {why}")),
+                )?;
+                (
+                    format!(
+                        "\n[read {target}] (the write at step {wrote_at} invalidated the earlier \
+                         read of this path above, and the re-read at step {step} could not be \
+                         done ({why}) — that copy is stale, read it yourself)\n"
+                    ),
+                    // No bytes arrived from anywhere: this is the crate's own
+                    // narration about a refusal, which is what `Prose` means.
+                    Origin::Prose,
+                )
+            }
+        };
+        ledger.push(Observation::new(
+            step,
+            ObsKind::Message,
+            Some(format!("{REREAD}{target}")),
+            text,
+            origin,
+        ));
+    }
+    Ok(())
 }
 
 /// Build the observation section the model sees this turn.
@@ -1386,7 +1573,7 @@ enum Shape {
 ///
 /// One `assembled` trace row per turn, plus one per re-read. Never a row per stub.
 pub async fn assemble(
-    ledger: &Ledger,
+    ledger: &mut Ledger,
     budget_tokens: u64,
     notes: &[MemoryEntry],
     // 0.56.0 — the scope above the workspace, already stripped of anything the
@@ -1397,18 +1584,35 @@ pub async fn assemble(
     at: Assembly<'_>,
 ) -> Result<Assembled> {
     let Assembly {
-        ws,
-        policy,
+        // Read by `append_refreshes` above, which is the only step that reads a
+        // file or asks the policy anything.
+        ws: _,
+        policy: _,
         store,
         run_id,
         step,
         collapse,
         ladder,
+        since,
+        folding,
     } = at;
-    let entries = ledger.entries();
-    let n = entries.len();
     let cap = entry_cap_chars(budget_tokens);
     let mut out = Assembled::default();
+
+    // 0. Re-read (0.85.0). A stale read is refreshed by appending the current
+    // contents at the *tail*, before anything below looks at the ledger, so the
+    // rest of this function sees the refreshed entry as an ordinary observation
+    // and the entry that went stale as an ordinary stub.
+    //
+    // Through 0.84.0 the refresh was written in place, carrying the assembling
+    // step's own number in its text — so a file read once and written once
+    // rendered differently on every remaining step of the run, from a position
+    // early in the transcript. That is a prefix change per step, which is a cache
+    // miss per step from that byte on.
+    append_refreshes(ledger, &at, cap, &mut out)?;
+
+    let entries = ledger.entries();
+    let n = entries.len();
 
     // Memory first. Notes from earlier runs are the cheapest context there is —
     // they are what makes a second run over a workspace cheaper than the first —
@@ -1422,7 +1626,17 @@ pub async fn assemble(
     // re-divided — which is why it runs before any rung that drops something.
     // Conditional on the overflow rather than always on, because a run that fits
     // has nothing to gain and its notes would be shortened for no reason.
-    let notes_share = if ladder.reduce && ledger.est_tokens() > budget_tokens {
+    // (0.85.0) Measured over the ledger as it stood at the last fold, not as it
+    // stands now: a rung whose condition is met partway through a run is a rung
+    // that trims the memory block — the very head of the prompt — on a step where
+    // nothing else changed.
+    let ledger_at_fold: u64 = ledger
+        .entries()
+        .iter()
+        .filter(|e| e.step < since)
+        .map(|e| estimate_tokens(&e.text))
+        .sum();
+    let notes_share = if ladder.reduce && ledger_at_fold > budget_tokens {
         out.reduced = true;
         NOTES_SHARE_FLOOR
     } else {
@@ -1437,6 +1651,22 @@ pub async fn assemble(
     // that makes this one not the current answer".
     let superseded: Vec<Option<u32>> = (0..n)
         .map(|i| {
+            // (0.85.0) A refreshed read supersedes an earlier refresh of the same
+            // path. Without this a read-then-edit loop — the commonest thing an
+            // agent does — appends one whole copy of the file per write and keeps
+            // every one of them: the appended entry is a `Message`, so it is not
+            // `target_is_the_subject`, not a `Read` to be invalidated, and not a
+            // lookup for `snip` to drop. Nothing in the crate would ever elide it.
+            if let Some(target) = entries[i]
+                .target
+                .as_deref()
+                .and_then(|t| t.strip_prefix(REREAD))
+            {
+                return entries[i + 1..]
+                    .iter()
+                    .find(|l| is_reread_of(l, target))
+                    .map(|l| l.step);
+            }
             if !entries[i].kind.target_is_the_subject() {
                 return None;
             }
@@ -1462,39 +1692,52 @@ pub async fn assemble(
         })
         .collect();
 
-    // 3. Re-read. A stale read is worth carrying only as its *current* contents,
-    // so it is refreshed here — through the policy, at this step, because the
-    // read the model would otherwise trust was decided many steps ago.
-    let mut shapes: Vec<Option<Shape>> = (0..n).map(|_| None).collect();
+    // 3. The stale read itself. Its current contents are already in the ledger as
+    // the appended entry step 0 wrote, so what is left here is one stub — and the
+    // stub names two steps that have both already happened, which is what makes it
+    // the same string on every later step.
+    // (0.85.0) Every elision is judged as of the step the prefix was built at, and
+    // this is the same rule the ladder rungs above are under. An entry superseded
+    // by something the run did *after* that step is still carried whole, because
+    // eliding it would rewrite bytes the model has already been shown — the first
+    // version of this release stubbed on the spot and broke the prefix once per
+    // read-then-write pair, which the debug assertion caught across the suite.
+    //
+    // The cost is one extra copy of a file read twice, carried until the next fold,
+    // and it is charged once: a vendor serves the earlier copy from its cache.
+    // Strictly earlier than `since`, not "at or before it". A step's own results
+    // reach the ledger *after* its prompt was assembled, so an entry superseded by
+    // the fold step's own work is one the fold never saw — stubbing it on the step
+    // after would be a rewrite one step past the fold, which is where it would do
+    // the most damage.
+    let superseded: Vec<Option<u32>> = superseded
+        .into_iter()
+        .map(|at| at.filter(|at| *at < since))
+        .collect();
+    let mut elided: Vec<Elision> = (0..n).map(|_| None).collect();
     for i in 0..n {
         let (Some(wrote_at), None) = (invalidated[i], superseded[i]) else {
             continue;
         };
-        let target = entries[i].target.clone().unwrap_or_default();
-        out.reread += 1;
-        match refresh(ws, policy, &target, cap) {
-            Ok(fresh) => {
-                store.record_context_event(
-                    run_id,
-                    &ContextEvent::reread(step, format!("{target} (written at step {wrote_at})")),
-                )?;
-                shapes[i] = Some(Shape::Whole(format!(
-                    "\n[read {target}] (re-read at step {step}; the read at step {} was invalidated \
-                     by the write at step {wrote_at})\n{fresh}\n",
-                    entries[i].step
-                )));
-            }
-            Err(why) => {
-                store.record_context_event(
-                    run_id,
-                    &ContextEvent::reread_refused(step, format!("{target}: {why}")),
-                )?;
-                shapes[i] = Some(Shape::Stub(format!(
-                    "invalidated by the write at step {wrote_at}; the re-read at step {step} could \
-                     not be done ({why}) — read it yourself"
-                )));
-            }
-        }
+        let target = entries[i].target.as_deref().unwrap_or_default();
+        // The first refresh that happened after the write this entry went stale
+        // on. The *first*, not the newest: a second write appends a second
+        // refresh, and naming that one would rewrite this stub on the step it
+        // arrived — the rewrite this release exists to remove.
+        let caught_up = entries[i + 1..]
+            .iter()
+            .find(|l| is_reread_of(l, target) && l.step >= wrote_at)
+            .map(|l| l.step)
+            // As of the step the prefix was built at, for the reason above: the
+            // refresh is appended at the tail on the step it happens, and this
+            // entry keeps the bytes it has until the next fold.
+            .filter(|at| *at < since);
+        let Some(at) = caught_up else {
+            continue;
+        };
+        elided[i] = Some(format!(
+            "invalidated by the write at step {wrote_at}; re-read at step {at}"
+        ));
     }
 
     // 3a. Snip (0.81.0), the ladder's second rung. An old lookup is dropped by
@@ -1505,17 +1748,17 @@ pub async fn assemble(
     if let Some(snip) = ladder.snip {
         for i in 0..n {
             if superseded[i].is_some()
-                || shapes[i].is_some()
+                || elided[i].is_some()
                 || !Snip::droppable(entries[i].kind)
-                || step.saturating_sub(entries[i].step) <= snip.older_than_steps
+                || since.saturating_sub(entries[i].step) <= snip.older_than_steps
             {
                 continue;
             }
             out.snipped += 1;
-            shapes[i] = Some(Shape::Stub(format!(
+            elided[i] = Some(format!(
                 "dropped as a lookup older than {} steps — ask again if it still matters",
                 snip.older_than_steps
-            )));
+            ));
         }
     }
 
@@ -1531,9 +1774,9 @@ pub async fn assemble(
     if ladder.skill_bodies_leave {
         for i in 0..n {
             if superseded[i].is_some()
-                || shapes[i].is_some()
+                || elided[i].is_some()
                 || entries[i].kind != ObsKind::Skill
-                || step.saturating_sub(entries[i].step) <= 1
+                || since.saturating_sub(entries[i].step) <= 1
             {
                 continue;
             }
@@ -1541,9 +1784,9 @@ pub async fn assemble(
             // was not worth carrying", which is the distinction the field draws
             // against the budget's own drops. `Assembled::snipped` says so.
             out.snipped += 1;
-            shapes[i] = Some(Shape::Stub(
+            elided[i] = Some(
                 "the body has been folded out; read the skill again if you need it".to_string(),
-            ));
+            );
         }
     }
 
@@ -1566,13 +1809,13 @@ pub async fn assemble(
                 && entries[j].step == at_step
                 && Piece::of(&entries[j]) == Piece::Result
                 && superseded[j].is_none()
-                && shapes[j].is_none()
+                && elided[j].is_none()
             {
                 j += 1;
             }
             // Never the step being assembled for: the agent has just made those
             // calls and is about to read their results.
-            if j - i >= MICROCOMPACT_MIN && at_step < step {
+            if j - i >= MICROCOMPACT_MIN && at_step < since {
                 // The replacement is built and measured before it is installed,
                 // because it is **not** one line: a stub still occupies its call's
                 // position, so the emission renders an elision line per entry and a
@@ -1611,7 +1854,7 @@ pub async fn assemble(
                 if after < before {
                     out.microcompacted += 1;
                     for (k, why) in (i..j).zip(replacement) {
-                        shapes[k] = Some(Shape::Stub(why));
+                        elided[k] = Some(why);
                     }
                 }
             }
@@ -1622,6 +1865,20 @@ pub async fn assemble(
     // 4. Fit: newest first, whole while the running total stays inside the
     // ceiling; once one does not fit, every older entry is a stub. Superseded and
     // stale-unrefreshable entries never consume budget — they are stubs already.
+    //
+    // (0.85.0) It runs on a folding step, and on a step whose entries do not fit
+    // at all. The second case is not a loophole in the append-only property, it is
+    // the floor underneath it: `keep` may hold a ledger too short to fold, and a
+    // ceiling can be tighter than what a fold would leave behind, and a run in
+    // either state has no third option but to elide. What it must not do is elide
+    // *progressively* — one more entry per step as a shrinking budget catches up
+    // with it — which is what the frozen budget above already removed. A run that
+    // fits carries everything and rewrites nothing.
+    let total: u64 = (0..n)
+        .filter(|&i| superseded[i].is_none() && elided[i].is_none())
+        .map(|i| estimate_tokens(&entries[i].text))
+        .sum();
+    let fitting = folding || total > budget_tokens;
     let mut used = 0u64;
     let mut whole = vec![false; n];
     // 0.76.0 — Context Collapse. Where an entry would have been stubbed, its
@@ -1630,15 +1887,23 @@ pub async fn assemble(
     // byte-identical to 0.75.0's for a caller who changed nothing.
     let mut shortened: Vec<Option<String>> = vec![None; n];
     for i in (0..n).rev() {
-        if superseded[i].is_some() || matches!(shapes[i], Some(Shape::Stub(_))) {
+        if superseded[i].is_some() || elided[i].is_some() {
             continue;
         }
-        let text = match &shapes[i] {
-            Some(Shape::Whole(t)) => t.as_str(),
-            _ => entries[i].text.as_str(),
-        };
+        let text = entries[i].text.as_str();
         let t = estimate_tokens(text);
-        if used + t > budget_tokens {
+        // (0.85.0) On a step that fits, the ceiling is not consulted at all. The
+        // walk is newest-first, so an entry that fits this step is an entry that
+        // may not fit the next one — a step's prompt rewriting what the step
+        // before it showed, whatever the budget does. Holding the ceiling is the
+        // fold's job, and `compact_ledger` is asked before assembly on every step.
+        if fitting && used + t > budget_tokens {
+            // The ceiling actually bit. Recorded here and nowhere else, because
+            // "the fit rule ran" is not the same claim: the walk runs on every
+            // folding step and elides nothing at all when the entries fit, and a
+            // flag set from that would tell the loop a break was expected on every
+            // step of every run — which is an assertion that never fires.
+            out.refit = true;
             // The rung beneath a fold: an entry that will not fit whole may still
             // fit shortened, and a shortened entry keeps its kind and its target
             // where a stub keeps neither. Carrying it does not end the walk —
@@ -1687,24 +1952,23 @@ pub async fn assemble(
         let e = &entries[i];
         if whole[i] {
             out.carried += 1;
-            let text = match (&shortened[i], &shapes[i]) {
+            let text = match &shortened[i] {
                 // A collapsed entry is carried, so it counts as carried — and
                 // separately as shortened, which is what lets a reader of the
                 // trace tell a collapsed turn from a folded one.
-                (Some(short), _) => {
+                Some(short) => {
                     out.shortened += 1;
                     short.clone()
                 }
-                (None, Some(Shape::Whole(t))) => t.clone(),
-                _ => e.text.clone(),
+                None => e.text.clone(),
             };
             pieces.push((true, text));
             continue;
         }
         out.stubbed += 1;
-        let why = match (&shapes[i], superseded[i]) {
+        let why = match (&elided[i], superseded[i]) {
             (_, Some(at)) => format!("superseded by the {} at step {at}", e.kind.label()),
-            (Some(Shape::Stub(why)), _) => why.clone(),
+            (Some(why), _) => why.clone(),
             // 0.55.0 — a read says how to get the part that matters back, by
             // name. Every other kind is re-run rather than re-read: a command's
             // output and a search's matches have no line range to ask for.
@@ -1755,6 +2019,11 @@ pub async fn assemble(
         origin: entries[i].origin,
         text: text.to_string(),
     };
+    // (0.85.0) Merging the elision lines needs no guard of its own, and the
+    // sabotage arm that removed one is what showed it: every elision is decided as
+    // of `since`, so the set of stubs — and therefore this total — is the same on
+    // every step between two folds. A decision that cannot change between folds
+    // cannot rewrite what an earlier step was shown, whatever it decides.
     if stub_tokens <= stub_ceiling {
         for (i, (_, t)) in pieces.iter().enumerate() {
             out.text.push_str(t);

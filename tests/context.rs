@@ -10,6 +10,12 @@
 //! The other half of every assertion is the trace: bounding what the model sees
 //! must never bound what an operator can audit, so wherever a prompt is asserted
 //! to be smaller, `steps.result` is asserted to still hold everything.
+//!
+//! (0.85.0) Every direct `assemble` call here passes `folding: true`. These cases
+//! are about what the fit rule does when the ceiling is reached, and that is now a
+//! fold's decision — a folding step is the step they were written against.
+//! `tests/prefix_append_only.rs` holds the other half: what an ordinary step may
+//! not do.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,12 +53,19 @@ impl MockScript {
         }
     }
 
-    /// The observation section of the `n`th request (0-based).
+    /// The observation section of the `n`th step's request (0-based).
+    ///
+    /// A fold buys its summary through the same provider, and that request carries
+    /// none of the workspace framing — so the steps are the requests that have it.
     fn observations(&self, n: usize) -> String {
         let seen = self.seen.lock().unwrap();
-        let req = seen
-            .get(n)
-            .unwrap_or_else(|| panic!("the loop ran only {} turn(s), wanted turn {n}", seen.len()));
+        let steps: Vec<&CompletionRequest> = seen
+            .iter()
+            .filter(|r| r.user.contains("Observations so far"))
+            .collect();
+        let req = steps.get(n).unwrap_or_else(|| {
+            panic!("the loop ran only {} turn(s), wanted turn {n}", steps.len())
+        });
         section(&req.user)
     }
 
@@ -75,6 +88,21 @@ impl MockScript {
 
 impl Provider for MockScript {
     async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        // A fold's summarisation request must be answered with prose: a summariser
+        // that says nothing is not allowed to replace the notes with nothing, so an
+        // empty answer aborts the fold and a fixture written to fold silently never
+        // does. It takes no slot in the script either — the script is the agent's
+        // turns, and this is not one of them.
+        //
+        // (0.85.0) Recognised by the instruction rather than by an empty tool list:
+        // the fold now extends the step's own request, tools and all.
+        if req.user.contains("compacting an agent's own working notes") {
+            self.seen.lock().unwrap().push(req);
+            return Ok(CompletionResponse {
+                text: Some("the run read a file more than once".into()),
+                ..Default::default()
+            });
+        }
         let i = self.at.fetch_add(1, Ordering::SeqCst);
         self.seen.lock().unwrap().push(req);
         Ok(CompletionResponse {
@@ -313,29 +341,88 @@ async fn prompt_size_stabilises_across_many_turns_instead_of_tracking_step_count
 /// F3 — two observations of one target are one answer. The later is carried whole;
 /// the earlier is a stub that names the step that superseded it, so the model can
 /// tell "you already have this" from "this was dropped".
+///
+/// **(0.85.0) The stub arrives at the next fold rather than on the spot.** Replacing
+/// an entry the model has already been shown is a rewrite of the prompt above the
+/// newest message, which costs the vendor's prompt cache from that byte on for the
+/// rest of the run — the same reason every other elision moved behind a fold. Until
+/// then the run carries both copies, and the second is charged once because a vendor
+/// serves the first from its cache. What the stub says when it comes is unchanged.
 #[tokio::test]
-async fn a_read_superseded_by_a_later_read_of_the_same_path_becomes_a_stub() {
+async fn a_read_superseded_by_a_later_read_is_stubbed_at_the_next_fold() {
     let dir = ws();
     std::fs::write(dir.path().join("a.rs"), "SENTINEL-BODY\n").unwrap();
-    let contract = never_passes(dir.path(), 3);
     let provider = MockScript::new(vec![
         vec![call("read_file", json!({ "path": "a.rs" }))],
         vec![call("read_file", json!({ "path": "a.rs" }))],
     ]);
     let store = Store::memory().unwrap();
-    run_with(&contract, &provider, &store, &open_policy(), &ApproveAll)
-        .await
-        .unwrap();
+    run_with(
+        &never_passes(dir.path(), 3),
+        &provider,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
 
+    // Between folds both copies stand, and neither has been rewritten.
     let third = provider.observations(2);
     assert_eq!(
         third.matches("SENTINEL-BODY").count(),
+        2,
+        "an entry already sent is not rewritten between folds, got:\n{third}"
+    );
+
+    // And at a fold, where every elision this release deferred is spent at once.
+    // Asserted against assembly directly: which step counts as the fold is the one
+    // input that decides this, and driving a loop into folding on a chosen step
+    // means tuning a ceiling, a threshold and `keep_recent` against each other
+    // until they agree — three knobs standing in for the one that matters.
+    let mut ledger = Ledger::new();
+    for step in 1..=2 {
+        ledger.push(Observation::new(
+            step,
+            ObsKind::Read,
+            Some("a.rs".into()),
+            "\n[read a.rs]\nSENTINEL-BODY\n",
+            Origin::File,
+        ));
+    }
+    let store = Store::memory().unwrap();
+    let policy = open_policy();
+    let workspace = Workspace::with_policy(dir.path(), policy.clone());
+    let out = assemble(
+        &mut ledger,
+        24_000,
+        &[],
+        &[],
+        Assembly {
+            collapse: Collapse::default(),
+            ladder: Ladder::default(),
+            since: 3,
+            folding: true,
+            ws: Some(&workspace),
+            policy: &policy,
+            store: &store,
+            run_id: 1,
+            step: 3,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out.text.matches("SENTINEL-BODY").count(),
         1,
-        "one path's contents must be sent once, got:\n{third}"
+        "at a fold one path's contents are sent once, got:\n{}",
+        out.text
     );
     assert!(
-        third.contains("[read a.rs] (elided: superseded by the read at step 2)"),
-        "the stub must name the step that superseded it, got:\n{third}"
+        out.text
+            .contains("[read a.rs] (elided: superseded by the read at step 2)"),
+        "the stub must name the step that superseded it, got:\n{}",
+        out.text
     );
 }
 
@@ -366,12 +453,27 @@ async fn a_write_invalidates_the_earlier_read_so_the_next_turn_sees_the_new_cont
         third.contains("NEW-CONTENT"),
         "the invalidated read must be refreshed, got:\n{third}"
     );
+    // (0.85.0) The stale copy is still there, because rewriting bytes the model has
+    // already been shown costs the vendor's prompt cache from that byte on for the
+    // rest of the run. What replaced the rewrite is a refresh at the tail that says
+    // outright which copy is current — the newest thing the model reads, and the
+    // wording is load-bearing.
     assert!(
-        !third.contains("OLD-CONTENT"),
-        "the stale contents must not be presented as current, got:\n{third}"
+        third.contains("these are the current contents and that one is stale"),
+        "the refresh must mark the copy above it stale, got:\n{third}"
+    );
+    let stale_first = third
+        .find("OLD-CONTENT")
+        .expect("the stale copy is carried");
+    let fresh_at = third
+        .find("NEW-CONTENT")
+        .expect("the fresh copy is carried");
+    assert!(
+        stale_first < fresh_at,
+        "the refresh is appended after what it supersedes, got:\n{third}"
     );
     assert!(
-        third.contains("invalidated by the write at step 2"),
+        third.contains("invalidated the earlier read of this path above"),
         "the refresh must say why it happened, got:\n{third}"
     );
 
@@ -430,13 +532,15 @@ async fn a_policy_refused_reread_is_a_stub_naming_the_invalidating_step_and_the_
 
     let ws = Workspace::with_policy(dir.path(), policy.clone());
     let out = assemble(
-        &ledger,
+        &mut ledger,
         24_000,
         &[],
         &[],
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 3,
+            folding: true,
             ws: Some(&ws),
             policy: &policy,
             store: &store,
@@ -447,18 +551,25 @@ async fn a_policy_refused_reread_is_a_stub_naming_the_invalidating_step_and_the_
     .await
     .unwrap();
 
+    // (0.85.0) The refusal is appended at the tail rather than written over the
+    // entry that went stale, for the reason every other elision moved behind a
+    // fold: rewriting bytes the model has already been shown costs the vendor's
+    // prompt cache from that byte on. Appended and not merely dropped, because a
+    // refusal nothing recorded would be re-attempted on every later step and would
+    // write the assembling step's number into the prompt each time.
     assert!(
-        out.text.contains("invalidated by the write at step 2"),
-        "the stub must name the invalidating step, got:\n{}",
+        out.text
+            .contains("the write at step 2 invalidated the earlier read of this path above"),
+        "the refusal must name the invalidating step, got:\n{}",
         out.text
     );
     assert!(
         out.text.contains("the policy denies reading it"),
-        "the stub must say why the re-read did not happen, got:\n{}",
+        "the refusal must say why the re-read did not happen, got:\n{}",
         out.text
     );
     assert!(
-        !out.text.contains("OLD-CONTENT") && !out.text.contains("NEW-CONTENT"),
+        !out.text.contains("NEW-CONTENT"),
         "a refused re-read must carry no contents at all, got:\n{}",
         out.text
     );
@@ -688,13 +799,18 @@ async fn assembling_one_turn_costs_a_bounded_amount_of_time() {
     let started = Instant::now();
     for step in 0..TURNS {
         let out = assemble(
-            &ledger,
+            &mut ledger,
             24_000,
             &[],
             &[],
             Assembly {
                 collapse: Collapse::default(),
                 ladder: Ladder::default(),
+                // Past every entry in the fixture, which is what a fold's own step
+                // is: this case is about the bound the fit rule holds, and every
+                // elision it depends on is one a fold has already spent.
+                since: 1_000,
+                folding: true,
                 ws: Some(&workspace),
                 policy: &policy,
                 store: &store,
@@ -788,13 +904,15 @@ async fn two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_colla
     ));
 
     let out = assemble(
-        &ledger,
+        &mut ledger,
         24_000,
         &[],
         &[],
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 5,
+            folding: true,
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -857,13 +975,15 @@ async fn a_re_read_cannot_escape_the_workspace_root() {
     ));
 
     let out = assemble(
-        &ledger,
+        &mut ledger,
         24_000,
         &[],
         &[],
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 3,
+            folding: true,
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -880,8 +1000,9 @@ async fn a_re_read_cannot_escape_the_workspace_root() {
         out.text
     );
     assert!(
-        out.text.contains("invalidated by the write at step 2"),
-        "the stub must still name the invalidating step, got:\n{}",
+        out.text
+            .contains("the write at step 2 invalidated the earlier read of this path above"),
+        "the refusal must still name the invalidating step, got:\n{}",
         out.text
     );
     let rows = store.context_events(1).unwrap();
@@ -937,13 +1058,15 @@ async fn the_rendered_note_block_is_byte_identical_whatever_run_id_the_notes_car
         let policy = &policy;
         async move {
             assemble(
-                &Ledger::new(),
+                &mut Ledger::new(),
                 24_000,
                 &notes,
                 &[],
                 Assembly {
                     collapse: Collapse::default(),
                     ladder: Ladder::default(),
+                    since: 9,
+                    folding: true,
                     ws: None,
                     policy,
                     store,
@@ -1094,13 +1217,15 @@ async fn a_long_runs_stubs_collapse_so_the_ceiling_still_holds() {
 
     const CEILING: u64 = 1_500;
     let out = assemble(
-        &ledger,
+        &mut ledger,
         CEILING,
         &[],
         &[],
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 401,
+            folding: true,
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -1370,13 +1495,18 @@ async fn a_surviving_result_keeps_the_position_of_the_call_it_answers() {
     let policy = open_policy().deny_read("a.txt");
     let workspace = Workspace::with_policy(dir.path(), policy.clone());
     let out = assemble(
-        &ledger,
+        &mut ledger,
         24_000,
         &[],
         &[],
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            // Past every entry, which is what a fold's own step is: this case is
+            // about which call a surviving result answers once something has been
+            // elided, and every elision is a fold's to spend.
+            since: 100,
+            folding: true,
             ws: Some(&workspace),
             policy: &policy,
             store: &store,
@@ -1640,7 +1770,7 @@ async fn what_the_run_observed_before_the_interruption_is_in_the_prompt_after_it
 // ------------------------------------------------- 0.49.0: the emitted pieces
 
 /// Assemble a ledger with an open policy and no notes, at `step`.
-async fn emitted_for(ledger: &Ledger, budget: u64) -> Assembled {
+async fn emitted_for(ledger: &mut Ledger, budget: u64) -> Assembled {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("s.db")).unwrap();
     let policy = open_policy();
@@ -1653,6 +1783,8 @@ async fn emitted_for(ledger: &Ledger, budget: u64) -> Assembled {
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 9,
+            folding: true,
             ws: Some(&ws),
             policy: &policy,
             store: &store,
@@ -1696,7 +1828,7 @@ async fn the_emitted_pieces_reconstruct_the_assembled_text_exactly() {
     ));
     ledger.push(observed(2, ObsKind::Read, "b.txt", "\n[read b.txt]\nBBB\n"));
 
-    let out = emitted_for(&ledger, 24_000).await;
+    let out = emitted_for(&mut ledger, 24_000).await;
     let rebuilt: String = out.emitted.iter().map(|e| e.text.as_str()).collect();
     assert_eq!(
         rebuilt, out.text,
@@ -1725,7 +1857,7 @@ async fn a_results_ordinal_is_the_index_of_the_call_it_answers() {
     ));
     ledger.push(observed(2, ObsKind::Read, "b.txt", "\n[read b.txt]\nBBB\n"));
 
-    let out = emitted_for(&ledger, 24_000).await;
+    let out = emitted_for(&mut ledger, 24_000).await;
     let shape: Vec<(u32, usize, bool)> = out
         .emitted
         .iter()
@@ -1756,7 +1888,7 @@ async fn an_elided_result_keeps_its_calls_position() {
     ledger.push(observed(1, ObsKind::Grep, "todo", "\n[grep todo]\nhit\n"));
     ledger.push(observed(1, ObsKind::Read, "a.txt", "\n[read a.txt]\nNEW\n"));
 
-    let out = emitted_for(&ledger, 24_000).await;
+    let out = emitted_for(&mut ledger, 24_000).await;
     let results: Vec<(usize, bool)> = out
         .emitted
         .iter()
@@ -1985,7 +2117,7 @@ async fn a_read_that_no_longer_fits_is_a_stub_and_not_a_tail() {
     ));
 
     let out = assemble(
-        &ledger,
+        &mut ledger,
         // A ceiling too small to carry the read whole, and large enough to carry
         // the newer entry — which is exactly the squeeze the rule is about.
         200,
@@ -1994,6 +2126,8 @@ async fn a_read_that_no_longer_fits_is_a_stub_and_not_a_tail() {
         Assembly {
             collapse: Collapse::default(),
             ladder: Ladder::default(),
+            since: 3,
+            folding: true,
             ws: None,
             policy: &policy,
             store: &store,

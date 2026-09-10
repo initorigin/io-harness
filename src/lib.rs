@@ -575,7 +575,7 @@ pub use otel::{OtelConfig, OtelExporter, GENAI_CONVENTIONS, OTEL_DEFAULT_ENDPOIN
 // namespace, or into a module whose only other public item is a policy helper.
 pub use attach::{Attach, Waiting, POLL_LIMIT};
 pub use net::{target, REQUEST_TIMEOUT};
-pub use observe::{Broadcast, EventKind, Flow, Ignore, Observer, RunEvent};
+pub use observe::{Broadcast, EventKind, Flow, Ignore, Observer, PrefixBreak, RunEvent};
 pub use plugin::{Dropped, Plugin, Plugins, MAX_ID, NAMESPACE, PLUGIN_FILE};
 pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{

@@ -93,9 +93,16 @@ use crate::provider::{CompletionRequest, CompletionResponse, Provider};
 /// transcripts differ while their `user` strings do not would share a key. This
 /// loop cannot produce such a pair, since both are built from one emission — but a
 /// caller hand-building requests could.
+/// The session key is cleared for the same reason (0.85.0). It is a routing hint
+/// — which replica should serve this call — and it carries a digest of the session
+/// id, so it differs between the run that recorded and the run that replays. Left
+/// in the key, every recording made by a `Session` turn would miss on replay,
+/// which is the guarantee `a_recorded_session_replays_under_a_new_session_id`
+/// holds. It changes nothing about what is asked of the model.
 fn key(request: &CompletionRequest) -> String {
     let stable = CompletionRequest {
         messages: Vec::new(),
+        session_key: None,
         ..request.clone()
     };
     serde_json::to_string(&stable).expect("a CompletionRequest is always serialisable")

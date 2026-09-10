@@ -1044,6 +1044,34 @@ pub struct CompletionRequest {
     /// itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_through: Option<usize>,
+    /// (0.85.0) An opaque key naming the conversation this request belongs to, so
+    /// a vendor can route it to the machine already holding its prefix.
+    ///
+    /// Prefix caches are **replica-local**: a serverless fleet keeps one per
+    /// machine, and a request that lands on a different machine from the one
+    /// before it misses however stable its prompt was. Vendors route on a caller
+    /// key rather than on the prompt, which is what this is. `None` — the default,
+    /// and every caller before 0.85.0 — sends the body 0.84.0 sent, byte for byte.
+    ///
+    /// **It is a hash and never an identity.** The crate derives it as
+    /// `io-<prefix-version>:<session-hash>`, at most 64 characters, where
+    /// `<prefix-version>` is a digest of the system text and the tool list — so a
+    /// run whose head changed asks for a fresh replica rather than fighting an old
+    /// one's cache — and `<session-hash>` a digest of the session id. It carries no
+    /// account id, no path and no user-supplied text, because it reaches a vendor
+    /// on every request and is logged there.
+    ///
+    /// A contained child inherits its parent's key: the fan-out shares the parent's
+    /// head, and concentrating it on one replica is the point.
+    ///
+    /// The OpenAI wire sends it as the `prompt_cache_key` body field and as an
+    /// `x-session-affinity` header, and **never as `user`** — that field means
+    /// abuse monitoring at OpenAI, which has deprecated it for this purpose, and
+    /// `prompt_cache_key` takes priority over it at Fireworks. The Anthropic wire
+    /// ignores it: its cache is addressed by explicit breakpoints, which
+    /// [`cache_boundary`](CompletionRequest::cache_boundary) already carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
     /// Images the model should see alongside `user`.
     ///
     /// A provider that does not accept images refuses a request carrying any,

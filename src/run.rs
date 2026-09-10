@@ -3496,6 +3496,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 web: contract.web.clone(),
                 spawn_background_after: contract.spawn_background_after,
                 detached_spawns: contract.detached_spawns,
+                session: std::sync::OnceLock::new(),
             };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
@@ -3614,6 +3615,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 web: contract.web.clone(),
                 spawn_background_after: contract.spawn_background_after,
                 detached_spawns: contract.detached_spawns,
+                session: std::sync::OnceLock::new(),
             };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
@@ -3927,6 +3929,16 @@ struct Tree<'a, P: Provider> {
     /// set, so a child is never seeded with the conversation, never classified as
     /// a reply, and never steerable by an operator it has not spoken to.
     turn: Option<&'a TurnExtras<'a>>,
+    /// (0.85.0) The session's routing key, computed once by the root agent and
+    /// read by every agent under it.
+    ///
+    /// A `OnceLock` rather than a value on the struct because the key is derived
+    /// from the *composed* system prompt and the tool list, which do not exist
+    /// until an agent's loop has started — and rather than a field each agent
+    /// fills for itself, because a child that derived its own key from its own
+    /// head would be routed away from the replica holding the prefix it shares
+    /// with its parent, which is the whole reason the key exists.
+    session: std::sync::OnceLock<Option<String>>,
     root: PathBuf,
     /// The tree root's run id, so `Containment::max_total_duration` can be
     /// measured against when the TREE started rather than when this agent did.
@@ -4384,6 +4396,7 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
         web: contract.web.clone(),
         spawn_background_after: contract.spawn_background_after,
         detached_spawns: contract.detached_spawns,
+        session: std::sync::OnceLock::new(),
     };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, 1, None).await;
     mcp.shutdown(store, run_id, watch).await;
@@ -4637,6 +4650,7 @@ pub async fn resume_tree_observed<P: Provider>(
         web: contract.web.clone(),
         spawn_background_after: contract.spawn_background_after,
         detached_spawns: contract.detached_spawns,
+        session: std::sync::OnceLock::new(),
     };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step, None).await;
     mcp.shutdown(store, run_id, watch).await;

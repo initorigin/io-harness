@@ -194,7 +194,7 @@ mod the_recovery {
             });
             // A summarising request is always served: it is the recovery, and a
             // provider that refused it would be refusing the way out.
-            if req.system.contains(SUMMARISER) {
+            if req.system.contains(SUMMARISER) || req.user.contains(SUMMARISER) {
                 return Ok(CompletionResponse {
                     text: Some("Read four files; nothing decided yet; the port is open.".into()),
                     usage,

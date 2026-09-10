@@ -676,3 +676,45 @@ async fn a_recording_answers_the_same_request_with_or_without_a_transcript() {
          the same point by the same observations replay against one recording"
     );
 }
+
+/// 0.85.0 — a `Session` turn carries a routing key derived from its session id, and
+/// the id is new on every run. If that key were part of the replay key, no
+/// recording of a session would ever answer a later replay of it: the recording and
+/// the replay ask the same question of the same model and differ only in which
+/// replica the vendor is asked to route to.
+///
+/// Written against the key rather than against a full session run, because the
+/// property is a property of the key: two requests alike in everything a model sees
+/// and different only in `session_key` are one question.
+#[tokio::test]
+async fn a_recorded_session_replays_under_a_new_session_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = recording_path(&dir);
+
+    let recorded = CompletionRequest {
+        session_key: Some("io-1a2b3c4d:0011223344556677".into()),
+        ..req("what is the answer")
+    };
+    let recorder = Record::new(Canned::new(vec![text("the recorded answer")]));
+    recorder.complete(recorded.clone()).await.unwrap();
+    recorder.save(&path).unwrap();
+
+    // A second run of the same turn: same goal, same observations, same prompt —
+    // and a session id generated fresh, so a different routing key.
+    let replayed = CompletionRequest {
+        session_key: Some("io-9f8e7d6c:8899aabbccddeeff".into()),
+        ..req("what is the answer")
+    };
+    assert_ne!(
+        recorded.session_key, replayed.session_key,
+        "the two keys must actually differ, or this asserts nothing"
+    );
+
+    let replay = Replay::load(&path).unwrap();
+    assert_eq!(
+        replay.complete(replayed).await.unwrap(),
+        text("the recorded answer"),
+        "a routing hint is not part of the question, and a recording of a session turn must \
+         answer the next run of it"
+    );
+}

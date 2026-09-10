@@ -26,6 +26,96 @@ notes are produced from it.
 
 ### Security
 
+## [0.85.0] - 2026-09-10
+
+**The prompt a run sends is append-only between folds.** Every vendor's prompt
+cache serves a request only up to the first byte that differs from the request
+before it, so a rewrite anywhere *above* the newest message throws the cache away
+from that byte on — for the rest of the run, on every step. Six things in this
+crate rewrote that region, and the commonest of them fired whenever an agent read
+a file and then edited it. Only a fold still rewrites, and it does so on purpose.
+
+Measured against Fireworks serverless on 2026-09-10: a ten-step session read
+95.2% of its prompt from cache on step 2 and 92–94% on every step after it, with
+`cache_read_tokens` equal to the previous step's whole prompt minus about twenty
+tokens. That is the ceiling — what is not served is the newest message, which no
+cache can serve. A repeated-prefix probe put three of seven models at 97–99% and
+four of them at 0–12% on a byte-identical prompt sent twice in a row, so a
+deployment's cached share is now something this crate reports rather than
+something it assumes: `docs/MEASUREMENTS.md` carries both tables.
+
+### Breaking changes
+
+- **BREAKING** — `context::assemble` takes `&mut Ledger`. A stale read's refresh
+  is appended at the tail as its own observation instead of being written over
+  the entry that went stale.
+  *Migration:* change `assemble(&ledger, …)` to `assemble(&mut ledger, …)`; a
+  `Ledger` behind a shared reference needs `.clone()` first, which is what the
+  crate's own comparison fixtures do.
+- **BREAKING** — `context::Assembly` gains `since` and `folding`. `since` is the
+  step the prefix being extended was built at — the last fold's, or the run's
+  first — and every ladder rung judges an entry's age against it. `folding` says
+  this step may re-decide how an entry it has already shown renders.
+  *Migration:* a caller assembling directly passes `since: step, folding: true`
+  to get 0.84.0's behaviour exactly.
+- **BREAKING** — `EventKind::StepUsage` gains `cached_fraction`.
+  *Migration:* a `match` that names every field adds `cached_fraction` or ends
+  with `..`. Rows written by an older process read it as `0`.
+
+### Added
+
+- **The prompt a run sends is append-only between folds.** Every vendor's prompt
+  cache serves a request only up to the first byte that differs from the one
+  before it, so anything this crate rewrote *above* the newest message threw the
+  cache away from that byte on for the rest of the run. Six things did: a stale
+  read refreshed in place with the assembling step's number written into it, the
+  memory block re-read from the store every turn, the fit rule stubbing one more
+  entry as a `max_tokens` budget shrank, the four ladder rungs, supersession, and
+  a fold. Only the fold still does, and it does it on purpose.
+- `EventKind::PrefixBroke { step, at_byte, reason }` — emitted whenever a step's
+  prompt is not an extension of the step before it, with `reason` from a closed
+  set (`memory`, `reread`, `stub`, `ladder`, `frame`, `other`) so a renderer can
+  count breaks by cause. A debug build asserts the same property. A fold is not a
+  break and emits nothing.
+- `CompletionRequest::session_key` — an opaque key, `io-<prefix-version>:<session-hash>`
+  and at most 64 characters, so a vendor routes a session's requests to the
+  replica already holding its prefix. Prefix caches are replica-local: a request
+  that lands elsewhere misses however stable its prompt was. The OpenAI wire
+  sends it as the `prompt_cache_key` body field and as an `x-session-affinity`
+  header, never as `user`. The Anthropic wire ignores it. A contained child
+  inherits its parent's key. The key is a digest and carries no id, path or
+  account.
+- `Compatible::with_perf_metrics`, and on by default for `Compatible::fireworks`
+  — asks the endpoint to report per-request performance metrics in the final
+  streamed chunk. Fireworks reports cached prompt tokens in headers and a
+  streaming response carries none, so a crate that always streams would read zero
+  from it.
+- `EventKind::StepUsage` gains `cached_fraction`, the share of the prompt served
+  from cache in permille, and `EventKind::CacheMiss { step, reprocessed_tokens,
+  expected }` reports a request that paid again for what the one before it had
+  cached — more than 5% of the previous prompt and at least 2,000 tokens. A
+  fold's rebuild is reported with `expected: true` rather than hidden.
+- `Assembled::refit` says a turn elided under a ceiling too tight to fold into,
+  which is the one case the append-only property cannot hold and is reported
+  rather than asserted.
+
+### Changed
+
+- An entry the run has already been shown is elided at the next fold rather than
+  on the spot. Between folds a file read twice is sent twice, and the second copy
+  is charged once because a vendor serves the first from its cache. This changes
+  what a long run's prompt looks like: supersession, invalidation and every
+  ladder rung now take effect at a fold.
+- Recalled notes are ranked once per run and again at each fold rather than once
+  per step. The block renders ahead of everything, so re-ranking it mid-run moved
+  the earliest bytes of the prompt for an ordering the model had already read.
+- A note written mid-run no longer withdraws the Anthropic cache marker, because
+  it no longer moves the prefix.
+- The fold's own summarisation request extends the step's request — same system,
+  same tools, same transcript, with the instruction appended — instead of
+  building a second one. A fold is the moment a run can least afford a second
+  full prefill of its own conversation.
+
 ## [0.84.0] - 2026-09-09
 
 **What the provider said about its rate limit reaches the caller.** Every vendor

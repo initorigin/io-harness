@@ -9,6 +9,81 @@ structure; this file records timing.
 Each entry says what was measured, with what, and on what. A number without a
 machine is a number nobody can reproduce or refute.
 
+## What an append-only prefix is served from cache (0.85.0)
+
+**What is being measured.** The cached share of every step's prompt on a live
+session against Fireworks, once the assembly is append-only between folds and
+every request of the session carries the same routing key. Reported by
+`EventKind::StepUsage::cached_fraction`, which is `cache_read_tokens` over
+`prompt_tokens` in permille.
+
+**The shape to expect, stated before it was measured.** A vendor can serve
+everything it has already seen and nothing it has not, so the ceiling on any one
+request is `(prompt − newest message) / prompt`. The share therefore has no fixed
+value: it rises as a session's history grows past the size of one step's
+observation, and it dips whenever a step observes something large. What is worth
+measuring is not the percentage but the *gap* — how far below that ceiling the
+crate actually lands.
+
+**The machine.** macOS 15 on Apple silicon, against Fireworks serverless,
+2026-09-10, on the seven models the account could reach that day. A ten-step
+session against `accounts/fireworks/models/glm-5p3`, reading one ~440-token file
+per step:
+
+| Step | cached / prompt | share |
+| --- | --- | --- |
+| 1 | 0 / 5,032 | 0.0% |
+| 2 | 5,008 / 5,257 | 95.2% |
+| 3 | 5,242 / 5,677 | 92.3% |
+| 5 | 6,102 / 6,557 | 93.0% |
+| 6 | 6,542 / 6,997 | 93.4% |
+| 8 | 7,495 / 7,960 | 94.1% |
+
+**The gap, which is the actual result.** On every step after the first,
+`cache_read_tokens` was the *previous step's whole prompt* minus about 20 tokens.
+The crate is at the ceiling: what is not served is the newest message, which no
+cache can serve, plus roughly 20 tokens where the prompt's closing instruction
+moves down as observations are appended below it. Raising the share above 94% is
+a matter of a session's history being long relative to one step's observation,
+not of anything left on the table here.
+
+**A cached share is a fact about a deployment.** The same bytes and the same key,
+sent five times in a row to each model — the first warms, the next four are
+reported:
+
+| Model | rounds 2–5 | rounds that hit |
+| --- | --- | --- |
+| `glm-5p3` | 99, 99, 99, 99 | 4 / 4 |
+| `minimax-m3` | 99, 99, 99, 99 | 4 / 4 |
+| `glm-5p3-flash` | 97, 97, 97, 97 | 4 / 4 |
+| `deepseek-v4-flash-0731` | 12, 12, 12, 12 | 0 / 4 |
+| `deepseek-v4-pro-0813` | 0, 0, 0, 0 | 0 / 4 |
+| `kimi-k3` | 0, 0, 0, 0 | 0 / 4 |
+| `qwen3p8-max` | 0, 0, 0, 0 | 0 / 4 |
+
+Four of the seven served little or nothing of a **byte-identical prompt repeated
+immediately**. `deepseek-v4-flash-0731` served 804 of 6,313 tokens — one block —
+four times within a token. The crate sent the same request to all seven, and the
+event stream reports what each one said. **A run that reports a low share is not
+necessarily a run doing anything wrong**, and a first reading can mislead in the
+other direction too: a single warm-then-measure pass put `glm-5p3` at 0% and then
+at 99% twenty minutes later, which is one draw from a fleet rather than a
+property of the model.
+
+**Consistency across a session is its own question.** `minimax-m3` matches
+`glm-5p3` on the repeated-prefix probe and does not hold it over a live session:
+the same ten-step run read 99.9%, 97.8%, 92.1%, then **84.1%**, and a second
+attempt dropped to **79.1%** at step 10 and reported one step at 0%. Nothing in
+the crate changed between them. Where a session must hold a floor, the floor is a
+property to measure per deployment rather than to assume from a probe.
+
+**Which surface reported it.** All three the contract names, on this vendor:
+`usage.prompt_tokens_details.cached_tokens` in the body of a *streaming*
+response, the final chunk's `perf_metrics` when `perf_metrics_in_response` was
+sent, and `fireworks-cached-prompt-tokens` on a **non-streaming** response only —
+a streaming response carries `fireworks-prompt-tokens` but no cached header,
+which is what `perf_metrics_in_response` exists to answer.
+
 ## What a run's cache hit rate actually is (0.83.0)
 
 **What is being measured.** `Spend::cache_hit_rate` over a whole live run —

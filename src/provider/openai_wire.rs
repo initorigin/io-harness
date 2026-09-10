@@ -22,6 +22,20 @@ pub(crate) fn body(
     request: &CompletionRequest,
     flavor: WebFlavor,
 ) -> serde_json::Value {
+    body_with(model, request, flavor, false)
+}
+
+/// [`body`], with 0.85.0's opt-in performance metrics.
+///
+/// A separate entry point rather than a fourth argument on `body`, because every
+/// caller but one passes `false` and a fourth positional `bool` at forty call
+/// sites is a fourth positional `bool` to get wrong.
+pub(crate) fn body_with(
+    model: &str,
+    request: &CompletionRequest,
+    flavor: WebFlavor,
+    perf_metrics: bool,
+) -> serde_json::Value {
     // 0.21.0 — the request may name its own model, which is how a named agent
     // definition reaches the wire when a whole tree shares one provider instance.
     // `None` means the provider's configured model, which is every pre-0.21.0 call.
@@ -66,6 +80,24 @@ pub(crate) fn body(
     if let Some(value) = response_format(request.output_schema.as_ref()) {
         body["response_format"] = value;
     }
+    // 0.85.0 — the session's routing key, added the same way and absent entirely
+    // for a caller that named none, which is what keeps a request that carries no
+    // key byte-identical to the one 0.84.0 sent.
+    //
+    // `prompt_cache_key` and never `user`: OpenAI has deprecated `user` for this
+    // purpose in favour of this field plus `safety_identifier`, and Fireworks
+    // documents this field as taking priority over `user` for session affinity.
+    // Both vendors spell it the same, so there is no per-flavour table here.
+    if let Some(key) = &request.session_key {
+        body["prompt_cache_key"] = json!(key);
+    }
+    // 0.85.0 — asked for by name and by nobody else, so every other vendor's body
+    // is the one 0.84.0 sent. A streaming response carries no per-request
+    // performance headers, and this is what puts the same numbers in the final
+    // chunk instead.
+    if perf_metrics {
+        body["perf_metrics_in_response"] = json!(true);
+    }
     // 0.38.0 — the cache breakpoint, added the third time in the shape the two
     // above established: a per-vendor difference resolved here rather than in each
     // provider, and absent entirely for a wire that does not take one — which is
@@ -106,6 +138,23 @@ pub(crate) fn body(
         }
     }
     body
+}
+
+/// The header half of 0.85.0's session key, or `None` when there is no key.
+///
+/// The same value as the body field, sent both ways because which one a hop reads
+/// is not uniform: a vendor may route on the body field, a gateway in front of it
+/// may only see headers, and neither documents a precedence between them. Sending
+/// one value twice cannot disagree with itself.
+///
+/// `x-session-affinity` is the name Fireworks documents. It is a request header
+/// and never a body field, so it changes no byte of the body a caller without a
+/// key would have sent.
+pub(crate) fn affinity_header(request: &CompletionRequest) -> Option<(&'static str, &str)> {
+    request
+        .session_key
+        .as_deref()
+        .map(|key| ("x-session-affinity", key))
 }
 
 /// The `messages` array.
@@ -551,6 +600,11 @@ pub(crate) async fn parse_stream_with(
     // the body. There is nowhere later this could be read from: the ordering the
     // contract asks for is the one the borrow checker already enforces.
     let rate_limit = crate::provider::RateLimit::from_headers(resp.headers());
+    // 0.85.0 — and beside it, for the same reason and at the same moment: the
+    // headers are gone once `read_sse` takes the response. `RateLimit::raw` cannot
+    // carry these, because it keeps what a *rate-limit* header is and these are an
+    // accounting of one request.
+    let counted = counted_headers(resp.headers());
     read_sse(resp, |data| {
         if data == "[DONE]" {
             return true;
@@ -575,7 +629,65 @@ pub(crate) async fn parse_stream_with(
     }
     let mut response = ensure_parsed(acc.finish())?;
     response.rate_limit = rate_limit;
+    // 0.85.0 — the third surface, and the last one asked. Each fills only what the
+    // one before it left at zero, so a response carrying two of them is counted
+    // once and the body's own accounting wins.
+    //
+    // Only into a `Usage` the response already reported, and never into one
+    // synthesised here: these headers count the prompt and nothing else, so a
+    // record built from them alone would carry a zero completion and a zero total
+    // for a call that generated tokens — a partial accounting rendered as a
+    // complete one, which is what `cache_write_tokens` is left absent to avoid.
+    if let Some(usage) = response.usage.as_mut() {
+        if usage.cache_read_tokens == 0 {
+            if let Some(cached) = counted.0 {
+                usage.cache_read_tokens = cached;
+            }
+        }
+        if usage.prompt_tokens == 0 {
+            if let Some(prompt) = counted.1 {
+                usage.prompt_tokens = prompt;
+            }
+        }
+    }
     Ok(response)
+}
+
+/// `(cached prompt tokens, prompt tokens)` as the response's headers report them
+/// (0.85.0).
+///
+/// Matched on the suffix rather than on an exact name: Fireworks sends
+/// `fireworks-prompt-tokens` and `fireworks-cached-prompt-tokens`, and a gateway
+/// in front of it renames the prefix rather than the noun — so a table of vendor
+/// spellings would be a table to keep current for no gain. The cached name is
+/// tested first and excluded from the second match, because it also ends in
+/// `prompt-tokens` and a plain suffix test would read the cached count as the
+/// total.
+///
+/// Bounded by what a header may be: a value that is not a plain integer is read as
+/// no number at all rather than guessed at, exactly as `RateLimit::from_headers`
+/// treats one.
+fn counted_headers(headers: &reqwest::header::HeaderMap) -> (Option<u64>, Option<u64>) {
+    let mut cached = None;
+    let mut prompt = None;
+    for (name, value) in headers {
+        let name = name.as_str().to_ascii_lowercase();
+        if !name.ends_with("prompt-tokens") {
+            continue;
+        }
+        let Some(parsed) = value
+            .to_str()
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        else {
+            continue;
+        };
+        match name.contains("cached") {
+            true => cached.get_or_insert(parsed),
+            false => prompt.get_or_insert(parsed),
+        };
+    }
+    (cached, prompt)
 }
 
 /// The assistant-text delta a chunk carries, if it carries one.
@@ -657,7 +769,13 @@ impl Accumulator {
             // The breakdowns live one level down, in objects that are absent
             // entirely on a provider — or a model — that reports neither.
             let detail = |path| u.pointer(path).and_then(|v| v.as_u64()).unwrap_or(0);
-            self.usage = Some(Usage {
+            // (0.85.0) Whatever a `perf_metrics` chunk has already filled in is
+            // carried across the assignment below. The two chunks have no
+            // guaranteed order — a vendor is free to send its metrics first — and
+            // replacing the whole struct would discard the only cached count a
+            // streaming response carries.
+            let prior = self.usage.take();
+            let mut counted = Usage {
                 prompt_tokens: get("prompt_tokens"),
                 completion_tokens: get("completion_tokens"),
                 total_tokens: get("total_tokens"),
@@ -675,7 +793,44 @@ impl Accumulator {
                 // the counter is read where a provider does report it and stays
                 // zero where none does.
                 server_tool_requests: detail("/server_tool_use/web_search_requests"),
-            });
+            };
+            if let Some(prior) = prior {
+                if counted.cache_read_tokens == 0 {
+                    counted.cache_read_tokens = prior.cache_read_tokens;
+                }
+                if counted.prompt_tokens == 0 {
+                    counted.prompt_tokens = prior.prompt_tokens;
+                }
+            }
+            self.usage = Some(counted);
+        }
+
+        // 0.85.0 — the second surface a cached count arrives on, and on a
+        // streaming request it is often the only one.
+        //
+        // Fireworks reports cached prompt tokens in headers, and streaming
+        // responses carry no per-request perf headers at all — so a run that
+        // always streams, as this crate does, would read zero from a vendor that
+        // served the whole prefix from cache. `perf_metrics_in_response` asks for
+        // the same numbers in the final chunk instead.
+        //
+        // Read *after* the usage block and only into fields it left at zero: the
+        // body's own `prompt_tokens_details` is the vendor's accounting and this
+        // is a second rendering of it. A response carrying both must not be
+        // counted twice, and the body wins.
+        if let Some(perf) = value.get("perf_metrics").filter(|p| p.is_object()) {
+            let metric = |k: &str| perf.get(k).and_then(|v| v.as_u64());
+            let usage = self.usage.get_or_insert_with(Usage::default);
+            if usage.cache_read_tokens == 0 {
+                if let Some(cached) = metric("cached-prompt-tokens") {
+                    usage.cache_read_tokens = cached;
+                }
+            }
+            if usage.prompt_tokens == 0 {
+                if let Some(prompt) = metric("prompt-tokens") {
+                    usage.prompt_tokens = prompt;
+                }
+            }
         }
 
         // 0.31.0 — the thinking, where a vendor streams it. OpenRouter sends
@@ -913,6 +1068,102 @@ impl Accumulator {
 mod tests {
     use super::*;
     use crate::provider::ToolSpec;
+
+    /// F6 — the key reaches the wire twice and never as `user`.
+    ///
+    /// Twice because which hop reads which is not uniform: a vendor may route on
+    /// the body field, a gateway in front of it may only see headers, and neither
+    /// documents a precedence. Never as `user` because that field means abuse
+    /// monitoring at OpenAI, which has deprecated it for routing, and because
+    /// Fireworks documents `prompt_cache_key` as taking priority over it.
+    #[test]
+    fn f6_a_session_key_reaches_the_body_and_the_header_and_never_user() {
+        let request = CompletionRequest {
+            system: "be brief".into(),
+            user: "hello".into(),
+            session_key: Some("io-deadbeef:0123456789abcdef".into()),
+            ..Default::default()
+        };
+        let sent = body("m", &request, WebFlavor::OpenAi);
+        assert_eq!(
+            sent["prompt_cache_key"], "io-deadbeef:0123456789abcdef",
+            "{sent}"
+        );
+        assert!(sent.get("user").is_none(), "{sent}");
+        assert_eq!(
+            affinity_header(&request),
+            Some(("x-session-affinity", "io-deadbeef:0123456789abcdef"))
+        );
+    }
+
+    /// F12 — the metrics are asked for by name and by nobody else.
+    #[test]
+    fn f12_perf_metrics_are_asked_for_only_where_they_were_opted_into() {
+        let request = CompletionRequest {
+            system: "be brief".into(),
+            user: "hello".into(),
+            ..Default::default()
+        };
+        let asked = body_with("m", &request, WebFlavor::OpenAi, true);
+        assert_eq!(asked["perf_metrics_in_response"], true, "{asked}");
+        let plain = body_with("m", &request, WebFlavor::OpenAi, false);
+        assert!(
+            plain.get("perf_metrics_in_response").is_none(),
+            "every other endpoint's body is the one 0.84.0 sent: {plain}"
+        );
+    }
+
+    /// F11 — a streaming response reports its cached count in the final chunk's
+    /// `perf_metrics` when the body carried no `prompt_tokens_details`.
+    ///
+    /// This is the surface that matters at Fireworks: it reports cached prompt
+    /// tokens in headers, and a streaming response carries no per-request headers
+    /// at all — so a crate that always streams would read zero from the one vendor
+    /// the caching work is aimed at.
+    #[test]
+    fn f11_a_final_chunks_perf_metrics_fill_a_missing_cached_count() {
+        let mut acc = Accumulator::default();
+        acc.ingest(&serde_json::json!({
+            "usage": { "prompt_tokens": 0, "completion_tokens": 12, "total_tokens": 12 },
+            "perf_metrics": { "prompt-tokens": 1_000, "cached-prompt-tokens": 950 },
+        }));
+        let usage = acc.usage.expect("the chunk carried a usage");
+        assert_eq!((usage.cache_read_tokens, usage.prompt_tokens), (950, 1_000));
+    }
+
+    /// F16 — a response carrying both prefers the body.
+    ///
+    /// The body's `prompt_tokens_details` is the vendor's own accounting and the
+    /// metrics are a second rendering of it. Reading both would count one prompt
+    /// twice; reading the metrics first would prefer the copy.
+    #[test]
+    fn f16_a_response_carrying_both_prefers_the_body() {
+        let mut acc = Accumulator::default();
+        acc.ingest(&serde_json::json!({
+            "usage": {
+                "prompt_tokens": 1_000,
+                "completion_tokens": 12,
+                "total_tokens": 1_012,
+                "prompt_tokens_details": { "cached_tokens": 900 },
+            },
+            "perf_metrics": { "prompt-tokens": 4_000, "cached-prompt-tokens": 3_900 },
+        }));
+        let usage = acc.usage.expect("the chunk carried a usage");
+        assert_eq!((usage.cache_read_tokens, usage.prompt_tokens), (900, 1_000));
+    }
+
+    /// F6 (the control) — a caller that named no key changes no byte.
+    #[test]
+    fn a_request_with_no_session_key_sends_the_0_84_0_body() {
+        let bare = CompletionRequest {
+            system: "be brief".into(),
+            user: "hello".into(),
+            ..Default::default()
+        };
+        let sent = body("m", &bare, WebFlavor::OpenAi);
+        assert!(sent.get("prompt_cache_key").is_none(), "{sent}");
+        assert_eq!(affinity_header(&bare), None);
+    }
 
     /// What the 0.54.0 completeness edge reported, in the order it reported it.
     type Reported = std::sync::Arc<std::sync::Mutex<Vec<(usize, ToolCall)>>>;

@@ -1080,6 +1080,83 @@ matches `hi` and not `namaste`, and answers `hi, the login page is broken`
 correctly only by accident. If the classification needed a lookup table to work,
 it would not work.
 
+## What the prompt is allowed to do between folds (0.85.0)
+
+Every vendor's prompt cache serves a request only up to the first byte that
+differs from one it has already seen. So the rule the assembler works to is:
+
+**Between two folds, nothing above the newest message changes.** The ledger grows
+at the tail and every entry renders as it first rendered. A fold is the one point
+where the prompt's head is deliberately thrown away and rebuilt, and it is the
+only point where an entry the model has already been shown may be elided,
+shortened or replaced.
+
+What that moved:
+
+- A stale read's refresh is **appended** at the tail as its own observation. The
+  entry that went stale keeps its bytes; the appended entry says which copy is
+  current, in the newest message the model reads.
+- The memory block and the assembly budget are held at what they were when the run
+  last folded. Recalled notes are therefore ranked once per run and again at each
+  fold, not once per step.
+- Supersession, invalidation, the fit rule and all four ladder rungs take effect at
+  a fold. Between folds a path read twice is sent twice — and charged once, because
+  a vendor serves the earlier copy from cache.
+- The fold's own summarisation request extends the step's request rather than
+  building a second one.
+
+**Two exceptions, both announced.** A run whose `keep_recent` holds a ledger too
+short to fold, or whose ceiling is tighter than what a fold would leave behind,
+elides anyway: there is no third option, and `Assembled::refit` says so. A system
+prompt a caller changes mid-run — the plan gate withdrawing its directive, a
+session's opening turn — moves the head, and that is a caller's decision rather
+than the assembler's.
+
+`EventKind::PrefixBroke { step, at_byte, reason }` is emitted whenever the property
+does not hold, with `reason` from a closed set: `memory`, `reread`, `stub`,
+`ladder`, `frame`, `other`. A debug build asserts the same property and refuses to
+continue past a break it did not expect. **A fold emits nothing** — it is not a
+break.
+
+### The key a session is routed on (0.85.0)
+
+A prefix cache is replica-local. `CompletionRequest::session_key` is an opaque
+routing key, shaped `io-<prefix-version>:<session-hash>` and at most 64
+characters: the session half concentrates a conversation on one replica, and the
+prefix half is a digest of the system text and the tool list, so a session whose
+head changed asks for a fresh replica instead of one whose cache it can no longer
+use.
+
+- The **OpenAI wire** sends it as the `prompt_cache_key` body field **and** as an
+  `x-session-affinity` request header — the same value both ways, because which
+  hop reads which is not uniform and no vendor documents a precedence.
+- It is **never** sent as `user`. OpenAI has deprecated that field for this
+  purpose and Fireworks documents `prompt_cache_key` as taking priority over it.
+- The **Anthropic wire** ignores it; its cache is addressed by the explicit
+  breakpoints below.
+- A contained child carries its parent's key.
+- The key is a digest and carries no account id, path or caller text.
+
+### What a cached share is read from (0.85.0)
+
+Three surfaces, asked in this order, each filling only what the one before it left
+at zero — so a response carrying two is counted once:
+
+1. `usage.prompt_tokens_details.cached_tokens` in the body.
+2. A streaming final chunk's `perf_metrics`, when the request asked for it with
+   `perf_metrics_in_response` — on for `Compatible::fireworks` and for anything
+   that opts in through `Compatible::with_perf_metrics`, absent everywhere else.
+3. The response's own `*-cached-prompt-tokens` / `*-prompt-tokens` headers.
+
+`EventKind::StepUsage::cached_fraction` reports the share in permille.
+`EventKind::CacheMiss { step, reprocessed_tokens, expected }` reports a request
+that paid again for more than 5% of the previous prompt **and** at least 2,000
+tokens of it; `expected` is true when the run had just folded.
+
+**What none of this promises.** The crate does not pace, throttle or fold on a
+cached fraction, and it interprets none of these numbers. A vendor that reports
+nothing yields zeros, which mean "not reported" rather than "nothing was cached".
+
 ## What prompt caching asks for, and what it cannot promise (0.38.0, 0.44.0)
 
 The crate marks up to **two** cache breakpoints per request.

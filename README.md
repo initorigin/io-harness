@@ -42,7 +42,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.84"
+io-harness = "0.85"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -415,16 +415,28 @@ while the change is small, and — the rule an unattended job needs — refuses 
 start at all when the primary provider reports it is unreachable, rather than
 quietly spending the night on a fallback nobody chose.
 
-The stable prefix is cached where the vendor sells it. One cache breakpoint sits
-at the end of the system block, which on the Anthropic wire covers the tool
+**The prompt is append-only between folds.** A cache serves a request only up to
+the first byte that differs from the one before it, so the assembler changes
+nothing above the newest message: the ledger grows at the tail, a stale read's
+refresh is appended rather than written over the entry that went stale, and
+supersession, the fit rule and every ladder rung take effect at a fold — the one
+point where the head is being rebuilt anyway. `PrefixBroke` names any step where
+that does not hold, by cause, and a debug build refuses to continue past one.
+
+**One session, one replica.** Prefix caches are per machine, so every request of a
+session carries an opaque `session_key` — sent as `prompt_cache_key` and
+`x-session-affinity`, never as `user`, inherited by contained children, and a
+digest that carries no id or path. What it bought is readable: `StepUsage` reports
+the cached share of every prompt, and `CacheMiss` reports a request that paid
+again for what the last one had cached.
+
+The stable prefix is also marked where the vendor sells an explicit breakpoint. One
+sits at the end of the system block, which on the Anthropic wire covers the tool
 schemas and the instructions together, and OpenRouter carries the same marker. A
-second sits at the end of the frozen transcript prefix once the run has compacted —
-everything from the top of the prompt through the written summary stops changing,
-so it can be cached, while the observations after it are still rewritten every turn
-and are still never marked. The reads land in the accounting rows beside every
-other token. The crate never asks a vendor to cache a prefix it has not already
-sent once, so a marker it places cannot be billed as a cache write on a prefix
-that then moves.
+second sits at the end of the frozen transcript prefix once the run has compacted.
+The reads land in the accounting rows beside every other token. The crate never
+asks a vendor to cache a prefix it has not already sent once, so a marker it places
+cannot be billed as a cache write on a prefix that then moves.
 
 ### Agents, and agents talking
 
