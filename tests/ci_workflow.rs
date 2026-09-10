@@ -113,8 +113,20 @@ fn without_comments(source: &str) -> Vec<&str> {
 }
 
 /// True when this line marks the place a test resolves an example binary.
+///
+/// **Every spelling a test can reach `examples/` by has to be here, and 0.86.0
+/// found that one was not.** A test that walked to the directory with
+/// `dir.push("examples")` rather than `dir.join("examples")` matched no marker,
+/// so the whole file was invisible to this checker: it spawned an example the CI
+/// matrix did not build, and the matrix-versus-suite assertion passed while
+/// saying nothing about it. The failure mode is silent by construction — a
+/// spelling this list does not know about exempts a test rather than failing it
+/// — which is why the list is stated as three cheap `contains` and not narrowed
+/// to the one spelling that happens to be commonest.
 fn is_spawn_marker(line: &str) -> bool {
-    line.contains(r#"join("examples")"#) || line.contains("example_binary(")
+    line.contains(r#"join("examples")"#)
+        || line.contains(r#"push("examples")"#)
+        || line.contains("example_binary(")
 }
 
 /// The example names `source` resolves as child processes.
@@ -230,9 +242,9 @@ fn the_matrix_builds_exactly_the_examples_the_tests_spawn() {
     assert!(
         !spawned.is_empty(),
         "no test in tests/ resolves an example binary, which cannot be true — the scan \
-         is looking for a line containing `join(\"examples\")` or `example_binary(` and \
-         found none. If the way a test locates a fixture has changed, this checker has \
-         stopped checking anything."
+         is looking for a line containing `join(\"examples\")`, `push(\"examples\")` or \
+         `example_binary(` and found none. If the way a test locates a fixture has \
+         changed, this checker has stopped checking anything."
     );
 
     if let Err(diff) = sets_match(&spawned, &built) {

@@ -166,6 +166,7 @@ jobs:
           --example flood
           --example lsp_fixture_server
           --example mcp_fixture_server
+          --example mcp_stderr_probe
           --example orphan
           --example plan_gate_fixture
           --example tick
@@ -344,6 +345,7 @@ jobs:
           --example flood
           --example lsp_fixture_server
           --example mcp_fixture_server
+          --example mcp_stderr_probe
           --example orphan
           --example plan_gate_fixture
           --example tick

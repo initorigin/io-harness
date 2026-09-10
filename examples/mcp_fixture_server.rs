@@ -158,8 +158,18 @@ impl ServerHandler for Fixture {
 const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk\
                              YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
+/// What this server prints to stderr before it speaks the protocol.
+///
+/// Real servers do this — a version banner, a "listening on stdio", a warning
+/// about a missing optional dependency — and until 0.86.0 every one of those
+/// lines went to whatever the harness's own stderr was. It is here so a test can
+/// prove where the line ends up, and it is a constant so the test names the same
+/// bytes this writes.
+pub const BANNER: &str = "banner: mcp_fixture_server starting";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("{BANNER}");
     let service = Fixture.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())

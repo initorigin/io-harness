@@ -26,6 +26,122 @@ notes are produced from it.
 
 ### Security
 
+## [0.86.0] - 2026-09-10
+
+**What a child returns, what a gate says, and what a server prints all reach the
+right place.** Six findings from an application layer's field test of the shipped
+binary, each on the harness's side of the seam. A gate that failed without saying
+what it printed was a loop an operator could not diagnose. An MCP server's banner
+on the host's stderr was another product's line in someone else's CI log. A model
+learned the `shell` tool's grammar one refusal at a time, at a model round trip
+each. An identifier a vendor echoed into an error body was a leak the moment the
+error was logged. And a file changed by `echo x >> notes.md` had no restore point,
+so `rewind` reported a path the run had just rewritten as one it had never
+touched.
+
+### Added
+
+- **`EventKind::GateOutput { output, exit_code }`** — what a failing
+  `Verification::Command` printed, and what it exited with, on the event stream.
+  The text has been stored as a `"gate_output"` row in `sandbox_events` since
+  0.17.0 and the matching event carried no payload, so an observer watching a
+  live run learned that a gate had failed and nothing about why, and a caller
+  with no store had no second place to look. Both streams, bounded at 4,000
+  characters from the head and the tail, from the same value the row is written
+  from. A gate that printed nothing still reports its exit status, because that
+  is the case where the status is all there is. `exit_code` is `None` for a
+  command killed by a signal or by a sandbox cap.
+
+  A new variant rather than two fields on `EventKind::Sandbox`: this enum is
+  `#[non_exhaustive]` and its variants are not, so adding fields to `Sandbox`
+  would break every exhaustive match on it.
+
+- **An MCP server's stderr is captured into the run instead of the host's.** A
+  stdio server is spawned with its stderr piped and drained on its own task, and
+  what it wrote is recorded as a `"mcp_stderr"` context event and logged at
+  `debug`. rmcp's default is `Stdio::inherit()`, so until now every banner,
+  warning and stack trace a server wrote went to whatever this process's stderr
+  was — attributed to this crate, and absent from the run's own trace. Bounded at
+  8 KiB per server per drain, with the count of dropped bytes stated rather than
+  a bare "truncated"; the reader keeps reading past the bound and discards the
+  excess, because a reader that stopped would fill the pipe and block the child.
+
+- **The `shell` tool's grammar is in the system prompt.** The tool's description
+  now names every construct the parser can refuse, generated from the same table
+  the refusals are raised from. `docs/CONTRACT.md` has said since 0.24.0 that "a
+  model that discovers the refusal set one construct at a time spends steps doing
+  it"; the prompt did not carry the set, so that is what a model did.
+
+### Changed
+
+- **A child that returned nothing says `returned nothing`.** The line a parent
+  reads for a child that ended without saying anything was `(it ended without
+  saying anything; read its trace by run id)` and is now `(returned nothing; read
+  its trace by run id)`. The fold itself is unchanged — a child's final text has
+  reached its parent as the spawn call's own tool result since 0.50.0 — and
+  `tests/child_fold.rs` now pins that, in spawn order, against the request the
+  parent actually sends.
+
+- **A shell stage's target is journalled before the stage runs.** `>`, `>>`,
+  `2>`, `2>>`, `tee`, `cp` and `mv` have the files they may write recorded
+  through the same journal `write_file` uses, so `rewind` puts them back. `mv`
+  journals its sources as well as its destination. `sed -i` and every other
+  in-place editor are deliberately **not** covered — the flag takes an optional
+  attached suffix on GNU and a mandatory separate argument on BSD, and a restore
+  point naming the wrong file is a silent corruption where a missing one is a
+  stated limit. `docs/CONTRACT.md` lists what is covered.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **`redacted_endpoint`'s documentation described a different function.**
+  `ensure_parsed`'s doc block sat above it with no item between them, so
+  `redacted_endpoint`'s rendered docs opened with three paragraphs about
+  rejecting an empty response and `ensure_parsed` had none.
+
+- **A release could ship exempt from the README-coverage check.**
+  `docs/CAPABILITIES.md`'s register is scanned by a pattern that matches only a
+  row with a dated link, so a row still pointing at `[Unreleased]` after its
+  changelog section was cut was invisible to the check — which is how 0.85.0
+  shipped without its capability being named in the README. The row is dated, the
+  README names it, and a new check fails when a version with a dated changelog
+  section still links to `[Unreleased]`.
+
+- **The CI-matrix checker did not recognise one way of reaching `examples/`.**
+  `tests/ci_workflow.rs` matched `join("examples")` and `example_binary(` and not
+  `push("examples")`, so a test using the third spelling was invisible to it: it
+  could spawn an example the matrix does not build, and the assertion comparing
+  the two sets would pass while saying nothing about it.
+
+### Security
+
+- **A provider's error body is redacted before it becomes an `Error`.** Every
+  JSON field whose name ends in `_id` or `-id` — `user_id`, `organization_id`,
+  `request_id`, the `x-request-id` a gateway echoes — has its value replaced with
+  `[redacted]`. The vendor's own message survives, so an error still says what
+  went wrong. It runs after the 8 KiB bound and is a scanner rather than a JSON
+  parse, deliberately: a large error body arrives *truncated*, and a redaction
+  that silently did nothing on exactly the biggest bodies would be a hole rather
+  than a feature. A bare `id` is not redacted — it names the failing object as
+  often as the caller.
+
+### Upgrading
+
+- **A child's result reaches the parent by default, and that has been true since
+  0.50.0** — this release changes only the words a *silent* child folds. If you
+  match on the old sentence, match on `returned nothing` instead.
+- **`EventKind` has a new variant.** Matches on it need a `_` arm, which the type
+  has required since it was made `#[non_exhaustive]`.
+- **A `shell` line's writes now leave restore points.** `rewind` will put back
+  files it previously reported as `NotRecorded`. Nothing that was restorable
+  before stops being restorable.
+- **An MCP server's stderr no longer appears on your process's stderr.** If you
+  were reading a server's log there, read the run's `"mcp_stderr"` context events
+  or enable `debug` logging for `io_harness::mcp`.
+
 ## [0.85.0] - 2026-09-10
 
 **The prompt a run sends is append-only between folds.** Every vendor's prompt

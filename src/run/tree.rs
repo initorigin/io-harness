@@ -2603,7 +2603,13 @@ pub(super) fn compose_child(
         Some(text) => format!("\n{text}\n"),
         // Stated, not omitted: a parent that reads nothing must be able to tell
         // "it said nothing" from "this build does not report what it said".
-        None => "\n(it ended without saying anything; read its trace by run id)\n".into(),
+        //
+        // 0.86.0 — and stated in the words the parent can act on. The sentence
+        // says both halves because either one alone is a worse answer: naming
+        // the trace without naming the emptiness reads as a build that cannot
+        // report, and naming the emptiness without the trace leaves the only
+        // remaining copy of the child's work unreachable.
+        None => "\n(returned nothing; read its trace by run id)\n".into(),
     };
     Ok(SpawnResult::Composed {
         decision: format!("spawned child {child_run}: {outcome:?}"),

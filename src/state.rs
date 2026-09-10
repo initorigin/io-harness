@@ -3257,6 +3257,21 @@ impl ContextEvent {
         }
     }
 
+    /// (0.86.0) What an MCP server wrote to its stderr, verbatim and bounded.
+    ///
+    /// A `context_events` row rather than an [`McpEvent`]: that type is public,
+    /// has public fields and no `#[non_exhaustive]`, so a fifth field on it
+    /// breaks every consumer that constructs one, and its row would need a new
+    /// column and a migration besides — the same argument 0.68.0 made about the
+    /// tool count. This is also the shape the fact wants: a server's log is a
+    /// bounded blob of text belonging to a step, which is what `detail` is.
+    ///
+    /// The step is `0` for anything a server said before the run's first step,
+    /// which is where a start-up banner lands.
+    pub fn mcp_stderr(step: u32, server: &str, text: &str) -> Self {
+        Self::of("mcp_stderr", step, format!("{server}: {text}"))
+    }
+
     /// The agent recorded a durable note for later runs over this workspace.
     pub fn memory_write(step: u32, detail: impl Into<String>) -> Self {
         Self::of("memory_write", step, detail)

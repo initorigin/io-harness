@@ -22,6 +22,8 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rmcp::model::CallToolRequestParams;
@@ -38,7 +40,7 @@ use crate::observe::{EventKind, RunEvent};
 use crate::policy::{Act, Effect, Policy};
 use crate::provider::ToolSpec;
 use crate::run::{refused, PendingMedia, Watch};
-use crate::state::{McpEvent, PolicyEvent, Store};
+use crate::state::{ContextEvent, McpEvent, PolicyEvent, Store};
 
 /// The prefix every MCP-provided tool name carries.
 ///
@@ -464,6 +466,94 @@ struct Connected {
     service: RunningService<RoleClient, ()>,
     timeout: Duration,
     tools: Vec<ToolSpec>,
+    /// (0.86.0) What this server has written to its stderr since the last drain,
+    /// for a stdio server. `None` for an HTTP one, which has no child process and
+    /// therefore no second stream to inherit.
+    stderr: Option<Arc<Mutex<StderrCapture>>>,
+}
+
+/// How much of one server's stderr is kept between drains, per server.
+///
+/// A whole run's worth would be unbounded, and this is held in memory and then
+/// written into a trace row. 8 KiB is the same order as
+/// [`crate::provider::MAX_ERROR_DETAIL_BYTES`], for the same reason: it is a
+/// diagnostic, and a diagnostic nobody bounded is a leak with a good excuse.
+const MCP_STDERR_CAP: usize = 8 * 1024;
+
+/// One stdio server's stderr, bounded, with what the bound cost recorded.
+///
+/// The count of dropped bytes is kept rather than a flag. "Truncated" tells a
+/// reader that they are missing something and not whether they are missing a
+/// line or a megabyte, and the two call for different responses — the second is
+/// a misconfigured server logging at debug into a pipe nobody reads.
+#[derive(Default)]
+struct StderrCapture {
+    kept: String,
+    dropped: usize,
+}
+
+impl StderrCapture {
+    /// Append what the child just wrote, keeping at most [`MCP_STDERR_CAP`].
+    ///
+    /// Cut on a character boundary, because the kept text becomes a trace row
+    /// and a row cut mid-character is not UTF-8. The chunk itself is decoded
+    /// lossily before it gets here: a read can end mid-character, and a
+    /// replacement character in a diagnostic beats holding bytes back for a
+    /// continuation that may never come.
+    fn push(&mut self, text: &str) {
+        let mut room = MCP_STDERR_CAP.saturating_sub(self.kept.len());
+        if room >= text.len() {
+            self.kept.push_str(text);
+            return;
+        }
+        while room > 0 && !text.is_char_boundary(room) {
+            room -= 1;
+        }
+        self.kept.push_str(&text[..room]);
+        self.dropped += text.len() - room;
+    }
+
+    /// Take everything held, leaving the capture empty and its counter reset.
+    ///
+    /// `None` when the server has said nothing since the last drain, so a quiet
+    /// server writes no rows at all rather than one empty row per drain point.
+    fn take(&mut self) -> Option<String> {
+        if self.kept.is_empty() && self.dropped == 0 {
+            return None;
+        }
+        let dropped = std::mem::take(&mut self.dropped);
+        let mut out = std::mem::take(&mut self.kept);
+        if dropped > 0 {
+            out.push_str(&format!("\n[{dropped} more bytes of stderr dropped]"));
+        }
+        Some(out)
+    }
+}
+
+/// Drain one server's stderr for as long as it has one, into `sink`.
+///
+/// **It reads past the cap and throws the excess away rather than stopping.** A
+/// reader that stops reading leaves the pipe to fill, and a full pipe blocks the
+/// child inside its own `write` — so a server that logs too much would hang
+/// instead of being truncated, which is the bound turning into a deadlock. The
+/// bound belongs in what is kept, never in what is read.
+async fn pump_stderr(mut err: tokio::process::ChildStderr, sink: Arc<Mutex<StderrCapture>>) {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 4096];
+    loop {
+        match err.read(&mut buf).await {
+            // End of stream, or a stderr this process can no longer read. Either
+            // way there is nothing further to drain and the task ends; the child
+            // is not this task's to kill.
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let text = String::from_utf8_lossy(&buf[..n]);
+                if let Ok(mut sink) = sink.lock() {
+                    sink.push(&text);
+                }
+            }
+        }
+    }
 }
 
 /// Every MCP server a run is connected to, for the life of that run.
@@ -504,6 +594,7 @@ impl McpSession {
                 continue;
             }
             let started = Instant::now();
+            let mut stderr_of = None;
             let service = match &server.transport {
                 McpTransport::Stdio { command, args, env } => {
                     authorize_spawn(command, policy, store, run_id, watch)?;
@@ -512,10 +603,29 @@ impl McpSession {
                     for (k, v) in env {
                         cmd.env(k, v);
                     }
-                    let transport = TokioChildProcess::new(cmd).map_err(|e| Error::Mcp {
-                        server: server.id.clone(),
-                        reason: format!("could not spawn {command}: {e}"),
-                    })?;
+                    // 0.86.0 — piped, not inherited. `TokioChildProcess::new`
+                    // leaves stderr at rmcp's default of `Stdio::inherit()`, so
+                    // every banner, warning and stack trace a server wrote went
+                    // to whatever this process's stderr was: an operator's CI log
+                    // carried another product's lines, attributed to this one, and
+                    // nothing in the run's own trace recorded that it had happened.
+                    let (transport, err) = TokioChildProcess::builder(cmd)
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .map_err(|e| Error::Mcp {
+                            server: server.id.clone(),
+                            reason: format!("could not spawn {command}: {e}"),
+                        })?;
+                    // Drained on its own task from the moment the child exists,
+                    // so nothing it writes during the handshake is lost and
+                    // nothing it writes ever fills the pipe. A server that offers
+                    // no stderr at all — which the builder reports as `None` —
+                    // simply has nothing to drain.
+                    if let Some(err) = err {
+                        let sink = Arc::new(Mutex::new(StderrCapture::default()));
+                        stderr_of = Some(sink.clone());
+                        tokio::spawn(pump_stderr(err, sink));
+                    }
                     ().serve(transport).await.map_err(|e| Error::Mcp {
                         server: server.id.clone(),
                         reason: format!("handshake failed: {e}"),
@@ -590,9 +700,42 @@ impl McpSession {
                 service,
                 timeout: server.timeout(),
                 tools,
+                stderr: stderr_of,
             });
         }
-        Ok(Self { servers: connected })
+        let session = Self { servers: connected };
+        // Whatever the servers said while starting up, recorded before the run's
+        // first step. A banner is written at start and nowhere else, so a session
+        // that only drained at teardown would report it under the last step of
+        // the run instead of before the first.
+        session.record_stderr(store, run_id, 0);
+        Ok(session)
+    }
+
+    /// (0.86.0) Write what each stdio server has said on stderr into the trace.
+    ///
+    /// Drained here rather than written from the reader task, because the store
+    /// cannot cross a task boundary: `rusqlite::Connection` is `Send` and not
+    /// `Sync`, which is the same constraint that decided 0.41.0's read batch and
+    /// 0.50.0's detached children. The task therefore only accumulates, and every
+    /// write happens on the run's own thread at a point where the store is in
+    /// scope — after connect, after each call, and at shutdown.
+    ///
+    /// Best-effort on the write, like every other trace row on this path: a
+    /// server's stderr must not be able to fail the run that captured it.
+    fn record_stderr(&self, store: &Store, run_id: i64, step: u32) {
+        for s in &self.servers {
+            let Some(sink) = &s.stderr else { continue };
+            let Some(text) = sink.lock().ok().and_then(|mut c| c.take()) else {
+                continue;
+            };
+            // At debug: this is another process's log, it is verbatim, and a
+            // harness that reprinted it at info would be doing what capturing it
+            // was meant to stop.
+            tracing::debug!(server = %s.id, stderr = %text, "mcp server stderr");
+            let _ =
+                store.record_context_event(run_id, &ContextEvent::mcp_stderr(step, &s.id, &text));
+        }
     }
 
     /// Every discovered tool, ready to offer to the model beside the built-ins.
@@ -691,12 +834,21 @@ impl McpSession {
             .with_detail(if truncated { "truncated" } else { "" });
         store.record_mcp(run_id, &ev)?;
         announce(watch, run_id, depth, &ev, None);
+        // Whatever any server logged while this call was in flight, attributed to
+        // the step that made it. Every server rather than the one called: a
+        // stdio server writes to stderr on its own schedule, and holding a
+        // second server's line back until it happens to be called would date it
+        // to the wrong step.
+        self.record_stderr(store, run_id, step);
         Ok(text)
     }
 
     /// Close every connection. Best-effort: a server that already died needs no
     /// goodbye, and a shutdown failure must not mask the run's own outcome.
     pub(crate) async fn shutdown(self, store: &Store, run_id: i64, watch: &Watch<'_>) {
+        // Before the goodbyes: a server says its last words on the way out, and
+        // cancelling the service first would drop them.
+        self.record_stderr(store, run_id, 0);
         for s in self.servers {
             let ev = McpEvent::disconnected(&s.id);
             let _ = store.record_mcp(run_id, &ev);
