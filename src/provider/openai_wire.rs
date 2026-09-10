@@ -670,7 +670,11 @@ fn counted_headers(headers: &reqwest::header::HeaderMap) -> (Option<u64>, Option
         if !name.ends_with("prompt-tokens") {
             continue;
         }
-        let Some(parsed) = value.to_str().ok().and_then(|v| v.trim().parse::<u64>().ok()) else {
+        let Some(parsed) = value
+            .to_str()
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        else {
             continue;
         };
         match name.contains("cached") {

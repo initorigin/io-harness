@@ -452,9 +452,7 @@ impl Frozen {
         let was = self.last.replace((section.to_string(), system.to_string()));
         // A fold throws the prefix away on purpose, so the step it happens on is
         // expected to differ and announces nothing.
-        let Some((before_section, before_system)) = was.filter(|_| !folded) else {
-            return None;
-        };
+        let (before_section, before_system) = was.filter(|_| !folded)?;
         if before_system != system {
             // The system string is the head of every prefix, so a change there
             // costs the whole prompt however small it is.
@@ -678,101 +676,6 @@ fn attribute(before: &str, after: &str, at: usize) -> PrefixBreak {
     PrefixBreak::Other
 }
 
-#[cfg(test)]
-mod attribution {
-    use super::*;
-
-    /// Every reason in the closed set, and the shape of the break that produces it.
-    ///
-    /// The event is what a renderer counts by cause, and a debug build refuses to
-    /// continue past a break — so a run cannot be driven into one from a test.
-    /// These cases feed the attribution directly, which is what makes the set
-    /// something asserted rather than something documented.
-    fn attributed(before: &str, after: &str) -> PrefixBreak {
-        let at = before
-            .bytes()
-            .zip(after.bytes())
-            .position(|(a, b)| a != b)
-            .unwrap_or(before.len().min(after.len()));
-        attribute(before, after, at)
-    }
-
-    #[test]
-    fn a_moved_memory_block_is_attributed_to_the_block() {
-        let before = "\n[memory] your notes\n- a: one\n\n[read x]\nbody\n";
-        let after = "\n[memory] your notes\n- b: two\n\n[read x]\nbody\n";
-        assert_eq!(attributed(before, after), PrefixBreak::Memory);
-    }
-
-    #[test]
-    fn a_refresh_written_in_place_is_attributed_to_the_re_read() {
-        let before = "\n[read x]\nold\n";
-        let after = "\n[read x] (re-read at step 7)\nnew\n";
-        assert_eq!(attributed(before, after), PrefixBreak::Reread);
-    }
-
-    #[test]
-    fn an_entry_replaced_by_an_elision_is_attributed_to_the_stub() {
-        let before = "\n[read x]\nbody\n";
-        let after = "\n[read x] (elided: 12 chars, older than the current context window)\n";
-        assert_eq!(attributed(before, after), PrefixBreak::Stub);
-    }
-
-    #[test]
-    fn a_rung_that_dropped_a_lookup_is_attributed_to_the_ladder() {
-        let before = "\n[grep fn]\nmatches\n";
-        let after = "\n[grep fn] (elided: dropped as a lookup older than 2 steps)\n";
-        assert_eq!(attributed(before, after), PrefixBreak::Ladder);
-    }
-
-    #[test]
-    fn framing_that_moved_is_attributed_to_the_frame() {
-        let before = "\n[read x]\nbody\n";
-        let after = "<external_content>\n[read x]\nbody\n";
-        assert_eq!(attributed(before, after), PrefixBreak::Frame);
-    }
-
-    #[test]
-    fn a_break_with_no_fingerprint_is_attributed_to_nothing_in_particular() {
-        let before = "\n[read x]\nbody\n";
-        let after = "\n[read x]\nsomething else entirely\n";
-        assert_eq!(attributed(before, after), PrefixBreak::Other);
-    }
-
-    /// The rung marks are looked for at the divergence, not anywhere after it. A
-    /// prompt that merely goes on to mention one of these words later must not be
-    /// attributed to it — the reason is meant to name where the bytes moved.
-    #[test]
-    fn a_fingerprint_far_past_the_divergence_does_not_claim_the_break() {
-        let before = "\n[read x]\nbody\n";
-        let after = format!("\n[read x]\nsomething else\n{}\n(elided: later)\n", "y".repeat(900));
-        assert_eq!(attributed(before, &after), PrefixBreak::Other);
-    }
-
-    /// A fold is not a break, and the guard is what says so.
-    #[test]
-    fn a_folding_step_is_not_asked_whether_it_extended_anything() {
-        let mut frozen = Frozen::default();
-        assert!(frozen.extended_by("one", "sys", false).is_none());
-        assert!(frozen.extended_by("two", "sys", true).is_none());
-        // And the fold's own text is what the next step has to extend.
-        assert!(frozen.extended_by("two and more", "sys", false).is_none());
-        assert!(frozen.extended_by("three", "sys", false).is_some());
-    }
-
-    /// The system string is the head of every prefix, so a change there is a break
-    /// at byte zero however small it is and whatever the section did.
-    #[test]
-    fn a_changed_system_string_breaks_the_whole_prefix() {
-        let mut frozen = Frozen::default();
-        frozen.extended_by("one", "sys", false);
-        let broke = frozen
-            .extended_by("one and more", "other", false)
-            .expect("a changed system string is a break");
-        assert_eq!((broke.at_byte, broke.reason), (0, PrefixBreak::Frame));
-    }
-}
-
 /// This step's boundary, emitting [`EventKind::CacheMarked`] when the marked prefix
 /// changes.
 ///
@@ -961,6 +864,7 @@ impl Fold {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn compact_ledger<P: Provider>(
     provider: &P,
     contract: &TaskContract,
@@ -1055,23 +959,23 @@ pub(super) async fn compact_ledger<P: Provider>(
                 // or a caller driving `compact_ledger` before anything was sent.
                 // The 0.84.0 request, unchanged.
                 None => CompletionRequest {
-                system: SUMMARY_SYSTEM.to_string(),
-                user: format!("The goal was: {}\n\nThe notes:\n{folded}", contract.goal),
-                // No tools. A summariser describes the run's work; it does not do
-                // any, and a tool schema it cannot call is tokens spent on nothing.
-                tools: Vec::new(),
-                // (0.75.0) The one completion this crate makes on its own behalf
-                // rather than the caller's, and the only one an operator can point
-                // at a cheaper model. `apply_routing` never reaches here — it is
-                // called once, from the workspace loop, against the step's own
-                // request — so this is set from the contract directly rather than
-                // through the routing rules, which decide the model from what the
-                // *run* has done and have nothing to say about which call this is.
-                //
-                // Unset, this is `None` and the request is byte-identical to
-                // 0.74.0's, which is what keeps the knob opt-in.
-                model: contract.routing.as_ref().and_then(|r| r.mechanical.clone()),
-                ..Default::default()
+                    system: SUMMARY_SYSTEM.to_string(),
+                    user: format!("The goal was: {}\n\nThe notes:\n{folded}", contract.goal),
+                    // No tools. A summariser describes the run's work; it does not do
+                    // any, and a tool schema it cannot call is tokens spent on nothing.
+                    tools: Vec::new(),
+                    // (0.75.0) The one completion this crate makes on its own behalf
+                    // rather than the caller's, and the only one an operator can point
+                    // at a cheaper model. `apply_routing` never reaches here — it is
+                    // called once, from the workspace loop, against the step's own
+                    // request — so this is set from the contract directly rather than
+                    // through the routing rules, which decide the model from what the
+                    // *run* has done and have nothing to say about which call this is.
+                    //
+                    // Unset, this is `None` and the request is byte-identical to
+                    // 0.74.0's, which is what keeps the knob opt-in.
+                    model: contract.routing.as_ref().and_then(|r| r.mechanical.clone()),
+                    ..Default::default()
                 },
             };
             // Announced, because a routed call that is invisible is one an
@@ -1446,4 +1350,101 @@ pub(super) async fn stream_completion<P: Provider>(
         ));
     }
     outcome
+}
+#[cfg(test)]
+mod attribution {
+    use super::*;
+
+    /// Every reason in the closed set, and the shape of the break that produces it.
+    ///
+    /// The event is what a renderer counts by cause, and a debug build refuses to
+    /// continue past a break — so a run cannot be driven into one from a test.
+    /// These cases feed the attribution directly, which is what makes the set
+    /// something asserted rather than something documented.
+    fn attributed(before: &str, after: &str) -> PrefixBreak {
+        let at = before
+            .bytes()
+            .zip(after.bytes())
+            .position(|(a, b)| a != b)
+            .unwrap_or(before.len().min(after.len()));
+        attribute(before, after, at)
+    }
+
+    #[test]
+    fn a_moved_memory_block_is_attributed_to_the_block() {
+        let before = "\n[memory] your notes\n- a: one\n\n[read x]\nbody\n";
+        let after = "\n[memory] your notes\n- b: two\n\n[read x]\nbody\n";
+        assert_eq!(attributed(before, after), PrefixBreak::Memory);
+    }
+
+    #[test]
+    fn a_refresh_written_in_place_is_attributed_to_the_re_read() {
+        let before = "\n[read x]\nold\n";
+        let after = "\n[read x] (re-read at step 7)\nnew\n";
+        assert_eq!(attributed(before, after), PrefixBreak::Reread);
+    }
+
+    #[test]
+    fn an_entry_replaced_by_an_elision_is_attributed_to_the_stub() {
+        let before = "\n[read x]\nbody\n";
+        let after = "\n[read x] (elided: 12 chars, older than the current context window)\n";
+        assert_eq!(attributed(before, after), PrefixBreak::Stub);
+    }
+
+    #[test]
+    fn a_rung_that_dropped_a_lookup_is_attributed_to_the_ladder() {
+        let before = "\n[grep fn]\nmatches\n";
+        let after = "\n[grep fn] (elided: dropped as a lookup older than 2 steps)\n";
+        assert_eq!(attributed(before, after), PrefixBreak::Ladder);
+    }
+
+    #[test]
+    fn framing_that_moved_is_attributed_to_the_frame() {
+        let before = "\n[read x]\nbody\n";
+        let after = "<external_content>\n[read x]\nbody\n";
+        assert_eq!(attributed(before, after), PrefixBreak::Frame);
+    }
+
+    #[test]
+    fn a_break_with_no_fingerprint_is_attributed_to_nothing_in_particular() {
+        let before = "\n[read x]\nbody\n";
+        let after = "\n[read x]\nsomething else entirely\n";
+        assert_eq!(attributed(before, after), PrefixBreak::Other);
+    }
+
+    /// The rung marks are looked for at the divergence, not anywhere after it. A
+    /// prompt that merely goes on to mention one of these words later must not be
+    /// attributed to it — the reason is meant to name where the bytes moved.
+    #[test]
+    fn a_fingerprint_far_past_the_divergence_does_not_claim_the_break() {
+        let before = "\n[read x]\nbody\n";
+        let after = format!(
+            "\n[read x]\nsomething else\n{}\n(elided: later)\n",
+            "y".repeat(900)
+        );
+        assert_eq!(attributed(before, &after), PrefixBreak::Other);
+    }
+
+    /// A fold is not a break, and the guard is what says so.
+    #[test]
+    fn a_folding_step_is_not_asked_whether_it_extended_anything() {
+        let mut frozen = Frozen::default();
+        assert!(frozen.extended_by("one", "sys", false).is_none());
+        assert!(frozen.extended_by("two", "sys", true).is_none());
+        // And the fold's own text is what the next step has to extend.
+        assert!(frozen.extended_by("two and more", "sys", false).is_none());
+        assert!(frozen.extended_by("three", "sys", false).is_some());
+    }
+
+    /// The system string is the head of every prefix, so a change there is a break
+    /// at byte zero however small it is and whatever the section did.
+    #[test]
+    fn a_changed_system_string_breaks_the_whole_prefix() {
+        let mut frozen = Frozen::default();
+        frozen.extended_by("one", "sys", false);
+        let broke = frozen
+            .extended_by("one and more", "other", false)
+            .expect("a changed system string is a break");
+        assert_eq!((broke.at_byte, broke.reason), (0, PrefixBreak::Frame));
+    }
 }

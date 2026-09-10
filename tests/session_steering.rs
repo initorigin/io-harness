@@ -279,9 +279,7 @@ impl Folding {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(system, user)| {
-                !system.contains(SUMMARISER) && !user.contains(SUMMARISER)
-            })
+            .filter(|(system, user)| !system.contains(SUMMARISER) && !user.contains(SUMMARISER))
             .map(|(_, user)| user.clone())
             .collect()
     }

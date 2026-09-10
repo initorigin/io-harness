@@ -63,9 +63,9 @@ impl MockScript {
             .iter()
             .filter(|r| r.user.contains("Observations so far"))
             .collect();
-        let req = steps
-            .get(n)
-            .unwrap_or_else(|| panic!("the loop ran only {} turn(s), wanted turn {n}", steps.len()));
+        let req = steps.get(n).unwrap_or_else(|| {
+            panic!("the loop ran only {} turn(s), wanted turn {n}", steps.len())
+        });
         section(&req.user)
     }
 
@@ -462,8 +462,12 @@ async fn a_write_invalidates_the_earlier_read_so_the_next_turn_sees_the_new_cont
         third.contains("these are the current contents and that one is stale"),
         "the refresh must mark the copy above it stale, got:\n{third}"
     );
-    let stale_first = third.find("OLD-CONTENT").expect("the stale copy is carried");
-    let fresh_at = third.find("NEW-CONTENT").expect("the fresh copy is carried");
+    let stale_first = third
+        .find("OLD-CONTENT")
+        .expect("the stale copy is carried");
+    let fresh_at = third
+        .find("NEW-CONTENT")
+        .expect("the fresh copy is carried");
     assert!(
         stale_first < fresh_at,
         "the refresh is appended after what it supersedes, got:\n{third}"
@@ -1062,7 +1066,7 @@ async fn the_rendered_note_block_is_byte_identical_whatever_run_id_the_notes_car
                     collapse: Collapse::default(),
                     ladder: Ladder::default(),
                     since: 9,
-            folding: true,
+                    folding: true,
                     ws: None,
                     policy,
                     store,

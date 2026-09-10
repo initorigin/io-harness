@@ -21,9 +21,13 @@ use io_harness::{
     Verification,
 };
 
-/// Every step's cached share, in permille, in step order.
+/// One step's accounting: the step, its uncached prompt, its cache read, and the
+/// share in permille.
+type Share = (u32, u64, u64, u64);
+
+/// Every step's cached share, in step order.
 #[derive(Default)]
-struct Shares(Arc<Mutex<Vec<(u32, u64, u64, u64)>>>);
+struct Shares(Arc<Mutex<Vec<Share>>>);
 
 impl Observer for Shares {
     fn event(&self, event: &RunEvent) -> Flow {
@@ -46,8 +50,12 @@ impl Observer for Shares {
 }
 
 fn from_env() -> Option<(String, String)> {
-    let key = std::env::var("FIREWORKS_API_KEY").ok().filter(|k| !k.is_empty())?;
-    let model = std::env::var("FIREWORKS_MODEL").ok().filter(|m| !m.is_empty())?;
+    let key = std::env::var("FIREWORKS_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())?;
+    let model = std::env::var("FIREWORKS_MODEL")
+        .ok()
+        .filter(|m| !m.is_empty())?;
     Some((key, model))
 }
 
@@ -136,8 +144,7 @@ async fn the_live_cached_fraction_holds_from_step_three() {
         "the run must reach step 3 for the claim to mean anything, got {} step(s)",
         seen.len()
     );
-    let from_three: Vec<&(u32, u64, u64, u64)> =
-        seen.iter().filter(|(step, ..)| *step >= 3).collect();
+    let from_three: Vec<&Share> = seen.iter().filter(|(step, ..)| *step >= 3).collect();
     let worst = from_three
         .iter()
         .map(|(.., permille)| *permille)

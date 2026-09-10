@@ -32,9 +32,7 @@ impl Provider for Metered {
                 ..Default::default()
             });
         }
-        let i = self
-            .at
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let i = self.at.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(CompletionResponse {
             tool_calls: match i + 1 < self.usage.len() {
                 true => vec![ToolCall {

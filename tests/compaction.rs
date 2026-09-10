@@ -169,9 +169,7 @@ mod the_fold {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(system, user)| {
-                    !system.contains(SUMMARISER) && !user.contains(SUMMARISER)
-                })
+                .filter(|(system, user)| !system.contains(SUMMARISER) && !user.contains(SUMMARISER))
                 .map(|(_, user)| user.clone())
                 .collect()
         }
@@ -181,9 +179,7 @@ mod the_fold {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(system, user)| {
-                    system.contains(SUMMARISER) || user.contains(SUMMARISER)
-                })
+                .filter(|(system, user)| system.contains(SUMMARISER) || user.contains(SUMMARISER))
                 .map(|(_, user)| user.clone())
                 .collect()
         }
@@ -194,8 +190,7 @@ mod the_fold {
             // (0.85.0) In `system` when the fold builds a request of its own, and
             // in `user` when it extends the step's — which it does whenever the run
             // has already sent one.
-            let summarising =
-                req.system.contains(SUMMARISER) || req.user.contains(SUMMARISER);
+            let summarising = req.system.contains(SUMMARISER) || req.user.contains(SUMMARISER);
             self.seen
                 .lock()
                 .unwrap()
@@ -661,9 +656,7 @@ mod requested {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(system, user)| {
-                    !system.contains(SUMMARISER) && !user.contains(SUMMARISER)
-                })
+                .filter(|(system, user)| !system.contains(SUMMARISER) && !user.contains(SUMMARISER))
                 .map(|(_, user)| user.clone())
                 .collect()
         }
@@ -678,8 +671,7 @@ mod requested {
             // (0.85.0) In `system` when the fold builds a request of its own, and
             // in `user` when it extends the step's — which it does whenever the run
             // has already sent one.
-            let summarising =
-                req.system.contains(SUMMARISER) || req.user.contains(SUMMARISER);
+            let summarising = req.system.contains(SUMMARISER) || req.user.contains(SUMMARISER);
             self.seen
                 .lock()
                 .unwrap()

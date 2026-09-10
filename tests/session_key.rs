@@ -34,9 +34,7 @@ impl Provider for Seen {
                 ..Default::default()
             });
         }
-        let i = self
-            .at
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let i = self.at.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.seen.lock().unwrap().push(req);
         Ok(CompletionResponse {
             tool_calls: self.script.get(i).cloned().unwrap_or_default(),
@@ -101,8 +99,7 @@ async fn f5_a_session_key_is_stable_opaque_and_bounded() {
     // A second `Session::open` is a second session, and a second session is a
     // second conversation with a prefix of its own.
     assert_ne!(
-        again[0],
-        first[0],
+        again[0], first[0],
         "two sessions must not be routed to one replica's cache"
     );
 
@@ -227,9 +224,7 @@ async fn f7_a_contained_child_carries_the_parents_key() {
     // which is where a child's request is built.
     let contract = TaskContract::workspace("look around", dir.path())
         .with_max_steps(3)
-        .with_agents(Agents::new().with(
-            AgentDef::new("reader").with_role("reads files"),
-        ));
+        .with_agents(Agents::new().with(AgentDef::new("reader").with_role("reads files")));
     session
         .turn_bounded(&contract, &seen, &store, &policy(), &ApproveAll)
         .await

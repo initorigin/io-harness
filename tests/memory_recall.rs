@@ -275,7 +275,9 @@ async fn a_path_the_run_has_read_is_a_signal_the_next_turn_recalls_by() {
 
 /// The memory block of a prompt, which is what must stand still within a run.
 fn block(prompt: &str) -> &str {
-    let from = prompt.find("\n[memory]").expect("the prompt carries a block");
+    let from = prompt
+        .find("\n[memory]")
+        .expect("the prompt carries a block");
     let rest = &prompt[from..];
     let to = ["\n<external_content>", "\n\nCall a tool", "\n\n["]
         .iter()
@@ -342,15 +344,9 @@ async fn a_fold_re_ranks_the_block_by_what_the_run_has_read() {
             at_share: 0.8,
             keep_recent: 2,
         });
-    run_with(
-        &contract,
-        &seen,
-        &store,
-        &Policy::permissive(),
-        &ApproveAll,
-    )
-    .await
-    .expect("the run itself must not error");
+    run_with(&contract, &seen, &store, &Policy::permissive(), &ApproveAll)
+        .await
+        .expect("the run itself must not error");
 
     let prompts = seen.0.lock().unwrap().clone();
     let first = prompts

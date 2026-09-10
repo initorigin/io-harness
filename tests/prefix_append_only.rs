@@ -21,7 +21,7 @@ use io_harness::context::{
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::Workspace;
 use io_harness::{
-    run_with, run_with_observed, ApproveAll, EventKind, Flow, Observer, PrefixBreak, Policy,
+    run_with, run_with_observed, ApproveAll, EventKind, Flow, Observer, Policy, PrefixBreak,
     Provider, RunEvent, Store, TaskContract, Verification,
 };
 use serde_json::json;
@@ -373,7 +373,8 @@ async fn f1_a_stale_read_is_appended_at_the_tail_and_the_original_is_left_alone(
             "step {step} rewrote the stale entry instead of leaving it:\n{text}"
         );
         assert!(
-            text.contains("re-read at step 5") && !text.contains(&format!("re-read at step {step}")),
+            text.contains("re-read at step 5")
+                && !text.contains(&format!("re-read at step {step}")),
             "the refresh belongs to the step that made it, not to step {step}, got:\n{text}"
         );
         assert_eq!(
@@ -602,10 +603,7 @@ async fn f10_a_tool_mask_moves_nothing_above_the_newest_message() {
     std::fs::write(dir.path().join("a.txt"), "content\n").unwrap();
 
     let run = async |mask: io_harness::ToolMask| {
-        let script = Script::new(vec![vec![call(
-            "read_file",
-            json!({ "path": "a.txt" }),
-        )]]);
+        let script = Script::new(vec![vec![call("read_file", json!({ "path": "a.txt" }))]]);
         let store = Store::memory().unwrap();
         run_with(
             &never_passes(dir.path(), 2).with_tool_mask(mask),
@@ -832,7 +830,9 @@ async fn f8_a_token_budgeted_run_does_not_stub_its_way_down_the_ledger() {
     let requests = script.steps();
     assert!(requests.len() >= 8, "the fixture must reach step 8");
     assert!(
-        !split(&requests[7].user).1.contains("older than the current context window"),
+        !split(&requests[7].user)
+            .1
+            .contains("older than the current context window"),
         "eight reads fit this ceiling, so nothing may have been elided:\n{}",
         split(&requests[7].user).1
     );
