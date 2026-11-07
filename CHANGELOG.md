@@ -26,6 +26,35 @@ notes are produced from it.
 
 ### Security
 
+## [0.86.1] - 2026-11-07
+
+**io-harness builds for Linux arm64 with musl.** `cargo build --target
+aarch64-unknown-linux-musl` failed inside the seccomp filter with
+``cannot find value `SYS_kexec_file_load` in crate `libc` ``: libc (0.2.191, the
+newest) names that syscall for every other target the filter covers, but not for
+musl on aarch64. io-cli's release workflow found it while building a Linux arm64
+artifact, because nothing in this crate's CI built that target.
+
+### Fixed
+
+- **The seccomp filter compiles on `aarch64-unknown-linux-musl`.** On that one
+  target `kexec_file_load` is taken from the kernel's generic syscall table (294,
+  the table arm64 uses) instead of from libc. Everywhere else it is still libc's
+  constant. A unit test on aarch64 glibc asserts the number equals
+  `libc::SYS_kexec_file_load`, and another asserts the call is refused on every
+  target. The filter refuses the same thirteen syscalls it did before.
+
+### Changed
+
+- **CI builds Linux arm64 natively.** A job on `ubuntu-24.04-arm` runs the seccomp
+  unit tests on arm64 glibc and builds the crate for `aarch64-unknown-linux-musl`.
+- Dependencies: `lopdf` 0.45 (the `documents` feature), `rmcp` 3.3, `reqwest`
+  0.13.5 and `toml` patch releases.
+
+### Contributors
+
+@dependabot kept dependencies current in #283, #284, #285.
+
 ## [0.86.0] - 2026-09-10
 
 **What a child returns, what a gate says, and what a server prints all reach the

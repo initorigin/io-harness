@@ -2051,6 +2051,11 @@ const README_MUST_NAME: &[(&str, &str)] = &[
 /// exemption by nobody noticing.
 const README_NAMES_NOTHING: &[(&str, &str)] = &[
     (
+        "0.86.1",
+        "a build fix for aarch64-unknown-linux-musl — no new name; the README's platform \
+         section says CI now builds that target",
+    ),
+    (
         "0.79.1",
         "documentation only — it named what 0.76.0 through 0.79.0 had already shipped",
     ),

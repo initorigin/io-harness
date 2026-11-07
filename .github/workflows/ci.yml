@@ -589,6 +589,35 @@ jobs:
       # and `media` in one pass instead of one pass each.
       - run: cargo check --all-targets --all-features
 
+  # Linux arm64, natively. The seccomp filter names syscalls through libc's
+  # per-architecture constants, and libc's musl aarch64 table lacked one, so the
+  # crate did not compile for `aarch64-unknown-linux-musl` until 0.86.1 — found
+  # by io-cli's release workflow, because nothing here built that target. This
+  # leg builds it (musl-gcc for the bundled SQLite, native on this runner), and
+  # runs the seccomp unit tests on arm64 glibc, where the one hand-written
+  # syscall number is checked against libc's own.
+  arm64-linux:
+    name: arm64 (ubuntu, gnu tests + musl build)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: arm64-linux
+      - run: cargo test --locked --lib sandbox::seccomp
+      - run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+      - env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --locked --lib --target aarch64-unknown-linux-musl --features media
+
   # Lints are platform-independent, so they run once instead of per-OS.
   lint:
     name: lint
