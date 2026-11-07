@@ -153,6 +153,9 @@ pub(crate) const AVAILABLE: bool = cfg!(any(target_arch = "x86_64", target_arch 
 /// would be invisible: a wrong number denies some *other* syscall, on one
 /// architecture, and the symptom is a build that fails for no stated reason.
 /// Naming them makes a missing constant a compile error instead.
+///
+/// One entry is the exception, and only on one target: see
+/// [`SYS_KEXEC_FILE_LOAD`].
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn denied() -> [libc::c_long; 13] {
     [
@@ -166,11 +169,35 @@ fn denied() -> [libc::c_long; 13] {
         libc::SYS_finit_module,
         libc::SYS_delete_module,
         libc::SYS_kexec_load,
-        libc::SYS_kexec_file_load,
+        SYS_KEXEC_FILE_LOAD,
         libc::SYS_bpf,
         libc::SYS_perf_event_open,
     ]
 }
+
+/// `kexec_file_load`, named by `libc` everywhere this filter is built except
+/// on `aarch64-unknown-linux-musl`, where libc 0.2.191 leaves it out of its
+/// table and the whole crate failed to compile (0.86.1).
+///
+/// That target takes the number from the kernel's generic syscall table,
+/// `include/uapi/asm-generic/unistd.h`, which is the table arm64 uses for every
+/// libc. It is the same number glibc's aarch64 constant carries, and
+/// `kexec_file_load_matches_libc_where_libc_names_it` asserts exactly that on
+/// aarch64 glibc — so the one hand-written number in this module is checked
+/// against the constant it stands in for, on the architecture it is for.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(all(target_arch = "aarch64", target_env = "musl"))
+))]
+const SYS_KEXEC_FILE_LOAD: libc::c_long = libc::SYS_kexec_file_load;
+#[cfg(all(target_arch = "aarch64", target_env = "musl"))]
+const SYS_KEXEC_FILE_LOAD: libc::c_long = AARCH64_KEXEC_FILE_LOAD;
+
+/// `__NR_kexec_file_load` in the asm-generic table. Defined for the musl build
+/// that uses it and for every aarch64 test build, so the glibc test below can
+/// compare it with libc's constant.
+#[cfg(all(target_arch = "aarch64", any(target_env = "musl", test)))]
+const AARCH64_KEXEC_FILE_LOAD: libc::c_long = 294;
 
 /// One BPF instruction, positionally. The four fields have no useful names at a
 /// call site that is already a table.
@@ -379,6 +406,26 @@ mod tests {
             }
         }
         panic!("the filter ran off its own end without returning")
+    }
+
+    /// 0.86.1 — the one hand-written syscall number, held to the constant it
+    /// stands in for on the architecture it is for. Runs on aarch64 glibc, the
+    /// target where libc names `kexec_file_load` and the number is also defined.
+    #[cfg(all(target_arch = "aarch64", target_env = "gnu"))]
+    #[test]
+    fn kexec_file_load_matches_libc_where_libc_names_it() {
+        assert_eq!(AARCH64_KEXEC_FILE_LOAD, libc::SYS_kexec_file_load);
+    }
+
+    /// Whatever the target, `kexec_file_load` is refused: the musl fallback
+    /// changed where the number comes from, never whether it is in the list.
+    #[test]
+    fn kexec_file_load_is_refused() {
+        assert!(denied().contains(&SYS_KEXEC_FILE_LOAD));
+        assert_eq!(
+            verdict(&program(false), &native(SYS_KEXEC_FILE_LOAD, [0; 6])),
+            RET_EPERM,
+        );
     }
 
     /// The jump arithmetic is the one part of an assembled BPF program that is
