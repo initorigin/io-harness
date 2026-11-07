@@ -104,9 +104,17 @@ async fn h8_a_separately_mounted_filesystem_is_read_only_too() {
     let target = format!("/dev/shm/io-harness-h8-{}", std::process::id());
 
     let escape = run(&rung, &sh(&format!("echo x > {target}")), dir.path()).await;
+    // 0.86.1 — the bubblewrap rung mounts a fresh `/dev` (`--dev /dev`), so its
+    // `/dev/shm` is a tmpfs private to the sandbox and not the host's mount.
+    // bubblewrap 0.9 happened to leave that directory unwritable; 0.11 (the
+    // `ubuntu-26.04` runner) does not, and a write to it lands nowhere the host
+    // can see. So the exit status is held only on a rung that keeps the host's
+    // `/dev`. The assertion below — nothing reached the host — holds on every
+    // rung, and it is the boundary this test is about.
+    let private_dev = escape.argv.windows(2).any(|pair| pair == ["--dev", "/dev"]);
     assert!(
-        !escape.success(),
-        "a write to /dev/shm was permitted: {escape:?}"
+        private_dev || !escape.success(),
+        "a write to the host's /dev/shm was permitted: {escape:?}"
     );
     assert!(
         !std::path::Path::new(&target).exists(),

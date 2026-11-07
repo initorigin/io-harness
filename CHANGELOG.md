@@ -48,6 +48,12 @@ artifact, because nothing in this crate's CI built that target.
 
 - **CI builds Linux arm64 natively.** A job on `ubuntu-24.04-arm` runs the seccomp
   unit tests on arm64 glibc and builds the crate for `aarch64-unknown-linux-musl`.
+- **H8 holds the boundary it is about on the bubblewrap rung.** Since
+  `ubuntu-latest` moved to 26.04, bubblewrap 0.11 lets a payload write the
+  `/dev/shm` of the private `/dev` the rung mounts, which never reaches the host.
+  The test now requires a refused write only on a rung that keeps the host's
+  `/dev`, and still requires on every rung that nothing lands on the host. The
+  sandbox itself is unchanged.
 - Dependencies: `lopdf` 0.45 (the `documents` feature), `rmcp` 3.3, `reqwest`
   0.13.5 and `toml` patch releases.
 
