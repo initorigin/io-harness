@@ -132,7 +132,7 @@ docx-rs = { version = "0.4", optional = true }
 # code over two dependencies this tree can already justify. The alternative was a
 # ten-day-old extraction crate, and the vetting rule that removed OCR applies to
 # convenience too.
-zip = { version = "8", optional = true, default-features = false, features = ["deflate"] }
+zip = { version = "9", optional = true, default-features = false, features = ["deflate"] }
 quick-xml = { version = "0.42", optional = true }
 lopdf = { version = "0.45", optional = true }
 pdf-extract = { version = "0.12", optional = true }
