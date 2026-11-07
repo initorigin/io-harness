@@ -327,7 +327,8 @@ pub(crate) fn bwrap_argv(
         "--new-session".into(),
         "--proc".into(),
         "/proc".into(),
-        "--dev".into(),
+        "--dev-bind".into(),
+        "/dev".into(),
         "/dev".into(),
         // A child of a run that ends must not outlive it. The shared runner
         // kills the tree, and this is the kernel saying the same thing —
