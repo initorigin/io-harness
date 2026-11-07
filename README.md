@@ -1000,7 +1000,8 @@ pulled in.
 | Windows, opt-in | Native, AppContainer inside a Job Object — writes confined to the paths the run resolved | No proxy at all: a process inside an AppContainer cannot reach a loopback listener under any capability set, which was measured rather than assumed. Egress is the capability — all of the network, or none |
 | Portable floor | Whatever the host allows, recorded as the floor | Advisory, as above |
 
-The full suite runs on macOS, Linux and Windows in CI.
+The full suite runs on macOS, Linux and Windows in CI, and a native Linux arm64 job
+runs the seccomp tests and builds `aarch64-unknown-linux-musl`.
 
 The rung a host takes is the strongest that can enforce what the run asked for, and
 a run denying egress is never given one that cannot deny egress. The Linux chain's
